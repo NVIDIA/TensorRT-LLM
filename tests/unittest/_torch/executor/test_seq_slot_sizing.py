@@ -13,12 +13,15 @@ while the V2 capacity scheduler has already dropped them from its budget
 (``no_schedule_after_state=GENERATION_TO_COMPLETE``) and the ADP router has
 already excluded them from the counts admission subtracts from its capacity --
 so a replacement cohort is admitted while the retiring one is still resident.
-``should_enable_overlap_headroom`` is the single gate for that, and it requires
-attention DP: ``ADPRouter.exclude_retiring_requests`` is read only inside the
-``if self.enable_attention_dp:`` branch of ``_fetch_new_requests``, so outside
-attention DP the else-branch subtracts ``len(active_requests)`` with retirees
-included and residency is capped at ``max_batch_size * pp_size`` however many
-seats exist. It stays off for V1 (the V1 capacity schedulers hardcode
+``should_enable_overlap_headroom`` is the single gate for that. It does not
+depend on attention DP: ``ADPRouter.exclude_retiring_requests`` follows the gate,
+and both branches of ``_fetch_new_requests`` read it -- the attention-DP branch
+through the router's rank states, the other by discounting
+``count_retiring_requests`` from ``len(active_requests)``. A context server is the
+case that needs it most: every request retires the iteration after its prefill,
+so without the headroom only the seats the previous iteration left unused can be
+refilled and the batch alternates between partial fills (nvbug 6919819 measured a
+``3, 1, 3, 1`` cadence at ``max_batch_size=4``). It stays off for V1 (the V1 capacity schedulers hardcode
 ``GENERATION_COMPLETE``) and for hybrid models (SSM state is sized from
 ``max_batch_size``). "V1" there is the manager the creator *selects*, not the
 ``use_kv_cache_manager_v2`` request: the gate reads
@@ -28,12 +31,12 @@ keep an MRoPE delta cache, which is sized ``max_num_tokens * pp_size + 1`` yet
 indexed by ``py_seq_slot``.
 
 The **index pool** (``KVCacheManagerV2.max_admissible_sequences``) is widened by
-a deliberately *broader* predicate -- ``is_disagg or (non-PP and overlap-on)``,
-with no attention-DP term -- so it equals the seat pool under attention DP and
-runs ahead of it elsewhere. Both reasons for the surplus are real: a request
-awaiting its KV transfer holds an index lease and no seat at all (because
-``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``), and a
-non-ADP overlap run needs the leases without being able to occupy the seats.
+a deliberately *broader* predicate -- ``is_disagg or (non-PP and overlap-on)`` --
+so it equals the seat pool wherever the seat gate is on and runs ahead of it
+elsewhere. The surplus is real: a request awaiting its KV transfer holds an
+index lease and no seat at all (because ``SeqSlotManager.prepare_resources``
+skips ``DISAGG_GENERATION_INIT``), and a hybrid or MRoPE-delta model keeps the
+single-micro-batch seat pool while its V2 index pool still widens.
 Hence ``validate_seq_slot_pool_covers_admission`` requires the index pool to
 *cover* the seat pool rather than to equal it. Equalising them by widening the
 seat pool is the thing not to do: surplus leases cost page-table rows, surplus
@@ -58,6 +61,8 @@ from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
     compute_max_num_sequences,
     create_torch_sampler_args,
+    get_overlap_headroom_penalty_workspace_bytes,
+    get_penalty_store,
     is_disagg_enabled,
     kv_cache_manager_v2_incompatible_features,
     resolve_max_num_sequences,
@@ -71,6 +76,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import resolve_mrope_position_deltas_cache
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyStore
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
 from tensorrt_llm.mapping import Mapping
@@ -92,9 +98,11 @@ SIZING_CASES = [
 @pytest.mark.parametrize(
     "enable_attention_dp,pp_size,disable_overlap,is_v2,is_hybrid,expected",
     [
-        # The scenario this PR exists for: attention DP, no PP, overlap on, V2.
+        # Attention DP, no PP, overlap on, V2.
         (True, 1, False, True, False, True),
-        (False, 1, False, True, False, False),
+        # The same without attention DP: an aggregated or context server
+        # (nvbug 6919819) retires requests one iteration late just the same.
+        (False, 1, False, True, False, True),
         (True, 1, True, True, False, False),
         (True, 2, False, True, False, False),
         (True, 4, False, True, False, False),
@@ -131,50 +139,46 @@ def test_overlap_headroom_gate(
 def test_overlap_headroom_gate_does_not_depend_on_disaggregation():
     """Disagg is not a reason to widen the *seat* pool, only the index pool.
 
-    The gate used to take ``cache_transceiver_config`` and return True for a
-    disaggregated server regardless of attention DP. That bought seats that could
-    never be occupied: a request in KV transfer holds an index lease and no seat,
-    and outside attention DP admission subtracts ``len(active_requests)`` so
-    residency stays at ``max_batch_size * pp_size``. Asserting on the signature
-    states the intent that a value test cannot: the parameter's mere presence is
-    what invites the conflation back.
+    The gate used to take ``cache_transceiver_config`` and return True for any
+    disaggregated server. A request in KV transfer holds an index lease and no
+    seat, so disaggregation alone never needs an extra seat; only a retiring
+    request does. Asserting on the signature states the intent that a value test
+    cannot: the parameter's mere presence is what invites the conflation back.
     """
     params = inspect.signature(should_enable_overlap_headroom).parameters
     assert "cache_transceiver_config" not in params
     assert "is_disagg" not in params
 
 
-def test_overlap_headroom_gate_requires_attention_dp():
-    """Attention DP is the only place the extra seats can be occupied.
+def test_overlap_headroom_gate_does_not_require_attention_dp():
+    """Retiring requests hold a seat for one iteration with or without attention DP.
 
-    ``ADPRouter.exclude_retiring_requests`` is what lets a replacement cohort be
-    admitted while the retiring cohort still holds its seats, and that correction
-    is read only inside the ``if self.enable_attention_dp:`` branch of
-    ``_fetch_new_requests``. The else-branch subtracts ``len(active_requests)``
-    with retirees included, so residency outside attention DP is capped at
-    ``max_batch_size * pp_size`` no matter how many seats exist. Widening the
-    pool there would allocate sampler state, ``[seats, draft_len, vocab]`` draft
-    probabilities and pinned-host block-offset tables for seats that admission
-    can never hand out.
-
-    The index pool still widens on this path, so the two pools are unequal here
-    by design -- see ``test_sizing_matches_kv_manager_admission_bound``.
+    The deferral comes from the overlap executor loop, which admits new work
+    before ``_process_previous_batch`` frees the requests that finished in the
+    previous iteration. Both branches of ``_fetch_new_requests`` discount those
+    retiring requests when ``ADPRouter.exclude_retiring_requests`` is set, so the
+    seats they hold must come from the headroom in both cases too. Gating the
+    headroom on attention DP left a single-rank context server refilling only
+    the seats its previous iteration had not used (nvbug 6919819).
     """
     kwargs = dict(kv_cache_manager_is_v2=True, is_hybrid=False)
     with_adp = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
     without_adp = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=False)
 
     assert should_enable_overlap_headroom(with_adp, False, **kwargs) is True
-    assert should_enable_overlap_headroom(without_adp, False, **kwargs) is False
+    assert should_enable_overlap_headroom(without_adp, False, **kwargs) is True
+    # The overlap scheduler is what defers retirement; without it there is no
+    # retiring request to seat.
+    assert should_enable_overlap_headroom(without_adp, True, **kwargs) is False
 
 
 @pytest.mark.parametrize("enable_attention_dp", [False, True])
-def test_non_adp_seat_pool_stays_at_max_batch_size(enable_attention_dp):
-    """End-to-end: the gate's ADP term reaches the seat count itself.
+def test_overlap_seat_pool_is_doubled_with_or_without_attention_dp(enable_attention_dp):
+    """End-to-end: the gate reaches the seat count itself.
 
     Asserting on ``compute_max_num_sequences`` rather than on the predicate is
-    what pins the consequence the reviewer asked for -- ``B`` seats for a non-ADP
-    overlap run, ``2B`` only under attention DP.
+    what pins the consequence: ``2B`` seats for any non-PP overlap run on V2, so
+    a retiring cohort of ``B`` and its replacement can be resident together.
     """
     max_batch_size = 8
     mapping = Mapping(
@@ -191,7 +195,7 @@ def test_non_adp_seat_pool_stays_at_max_batch_size(enable_attention_dp):
             mapping, False, kv_cache_manager_is_v2=True
         ),
     )
-    assert seats == (2 * max_batch_size if enable_attention_dp else max_batch_size)
+    assert seats == 2 * max_batch_size
 
 
 def test_overlap_headroom_gate_excludes_mrope_delta_cache_models():
@@ -522,12 +526,12 @@ def test_sizing_matches_kv_manager_admission_bound(
     ``validate_seq_slot_pool_covers_admission`` -- and the assertion is exactly
     that validator's invariant.
 
-    The seat gate is the narrower predicate: it additionally requires attention
-    DP, because that is the only branch of ``_fetch_new_requests`` that consumes
-    ``ADPRouter.exclude_retiring_requests``. So the index pool runs ahead
-    wherever the manager widens and the seat gate does not -- a non-ADP overlap
-    run, or any disaggregated run. That direction is permitted; what must never
-    happen is the reverse, which is what shipped as nvbug 6627795.
+    The seat gate is the narrower predicate: it has no disaggregation term,
+    because a request in KV transfer holds an index lease and no seat. So the
+    index pool runs ahead wherever the manager widens and the seat gate does not
+    -- a disaggregated run without the overlap term, e.g. one with the overlap
+    scheduler disabled. That direction is permitted; what must never happen is
+    the reverse, which is what shipped as nvbug 6627795.
     """
     max_batch_size = 8
     mapping = Mapping(
@@ -592,19 +596,17 @@ def test_validator_permits_an_index_pool_above_the_seat_pool():
     so the manager's ``is_disagg`` term deliberately has no seat-pool
     counterpart. A hybrid model suppresses the seat headroom -- SSM state is
     sized from ``max_batch_size`` -- while a V2 index pool behind it still
-    widens. And a non-ADP overlap run widens the index pool while the seat gate
-    stays shut, because only the attention-DP branch of ``_fetch_new_requests``
-    can admit a replacement before its predecessor releases a seat.
+    widens. And a disaggregated run with the overlap scheduler disabled widens the
+    index pool while the seat gate stays shut.
 
-    So the gap is the *ordinary* case on plain TP, not a rare exception, and that
-    is accepted rather than engineered away: admission is bounded independently
-    at ``max_batch_size * pp_size``, so a surplus lease is never extra
-    concurrency, and it is the cheap direction -- spare leases cost page-table
-    rows, spare seats would cost sampler state, the eagerly allocated
-    ``[seats, draft_len, vocab]`` draft probabilities and the pinned-host
-    block-offset tables. Widening the seat pool to make the two numbers equal
-    would buy allocation and no admission, which is why the validator checks
-    coverage rather than equality.
+    That gap is accepted rather than engineered away: admission is capped
+    independently at ``max_num_active_requests`` (``max_batch_size * pp_size``),
+    so a surplus lease is never extra concurrency, and it is the cheap direction
+    -- spare leases cost page-table rows, spare seats would cost sampler state,
+    the eagerly allocated ``[seats, draft_len, vocab]`` draft probabilities and
+    the pinned-host block-offset tables. Widening the seat pool to make the two
+    numbers equal would buy allocation and no admission, which is why the
+    validator checks coverage rather than equality.
 
     Asserting on the signature as well: ``is_disagg`` used to select which
     surplus was tolerated, and its absence is what stops the validator from
@@ -667,7 +669,7 @@ def test_resolve_max_num_sequences_prefers_the_published_pool(explicit, engine_s
     """
     engine = SimpleNamespace(
         max_num_seq_slots=engine_seats,
-        _enable_overlap_headroom=True,
+        enable_overlap_headroom=True,
     )
     mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
     llm_args = SimpleNamespace(disable_overlap_scheduler=False)
@@ -923,3 +925,95 @@ def test_seq_slot_ids_remain_valid_after_partial_reuse():
     assert all(0 <= s < capacity for s in slots), slots
     assert len(set(slots)) == len(live)
     assert not manager.slot_manager.free_slots
+
+
+# The penalty workspace (``PenaltyStore.counts_cuda`` / ``presence_prefix_cuda``) is
+# allocated on the first penalized request, after the KV cache has taken its share
+# of free memory, so the estimation has to reserve the part the headroom adds.
+@pytest.mark.parametrize("max_beam_width", [1, 4])
+def test_penalty_workspace_reserve_covers_only_the_headroom_seats(max_beam_width):
+    vocab_size, max_batch_size = 152064, 2048
+    seats = compute_max_num_sequences(
+        Mapping(world_size=1, tp_size=1, pp_size=1),
+        max_batch_size,
+        disable_overlap_scheduler=False,
+        enable_overlap_headroom=True,
+    )
+    assert seats == 2 * max_batch_size
+    reserve = get_overlap_headroom_penalty_workspace_bytes(
+        max_num_sequences=seats,
+        num_sequences_without_headroom=max_batch_size,
+        max_beam_width=max_beam_width,
+        vocab_size=vocab_size,
+    )
+    # int32 counts per beam of each extra seat, plus one bool prefix row per extra seat.
+    assert reserve == max_batch_size * vocab_size * (4 * max_beam_width + 1)
+
+
+@pytest.mark.parametrize(
+    "max_num_sequences,num_sequences_without_headroom,vocab_size",
+    [
+        (8, 8, 1000),  # headroom off: the slack has always covered these seats
+        (16, 16, 1000),  # pipeline parallelism: the pool is pp_size wide either way
+        (16, 8, None),  # vocabulary unknown
+    ],
+)
+def test_penalty_workspace_reserve_is_zero_without_extra_seats(
+    max_num_sequences, num_sequences_without_headroom, vocab_size
+):
+    assert (
+        get_overlap_headroom_penalty_workspace_bytes(
+            max_num_sequences=max_num_sequences,
+            num_sequences_without_headroom=num_sequences_without_headroom,
+            max_beam_width=1,
+            vocab_size=vocab_size,
+        )
+        == 0
+    )
+
+
+def _penalty_store(max_num_sequences, max_beam_width=1):
+    return PenaltyStore.create(
+        max_num_sequences=max_num_sequences, max_beam_width=max_beam_width, device="cpu"
+    )
+
+
+def _sampler_with(store):
+    return SimpleNamespace(_penalty_handler=SimpleNamespace(store=store))
+
+
+def test_penalty_store_is_read_from_the_torch_sampler_only():
+    store = _penalty_store(16)
+    assert get_penalty_store(_sampler_with(store)) is store
+    # EarlyStopSampler and friends own no penalty handler, and estimation may have no sampler.
+    assert get_penalty_store(SimpleNamespace()) is None
+    assert get_penalty_store(None) is None
+    # A mocked sampler auto-creates the attributes; that is not a store to size from.
+    assert get_penalty_store(Mock()) is None
+
+
+@pytest.mark.parametrize("enable_overlap_headroom", [False, True])
+def test_kv_estimation_reserves_the_headroom_penalty_workspace(enable_overlap_headroom):
+    """The reserve follows the profiling executor's own sampler store."""
+    max_batch_size, vocab_size = 64, 1000
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+    seats = compute_max_num_sequences(
+        mapping, max_batch_size, False, enable_overlap_headroom=enable_overlap_headroom
+    )
+    creator = KvCacheCreator.__new__(KvCacheCreator)
+    creator._mapping = mapping
+    creator._max_batch_size = max_batch_size
+    creator._llm_args = SimpleNamespace(disable_overlap_scheduler=False)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=vocab_size))
+        )
+    )
+    py_executor = SimpleNamespace(sampler=_sampler_with(_penalty_store(seats)))
+    expected = max_batch_size * vocab_size * 5 if enable_overlap_headroom else 0
+    assert creator._get_penalty_workspace_reserve(py_executor) == expected
+    # No executor (skipped estimation) or a sampler without penalties reserves nothing.
+    assert creator._get_penalty_workspace_reserve(None) == 0
+    assert creator._get_penalty_workspace_reserve(SimpleNamespace(sampler=SimpleNamespace())) == 0
+    # Nor does a mocked executor, as the KV-estimation tests pass in.
+    assert creator._get_penalty_workspace_reserve(Mock()) == 0

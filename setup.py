@@ -715,10 +715,15 @@ setup(
         'console_scripts': [
             'trtllm-bench=tensorrt_llm.commands.bench:main',
             'trtllm-serve=tensorrt_llm.commands.serve:main',
-            'trtllm-eval=tensorrt_llm.commands.eval:main'
+            'trtllm-eval=tensorrt_llm.commands.eval:main',
         ],
     },
-    scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
+    scripts=[
+        'tensorrt_llm/llmapi/trtllm-llmapi-launch',
+        'tensorrt_llm/llmapi/_llmapi_process_guard.py',
+        'tensorrt_llm/llmapi/_llmapi_mpi_stop.py',
+        'tensorrt_llm/serve/render/trtllm-render',
+    ],
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
         "openengine": [],

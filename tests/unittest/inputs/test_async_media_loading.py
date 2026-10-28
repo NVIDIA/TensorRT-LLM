@@ -59,6 +59,15 @@ def _make_audio_file(tmp_path: str) -> str:
 
 class TestAsyncLoadImage:
     @pytest.mark.asyncio
+    async def test_load_image_from_raw_bytes_pil(self):
+        encoded = _make_image_data_url().partition(",")[2]
+        image = await media_io_module.ImageMediaIO(format="pil").async_load_bytes(
+            base64.b64decode(encoded)
+        )
+        assert isinstance(image, Image.Image)
+        assert image.mode == "RGB"
+
+    @pytest.mark.asyncio
     async def test_load_image_from_data_url_pil(self):
         url = _make_image_data_url()
         image = await async_load_image(url, format="pil")
@@ -161,6 +170,7 @@ class TestSessionReuse:
         assert first_session is second_session, (
             "Expected the same ClientSession object to be returned"
         )
+        assert isinstance(first_session.connector._resolver, media_io_module._ValidatingResolver)
 
     @pytest.mark.asyncio
     async def test_new_session_created_after_close(self):

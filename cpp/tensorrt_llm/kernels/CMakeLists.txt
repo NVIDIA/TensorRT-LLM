@@ -39,6 +39,16 @@ add_subdirectory(fusedSampling)
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
+list(REMOVE_ITEM SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/kvCachePartialCopy.cu")
+add_library(tllm_kernel_kv_cache_copy STATIC kvCachePartialCopy.cu)
+add_library(tllm::kernel_kv_cache_copy ALIAS tllm_kernel_kv_cache_copy)
+target_link_libraries(tllm_kernel_kv_cache_copy PUBLIC tllm::common_cuda)
+target_compile_features(tllm_kernel_kv_cache_copy PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_kernel_kv_cache_copy PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(tllm_kernel_kv_cache_copy 89)
+
 # Exclude files in the cutlass_kernels, decoderMaskedMultiheadAttention and
 # selectiveScan trtllmGenKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")

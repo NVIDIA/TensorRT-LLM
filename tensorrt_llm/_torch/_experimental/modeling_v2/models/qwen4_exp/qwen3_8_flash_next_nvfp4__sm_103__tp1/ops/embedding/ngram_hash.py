@@ -67,31 +67,21 @@ class NgramHash(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: batch, length, num_query_tokens; history is uniform random ids
+    # spec: batch, length, num_query_tokens; history is uniform random int64 ids
     # with the first `min(CONTEXT_LEN, length)` set to EOS when `lead_eos`
     # (default True), `eos_positions` forced to EOS, and `eos_density` of the
-    # remaining ids replaced by EOS; ids_dtype (int64).
+    # remaining ids replaced by EOS.
+    #
+    # Every cell is the call site's: one `[T, ngram_size]` window per packed
+    # token from `ngram_token_history`, num_query_tokens 1.
     CELLS: tuple[Cell, ...] = (
-        _rows(1, 3, 1, "decode: 2 cached ids + 1 new, 1 row"),
-        _rows(8, 3, 1, "decode: 2 cached ids + 1 new, 8 rows"),
         _rows(4, 3, 1, "decode row whose cached context is EOS", eos_positions=(0, 1)),
-        _rows(1, 130, 128, "prefill chunk of 128"),
-        _rows(2, 130, 128, "prefill chunk of 128, EOS inside", eos_positions=(40, 41, 100)),
-        _rows(3, 1026, 1024, "prefill chunk of 1024, EOS runs", eos_positions=(7, 8, 9, 512)),
-        _rows(2, 64, 64, "whole history emitted", eos_positions=(16, 17)),
-        _rows(1, 2, 0, "empty query: [batch, 0, heads]"),
-        _rows(4, 6, 4, "4 query tokens per row (draft width)", eos_positions=(2,)),
-        # The call site: one `[T, ngram_size]` window per packed token from
-        # `ngram_token_history`, raw ids with EOS anywhere, num_query_tokens 1.
-        _rows(1, 3, 1, "call site: 1 window, 1 token", lead_eos=False, eos_density=0.2),
         _rows(
             32, 3, 1, "call site: 32 windows, decode / MTP verify", lead_eos=False, eos_density=0.2
         ),
-        _rows(4096, 3, 1, "call site: 4096 windows, prefill", lead_eos=False, eos_density=0.1),
         _rows(
             8192, 3, 1, "call site: 8192 windows, largest prefill", lead_eos=False, eos_density=0.05
         ),
-        _rows(2, 34, 32, "int32 token_history", eos_positions=(10,), ids_dtype=torch.int32),
     )
 
     note = """
@@ -103,11 +93,12 @@ class NgramHash(OpWrapper):
 
     Preconditions: `head_vocab_sizes`, `head_offsets` on `token_history`'s
     device (raises otherwise; a cpu `layer_multipliers` is accepted and
-    gives the identical result). `token_history` may be any integer dtype
-    (int32 and int64 identical). Negative ids are accepted and hashed as
-    ordinary ids, not padding. `num_query_tokens == 0` returns
-    `[batch, 0, heads]`. A single multiplier raises `ZeroDivisionError`. The
-    four silent mistakes are `is_valid`'s.
+    gives the identical result). Certified on an int64 `token_history`, the
+    window `ngram_token_history` returns. Negative ids are accepted and hashed
+    as ordinary ids, not padding. Longer histories and `num_query_tokens > 1`
+    (a chunk's tail) are not certified.
+    A single multiplier raises `ZeroDivisionError`. The four silent mistakes
+    are `is_valid`'s.
 
     A wrong hash is a valid row: an extra shift, no EOS reset, an inclusive
     segment start, reversed multipliers, no offsets, swapped blocks all stay

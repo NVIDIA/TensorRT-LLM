@@ -80,7 +80,7 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      create_lm_head_tp_mapping)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
-                             register_auto_model)
+                             layerwise_moe_quant_config, register_auto_model)
 
 
 @triton.jit
@@ -1139,8 +1139,12 @@ class Deepseekv3MoE(nn.Module):
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
         if getattr(model_config, "quant_config_dict", None) is None:
             return model_config.quant_config
-        return model_config.quant_config_dict.get(
-            f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config)
+        experts_quant_config = layerwise_moe_quant_config(
+            model_config.quant_config_dict,
+            f"model.layers.{layer_idx}.mlp.experts")
+        if experts_quant_config is None:
+            return model_config.quant_config
+        return experts_quant_config
 
     @staticmethod
     def _expert_weight_loading_mode(

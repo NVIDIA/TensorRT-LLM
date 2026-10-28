@@ -44,7 +44,8 @@ class _LayerCache:
     def __init__(self, conv: torch.Tensor, temporal: torch.Tensor) -> None:
         self.conv = conv
         self.temporal = temporal
-        self.kda_qkg_cache = None
+        self.kda_k_cache = None
+        self.kda_g_cache = None
         self.has_kda_replay_caches = False
 
 

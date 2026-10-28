@@ -23,16 +23,27 @@ Pass the Hub ID or local path via `--model`:
 
 ### Static FP8 checkpoints
 
-Statically quantized (ModelOpt) FP8 builds of Nano and Super run on this path.
-Quantization is detected from the checkpoint's own metadata, so nothing has to
-be declared on the command line. The weights live on the `fp8` branch of the
-same repos as the BF16 builds rather than under a separate model ID, so select
-them with `--revision`:
+Statically quantized (ModelOpt) FP8 builds of Nano, Super, and the two 4-Step
+distilled checkpoints (`Cosmos3-Super-Text2Image-4Step`,
+`Cosmos3-Super-Image2Video-4Step`) run on this path. Quantization is detected
+from the checkpoint's own metadata, so nothing has to be declared on the
+command line. The weights live on the `fp8` branch of the same repos as the
+BF16 builds rather than under a separate model ID, so select them with
+`--revision`:
 
 ```bash
 python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
     --prompt_file prompts/t2v.json \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+# FP8 distilled 4-step text-to-image
+python cosmos3.py --model nvidia/Cosmos3-Super-Text2Image-4Step --revision fp8 \
+    --prompt_file prompts/t2i.json --output_type image \
+    --visual_gen_args ../configs/cosmos3-t2i-1gpu.yaml
+
+# FP8 distilled 4-step image-to-video
+python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step --revision fp8 \
+    --prompt_file prompts/i2v.json
 ```
 
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
@@ -41,8 +52,11 @@ equally fine; pass its directory to `--model` and omit `--revision`.
 `../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
 that would rather set it in the config than on the command line.
 
-T2V, T2I, I2V and V2V are validated on a **single GPU**; every multi-GPU
-configuration is refused with an explicit error, so use BF16 there.
+Static FP8 runs on a single GPU or with Tensor Parallel, Ulysses, and CFG
+parallelism (alone or combined); only Attention2D/ring context parallelism is
+refused, with an explicit error. Note that CFG parallelism is irrelevant to the
+distilled checkpoints — they bake guidance into the weights (guidance 1.0, one
+branch per step).
 
 These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
 rather than being refused — audio is quantized and generated like any other

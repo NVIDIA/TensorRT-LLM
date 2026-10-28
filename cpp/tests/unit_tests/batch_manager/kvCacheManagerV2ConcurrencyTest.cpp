@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -158,13 +159,13 @@ size_t seedPendingRootErases(BlockRadixTree& tree, size_t count)
     for (size_t index = 0; index < count; ++index)
     {
         ReuseScope scope;
-        scope.salt = static_cast<std::uint64_t>(index) + 1;
+        scope.salt = std::to_string(index + 1);
         tree.addOrGetExisting(scope);
     }
     for (size_t index = 0; index < count; ++index)
     {
         ReuseScope scope;
-        scope.salt = static_cast<std::uint64_t>(index) + 1;
+        scope.salt = std::to_string(index + 1);
         // Freshly created roots are childless, which is exactly the state the drain acts on.
         tree.proposeToEraseEmptyRoot(RootBlock::makeKey(scope));
     }
@@ -195,14 +196,14 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseDoesNotMutateTheRadixTree)
     for (int attempt = 0; attempt < 4; ++attempt)
     {
         ReuseScope scope;
-        scope.salt = 1;
+        scope.salt = "1";
         EXPECT_EQ(manager->probeReuse(scope, toSpan(tokens), /*knownNoDigest=*/true), 0);
         EXPECT_EQ(tree.roots().size(), kNumRoots) << "probeReuse() drained pending root erases on attempt " << attempt;
     }
 
     // The drain still happens, just at an exclusive-locked entry point.
     ReuseScope fresh;
-    fresh.salt = 9999;
+    fresh.salt = "9999";
     tree.addOrGetExisting(fresh);
     EXPECT_EQ(tree.roots().size(), 1U) << "addOrGetExisting() must drain the pending root erases";
 
@@ -256,7 +257,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
                 for (int iteration = 0; iteration < kIterations; ++iteration)
                 {
                     ReuseScope scope;
-                    scope.salt = static_cast<std::uint64_t>((threadIndex + iteration) % kNumRoots) + 1;
+                    scope.salt = std::to_string((threadIndex + iteration) % kNumRoots + 1);
                     if (manager->probeReuse(scope, toSpan(tokens), /*knownNoDigest=*/true) != 0)
                     {
                         nonZeroMatches.fetch_add(1, std::memory_order_relaxed);

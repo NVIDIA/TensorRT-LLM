@@ -18,7 +18,7 @@ TRT-LLM PyTorch-backend flow (``LLM(model=<ckpt>) -> generate``):
 
 Caching
 -------
-KDA states use ``MambaHybridCacheManagerV2`` with the ``KvCacheConfig``
+KDA states use ``KimiK3HybridCacheManager`` with the ``KvCacheConfig``
 default ``use_kv_cache_manager_v2=True`` (selected in ``pyexecutor/_util.py``).
 Setting this field to ``"auto"`` falls back to V1 for
 ``KimiLinearForCausalLM``, which declares no V2 model preference.
@@ -106,24 +106,38 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
+from ..attention.attention import _helix_cp_pad
 from ..attention.backends import AttentionMetadata
-from ..distributed import AllReduce, AllReduceParams
+from ..distributed import (
+    AllReduce,
+    AllReduceFusionOp,
+    AllReduceParams,
+    AllReduceStrategy,
+    allgather,
+)
+from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
+from ..modules.linear import (
+    Fp8BlockScaleLowMGemmRange,
+    TensorParallelMode,
+    fp8_block_scale_ue8m0_gemm,
+    load_weight_shard,
+)
 from ..modules.linear import Linear as TrtllmLinear
-from ..modules.linear import TensorParallelMode, load_weight_shard
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -804,12 +818,37 @@ def _helix_cp_v_b_shard(
 # ---------------------------------------------------------------------------
 
 
+def _rubin_mxfp8_is_available() -> bool:
+    """Whether this rank can run the SM107 native block-scaled MXFP8 GEMM.
+
+    Recomputed rather than cached: the SM version cannot change within a run,
+    so weight preparation and forward always agree.
+    """
+    from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+
+def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """The DeepGEMM-packed scale the low-M GEMM reads, from the SM107 CuTe MXFP8 scale."""
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+    return fp8_block_scale_low_m_gemm.pack_block_scale_from_mxfp8_layout(weight_scale, n, k)
+
+
 class _Fp8BlockScaleWeightReadLinear(nn.Module):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
     Attention loads checkpoint E4M3 codes and 128x128 scales directly. The optional
-    MLP path quantizes BF16 weights once at load. Both prepare UE8M0 scales
-    for DeepGEMM and quantize BF16 activations inside the GEMM.
+    MLP path quantizes BF16 weights once at load. On SM100/SM103 the UE8M0
+    scales are packed for DeepGEMM, which quantizes BF16 activations inside the
+    GEMM. On Rubin (SM107) the scales are packed into the CuTe DSL K32 R128c4
+    layout and the activation is quantized by the specialized CuTe quantizer
+    before the native MXFP8 GEMM, which runs with K3's fine-grained low-M tuning
+    buckets. On both, the low-M GEMM is a candidate of forward like in the
+    generic FP8 block-scale linear (``Fp8BlockScaleLowMGemmRange``); it reads a
+    DeepGEMM-packed scale, which is ``weight_scale`` on SM100/SM103 and a copy
+    repacked from the MXFP8 scale on SM107.
     """
 
     def __init__(
@@ -825,6 +864,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # touched by any later autocast/dtype move.
         self.register_buffer("weight", weight_fp8, persistent=False)
         self.register_buffer("weight_scale", weight_scale, persistent=False)
+        # Rows the low-M GEMM serves and the DeepGEMM-packed scale it reads; set at post-load.
+        self._low_m = Fp8BlockScaleLowMGemmRange()
+        self._low_m_weight_scale: Optional[torch.Tensor] = None
 
     @property
     def has_fp8_qdq(self) -> bool:
@@ -836,9 +878,14 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         """Match the ``Linear`` interface consumed by ``GatedMLP``."""
         return False
 
+    @property
+    def supports_prequantized_input(self) -> bool:
+        """Whether a producer may hand this GEMM an FP8 activation in CuTe layout."""
+        return _rubin_mxfp8_is_available()
+
     @staticmethod
     def quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """BF16 ``[out, in]`` weight -> (FP8 weight, deep_gemm-ready scale).
+        """BF16 ``[out, in]`` weight -> (FP8 weight, backend-ready scale).
 
         Both dims must be multiples of 128. Because the 128x128 block scale is
         computed per block, concatenating several such weights along ``out``
@@ -858,14 +905,22 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from ...quantization.utils.fp8_utils import (
             resmooth_to_fp8_e8m0,
+            transform_k128_scales_to_cutedsl_mxfp8_layout,
             transform_sf_into_required_layout,
         )
 
-        # fp8_swap_ab_gemm with disable_ue8m0_cast=True consumes packed,
-        # TMA-aligned UE8M0 scales rather than the checkpoint's FP32 grid.
+        # Both GEMMs consume UE8M0 scales rather than the checkpoint's FP32 grid.
         weight_fp8, weight_scale = resmooth_to_fp8_e8m0(
             weight_fp8.contiguous(), weight_scale.contiguous().float()
         )
+        if _rubin_mxfp8_is_available():
+            # cute_dsl_mxfp8_gemm_rubin reads K32 R128c4 UE8M0 scales.
+            weight_scale = transform_k128_scales_to_cutedsl_mxfp8_layout(
+                weight_scale, mn=weight_fp8.shape[0], k=weight_fp8.shape[1]
+            )
+            return weight_fp8, weight_scale
+        # fp8_swap_ab_gemm with disable_ue8m0_cast=True consumes packed,
+        # TMA-aligned UE8M0 scales.
         weight_scale = transform_sf_into_required_layout(
             weight_scale,
             mn=weight_fp8.shape[0],
@@ -901,6 +956,23 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
 
     def post_load_weights(self) -> None:
         self.transform_weights()
+        self._prepare_low_m_gemm()
+
+    def _prepare_low_m_gemm(self) -> None:
+        """Select the low-M GEMM for this weight where it has a DeepGEMM-packed scale.
+
+        On SM107 that scale is a copy (N * K / 128 bytes) derived from the MXFP8
+        ``weight_scale``; row views of a fused KDA projection have none (the fused module
+        serves decode).
+        """
+        n, k = self.out_features, self.in_features
+        self._low_m = Fp8BlockScaleLowMGemmRange.for_weight(n, k)
+        if not _rubin_mxfp8_is_available():
+            self._low_m_weight_scale = self.weight_scale
+        elif self._low_m.max_m and self._fused_projection is None:
+            self._low_m_weight_scale = _low_m_gemm_scale_from_mxfp8(self.weight_scale, n, k)
+        else:
+            self._low_m, self._low_m_weight_scale = Fp8BlockScaleLowMGemmRange(), None
 
     def forward(
         self,
@@ -911,14 +983,54 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         out_shape = (*x.shape[:-1], self.out_features)
-        out = torch.ops.trtllm.fp8_swap_ab_gemm(
-            x.reshape(-1, x.shape[-1]),
-            self.weight,
-            self.weight_scale,
-            output_dtype=x.dtype,
-            disable_ue8m0_cast=True,
-        )
+        x_flat = x.reshape(-1, x.shape[-1])
+        if not _rubin_mxfp8_is_available():
+            out = fp8_block_scale_ue8m0_gemm(
+                x_flat, self.weight, self.weight_scale, self._low_m, output_dtype=x.dtype
+            )
+        elif self._low_m.serves(x_flat):
+            out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
+                x_flat, self.weight, self._low_m_weight_scale
+            )
+        else:
+            act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
+            out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                act_fp8,
+                self.weight,
+                act_scale,
+                self.weight_scale,
+                output_dtype=torch.bfloat16,
+                fine_grained_m=True,
+            )
         return out.reshape(out_shape)
+
+    def forward_prequantized(
+        self,
+        activation: torch.Tensor,
+        activation_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project an FP8 activation a fused producer already quantized.
+
+        Args:
+            activation: ``[..., in_features]`` ``float8_e4m3fn`` activation.
+            activation_scale: ``uint8`` UE8M0 scales in the CuTe K32 R128c4
+                layout that ``fp8_quantize_1x128_cutedsl_ue8m0`` produces.
+        """
+        if activation.dtype is not torch.float8_e4m3fn:
+            raise TypeError("prequantized Kimi K3 activation must be float8_e4m3fn")
+        if not self.supports_prequantized_input:
+            raise RuntimeError("prequantized Kimi K3 activation requires the Rubin CuTe GEMM")
+        if activation_scale.dtype is not torch.uint8:
+            raise TypeError("prequantized Kimi K3 activation scale must be uint8 R128c4")
+        out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            activation.reshape(-1, activation.shape[-1]),
+            self.weight,
+            activation_scale,
+            self.weight_scale,
+            output_dtype=torch.bfloat16,
+            fine_grained_m=True,
+        )
+        return out.reshape(activation.shape[:-1] + (self.out_features,))
 
 
 def _swap_linear_to_fp8_weight_read(
@@ -1036,7 +1148,10 @@ _K3_DEFAULT_ROUTED_QUANT_ALGO = QuantAlgo.W4A8_MXFP4_MXFP8
 # ---------------------------------------------------------------------------
 
 
-def _load_packed_mxfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
+def _load_packed_mxfp4_expert(
+    backend, base, expert_idx, local_slot_id, get_tensor, get_optional_tensor
+) -> None:
+    del get_optional_tensor  # this layout stores no optional per-expert tensor
     backend.quant_method.load_packed_mxfp4_expert(
         backend,
         global_expert_id=expert_idx,
@@ -1050,7 +1165,18 @@ def _load_packed_mxfp4_expert(backend, base, expert_idx, local_slot_id, get_tens
     )
 
 
-def _load_nvfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
+def _load_nvfp4_expert(
+    backend, base, expert_idx, local_slot_id, get_tensor, get_optional_tensor
+) -> None:
+    # Only an NVFP4_AWQ / NVFP4_ARC calibration writes a pre-quant scale; a
+    # plain NVFP4 checkpoint has none and the pair stays None, which leaves
+    # ``fc31_act_scale`` unset exactly as before. Dropping it for a checkpoint
+    # that HAS one would be silently wrong -- the activation would be quantized
+    # unsmoothed against an input scale calibrated on the smoothed one.
+    pre_quant_scales = {
+        f"{w}_pre_quant_scale": get_optional_tensor(f"{base}.{expert_idx}.{w}.pre_quant_scale")
+        for w in ("w1", "w3")
+    }
     backend.quant_method.load_streaming_nvfp4_expert(
         backend,
         global_expert_id=expert_idx,
@@ -1060,13 +1186,15 @@ def _load_nvfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> 
             for w in ("w1", "w2", "w3")
             for kind in ("weight", "weight_scale", "weight_scale_2", "input_scale")
         },
+        **pre_quant_scales,
     )
 
 
 class _K3ExpertCkptSpec(NamedTuple):
     """How one routed-expert quantization is spelled and loaded."""
 
-    # Per-``w{1,2,3}`` checkpoint tensor suffixes this layout stores.
+    # Per-``w{1,2,3}`` checkpoint tensor suffixes this layout stores. Every
+    # combination is required: a missing one fails the key plan.
     kinds: Tuple[str, ...]
     loader: Callable[..., None]
     # Set of filled slots the loader maintains, checked after the load.
@@ -1074,7 +1202,21 @@ class _K3ExpertCkptSpec(NamedTuple):
     # NVFP4 defers cat/pad/interleave and the alpha computation to
     # ``process_weights_after_loading``; the MXFP4 loaders write through.
     needs_layer_finalize: bool
+    # Whole per-expert key suffixes the loader passes through WHEN PRESENT, for
+    # a calibration artifact only some checkpoints of this layout carry. Spelled
+    # per weight rather than per kind, because they are not stored for every
+    # ``w``, and kept out of ``kinds`` because demanding them would reject the
+    # checkpoints that have none.
+    optional_suffixes: Tuple[str, ...] = ()
 
+
+_K3_NVFP4_EXPERT_CKPT_SPEC = _K3ExpertCkptSpec(
+    kinds=("weight", "weight_scale", "weight_scale_2", "input_scale"),
+    loader=_load_nvfp4_expert,
+    loaded_slots_attr="_streamed_expert_slots",
+    needs_layer_finalize=True,
+    optional_suffixes=("w1.pre_quant_scale", "w3.pre_quant_scale"),
+)
 
 _K3_EXPERT_CKPT_SPECS = {
     QuantAlgo.W4A8_MXFP4_MXFP8: _K3ExpertCkptSpec(
@@ -1083,12 +1225,12 @@ _K3_EXPERT_CKPT_SPECS = {
         loaded_slots_attr="_packed_mxfp4_loaded_slots",
         needs_layer_finalize=False,
     ),
-    QuantAlgo.NVFP4: _K3ExpertCkptSpec(
-        kinds=("weight", "weight_scale", "weight_scale_2", "input_scale"),
-        loader=_load_nvfp4_expert,
-        loaded_slots_attr="_streamed_expert_slots",
-        needs_layer_finalize=True,
-    ),
+    QuantAlgo.NVFP4: _K3_NVFP4_EXPERT_CKPT_SPEC,
+    # The two NVFP4 calibration recipes store plain NVFP4 expert weights plus
+    # the per-channel pre-quant scale above, so they share one layout; the MoE
+    # quantization method folds them onto the NVFP4 pipeline as well.
+    QuantAlgo.NVFP4_AWQ: _K3_NVFP4_EXPERT_CKPT_SPEC,
+    QuantAlgo.NVFP4_ARC: _K3_NVFP4_EXPERT_CKPT_SPEC,
 }
 
 
@@ -1101,6 +1243,12 @@ def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
             f"{sorted(a.name for a in _K3_EXPERT_CKPT_SPECS)}."
         )
     return spec
+
+
+def _is_helix_a2a(model_config: ModelConfig) -> bool:
+    """Helix + attention DP: CP ranks repurposed to TP, MoE on token slices."""
+    mapping = model_config.mapping
+    return mapping.enable_attention_dp and mapping.helix_repurposed_cp_size > 1
 
 
 class KimiK3MoERuntime(nn.Module):
@@ -1146,12 +1294,13 @@ class KimiK3MoERuntime(nn.Module):
         # GEMM is kept: the bf16-input min-latency GEMM's different reduction
         # order flips borderline top-16 picks (GSM8K 96.7 -> 96.1/96.4,
         # 3-run bisect on 62b20dd868), and the bs1-latency win is irrelevant
-        # at DEP batch sizes. KIMI_K3_ROUTER_BF16=1/0 forces either path.
+        # at DEP batch sizes. helix_a2a ranks share requests and keep bf16.
+        # KIMI_K3_ROUTER_BF16=1/0 forces either path.
         _router_bf16_env = os.environ.get("KIMI_K3_ROUTER_BF16")
         _router_bf16 = (
             _router_bf16_env == "1"
             if _router_bf16_env is not None
-            else not model_config.mapping.enable_attention_dp
+            else model_config.mapping.tp_group_shares_requests
         )
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
@@ -1169,6 +1318,9 @@ class KimiK3MoERuntime(nn.Module):
             # Kimi owns the latent reduction so it can order that collective
             # after the shared expert's auxiliary-stream reduction.
             reduce_results=False,
+            # Lets a FUSED_COMM backend return its globally combined routed
+            # output; ``_reduce_routed_output`` then skips that reduction.
+            accepts_global_routed_output=True,
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
             layer_idx=layer_idx,
@@ -1192,7 +1344,7 @@ class KimiK3MoERuntime(nn.Module):
             # CUTLASS is absent on purpose: it is the fallback target, so
             # "degraded to CUTLASS" is not a thing that can happen to it.
             allow_backend_degradation=routed_moe_model_config.moe_backend
-            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL"),
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL", "CUTEDSL_FC12"),
         )
         self._check_trtllm_situ_quant(
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
@@ -1230,9 +1382,18 @@ class KimiK3MoERuntime(nn.Module):
         # Direct MoE-TP leaves both branches as partials for one concatenated
         # all-reduce.
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
-        self._reduce_routed_output = (
+        # Fused-comm MegaMoE runs its own cross-rank exchange inside the
+        # kernel. Order the shared-expert all-reduce after the routed MoE
+        # instead of running the two collectives concurrently (startup
+        # deadlocks). CuteDSL is the validated scope, not a correctness
+        # dependency: DeepGEMM rejects TP without attention DP.
+        self._defer_shared_allreduce = (
             use_shared_tp
-            and self.routed_experts.backend.scheduler_kind != MoESchedulerKind.FUSED_COMM
+            and routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL"
+            and self.routed_experts.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
+        )
+        self._reduce_routed_output = (
+            use_shared_tp and not self.routed_experts.returns_global_routed_output
         )
         if self._reduce_routed_output and self.routed_experts.all_reduce is None:
             raise RuntimeError(
@@ -1262,6 +1423,17 @@ class KimiK3MoERuntime(nn.Module):
         self.shared_expert_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
+        self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
+        # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream;
+        # the latent down-projection runs there too, beside the routing chain.
+        self.latent_down_stream = (
+            aux_stream_dict.get(AuxStreamType.MoeOutputMemset)
+            if routed_moe_model_config.moe_backend in ("CUTEDSL", "CUTEDSL_FC12")
+            else None
+        )
+        has_latent_stream = self.latent_down_stream is not None
+        self.moe_latent_fork_event = torch.cuda.Event() if has_latent_stream else None
+        self.moe_latent_ready_event = torch.cuda.Event() if has_latent_stream else None
         self.routed_expert_down_proj = nn.Linear(
             cfg.hidden_size, self.moe_hidden_size, bias=False, dtype=dtype
         )
@@ -1280,6 +1452,45 @@ class KimiK3MoERuntime(nn.Module):
             return projection(hidden_states)
         return torch.ops.trtllm.dsv3_fused_a_gemm_op(
             hidden_states, projection.weight.t(), None, None
+        )
+
+    def _can_fuse_router_down(self, hidden_states: torch.Tensor) -> bool:
+        """Whether one fused GEMM can produce the router logits and the latent
+        down-projection (trtllm::dsv3_router_latent_gemm_op).
+
+        Scoped to the validated configuration (TP MEGAMOE_CUTEDSL with fused
+        communication on SM107); the fusion itself does not depend on it.
+        """
+        if (
+            torch.compiler.is_compiling()
+            or _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
+            or not hidden_states.is_cuda
+            or self.routed_experts.use_dp
+            or self.routed_experts.parallel_size <= 1
+            or self.routed_experts.moe_backend != "MEGAMOE_CUTEDSL"
+            or self.routed_experts.backend.scheduler_kind != MoESchedulerKind.FUSED_COMM
+            or get_sm_version() != 107
+        ):
+            return False
+        down = self.routed_expert_down_proj
+        if not isinstance(down, nn.Linear) or down.bias is not None:
+            return False
+        if (
+            hidden_states.ndim != 2
+            or not 1 <= hidden_states.shape[0] <= 16
+            or hidden_states.shape[1] != 7168
+            or self.gate.weight.shape != (896, 7168)
+            or down.weight.shape != (3584, 7168)
+        ):
+            return False
+        # Inspect the loaded weights: FP8 conversion can replace the down module.
+        return all(
+            tensor.dtype == torch.bfloat16
+            and tensor.is_cuda
+            and tensor.device == hidden_states.device
+            and tensor.stride() == (7168, 1)
+            and tensor.data_ptr() % 16 == 0
+            for tensor in (hidden_states, self.gate.weight, down.weight)
         )
 
     @staticmethod
@@ -1400,18 +1611,20 @@ class KimiK3MoERuntime(nn.Module):
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
         # Every backend here declares ``ActivationType.SiTu`` in its
         # ``activation_support``; the list is not a preference order. CUTEDSL
-        # joined once its act-fusion kernel grew the SiTU epilogue.
+        # joined once its act-fusion kernel grew the SiTU epilogue, and
+        # CUTEDSL_FC12 (Rubin/SM107) once its fused FC1+FC2 kernel did.
         supported_backends = {
             "CUTLASS",
             "TRTLLM",
             "CUTEDSL",
+            "CUTEDSL_FC12",
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
                 "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
-                "CUTEDSL, MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
+                "CUTEDSL, CUTEDSL_FC12, MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:
@@ -1421,7 +1634,26 @@ class KimiK3MoERuntime(nn.Module):
             )
         mapping = model_config.mapping
         if getattr(mapping, "_dwdp_size", 0) > 1:
-            raise NotImplementedError("Kimi K3 packed-checkpoint streaming does not support DWDP.")
+            # DWDP does not hook the load path at all: setup_dwdp() scans the
+            # model *after* every weight is loaded, reads w3_w1_weight /
+            # w2_weight and their block scales straight off the backend
+            # (dwdp/setup.py::collect_moe_params), copies them into fabric
+            # memory, frees the originals, and rebinds param.data to a
+            # composite VA view.  K3's packed-checkpoint streaming produces
+            # exactly those tensors, so the two are compatible -- but only on
+            # the NVFP4 CuteDSL leaves that declare supports_dwdp (CUTEDSL,
+            # CUTEDSL_FC12).
+            #
+            # MEGAMOE_CUTEDSL is excluded deliberately rather than by
+            # oversight: its process_weights_after_loading packs into the mega
+            # buffers and shrinks the raw source params back to placeholders
+            # (see maybe_finalize_layer), which has never been checked against
+            # DWDP's copy-then-free of those same originals.
+            if model_config.moe_backend not in ("CUTEDSL", "CUTEDSL_FC12"):
+                raise NotImplementedError(
+                    "Kimi K3 with DWDP requires moe_config.backend CUTEDSL or "
+                    f"CUTEDSL_FC12; got {model_config.moe_backend!r}."
+                )
 
         moe_tp, moe_ep = KimiK3MoERuntime._select_moe_tp_ep(mapping)
         if moe_tp < 1 or moe_ep < 1 or moe_tp * moe_ep != mapping.tp_size:
@@ -1460,7 +1692,11 @@ class KimiK3MoERuntime(nn.Module):
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }:
-            default_moe_max_num_tokens = routed_model_config.max_num_tokens * routed_mapping.dp_size
+            # helix_a2a ranks route ceil(max_num_tokens / tp) rows each.
+            rank_max_num_tokens = routed_model_config.max_num_tokens
+            if _is_helix_a2a(model_config):
+                rank_max_num_tokens = -(-rank_max_num_tokens // routed_mapping.tp_size)
+            default_moe_max_num_tokens = rank_max_num_tokens * routed_mapping.dp_size
             configured_moe_max_num_tokens = int(routed_model_config.moe_max_num_tokens or 0)
             if configured_moe_max_num_tokens < default_moe_max_num_tokens:
                 logger.info_once(
@@ -1483,8 +1719,38 @@ class KimiK3MoERuntime(nn.Module):
     def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
-        router_logits = self.gate.compute_logits(hidden_states)
+        projected_input = None
+        early_routed_in = None
+        if self._can_fuse_router_down(hidden_states):
+            router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
+                hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
+            )
+        else:
+            if (
+                self.latent_down_stream is not None
+                and do_multi_stream()
+                and not torch.compiler.is_compiling()
+            ):
+                # Forked ahead of the router GEMM: the latent chain needs only
+                # hidden_states.
+                self.moe_latent_fork_event.record()
+                with torch.cuda.stream(self.latent_down_stream):
+                    self.moe_latent_fork_event.wait()
+                    early_routed_in = self._routed_projection(
+                        hidden_states, self.routed_expert_down_proj
+                    )
+                    self.moe_latent_ready_event.record()
+                # No record_stream (under graph capture it holds every layer's
+                # blocks until capture ends): both tensors are read on main only
+                # after the join, and later work on this stream forks from main.
+            router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
+        overlap_shared_allreduce = (
+            self._defer_shared_allreduce
+            and do_multi_stream()
+            and self.shared_expert_stream is not None
+            and not torch.compiler.is_compiling()
+        )
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
@@ -1497,36 +1763,75 @@ class KimiK3MoERuntime(nn.Module):
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
             # is already a single fused GEMM (fp8_swap_ab_gemm).
-            routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+            moe_kwargs = {}
+            if projected_input is not None:
+                routed_in = projected_input
+            elif early_routed_in is not None:
+                routed_in = early_routed_in
+                # ConfigurableMoE joins the event before its first read of x.
+                moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
+            else:
+                routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             y = self.routed_experts(
                 routed_in,
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
+                **moe_kwargs,
             )
+            if overlap_shared_allreduce:
+                self.moe_routed_event.record()
             if self._reduce_routed_output:
                 return y
             # Communication-backed paths return a complete routed result.
             y = self.routed_expert_norm(y)
             return self._routed_projection(y, self.routed_expert_up_proj)
 
+        def _shared_output():
+            shared_out = self.shared_experts(
+                identity,
+                final_all_reduce_params=(
+                    AllReduceParams(enable_allreduce=False)
+                    if self._defer_shared_allreduce
+                    else None
+                ),
+            )
+            if overlap_shared_allreduce:
+                # Wait for all routed chunks, but overlap the norm/up tail.
+                self.moe_routed_event.wait()
+                shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
+            return shared_out
+
         # Shared experts depend only on the block input, so overlap their GEMMs
         # with the routed dispatch/expert/combine chain. Multi-stream engages
         # only under CUDA graphs; otherwise both branches run in order on the
         # default stream. The shared GatedMLP includes its output all-reduce on
-        # the auxiliary stream. The join below must precede the routed
-        # all-reduce: concurrent collectives on different streams can corrupt
-        # SYMM_MEM all-reduce state.
+        # the auxiliary stream (deferred past the routed MoE for fused-comm
+        # MegaMoE). The final join includes the shared all-reduce, so it
+        # precedes the routed all-reduce: concurrent collectives on different
+        # streams can corrupt SYMM_MEM all-reduce state.
         routed_out, shared_out = maybe_execute_in_parallel(
             _routed_output,
-            lambda: self.shared_experts(identity),
+            _shared_output,
             self.moe_main_event,
             self.moe_shared_event,
             self.shared_expert_stream,
             disable_on_compile=True,
         )
+        if self._defer_shared_allreduce and not overlap_shared_allreduce:
+            shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
         if self._reduce_routed_output:
-            routed_latent = moe_all_reduce(routed_out)
-            routed_latent = self.routed_expert_norm(routed_latent)
+            # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
+            # MNNVL kernel normalizes straight out of the lamport buffer, so
+            # the reduced row never round-trips through HBM for a norm kernel.
+            # Strategies without the fusion fall back inside AllReduce.
+            routed_latent = moe_all_reduce(
+                routed_out,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RMS_NORM,
+                    norm_weight=self.routed_expert_norm.weight,
+                    eps=float(self.routed_expert_norm.variance_epsilon),
+                ),
+            )
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         return routed_out + shared_out
 
@@ -1571,6 +1876,110 @@ def resolve_attention_quant_config(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# helix_a2a: token-sliced residual stream around head-TP attention.
+# ---------------------------------------------------------------------------
+
+# Helix + enable_attention_dp: every MoE layer keeps its residual stream
+# (prefix sum, attn-res bank, norms, MoE) on this rank's ceil(T / cp) rows, the
+# split the executor's helix all_rank_num_tokens assumes. KDA and MLA stay
+# head-TP over the CP group on all T rows: an all-gather feeds them and their
+# o_proj partials are reduce-scattered. The MoE runs the attention-DP
+# all-to-all with a replicated shared expert. The all-gather is symm_mem
+# MULTIMEM (NCCL fallback) and the reduce-scatter is AllReduce + own rows: at
+# 16 ranks, T=512 they take 19.4 / 28.1 us against NCCL's 40.0 / 38.4 us.
+
+
+def _multimem_allgather(mapping: Mapping, max_bytes: int) -> SymmetricMemoryAllGather:
+    """SymmetricMemoryAllGather admitted for this GPU and TP size.
+
+    The upstream allow-list stops at SM 10.0 and 8 ranks; MULTIMEM all-gather
+    also runs at 16 and 32 ranks on Rubin. The class's rendezvous probe still
+    disables it when MULTIMEM is not usable.
+    """
+    major, minor = torch.cuda.get_device_capability()
+    capability = f"{major}.{minor}"
+    cls = type(
+        "_HelixA2AMultimemAllGather",
+        (SymmetricMemoryAllGather,),
+        {
+            "_WORLD_SIZES_MULTIMEM": {capability: [mapping.tp_size]},
+            "_MAX_SIZES": {capability: {mapping.tp_size: max_bytes}},
+        },
+    )
+    # Reuse WORLD when it is the TP group (helix GEN: world == tp * cp).
+    group = (
+        torch.distributed.group.WORLD
+        if torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() == mapping.tp_size
+        else None
+    )
+    return cls(mapping, dtype=torch.bfloat16, group=group)
+
+
+class KimiK3HelixA2A(nn.Module):
+    """Moves rows between the full T-row batch and this rank's chunk.
+
+    Row ownership and zero padding follow the upstream helix + attention-DP
+    path (``_helix_cp_pad``): rank r owns rows ``[r * chunk, (r + 1) * chunk)``.
+    """
+
+    def __init__(
+        self,
+        mapping: Mapping,
+        hidden_size: int,
+        max_num_tokens: int,
+        allreduce_strategy: AllReduceStrategy,
+    ):
+        super().__init__()
+        if mapping.tp_size <= 1 or mapping.enable_attention_dp:
+            raise ValueError(
+                "Kimi K3 helix_a2a needs the head-TP (non-attention-DP) mapping; got "
+                f"tp_size={mapping.tp_size}, enable_attention_dp={mapping.enable_attention_dp}."
+            )
+        self.mapping = mapping
+        self.world_size = mapping.tp_size
+        self.rank = mapping.tp_rank
+        padded_rows = -(-max_num_tokens // self.world_size) * self.world_size
+        # 1 MiB granularity; can_use_symm_mem rejects out_bytes >= max.
+        symm = _multimem_allgather(mapping, ((padded_rows * hidden_size * 2 >> 20) + 1) << 20)
+        if symm.disabled:
+            logger.warning(
+                "Kimi K3 helix_a2a: symm_mem MULTIMEM all-gather unavailable at "
+                f"tp_size={self.world_size}; using NCCL all-gather."
+            )
+        self._symm_allgather = None if symm.disabled else symm
+        self._allreduce = AllReduce(
+            mapping=mapping, strategy=allreduce_strategy, dtype=torch.bfloat16
+        )
+        logger.info_once(
+            f"Kimi K3 helix_a2a: token-sliced MoE layers over tp_size={self.world_size}, "
+            f"all-gather={'nccl' if symm.disabled else 'symm'}",
+            key="kimi_k3_helix_a2a",
+        )
+
+    def all_rank_num_tokens(self, num_tokens: int) -> List[int]:
+        return [-(-num_tokens // self.world_size)] * self.world_size
+
+    def scatter_rows(self, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """This rank's chunk of a rank-replicated tensor (rows on dim -2)."""
+        x, chunk = _helix_cp_pad(x, num_tokens, self.world_size)
+        return x.narrow(-2, self.rank * chunk, chunk).contiguous()
+
+    def all_gather(self, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """``[chunk, H]`` per rank -> ``[num_tokens, H]`` on every rank."""
+        gathered = None
+        if self._symm_allgather is not None:
+            gathered = self._symm_allgather(x, dim=0)
+        if gathered is None:
+            gathered = allgather(x, self.mapping, dim=0)
+        return gathered[:num_tokens]
+
+    def reduce_scatter(self, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """Row-parallel partial sums ``[num_tokens, H]`` -> this rank's ``[chunk, H]``."""
+        return self.scatter_rows(self._allreduce(x), num_tokens)
+
+
 class KimiMLARuntime(nn.Module):
     """Wraps K3 MLA and applies its external TP output reduction."""
 
@@ -1581,6 +1990,7 @@ class KimiMLARuntime(nn.Module):
         model_config: ModelConfig,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
+        reduce_output: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1598,9 +2008,10 @@ class KimiMLARuntime(nn.Module):
         # between attention and the row-parallel o_proj.
         # Helix: mapping_with_cp (the CP original) activates the base MLA's
         # helix machinery; this wrapper's allreduce over the repurposed
-        # mapping sums the base o_proj's tp*cp partials.
-        mapping = model_config.mapping
-        reduce_output = not mapping.enable_attention_dp and mapping.tp_size > 1
+        # mapping sums the base o_proj's tp*cp partials. reduce_output=False
+        # leaves that reduction to the caller (helix_a2a reduce-scatter).
+        mapping = model_config.mapping.mapping_for_full_rows()
+        reduce_output = reduce_output and not mapping.enable_attention_dp and mapping.tp_size > 1
         self._o_allreduce = (
             AllReduce(
                 mapping=mapping,
@@ -1664,6 +2075,7 @@ class KimiMLARuntime(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class KimiLinearDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1676,6 +2088,14 @@ class KimiLinearDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
         dtype = torch.bfloat16
+        self.is_moe = (
+            cfg.num_experts is not None
+            and layer_idx >= cfg.first_k_dense_replace
+            and layer_idx % getattr(cfg, "moe_layer_freq", 1) == 0
+        )
+        # helix_a2a: an MoE layer keeps its residual stream and MoE on this
+        # rank's token rows, attention on all rows (see KimiK3HelixA2A).
+        self.token_sliced = self.is_moe and _is_helix_a2a(model_config)
 
         self.is_kda = _is_kda_layer(cfg, layer_idx)
         is_mla = _is_mla_layer(cfg, layer_idx)
@@ -1694,10 +2114,11 @@ class KimiLinearDecoderLayer(nn.Module):
             self.linear_attn = KimiKDALinearAttention(
                 cfg,
                 layer_idx,
-                mapping=model_config.mapping,
+                mapping=model_config.mapping.mapping_for_full_rows(),
                 allreduce_strategy=model_config.allreduce_strategy,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
                 model_config=attention_config,
+                reduce_output=not self.token_sliced,
             )
         else:
             self.self_attn = KimiMLARuntime(
@@ -1707,29 +2128,27 @@ class KimiLinearDecoderLayer(nn.Module):
                 aux_stream_dict=aux_stream_dict,
                 # CP original stashed by _setup_helix_mappings; None outside helix.
                 mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
+                reduce_output=not self.token_sliced,
             )
 
-        self.is_moe = (
-            cfg.num_experts is not None
-            and layer_idx >= cfg.first_k_dense_replace
-            and layer_idx % getattr(cfg, "moe_layer_freq", 1) == 0
-        )
         if self.is_moe:
             self.block_sparse_moe = KimiK3MoERuntime(model_config, cfg, layer_idx, aux_stream_dict)
         else:
             situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
             situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
-            attention_dp = model_config.mapping.enable_attention_dp
-            if attention_dp:
+            # Dense layers run on every row (helix_a2a slices only MoE layers).
+            mlp_mapping = model_config.mapping.mapping_for_full_rows()
+            if mlp_mapping.enable_attention_dp:
                 self.mlp_tp_size = 1
             else:
-                self.mlp_tp_size = math.gcd(cfg.intermediate_size, model_config.mapping.tp_size)
-                if self.mlp_tp_size > model_config.mapping.gpus_per_node:
-                    self.mlp_tp_size = math.gcd(
-                        self.mlp_tp_size, model_config.mapping.gpus_per_node
-                    )
+                self.mlp_tp_size = math.gcd(cfg.intermediate_size, mlp_mapping.tp_size)
+                if self.mlp_tp_size > mlp_mapping.gpus_per_node:
+                    self.mlp_tp_size = math.gcd(self.mlp_tp_size, mlp_mapping.gpus_per_node)
             mlp_model_config = copy.copy(model_config)
+            mlp_model_config._frozen = False
+            mlp_model_config.mapping = mlp_mapping
             mlp_model_config.quant_config = QuantConfig()
+            mlp_model_config._frozen = model_config._frozen
             # K3's dense layer is BF16, so a unit block size gives the same
             # subgroup selection as DeepSeek-V3. Attention DP replicates the
             # MLP because ranks own different tokens; otherwise the subgroup
@@ -1782,6 +2201,7 @@ class KimiLinearDecoderLayer(nn.Module):
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
         capture: Optional[Tuple[Any, int]] = None,
+        helix_a2a: Optional[KimiK3HelixA2A] = None,
     ) -> Tuple[torch.Tensor, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
@@ -1795,7 +2215,20 @@ class KimiLinearDecoderLayer(nn.Module):
         below already is it. Reading it here beats recomputing it, and is only
         possible because K3 asserts pp_size == 1 -- layer j+1 is always local.
         PP support would need a recompute at the rank boundary.
+
+        On a ``token_sliced`` layer M is this rank's chunk of the batch and
+        ``helix_a2a`` moves rows between that chunk and the full batch.
         """
+        sliced = helix_a2a if self.token_sliced else None
+        num_tokens = attn_metadata.num_tokens if sliced is not None else None
+        if self.token_sliced and helix_a2a is None:
+            raise RuntimeError(
+                f"Kimi K3 layer {self.layer_idx} is token-sliced but got no helix_a2a"
+            )
+
+        def _full_rows(t: torch.Tensor) -> torch.Tensor:
+            return t if sliced is None else sliced.all_gather(t, num_tokens)
+
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
 
@@ -1814,7 +2247,7 @@ class KimiLinearDecoderLayer(nn.Module):
             # acceptance, silently. hidden_states is the pre-norm attn_res mixture;
             # prefix_only wants the running prefix, already in hand as prefix_sum.
             tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
-            capture[0].maybe_capture_hidden_states(capture[1], tapped, None)
+            capture[0].maybe_capture_hidden_states(capture[1], _full_rows(tapped), None)
             hidden_states = self.input_layernorm(hidden_states)
         elif num_snapshots > 0:
             hidden_states = _apply_attn_res_and_rmsnorm(
@@ -1832,8 +2265,14 @@ class KimiLinearDecoderLayer(nn.Module):
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
+
+        # Attention is head-TP over every row: KDA rows are gathered in and its
+        # row-sharded o_proj partials reduce-scattered back out here; helix MLA
+        # does both itself (_helix_cp_allgather_input / _helix_cp_output_projection).
         if self.is_kda:
-            hidden_states = self.linear_attn(hidden_states, attn_metadata)
+            hidden_states = self.linear_attn(_full_rows(hidden_states), attn_metadata)
+            if sliced is not None:
+                hidden_states = sliced.reduce_scatter(hidden_states, num_tokens)
         else:
             hidden_states = self.self_attn(hidden_states, attn_metadata)
 
@@ -1857,7 +2296,10 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
-                hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
+                hidden_states,
+                sliced.all_rank_num_tokens(num_tokens)
+                if sliced is not None
+                else getattr(attn_metadata, "all_rank_num_tokens", None),
             )
         else:
             hidden_states = self.mlp(hidden_states)
@@ -1910,6 +2352,26 @@ class KimiLinearModel(DecoderModel):
                 for layer_idx in range(cfg.num_hidden_layers)
             ]
         )
+        # Rows are rank-replicated up to the first token-sliced layer (the dense
+        # layers stay on all rows), and sliced from there to the end.
+        sliced = [layer.token_sliced for layer in self.layers]
+        self.helix_a2a_first_layer = sliced.index(True) if any(sliced) else len(sliced)
+        if not all(sliced[self.helix_a2a_first_layer :]):
+            raise ValueError(
+                "Kimi K3 helix_a2a needs every layer after the first MoE layer to be MoE"
+            )
+        # After the layers: MegaMoE bootstraps torch.distributed under MPI,
+        # which the symm_mem all-gather needs.
+        self.helix_a2a = (
+            KimiK3HelixA2A(
+                model_config.mapping.mapping_for_full_rows(),
+                cfg.hidden_size,
+                model_config.max_num_tokens,
+                model_config.allreduce_strategy,
+            )
+            if any(sliced)
+            else None
+        )
         self.norm = RMSNorm(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype)
 
         # KimiK3RMSNorm (not RMSNorm): consumed field-wise (.weight/.eps)
@@ -1948,6 +2410,14 @@ class KimiLinearModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
 
+        num_tokens = attn_metadata.num_tokens if self.helix_a2a is not None else None
+        if self.helix_a2a is not None and hidden_states.shape[0] != num_tokens:
+            # Rows are split by the metadata token count on every rank.
+            raise ValueError(
+                f"Kimi K3 helix_a2a does not support padded batches (got "
+                f"{hidden_states.shape[0]} rows, metadata says {num_tokens} tokens)."
+            )
+
         block_residual = hidden_states.new_empty(
             self.num_attn_res_snapshots,
             hidden_states.shape[0],
@@ -1977,9 +2447,19 @@ class KimiLinearModel(DecoderModel):
                 and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
             ):
                 capture = (spec_metadata, self.layers[i - 1].layer_idx)
+            if i == self.helix_a2a_first_layer:
+                # Rows are rank-replicated up to here: keep this rank's chunk.
+                hidden_states = self.helix_a2a.scatter_rows(hidden_states, num_tokens)
+                block_residual = self.helix_a2a.scatter_rows(block_residual, num_tokens)
             hidden_states, num_snapshots = layer(
-                hidden_states, block_residual, num_snapshots, attn_metadata, capture=capture
+                hidden_states,
+                block_residual,
+                num_snapshots,
+                attn_metadata,
+                capture=capture,
+                helix_a2a=self.helix_a2a,
             )
+        sliced = self.helix_a2a is not None
 
         # The last layer has no successor, so this one recompute is
         # unavoidable -- output-side score weights, matching SGLang's
@@ -1999,15 +2479,20 @@ class KimiLinearModel(DecoderModel):
                     if num_snapshots > 0 and _AUX_ATTN_RES_STREAM_ENABLED
                     else hidden_states
                 )
+                if sliced:
+                    tail = self.helix_a2a.all_gather(tail, num_tokens)
                 spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
-        return _apply_attn_res_and_rmsnorm(
+        hidden_states = _apply_attn_res_and_rmsnorm(
             hidden_states,
             block_residual[:num_snapshots],
             self.output_attn_res_proj,
             self.output_attn_res_norm,
             self.norm,
         )
+        if sliced:
+            hidden_states = self.helix_a2a.all_gather(hidden_states, num_tokens)
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -2166,11 +2651,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         self._repurposed_tp_mapping = None
         if not model_config.mapping.has_cp_helix():
             return
-        if model_config.mapping.enable_attention_dp:
-            raise ValueError(
-                "Kimi K3 helix phase 1 requires enable_attention_dp="
-                "False: the helix ADP token-scatter conflicts with the "
-                "per-request locality of KDA recurrent state."
+        # Helix + attention DP = helix_a2a: KDA keeps head-TP state across the
+        # CP group (every CP rank holds the same requests) and only the MoE
+        # layers run attention-DP on ceil(T / cp) token rows each.
+        if model_config.mapping.enable_attention_dp and model_config.mapping.tp_size != 1:
+            raise NotImplementedError(
+                "Kimi K3 helix with enable_attention_dp requires tp_size=1 "
+                f"(got tp_size={model_config.mapping.tp_size}): KDA and MLA are "
+                "head-TP over the CP group, so there is no request-level DP to add."
             )
         if spec_config is not None:
             # Helix supports only the standalone DSpark drafter (verified on
@@ -2295,10 +2783,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         #   speculative decoding is not validated. Both settings use V2
         #   with the default use_kv_cache_manager_v2=True. The "auto"
         #   setting follows the model preference and can resolve to V1.
-        # - tokens_per_block=64: with 32, the flashinfer trtllm-gen FMHA lib
-        #   rejects the MLA (576, 512) generation kernel (marked slower) and
-        #   the fallback C++ path requires num_heads % 64 == 0, which K3's
-        #   96 query heads violate.
+        # - tokens_per_block=64: keep the validated K3 page size. Earlier
+        #   releases needed it to avoid a legacy MLA fallback that could not
+        #   serve attention-DP's 96 query heads. The current FlashInfer
+        #   TRTLLM-Gen backend declines H=96 at either page size, allowing
+        #   the updated legacy TRTLLM-Gen autotuner to select a Q16 kernel.
         return {
             "kv_cache_config": {
                 "enable_block_reuse": False,
@@ -2592,6 +3081,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 continue
             moe = layer.block_sparse_moe
             base = f"{prefix}model.layers.{layer_idx}.block_sparse_moe.experts"
+            # Required suffixes only: ``optional_suffixes`` are per-checkpoint
+            # (an AWQ pre-quant scale), and demanding them here would reject
+            # every checkpoint of the same layout that does not carry them.
+            # Unmatched expert keys only warn, and this validator already
+            # exempts expert keys from that, so the present ones stay quiet.
             kinds = moe.expert_ckpt_spec.kinds
             for expert_idx in moe.local_expert_ids:
                 for w in ("w1", "w2", "w3"):
@@ -2943,7 +3437,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             backend.process_weights_after_loading()
 
         def load_expert(
-            moe: KimiK3MoERuntime, base: str, local_slot_id: int, expert_idx: int, get_tensor
+            moe: KimiK3MoERuntime,
+            base: str,
+            local_slot_id: int,
+            expert_idx: int,
+            get_tensor,
+            get_optional_tensor,
         ):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
@@ -2952,7 +3451,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # split-file and the shared-dict fallback alike), so this is the
             # one place preparation has to be hooked.
             ensure_prepared(moe)
-            moe.expert_ckpt_spec.loader(backend, base, expert_idx, local_slot_id, get_tensor)
+            moe.expert_ckpt_spec.loader(
+                backend, base, expert_idx, local_slot_id, get_tensor, get_optional_tensor
+            )
             maybe_finalize_layer(moe)
 
         def load_experts_from_weights(layer_idx: int, moe: KimiK3MoERuntime, base: str):
@@ -2964,6 +3465,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     local_slot_id,
                     expert_idx,
                     lambda key: _materialize(weights[key]),
+                    lambda key: _materialize(weights[key]) if key in weights else None,
                 )
 
         # ---- backend expert slots: file-grouped streaming ----
@@ -2995,11 +3497,23 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             split_file_jobs = []
             for layer_idx, moe, base in expert_jobs:
                 del layer_idx
+                spec = moe.expert_ckpt_spec
                 for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
                     keys = [
                         f"{base}.{expert_idx}.{w}.{kind}"
                         for w in ("w1", "w2", "w3")
-                        for kind in moe.expert_ckpt_spec.kinds
+                        for kind in spec.kinds
+                    ]
+                    # An optional tensor this checkpoint does store has to be
+                    # counted here: it decides which files the job opens, and
+                    # ``get_optional_tensor`` below can only read a file that
+                    # ``files`` named.
+                    keys += [
+                        key
+                        for key in (
+                            f"{base}.{expert_idx}.{suffix}" for suffix in spec.optional_suffixes
+                        )
+                        if checkpoint_key(key) in weight_map
                     ]
                     files = {weight_map[checkpoint_key(key)] for key in keys}
                     job = (moe, base, local_slot_id, expert_idx)
@@ -3024,6 +3538,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     torch.cuda.set_device(device)
                 path = os.path.join(ckpt_dir, file_name)
                 with safe_open(path, framework="pt", device="cpu") as fh:
+                    # A job lands here only when every key it needs -- optional
+                    # ones included, see the grouping above -- is in this file,
+                    # so presence in this file is the whole question.
+                    file_keys = set(fh.keys())
                     for moe, base, local_slot_id, expert_idx in jobs:
                         load_expert(
                             moe,
@@ -3031,6 +3549,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                             local_slot_id,
                             expert_idx,
                             lambda key: fh.get_tensor(checkpoint_key(key)),
+                            lambda key: (
+                                fh.get_tensor(checkpoint_key(key))
+                                if checkpoint_key(key) in file_keys
+                                else None
+                            ),
                         )
                 # Handle closed -> pages unmapped -> the drop takes effect.
                 drop_file_pages(file_name)
@@ -3052,7 +3575,16 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         source_key = checkpoint_key(key)
                         return handles[weight_map[source_key]].get_tensor(source_key)
 
-                    load_expert(*job, get_tensor)
+                    def get_optional_tensor(key):
+                        source_key = checkpoint_key(key)
+                        # Absent from the index means the checkpoint does not
+                        # store it; present means the grouping above put its
+                        # file in ``handles``.
+                        if source_key not in weight_map:
+                            return None
+                        return handles[weight_map[source_key]].get_tensor(source_key)
+
+                    load_expert(*job, get_tensor, get_optional_tensor)
                 for file_name in files:
                     drop_file_pages(file_name)
 
@@ -3118,6 +3650,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     projection = getattr(attention, name)
                     projection._fused_projection = (weakref.ref(fused), offset)
                     offset += projection.out_features
+                    # Repoint to the fused rows now rather than in post_load:
+                    # deferring kept every layer's standalone codes alongside
+                    # its fused copy, ~22.6 GiB at peak across K3's 69 KDA
+                    # layers, which overflows a DEP8 context rank.
+                    projection.transform_weights()
         logger.info(
             f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
         )

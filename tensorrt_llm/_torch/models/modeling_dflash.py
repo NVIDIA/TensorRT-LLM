@@ -9,15 +9,17 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
 
-from ...functional import RotaryScalingType
+from ...functional import AllReduceFusionOp, AllReduceParams, RotaryScalingType
 from ..attention.rotary_embedding import RotaryEmbedding
 
 try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..distributed import AllReduce
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
     dflash_trtllm_gen_unavailability_reason,
@@ -27,6 +29,7 @@ from ..speculative.dflash_attention import (
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
 
@@ -62,25 +65,10 @@ def dspark_layer_window_size(
     return (swa_window - 1, swa_window - 1)
 
 
-def _is_dflash2_architecture(config: PretrainedConfig) -> bool:
-    """Whether a draft checkpoint advertises itself as a DFlash 2 drafter.
-
-    Matches on the "dflash2" stem (released drafters use ``DFlash2DraftModel``)
-    so per-target variants of the label are picked up too.
-    """
-    return any(
-        "dflash2" in str(arch).lower().replace("_", "").replace("-", "")
-        for arch in (getattr(config, "architectures", None) or [])
-    )
-
-
 def declares_lilicorr(config: PretrainedConfig) -> bool:
     """Whether the checkpoint requires the LiLiCorr candidate scorer."""
-    settings = getattr(config, "dflash_config", None) or {}
-    return bool(
-        settings.get("projector_type") == "lilicorr"
-        or settings.get("lilicorr_enabled", False)
-        or "LiLiCorrDraftModel" in (getattr(config, "architectures", None) or [])
+    return is_lilicorr_checkpoint(
+        getattr(config, "architectures", None), getattr(config, "dflash_config", None) or {}
     )
 
 
@@ -359,6 +347,15 @@ class DFlashForCausalLM(nn.Module):
     # is about which kernel reads it.
     _paged_ctx_cache = False
 
+    # Whether the drafter runs its TP fusions under plain TP (tp > 1, no
+    # attention DP): fc keeps only this rank's input features and one
+    # all-reduce sums the partial projections with hidden_norm fused in, and
+    # the drafter's own block decode may fuse its all-reduces with the residual
+    # add and the RMSNorm after them. They change the drafter's rounding, so a
+    # family declares this once its acceptance length has been measured with
+    # them; the others keep the unsplit fc and the unfused norms.
+    _tp_fusions = False
+
     # Positions the worker will actually serve, published once by
     # DFlashDrafter._lazy_init_ctx_buffers before the first forward. A drafter
     # that sizes an absolute-position table reads it in place of its
@@ -549,10 +546,8 @@ class DFlashForCausalLM(nn.Module):
         self._dflash2_selector_rank = int(dflash_config.get("selector_rank", 0) or 0)
         self._dflash2_selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
         # LiLiCorr supplies its own scorer and permits convolution-free checkpoints.
-        self._is_dflash2 = not self._uses_lilicorr and (
-            self._dflash2_conv_taps > 0
-            or self._dflash2_selector_rank > 0
-            or _is_dflash2_architecture(pretrained_config)
+        self._is_dflash2 = not self._uses_lilicorr and is_dflash2_checkpoint(
+            getattr(pretrained_config, "architectures", None), dflash_config
         )
         if self._is_dflash2:
             self._validate_dflash2_config()
@@ -592,6 +587,19 @@ class DFlashForCausalLM(nn.Module):
         # and validates the managed pool against this, so a drafter that stores
         # a single tensor must override it (see MLADSparkForCausalLM).
         self._kv_factor = 2
+        # The drafter's TP fusions (see _tp_fusions) run under plain
+        # TP: fc keeps only this rank's input features (_project_features),
+        # and a drafter's block decode may fuse its all-reduces with the
+        # residual add and the following RMSNorm.
+        mapping = self.model_config.mapping
+        self._tp_split = (
+            self._tp_fusions and mapping.tp_size > 1 and not mapping.enable_attention_dp
+        )
+        # This rank's input features of fc and the all-reduce that sums the
+        # partial projections, set by _load_target_projection under _tp_split
+        # when the fc input width splits over tp_size.
+        self._fc_input_slice: Optional[slice] = None
+        self._fc_all_reduce: Optional[AllReduce] = None
         self._has_qk_norm = False
         self._use_fused_qk_norm_rope = False
         # Laguna-specific draft-layer behaviors, disabled by default so generic
@@ -723,8 +731,27 @@ class DFlashForCausalLM(nn.Module):
         Generic DFlash: fc then hidden_norm. Subclasses (e.g. Laguna) may
         normalize the per-aux features first by overriding this method.
         """
-        hidden_states = hidden_states.to(self.fc.weight.dtype)
-        return self.hidden_norm(self.fc(hidden_states))
+        return self._project_features(hidden_states.to(self.fc.weight.dtype))
+
+    def _project_features(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``hidden_norm(fc(hidden_states))`` for ``[N, in_features]`` features.
+
+        With the TP fusions (``_tp_split``) every rank holds the same features,
+        so each multiplies its slice of them by its slice of the ``fc`` columns
+        and one all-reduce sums the partials with ``hidden_norm`` fused in:
+        every rank reads ``1 / tp`` of the ``fc`` weight.
+        """
+        if self._fc_input_slice is None:
+            return self.hidden_norm(self.fc(hidden_states))
+        partial = self.fc(hidden_states[:, self._fc_input_slice])
+        return self._fc_all_reduce(
+            partial,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.hidden_norm.weight,
+                eps=self.hidden_norm.eps,
+            ),
+        )
 
     def _validate_dflash2_config(self) -> None:
         """Require the full DFlash 2 recipe; a partial one would silently
@@ -892,6 +919,22 @@ class DFlashForCausalLM(nn.Module):
         if "fc.weight" not in weights:
             return
         weight = weights.pop("fc.weight")
+        # A drafter with the TP fusions keeps only its rank's slice of the
+        # input features (see _project_features); a width that does not split
+        # over tp_size keeps the whole fc.
+        mapping = self.model_config.mapping
+        if self._tp_split and weight.shape[1] % mapping.tp_size != 0:
+            logger.info(
+                f"{type(self).__name__}: fc input width {weight.shape[1]} does not split "
+                f"over tp_size={mapping.tp_size}; keeping the unsplit context projection."
+            )
+        elif self._tp_split:
+            width = weight.shape[1] // mapping.tp_size
+            self._fc_input_slice = slice(mapping.tp_rank * width, (mapping.tp_rank + 1) * width)
+            self._fc_all_reduce = AllReduce(
+                mapping, strategy=self.model_config.allreduce_strategy, dtype=weight.dtype
+            )
+            weight = weight[:, self._fc_input_slice]
         self.fc = nn.Linear(
             weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
         )
@@ -1470,6 +1513,7 @@ class DFlashForCausalLM(nn.Module):
         ctx_cache_batch_idx: torch.Tensor,
         ctx_kv_cache: Optional[torch.Tensor] = None,
         ctx_page_table: Optional[torch.Tensor] = None,
+        block_placement: Optional[DraftBlockPlacement] = None,
     ) -> torch.Tensor:
         """DFlash draft forward with cross-attention over a pooled K/V buffer.
 
@@ -1482,6 +1526,9 @@ class DFlashForCausalLM(nn.Module):
             ctx_k_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
             ctx_v_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
             ctx_cache_batch_idx: [B] — slot index into the pool per batch entry
+            block_placement: where the block's own positions sit in the
+                context pages, from the worker's paged single-latent
+                preparation; a drafter that appends the block itself ignores it
         Returns:
             [B * block_size, hidden_size]
         """
@@ -1991,7 +2038,7 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         if fc_norm is not None:
             chunks = hidden_states.chunk(len(fc_norm), dim=-1)
             hidden_states = torch.cat([norm(chunk) for norm, chunk in zip(fc_norm, chunks)], dim=-1)
-        return self.hidden_norm(self.fc(hidden_states))
+        return self._project_features(hidden_states)
 
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads, head_dim):
         """Apply Laguna's per-head softplus output gate (``g_proj``) to the

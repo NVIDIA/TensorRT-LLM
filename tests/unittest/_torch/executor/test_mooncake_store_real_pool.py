@@ -23,12 +23,16 @@ connector is serving wrong KV.
 Expected byte offsets are computed here rather than read back from
 `PageAddressing`, so an error in the page arithmetic cannot cancel out between
 the save and the load.
+
+Most tests run over TCP. The RDMA test registers a real `KVCacheManagerV2`
+and needs an InfiniBand device and a GPUDirect path.
 """
 
 from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -37,13 +41,17 @@ import pytest
 import torch
 from test_common.mooncake_utils import running_master_on_free_ports
 
+import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheBufferRef,
     KvCacheLayerGroupLayout,
     KvCacheLayout,
     KvCacheRegion,
+    build_kv_cache_layout_v2,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import gpudirect
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import PageAddressing
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     CONFIG_PATH_ENV,
     MooncakeStoreConnectorConfig,
@@ -51,7 +59,9 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     POOL_MANIFEST_NAME,
+    _highest_rate_ib_devices,
     provision_pool,
+    resolve_device_name,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
     MooncakeStoreMetadata,
@@ -62,7 +72,14 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
     _open_store,
 )
-from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MooncakeStoreConfig
+from tensorrt_llm.mapping import Mapping
+
+# Mooncake reads this once per process, and pytest imports this module before
+# any test opens a client, so a TCP test cannot decide the path for the RDMA one.
+if gpudirect.dmabuf_needed():
+    os.environ.setdefault(gpudirect.PEERMEM_ENV, "0")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -177,9 +194,9 @@ def _llm_args(store_config: MooncakeStoreConfig) -> SimpleNamespace:
     )
 
 
-@pytest.fixture
-def mooncake_pool(tmp_path, monkeypatch):
-    """A live master and the capacity behind it, shut down with the test.
+@contextlib.contextmanager
+def _running_pool(tmp_path, monkeypatch, *, protocol: str) -> Iterator[SimpleNamespace]:
+    """A live master and the capacity behind it, over `protocol`.
 
     The master stores nothing: a page lives in the memory of the participant
     it was allocated in, so the keeper is what lets the pool outlive a worker.
@@ -196,13 +213,12 @@ def mooncake_pool(tmp_path, monkeypatch):
     master_dir.mkdir()
     client_dir.mkdir()
 
-    # TCP rather than RDMA, since a CI node need not have a usable NIC and the
-    # transport is not what these tests are about.
-    with running_master_on_free_ports(str(master_dir), protocol="tcp") as master:
+    with running_master_on_free_ports(str(master_dir), protocol=protocol) as master:
         keeper, _ = _open_store(
             MooncakeStoreConnectorConfig(
                 master_server_address=master.address,
-                protocol="tcp",
+                protocol=protocol,
+                device_name=resolve_device_name(protocol, ""),
                 global_segment_size=KEEPER_SEGMENT_SIZE,
                 role=StoreRole.CAPACITY,
             )
@@ -216,14 +232,50 @@ def mooncake_pool(tmp_path, monkeypatch):
             keeper.close()
 
 
+@pytest.fixture
+def mooncake_pool(tmp_path, monkeypatch):
+    """A pool over TCP, shut down with the test.
+
+    TCP rather than RDMA, since a CI node need not have a usable NIC and the
+    transport is not what most of these tests are about.
+    """
+    with _running_pool(tmp_path, monkeypatch, protocol="tcp") as pool:
+        yield pool
+
+
+def _gpudirect_unavailable() -> str | None:
+    """Why this host cannot register device memory for RDMA, or None if it can."""
+    if not _highest_rate_ib_devices():
+        return "no active InfiniBand device"
+    if not gpudirect.dmabuf_selected() and not gpudirect.peermem_loaded():
+        return (
+            "nvidia_peermem is not loaded and WITH_NVIDIA_PEERMEM is not 0, so "
+            "Mooncake has no way to register GPU memory (set WITH_NVIDIA_PEERMEM=0 "
+            "to use dma-buf)"
+        )
+    return None
+
+
+@pytest.fixture
+def rdma_pool(tmp_path, monkeypatch):
+    """A pool over RDMA, or a skip on a host without GPUDirect RDMA."""
+    reason = _gpudirect_unavailable()
+    if reason is not None:
+        pytest.skip(f"GPUDirect RDMA unavailable: {reason}.")
+    with _running_pool(tmp_path, monkeypatch, protocol="rdma") as pool:
+        yield pool
+
+
 @contextlib.contextmanager
 def open_worker(
     pool,
     *,
-    buffer: torch.Tensor,
+    buffer: torch.Tensor | None = None,
+    layout: KvCacheLayout | None = None,
+    stage_through_host: bool,
     model_key: str = MODEL_KEY,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
-    """A worker holding a real store handle, with `buffer` as its KV cache.
+    """A worker holding a real store handle, over `buffer` or `layout` as its KV cache.
 
     Shut down inside the test call phase, because registering a layout starts
     the background save thread and pytest-threadleak snapshots threads around
@@ -233,12 +285,13 @@ def open_worker(
         pool=pool.pool,
         model_key=model_key,
         segment_size=WORKER_SEGMENT_SIZE,
+        stage_through_host=stage_through_host,
         run_dir=pool.run_dir,
     )
     with provision_pool(store_config, run_dir=pool.run_dir):
         worker = MooncakeStoreConnectorWorker(_llm_args(store_config))
         try:
-            worker.register_kv_cache_layout(_layout(buffer))
+            worker.register_kv_cache_layout(layout if layout is not None else _layout(buffer))
             yield worker
         finally:
             worker.shutdown()
@@ -248,19 +301,28 @@ def open_worker(
             worker_module._LOCAL_WORKER_READY.clear()
 
 
-def _page_transfers(request_id: int, page_index: int) -> list[RequestTransfers]:
+def _page_transfers(
+    request_id: int, page_index: int, group_ids: tuple[int, ...]
+) -> list[RequestTransfers]:
     """One page of every layer group, which is how a block is published."""
     return [
         RequestTransfers(
             request_id,
-            [PageTransfer(BLOCK_HASH, group_id, page_index) for group_id in range(NUM_GROUPS)],
+            [PageTransfer(BLOCK_HASH, group_id, page_index) for group_id in group_ids],
         )
     ]
 
 
-def save_page(worker: MooncakeStoreConnectorWorker, request_id: int, page_index: int) -> None:
+def save_page(
+    worker: MooncakeStoreConnectorWorker,
+    request_id: int,
+    page_index: int,
+    group_ids: tuple[int, ...] = tuple(range(NUM_GROUPS)),
+) -> None:
     """Publish a page and wait for the background save thread to drain it."""
-    worker.bind_connector_meta(MooncakeStoreMetadata(saves=_page_transfers(request_id, page_index)))
+    worker.bind_connector_meta(
+        MooncakeStoreMetadata(saves=_page_transfers(request_id, page_index, group_ids))
+    )
     worker.wait_for_save(torch.cuda.current_stream())
 
     deadline = time.monotonic() + SAVE_TIMEOUT_SECONDS
@@ -275,28 +337,38 @@ def save_page(worker: MooncakeStoreConnectorWorker, request_id: int, page_index:
     )
 
 
-def load_page(worker: MooncakeStoreConnectorWorker, request_id: int, page_index: int) -> None:
+def load_page(
+    worker: MooncakeStoreConnectorWorker,
+    request_id: int,
+    page_index: int,
+    group_ids: tuple[int, ...] = tuple(range(NUM_GROUPS)),
+) -> None:
     """Pull a page into `page_index`, as the executor does before a forward pass."""
-    # The load lands bytes outside this stream's ordering, so work the test
-    # queued against the KV buffer has to have retired first.
+    # Zero copy lands bytes by RDMA, outside this stream's ordering, so work
+    # the test queued against the KV buffer has to have retired first.
     torch.cuda.current_stream().synchronize()
-    worker.bind_connector_meta(MooncakeStoreMetadata(loads=_page_transfers(request_id, page_index)))
+    worker.bind_allocation_fence(lambda _request_ids: None)
+    worker.bind_connector_meta(
+        MooncakeStoreMetadata(loads=_page_transfers(request_id, page_index, group_ids))
+    )
     worker.start_load_kv(torch.cuda.current_stream())
     torch.cuda.current_stream().synchronize()
 
 
-def test_a_saved_page_comes_back_byte_identical(mooncake_pool):
+@pytest.mark.parametrize("stage_through_host", [False, True], ids=["zero_copy", "host_staged"])
+def test_a_saved_page_comes_back_byte_identical(mooncake_pool, stage_through_host):
     """Save a page, lose it, load it back, and compare the bytes.
 
     The buffer is zeroed between the two halves, so a load that transfers
-    nothing fails instead of passing on leftover memory. The gather and
-    scatter through pinned host slots have to leave the page as it was.
+    nothing fails instead of passing on leftover memory. Host staging adds a
+    gather and a scatter through pinned buffers, and its whole point is to be
+    indistinguishable from the zero-copy path.
     """
     buffer = _device_buffer(filled=True)
     page_index = 3
     expected = _snapshot(buffer, page_index)
 
-    with open_worker(mooncake_pool, buffer=buffer) as worker:
+    with open_worker(mooncake_pool, buffer=buffer, stage_through_host=stage_through_host) as worker:
         save_page(worker, request_id=1, page_index=page_index)
         buffer.zero_()
         load_page(worker, request_id=2, page_index=page_index)
@@ -325,11 +397,11 @@ def test_a_page_written_by_one_worker_is_read_back_by_another(mooncake_pool):
     writer_buffer = _device_buffer(filled=True)
     expected = _snapshot(writer_buffer, writer_page)
 
-    with open_worker(mooncake_pool, buffer=writer_buffer) as writer:
+    with open_worker(mooncake_pool, buffer=writer_buffer, stage_through_host=True) as writer:
         save_page(writer, request_id=1, page_index=writer_page)
 
     reader_buffer = _device_buffer(filled=False)
-    with open_worker(mooncake_pool, buffer=reader_buffer) as reader:
+    with open_worker(mooncake_pool, buffer=reader_buffer, stage_through_host=True) as reader:
         assert reader.count_prefix_hit([BLOCK_HASH]) == 1, (
             "The second worker did not find the block the first one published, so "
             "nothing written by a previous engine would ever be reused."
@@ -357,7 +429,7 @@ def test_a_prefix_counts_only_once_every_rank_has_its_shard(mooncake_pool, monke
     monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 2)
 
     buffer = _device_buffer(filled=True)
-    with open_worker(mooncake_pool, buffer=buffer) as rank_zero:
+    with open_worker(mooncake_pool, buffer=buffer, stage_through_host=True) as rank_zero:
         save_page(rank_zero, request_id=1, page_index=0)
         assert rank_zero.count_prefix_hit([BLOCK_HASH]) == 0, (
             "A block with only rank 0's shard in the pool was offered for reuse. "
@@ -365,7 +437,7 @@ def test_a_prefix_counts_only_once_every_rank_has_its_shard(mooncake_pool, monke
         )
 
     monkeypatch.setattr(worker_module, "mpi_rank", lambda: 1)
-    with open_worker(mooncake_pool, buffer=buffer) as rank_one:
+    with open_worker(mooncake_pool, buffer=buffer, stage_through_host=True) as rank_one:
         save_page(rank_one, request_id=2, page_index=0)
         assert rank_one.count_prefix_hit([BLOCK_HASH]) == 1, (
             "Both ranks' shards are in the pool and the block was still not "
@@ -384,17 +456,121 @@ def test_a_different_model_key_shares_nothing(mooncake_pool):
     rather than a page the pool lost: the `model-a` hit would fail first.
     """
     buffer = _device_buffer(filled=True)
-    with open_worker(mooncake_pool, buffer=buffer, model_key="model-a") as writer:
+    with open_worker(
+        mooncake_pool, buffer=buffer, stage_through_host=True, model_key="model-a"
+    ) as writer:
         save_page(writer, request_id=1, page_index=0)
 
     other_buffer = _device_buffer(filled=False)
-    with open_worker(mooncake_pool, buffer=other_buffer, model_key="model-b") as reader:
+    with open_worker(
+        mooncake_pool, buffer=other_buffer, stage_through_host=True, model_key="model-b"
+    ) as reader:
         assert reader.count_prefix_hit([BLOCK_HASH]) == 0, (
             "A block saved under one model key was offered to a different model."
         )
 
-    with open_worker(mooncake_pool, buffer=other_buffer, model_key="model-a") as same_model:
+    with open_worker(
+        mooncake_pool, buffer=other_buffer, stage_through_host=True, model_key="model-a"
+    ) as same_model:
         assert same_model.count_prefix_hit([BLOCK_HASH]) == 1, (
             "The block is gone from the pool under the key it was saved with, "
             "so the miss asserted above says nothing about model keys."
+        )
+
+
+# ---- RDMA over a real KVCacheManagerV2 ----
+
+
+@contextlib.contextmanager
+def _v2_cache_manager() -> Iterator[KVCacheManagerV2]:
+    """A cache whose pools span several `cuMemCreate` allocations.
+
+    About 16 MiB of KV, mapped in 2 MiB allocations at this quota.
+    """
+    manager = KVCacheManagerV2(
+        kv_cache_config=KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=4,
+        num_kv_heads=4,
+        head_dim=128,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=256,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+        vocab_size=32000,
+    )
+    try:
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def _page_crossing_an_allocation(layout: KvCacheLayout, addressing: PageAddressing) -> int:
+    """A page whose bytes the connector must split, or page 0 if none needs it."""
+    num_slots = min(region.num_slots for group in layout.groups for region in group.regions)
+    for page_index in range(num_slots):
+        for group in layout.groups:
+            addresses, _ = addressing.buffers(group.layer_group_id, page_index)
+            if len(addresses) > len(group.regions):
+                return page_index
+    return 0
+
+
+def test_a_real_v2_cache_registers_per_allocation_and_round_trips_over_rdma(rdma_pool):
+    """The zero-copy path over the VMM memory a V2 cache really allocates.
+
+    A plain torch tensor is one allocation, so it cannot show a registration
+    crossing allocation boundaries.
+    """
+    with _v2_cache_manager() as manager:
+        layout = build_kv_cache_layout_v2(manager)
+        if not gpudirect.dmabuf_selected():
+            first_region = layout.groups[0].regions[0]
+            facts = gpudirect.describe_range(first_region.base, first_region.size)
+            if facts.gdr_capable is False:
+                pytest.skip(
+                    "The V2 allocator fell back to memory without "
+                    "gpuDirectRDMACapable, which nvidia_peermem cannot register; "
+                    "set WITH_NVIDIA_PEERMEM=0 to test the dma-buf path."
+                )
+
+        group_ids = tuple(group.layer_group_id for group in layout.groups)
+        regions = [region for group in layout.groups for region in group.regions]
+        with open_worker(
+            rdma_pool, layout=layout, stage_through_host=False, model_key="v2-rdma"
+        ) as worker:
+            registered = list(worker._registered_ranges)
+            assert len(registered) > 1, (
+                "The cache's pools were registered as a single range, so the "
+                "allocation walk found no boundary to cut at."
+            )
+            for start, end in registered:
+                allocation = gpudirect.allocation_range(start)
+                assert allocation is not None
+                base, size = allocation
+                assert end <= base + size, (
+                    f"[{start:#x}, {end:#x}) runs past its cuMemCreate allocation "
+                    f"[{base:#x}, {base + size:#x}), which GPUDirect cannot register."
+                )
+
+            page_index = _page_crossing_an_allocation(layout, worker._addressing)
+            for region in regions:
+                page = region.slot_tensor(page_index)
+                page.copy_(torch.randint(0, 256, page.shape, dtype=torch.uint8, device="cuda"))
+            expected = [region.slot_tensor(page_index).clone() for region in regions]
+
+            save_page(worker, request_id=1, page_index=page_index, group_ids=group_ids)
+            for region in regions:
+                region.slot_tensor(page_index).zero_()
+            load_page(worker, request_id=2, page_index=page_index, group_ids=group_ids)
+
+            for region, want in zip(regions, expected):
+                assert torch.equal(region.slot_tensor(page_index), want), (
+                    f"Page {page_index} of the region at {region.base:#x} came back "
+                    "changed after an RDMA round trip through the pool."
+                )
+        assert not worker._registered_ranges, (
+            "Shutdown left KV pool registrations behind over memory the cache "
+            "manager is about to free."
         )

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -14,7 +14,14 @@
 # the License.
 
 if(${BUILD_PYT})
-  add_gtest(thUtilsTest thUtilsTest.cpp)
+  add_tllm_gtest(
+    thUtilsTest
+    SOURCES
+    thUtilsTest.cpp
+    eagerMoeWorkspaceTest.cpp
+    FULL_STACK
+    LABELS
+    "unit;full-stack;gpu")
   target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
                                            ${TORCH_LIBRARIES})
 endif()

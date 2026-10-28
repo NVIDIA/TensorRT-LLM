@@ -64,7 +64,6 @@ worker_config:
         num_slots: 416
         layer_updates_per_iter: 1
     cache_transceiver_config:
-      max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
@@ -94,7 +93,6 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false

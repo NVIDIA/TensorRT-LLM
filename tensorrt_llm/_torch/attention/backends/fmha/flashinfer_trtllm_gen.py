@@ -369,6 +369,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     MAX_HEADS_RATIO_GENERATION = 32
     MIN_TOKENS_PER_BLOCK = 8
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
+    # SMs on which this library serves only a KV cache manager's extra page
+    # sizes (``trtllm_gen_extra_tokens_per_block``); every other request there
+    # stays on the fallback FMHA.
+    EXTRA_PAGE_SIZES_ONLY_SMS = frozenset({107})
     # FlashInfer narrows key_cache.size(0) to int before constructing its TMA descriptor.
     MAX_NUM_PAGES_IN_MEM_POOL = (1 << 31) - 1
     SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
@@ -407,13 +411,19 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False
 
         sm = get_sm_version()
-        if sm not in (100, 103):
+        if sm not in (100, 103, 107):
             logger.debug(
-                f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: "
+                f"requires SM100, SM103 or SM107, got SM{sm}."
             )
             return False
 
         return True
+
+    @classmethod
+    def serves_only_extra_page_sizes(cls) -> bool:
+        """Whether this device uses the library only for a KV cache manager's extra page sizes."""
+        return get_sm_version() in cls.EXTRA_PAGE_SIZES_ONLY_SMS
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -487,6 +497,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        num_heads: int,
         tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
@@ -523,6 +534,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        # FlashInfer's TRTLLM-Gen MLA decode does not support 64 < H < 128.
+        # Let selection fall through to the legacy TRTLLM-Gen backend.
+        if 64 < num_heads < 128:
+            return (
+                False,
+                "[Generation][MLA] FlashInfer TRTLLM-GEN backend is disabled "
+                f"for num_heads={num_heads} (64 < num_heads < 128) "
+                "as it may select unsupported kernels.",
             )
 
         if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
@@ -727,7 +748,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 if AttentionMaskType(fwd.mask_type) == AttentionMaskType.custom_mask:
                     return False, "[Context] custom mask."
             except ValueError:
-                return False, f"[Context] invalid mask_type: {fwd.mask_type}."
+                return False, f"[Context] unsupported attention mask: {fwd.attention_mask!r}."
             if has_alibi:
                 return False, "[Context] ALiBi."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_CONTEXT:
@@ -766,6 +787,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    num_heads=attn.num_heads,
                     tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
@@ -778,12 +800,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if tokens_per_block & (tokens_per_block - 1) != 0:
             return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
         # A KV cache manager may allow extra page sizes, e.g. MiniMax-M3 adds 128.
-        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | set(
+        extra_tokens_per_block = frozenset(
             getattr(meta.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
         )
+        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | extra_tokens_per_block
         if tokens_per_block not in supported_tokens_per_block:
             supported = sorted(supported_tokens_per_block)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
+        # On SM107 this library serves only the extra page sizes, which the
+        # fallback thop FMHA has no paged-context kernels for. Every other SM107
+        # request stays on the fallback.
+        if self.serves_only_extra_page_sizes() and tokens_per_block not in extra_tokens_per_block:
+            return False, (
+                f"tokens_per_block ({tokens_per_block}) on SM107, which uses this library "
+                "only for the KV cache manager's extra page sizes."
+            )
 
         return True, ""
 

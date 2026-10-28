@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/staticHostMem.h"
 
 #include <cstdint>
 #include <list>
@@ -111,7 +112,7 @@ private:
 
     struct Upload
     {
-        std::unique_ptr<HostMem> staging;
+        std::unique_ptr<StaticHostMem> staging;
         CachedCudaEvent completion = CachedCudaEvent::makeNull();
     };
 

@@ -57,7 +57,7 @@ class DSAParams(SparseParams):
     indexer_max_chunk_size: Optional[int] = None
     skip_indexer_for_short_seqs: bool = True
     use_cute_dsl_topk: bool = False
-    use_cute_dsl_paged_mqa_logits: bool = False
+    use_cute_dsl_paged_mqa_logits: bool = True
     q_split_threshold: int = 8192
     indexer_rope_interleave: bool = False
     enable_heuristic_topk: bool = False

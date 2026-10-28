@@ -1,0 +1,148 @@
+# Controlled vocabulary for instability-case frontmatter.
+#
+# Case frontmatter fields MUST use canonical terms from this file only.
+# Synonyms live in aliases.yaml and are for QUERY-TIME normalization —
+# never write a synonym into frontmatter. Check by hand when adding a case.
+#
+# Extend by adding a term here first (one term, one meaning); do not invent
+# terms inline in a case file.
+
+# WHERE the defect lived — the module the fix landed in. Single-valued, and
+# it MUST equal the case file's parent directory name under references/.
+# This is the primary index: `references/<module>/<slug>.md`.
+#
+# Tie-break when a case could sit in two modules: file it under the module
+# the FIX landed in, not the one that showed the symptom. A missing FMHA
+# warmup grid is fixed by editing the warmup enumeration -> jit-and-warmup;
+# a slow FMHA dispatcher is fixed in the dispatcher -> attention-fmha.
+# Cross-cutting queries are served by `subsystems:` (multi-valued), e.g.
+# `grep -l attention-kernel references/*/*.md`.
+#
+# The same 18 terms are used by both cookbooks, so a module query works
+# across them; see data/modules.yaml for what each module covers. Only five
+# of the 18 hold instability cases today — the rest are listed so filing the
+# first case in one needs no vocabulary change.
+module:
+  - attention-fmha
+  - kernel-fusion
+  - jit-and-warmup
+  - cuda-graph-and-compile
+  - moe
+  - gemm-and-quantization
+  - autotuner
+  - communication
+  - kv-cache-manager
+  - kv-cache-transceiver
+  - disagg-orchestrator
+  - scheduler-and-executor
+  - sampler
+  - spec-decode
+  - tokenization
+  - model-definition
+  - runtime-and-serving
+  - measurement-and-test
+
+# HOW it broke, coarse — the mechanism family. Retained as a label only: it
+# no longer names a directory (`module:` does). Kept because it groups the
+# `instability_class` values below, and because patterns.yaml is indexed by it.
+family:
+  - warmup-and-jit
+  - communication-negotiation
+  - runtime-determinism
+  - measurement-determinism
+
+# How-it-broke classes — the cookbook's primary axis. An instability case
+# lists 1–2. These are failure modes, not bottleneck classes: the same
+# first-iter spike can arise from warmup-gap OR from cache-key-over-specific.
+instability_class:
+  - warmup-gap                       # a mode / shape / path was left uncompiled and JIT lands at runtime
+  - warmup-path-mismatch             # warmup ran but a served path invalidates the compiled graph (image=None vs =..., cached-kv vs no-cache)
+  - warmup-sizing-tradeoff           # warmup token-count / batch cap either OOMs (too large) or drops coverage (too small)
+  - warmup-cache-key-over-specific   # warmup cache-key includes dimensions that don't affect the compiled artifact
+  - cold-start-imbalance             # first N requests skewed to one rank/worker until the shared prefix is cached everywhere
+  - opportunistic-collective-fallback # a fast collective (NCCL_SYMMETRIC, MNNVL) silently falls back when a corner case fires
+  - platform-conditional-disable     # a NCCL / kernel path must be disabled on a specific platform bug
+  - gc-driven-collective-destruction # __del__ on a communicator runs a collective; non-deterministic GC across ranks hangs
+  - gc-pause-on-decode-path          # a host-side GC / finalizer pause lands in the decode loop because its tuning knob is absent or defaulted off
+  - active-vs-max-batch-stride       # decoder / sampler tensor sliced to active batch but stride assumes max batch
+  - metric-with-hidden-rng           # a perf metric depends on an RNG (spec-decode acceptance) with no way to pin it
+  - cross-node-log-flush-race        # parser reads a log written on another node; log lines still flushing across NFS
+  - process-lifetime-cache-binds-env # @cache / lru_cache captures an env value at first call, ignoring later changes
+
+# Observable variance signals — how the instability class shows up in a
+# profile / log / metric. A case lists 2–5.
+signals:
+  - first-iter-spike                 # iter 0 (or first-N) latency dramatically higher than steady state
+  - midrun-stall                     # sporadic long iteration (JIT/compile/alloc mid-run)
+  - rep-to-rep-variance              # same test/commit/HW → different numbers each rep
+  - cross-rank-hang                  # one or more ranks stuck in a collective / barrier while peers proceed
+  - non-deterministic-log-probs      # log_probs / logits vary across otherwise-identical runs
+  - eager-fallback-in-log            # log shows fast path silently downgraded to slow variant
+  - oom-in-warmup                    # warmup pass OOMs / illegal-memory-accesses at a shape live traffic wouldn't have hit
+  - autotuner-cache-miss-during-capture # autotuner fires JIT while inside a CUDA-graph capture region
+  - perf-ci-bar-flake                # perf-sanity/perf-CI bar tripped intermittently, not monotonically
+  - startup-time-increase            # warmup / autotune duration inflated by a coverage widening
+  - acceptance-length-drift          # spec-decode acceptance-rate varies rep-to-rep on identical config
+  - segfault-on-load                 # process crash at collective library init when versions mismatch
+  - test-parser-missing-line         # perf-test parser returns None because expected log line never arrived
+  - platform-specific-failure        # identical job passes on one SKU / platform class and hangs or miscomputes on another
+  - silent-noop-test                 # test passes trivially: its mock / assertion never fires, so it validates nothing
+  - directory-sweep-only             # only reproduces in a directory-level pytest run; outcome depends on test ordering in the process
+
+# Which code the fix touched — 1–3 terms, from the diff's file paths. This is
+# the CROSS-CUTTING axis: `module:` is single-valued and names the directory,
+# so a case that spans two subsystems records both here.
+#
+# This list is identical in both cookbooks (they had drifted apart, which made
+# a cross-cookbook subsystem query unanswerable). Terms one cookbook has never
+# used yet are still listed, so neither side has to extend the vocabulary to
+# file a case.
+subsystems:
+  - attention-kernel
+  - fmha-kernel
+  - mla-attention
+  - dsa-attention
+  - moe
+  - gemm-kernel
+  - sampler
+  - tokenizer
+  - kv-cache
+  - memory-allocator
+  - cuda-graph
+  - scheduler-executor
+  - model-engine
+  - spec-decode
+  - communication
+  - disagg-serve
+  - adp-router
+  - autotuner
+  - model-definition
+  - runtime-python
+  - runtime-cpp
+  - serve-endpoint
+  - visual-gen-pipeline
+  - perf-test-config
+  - perf-test-harness
+  - unit-test-infra
+  - build-dependency
+
+# How the instability got introduced (when identifiable from the fix PR).
+introduced_via:
+  - new-feature                # feature shipped without warmup / with too-narrow warmup
+  - incomplete-coverage        # warmup / autotuner shipped but missed a path/dtype/arch/shape/mode
+  - prior-fix-side-effect      # an earlier fix's cap / opportunistic path introduced the instability
+  - dep-bump                   # a dependency's JIT / kernel-selection changed
+  - refactor                   # code motion broke a warmup invariant / cache-key assumption
+  - kernel-change              # a new kernel added JIT that runtime hits
+  - preexisting                # never was stable; instability filed against as-shipped behavior
+  - unknown                    # the fix PR does not identify the cause
+
+phase:
+  - prefill
+  - decode
+  - warmup
+  - any-phase
+
+maturity:
+  - stub
+  - full

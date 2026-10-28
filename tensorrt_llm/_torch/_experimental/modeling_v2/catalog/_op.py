@@ -24,10 +24,12 @@ stops holding stops the build. How close the two have to be is the test's
 business, not the entry's: nothing on the way to the kernel needs it.
 
 `CELLS` is also the answer to "can my model use this op?". A target author
-reads the cell list and its reasons, not a document -- and what they read is
-what CI proved on the last commit. Cells cover what the shipped targets
-actually run; an input outside them is not known to work, which for most of
-these ops means "nobody measured it" rather than "known broken".
+reads the cell lists and their reasons, not a document -- and what they read is
+what CI proved on the last commit. An entry's own `CELLS` are the
+configurations that belong to the op whoever calls it; the shapes a shipped
+target runs are in the entry's test, as `TARGET_CELLS` keyed by target, and
+the test drives both. An input outside them is not known to work, which for most
+of these ops means "nobody measured it" rather than "known broken".
 
 `is_valid` is never called on the way to the kernel. It states, in executable
 form, the inputs the op accepts and quietly answers wrongly -- the class of
@@ -87,7 +89,9 @@ class Arch(str, enum.Enum):
     architecture is one edit that every entry's declaration is checked against.
     """
 
+    SM_100 = "sm_100"
     SM_103 = "sm_103"
+    SM_107 = "sm_107"
 
 
 @dataclass(frozen=True)
@@ -97,8 +101,8 @@ class Cell:
     `spec` is entry-specific: the entry's test knows how to turn it into
     tensors, and nothing here interprets it. That keeps environment building --
     a KV-cache manager, a 4-rank communicator -- in the test where it belongs,
-    while the *set of configurations* stays with the op, which is what a target
-    author needs to read.
+    while the *set of configurations* stays with the op and the targets that
+    call it, which is what a target author needs to read.
 
     `why` is not decoration. A cell that cannot say what it covers beyond the
     ones already listed is a cell that costs CI time for nothing.

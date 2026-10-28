@@ -1745,6 +1745,52 @@ def test_post_tune_merge_tactics_single_rank_noop():
     assert tuner.profiling_cache.cache == original
 
 
+@pytest.mark.parametrize("tp_size,cp_size", [(1, 4), (2, 2)])
+def test_parallel_tactics_split_across_helix_cp_ranks(tp_size, cp_size):
+    """Helix CP ranks share the PARALLEL tactic sweep with the TP ranks."""
+    from tensorrt_llm.mapping import CpType
+
+    world_size = tp_size * cp_size
+    tactics = list(range(11))
+    shares = []
+    for rank in range(world_size):
+        tuner = autotuner.AutoTuner()
+        mapping = Mapping(world_size=world_size,
+                          rank=rank,
+                          tp_size=tp_size,
+                          cp_size=cp_size,
+                          cp_config={"cp_type": CpType.HELIX})
+        tuner.setup_distributed_state(mapping, dist=object())
+        assert tuner._is_distributed()
+        assert tuner._tuning_group() == (world_size, rank)
+        shares.append(
+            tuner._maybe_parallelize_tactics(
+                tactics, DistributedTuningStrategy.PARALLEL))
+        assert tuner._maybe_parallelize_tactics(
+            tactics, DistributedTuningStrategy.MERGE) == tactics
+
+    # Every tactic is tuned on exactly one rank.
+    assert sorted(t for share in shares for t in share) == tactics
+
+
+def test_parallel_tactics_split_skips_non_helix_cp_ranks():
+    """Non-Helix CP keeps the TP-only tuning group."""
+    from tensorrt_llm.mapping import CpType
+
+    tuner = autotuner.AutoTuner()
+    mapping = Mapping(world_size=4,
+                      rank=3,
+                      tp_size=1,
+                      cp_size=4,
+                      cp_config={"cp_type": CpType.ULYSSES})
+    tuner.setup_distributed_state(mapping, dist=object())
+    assert tuner._tuning_group() == (1, 0)
+    assert not tuner._is_distributed()
+    tactics = list(range(5))
+    assert tuner._maybe_parallelize_tactics(
+        tactics, DistributedTuningStrategy.PARALLEL) == tactics
+
+
 def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
     # An enum tactic must survive save -> load: repr("<Enum.X: v>") isn't
     # ast.literal_eval-parsable, so the cache serializes tactic.value instead.

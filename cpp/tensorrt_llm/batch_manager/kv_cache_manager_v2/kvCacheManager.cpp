@@ -125,7 +125,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     StorageConfig storageConfig = createStorageConfig(mConfig);
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
-        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
+        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority);
 
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();
@@ -187,7 +187,8 @@ void KvCacheManager::clearReusableBlocks()
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly, bool enableRequestStats)
+    std::optional<bool> textOnly, bool enableRequestStats,
+    std::optional<executor::KvCacheRetentionConfig> retentionConfig)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
@@ -211,7 +212,27 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats);
+        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
+}
+
+void KvCacheManager::refreshRetention()
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    mStorage->refreshRetention();
+}
+
+bool KvCacheManager::prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens, CacheLevel target, bool knownNoDigest)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (target < kHotLevel || target >= mStorage->numCacheLevels())
+        throw std::out_of_range("Prefetch target is outside the configured cache tiers");
+    auto reuseMatch = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::nullopt,
+        KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);
+    auto close = FuncGuard([&cache]() { cache->close(); });
+    return cache->prefetch(target);
 }
 
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
@@ -601,6 +622,26 @@ ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksB
     return byLifeCycle;
 }
 
+void KvCacheManager::commitConnectorReusedBlocks(ConnectorReusedBlocksByLifeCycle const& byLifeCycle)
+{
+    for (auto const& [lifeCycle, numBlocks] : byLifeCycle)
+    {
+        TLLM_CHECK_DEBUG(numBlocks >= 0);
+        if (numBlocks != 0)
+        {
+            mIterConnectorReusedBlocks[lifeCycle] += numBlocks;
+        }
+    }
+}
+
+ConnectorReusedBlocksByLifeCycle KvCacheManager::getAndResetIterationConnectorReusedBlocks()
+{
+    auto const apiLock = lockExclusive();
+    ConnectorReusedBlocksByLifeCycle byLifeCycle;
+    byLifeCycle.swap(mIterConnectorReusedBlocks);
+    return byLifeCycle;
+}
+
 void KvCacheManager::recordRequestSuspended()
 {
     auto const apiLock = lockExclusive();
@@ -655,6 +696,24 @@ CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
     CountsByLevel counts;
     std::swap(counts, mIterCachedTokensByLevel);
     return counts;
+}
+
+void KvCacheManager::commitConnectorCachedTokens(int64_t numTokens)
+{
+    TLLM_CHECK_DEBUG(numTokens >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterConnectorCachedTokens += numTokens;
+}
+
+int64_t KvCacheManager::getAndResetIterationConnectorCachedTokens()
+{
+    auto const apiLock = lockExclusive();
+    auto const numTokens = mIterConnectorCachedTokens;
+    mIterConnectorCachedTokens = 0;
+    return numTokens;
 }
 
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()

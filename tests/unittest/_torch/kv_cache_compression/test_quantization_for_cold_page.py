@@ -70,6 +70,8 @@ def _factory_model_engine(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         mapping=SimpleNamespace(has_cp_helix=lambda: helix),
+        cuda_graph_batch_sizes=[],
+        cuda_graph_padding_enabled=False,
         spec_config=None,
         model=SimpleNamespace(
             model_config=SimpleNamespace(
@@ -1331,7 +1333,6 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
             kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
         )
         creator._model_engine = _factory_model_engine(active_kv_quant=active_kv_quant)
-        creator._draft_model_engine = None
         creator._kv_connector_manager = None
         creator._fp8_ctx_mla_kv_len_cap = None
         creator._is_encoder_decoder = MagicMock(return_value=False)

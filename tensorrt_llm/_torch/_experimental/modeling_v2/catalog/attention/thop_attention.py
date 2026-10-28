@@ -26,12 +26,16 @@ STANDARD, MLA_CONTEXT, MLA_GENERATION = 0, 1, 2
 #: quant_mode bit for an fp8 KV cache.
 QM_FP8_KV_CACHE = 128
 
+#: quant_mode bit for an NVFP4 KV cache: e2m1 values in the pool, one e4m3 scale
+#: per 16 values in a second pool, fp32 [3] kv scales (q, K, V).
+QM_NVFP4_KV_CACHE = 8192
+
 #: qwen4_exp's full-attention layer -- the twelve trunk layers and the MTP
 #: module alike: packed-QKV causal GQA over a bf16 pool, rope applied outside,
 #: the paged-context path on (the target serves with block reuse and chunked
 #: prefill). Pool sizes are chosen, not dumped: 128 pages of 32 tokens and 4
 #: block-offset rows, larger than any cell's batch.
-_QWEN4_DENSE = dict(
+QWEN4_DENSE = dict(
     input_type=STANDARD,
     num_heads=24,
     num_kv_heads=2,
@@ -50,7 +54,7 @@ _QWEN4_DENSE = dict(
 #: qwen4_exp's vision tower: the no-KV-cache mode, one context sequence per
 #: frame, MHA 16/16 at head_size 72 (hidden 1152 over 16 heads), padding mask.
 #: `max_num_requests` is the segment count, as the target passes it.
-_QWEN4_VISION = dict(
+QWEN4_VISION = dict(
     input_type=STANDARD,
     kv_cache="none",
     num_heads=16,
@@ -64,7 +68,7 @@ _QWEN4_VISION = dict(
 )
 
 #: A GQA 24/4/256 full-attention layer (Qwen3.8-27B) over an fp8-e4m3 pool at
-#: the production kv scale 1.0. Same chosen pool sizes as `_QWEN4_DENSE`.
+#: the production kv scale 1.0. Same chosen pool sizes as `QWEN4_DENSE`.
 _FP8_24_4_256 = dict(
     input_type=STANDARD,
     num_heads=24,
@@ -90,156 +94,28 @@ class ThopAttention(OpWrapper):
     it, by different paths: gpt-oss on the standard path with attention sinks
     and an alternating sliding window, deepseek on MLA's two phases, and
     qwen4_exp on the standard path twice over -- its full-attention layers and
-    MTP module (GQA 24/2/256, a P-token draft block per generation sequence,
-    a two-pool hybrid mapping), and its vision tower with no KV cache at all.
+    MTP module (GQA 24/2/256 over a bf16 or an fp8-e4m3 pool, a P-token draft
+    block per generation sequence, a two-pool hybrid mapping), and its vision
+    tower with no KV cache at all.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
     without allocating.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # gpt-oss alternates its two window classes inside one engine, so both of
-    # its cells are live every step; deepseek runs context and generation
-    # against the same pool. qwen4_exp's cells give `cached` (tokens already in
-    # the pool) and `new` (this call's q rows) per sequence, contexts first.
+    # The shipped targets' cells are in this entry's test. gpt-oss alternates its
+    # two window classes inside one engine, so both of its cells are live every
+    # step; deepseek runs context and generation against the same pool. Cells
+    # with `cached` (tokens already in the pool) and `new` (this call's q rows)
+    # give them per sequence, contexts first.
     CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
-            spec=dict(
-                input_type=STANDARD,
-                num_heads=64,
-                num_kv_heads=8,
-                head_size=64,
-                v_head_dim=64,
-                sinks=True,
-                window=128,
-                quant_mode=0,
-            ),
-        ),
-        Cell(
-            why="gpt-oss full layer: the same heads with no window",
-            spec=dict(
-                input_type=STANDARD,
-                num_heads=64,
-                num_kv_heads=8,
-                head_size=64,
-                v_head_dim=64,
-                sinks=True,
-                window=None,
-                quant_mode=0,
-            ),
-        ),
-        Cell(
-            why="deepseek MLA context: explicit k/v, qk 576 -> v 128, fp8 pool",
-            spec=dict(
-                input_type=MLA_CONTEXT,
-                num_heads=128,
-                num_kv_heads=128,
-                head_size=576,
-                v_head_dim=128,
-                sinks=False,
-                window=None,
-                quant_mode=QM_FP8_KV_CACHE,
-            ),
-        ),
-        Cell(
-            why="deepseek MLA generation: one kv head, latent 576 -> 512, fp8 pool",
-            spec=dict(
-                input_type=MLA_GENERATION,
-                num_heads=128,
-                num_kv_heads=1,
-                head_size=576,
-                v_head_dim=512,
-                sinks=False,
-                window=None,
-                quant_mode=QM_FP8_KV_CACHE,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp prefill: GQA 24q/2kv d256, bf16 pool, paged context; "
-            "a fresh 70-row sequence beside 33 rows over a 48-token cached prefix",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(0, 48),
-                new=(70, 33),
-                num_contexts=2,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp decode P=1: one row per generation sequence over "
-            "page-crossing histories (70, 35)",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(70, 35),
-                new=(1, 1),
-                num_contexts=0,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp MTP verify P=2 (max_draft_len 1): draft row t attends "
-            "[0, L-P+t], bottom-right causal within the block",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(70, 35),
-                new=(2, 2),
-                num_contexts=0,
-                predicted_tokens_per_seq=2,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp MTP verify P=3 (max_draft_len 2): a separate decode "
-            "compile, P reaches the kernel as maxSeqLenQ",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(70, 35),
-                new=(3, 3),
-                num_contexts=0,
-                predicted_tokens_per_seq=3,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp MTP verify P=4 (max_draft_len 3): the target's ceiling",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(70, 35),
-                new=(4, 4),
-                num_contexts=0,
-                predicted_tokens_per_seq=4,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp mixed step: a fresh 20-row context ahead of two P=2 "
-            "draft blocks, generation rows token-major after the context rows",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(0, 70, 35),
-                new=(20, 2, 2),
-                num_contexts=1,
-                predicted_tokens_per_seq=2,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp hybrid pool: row 47 of the 48-row two-pool mapping "
-            "(pool 0, layer-in-pool 11), P=2 verify",
-            spec=dict(
-                _QWEN4_DENSE,
-                pool_layout="hybrid48",
-                local_layer_idx=47,
-                cached=(64, 25),
-                new=(2, 2),
-                num_contexts=0,
-                predicted_tokens_per_seq=2,
-            ),
-        ),
         Cell(
             why="48-layer single pool, identity mapping: row 47 = layer-in-pool 47, "
             "24 rows over a 40-token cached prefix",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 pool_layout="identity48",
                 local_layer_idx=47,
                 cached=(40,),
@@ -249,52 +125,40 @@ class ThopAttention(OpWrapper):
             ),
         ),
         Cell(
-            why="qwen4_exp vision tower: no KV cache, MHA 16/16 d72, padding mask, "
-            "frames of 27/9/41 rows each attending only to itself",
-            spec=dict(_QWEN4_VISION, seg_lens=(27, 9, 41)),
-        ),
-        Cell(
             why="encoder-only, d72 causal: measured, not what the tower passes",
-            spec=dict(_QWEN4_VISION, mask_type=1, seg_lens=(27, 9, 41)),
+            spec=dict(QWEN4_VISION, mask_type=1, seg_lens=(27, 9, 41)),
         ),
         Cell(
             why="encoder-only, d128 padding: the tower's other admitted width",
-            spec=dict(_QWEN4_VISION, head_size=128, v_head_dim=128, seg_lens=(27, 9, 41)),
+            spec=dict(QWEN4_VISION, head_size=128, v_head_dim=128, seg_lens=(27, 9, 41)),
         ),
         Cell(
             why="encoder-only, d128 causal",
             spec=dict(
-                _QWEN4_VISION, head_size=128, v_head_dim=128, mask_type=1, seg_lens=(27, 9, 41)
+                QWEN4_VISION, head_size=128, v_head_dim=128, mask_type=1, seg_lens=(27, 9, 41)
             ),
         ),
         Cell(
             why="encoder-only, a single one-token frame",
-            spec=dict(_QWEN4_VISION, seg_lens=(1,)),
+            spec=dict(QWEN4_VISION, seg_lens=(1,)),
+        ),
+        # A vision-tower call is one frame per frame group, at most 32768 rows per call.
+        Cell(
+            why="video: 384 frame groups of 64 rows (8x8 patches), the untiled "
+            "kernel's longest frame",
+            spec=dict(QWEN4_VISION, seg_lens=(64,) * 384),
         ),
         Cell(
-            why="mmmu serving shape: one 5580-row frame, the 62x90 patch grid",
-            spec=dict(_QWEN4_VISION, seg_lens=(5580,)),
+            why="video: 256 frame groups of 128 rows, the 32768-row ceiling",
+            spec=dict(QWEN4_VISION, seg_lens=(128,) * 256),
         ),
         Cell(
-            why="mmmu serving shape: one 8160-row frame, the largest single-segment call",
-            spec=dict(_QWEN4_VISION, seg_lens=(8160,)),
+            why="video: 2 frame groups of 16384 rows (128x128), the longest frame at the ceiling",
+            spec=dict(QWEN4_VISION, seg_lens=(16384, 16384)),
         ),
         Cell(
-            why="mmmu serving shape: 2204 rows in four frames",
-            spec=dict(_QWEN4_VISION, seg_lens=(728, 728, 460, 288)),
-        ),
-        Cell(
-            why="mmmu serving shape: 1892 rows in five frames, the most segments per call",
-            spec=dict(_QWEN4_VISION, seg_lens=(480, 480, 400, 352, 180)),
-        ),
-        Cell(
-            why="mmmu serving shape: 9008 rows in two frames",
-            spec=dict(_QWEN4_VISION, seg_lens=(8000, 1008)),
-        ),
-        Cell(
-            why="mmmu serving shape: 22144 rows in two frames, the largest call; its "
-            "12544-row frame is the longest segment",
-            spec=dict(_QWEN4_VISION, seg_lens=(12544, 9600)),
+            why="video: 8192 frame groups of 2x2 patches, the most a 32768-row call can carry",
+            spec=dict(QWEN4_VISION, seg_lens=(4,) * 8192),
         ),
         Cell(
             why="fp8 pool packed prefill, GQA 24q/4kv d256: the FMHA reads the "
@@ -435,24 +299,51 @@ class ThopAttention(OpWrapper):
     `is_spec_decoding_enabled` False, which is what sm_103 passes for a linear
     draft, and mask_type 0 and 1 are bitwise identical at P > 1. Nothing checks
     q's row count against P. P reaches the decode kernel as `maxSeqLenQ`: one
-    JIT compile per P.
+    JIT compile per P. P is driven at 1..8 (max_draft_len 1..7) at 24/2/256 over
+    bf16 and fp8 pools. From P = 5 the launch picks its generation kernel by
+    batch size, so P 5..8 is also driven at 32 requests and at one batch in
+    17..20 (bf16), and P = 8 at 32 requests over the fp8 pool.
 
     No KV cache (an encoder): pass `kv_cache_block_offsets`,
     `host_kv_cache_pool_pointers` and `host_kv_cache_pool_mapping` all None,
     with `update_kv_cache=True` -- False is rejected ("KV cache update cannot
     be disabled now"). One context sequence per frame; mask_type 0 confines a
     frame to itself. `tokens_per_block` and `use_paged_context_fmha` are
-    bitwise inert there. Passing only some of the three None is unmeasured.
+    bitwise inert there. Passing only some of the three None is unmeasured. An
+    image is one frame and a video one frame per frame group; the cells run up to
+    8192 frames and 32768 rows per call at 16/16/72 under the padding mask.
+    `FusedMHARunnerV2` picks a different fmha_v2 kernel for a call whose longest
+    frame is at most 64 rows than for a longer one, so a frame's last bits can
+    move with the other frames it shares a call with, within `reference`'s band.
     head_size 72 exists in the context phase only: a generation call raises
     "unsupported head_size 72", and the process stays usable.
 
     Over an fp8-e4m3 pool the packed context path reads the bf16 q rows and
     never the pool, while `use_paged_context_fmha=True` reads the pool, so its
     operands are e4m3: the flag is output-inert over a bf16 pool only. Every
-    fp8 cell runs kv scale 1.0; at 1.5 `reference` does not reproduce the
-    kernel's probability rounding.
+    fp8 cell runs kv scale 1.0 through fp32 [1] scale tensors; at 1.5 `reference`
+    does not reproduce the kernel's probability rounding.
     quant_mode 384, 1152, 4224 and 4480 are bit-identical to 128 at 24/4/256;
-    4352 (the same bits without FP8_KV_CACHE) reads e4m3 slabs as bf16.
+    4352 (the same bits without FP8_KV_CACHE) reads e4m3 slabs as bf16. At
+    24/2/256 only 128 was driven, with KV up to 200 keys at P = 1 and up to
+    127 at P 2..8: the fp8 kernels round the softmax probabilities against a
+    per-tile max, which the row-max model of
+    `reference(e4m3_probabilities=True)` reproduces within one 128-key tile
+    and approximates up to 200 keys.
+
+    NVFP4 pool (quant_mode 8192): K and V are stored as e2m1 values, two per
+    byte (low nibble = even element), per head page `[tpb, D/2]`, with one e4m3
+    scale per 16 values in a second pool whose pointer is the third axis of
+    `host_kv_cache_pool_pointers` (`[pools, 2, 2]`: primary/secondary x
+    data/scales); K's scales are token-major per head page, V's in four-token
+    groups `[tpb/4, D/16, 4]`. The append quantizes with `kv_scale_orig_quant[1]`
+    / `[2]` as second-level scales (fp32 `[3]`, `[0]` is q's e4m3 scale). One
+    block-offset table addresses both pools, so they must hold the same pages
+    per slot. The kernels are trtllm-gen cubins with e4m3 q and e2m1 K/V and
+    exist for the paged-context path only, which needs the op to enable FP8
+    context FMHA for an FP4 KV cache. Every NVFP4 cell runs the paged-context
+    path at kv scale 1.0 and reads K and V through e4m3, so `reference` runs
+    over the NVFP4 values with `e4m3_inputs` and `e4m3_probabilities`.
 
     The sparse / skip-softmax arguments are bitwise inert in the standard
     configuration (nine off-default settings at 24/2/256): passing them does

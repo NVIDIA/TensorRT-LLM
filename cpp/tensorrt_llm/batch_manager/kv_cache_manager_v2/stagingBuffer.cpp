@@ -35,7 +35,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
-using MemoryOwner = std::variant<HostMem, CudaUniqPtr>;
+using MemoryOwner = std::variant<StaticHostMem, CudaUniqPtr>;
 
 CudaUniqPtr allocateDeviceMemory(size_t size)
 {
@@ -49,7 +49,7 @@ MemoryOwner makeMemoryOwner(size_t size, StagingBufferMemory memory)
     TLLM_CHECK_WITH_INFO(size > 0, "Staging buffer size must be non-zero");
     switch (memory)
     {
-    case StagingBufferMemory::kPinnedHost: return MemoryOwner{std::in_place_type<HostMem>, size};
+    case StagingBufferMemory::kPinnedHost: return MemoryOwner{std::in_place_type<StaticHostMem>, size};
     case StagingBufferMemory::kDevice: return MemoryOwner{std::in_place_type<CudaUniqPtr>, allocateDeviceMemory(size)};
     default: throw std::invalid_argument("StagingBufferManager received an invalid memory kind");
     }
@@ -170,7 +170,7 @@ StagingBufferManager::~StagingBufferManager() noexcept
 
 MemAddress StagingBufferManager::baseAddress() const noexcept
 {
-    if (auto const* host = std::get_if<HostMem>(&mMemoryOwner))
+    if (auto const* host = std::get_if<StaticHostMem>(&mMemoryOwner))
     {
         return host->address();
     }
@@ -179,8 +179,8 @@ MemAddress StagingBufferManager::baseAddress() const noexcept
 
 StagingBufferMemory StagingBufferManager::memory() const noexcept
 {
-    return std::holds_alternative<HostMem>(mMemoryOwner) ? StagingBufferMemory::kPinnedHost
-                                                         : StagingBufferMemory::kDevice;
+    return std::holds_alternative<StaticHostMem>(mMemoryOwner) ? StagingBufferMemory::kPinnedHost
+                                                               : StagingBufferMemory::kDevice;
 }
 
 StagingBuffer StagingBufferManager::acquire(

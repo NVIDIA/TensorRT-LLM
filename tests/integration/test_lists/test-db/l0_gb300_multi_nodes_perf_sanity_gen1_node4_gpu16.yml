@@ -14,7 +14,5 @@ l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16:
       stage: post_merge
       backend: pytorch
   tests:
-  # deepseek-r1-fp4 8k1k con4096
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-r1-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp1_ccb-NIXL] TIMEOUT (90)
   # deepseek-v4-pro-fp4 8k1k con666
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] TIMEOUT (30)
