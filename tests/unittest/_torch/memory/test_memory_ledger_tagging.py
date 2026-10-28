@@ -270,3 +270,54 @@ class TestClaimModuleMemory:
         from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory
 
         assert claim_module_memory(torch.nn.Linear(8, 8), "WEIGHTS") == 0
+
+
+class TestCaptureBuildsTagEntries:
+    """``capture()`` with tags present, which is the shipped path.
+
+    Earlier tests all passed ``entries`` explicitly and so never ran
+    ``_tag_entries``. That left a reference to a non-existent enum member
+    unexercised until a real serving run hit it, so these go through
+    ``capture()`` itself.
+    """
+
+    def test_capture_succeeds_with_tagged_memory(self, window, monkeypatch):
+        if not window:
+            pytest.skip("tagging unsupported here")
+        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
+
+        from tensorrt_llm._torch.memory.ledger import capture, render_capture
+        from tensorrt_llm._torch.memory.ledger.tagging import set_frozen_map
+
+        with tag("WEIGHTS"):
+            weights = torch.empty(32 * MB, dtype=torch.uint8, device="cuda")
+        try:
+            set_frozen_map(freeze_tag_map())
+            result = capture(tag="test", rank=0)
+            assert result is not None
+            # Rendering exercises every field each entry declares.
+            assert "weights" in render_capture(result)
+        finally:
+            set_frozen_map(TagSnapshot(supported=False))
+            del weights
+
+    def test_tag_entries_use_a_real_placement(self, window, monkeypatch):
+        if not window:
+            pytest.skip("tagging unsupported here")
+        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
+
+        from tensorrt_llm._torch.memory.ledger import _tag_entries
+        from tensorrt_llm._torch.memory.ledger.schema import Placement
+        from tensorrt_llm._torch.memory.ledger.tagging import set_frozen_map
+
+        with tag("WEIGHTS"):
+            weights = torch.empty(16 * MB, dtype=torch.uint8, device="cuda")
+        try:
+            set_frozen_map(freeze_tag_map())
+            entries = _tag_entries()
+            assert entries, "a tagged allocation must produce an entry"
+            for entry in entries:
+                assert isinstance(entry.placement, Placement)
+        finally:
+            set_frozen_map(TagSnapshot(supported=False))
+            del weights

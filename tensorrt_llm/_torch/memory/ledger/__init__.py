@@ -168,7 +168,7 @@ def _tag_entries() -> list[Entry]:
                 category=_TAG_CATEGORIES.get(label, Category.TAGGED_OTHER),
                 size_bytes=size,
                 source=Source.TAG,
-                placement=Placement.TORCH,
+                placement=Placement.TORCH_DEFAULT,
                 basis=Basis.LOGICAL,
                 owner=label,
             )
