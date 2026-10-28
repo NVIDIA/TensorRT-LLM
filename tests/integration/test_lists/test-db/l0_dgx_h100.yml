@@ -37,6 +37,7 @@ l0_dgx_h100:
   - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks
   - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_prefix_reuse_across_attention_dp_owners[False]
   - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_prefix_reuse_across_attention_dp_owners[True]
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_work_aware_routing_under_attention_dp
   # ------------- Disaggregated serving tests ---------------
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-True]
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True-True]

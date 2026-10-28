@@ -56,6 +56,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
 )
 from tensorrt_llm.llmapi import RequestError, SchedulingParams
 from tensorrt_llm.llmapi.llm_args import (
+    AttentionDpConfig,
     CacheTransceiverConfig,
     Eagle3DecodingConfig,
     KvCacheConfig,
@@ -567,6 +568,52 @@ def test_mooncake_e2e_prefix_reuse_across_attention_dp_owners(
             list(output.outputs[0].token_ids),
             context=f"Copy {index} replayed under attention DP",
         )
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.skip_less_device(2)
+def test_mooncake_e2e_work_aware_routing_under_attention_dp(mooncake_pool):
+    """Serve attention-DP requests through the work-aware router.
+
+    PyExecutor hands every attention-DP fetch to the router together with the
+    ranks pop_requests planned, so this is the path that breaks when the router
+    and the executor disagree on that contract. The router is built only with a
+    connector that moves KV, as mooncake_store does. Four copies of one prompt go
+    to an engine with one request slot per owner: every copy must finish with the
+    tokens of the first, and rank 0 must have prefilled one, so the router placed
+    requests on both owners rather than stalling or crashing the fetch.
+    """
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+    llm = LLM(
+        **llm_kwargs(
+            mooncake_pool,
+            tensor_parallel_size=2,
+            enable_attention_dp=True,
+            attention_dp_config=AttentionDpConfig(enable_work_aware_routing=True),
+            max_batch_size=1,
+            enable_iter_perf_stats=True,
+            # Keep every iteration rather than the most recent 1000.
+            iter_stats_max_iterations=-1,
+        )
+    )
+    try:
+        outputs = llm.generate([PROMPT] * 4, sampling_params)
+        stats = llm.get_stats(timeout=30)
+    finally:
+        llm.shutdown()
+
+    token_ids = [list(output.outputs[0].token_ids) for output in outputs]
+    for index, replayed in enumerate(token_ids[1:], start=1):
+        assert_tokens_agree(
+            token_ids[0], replayed, context=f"Copy {index} routed by the work-aware router"
+        )
+    rank0_context_tokens = sum(
+        entry.get("inflightBatchingStats", {}).get("numCtxTokens", 0)
+        for entry in _rank0_rows(stats)
+    )
+    assert rank0_context_tokens > 0, (
+        "Rank 0 prefilled nothing, so the work-aware router sent all four copies to owner 1."
+    )
 
 
 @pytest.mark.threadleak(enabled=False)
