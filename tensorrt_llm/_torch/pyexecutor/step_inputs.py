@@ -29,10 +29,13 @@ from typing import Iterator, Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import (  # noqa: F401
-    fake_ops as _m3_fake_ops,  # registers trtllm::step_inputs_scatter's fake impl
-)
 from tensorrt_llm._utils import prefer_pinned
+
+
+@torch.library.register_fake("trtllm::step_inputs_scatter")
+def _step_inputs_scatter_fake(stage: torch.Tensor) -> None:
+    # Writes the staged rows into their destinations; returns nothing.
+    return None
 
 
 class StepInputPack:

@@ -67,11 +67,13 @@ def _load_module():
     """The compiled ops' namespace (``torch.ops.trtllm``), resolved once; ``_module`` stays None until then."""
     global _module
     if _module is None:
-        if not hasattr(torch.ops.trtllm, "minimax_m3_attn_mega"):
+        try:
+            torch.ops.trtllm.minimax_m3_attn_mega
+        except AttributeError as exc:
             raise RuntimeError(
                 "torch.ops.trtllm.minimax_m3_attn_mega is not registered: this TensorRT-LLM build lacks "
                 "cpp/tensorrt_llm/kernels/minimaxM3/attnMega.cu"
-            )
+            ) from exc
         _module = torch.ops.trtllm
     return _module
 
