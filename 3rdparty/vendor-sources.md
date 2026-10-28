@@ -274,8 +274,14 @@ PRIMTS_TMP_BRANCH=trtllm-prims-ts-validation-fix
 git switch -c feat/prims-ts-validation-fix
 python scripts/vendor/manage.py check flashinfer-prims-ts
 git clone "$PRIMTS_FORK_URL" "$PRIMTS_REPO"
-git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
-PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH" || {
+  echo 'STOP: could not fetch the canonical branch.' >&2
+  exit 1
+}
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched canonical revision is not a commit.' >&2
+  exit 1
+}
 ```
 
 Compare `PRIMTS_LOCKED_SHA` with `PRIMTS_DEV_TIP`. The straightforward path below
@@ -324,8 +330,14 @@ Stage any additional upstream test files explicitly as well.
 ```bash
 git -C "$PRIMTS_REPO" add flashinfer/attention/prims_ts
 git -C "$PRIMTS_REPO" commit -s -m 'Fix PrimTS context validation'
-git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
-PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH" || {
+  echo 'STOP: could not fetch the canonical branch.' >&2
+  exit 1
+}
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched canonical revision is not a commit.' >&2
+  exit 1
+}
 git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_DEV_TIP" HEAD
 ```
 
@@ -425,10 +437,22 @@ using the source repository and dev variables from the walkthrough:
 
 ```bash
 PRIMTS_UPSTREAM_URL=https://github.com/flashinfer-ai/flashinfer.git
-git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
-PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
-git -C "$PRIMTS_REPO" fetch "$PRIMTS_UPSTREAM_URL" main
-PRIMTS_UPSTREAM_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH" || {
+  echo 'STOP: could not fetch the canonical branch.' >&2
+  exit 1
+}
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched canonical revision is not a commit.' >&2
+  exit 1
+}
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_UPSTREAM_URL" main || {
+  echo 'STOP: could not fetch the upstream branch.' >&2
+  exit 1
+}
+PRIMTS_UPSTREAM_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched upstream revision is not a commit.' >&2
+  exit 1
+}
 PRIMTS_NEW_SHA=$PRIMTS_UPSTREAM_TIP  # Or an older reviewed commit on main.
 git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_DEV_TIP" "$PRIMTS_NEW_SHA"
 git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_NEW_SHA" "$PRIMTS_UPSTREAM_TIP"
@@ -463,8 +487,14 @@ checks succeed, resolving conflicts and rerunning tests:
 
 ```bash
 PRIMTS_PREVIOUS_DEV_TIP=$PRIMTS_DEV_TIP
-git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
-PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH" || {
+  echo 'STOP: could not fetch the canonical branch.' >&2
+  exit 1
+}
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched canonical revision is not a commit.' >&2
+  exit 1
+}
 if ! git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_PREVIOUS_DEV_TIP" "$PRIMTS_DEV_TIP" ||
    ! git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_LOCKED_SHA" "$PRIMTS_DEV_TIP"; then
   echo 'STOP: canonical history changed; ask the maintainer before rebasing.' >&2
