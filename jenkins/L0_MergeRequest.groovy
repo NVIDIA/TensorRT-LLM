@@ -2068,7 +2068,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
 
-            junit(testResults: '**/results*.xml', allowEmptyResults : true)
+            junit(testResults: '**/results*.xml', allowEmptyResults : true, keepProperties: true)
 
             // Pre-install shared dependencies for parallel tasks
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")

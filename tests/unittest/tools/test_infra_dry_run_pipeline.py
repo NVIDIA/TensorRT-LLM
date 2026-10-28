@@ -102,7 +102,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn(f"{process_results}\n            {process_results_branch}", result_handler)
         self.assertLess(
             result_handler.index(process_results_branch),
-            result_handler.index('junit(testResults: "${stageName}/results*.xml")'),
+            result_handler.index('junit(testResults: "${stageName}/results*.xml"'),
         )
 
     def test_failure_evidence_match_is_logged_before_caching(self) -> None:

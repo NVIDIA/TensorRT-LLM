@@ -313,14 +313,27 @@ def _detect_sm_version() -> int | None:
 def _apply_waive(
     case: ET.Element, rule: WaiveRule, result_file: Path, stage_name: str, source: dict[str, str]
 ) -> dict:
-    """Replace a failure with a skip and record the applied waive rule."""
-    for failure in case.findall("failure") + case.findall("error"):
+    """Replace a failure with a skip, keeping the raw error for result collectors."""
+    failures = case.findall("failure") + case.findall("error")
+    original_error = {
+        "waive_original_status": "FAILED",
+        "waive_original_error_message": "\n".join(
+            failure.get("message", "") for failure in failures
+        ),
+        "waive_original_error_stack_trace": "\n".join(failure.text or "" for failure in failures),
+    }
+    for failure in failures:
         case.remove(failure)
     properties = case.find("properties")
     if properties is None:
         properties = ET.Element("properties")
         case.insert(0, properties)
-    for key, value in {"waive_rule": rule.nodeid, **source}.items():
+    for key, value in {
+        "waive_rule": rule.nodeid,
+        "waive_reason": rule.reason,
+        **source,
+        **original_error,
+    }.items():
         ET.SubElement(properties, "property", {"name": key, "value": value})
     message = f"Skipped by new TOT waive: {rule.reason}"
     skipped = ET.Element("skipped", {"type": "tot-waive", "message": message})

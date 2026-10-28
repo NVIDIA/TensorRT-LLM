@@ -465,7 +465,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     // junit() uses local XML files already downloaded by the final progress snapshot.
     def hasLocalResults = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger() > 0
     if (hasLocalResults && !suppressTestReporting) {
-        junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+        junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml", keepProperties: true)
     } else if (suppressTestReporting) {
         echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
     }
@@ -480,7 +480,6 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     def unrerunInfraFailure = null
     def hasUnrerunFailure = false
     def hasUnfinishedTests = false
-    def testFailure = null
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
@@ -508,7 +507,9 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            testFailure = testFailure ?: e
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                throw e
+            }
             def rerunResult = rerunFailedTests(
                 pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag, retryContext)
             if (rerunResult.failed) {
@@ -561,7 +562,6 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     }
 
     return [
-        testFailure: testFailure,
         rerunFailed: rerunFailed,
         rerunInfraFailure: rerunInfraFailure,
         unrerunInfraFailure: unrerunInfraFailure,
@@ -2488,7 +2488,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
             }
 
-            runPytestStage(stageName) { pytestResult ->
+            runPytestStage(stageName) {
                 // Submit the Slurm job. Submit/metadata/track all run on the one
                 // frontend the enclosing withSlurmFrontendFailover pinned, so they
                 // share the job workspace (slurm_job_id.txt, scripts) on that login
@@ -2838,6 +2838,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             script: scpFromRemoteCmd(remote, "${jobWorkspace}/tot_waive_eligible.txt", eligiblePath),
                             returnStatus: true, retryOnFail: false)
                         if (copied == 0) {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                                throw jobFailure
+                            }
                             def computeCap = readFile(eligiblePath).trim()
                             generateTimeoutTestResultXml(pipeline, stageName)
                             def refresh = refreshFailedTestWaives(llmSrcLocal, stageName, [
@@ -2845,7 +2848,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                 expectedTestLists: [unsplitTestListLocal],
                             ])
                             if (refresh.allFailuresWaived) {
-                                pytestResult.failure = jobFailure
                                 return
                             }
                         }
@@ -3806,7 +3808,7 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
             )
             deleteProgressArtifact(stageName, postTag)
             if (!suppressTestReporting) {
-                junit(testResults: "${stageName}/results*.xml")
+                junit(testResults: "${stageName}/results*.xml", keepProperties: true)
             }
             }
         }
@@ -5328,22 +5330,16 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-// Annotate a step before nested stages so Jenkins colors Run Pytest itself.
-// Preserve test execution failures visually even when reruns or waives succeed.
-// Rethrow final failures unchanged to preserve classification and retries.
+// Preserve the final exception for the outer classifier and retry boundary.
 def runPytestStage(String stageName, Closure body) {
     stage("[${stageName}] Run Pytest") {
         def stageFailure = null
-        def pytestResult = [failure: null]
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
             try {
-                body(pytestResult)
+                body()
             } catch (Throwable e) {
                 stageFailure = e
                 throw e
-            }
-            if (pytestResult.failure != null) {
-                throw pytestResult.failure
             }
         }
         if (stageFailure != null) {
@@ -5509,7 +5505,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     }
 
     runPytestStage(stageName)
-    { pytestResult ->
+    {
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
@@ -5705,7 +5701,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        pytestResult.failure = e
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                            throw e
+                        }
                         def rerunResult = rerunFailedTests(
                             pipeline, stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag, retryContext)
                         // Unconditional: a test can crash again during the rerun itself
@@ -5741,7 +5739,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
                             def isolatedResult = runIsolatedTests(
                                 pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag, retryContext)
-                            pytestResult.failure = isolatedResult.testFailure ?: pytestResult.failure
                             rerunFailed = isolatedResult.rerunFailed || rerunFailed
                             rerunInfraFailure = isolatedResult.rerunInfraFailure ?: rerunInfraFailure
                             unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure
