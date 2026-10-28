@@ -541,7 +541,7 @@ class DecoderRunner(ScheduledModelRunner):
                     f"attention config, got {type(sparse_config).__name__}"
                 )
             topk_span = sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
-            return topk_span - self.get_runtime_tokens_per_gen_step(self._config.max_draft_len)
+            return topk_span - self._get_runtime_tokens_per_gen_step(self._config.max_draft_len)
         return None
 
     def _initialize_breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:

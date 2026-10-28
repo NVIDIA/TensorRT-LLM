@@ -41,7 +41,7 @@ def _runner(
     runner._sparse_attention_config = sparse_attention_config
     runner.runtime_hooks = hooks
     runner._config = SimpleNamespace(max_draft_len=max_draft_len)
-    runner.get_runtime_tokens_per_gen_step = lambda draft_len: draft_len + 1
+    runner._get_runtime_tokens_per_gen_step = lambda draft_len: draft_len + 1
     return runner
 
 
