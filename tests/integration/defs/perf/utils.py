@@ -726,7 +726,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 )
                 outputs.pop(cmd_idx, None)
             else:
-                self._perf_result = self.get_perf_result(outputs)
+                try:
+                    self._perf_result = self.get_perf_result(outputs)
+                except (AssertionError, RuntimeError, ValueError):
+                    if isinstance(commands, PerfServeScriptTestCmds):
+                        commands.print_server_log_tail()
+                    raise
 
                 # Stop the timer
                 self._end_timestamp = datetime.utcnow()
