@@ -44,6 +44,7 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
+    from flashinfer import SfLayout
     from flashinfer import autotune as _flashinfer_autotune
     from flashinfer import mm_mxfp8 as _flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
@@ -3314,19 +3315,19 @@ def _fp4_quantize_dispatch(input: torch.Tensor, input_scale: torch.Tensor,
         assert not sf_use_ue8m0, (
             "FlashInfer FP4 tactic does not support sf_use_ue8m0=True; "
             "force the TRTLLM tactic.")
+        sf_layout = (SfLayout.layout_128x4
+                     if is_sf_swizzled_layout else SfLayout.layout_linear)
         act_fp4, act_sf = _flashinfer_nvfp4_quantize(
             input,
             input_scale,
-            do_shuffle=is_sf_swizzled_layout,
+            sfLayout=sf_layout,
+            do_shuffle=False,
             sf_vec_size=scaling_vector_size,
             enable_pdl=get_env_enable_pdl(),
         )
-        # FlashInfer returns 2D act_sf [M_padded, sf_cols] but downstream
-        # (nvfp4_gemm) and the TRTLLM kernel expect 1D flat. Reshape to match.
-        # Use swizzled_layout=True since the C++ kernel always pads M to 128.
         _, expected_sf_shape = fp4_utils.get_fp4_shape(input.shape,
                                                        scaling_vector_size,
-                                                       True)
+                                                       is_sf_swizzled_layout)
         act_sf = act_sf.reshape(expected_sf_shape)
         return act_fp4, act_sf
     else:
@@ -3454,17 +3455,11 @@ def _(
     sf_use_ue8m0: bool = False,
     is_sf_swizzled_layout: bool = True,
 ) -> List[torch.Tensor]:
-    """Fake implementation for torch.compile support.
-
-    Note: The underlying TRTLLM C++ kernel always pads M to 128 for scale
-    factors regardless of the swizzled_layout flag, so we use
-    swizzled_layout=True in get_fp4_shape to match the actual output size.
-    We also reshape FlashInfer's output to match in _fp4_quantize_dispatch.
-    """
-    del sf_use_ue8m0, is_sf_swizzled_layout
+    """Fake implementation for torch.compile support."""
+    del sf_use_ue8m0
     output_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape,
                                                         scaling_vector_size,
-                                                        True)
+                                                        is_sf_swizzled_layout)
 
     return [
         input.new_empty(output_shape, dtype=torch.uint8),
