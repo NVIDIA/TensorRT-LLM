@@ -708,6 +708,11 @@ TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
         }
     }
     ASSERT_EQ(oldSlotReservations.size(), 2);
+    for (auto const& [group, slot] : oldSlotReservations)
+    {
+        // Offload can still be reading the recycled GPU slot on another stream.
+        slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(mStream));
+    }
     for (auto const& buffer : splitSsmBuffers())
     {
         auto const group = manager->getBufferGroupId(buffer.layer, buffer.role);
