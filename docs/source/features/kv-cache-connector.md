@@ -838,6 +838,14 @@ sliding-window attention, and `sparse_attention_config` with an index-V cache un
 `sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
 multimodal content without hashes, leaving the rest of the deployment served.
 
+A page offered at lookup can still be gone at load time, evicted from a full pool or left behind by
+a put that never completed. The worker declares
+[`reports_failed_loads`](#2-worker-interface-kvcacheconnectorworker), so on a single-rank server
+(and on attention-DP owners once `mooncake-store` supports attention data parallelism) only the
+affected request restarts, without the offered prefix, and the rest of its batch runs. Under tensor
+parallelism every rank holds a shard of the same page and cannot restart the request alone, so a
+missing page fails the executor there.
+
 ### GPUDirect RDMA
 
 By default the connector registers the KV pools with Mooncake so the NIC reads and writes pages in

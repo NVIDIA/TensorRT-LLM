@@ -36,6 +36,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
+    KvCacheConnectorManager,
     RequestData,
     SchedulerOutput,
 )
@@ -61,6 +62,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
+    MooncakeStoreMetadata,
     PageTransfer,
     RequestTransfers,
 )
@@ -934,13 +936,162 @@ def test_worker_prefix_hit_stops_at_the_first_gap(store_config, fake_store):
         assert worker.count_prefix_hit(hashes) == 1
 
 
-def test_worker_load_raises_when_a_page_is_missing(store_config, fake_store):
+def test_worker_declares_failed_load_reporting():
+    """The runtime restarts a request whose page went missing only if the worker says so."""
+    assert MooncakeStoreConnectorWorker.reports_failed_loads is True
+    # The hooks the manager requires of a reporting worker are implemented.
+    KvCacheConnectorManager._validate_failed_load_reporting(MooncakeStoreConnectorWorker)
+
+
+def test_worker_load_reports_the_request_when_a_page_is_missing(store_config, fake_store):
+    """A single-rank worker hands a request whose page is gone back to the executor."""
     with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._recover_failed_loads
+        transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {7}
+        # Cleared on return: the next iteration starts clean.
+        assert worker.take_failed_load_requests() == set()
+
+
+def test_worker_load_raises_when_a_page_is_missing_under_tensor_parallelism(
+    store_config, fake_store
+):
+    """Tensor-parallel ranks hold shards of one page and cannot restart a request alone.
+
+    Set on the built worker rather than through the world size, which would
+    also change every key namespace.
+    """
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker._recover_failed_loads = False
         transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
         worker.bind_allocation_fence(AllocationFence(fake_store))
         worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
         with pytest.raises(RuntimeError, match="already"):
             worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == set()
+
+
+def test_worker_load_skips_the_rest_of_a_failed_request_and_keeps_the_others(
+    store_config, fake_store
+):
+    """Only the request that lost a page restarts; its later pages are not fetched."""
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        present, missing, later = (bytes([1]) * 16, bytes([2]) * 16, bytes([3]) * 16)
+        for block_hash in (present, later):
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # The first store call holds request 7's page and request 8's missing
+        # one, so request 8's second page would be the second call.
+        worker._batch_size = 2
+        loads = [
+            RequestTransfers(7, [PageTransfer(present, 0, 1)]),
+            RequestTransfers(8, [PageTransfer(missing, 0, 2), PageTransfer(later, 0, 3)]),
+        ]
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(SimpleNamespace(loads=loads, saves=[]))
+        worker.start_load_kv(None)
+
+        assert worker.take_failed_load_requests() == {8}
+        assert len(fake_store.get_calls) == 1
+        fetched = [key for keys, _addresses, _sizes in fake_store.get_calls for key in keys]
+        assert worker._namespaces[0].key(present) in fetched
+        assert worker._namespaces[0].key(later) not in fetched
+
+
+def test_worker_load_counts_a_short_answer_as_every_page_failed(
+    store_config, fake_store, monkeypatch
+):
+    """A store answer of the wrong length cannot say which pages landed.
+
+    Both pages exist, but the store answers for the first one only. Reading
+    that as one landed page would let request 7 compute over a page nothing
+    confirmed, so every request in the call restarts.
+    """
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        first, second = bytes([1]) * 16, bytes([2]) * 16
+        for block_hash in (first, second):
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        answer = fake_store.batch_get_into_multi_buffers
+        monkeypatch.setattr(
+            fake_store,
+            "batch_get_into_multi_buffers",
+            lambda keys, addresses, sizes: answer(keys, addresses, sizes)[:1],
+        )
+        worker._batch_size = 2
+        loads = [
+            RequestTransfers(7, [PageTransfer(first, 0, 1)]),
+            RequestTransfers(8, [PageTransfer(second, 0, 2)]),
+        ]
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(SimpleNamespace(loads=loads, saves=[]))
+        worker.start_load_kv(None)
+
+        assert len(fake_store.get_calls) == 1
+        assert worker.take_failed_load_requests() == {7, 8}
+
+
+def test_worker_failed_load_drops_that_requests_saves_from_the_pass(store_config, fake_store):
+    """The request that lost a page must not publish its scheduled tail.
+
+    `build_connector_meta` bound the saves of every scheduled request before
+    the load ran. The failed request leaves the batch without computing
+    anything, so only the surviving request's saves may reach `wait_for_save`.
+    """
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        present, missing = bytes([1]) * 16, bytes([2]) * 16
+        tail_ok, tail_failed = bytes([3]) * 16, bytes([4]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(present))
+        metadata = MooncakeStoreMetadata(
+            loads=[
+                RequestTransfers(7, [PageTransfer(present, 0, 1)]),
+                RequestTransfers(9, [PageTransfer(missing, 0, 2)]),
+            ],
+            saves=[
+                RequestTransfers(7, [PageTransfer(tail_ok, 0, 3)]),
+                RequestTransfers(9, [PageTransfer(tail_failed, 0, 4)]),
+            ],
+        )
+        saves = metadata.saves
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(metadata)
+        worker.start_load_kv(None)
+
+        assert worker.take_failed_load_requests() == {9}
+        # What `wait_for_save` will hand to the save thread after the pass.
+        assert [transfers.request_id for transfers in worker.get_connector_meta().saves] == [7]
+        # Edited in place, since that is the object `wait_for_save` reads.
+        assert worker.get_connector_meta().saves is saves
+        assert 9 not in worker._outstanding_saves
+        # The manager drops the same request again before the restart.
+        assert worker.drop_bound_saves([9]) == 0
+        assert [transfers.request_id for transfers in saves] == [7]
+
+
+def test_worker_drops_bound_saves_of_a_restarted_request_even_when_it_was_the_whole_batch(
+    store_config, fake_store
+):
+    """A pass whose only request restarted publishes nothing."""
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        missing, tail = bytes([2]) * 16, bytes([4]) * 16
+        metadata = MooncakeStoreMetadata(
+            loads=[RequestTransfers(8, [PageTransfer(missing, 0, 2)])],
+            saves=[RequestTransfers(8, [PageTransfer(tail, 0, 4)])],
+        )
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(metadata)
+        worker.start_load_kv(None)
+
+        assert worker.take_failed_load_requests() == {8}
+        assert metadata.saves == []
+        # With nothing bound to save, the post-pass handoff queues nothing.
+        worker.wait_for_save(None)
+        assert worker._save_queue.empty()
+        assert not worker._outstanding_saves
+        assert worker.take_submitted_saves() == set()
+        # A second drop is harmless, as is dropping an unknown request.
+        assert worker.drop_bound_saves([8, 9]) == 0
 
 
 def test_worker_zero_copy_load_refuses_to_run_unordered(store_config, fake_store):
@@ -1188,9 +1339,11 @@ def test_staging_get_scatters_back_to_the_device_regions(store_config, fake_stor
         assert staged_copies == expected
 
 
-def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged_copies):
+@pytest.mark.parametrize("recover", [True, False], ids=["restart", "tensor_parallel"])
+def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged_copies, recover):
     layout = make_layout()
     with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        worker._recover_failed_loads = recover
         block_hash = b"\x09" * 16
         key = worker._namespaces[0].key(block_hash)
         fake_store.objects.add(key)
@@ -1199,13 +1352,45 @@ def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged
         worker.bind_connector_meta(
             SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], saves=[])
         )
-        with pytest.raises(RuntimeError, match="failed to load"):
+        if recover:
             worker.start_load_kv(None)
+            assert worker.take_failed_load_requests() == {7}
+        else:
+            with pytest.raises(RuntimeError, match="failed to load"):
+                worker.start_load_kv(None)
 
         # A failed read leaves the slot holding whatever it held before, and
         # copying that onto the page would put unrelated bytes where the
         # runtime already promised computed KV.
         assert staged_copies == []
+
+
+def test_staging_scatters_only_the_pages_that_landed(store_config, fake_store, staged_copies):
+    """In a mixed batch the filled slot reaches its page and the failed one does not."""
+    layout = make_layout(regions_per_group=2)
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        good, bad = bytes([0x0A]) * 16, bytes([0x0B]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(good))
+        fake_store.objects.add(worker._namespaces[0].key(bad))
+        fake_store.fail_gets_for.add(worker._namespaces[0].key(bad))
+        loads = [
+            RequestTransfers(7, [PageTransfer(good, 0, 1)]),
+            RequestTransfers(8, [PageTransfer(bad, 0, 2)]),
+        ]
+        worker.bind_connector_meta(SimpleNamespace(loads=loads, saves=[]))
+        worker.start_load_kv(None)
+
+        assert worker.take_failed_load_requests() == {8}
+        # Both pages shared one store call, so slot 0 holds the landed page.
+        assert len(fake_store.get_calls) == 1
+        good_addresses, good_sizes = PageAddressing(layout).buffers(0, 1)
+        slot = worker._load_staging.slot_address(0)
+        expected = []
+        offset = 0
+        for address, size in zip(good_addresses, good_sizes):
+            expected.append((address, slot + offset, size))
+            offset += size
+        assert staged_copies == expected
 
 
 def test_staging_load_leaves_the_ordering_to_the_stream(store_config, fake_store, staged_copies):

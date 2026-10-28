@@ -19,8 +19,13 @@ between that pool and its own GPU KV cache. It is also the only place that
 knows how a page is addressed and how a key is spelled, which is why the
 leader, colocated with rank 0's worker, asks it to run prefix lookups.
 
-Loads are synchronous: the runtime has already told the scheduler those tokens
-are computed, so a failed load is a wrong answer rather than a slow one.
+Loads are synchronous, and the runtime has already counted the loaded tokens as
+computed, so a page missing at load time must never reach a forward pass. A
+rank that holds whole pages and its own batch hands the affected request back
+for a restart without the offered prefix (`reports_failed_loads`): a single-rank
+server, and an attention-DP owner once this connector supports attention data
+parallelism. Under tensor parallelism the ranks hold shards of the same page and
+cannot restart a request alone, so there a missing page fails the executor.
 
 Saves are asynchronous and gated on a CUDA event, since the pages are complete
 only once the forward pass that wrote them has retired and blocking the
@@ -42,7 +47,7 @@ import threading
 import traceback
 from collections import defaultdict
 from queue import Queue
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -178,6 +183,13 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
+    #: A page offered at lookup can be gone by load time, evicted from a full
+    #: pool or left behind by a put that never completed. On a single rank or an
+    #: attention-DP owner the affected requests are handed back to the executor
+    #: to restart (`take_failed_load_requests`). Tensor-parallel ranks hold
+    #: shards of one page and cannot restart a request alone, so there a failed
+    #: page stays fatal.
+    reports_failed_loads = True
     #: Registering pages drops the automatic host tier, and a prefix restore is
     #: chosen only after the final batch, so on a disaggregated server the
     #: pages each admitted request needs to finish have to stay free.
@@ -203,6 +215,20 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # The same namespaces for every rank. A prefix is only reusable when all
         # shards of it are present, so a lookup has to ask about all of them.
         self._peer_namespaces: Dict[int, Tuple[KeyNamespace, ...]] = {}
+        # A rank that holds whole pages and its own batch can restart a request
+        # whose page went missing: a single-rank server, or an attention-DP
+        # owner. Tensor-parallel ranks hold shards of the same page and would
+        # have to agree on the restart, which they cannot do here, so a failed
+        # load stays fatal there.
+        holds_whole_pages = (
+            getattr(llm_args, "enable_attention_dp", False) is True or self._world_size == 1
+        )
+        self._recover_failed_loads = (
+            getattr(type(self), "reports_failed_loads", False) is True and holds_whole_pages
+        )
+        # Requests whose last synchronous load came up short, taken by the
+        # executor right after `start_load_kv`. Executor thread only.
+        self._failed_load_requests: Set[int] = set()
 
         # Checked before the segment is mounted, since the kernel answers an
         # unaffordable total by killing the process rather than by failing the
@@ -533,7 +559,21 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     # ---- load path ----
 
     def start_load_kv(self, stream: torch.cuda.Stream):
-        """Pull every scheduled page into its GPU slot before the forward pass."""
+        """Pull every scheduled page into its GPU slot before the forward pass.
+
+        The runtime has already counted these tokens as computed. When a page
+        is missing and this rank can restart a request alone, the request is
+        recorded for `take_failed_load_requests`, its remaining pages are not
+        fetched, and its saves leave the bound metadata; the other requests
+        load as usual.
+
+        Args:
+            stream: The executor's stream, on which staged scatters are issued.
+
+        Raises:
+            RuntimeError: When a page is missing on a tensor-parallel rank, or
+                a zero-copy load has no allocation fence to wait on.
+        """
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.loads:
             return
@@ -541,6 +581,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
         if not keys:
             return
+        # `_resolve` emits one key per page in transfer order, so this names the
+        # request every key is loaded for.
+        owners = [entry.request_id for entry in metadata.loads for _ in entry.pages]
 
         staging = self._load_staging
         handle = _stream_handle(stream) if staging is not None else 0
@@ -559,42 +602,174 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
             fence({entry.request_id for entry in metadata.loads})
 
-        for batch in zip(
-            _batched(keys, self._batch_size),
-            _batched(addresses, self._batch_size),
-            _batched(sizes, self._batch_size),
-        ):
-            batch_keys, batch_addresses, batch_sizes = batch
+        failed_requests, num_failed_pages, first_failure, _ = self._load_pages(
+            keys,
+            addresses,
+            sizes,
+            owners,
+            staging,
+            handle,
+            self._batch_size,
+            recover=self._recover_failed_loads,
+        )
+        if failed_requests:
+            # The executor takes these requests out of the batch and restarts
+            # them; see `take_failed_load_requests`. Nothing of theirs is
+            # computed this pass, so their saves leave the bound metadata now:
+            # `wait_for_save` would otherwise read pages the executor has freed,
+            # or another request has since filled, and publish them under the
+            # failed request's valid keys.
+            self.drop_bound_saves(failed_requests)
+            self._failed_load_requests.update(failed_requests)
+            logger.warning(
+                f"mooncake-store rank {self._rank} failed to load {num_failed_pages} page(s) "
+                f"for {len(failed_requests)} request(s); they restart without the offered "
+                f"prefix. First failure: {first_failure!r}"
+            )
+        logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
+
+    def _load_pages(
+        self,
+        keys: List[str],
+        addresses: List[List[int]],
+        sizes: List[List[int]],
+        owners: List[int],
+        staging: Optional[HostStagingPool],
+        handle: int,
+        batch_size: int,
+        *,
+        recover: bool,
+    ) -> Tuple[Set[int], int, Optional[str], int]:
+        """Fetch pages batch by batch, scattering staged ones onto the device.
+
+        A store call is synchronous, and a staged batch's scatter is synced
+        before the next batch reuses its slots, so no write into a page is in
+        flight on return.
+
+        Args:
+            keys: Store key of every page, in transfer order.
+            addresses: Device region addresses of every page.
+            sizes: Device region sizes of every page.
+            owners: The request each page is loaded for.
+            staging: Host slots the pages pass through, or None for zero copy.
+            handle: Raw CUDA stream the staged scatters are issued on.
+            batch_size: Pages per store call.
+            recover: Whether a missing page is handed back rather than raised.
+                The pages of a request that already lost one are then skipped,
+                since the request restarts and recomputes all of them.
+
+        Returns:
+            The requests that lost a page, how many pages were lost, the first
+            missing key, and the bytes that landed.
+
+        Raises:
+            RuntimeError: On the first batch with a missing page when `recover`
+                is False.
+        """
+        failed_requests: Set[int] = set()
+        first_failure: Optional[str] = None
+        num_failed_pages = 0
+        loaded_bytes = 0
+
+        for start in range(0, len(keys), batch_size):
+            indices = [
+                index
+                for index in range(start, min(start + batch_size, len(keys)))
+                if owners[index] not in failed_requests
+            ]
+            if not indices:
+                continue
+            batch_keys = [keys[index] for index in indices]
+            batch_addresses = [addresses[index] for index in indices]
+            batch_sizes = [sizes[index] for index in indices]
             if staging is None:
-                target_addresses, target_sizes = list(batch_addresses), list(batch_sizes)
+                target_addresses, target_sizes = batch_addresses, batch_sizes
             else:
                 target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
             results = self._store.batch_get_into_multi_buffers(
-                list(batch_keys), target_addresses, target_sizes
+                batch_keys, target_addresses, target_sizes
             )
-            failed = [
-                key
-                for key, result in zip(batch_keys, results)
-                if not isinstance(result, int) or result < 0
+            if len(results) != len(batch_keys):
+                # Which pages landed is unknowable, so none of them counts.
+                results = [-1] * len(batch_keys)
+            landed = [
+                position
+                for position, result in enumerate(results)
+                if isinstance(result, int) and result >= 0
             ]
-            if failed or len(results) != len(batch_keys):
-                # The runtime already counted these tokens as computed, so a
-                # partial load would leave the forward pass reading
-                # uninitialized KV and silently producing wrong tokens.
-                raise RuntimeError(
-                    f"mooncake-store failed to load {len(failed) or len(batch_keys)} of "
-                    f"{len(batch_keys)} pages; the affected KV slots were already "
-                    f"reported as computed. First failure: {failed[:1]}"
-                )
-            if staging is not None:
-                # Only reached once every page in the batch landed, so no slot
-                # holding a failed read is copied over a device page.
-                unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle)
+            loaded_bytes += sum(sum(batch_sizes[position]) for position in landed)
+            if len(landed) != len(batch_keys):
+                landed_set = set(landed)
+                for position, index in enumerate(indices):
+                    if position in landed_set:
+                        continue
+                    failed_requests.add(owners[index])
+                    num_failed_pages += 1
+                    if first_failure is None:
+                        first_failure = batch_keys[position]
+                if not recover:
+                    # The runtime already counted these tokens as computed, so a
+                    # partial load would leave the forward pass reading
+                    # uninitialized KV and silently producing wrong tokens.
+                    raise RuntimeError(
+                        f"mooncake-store failed to load {len(batch_keys) - len(landed)} of "
+                        f"{len(batch_keys)} pages; the affected KV slots were already "
+                        f"reported as computed. First failure: {first_failure!r}"
+                    )
+            if staging is not None and landed:
+                # Only filled slots are scattered, so no slot holding a failed
+                # read is copied over a device page.
+                unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle, only=landed)
                 # The next batch reuses the slots and the forward pass reads
                 # these pages, so the scatter has to complete before either.
                 _sync_stream(handle)
+        return failed_requests, num_failed_pages, first_failure, loaded_bytes
 
-        logger.debug(f"mooncake-store rank {self._rank} loaded {total_pages} pages")
+    def take_failed_load_requests(self) -> Set[int]:
+        """Requests whose pages could not all be loaded in the last `start_load_kv`.
+
+        The executor drains this right after `start_load_kv` and before the
+        forward pass, takes those requests out of the batch, frees their
+        allocation and lets the scheduler admit them again, so the store is
+        asked afresh and the lost pages are recomputed. Every write into their
+        pages has completed by then; see `_load_pages`. Cleared on return.
+
+        Returns:
+            The request IDs to restart.
+        """
+        failed, self._failed_load_requests = self._failed_load_requests, set()
+        return failed
+
+    def drop_bound_saves(self, request_ids: Iterable[int]) -> int:
+        """Remove these requests' saves from the metadata bound for this pass.
+
+        For a request taken out of the batch after `build_connector_meta` ran:
+        its scheduled tail is never computed, so none of it may be published.
+        Edits the bound metadata in place, which is the object `wait_for_save`
+        reads, and a request that is not bound is ignored, so repeating a call
+        changes nothing.
+
+        Args:
+            request_ids: The restarted requests.
+
+        Returns:
+            The number of save entries removed.
+        """
+        metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
+        if metadata is None or not metadata.saves:
+            return 0
+        drop = set(request_ids)
+        saves = metadata.saves
+        kept = [transfers for transfers in saves if transfers.request_id not in drop]
+        removed = len(saves) - len(kept)
+        if removed:
+            dropped_ids = sorted({transfers.request_id for transfers in saves} & drop)
+            saves[:] = kept
+            logger.debug(
+                f"mooncake-store rank {self._rank} dropped the saves of requests "
+                f"{dropped_ids} ({removed} entr{'y' if removed == 1 else 'ies'}) from this pass"
+            )
+        return removed
 
     def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         """No-op: loads complete in `start_load_kv`.
