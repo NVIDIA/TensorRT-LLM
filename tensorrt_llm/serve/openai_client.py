@@ -671,7 +671,12 @@ class OpenAIHttpClient(OpenAIClient):
                 # as an aiohttp.ClientResponseError -- a ClientError subclass --
                 # to carry the response body up; the retry budget here is meant
                 # for transport failures, not for server-side rejections.
-                if isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500:
+                # 408 and 429 are transient, not deterministic: keep them retryable.
+                if (
+                    isinstance(e, aiohttp.ClientResponseError)
+                    and 400 <= e.status < 500
+                    and e.status not in (408, 429)
+                ):
                     logger.error(
                         f"Client error to {url}: {e} - not retrying, {e.status} is deterministic",
                         traceback.format_exc(),

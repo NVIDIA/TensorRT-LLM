@@ -183,6 +183,7 @@ def test_decode_kernel_accepts_misaligned_slot_slice(offset):
     assert torch.equal(pools[1], pools[0])
 
 
+@needs_cuda
 def test_metadata_steady_gen_step_skips_state_index_staging():
     """prepare_steady_gen_step() keeps the staged state indices and only refreshes per-step bookkeeping."""
     from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
