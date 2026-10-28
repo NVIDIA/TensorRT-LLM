@@ -278,6 +278,8 @@ def open_worker(
     stage_through_host: bool,
     model_key: str = MODEL_KEY,
     enable_attention_dp: bool = False,
+    soft_pin_ttl_ms: int | None = None,
+    group_blocks: bool = False,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """A worker holding a real store handle, over `buffer` or `layout` as its KV cache.
 
@@ -291,6 +293,8 @@ def open_worker(
         segment_size=WORKER_SEGMENT_SIZE,
         stage_through_host=stage_through_host,
         run_dir=pool.run_dir,
+        soft_pin_ttl_ms=soft_pin_ttl_ms,
+        group_blocks=group_blocks,
     )
     with provision_pool(store_config, run_dir=pool.run_dir):
         worker = MooncakeStoreConnectorWorker(
@@ -522,6 +526,46 @@ def test_a_different_model_key_shares_nothing(mooncake_pool):
             "The block is gone from the pool under the key it was saved with, "
             "so the miss asserted above says nothing about model keys."
         )
+
+
+@pytest.mark.parametrize(
+    "soft_pin_ttl_ms, group_blocks",
+    [(60_000, False), (None, True), (60_000, True)],
+    ids=["soft_pin", "group", "both"],
+)
+def test_soft_pinned_grouped_pages_round_trip(mooncake_pool, soft_pin_ttl_ms, group_blocks):
+    """Pages put with a `ReplicateConfig` are stored and served like any other.
+
+    Proves the pinned bindings accept the soft-pin and group fields all the way
+    from the `mooncake_store` block, through the rendered client config, to the
+    put. Which page the master evicts first is left to cluster validation.
+    """
+    writer_page, reader_page = 4, 1
+    writer_buffer = _device_buffer(filled=True)
+    expected = _snapshot(writer_buffer, writer_page)
+
+    with open_worker(
+        mooncake_pool,
+        buffer=writer_buffer,
+        stage_through_host=True,
+        soft_pin_ttl_ms=soft_pin_ttl_ms,
+        group_blocks=group_blocks,
+    ) as writer:
+        assert writer._soft_pin_ttl_ms == soft_pin_ttl_ms
+        assert writer._group_blocks is group_blocks
+        save_page(writer, request_id=1, page_index=writer_page)
+
+    reader_buffer = _device_buffer(filled=False)
+    with open_worker(mooncake_pool, buffer=reader_buffer, stage_through_host=True) as reader:
+        assert reader.count_prefix_hit([BLOCK_HASH]) == 1, (
+            "A block put with a ReplicateConfig was not found, so the pool refused "
+            "or dropped the soft-pinned or grouped put."
+        )
+        load_page(reader, request_id=2, page_index=reader_page)
+
+    assert_page_matches(
+        reader_buffer, reader_page, expected, context="Replay of a soft-pinned or grouped put"
+    )
 
 
 # ---- RDMA over a real KVCacheManagerV2 ----

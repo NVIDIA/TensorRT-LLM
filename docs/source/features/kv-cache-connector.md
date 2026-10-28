@@ -815,6 +815,39 @@ keeps its own host and disk cache tiers, including the host tier
 [`MAX_UTILIZATION` suspends pages into](#kv-cache-tiers-are-gpu-only-under-a-connector), and pays
 no per-request or per-layer connector cost.
 
+### Pool eviction
+
+A full pool evicts on the master, and two settings shape what it evicts. Both apply only to a role
+that writes the pool (`both` or `producer`), both need `mooncake-transfer-engine-cuda13` 0.3.13 or
+newer, and both are off by default.
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    model_key: qwen2-1.5b-instruct
+    soft_pin_ttl_ms: 86400000   # 24 h, the master's default ceiling
+    group_blocks: true
+```
+
+* `soft_pin_ttl_ms` soft-pins every page the server writes for that many milliseconds. Mooncake
+  0.3.13's first eviction pass makes up a shortfall from the shard-ordered rest of the pool when
+  lookups re-lease part of its oldest frontier mid-eviction, which leaves holes in prefixes still in
+  use: a prefix is replayed only up to its first missing block, so every stored block behind a hole
+  is recomputed. Soft-pinned pages are evicted only by the second, age-ordered pass. The TTL must not
+  exceed the master's `--max_kv_soft_pin_ttl` (24 h by default), or the master refuses every put,
+  which the server logs once; and the master must allow evicting soft-pinned objects, which is
+  Mooncake's default.
+* `group_blocks` puts every page a hit on a block needs (all its layer groups and tensor-parallel
+  shards) into one eviction group, `<namespace>/<model_key>/w<world>/<block hash>`, so the master
+  evicts a block whole and never keeps a shard that holds space but can no longer hit. It matters
+  most under tensor parallelism, where a block has one page per rank.
+
+Both are per-server settings like `transfer_batch_size`, rendered into the client config and read
+back from an inherited `MOONCAKE_CONFIG_PATH`. Servers sharing a pool should agree on
+`soft_pin_ttl_ms`, since the master evicts unpinned pages first.
+
 ### Settings this connector overrides
 
 For a role that transfers KV, the pool *is* the deployment's offload tier, so the server's own

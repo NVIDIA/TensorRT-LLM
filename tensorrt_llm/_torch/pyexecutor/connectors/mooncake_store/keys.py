@@ -30,7 +30,8 @@ A key is `<namespace>/<block hash>`. The namespace pins down everything else
 that decides what the stored bytes mean: the model, the attention shard that
 produced them, the layer group inside that shard, the tokens each page holds and
 how many bytes a page is. A change to any of those reads as a miss rather than
-as garbage.
+as garbage. With `group_blocks`, the pages of one block also share an eviction
+group named by `KeyNamespace.group`.
 """
 
 import hashlib
@@ -234,3 +235,20 @@ class KeyNamespace:
     def key(self, block_hash: bytes) -> str:
         """The store key holding one page of this namespace."""
         return f"{self.prefix}/{block_hash.hex()}"
+
+    def group(self, block_hash: bytes) -> str:
+        """The Mooncake eviction group every page of one block is put into.
+
+        It leaves out the attention shard, the layer group, the tokens per
+        block and the page size, so every page a hit on this block needs (all
+        layer groups, all tensor-parallel shards) shares one group and the
+        master evicts them together. It keeps the shard count, so deployments
+        sharded differently never share a group.
+
+        Args:
+            block_hash: The block's hash, as its keys carry it.
+
+        Returns:
+            The group id to put the block's pages under.
+        """
+        return f"{self.namespace}/{self.model_key}/w{self.world_size}/{block_hash.hex()}"

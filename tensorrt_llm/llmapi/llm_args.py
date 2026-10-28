@@ -2655,6 +2655,25 @@ class MooncakeStoreConfig(StrictBaseModel):
         "registering the KV pools with Mooncake. For a host whose HCA cannot "
         "pin GPU pages; costs a copy each way. Ignored when role is "
         "'capacity'.")
+    soft_pin_ttl_ms: Optional[PositiveInt] = Field(
+        None,
+        telemetry=False,
+        description="Soft-pin every page this server writes for this many "
+        "milliseconds, so the master evicts the pool by age instead of "
+        "refilling an eviction shortfall in shard order, which punches holes "
+        "into prefixes still in use. Must not exceed the master's "
+        "--max_kv_soft_pin_ttl (24 h by default), or every put is refused, "
+        "and the master must allow evicting soft-pinned objects (Mooncake's "
+        "default). Ignored unless the role writes; needs Mooncake 0.3.13 or "
+        "newer.")
+    group_blocks: bool = Field(
+        False,
+        telemetry=False,
+        description="Put every page of a block (all layer groups and "
+        "tensor-parallel shards) into one Mooncake eviction group, so the "
+        "master evicts a block whole rather than leaving pages that hold "
+        "space but can never hit. Mostly matters under tensor parallelism. "
+        "Ignored unless the role writes; needs Mooncake 0.3.13 or newer.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,

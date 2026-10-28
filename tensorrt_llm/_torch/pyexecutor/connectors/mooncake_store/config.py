@@ -29,7 +29,7 @@ import re
 import socket
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
@@ -240,6 +240,18 @@ def parse_size(value: Any, *, strict_units: bool = False) -> int:
     return int(float(magnitude) * scale)
 
 
+def _json_bool(raw: Dict[str, Any], name: str, default: bool, path: str) -> bool:
+    """A JSON boolean setting, refusing anything else.
+
+    `bool("false")` is True, so coercing a quoted value would silently turn on
+    what the file meant to turn off.
+    """
+    value = raw.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name}={value!r} in {path} must be true or false")
+    return value
+
+
 def pool_config(llm_args: "TorchLlmArgs") -> Optional["MooncakeStoreConfig"]:
     """The `mooncake_store` block of `llm_args`, if the deployment set one.
 
@@ -310,6 +322,16 @@ class MooncakeStoreConnectorConfig:
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
+    #: Soft-pin every page this server writes for this many milliseconds, or
+    #: `None` to leave pages unpinned. Mooncake's first eviction pass refills a
+    #: shortfall in shard order rather than by age, which punches holes into
+    #: prefixes still in use; soft-pinned pages are evicted only by the second,
+    #: age-ordered pass. Must not exceed the master's `--max_kv_soft_pin_ttl`,
+    #: or the master refuses every put.
+    soft_pin_ttl_ms: Optional[int] = None
+    #: Put every page of a block, across layer groups and attention shards,
+    #: into one eviction group, so the master evicts a block whole.
+    group_blocks: bool = False
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -321,6 +343,11 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("global_segment_size must be >= 0")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
+        if self.soft_pin_ttl_ms is not None and self.soft_pin_ttl_ms <= 0:
+            raise ValueError(
+                f"soft_pin_ttl_ms must be > 0, or absent to leave pages unpinned; "
+                f"got {self.soft_pin_ttl_ms}"
+            )
 
     @property
     def capacity_only(self) -> bool:
@@ -356,6 +383,10 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", False)),
+            soft_pin_ttl_ms=(
+                int(raw["soft_pin_ttl_ms"]) if raw.get("soft_pin_ttl_ms") is not None else None
+            ),
+            group_blocks=_json_bool(raw, "group_blocks", False, path),
         )
 
     @staticmethod

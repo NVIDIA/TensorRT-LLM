@@ -25,3 +25,8 @@ kv_connector_config:
     segment_size: 32GiB
     # Identifies this checkpoint to the pool. Must match on every server.
     model_key: qwen2-1.5b-instruct
+    # Soft-pin written pages so a full pool evicts by age; must not exceed the
+    # master's --max_kv_soft_pin_ttl (24 h by default). Needs Mooncake 0.3.13+.
+    # soft_pin_ttl_ms: 86400000
+    # Evict every page of a block (all layer groups and TP shards) together.
+    # group_blocks: true
