@@ -30,20 +30,28 @@ from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers,
     DecoderInputPreparer,
+    HostInputs,
     _get_context_prompt_lookahead_token,
     _zero_fill_row_spans,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
+from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
 )
-from tensorrt_llm.llmapi import MTPDecodingConfig, NGramDecodingConfig, SADecodingConfig
+from tensorrt_llm.llmapi import (
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+    SADecodingConfig,
+    SamplingParams,
+)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -54,7 +62,6 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.kernels.spec_step_copies.op import StepInputGather
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.config import DecoderRunnerConfig
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
@@ -603,6 +610,136 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         if hasattr(attn_metadata, "seq_lens") and attn_metadata.seq_lens is not None:
             actual_seq_lens = attn_metadata.seq_lens.cpu().tolist()
             self.assertEqual(actual_seq_lens, expected_seq_lens)
+
+    def test_mrope_multi_beam_generation_positions(self) -> None:
+        """Every beam row gets its request's `past + delta` on all 3 axes."""
+        beam_width = 2
+        config = decoder_config(
+            max_batch_size=4, max_num_tokens=64, max_beam_width=beam_width, use_mrope=True
+        )
+        preparer = input_preparer(
+            config,
+            model=DummyModel(torch.half, rope_scaling={"type": "mrope"}),
+            buffers=DecoderInputBuffers.for_config(config, config.max_beam_width > 1),
+        )
+        # (num_tokens, delta): one delta arrives on the host and one is
+        # already a CUDA int32 scalar.
+        cases = (
+            (4, torch.tensor([[10]], dtype=torch.int32)),
+            (7, torch.tensor([[-3]], dtype=torch.int32, device="cuda")),
+        )
+        requests = []
+        for seq_slot, (num_tokens, delta) in enumerate(cases):
+            request = LlmRequest(
+                request_id=seq_slot + 1,
+                max_new_tokens=1,
+                input_tokens=list(range(1, num_tokens + 1)),
+                sampling_config=SamplingConfig(
+                    SamplingParams(n=beam_width, use_beam_search=True)._get_sampling_config()
+                ),
+                is_streaming=False,
+            )
+            request.py_seq_slot = seq_slot
+            request.py_multimodal_data = {"mrope_config": {"mrope_position_deltas": delta}}
+            requests.append(request)
+        host = HostInputs(
+            use_mrope=True,
+            mrope_dummy_seq_slot=config.max_num_tokens,
+            extra_inputs=preparer._new_extra_inputs(),
+            context_prompt_lookahead=None,
+        )
+        host.lists.generation_requests.extend(requests)
+
+        batched_mrope_generation_updates: list[tuple[int, int, torch.Tensor]] = []
+        preparer._pack_generation_requests(
+            host,
+            frozenset(),
+            None,
+            batched_mrope_generation_updates=batched_mrope_generation_updates,
+        )
+        host.total_num_tokens = len(host.lists.position_ids)
+        preparer._copy_position_ids_to_device(
+            host, batched_mrope_generation_updates=batched_mrope_generation_updates
+        )
+
+        # Both deltas take the batched scalar path, one row per beam.
+        self.assertEqual([row for row, _, _ in batched_mrope_generation_updates], [0, 1, 2, 3])
+        self.assertEqual(host.lists.mrope_position_ids, [])
+        # Without a previous tensor the past length is num_tokens - 1.
+        expected_row = [
+            num_tokens - 1 + int(delta) for num_tokens, delta in cases for _ in range(beam_width)
+        ]
+        self.assertEqual(expected_row, [13, 13, 3, 3])
+        torch.testing.assert_close(
+            preparer._buffers.mrope_position_ids_cuda[:, :, :4],
+            torch.tensor([[expected_row]] * 3, dtype=torch.int32, device="cuda"),
+            atol=0,
+            rtol=0,
+        )
+
+    def test_mrope_mixed_batched_and_fallback_positions_match_fallback(self) -> None:
+        """Mixed scalar batching matches the old per-request writes exactly."""
+        config = decoder_config(max_batch_size=2, max_num_tokens=64, use_mrope=True)
+        preparer = input_preparer(
+            config,
+            model=DummyModel(torch.half, rope_scaling={"type": "mrope"}),
+            buffers=DecoderInputBuffers.for_config(config, config.max_beam_width > 1),
+        )
+        sentinel = 123
+
+        def run(
+            delta_dtypes: tuple[torch.dtype, torch.dtype],
+        ) -> tuple[HostInputs, list[tuple[int, int, torch.Tensor]], torch.Tensor]:
+            requests = []
+            for seq_slot, (num_tokens, delta, dtype) in enumerate(
+                zip((4, 7), (10, -3), delta_dtypes)
+            ):
+                request = LlmRequest(
+                    request_id=seq_slot + 1,
+                    max_new_tokens=1,
+                    input_tokens=list(range(1, num_tokens + 1)),
+                    sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+                    is_streaming=False,
+                )
+                request.py_seq_slot = seq_slot
+                request.py_multimodal_data = {
+                    "mrope_config": {
+                        "mrope_position_deltas": torch.tensor([[delta]], dtype=dtype, device="cuda")
+                    }
+                }
+                requests.append(request)
+            host = HostInputs(
+                use_mrope=True,
+                mrope_dummy_seq_slot=config.max_num_tokens,
+                extra_inputs=preparer._new_extra_inputs(),
+                context_prompt_lookahead=None,
+            )
+            host.lists.generation_requests.extend(requests)
+            batched_mrope_generation_updates: list[tuple[int, int, torch.Tensor]] = []
+            preparer._pack_generation_requests(
+                host,
+                frozenset(),
+                None,
+                batched_mrope_generation_updates=batched_mrope_generation_updates,
+            )
+            host.total_num_tokens = len(host.lists.position_ids)
+            preparer._buffers.mrope_position_ids_cuda.fill_(sentinel)
+            preparer._copy_position_ids_to_device(
+                host, batched_mrope_generation_updates=batched_mrope_generation_updates
+            )
+            positions = preparer._buffers.mrope_position_ids_cuda.clone()
+            return host, batched_mrope_generation_updates, positions
+
+        mixed_host, mixed_updates, mixed = run((torch.int32, torch.int64))
+        _, fallback_updates, fallback = run((torch.int64, torch.int64))
+
+        self.assertEqual([row for row, _, _ in mixed_updates], [0])
+        self.assertEqual(
+            [(start, end) for start, end, _ in mixed_host.lists.mrope_position_ids], [(1, 2)]
+        )
+        self.assertEqual(fallback_updates, [])
+        torch.testing.assert_close(mixed, fallback, atol=0, rtol=0)
+        self.assertTrue(torch.all(mixed[:, :, 2:] == sentinel).item())
 
     def _setup_mrope_inputs(
         self,

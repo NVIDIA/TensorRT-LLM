@@ -1811,6 +1811,9 @@ public:
     LlmRequest(LlmRequest&& request) = default;
     LlmRequest(LlmRequest const& request) = default;
 
+    /// @brief Construct an unregistered child from request inputs, with fresh execution state.
+    LlmRequest(LlmRequest const& parent, RequestIdType requestId);
+
     std::optional<executor::Result> createResult();
 
     void createSerializedResult(std::vector<char>& serializedResult, bool& isFinal);
@@ -1824,6 +1827,9 @@ public:
         SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool enableKVCacheReuse = false);
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
+
+    /// @brief Retain the actual executing child and commit its sequence-group membership.
+    void registerChildRequest(std::shared_ptr<LlmRequest> const& child);
 
     // Remove LoRA weights and LoRA config tensors
     void removeLoraTensors();
