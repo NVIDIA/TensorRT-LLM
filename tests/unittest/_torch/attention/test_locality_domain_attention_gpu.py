@@ -64,11 +64,14 @@ def _domains(batch: int, localized: bool):
     return [0] * half + [1] * (batch - half)
 
 
-def _manager(
-    *, mla: bool, batch: int, cached: int, num_kv_heads: int, head_dim: int, localized: bool
-):
+def _cached_lengths(cached, batch: int) -> list[int]:
+    return list(cached) if isinstance(cached, (list, tuple)) else [cached] * batch
+
+
+def _manager(*, mla: bool, batch: int, cached, num_kv_heads: int, head_dim: int, localized: bool):
     tokens_per_block = 32 if mla else 64
-    max_seq_len = cached + 1 + tokens_per_block
+    lengths = _cached_lengths(cached, batch)
+    max_seq_len = max(lengths) + 1 + tokens_per_block
     blocks_per_seq = math.ceil(max_seq_len / tokens_per_block)
     cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType
     manager = KVCacheManagerV2(
@@ -88,7 +91,9 @@ def _manager(
         enable_locality_domains=localized,
     )
     requests = manager.add_dummy_requests(
-        list(range(batch)), [cached + 1] * batch, locality_domain_ids=_domains(batch, localized)
+        list(range(batch)),
+        [length + 1 for length in lengths],
+        locality_domain_ids=_domains(batch, localized),
     )
     assert requests is not None
     if localized:
@@ -96,16 +101,17 @@ def _manager(
     return manager
 
 
-def _metadata(manager, *, mla: bool, batch: int, cached: int, localized: bool):
+def _metadata(manager, *, mla: bool, batch: int, cached, localized: bool):
+    lengths = _cached_lengths(cached, batch)
     kwargs = dict(
         num_contexts=0,
-        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached] * batch),
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=lengths),
         seq_lens=torch.ones(batch, dtype=torch.int),
         max_num_requests=batch,
         max_num_tokens=8192,
         kv_cache_manager=manager,
         request_ids=list(range(batch)),
-        prompt_lens=[cached + 1] * batch,
+        prompt_lens=[length + 1 for length in lengths],
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         locality_domain_enabled=localized,
     )
@@ -182,11 +188,11 @@ def _gqa_output(*, batch: int, cached: int, localized: bool) -> torch.Tensor:
         manager.shutdown()
 
 
-def _mla_output(*, batch: int, cached: int, localized: bool) -> torch.Tensor:
-    num_heads = 64
+def _mla_output(*, batch: int, cached, localized: bool, num_heads: int = 64) -> torch.Tensor:
     gen = torch.Generator(device="cuda").manual_seed(0)
     latent = [
-        torch.randn(cached, _MLA_HEAD_DIM, device="cuda", generator=gen) * 0.5 for _ in range(batch)
+        torch.randn(length, _MLA_HEAD_DIM, device="cuda", generator=gen) * 0.5
+        for length in _cached_lengths(cached, batch)
     ]
     fused_q = torch.randn(batch, num_heads * _MLA_HEAD_DIM, device="cuda", generator=gen).to(
         torch.bfloat16
@@ -302,5 +308,33 @@ def test_gqa_decode_matches_with_locality_domains(batch, cached):
 def test_mla_decode_matches_with_locality_domains(batch, cached):
     off = _mla_output(batch=batch, cached=cached, localized=False)
     on = _mla_output(batch=batch, cached=cached, localized=True)
+    assert torch.isfinite(on).all()
+    torch.testing.assert_close(on, off, atol=2e-2, rtol=2e-2)
+
+
+def test_cute_dsl_mla_decode_with_unequal_domain_lengths(monkeypatch):
+    # CuTe DSL MLA caches its split-KV plan on the metadata. Domain 0 holds short
+    # contexts and domain 1 long ones, so their plans differ; with one shared plan
+    # the domain-1 writer would race domain 0's kernels on the other stream.
+    from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "cute_dsl_mla,fallback")
+    plans = []
+    split_kv_plan = CuteDslMlaFmha._split_kv_plan
+
+    def recording_split_kv_plan(*args, **kwargs):
+        plan = split_kv_plan(*args, **kwargs)
+        plans.append(None if plan is None else plan.data_ptr())
+        return plan
+
+    monkeypatch.setattr(CuteDslMlaFmha, "_split_kv_plan", staticmethod(recording_split_kv_plan))
+    batch = 32
+    cached = [1000] * (batch // 2) + [16384] * (batch // 2)
+    off = _mla_output(batch=batch, cached=cached, localized=False, num_heads=96)
+    assert len(plans) == 1 and plans[0] is not None
+    plans.clear()
+    on = _mla_output(batch=batch, cached=cached, localized=True, num_heads=96)
+    assert len(plans) == 2 and None not in plans
+    assert plans[0] != plans[1]
     assert torch.isfinite(on).all()
     torch.testing.assert_close(on, off, atol=2e-2, rtol=2e-2)

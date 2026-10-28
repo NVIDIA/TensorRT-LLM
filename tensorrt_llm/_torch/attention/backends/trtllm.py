@@ -338,6 +338,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # spec_decoding_bl_tree_mask).
     locality_domain_spec_decoding_bl_tree_masks: Optional[List[Optional[
         torch.Tensor]]] = None
+    # Per-domain (_cute_dsl_mla_split_plan, _cute_dsl_mla_split_plan_key).
+    locality_domain_cute_dsl_mla_split_plans: Optional[List[Tuple[
+        Optional[torch.Tensor], Optional[tuple]]]] = None
     # Layout whose domain slices last passed _validate_locality_domain_coverage;
     # the check reruns only when the layout changes.
     locality_domain_validated_layout: Optional[tuple] = None
@@ -726,6 +729,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 torch.empty(0, device='cuda', dtype=torch.int8)
                 for _ in range(num_locality_domains)
             ]
+        if (self.locality_domain_cute_dsl_mla_split_plans is None
+                or len(self.locality_domain_cute_dsl_mla_split_plans)
+                != num_locality_domains):
+            self.locality_domain_cute_dsl_mla_split_plans = [
+                (None, None)
+            ] * num_locality_domains
 
     def update_for_spec_dec(self) -> None:
         if self.enable_flash_mla:
@@ -741,6 +750,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
         self._cute_dsl_mla_split_plan_key = None
+        plans = self.locality_domain_cute_dsl_mla_split_plans
+        if plans is not None:
+            plans[:] = [(plan, None) for plan, _ in plans]
 
         if (not self.locality_domain_enabled or self.kv_cache_manager is None
                 or self.request_ids is None):
@@ -2465,12 +2477,23 @@ def _locality_domain_metadata(metadata, ld_slice, locality_domain_id):
                               metadata.locality_domain_cuda_graph_workspaces)):
         if per_domain is not None and locality_domain_id < len(per_domain):
             overrides[name] = per_domain[locality_domain_id]
+    # CuTe DSL MLA caches its split-KV plan on the metadata and rewrites it when
+    # the key changes; a shared plan would be rewritten by one domain's stream
+    # while the other domain's kernels still read it.
+    plans = metadata.locality_domain_cute_dsl_mla_split_plans
+    has_plan = plans is not None and locality_domain_id < len(plans)
+    if has_plan:
+        (overrides["_cute_dsl_mla_split_plan"],
+         overrides["_cute_dsl_mla_split_plan_key"]) = plans[locality_domain_id]
     saved = {k: getattr(metadata, k) for k in overrides}
     try:
         for name, value in overrides.items():
             setattr(metadata, name, value)
         yield
     finally:
+        if has_plan:
+            plans[locality_domain_id] = (metadata._cute_dsl_mla_split_plan,
+                                         metadata._cute_dsl_mla_split_plan_key)
         for name, value in saved.items():
             setattr(metadata, name, value)
 
