@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cuda/atomic>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_pipeline.h>
 #include <optional>
 #include <tuple>
@@ -1011,17 +1012,25 @@ inline __device__ uint2 ldVolatileU32x2(void const* ptr)
     return v;
 }
 
+// The E4M3 conversion instructions exist from SM 8.9 on. Older targets, which never launch the E4M3 kernels (they
+// require SM 9.0), use the equivalent cuda_fp8.h conversions so the file still compiles for every architecture.
+
 // Two FP32 -> two E4M3 (RN, satfinite) in the low 16 bits, lo first.
 inline __device__ uint32_t e4m3x2(float lo, float hi)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
     uint16_t h;
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h) : "f"(hi), "f"(lo));
     return h;
+#else
+    return __nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
+#endif
 }
 
 // Four E4M3 (byte i = element i) -> four FP32 (exact, through FP16).
 inline __device__ void e4m3x4ToFloat(uint32_t w, float* out)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
     uint32_t h01, h23;
     asm("{\n\t.reg .b16 lo, hi;\n\tmov.b32 {lo, hi}, %2;\n\tcvt.rn.f16x2.e4m3x2 %0, lo;\n\t"
         "cvt.rn.f16x2.e4m3x2 %1, hi;\n\t}"
@@ -1033,6 +1042,15 @@ inline __device__ void e4m3x4ToFloat(uint32_t w, float* out)
     asm("{\n\t.reg .b16 a, b;\n\tmov.b32 {a, b}, %2;\n\tcvt.f32.f16 %0, a;\n\tcvt.f32.f16 %1, b;\n\t}"
         : "=f"(out[2]), "=f"(out[3])
         : "r"(h23));
+#else
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+    {
+        __half2_raw const h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(w >> (16 * i)), __NV_E4M3);
+        out[2 * i] = __half2float(__half(__half_raw{h.x}));
+        out[2 * i + 1] = __half2float(__half(__half_raw{h.y}));
+    }
+#endif
 }
 
 // max |x| over the warp's 32 x 8 values (every lane gets it), at least 1e-30.
