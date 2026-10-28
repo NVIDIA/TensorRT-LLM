@@ -4018,12 +4018,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     imagePullPolicy: Always
         """
     }
-    // Temporarily avoid an arm64 CPU builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-    def blockedNodeAffinity = targetCloud == "kubernetes-cpu" && arch == "arm64" ? '''
-                              - key: "kubernetes.io/hostname"
-                                operator: NotIn
-                                values:
-                                - "rl300-0021.ipp2a1.colossus"''' : ""
     // CPU test pods mount the model scratch from 10.117.145.14, which is not exported to the builders
     // in the ipp6/ipp9 DCs. Pods placed there stay in ContainerCreating.
     // Build pods do not mount the model scratch, so they can still use these nodes.
@@ -4086,7 +4080,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                                 - "qa_only"
-${blockedNodeAffinity}
 ${scratchUnreachableNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:

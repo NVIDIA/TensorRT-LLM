@@ -117,7 +117,7 @@ def globalVars = [
 @Field
 def imageKeyToTag = [:]
 
-def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
+def createKubernetesPodConfig(type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
@@ -126,66 +126,6 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
                   kubernetes.io/arch: ${arch}"""
-
-    if (build_wheel && arch == "arm64") {
-        // For aarch64, we need to use hostname to fix the ucxx issue when building wheels
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: In
-                                      values:
-                                        - "rl300-0008.ipp2u1.colossus"
-                                        - "rl300-0014.ipp2u1.colossus"
-                                        - "rl300-0023.ipp2u1.colossus"
-                                        - "rl300-0024.ipp2u1.colossus"
-                                        - "rl300-0030.ipp2u1.colossus"
-                                        - "rl300-0040.ipp2u1.colossus"
-                                        - "rl300-0041.ipp2u1.colossus"
-                                        - "rl300-0042.ipp2u1.colossus"
-                                        - "rl300-0043.ipp2u1.colossus"
-                                        - "rl300-0044.ipp2u1.colossus"
-                                        - "rl300-0045.ipp2u1.colossus"
-                                        - "rl300-0046.ipp2u1.colossus"
-                                        - "rl300-0047.ipp2u1.colossus"
-        """
-    } else if (arch == "arm64") {
-        // Temporarily avoid an arm64 builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: NotIn
-                                      values:
-                                        - "rl300-0021.ipp2a1.colossus"
-        """
-    }
-
-    if (arch == "amd64") {
-        // For x86_64, we block some nodes to avoid unstable network access.
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: NotIn
-                                      values:
-                                        - "sc-ipp-blossom-prod-k8w-105"
-                                        - "sc-ipp-blossom-prod-k8w-114"
-                                        - "sc-ipp-blossom-prod-k8w-115"
-                                        - "sc-ipp-blossom-prod-k8w-121"
-                                        - "sc-ipp-blossom-prod-k8w-123"
-                                        - "sc-ipp-blossom-prod-k8w-124"
-        """
-    }
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
@@ -770,7 +710,6 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         args: "",
         torchInstallType: "skip",
         arch: "amd64",
-        build_wheel: false,
         dependent: [:],
         dockerfileStage: "tritondevel",
     ]
@@ -792,14 +731,12 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
-            build_wheel: true,
             dockerfileStage: "tritonrelease",
         ],
         (stageNames.internalReleaseSBSA): [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
-            build_wheel: true,
             arch: "arm64",
             dockerfileStage: "tritonrelease",
         ],
@@ -827,7 +764,6 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
-            build_wheel: true,
             dependent: [
                 target: "ngc-devel",
                 dockerfileStage: "devel",
@@ -839,7 +775,6 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
             arch: "arm64",
-            build_wheel: true,
             dependent: [
                 target: "ngc-devel",
                 dockerfileStage: "devel",
@@ -890,7 +825,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                 config[defaultKey] = defaultValue
             }
         }
-        config.podConfig = createKubernetesPodConfig("build", config.arch, config.build_wheel)
+        config.podConfig = createKubernetesPodConfig("build", config.arch)
     }
     echo "Build configs:"
     println buildConfigs
