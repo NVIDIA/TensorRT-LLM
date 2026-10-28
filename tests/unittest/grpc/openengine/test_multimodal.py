@@ -43,6 +43,7 @@ from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData  # noqa: E4
 from tensorrt_llm.inputs.registry import (  # noqa: E402
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
+    DefaultInputProcessor,
 )
 from tensorrt_llm.llmapi.llm import PreprocessedInputs  # noqa: E402
 
@@ -505,10 +506,11 @@ def test_decoded_audio_bytes_count_samples_and_reject_unknown_types():
         request_mapping._decoded_audio_bytes(object())
 
 
+@pytest.mark.parametrize("audio_format", ["FLAC", "MP3"])
 @pytest.mark.parametrize("channels", [1, 2])
 @pytest.mark.parametrize("source", ["bytes", "base64", "file"])
 def test_audio_reserves_before_decoding_and_preserves_samples(
-    channels, source, tmp_path, monkeypatch
+    audio_format, channels, source, tmp_path, monkeypatch
 ):
     import base64
 
@@ -516,15 +518,17 @@ def test_audio_reserves_before_decoding_and_preserves_samples(
 
     samples = np.arange(32 * channels, dtype=np.float64).reshape(32, channels) / 128
     encoded = BytesIO()
-    soundfile.write(encoded, samples, 16000, format="FLAC")
+    soundfile.write(encoded, samples, 16000, format=audio_format)
     data = encoded.getvalue()
     expected, _ = soundfile.read(BytesIO(data))
-    budget = request_mapping._DecodedMediaBudget(samples.nbytes)
+    with soundfile.SoundFile(BytesIO(data)) as audio:
+        reserved_bytes = audio.frames * audio.channels * np.dtype(np.float64).itemsize
+    budget = request_mapping._DecodedMediaBudget(reserved_bytes)
     original_read = soundfile.SoundFile.read
 
     def checked_read(audio, *args, **kwargs):
-        assert (budget._used, budget._reserved_retained) == (samples.nbytes, samples.nbytes)
-        assert kwargs["out"].nbytes == samples.nbytes
+        assert (budget._used, budget._reserved_retained) == (reserved_bytes, reserved_bytes)
+        assert kwargs["out"].nbytes == reserved_bytes
         return original_read(audio, *args, **kwargs)
 
     monkeypatch.setattr(soundfile.SoundFile, "read", checked_read)
@@ -532,21 +536,28 @@ def test_audio_reserves_before_decoding_and_preserves_samples(
     if source == "bytes":
         decoded, rate = loader.load_bytes(data)
     elif source == "base64":
-        decoded, rate = loader.load_base64("audio/flac", base64.b64encode(data).decode())
+        decoded, rate = loader.load_base64(
+            "audio/mpeg" if audio_format == "MP3" else "audio/flac",
+            base64.b64encode(data).decode(),
+        )
     else:
-        path = tmp_path / "audio.flac"
+        path = tmp_path / f"audio.{audio_format.lower()}"
         path.write_bytes(data)
         decoded, rate = loader.load_file(path.as_uri())
-    np.testing.assert_array_equal(decoded, expected)
+    if audio_format == "MP3":
+        # Buffered and ordinary MP3 reads can differ by float32 rounding.
+        np.testing.assert_allclose(decoded, expected, rtol=0, atol=np.finfo(np.float32).eps)
+    else:
+        np.testing.assert_array_equal(decoded, expected)
     assert rate == 16000
     assert (budget._used, budget._retained, budget._reserved_retained) == (
-        samples.nbytes,
-        samples.nbytes,
+        expected.nbytes,
+        expected.nbytes,
         0,
     )
 
 
-@pytest.mark.parametrize("outcome", ["oversized", "failure", "truncated", "cancelled"])
+@pytest.mark.parametrize("outcome", ["oversized", "failure", "cancelled"])
 def test_audio_budget_rejects_before_allocation_and_cleans_up(outcome, monkeypatch):
     import soundfile
 
@@ -562,7 +573,6 @@ def test_audio_budget_rejects_before_allocation_and_cleans_up(outcome, monkeypat
             raise RuntimeError("decode failed")
         if outcome == "cancelled":
             raise asyncio.CancelledError()
-        return kwargs["out"][:0]
 
     monkeypatch.setattr(soundfile.SoundFile, "read", read)
     if outcome == "oversized":
@@ -572,12 +582,44 @@ def test_audio_budget_rejects_before_allocation_and_cleans_up(outcome, monkeypat
     error = {
         "oversized": ValueError,
         "failure": RuntimeError,
-        "truncated": ValueError,
         "cancelled": asyncio.CancelledError,
     }[outcome]
     with pytest.raises(error):
         loader.load_bytes(encoded.getvalue())
     assert (budget._used, budget._retained, budget._reserved_retained) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+@pytest.mark.parametrize("decoded_frames", [0, 17])
+def test_audio_short_read_preserves_samples_and_accounts_for_owning_storage(
+    channels, decoded_frames, monkeypatch
+):
+    import soundfile
+
+    encoded = BytesIO()
+    samples = np.arange(32 * channels, dtype=np.float64).reshape(32, channels) / 128
+    soundfile.write(encoded, samples, 16000, format="FLAC")
+    expected, _ = soundfile.read(BytesIO(encoded.getvalue()))
+    budget = request_mapping._DecodedMediaBudget(samples.nbytes)
+    original_read = soundfile.SoundFile.read
+
+    def short_read(audio, *args, **kwargs):
+        assert budget._used == samples.nbytes
+        return original_read(audio, *args, **kwargs)[:decoded_frames]
+
+    monkeypatch.setattr(soundfile.SoundFile, "read", short_read)
+    decoded, rate = media_io.AudioMediaIO(decoded_memory_reserver=budget.reserve).load_bytes(
+        encoded.getvalue()
+    )
+    np.testing.assert_array_equal(decoded, expected[:decoded_frames])
+    assert rate == 16000
+    assert decoded.flags.owndata
+    assert decoded.base is None
+    assert (budget._used, budget._retained, budget._reserved_retained) == (
+        decoded.nbytes,
+        decoded.nbytes,
+        0,
+    )
 
 
 @pytest.mark.asyncio
@@ -634,6 +676,31 @@ async def test_gemma4_audio_capability_requires_checkpoint_encoder(audio_encoder
         )
         with pytest.raises(UnsupportedFeatureError, match="audio"):
             await request_mapping._input_from_request(request, llm, capabilities)
+
+
+@pytest.mark.parametrize("config_state", ["absent", "none"])
+def test_gemma4_missing_processor_config_fails_closed(config_state, monkeypatch):
+    config = SimpleNamespace(model_type="gemma4", audio_config=object())
+    processor = _ImageInputProcessor(config)
+    if config_state == "absent":
+        del processor._config
+    else:
+        processor._config = None
+    llm = SimpleNamespace(input_processor=processor, _hf_model_config=config)
+    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda *args: True)
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_placeholder",
+        lambda model_type, modality: f"<{modality}_{{}}>",
+    )
+    capabilities = request_mapping.media_capabilities_for_model(llm)
+    assert "image" in capabilities.modalities
+    assert "audio" not in capabilities.modalities
+
+
+def test_default_input_processor_declares_token_ids_supported():
+    processor = DefaultInputProcessor(model_path="unused", config=None, tokenizer=None)
+    assert processor.supports_token_ids_input is True
 
 
 def test_decoded_media_budget_settles_peak_to_retained_bytes():

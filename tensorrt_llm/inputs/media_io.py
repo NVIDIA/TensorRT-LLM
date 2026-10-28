@@ -135,8 +135,8 @@ _SUPPORTED_IMAGE_FORMATS = ("pt", "np", "pil")
 _SUPPORTED_VIDEO_FORMATS = ("pt", "np", "pil")
 
 # One aiohttp session per event loop. Media loading can run on multiple live
-# loops in one process, and aiohttp sessions must only be used and closed from
-# their owning loop.
+# loops in one process. Live sessions must only be used and closed from their
+# owning loop; closed-loop entries are disposed on the next lookup.
 _aiohttp_sessions: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
 _aiohttp_sessions_lock = threading.Lock()
 
@@ -145,11 +145,16 @@ async def _get_aiohttp_session() -> aiohttp.ClientSession:
     """Return the aiohttp session owned by the current event loop."""
     current_loop = asyncio.get_running_loop()
     with _aiohttp_sessions_lock:
+        stale_sessions = [
+            _aiohttp_sessions.pop(loop) for loop in list(_aiohttp_sessions) if loop.is_closed()
+        ]
         session = _aiohttp_sessions.get(current_loop)
         if session is None or session.closed:
             connector = aiohttp.TCPConnector(resolver=_ValidatingResolver())
             session = aiohttp.ClientSession(connector=connector)
             _aiohttp_sessions[current_loop] = session
+    for stale_session in stale_sessions:
+        await stale_session.close()
     return session
 
 
@@ -1361,7 +1366,11 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
                 samples = np.empty(shape, dtype=np.float64)
                 decoded = audio.read(frames=frames, out=samples)
                 if decoded.shape != samples.shape:
-                    raise ValueError("audio decoded fewer frames than its header declares")
+                    # Compressed headers may overestimate frames. Drop the decoder's
+                    # view before shrinking the owning allocation and its budget.
+                    decoded_shape = decoded.shape
+                    decoded = None
+                    samples.resize(decoded_shape)
                 sample_rate = audio.samplerate
             reservation.commit(samples.nbytes)
             return samples, sample_rate

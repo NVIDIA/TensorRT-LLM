@@ -480,7 +480,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             return lifecycle_pb2.HealthCheck(
                 name="inference_probe",
                 state=lifecycle_pb2.HEALTH_STATE_READY,
-                message="probe not applicable: model does not accept token-ID input",
+                message=(
+                    "probe not applicable: model does not accept token-ID input; "
+                    "inference liveness was not tested"
+                ),
             )
         handle = None
         reservation = None

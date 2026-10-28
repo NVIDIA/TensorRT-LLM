@@ -98,7 +98,10 @@ def resolve_media_capabilities(
         if MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality)
     }
     # Gemma4 checkpoints may omit the audio encoder despite sharing a model type.
-    if model_type == "gemma4" and getattr(input_processor.config, "audio_config", None) is None:
+    if (
+        model_type == "gemma4"
+        and getattr(getattr(input_processor, "config", None), "audio_config", None) is None
+    ):
         placeholders.pop("audio", None)
     # Fail startup before Control advertises a malformed template.
     for modality, template in placeholders.items():

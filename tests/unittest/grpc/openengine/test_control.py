@@ -442,6 +442,7 @@ async def test_health_probe_is_not_applicable_to_text_only_input_models():
     probe = next(check for check in response.checks if check.name == "inference_probe")
     assert probe.state == lifecycle_pb2.HEALTH_STATE_READY
     assert "not applicable" in probe.message
+    assert "inference liveness was not tested" in probe.message
     assert response.state == lifecycle_pb2.HEALTH_STATE_READY
 
 

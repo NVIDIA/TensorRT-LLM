@@ -69,6 +69,11 @@ Set `failureThreshold * periodSeconds` to cover the longest expected model start
 
 OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
 
+For models that do not accept token-ID input, including Whisper, the optional
+`Health(include_inference_probe=True)` check reports the inference probe as not
+applicable. It does not submit inference and does not establish inference liveness;
+the ordinary lifecycle and executor health checks still apply.
+
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.

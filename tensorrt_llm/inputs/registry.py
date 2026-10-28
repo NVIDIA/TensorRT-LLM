@@ -100,6 +100,9 @@ class InputProcessor(Protocol):
         - Register the inherited class to the model class using @register_input_processor(...)
     """
 
+    supports_token_ids_input: bool = True
+    """Whether pre-tokenized prompts are accepted; encoder-driven processors may opt out."""
+
     model_path: any
     config: any
     tokenizer: any

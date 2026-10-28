@@ -182,6 +182,20 @@ class TestSessionReuse:
         assert not second_session.closed
 
     @pytest.mark.asyncio
+    async def test_closed_event_loop_sessions_are_disposed_on_next_lookup(self):
+        async def abandoned_session():
+            return asyncio.get_running_loop(), await _get_aiohttp_session()
+
+        loop, session = await asyncio.to_thread(asyncio.run, abandoned_session())
+        assert loop.is_closed()
+        assert loop in media_io_module._aiohttp_sessions
+        assert not session.closed
+        current_session = await _get_aiohttp_session()
+        assert loop not in media_io_module._aiohttp_sessions
+        assert session.closed
+        assert not current_session.closed
+
+    @pytest.mark.asyncio
     async def test_live_event_loops_keep_independent_sessions(self):
         first_session = await _get_aiohttp_session()
         worker_ready = threading.Event()
