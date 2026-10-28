@@ -172,6 +172,7 @@ class _ControlExecutor:
         self.control_action_done.set()  # the action completes immediately
         self.hang_detector = MagicMock()
         self._active_control_id = None
+        self.dwdp_manager = None
 
     def _num_inflight_kv_transfers(self):
         return self._transfers
@@ -234,7 +235,7 @@ class TestHandleControlRequest:
     def test_drain_transfer_deadline_is_rank_local(self, monkeypatch):
         ex = _ControlExecutor(drain=True, attention_dp=False, transfers=1)
         now = [1000.0]
-        monkeypatch.setattr(time, "time", lambda: now[0])
+        monkeypatch.setattr(time, "monotonic", lambda: now[0])
 
         assert ex._control_drain_ready(1) is False
         assert ex._control_drain_transfer_deadline > 1000.0  # armed on first sight

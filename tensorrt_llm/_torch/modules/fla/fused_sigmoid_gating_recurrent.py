@@ -511,7 +511,8 @@ def _fi_wide_vec_compiled_entry(H: int, HV: int, pool: torch.Tensor,
     cache = _fi_wide_vec_compiled.get(cache_key)
     if cache is None:
         return None
-    entry = (cache["compiled"], pool[:1, :1, :1])
+    # Own storage: a view would keep the whole pool alive in this module-level cache.
+    entry = (cache["compiled"], pool[:1, :1, :1].clone())
     if len(_fi_wide_vec_entries) >= 256:
         _fi_wide_vec_entries.clear()
     _fi_wide_vec_entries[key] = entry

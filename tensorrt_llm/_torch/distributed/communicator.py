@@ -274,18 +274,14 @@ class Distributed(ABC):
     def allgather_ints(self, values: List[int]) -> List[List[int]]:
         """All-gather one fixed-width vector of Python ints per TP rank.
 
-        Rides ``tp_allgather`` of an int64 CPU tensor, i.e. exactly the
-        transport (and fallback) the attention-DP RankState exchange uses,
-        so callers packing several per-iteration votes into one vector can
-        never take a different path than the gather they replace.  Every
-        rank must pass the same number of values: tensor all-gathers have
-        no size exchange.  Returns one plain ``list[int]`` per rank,
-        indexed by TP rank -- never tensors -- so consumers see the same
-        Python types as from an object all-gather.
+        Rides ``tp_allgather_int64``: one buffer collective under MPI and the
+        CUDA-staged CPU-tensor path under TorchDist, falling back to the
+        object gather where that is unavailable.  Every rank must pass the
+        same number of values: fixed-size gathers have no size exchange.
+        Returns one plain ``list[int]`` per rank, indexed by TP rank.
         """
         width = len(values)
-        rows = self.tp_allgather(torch.tensor(list(values), dtype=torch.int64))
-        result = [row.tolist() for row in rows]
+        result = self.tp_allgather_int64(values).tolist()
         if any(len(row) != width for row in result):
             raise RuntimeError(
                 f"allgather_ints: rank {self.rank} sent {width} values but "

@@ -8,6 +8,7 @@ and the registration -- therefore lost its final response and the caller waited
 for it forever (seen as 1800 s request timeouts in disaggregated serving).
 """
 
+import importlib.util
 import types
 
 import pytest
@@ -71,12 +72,10 @@ _MixinProxy.__abstractmethods__ = frozenset()
 
 def _proxy_classes():
     classes = [_MixinProxy]
-    try:
+    if importlib.util.find_spec("ray") is not None:
         from tensorrt_llm.executor.ray.executor import RayExecutor
 
         classes.append(RayExecutor)
-    except Exception:  # ray not installed
-        pass
     return classes
 
 
