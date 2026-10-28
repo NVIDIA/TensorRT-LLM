@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Decoder execution moved out of ``PyTorchModelEngine``."""
+"""Decoder execution moved out of ``ModelEngine``."""
 
 import contextlib
 import inspect
@@ -33,7 +33,9 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.sampler.beam_search import PendingBeamHistories
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
@@ -177,6 +179,11 @@ class DecoderRunner(ScheduledModelRunner):
         # sampling lands at the end of the captured forward graph instead of
         # costing a separate launch. Left None when the sampler does not opt in.
         self.sample_in_graph_callable = None
+        # Starts rebuilding each live beam's generated tokens for beam-search
+        # requests, registered by PyExecutor from the sampler. Logits
+        # post-processors read the result instead of the per-slot token lists
+        # (see _start_beam_histories). Left None when the sampler has none.
+        self.start_beam_histories_callable = None
         # Stages (or clears) in-graph sampling state once the batch is settled.
         self._stage_in_graph_sampling = None
         # Set by warmup: whether a forward is the TRTLLM-Gen FMHA JIT warmup,
@@ -666,6 +673,8 @@ class DecoderRunner(ScheduledModelRunner):
                     runtime_draft_len=runtime_draft_len,
                 )
 
+            pending_beam_histories = self._start_beam_histories(semantic_requests)
+
             graph_key = key if can_run_graph else None
             captures_model_body = self._graphs.captures_model_body(graph_key)
             outputs = self._graphs.run(
@@ -692,7 +701,7 @@ class DecoderRunner(ScheduledModelRunner):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
-            self._execute_logit_post_processors(semantic_requests, outputs)
+            self._execute_logit_post_processors(semantic_requests, outputs, pending_beam_histories)
 
             if not isinstance(outputs, dict):
                 return outputs
@@ -820,10 +829,42 @@ class DecoderRunner(ScheduledModelRunner):
         # back would be a self-assignment, which torch rejects for the
         # non-contiguous slices a TP-padded vocab produces.
 
+    def _start_beam_histories(
+        self, scheduled_requests: ScheduledRequests
+    ) -> tuple[list[LlmRequest], PendingBeamHistories] | None:
+        """Start copying the live beam histories that logits post-processors will read.
+
+        Under beam search, request.get_tokens(beam_idx) is the list of tokens
+        appended to slot beam_idx, which stops matching the hypothesis that slot
+        holds as soon as the search reorders its beams; the corrected paths are
+        only written back when the request finishes. Processors get each live
+        beam's real history instead, gathered for all such requests in one pass.
+        The gather and its copy are queued before the forward pass, so the
+        processors wait for the copy rather than for the forward pass.
+        """
+        if self.start_beam_histories_callable is None or not self._mapping.is_last_pp_rank():
+            return None
+        beam_requests = [
+            request
+            for request in scheduled_requests.generation_requests
+            if getattr(request, "py_logits_post_processors", None)
+            and request.get_beam_width_by_iter(for_next_iteration=False) > 1
+        ]
+        if not beam_requests:
+            return None
+        return beam_requests, self.start_beam_histories_callable(beam_requests)
+
     def _execute_logit_post_processors(
-        self, scheduled_requests: ScheduledRequests, outputs: dict
+        self,
+        scheduled_requests: ScheduledRequests,
+        outputs: dict,
+        pending_beam_histories: tuple[list[LlmRequest], PendingBeamHistories] | None = None,
     ) -> None:
-        """Apply logit post processors (in-place modify outputs Tensors) if any."""
+        """Apply logit post processors (in-place modify outputs Tensors) if any.
+
+        pending_beam_histories is what _start_beam_histories returned for this
+        step.
+        """
 
         if not (self._mapping.is_last_pp_rank()):
             return
@@ -859,6 +900,13 @@ class DecoderRunner(ScheduledModelRunner):
             if vocab_size is not None:
                 logits_tensor = logits_tensor[..., :vocab_size]
 
+        beam_histories: dict[int, list[list[int]]] = {}
+        if pending_beam_histories is not None:
+            beam_requests, pending = pending_beam_histories
+            beam_histories = {
+                id(request): histories for request, histories in zip(beam_requests, pending.wait())
+            }
+
         logits_row_offset = 0
         request_groups = (
             (scheduled_requests.context_requests, True),
@@ -882,11 +930,13 @@ class DecoderRunner(ScheduledModelRunner):
 
                 logits_processors = getattr(request, "py_logits_post_processors", None)
                 if logits_processors:
-                    token_ids = (
-                        [request.get_tokens(0)]
-                        if is_context_request
-                        else [request.get_tokens(beam_idx) for beam_idx in range(beam_width)]
-                    )
+                    if is_context_request:
+                        token_ids = [request.get_tokens(0)]
+                    elif (histories := beam_histories.get(id(request))) is not None:
+                        prompt = request.get_tokens(0)[: request.py_prompt_len]
+                        token_ids = [prompt + history for history in histories]
+                    else:
+                        token_ids = [request.get_tokens(beam_idx) for beam_idx in range(beam_width)]
                     if is_context_request and request.py_orig_prompt_len < len(token_ids[0]):
                         # Skip as we only need to apply logit processor on the last context request
                         logits_row_offset += row_stride

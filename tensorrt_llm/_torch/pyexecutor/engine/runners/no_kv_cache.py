@@ -140,8 +140,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
                         request,
                         runner_config.mm_encoder_cache_enabled,
                     ),
-                    multimodal_data=request.py_multimodal_data,
-                    mm_item_order=getattr(request, "py_mm_item_order", None),
+                    multimodal_data=request.py_multimodal_params.multimodal_data,
                     input_ids_start_offset=context_start_idx,
                 )
                 multimodal_params.to_device(

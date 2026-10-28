@@ -132,7 +132,7 @@ class MultimodalEncoderMixin:
     """Encoder-side counterpart to ``MultimodalModelMixin``.
 
     Marker + default ``setup_attn_metadata`` for multimodal encoders whose
-    ``AttentionMetadata`` is built by ``PyTorchModelEngine`` after model load
+    ``AttentionMetadata`` is built by ``ModelEngine`` after model load
     using the runtime encoder token budget (``max_num_tokens``).
 
     Subclasses set ``metadata_cls`` in their own ``__init__`` (typically from

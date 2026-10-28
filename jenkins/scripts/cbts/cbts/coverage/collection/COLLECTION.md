@@ -63,7 +63,7 @@ A process learns what it is from `CBTS_PROCESS_ROLE`, set by whoever launches it
 |---|---|---|---|
 | `outer_pytest` | `jenkins/L0_Test.groovy` | `cbts_plugin`'s `pytest_runtest_protocol` switches it directly | at interpreter startup |
 | `inner_pytest` | `tests/integration/defs/test_unittests.py` | inherited `CBTS_TEST_ID`, held for the whole batch | at interpreter startup |
-| *(unset)* — pool workers, `trtllm-serve`, helper subprocesses | — | inherited `CBTS_TEST_ID` until it subscribes to the context channel, then every announcement | **deferred** until `tensorrt_llm` finishes importing, via an import hook |
+| *(unset)* — pool workers, `trtllm-serve`, helper subprocesses | — | inherited `CBTS_TEST_ID` until it subscribes to the context channel, then every announcement | immediate, at interpreter startup — except an `mpi4py.futures` pool worker, deferred to its `_sync_set_data` sync-handshake hook (see `README.md`) |
 
 A subscriber finds the channel through `CBTS_CONTEXT_SOCKET`. Ordinary children inherit it at exec;
 MPI pool workers are spawned from an environment the MPI runtime captured before `pytest_configure`
@@ -82,24 +82,23 @@ Every process writes its own compact SQLite (`.cbtscov.<stage>.<host>.X<rand>.pi
 channel subscriber additionally flushes synchronously on every context switch, before ACK-ing it
 (`ContextSubscriber._pump`) — the periodic snapshot is a backstop for a test still in progress, not
 what a confirmed-dead subscriber's already-superseded tests rely on. Leaf, platform-level and final
-databases share schema version 4, so one reducer merges every level:
+databases share schema version 5, so one reducer merges every level:
 
 | Table | Contents |
 |---|---|
 | `stage`, `case_stage` | interned stage names and bare test contexts |
 | `file`, `symbol` | interned product paths and qualnames |
 | `touch(case_stage_id, symbol_id)` | which test context entered each symbol |
-| `process`, `process_case` | stable process identity and the test contexts each process saved |
-| `test_result` | coordinator outcome and expected-worker observations |
+| `process` | stable process identity |
+| `test_result` | coordinator outcome observations |
 | `taint(process_id, case_stage_id, kind, reason)` | coverage the context channel could not vouch for |
 | `process_diagnostic(process_id, key, value)` | diagnostic only: arbitrary facts recorded about a process, open-ended by design — a new fact is a new row, never a schema change. Currently sourced from `ContextServer.diagnostics` (a subscriber's own cmdline and inherited pytest case, kept if it is later dropped confirmed dead or on an ordinary voluntary leave), but the table itself carries whatever is sent |
 
 The merge (`pystart_report.py`) resolves each input's local IDs by its natural keys and unions the
-relations. `saved_procs` is derived from distinct process identities, so repeated intermediate inputs
-do not inflate completeness. The final artifact is `cbts_touchmap.sqlite`; the `touch_rows`,
-`taint_rows`, `process_diagnostic_rows` and `test_case_meta` views reconstruct its logical query
-rows. Join `process_diagnostic_rows` on `taint_rows.process` to pair a taint with whatever
-diagnostics its process has — a process with none known simply has no matching rows.
+relations. The final artifact is `cbts_touchmap.sqlite`; the `touch_rows`, `taint_rows`,
+`process_diagnostic_rows` and `test_case_meta` views reconstruct its logical query rows. Join
+`process_diagnostic_rows` on `taint_rows.process` to pair a taint with whatever diagnostics its
+process has — a process with none known simply has no matching rows.
 
 ---
 
@@ -125,31 +124,16 @@ full (`../selection/SELECTION.md` §4.1); **the collection side itself is unfixe
 means having the producer record closure frames (the `<locals>` segments in `co_qualname` can be kept
 or folded), which is follow-up work.
 
-### 5.2 Import phase is lost inside MPI pool workers
+### 5.2 The outer pytest's own import is unattributed
 
-Only an actual `mpi4py.futures` pool worker defers activation (`process_roles.is_mpi_pool_worker()`
-gates it) — every other product process (`trtllm-serve`, disagg helpers, ...) activates immediately
-and records its own import. So a worker's `tensorrt_llm` import happens **before deferred
-activation**, and module bodies (`<module>`) and class bodies (`ClassName`) get no rows at all from
-it.
+Every product process activates `PY_START` and records its own import — immediately for most, or at
+its mpi4py sync handshake for an `mpi4py.futures` pool worker specifically, which still precedes any
+product code — see `README.md`'s "Process roles" and "The context channel" sections.
 
 The outer pytest's import happens before any test, under the empty context, and the merge filters it
-out with `WHERE test != ''`.
-
-Net effect: `<module>` and class bodies are only recorded by the tests that spawn subprocesses.
-Measured, `llmapi/llm_args.py::<module>` has **509** holders while all **746** known tests import it
-from their process — the missing 226 are exactly the accuracy / disagg tests served by MPI pool
-workers.
-
-Deferred activation is deliberate, and scoped to pool workers specifically: the instrumented
-cold-start import overruns the `wait_shutdown` worker identity barrier
-(`tensorrt_llm/llmapi/mpi_session.py`), whose deadline is shared with process spawn plus this
-import — a budget only a pool worker's own spawn-and-barrier sequence is subject to.
-
-This blind spot costs the most on the consumer side: a change landing on a module body, a class body
-or a signature / decorator line cannot be bounded from these rows, so the tier declines and the PR
-runs in full (`../selection/SELECTION.md` §4). Recording the workers' import phase is what
-would let those changes narrow again.
+out with `WHERE test != ''`. So the outer pytest's own module-level and class-level import-time code
+(as opposed to a subprocess's) earns no rows from any test, by construction — nothing to fix here,
+since nothing could ever attribute it to one test over another.
 
 ### 5.3 Other blind spots
 
@@ -178,15 +162,12 @@ These rows describe execution, not every test that depends on a shared fixture. 
 `test_case_meta` lets the consumer decide whether a record can be trusted:
 
 ```sql
-outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1 OR tainted != 0
+outcome IS NULL OR outcome != 'passed' OR tainted != 0
 ```
 
-The three terms cover three ways a record can fall short:
+The two terms cover two ways a record can fall short:
 
 - **`outcome`** — a test that did not pass may not have reached the code it normally covers.
-- **`saved_procs` vs `expected_workers + 1`** — `expected_workers` is counted in the coordinator by
-  the patched `MPIPoolExecutor.__init__`, `saved_procs` by the merge, and the `+1` is the coordinator
-  itself. A shortfall means some process's coverage never reached disk.
 - **`tainted`** — the context channel could not vouch for the attribution of some rows, or for their
   completeness. `README.md` documents the kinds, the reasons and their scopes; `taint_rows` gives the
   detail per `(process, test)`.

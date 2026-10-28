@@ -38,10 +38,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
 )
-from tensorrt_llm.inputs.registry import (
-    BaseMultimodalDummyInputsBuilder,
-    MultimodalEncoderItemMetadata,
-)
+from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder, MultimodalItemMetadata
 from tensorrt_llm.llmapi.llm_args import (
     MultimodalConfig,
     MultimodalEncoderCudaGraphConfig,
@@ -302,7 +299,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     monkeypatch.setattr(
         model_engine.MultimodalItemScheduler, "maybe_create", Mock(return_value=scheduler)
     )
-    engine_cls = model_engine.PyTorchModelEngine
+    engine_cls = model_engine.ModelEngine
     monkeypatch.setattr(engine_cls, "_validate_breakable_cuda_graph_compatibility", Mock())
     monkeypatch.setattr(engine_cls, "_init_model_capacity", engine_cls._init_max_num_tokens)
     monkeypatch.setattr(engine_cls, "__del__", lambda self: None)
@@ -373,7 +370,9 @@ def test_encoder_graph_modality_validation_allows_delegated_encoders() -> None:
 
 def _bind_items(mm_item_scheduler: MultimodalItemScheduler, request, *, row_bytes: int = 8) -> None:
     state = request.py_mm_encoder_state
-    for item_idx, rows in enumerate(state.embedding_lengths):
+    for item_idx, rows in enumerate(
+        request.py_multimodal_params.item_metadata.output_embedding_lengths
+    ):
         cache_key = make_mm_encoder_transient_cache_key(request.request_id, item_idx)
         assert mm_item_scheduler.encoder_cache.acquire(
             cache_key, rows * row_bytes, retain_after_release=False
@@ -706,12 +705,11 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
                 "pixel_values": torch.arange(5).unsqueeze(1),
                 "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
             },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("image", 0), ("image", 1)],
                 encoder_token_lengths=[2, 3],
                 output_embedding_lengths=[2, 3],
             ),
-            "multimodal_embedding_lengths": [2, 3],
             "multimodal_embed_mask_cumsum": embed_mask_cumsum,
         },
         input_tokens=list(range(8)),
@@ -769,12 +767,11 @@ def test_admission_requires_item_rows_to_fill_prompt_embedding_slots() -> None:
             1,
             multimodal_data={
                 "image": {"pixel_values": torch.empty(5, 1)},
-                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                     item_refs=[("image", 0), ("image", 1)],
                     encoder_token_lengths=[2, 3],
                     output_embedding_lengths=[2, 3],
                 ),
-                "multimodal_embedding_lengths": [2, 3],
                 "multimodal_embed_mask_cumsum": torch.tensor(embed_mask_cumsum),
             },
         )
@@ -799,12 +796,11 @@ def test_cache_hit_only_request_omits_raw_inputs_from_llm_payload() -> None:
                 "pixel_values": torch.arange(2).unsqueeze(1),
                 "image_grid_thw": torch.tensor([[1, 1, 2]]),
             },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("image", 0)],
                 encoder_token_lengths=[2],
                 output_embedding_lengths=[2],
             ),
-            "multimodal_embedding_lengths": [2],
         },
     )
     initialize_multimodal_encoder_request(request, max_num_tokens=8)

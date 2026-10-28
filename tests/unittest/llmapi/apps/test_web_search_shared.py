@@ -20,6 +20,7 @@ that no endpoint should have to reimplement.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -287,3 +288,22 @@ def test_a_real_request_carrying_web_search_is_recognised():
 
     plain = ResponsesRequest(model="m", input="hi")
     assert web_search_rejection_reason(plain.tools) is None
+
+
+@pytest.mark.parametrize(
+    "tool, rejected",
+    [
+        ({"type": "web_search", "external_web_access": False}, False),
+        (SimpleNamespace(type="web_search", external_web_access=False, filters=None), False),
+        (SimpleNamespace(type="web_search", external_web_access=True, filters=None), True),
+        ({"type": "web_search"}, True),
+    ],
+)
+def test_web_search_is_accepted_only_without_external_access(tool, rejected):
+    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+
+    reason = web_search_rejection_reason([tool])
+    assert (reason is not None) == rejected
+    if rejected:
+        external = tool.get("external_web_access") if isinstance(tool, dict) else True
+        assert f"tool type 'web_search', external_web_access={external!r}" in reason

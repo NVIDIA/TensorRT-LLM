@@ -95,6 +95,7 @@ MODEL_PATH_DICT = {
     "glm_5.3_fp8": "GLM-5.3",
     "glm_5.3_flash_fp8": "GLM-5.3-Flash",
     "glm_5.3_flash_fp8_mtp": "GLM-5.3-Flash",
+    "glm_5.3_flash_nvfp4": "GLM-5.3-Flash-NVFP4",
     # MiniMax-M3 NVFP4: MXFP8 base layers with NVFP4 routed experts
     # (the MXFP8 checkpoint is registered as "minimax_m3_mxfp8" above).
     "minimax_m3_fp4": "MiniMax-M3-NVFP4",

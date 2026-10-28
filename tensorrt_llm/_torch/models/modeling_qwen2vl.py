@@ -30,9 +30,9 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalParams)
-from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalItemPartition, MultimodalParams)
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -194,11 +194,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def get_mm_encoder_item_metadata(
+    def _build_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalEncoderItemMetadata]:
+    ) -> Optional[MultimodalItemMetadata]:
         """Return prompt-ordered Qwen vision items and pre-merger costs."""
         grids_by_modality: Dict[str, torch.Tensor] = {}
         for modality, grid_key in (("image", "image_grid_thw"),
@@ -326,10 +326,37 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             token_length // self.spatial_merge_unit
             for token_length in encoder_token_lengths
         ]
-        return MultimodalEncoderItemMetadata(
+        if any(length <= 0 for length in output_embedding_lengths):
+            raise ValueError(
+                "Processed Qwen items must produce positive embedding lengths")
+        return MultimodalItemMetadata(
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = (
+            self._build_mm_item_metadata(prompt_token_ids, multimodal_data)
+            if multimodal_data.get("multimodal_embedding") is None else None)
+        if metadata is None:
+            metadata = super().get_mm_item_metadata(prompt_token_ids,
+                                                    multimodal_data,
+                                                    mm_item_order)
+        if metadata is not None:
+            for modality in ("image", "video"):
+                modality_data = multimodal_data.get(modality)
+                grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
+                if isinstance(modality_data,
+                              dict) and modality_data.get(grid_key) is not None:
+                    metadata.input_partitions[
+                        modality] = _qwen_vision_input_partitions(
+                            multimodal_data, modality, metadata)
+        return metadata
 
     # ------------------------------------------------------------------
     # Deterministic dummy-input sizing for multimodal profiling.
@@ -783,6 +810,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         mm_data: Dict[str, Any] = {}
         total_tokens = 0
+        item_refs: list[tuple[str, int]] = []
+        encoder_token_lengths: list[int] = []
         for modality, num_items in mm_counts.items():
             if modality not in ("image", "video"):
                 raise ValueError(f"Unsupported vision modality: {modality}")
@@ -799,7 +828,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 raise ValueError(
                     f"Qwen {modality} dummy does not fit within "
                     f"max_num_encoder_tokens={max_num_encoder_tokens}")
-            total_tokens += num_items * math.prod(grid)
+            item_tokens = math.prod(grid)
+            total_tokens += num_items * item_tokens
             if total_tokens > max_num_encoder_tokens:
                 raise ValueError(
                     "Requested multimodal dummy items exceed "
@@ -811,6 +841,22 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     num_items=num_items,
                     dtype=dtype,
                 ))
+            item_refs.extend((modality, i) for i in range(num_items))
+            encoder_token_lengths.extend([item_tokens] * num_items)
+        if item_refs:
+            metadata = MultimodalItemMetadata(
+                item_refs,
+                encoder_token_lengths,
+                [
+                    tokens // self.spatial_merge_unit
+                    for tokens in encoder_token_lengths
+                ],
+            )
+            for modality in mm_data:
+                metadata.input_partitions[
+                    modality] = _qwen_vision_input_partitions(
+                        mm_data, modality, metadata)
+            mm_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
         return mm_data
 
     def _dummy_mm_data_for_size(
@@ -1191,8 +1237,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mm_handles = [{
             "tensor_size": tuple(image_embedding.shape)
         } for image_embedding in image_embeddings]
-        prompt_token_ids = build_disagg_prefill_multimodal_inputs(
-            inputs, mm_handles).prompt_token_ids
+        prompt_token_ids, multimodal_params = build_disagg_prefill_multimodal_inputs(
+            inputs, mm_handles)
 
         # ``build_disagg_prefill_multimodal_inputs`` already emits the in-vocab
         # ``image_token_id`` at mm positions (no legacy OOV remap), so
@@ -1212,10 +1258,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mrope_config = self.get_mrope_config(mrope_input_ids, image_grid_thw,
                                              None, attention_mask, None)
 
-        multimodal_data = {
-            "multimodal_embedding": image_embeddings,
-            "mrope_config": mrope_config,
-        }
+        multimodal_data = multimodal_params.multimodal_data
+        multimodal_data["multimodal_embedding"] = image_embeddings
+        multimodal_data["mrope_config"] = mrope_config
         return prompt_token_ids, {"multimodal_data": multimodal_data}
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
@@ -1523,7 +1568,8 @@ class Qwen2_5_VLVisionAttention(Attention):
                    v: Optional[torch.Tensor],
                    position_ids: Optional[torch.IntTensor] = None,
                    position_embeddings: Optional[Tuple[torch.Tensor,
-                                                       torch.Tensor]] = None):
+                                                       torch.Tensor]] = None,
+                   packed_qk: Optional[torch.Tensor] = None):
         seq_len, _ = q.size()
         cos, sin = position_embeddings
 
@@ -1569,6 +1615,15 @@ class Qwen2_5_VLVisionAttention(Attention):
             k.copy_(
                 RotaryEmbedding.apply_rotary_pos_emb(
                     k.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
+        elif packed_qk is not None:
+            # The caller supplies the Q/K prefix of the fused projection, so
+            # its provenance is explicit and the excluded V suffix is untouched.
+            qk = packed_qk.view(1, seq_len, 2 * q.shape[1], self.head_dim)
+            _flash_attn_apply_rotary(qk,
+                                     cos,
+                                     sin,
+                                     interleaved=False,
+                                     inplace=True)
         else:
             # flash_attn Triton kernel: single launch per tensor. cos/sin
             # are expected as `[seqlen, head_dim/2]`. The PyTorch path
@@ -1608,7 +1663,14 @@ class Qwen2_5_VLVisionAttention(Attention):
         q, k, v = qkv, None, None
         q, k, v = self.split_qkv(q, k, v)
 
-        q, k, v = self.apply_rope(q, k, v, position_ids, position_embeddings)
+        packed_qk = (qkv[..., :self.q_size +
+                         self.kv_size] if q.shape == k.shape else None)
+        q, k, v = self.apply_rope(q,
+                                  k,
+                                  v,
+                                  position_ids,
+                                  position_embeddings,
+                                  packed_qk=packed_qk)
         reuse_qkv = False
         if self.support_fused_qkv:
             # Only reuse the projection when RoPE preserves every original
@@ -2101,8 +2163,58 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         return hidden_states
 
 
+_QWEN_VISION_BATCHED_FIELD = MultimodalItemPartition()
+
+
+def _qwen_vision_item_partitions(
+    param: MultimodalParams,
+    modality: str,
+) -> dict[str, MultimodalItemPartition] | None:
+    if modality not in ("image", "video"):
+        return None
+    metadata = param.item_metadata
+    if metadata is not None and modality in metadata.input_partitions:
+        return metadata.input_partitions[modality]
+    return _qwen_vision_input_partitions(param.multimodal_data, modality,
+                                         metadata)
+
+
+def _qwen_vision_input_partitions(
+    multimodal_data: dict[str, Any],
+    modality: str,
+    metadata: MultimodalItemMetadata | None,
+) -> dict[str, MultimodalItemPartition]:
+    """Declare patch packing once on the producer, with a legacy fallback."""
+    pixel_key, grid_key = (("pixel_values",
+                            "image_grid_thw") if modality == "image" else
+                           ("pixel_values_videos", "video_grid_thw"))
+    grids = multimodal_data[modality][grid_key]
+    if metadata is not None and metadata.encoder_token_lengths is not None:
+        costs = {
+            index: cost
+            for (item_modality, index), cost in zip(
+                metadata.item_refs, metadata.encoder_token_lengths, strict=True)
+            if item_modality == modality
+        }
+        patch_counts = tuple(costs[i] for i in range(grids.shape[0]))
+    else:
+        patch_counts = tuple(t * h * w for t, h, w in grids.tolist())
+    return {
+        pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
+        grid_key: _QWEN_VISION_BATCHED_FIELD,
+        "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+    }
+
+
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supports_mm_encoder_item_scheduling = True
+
+    def get_multimodal_item_partitions(
+        self,
+        param: MultimodalParams,
+        modality: str,
+    ) -> dict[str, MultimodalItemPartition] | None:
+        return _qwen_vision_item_partitions(param, modality)
 
     def __init__(
         self,
@@ -2403,21 +2515,24 @@ class Qwen2VLModel(Qwen2VLModelBase):
 class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
     def build_disagg_prefill_multimodal_inputs(
-            self, inputs: TextPrompt,
-            mm_handles: List[Dict[str, Any]]) -> DisaggPrefillMultimodalInputs:
+        self,
+        inputs: TextPrompt,
+        mm_handles: List[Dict[str, Any]],
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """
         Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
             mm_handles: List of multimodal embedding handles.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
-        # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
@@ -2475,18 +2590,23 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
         assert mm_token_length[-1] + mm_token_offsets[
             -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
-            multimodal_lengths=mm_token_length,
-            multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[
-                mm_handle["tensor_size"][0] for mm_handle in mm_handles
-            ],
-            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) +
-                                                      1)),
-            multimodal_run_positions=mm_token_offsets,
-            multimodal_run_lengths=mm_token_length,
-        )
+        return expanded_ids.to(
+            torch.int32).tolist(), MultimodalParams.from_embeddings(
+                mm_handles,
+                MultimodalItemMetadata(
+                    [("image", i) for i in range(len(mm_handles))],
+                    output_embedding_lengths=[
+                        handle["tensor_size"][0] for handle in mm_handles
+                    ],
+                ),
+                multimodal_hashes=mm_hashes,
+                multimodal_lengths=mm_token_length,
+                multimodal_positions=mm_token_offsets,
+                multimodal_item_run_cu_offsets=list(
+                    range(len(mm_token_length) + 1)),
+                multimodal_run_positions=mm_token_offsets,
+                multimodal_run_lengths=mm_token_length,
+            )
 
 
 @support_multimodal_disaggregated

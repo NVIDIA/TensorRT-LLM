@@ -31,11 +31,15 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import (
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+)
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     EncodeCudaGraphConfig,
@@ -171,7 +175,7 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
 def test_model_engine_initializes_runner_by_family(
     runner_type: type[ModelRunner], initializer_name: str
 ) -> None:
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     expected = Mock(spec=runner_type)
     initializer = Mock(return_value=expected)
@@ -194,7 +198,7 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
     expected_encode_config: bool,
 ) -> None:
     """Encode-only takes its buckets from `cuda_graph_config`, never from llm_args."""
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     engine.model = object()
     engine.mapping = object()
@@ -244,7 +248,7 @@ def test_model_engine_rejects_unregistered_runner_family() -> None:
     class UnregisteredRunner:
         pass
 
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
 
     with pytest.raises(TypeError, match="No runner initializer registered"):
@@ -255,8 +259,8 @@ def _model_engine_with_runner(
     runner: Mock | None,
     *,
     kv_cache_manager: object | None,
-) -> tuple[PyTorchModelEngine, Mock]:
-    engine = object.__new__(PyTorchModelEngine)
+) -> tuple[ModelEngine, Mock]:
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     engine.model = SimpleNamespace(extra_attrs={})
     if runner is None:
@@ -315,7 +319,7 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
         "encoder_hidden_states": hidden_states,
         "encoder_seq_lens": [2, 3],
     }
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     engine.model = SimpleNamespace(
         model_config=SimpleNamespace(is_encoder_decoder=True),
@@ -338,7 +342,7 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
 
 
 def test_model_engine_releases_runner_owned_graphs() -> None:
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     engine._runner = Mock(spec=EncoderRunner)
     engine._torch_compile_backend = None
@@ -476,7 +480,9 @@ def test_mm_encoder_runner_forward_step_skips_metadata_only_and_missing_length_r
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
             },
             multimodal_lengths=[2],
         ),
@@ -524,14 +530,18 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [1],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
             },
             multimodal_lengths=[1],
         ),
         SimpleNamespace(
             py_multimodal_data={
                 "image": object(),
-                "multimodal_embedding_lengths": [2],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
             },
             multimodal_lengths=[2],
         ),
@@ -744,12 +754,22 @@ def test_model_caller_requires_streams_with_compile_backend():
 def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> None:
     requests = [
         SimpleNamespace(
-            py_multimodal_data={"image": object(), "multimodal_embedding_lengths": [1]},
+            py_multimodal_data={
+                "image": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
+            },
             multimodal_lengths=[1],
         ),
         SimpleNamespace(py_multimodal_data=None),
         SimpleNamespace(
-            py_multimodal_data={"video": object(), "multimodal_embedding_lengths": [3, 2]},
+            py_multimodal_data={
+                "video": object(),
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("video", 0), ("video", 1)], output_embedding_lengths=[3, 2]
+                ),
+            },
             multimodal_lengths=[7, 6],
         ),
     ]

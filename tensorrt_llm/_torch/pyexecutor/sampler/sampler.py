@@ -49,6 +49,7 @@ from .beam_search import (
     BeamSearchParams,
     BeamSearchStep,
     BeamSearchStore,
+    PendingBeamHistories,
     finalize_beam,
     prepare_beam_search,
 )
@@ -507,6 +508,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if (beam_search_store := self.store.beam_search_store) is not None:
             return beam_search_store.cache_indirection
         return None
+
+    def start_beam_histories(self, requests: list[LlmRequest]) -> PendingBeamHistories:
+        """Start copying the generated tokens of each live beam of each beam-search request.
+
+        See ``BeamSearchHandler.start_beam_histories``; used by the model engine
+        to give logits post-processors each beam's real hypothesis.
+        """
+        return self._beam_search.start_beam_histories(requests)
 
     @override
     def is_generation_model(self) -> bool:
@@ -1382,7 +1391,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return
 
         new_tokens = state.host.new_tokens
-        finish_reasons = state.host.finish_reasons_list()
         first_finish_reasons_host = state.host.first_finish_reasons
         if first_finish_reasons_host is not None:
             first_finish_reasons = first_finish_reasons_host.tolist()
@@ -1400,6 +1408,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         logprobs_state_list: LogProbsStateList | None = None
         if state.host.logprobs_state is not None:
             logprobs_state_list = LogProbsStateList.from_logprobs_state(state.host.logprobs_state)
+
+        # Beam-search requests read their finish reasons from
+        # first_finish_reasons; only single-beam requests (and the batched
+        # fast path below) consume the per-step finish_reasons list, whose
+        # conversion scales with max_num_sequences x max_beam_width.
+        finish_reasons: FinishReasonsList = []
+        if (self._batch_fastpath_eligible and logprobs_state_list is None) or any(
+            req.py_beam_width == 1 for req in state.requests
+        ):
+            finish_reasons = state.host.finish_reasons_list()
 
         beam_history_builders = state.beam_history_builders
         assert (beam_history_builders is not None) == self._use_beam_search
@@ -1493,9 +1511,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # visible to streaming consumers and to anything reading
                     # get_tokens() mid-flight (e.g. the token-ban suffix
                     # matching) even though finalization later rewrites it.
-                    for beam_idx in range(_get_beam_width_out(req)):
-                        # Beam search does not support speculative decoding.
-                        add_token(req, new_tokens_list, beam_idx=beam_idx)
+                    beam_width_out = _get_beam_width_out(req)
+                    if beam_width_out == req.py_beam_width:
+                        # One binding call appends this step's token to every
+                        # beam; the C++ side requires exactly beam_width tokens.
+                        assert req.py_seq_slot is not None
+                        req.add_new_tokens(new_tokens_list[0][req.py_seq_slot][:beam_width_out])
+                    else:
+                        for beam_idx in range(beam_width_out):
+                            # Beam search does not support speculative decoding.
+                            add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self._log_probs.handle_logprobs(
                         req, logprobs_state_list=logprobs_state_list, count=1
                     )
@@ -1848,9 +1873,28 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batch_next_tokens_cuda_int = torch.empty(
             (logits_cuda.size(0), self.max_beam_width), device=cuda_device, dtype=token_dtype
         )
+        # Only processed logprobs need a full-vocabulary buffer. Raw logprobs
+        # are selected directly from logits; beam search uses its own history.
+        reqs_indices_needing_raw_logprobs: list[int] = []
+        reqs_indices_needing_raw_logits: list[int] = []
+        num_logprobs_rows = 0
+        if return_log_probs:
+            need_raw_logprobs = self._slot_params.need_raw_logprobs
+            need_processed_logprobs = self._slot_params.need_processed_logprobs
+            for req_idx, (request, slot, num_generated_tokens) in enumerate(
+                zip(requests, seq_slots_list, req_num_generated_tokens.tolist())
+            ):
+                if need_raw_logprobs[slot]:
+                    reqs_indices_needing_raw_logprobs.append(req_idx)
+                if self._use_beam_search and request.py_beam_width != 1:
+                    continue
+                if need_raw_logprobs[slot]:
+                    reqs_indices_needing_raw_logits.append(req_idx)
+                if need_processed_logprobs[slot]:
+                    num_logprobs_rows += num_generated_tokens
         batch_processed_logprobs_cuda = (
-            torch.empty(  # NB: overprovisioning buffer for simplicity and later reuse in _process_logprobs
-                (logits_cuda.size(0), logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
+            torch.empty(
+                (num_logprobs_rows, logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
             )
             if return_log_probs
             else None
@@ -2046,20 +2090,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # Prepare logit indices for raw logprobs; beam-search requests get theirs
         # from the beam history instead.
-        reqs_indices_needing_raw_logprobs: list[int] = []
         batch_raw_logprob_indices_cuda = None
-        if return_log_probs:
-            need_raw_logprobs = self._slot_params.need_raw_logprobs
-            reqs_indices_needing_raw_logprobs = [
-                req_idx
-                for req_idx, (request, slot) in enumerate(zip(requests, seq_slots_list))
-                if need_raw_logprobs[slot]
-                and (not self._use_beam_search or request.py_beam_width == 1)
-            ]
-            if reqs_indices_needing_raw_logprobs:
-                batch_raw_logprob_indices_cuda = logits_cuda_indexer[
-                    torch.tensor(reqs_indices_needing_raw_logprobs, dtype=torch.int64)
-                ].to(device=cuda_device, non_blocking=True)
+        if reqs_indices_needing_raw_logits:
+            batch_raw_logprob_indices_cuda = logits_cuda_indexer[
+                torch.tensor(reqs_indices_needing_raw_logits, dtype=torch.int64)
+            ].to(device=cuda_device, non_blocking=True)
 
         return _BatchedSamplingResult(
             req_indices=batch_req_indices,

@@ -105,6 +105,11 @@ _KIMI_K3_ARCHITECTURES = {
     "KimiLinearForCausalLM",
 }
 
+_GLM5_NEXT_ARCHITECTURES = {
+    "Glm5NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
+}
+
 _MINIMAX_M3_ARCHITECTURES = {
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -383,6 +388,11 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        # Fused expert reduction can change accumulation order between runs.
+        if (os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+                or os.getenv("FORCE_MOE_KERNEL_DETERMINISTIC", "0") == "1"):
+            self.moe_disable_finalize_fusion = True
+
         if (self.sparse_attention_config is None
                 and getattr(self.pretrained_config, "model_type",
                             None) in ("deepseek_v41", "deepseek_v41_text")):
@@ -563,6 +573,9 @@ class ModelConfig(Generic[TConfig]):
             sm_version = get_sm_version()
             if 100 <= sm_version < 120:
                 return "TRTLLM"
+
+        if architecture in _GLM5_NEXT_ARCHITECTURES and is_sm_100f():
+            return "TRTLLM"
 
         is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
                           in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))

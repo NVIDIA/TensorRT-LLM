@@ -901,6 +901,12 @@ class TmemSResource(DecodeGenResourceBase):
                 elif cutlass.const_expr(cfg.qk_dtype_bytes == 1):
                     k_desc_offset = ki * Int32(2)
                     q_desc_offset = ki * Int32(2)
+                    if cutlass.const_expr(cfg.head_dim_kv_stage > 128):
+                        # A full FP8 head stage consists of two SW128 planes,
+                        # not a row-major D256 tile. Cross planes at K128.
+                        chunk_idx = (ki * Int32(_mma_k_step_qk(cfg))) // Int32(128)
+                        k_desc_offset += chunk_idx * Int32(8 * cfg.tile_size_kv - 8)
+                        q_desc_offset += chunk_idx * Int32(8 * cfg.tile_size_q - 8)
                     iter_k_desc = k_desc + k_desc_offset
                 else:
                     chunk_idx = (ki * Int32(_mma_k_step_qk(cfg))) // Int32(64)
@@ -1072,24 +1078,42 @@ class TmemSResource(DecodeGenResourceBase):
             lane_idx,
             cfg.softmax_score_fragment_regs,
         )
+        if cutlass.const_expr(cfg.query_major_memberships):
+            return self.page_offsets_ref.query_membership_keep_word(
+                stage_info, local_tile_idx, q_token_idx
+            ) >> Uint32(col_base // Int32(4))
         keep_word = Uint32(0)
         page_span = min(cfg.num_tokens_per_page, cfg.num_s_regs_per_thread)
         pages_per_lane = cfg.num_s_regs_per_thread // page_span
+        if cutlass.const_expr(pages_per_lane >= 16):
+            for vector_idx in cutlass.range_constexpr(pages_per_lane // 16):
+                bits = self.page_offsets_ref.q_token_kv_block_sparse_page_keep_word16(
+                    stage_info,
+                    local_tile_idx,
+                    col_base // Int32(cfg.num_tokens_per_page) + Int32(vector_idx * 16),
+                    q_token_idx,
+                )
+                keep_word |= bits << Uint32(vector_idx * 16)
+            return keep_word
         for page_vector_idx in cutlass.range_constexpr(pages_per_lane // 4):
             memberships = (
-                self.page_offsets_ref.q_token_kv_block_sparse_page_memberships4(
+                self.page_offsets_ref.q_token_kv_block_sparse_page_membership_word4(
                     stage_info,
                     local_tile_idx,
                     col_base // Int32(cfg.num_tokens_per_page)
                     + Int32(page_vector_idx * 4),
                 )
             )
-            for vector_elem_idx in cutlass.range_constexpr(4):
-                local_page_idx = page_vector_idx * 4 + vector_elem_idx
-                page_is_member = Uint32(
-                    (memberships[vector_elem_idx] & membership_bit) != Uint32(0)
-                )
-                keep_word = keep_word | (page_is_member << Uint32(local_page_idx))
+            # Select query q's bit from each byte (positions 0/8/16/24), then
+            # pack them into bits 0..3 with a carry-free uint32 multiply, not
+            # a first-set-bit search. Zero q >= 8 so the bounded shift cannot
+            # alias another query's bit.
+            byte_bits = (memberships >> (q_token_idx & Int32(7))) & Uint32(0x01010101)
+            packed_bits = (byte_bits * Uint32(0x01020408)) >> Uint32(24)
+            packed_bits = cutlass.select_(
+                Uint32(q_token_idx) < Uint32(8), packed_bits, Uint32(0)
+            )
+            keep_word = keep_word | (packed_bits << Uint32(page_vector_idx * 4))
         if cutlass.const_expr(pages_per_lane < 4):
             for local_page_idx in cutlass.range_constexpr(pages_per_lane):
                 membership = (

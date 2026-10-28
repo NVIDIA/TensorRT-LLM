@@ -2620,7 +2620,7 @@ def create_mma_task_one_inst_qkv(
     work_queue: WorkQueue | None,
     cfg: FmhaDecodeConfig,
     *,
-    tmem_stats_done: MemoryResource,
+    tmem_stats_done: MemoryResource | None,
     domain: int | cutlass.Int32,
     warp_idx: int | None = None,
     num_warps: int | None = None,
@@ -2636,14 +2636,15 @@ def create_mma_task_one_inst_qkv(
         tmem_s: MemoryResource,
         smem_p: MemoryResource,
         tmem_o: MemoryResource,
-        tmem_stats_done: MemoryResource,
+        tmem_stats_done: MemoryResource | None,
         q_desc: Any,
     ) -> None:
         """Schedule single-instance QK and PV waves across HEAD/LOOP/TAIL."""
 
         def qk_mma(q_desc, qk_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance QK wave."""
-            tmem_stats_done.acquire()
+            if tmem_stats_done is not None:
+                tmem_stats_done.acquire()
             tmem_s.acquire()
             _issue_score_seed(tmem_s, section, cfg)
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
@@ -2662,7 +2663,8 @@ def create_mma_task_one_inst_qkv(
                     )
                 smem_k.release()
             tmem_s.commit()
-            tmem_stats_done.commit()
+            if tmem_stats_done is not None:
+                tmem_stats_done.commit()
 
         def pv_mma(vp_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance PV wave."""
@@ -2710,7 +2712,7 @@ def create_mma_task_one_inst_qkv(
         smem_v.init_descriptor_state()
         smem_p.init_descriptor_state()
 
-    @schedule
+    @_schedule_with_optional_resources
     def mma_schedule(
         smem_q: MemoryResource,
         smem_k: MemoryResource,
@@ -2718,8 +2720,8 @@ def create_mma_task_one_inst_qkv(
         tmem_s: MemoryResource,
         smem_p: MemoryResource,
         tmem_o: MemoryResource,
-        tmem_stats_done: MemoryResource,
-        work_queue: WorkQueue | None = None,
+        tmem_stats_done: MemoryResource | None,
+        work_queue: WorkQueue | None,
     ) -> None:
         """Wrap one-inst MMA work in packed persistent skip handling."""
         _decode_work_tile_schedule_with_invariant_bridge(
@@ -2740,34 +2742,16 @@ def create_mma_task_one_inst_qkv(
             ),
         )
 
-    schedule_result = (
-        mma_schedule(
-            smem_q,
-            smem_k,
-            smem_v,
-            tmem_s,
-            smem_p,
-            tmem_o,
-            tmem_stats_done,
-        )
-        if work_queue is None
-        else mma_schedule(
-            smem_q,
-            smem_k,
-            smem_v,
-            tmem_s,
-            smem_p,
-            tmem_o,
-            tmem_stats_done,
-            work_queue,
-        )
+    schedule_result = mma_schedule(
+        smem_q, smem_k, smem_v, tmem_s, smem_p, tmem_o, tmem_stats_done, work_queue
     )
     src = [smem_q, smem_k, smem_v, smem_p]
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_s, tmem_o, tmem_stats_done],
+        dst_resources=[tmem_s, tmem_o]
+        + ([tmem_stats_done] if tmem_stats_done is not None else []),
         cfg=cfg,
         warp_idx=cfg.mma_warp_idx if warp_idx is None else warp_idx,
         num_warps=cfg.mma_num_warps if num_warps is None else num_warps,
@@ -4149,7 +4133,7 @@ def create_padding_task(
         warp_idx=warp_idx,
         num_warps=num_warps,
         schedule=captured_schedule,
-        num_registers=cfg.mma_load_task_num_registers,
+        num_registers=cfg.padding_task_num_registers(warp_idx, num_warps),
         name="PaddingTask",
         **kw,
     )

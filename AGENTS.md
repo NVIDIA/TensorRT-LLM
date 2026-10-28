@@ -95,6 +95,12 @@ HuggingFace Model → LLM API → PyTorch Executor
 - **Disaggregated serving**: separates prefill (context) and decode (generation) across GPUs
   - KV cache exchange via NIXL (default), UCX, or MPI
 
+### Multimodal request data
+
+Read the [multimodal developer guide](docs/source/developer-guide/multimodal.md) before changing multimodal paths.
+Reuse `MultimodalParams`; request Params own cache references.
+Encoder and LLM forward Params are execution views.
+
 ## Key Files
 
 | File | Role |
@@ -186,7 +192,8 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
+for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
+CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
 
 ### Advisory semantic review

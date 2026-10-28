@@ -1264,12 +1264,32 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 // `import cbts.*` resolves without touching the rest of jenkins/scripts/.
 // ============================================================================
 
+def _cbtsEnsureCliDependencies(pipeline)
+{
+    try {
+        // The preparation pod is Debian; requirements.txt includes Click and PyYAML.
+        trtllm_utils.llmExecStepWithRetry(pipeline,
+            script: "apt-get update -qq && apt-get install -y -qq python3-pip")
+        trtllm_utils.llmExecStepWithRetry(pipeline,
+            script: "python3 -m pip install --break-system-packages --disable-pip-version-check " +
+                    "-r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
+        return true
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS CLI dependencies unavailable (non-fatal): ${e.message}")
+        return false
+    }
+}
+
 def getCbtsResult(pipeline, testFilter, globalVars)
 {
     // Explicit kill switch: `/bot run --disable-cbts` forces a full run.
     if (testFilter[(DISABLE_CBTS)]) {
         pipeline.echo("CBTS: disabled — user-specified /bot run --disable-cbts")
-        _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        if (_cbtsEnsureCliDependencies(pipeline)) {
+            _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        }
         return null
     }
 
@@ -1284,8 +1304,10 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
     if (!triggeredFlags.isEmpty()) {
         pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
-        _cbtsReportDecision(pipeline, globalVars, "deferred",
-                            "user flags: ${triggeredFlags.join(', ')}", null)
+        if (_cbtsEnsureCliDependencies(pipeline)) {
+            _cbtsReportDecision(pipeline, globalVars, "deferred",
+                                "user flags: ${triggeredFlags.join(', ')}", null)
+        }
         return null
     }
 
@@ -1296,9 +1318,10 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 
     try {
-        // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
-        sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
-
+        if (!_cbtsEnsureCliDependencies(pipeline)) {
+            pipeline.echo("CBTS: falling back to full run because CLI dependencies are unavailable")
+            return null
+        }
         def coveragePilotEligible = false
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -1855,7 +1878,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
@@ -2525,7 +2547,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 string(name: 'postMergeBuildNumber', value: ''),
                                 string(name: 'scanMode', value: isNightlyRelease ? 'release' : 'pre_merge'),
                                 string(name: 'runSourceCodeScanning', value: 'true'),
-                                string(name: 'runContainerScanning', value: 'false'),
+                                string(name: 'runContainerOssScanning', value: 'false'),
+                                string(name: 'runContainerMalwareScanning', value: 'false'),
                                 string(name: 'runSonarQube', value: 'false'),
                             ]
                             def handle = build(
@@ -3066,7 +3089,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 name: 'scanMode',
                                 value: runMode == "nightly_release" ? 'release' : 'pre_merge'),
                             string(name: 'runSourceCodeScanning', value: 'false'),
-                            string(name: 'runContainerScanning', value: 'true'),
+                            string(name: 'runContainerOssScanning', value: 'true'),
+                            string(name: 'runContainerMalwareScanning', value: 'false'),
                             string(name: 'runSonarQube', value: 'false'),
                         ]
                         def logger = new Logger(pipeline)

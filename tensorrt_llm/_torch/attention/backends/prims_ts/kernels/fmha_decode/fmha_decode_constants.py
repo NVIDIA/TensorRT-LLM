@@ -186,14 +186,21 @@ REDUCTION_BYTES_PER_SLICE = REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THRE
 
 # Clustered standalone reducer shape. One 128-thread CTA covers a contiguous
 # 2 KiB partial-O slice with one 16-byte vector per thread. Each cluster rank
-# owns a compile-time 2, 4, or 8 split slots. Loads are batched in groups of at
-# most four; padded split slots remain neutral and never form GMEM pointers.
+# owns a compile-time 2, 4, or 8 split slots. Padded and unpublished slots
+# remain neutral and never form GMEM pointers.
 PARALLEL_REDUCTION_THREADS_PER_CTA = 128
 PARALLEL_REDUCTION_BYTES_PER_SLICE = (
     PARALLEL_REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THREAD
 )
-PARALLEL_REDUCTION_LOAD_BATCH = 4
+# Batch independent published-slot loads before the serial fold.
+PARALLEL_REDUCTION_LOAD_BATCH = 16
 PARALLEL_REDUCTION_FINAL_REDUCERS = 4
+# Single-CTA reducer profiles spread one output fragment's split slots
+# over this many adjacent lanes and merge them with warp shuffles. The fold is
+# a serial chain of dependent FP32 instructions at very low occupancy, so more
+# lanes with fewer slots shorten that per-lane dependency chain. Must divide
+# the slots owned by each CTA.
+PARALLEL_REDUCTION_SLOT_LANES = 4
 
 # Each reduction thread produces an 8-element O vector backed by four packed
 # 16-bit registers.
