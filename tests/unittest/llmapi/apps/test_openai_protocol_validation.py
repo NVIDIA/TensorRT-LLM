@@ -30,6 +30,9 @@ from tensorrt_llm.serve.openai_protocol import (
     ResponsesRequest,
 )
 
+# The CPU CI stage runs pytest with -m cpu_only and skips files without this marker.
+pytestmark = pytest.mark.cpu_only
+
 
 def _completion(**kw):
     return CompletionRequest(model="m", prompt="hi", **kw)
