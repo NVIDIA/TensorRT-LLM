@@ -492,11 +492,10 @@ def _reserve_multi_frontend_port(host: str, port: int,
                                  family: socket.AddressFamily) -> socket.socket:
     """Refuse a port another server uses; return a lock to hold while serving.
 
-    The frontends bind the port with SO_REUSEPORT, which lets any socket of the
-    same user that also sets it join: a second server on a busy port would share
-    its traffic instead of failing. A plain bind fails on any listener
-    (SO_REUSEADDR keeps TIME_WAIT leftovers out), and an abstract Unix socket
-    named after the port stops a second launcher before this one listens.
+    SO_REUSEPORT would let a second server of the same user join the port. A
+    plain bind catches any listener (SO_REUSEADDR ignores TIME_WAIT), and an
+    abstract Unix socket named after the port catches a launcher that has not
+    started listening yet.
     """
     lock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -587,9 +586,8 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
             f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
 
 
-# One serving process is host-bound at high concurrency (a single asyncio loop
-# parses every request and streams every chunk). LlmArgs keeps default 1:
-# only trtllm-serve spawns frontends.
+# One serving process is host-bound at high concurrency. LlmArgs keeps
+# default 1: only trtllm-serve spawns frontends.
 DEFAULT_NUM_SERVE_FRONTENDS = 8
 
 
@@ -1184,11 +1182,9 @@ def launch_visual_gen_server(
     default=DEFAULT_NUM_SERVE_FRONTENDS,
     help="Number of HTTP or OpenEngine frontend processes serving one "
     "executor; values > 1 share the serving port via "
-    "SO_REUSEPORT (classic IPC executor path only). The default applies to "
-    "the OpenAI HTTP server and falls back to 1 for configurations that "
-    "support a single frontend only (--port 0/--report_addr, "
-    "orchestrator_type, enable_resource_governor, --enable_sleep_mode) and "
-    "with --grpc; an explicit value is honored or fails instead.",
+    "SO_REUSEPORT (classic IPC executor path only). Without an explicit "
+    "value, --grpc and configurations that support a single frontend only "
+    "use 1 and log why.",
     status="prototype")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),

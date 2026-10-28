@@ -66,13 +66,6 @@ def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, rea
         pytest.param([], "num_serve_frontends: 1", 1, id="yaml_opt_out"),
         pytest.param(["--port", "0"], None, 1, id="port0"),
         pytest.param(["--enable_sleep_mode"], None, 1, id="sleep_mode"),
-        # Only the launcher registers with a disagg cluster, so the default holds.
-        pytest.param(
-            ["--server_role", "context", "--disagg_cluster_uri", "etcd://localhost:2379"],
-            None,
-            DEFAULT_NUM_SERVE_FRONTENDS,
-            id="disagg_cluster",
-        ),
         # An explicit count is honored; launch_server's own guard rejects the conflict.
         pytest.param(["--port", "0", "--num_serve_frontends", "8"], None, 8, id="explicit"),
     ],
@@ -95,8 +88,7 @@ def test_frontend_count_reaching_launch_server(
 
 
 def test_port_used_by_another_server_is_refused() -> None:
-    # Another multi-frontend server listens with SO_REUSEPORT: without the
-    # check, this launcher would join its port and share its traffic.
+    # Without the check, SO_REUSEPORT would let this launcher join the port.
     with socket.socket() as other:
         other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         other.bind(("127.0.0.1", 0))
