@@ -71,37 +71,10 @@ class BaseCheckpointLoader(ABC):
                                                mapping=mapping,
                                                **kwargs)
 
-    def is_weights_preloaded(self) -> bool:
-        """Whether the last load wrote weights directly into the model."""
-        return False
-
-    def is_post_transform_weights_preloaded(self) -> bool:
-        """Whether the last direct preload delivered post-transform weights.
-
-        This is narrower than :meth:`is_weights_preloaded`: a loader may write
-        bytes directly into the model while those bytes still use the raw
-        checkpoint layout. Return True only when the source identity was
-        verified and the incoming bytes can safely skip module transform hooks.
-        """
-        return False
-
     def build_checkpoint_catalog(self, checkpoint_dir: str,
                                  **kwargs) -> CheckpointCatalog | None:
         """Return source metadata for shadow planning when available."""
         return None
-
-    def post_load_apply(self,
-                        model: nn.Module,
-                        *,
-                        weights_preloaded: bool = False) -> None:
-        """Apply format-specific state after weights have been loaded."""
-
-    def post_load_publish(self,
-                          model: nn.Module,
-                          *,
-                          checkpoint_dir: str,
-                          weights_preloaded: bool = False) -> None:
-        """Publish format-specific loaded weights after the load path."""
 
     @classmethod
     def get(cls, checkpoint_format: CheckpointFormat | str,

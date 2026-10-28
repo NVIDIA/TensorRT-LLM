@@ -826,7 +826,7 @@ def load_model_from_auto_load_format(
         metrics=metrics)
     # Read before the draft load: an MX draft read without MX state resets
     # this flag.
-    weights_preloaded = checkpoint_loader.is_weights_preloaded()
+    weights_preloaded = mx_loading.is_mx_weights_preloaded(checkpoint_loader)
 
     # load separate draft weights
     if spec_config is not None and spec_config.needs_separate_draft_weights:
@@ -1203,19 +1203,16 @@ class ModelLoader:
         with timing_metric(
                 ModelLoaderMetricNames.POST_LOAD_PROCESSING_SECONDS.value,
                 self._metrics):
-            # GMS RW and RO have already run the post_load_* hooks
-            # themselves. RW handles them inside `mem_pool_scope` so the
-            # committed pool reflects the post-post_load layout; RO runs
+            # GMS RW and RO have already run the post-load hooks and the MX
+            # publish themselves. RW handles them inside `mem_pool_scope` so
+            # the committed pool reflects the post-post_load layout; RO runs
             # `setup_aliases()` before `materialize_module` to wire aliases
             # prior to zero-copy mapping, then refreshes derived state after
             # real GMS tensors are bound.
             if load_format != LoadFormat.GMS:
-                checkpoint_loader.post_load_apply(
-                    model, weights_preloaded=weights_preloaded)
                 mx_loading.run_post_load_walks_and_publish(
                     checkpoint_loader,
                     model,
-                    checkpoint_dir=checkpoint_dir,
                     weights_preloaded=weights_preloaded,
                     qualification=post_transform_qualification,
                     source_identity=source_identity)
