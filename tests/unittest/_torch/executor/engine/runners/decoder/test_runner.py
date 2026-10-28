@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 import contextlib
 import unittest
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import pytest
@@ -37,6 +41,12 @@ from tensorrt_llm._torch.utils import (
 )
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from typing import Any
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+
 _TWO_MODEL_SPEC_MODE = SimpleNamespace(use_one_engine=lambda: False)
 
 
@@ -44,8 +54,8 @@ def _make_decoder_runner(
     graph_key: KeyType | None,
     runner_enabled: bool = True,
     private_decoder: bool = False,
-    **config_changes,
-):
+    **config_changes: Any,
+) -> tuple[DecoderRunner, Mock, Mock, Mock, dict[str, object]]:
     config = decoder_config(
         **{
             "disable_overlap_scheduler": True,
@@ -126,7 +136,7 @@ def _make_decoder_runner(
     resources = Mock()
     peft_cache_manager = Mock(data_type=torch.bfloat16)
 
-    def get_resource_manager(resource_type):
+    def get_resource_manager(resource_type: ResourceManagerType) -> object:
         if resource_type == ResourceManagerType.PEFT_CACHE_MANAGER:
             return peft_cache_manager
         if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
@@ -375,7 +385,7 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                 engine._graphs.breakable_cuda_graph_runner = breakable_runner
                 prepared = engine._inputs.prepare_inputs.return_value
 
-                def prepare_prefill_graph_batch(*args, **kwargs):
+                def prepare_prefill_graph_batch(*args: object, **kwargs: object) -> PreparedInputs:
                     set_per_request_prefill_cuda_graph_flag(True)
                     return prepared
 
@@ -562,14 +572,14 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
 @pytest.mark.cpu_only
 class TestDecodeGraphMetadataPreparation(unittest.TestCase):
     @staticmethod
-    def _metadata():
+    def _metadata() -> CSA2TrtllmMetadata:
         from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
         metadata = object.__new__(CSA2TrtllmMetadata)
         metadata.is_cuda_graph = True
         return metadata
 
-    def test_scope_requires_selected_ordinary_decode_graph(self):
+    def test_scope_requires_selected_ordinary_decode_graph(self) -> None:
         key = KeyType(batch_size=1, draft_len=0)
         cases = (
             "ordinary",
@@ -622,7 +632,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                     )
                 self.assertFalse(metadata._csa2_defer_decode_outputs)
 
-    def test_forward_scopes_proof_to_prepare_for_capture_replay_and_fallback(self):
+    def test_forward_scopes_proof_to_prepare_for_capture_replay_and_fallback(self) -> None:
         key = KeyType(batch_size=1, draft_len=0)
         for mode in ("warmup", "capture", "replay", "fallback", "prepare_error"):
             with self.subTest(mode=mode):
@@ -639,7 +649,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                 batch.generation_requests = [_make_request_stub(1)]
                 prepared = engine._inputs.prepare_inputs.return_value
 
-                def prepare(*args, **kwargs):
+                def prepare(*args: object, **kwargs: object) -> PreparedInputs:
                     self.assertIs(metadata.trtllm_gen_jit_warmup, False)
                     self.assertEqual(metadata._csa2_defer_decode_outputs, mode != "fallback")
                     if mode == "prepare_error":
@@ -670,7 +680,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                 if mode == "fallback":
                     engine._forward_step.assert_called_once()
 
-    def test_jit_warmup_flag_marks_only_the_warmup_forward(self):
+    def test_jit_warmup_flag_marks_only_the_warmup_forward(self) -> None:
         engine, _, resource_manager, _, _ = _make_decoder_runner(None)
         runner = engine
         metadata = self._metadata()
@@ -679,7 +689,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
         prepared = runner._inputs.prepare_inputs.return_value
         observed = []
 
-        def prepare(*args, **kwargs):
+        def prepare(*args: object, **kwargs: object) -> PreparedInputs:
             observed.append(metadata.trtllm_gen_jit_warmup)
             return prepared
 
@@ -839,7 +849,7 @@ def test_prefill_compile_scopes_whole_model_forward(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("is_dummy", [False, True])
-def test_decoder_runner_passes_call_state_without_engine_writes(is_dummy):
+def test_decoder_runner_passes_call_state_without_engine_writes(is_dummy: bool) -> None:
     engine, _, resources, _, _ = _make_decoder_runner(None)
     # The dummy flag comes from the caller, not from the warmup scope.
     inputs = ScheduledInputs(
@@ -856,11 +866,13 @@ def test_decoder_runner_passes_call_state_without_engine_writes(is_dummy):
 
 
 @pytest.mark.cpu_only
-def test_forward_warmup_runs_local_call_state_in_forward_context():
+def test_forward_warmup_runs_local_call_state_in_forward_context() -> None:
     engine, _, resources, _, _ = _make_decoder_runner(None)
     batch = ScheduledRequests()
 
-    def decoder_forward(inputs, resource_manager, *, is_dummy):
+    def decoder_forward(
+        inputs: ScheduledInputs, resource_manager: ResourceManager, *, is_dummy: bool
+    ) -> dict[str, object]:
         assert torch.is_inference_mode_enabled()
         assert get_model_extra_attrs() is engine._model.extra_attrs
         return {"logits": object(), "runtime_draft_len": 3}
@@ -880,11 +892,13 @@ def test_forward_warmup_runs_local_call_state_in_forward_context():
 
 
 @pytest.mark.cpu_only
-def test_decoder_runner_forward_enters_model_context():
+def test_decoder_runner_forward_enters_model_context() -> None:
     engine, _, resources, _, _ = _make_decoder_runner(None)
     inputs = ScheduledInputs(batch=ScheduledRequests())
 
-    def decoder_forward(inputs, resource_manager, *, is_dummy):
+    def decoder_forward(
+        inputs: ScheduledInputs, resource_manager: ResourceManager, *, is_dummy: bool
+    ) -> dict[str, object]:
         assert torch.is_inference_mode_enabled()
         assert get_model_extra_attrs() is engine._model.extra_attrs
         return {"logits": object()}

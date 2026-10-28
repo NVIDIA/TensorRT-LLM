@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 import contextlib
 import gc
 import os
@@ -9,6 +12,7 @@ import unittest
 from collections.abc import Iterator
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest import mock
 from unittest.mock import Mock, call, patch
 
@@ -39,8 +43,13 @@ from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PrefillCudaGraphBackend
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-def _warmup_and_resources():
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.config import DecoderRunnerConfig
+
+
+def _warmup_and_resources() -> tuple[DecoderWarmup, ResourceManager]:
     config = decoder_config()
     model = DummyModel(torch.half)
     backend = Mock(enabled=True, is_warmup_only=False)
@@ -55,12 +64,12 @@ def _warmup_and_resources():
 class _Tracker:
     """Records method-call order (and each call's arguments) via mock side_effects."""
 
-    def __init__(self):
-        self.calls = []
-        self.call_args = {}
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.call_args: dict[str, list[tuple[tuple[object, ...], dict[str, object]]]] = {}
 
-    def __call__(self, name):
-        def _wrapped(*args, **kwargs):
+    def __call__(self, name: str) -> Callable[..., None]:
+        def _wrapped(*args: object, **kwargs: object) -> None:
             self.calls.append(name)
             self.call_args.setdefault(name, []).append((args, kwargs))
 
@@ -68,8 +77,13 @@ class _Tracker:
 
 
 def _run_warmup_tracked(
-    model_engine, resource_manager, *, force_helix_cp=False, capture_logs=False, tracker=None
-):
+    model_engine: DecoderWarmup,
+    resource_manager: ResourceManager,
+    *,
+    force_helix_cp: bool = False,
+    capture_logs: bool = False,
+    tracker: _Tracker | None = None,
+) -> tuple[list[str], list[str] | None]:
     """Patch warmup stages and cleanup operations, then run warmup.
 
     Optionally force helix CP and capture logs. Pass ``tracker`` to inspect the
@@ -128,7 +142,9 @@ def _run_warmup_tracked(
         return tracker.calls, None
 
 
-def _indexer_q_prewarm_owner(modules: list, tp_size: int) -> SimpleNamespace:
+def _indexer_q_prewarm_owner(
+    modules: list[torch.nn.Module | SimpleNamespace | Mock], tp_size: int
+) -> SimpleNamespace:
     return SimpleNamespace(
         model=SimpleNamespace(modules=lambda: iter(modules)),
         mapping=SimpleNamespace(tp_size=tp_size),
@@ -169,7 +185,9 @@ class _StandInMambaCacheManager:
         return self._available_tokens
 
 
-def _engine(*, world_size: int = 1, dwdp_size: int = 0, config=None) -> DecoderWarmup:
+def _engine(
+    *, world_size: int = 1, dwdp_size: int = 0, config: DecoderRunnerConfig | None = None
+) -> DecoderWarmup:
     agreement = _agreement(world_size=world_size, dwdp_size=dwdp_size)
     engine = decoder_warmup(
         config or decoder_config(), agreement=agreement, mapping=agreement.mapping
@@ -269,7 +287,9 @@ class DecoderDsaWarmupTestCase(unittest.TestCase):
         )
         metadata = Mock(spec=DSAtrtllmAttentionMetadata)
 
-        def build(kv_cache_manager, draft_kv_cache_manager):
+        def build(
+            kv_cache_manager: KVCacheManagerV2, draft_kv_cache_manager: KVCacheManagerV2 | None
+        ) -> Mock:
             engine._metadata.attn_metadata = metadata
             return metadata
 
@@ -708,7 +728,7 @@ def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
 
 
 class TestWarmupCleanup(unittest.TestCase):
-    def test_empty_cache_fires_immediately_after_autotuner(self):
+    def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
         _run_autotuner_warmup."""
         model_engine, resource_manager = _warmup_and_resources()
@@ -727,7 +747,7 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Expected empty_cache right after autotuner; got {calls}",
         )
 
-    def test_empty_cache_count_under_default(self):
+    def test_empty_cache_count_under_default(self) -> None:
         """Default warmup should call empty_cache exactly twice:
         once at the end of step (a) (pre-existing) and once after step (b)
         (Change 1)."""
@@ -739,7 +759,7 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Expected exactly 2 empty_cache calls; got order={calls}",
         )
 
-    def test_helix_cp_runs_only_the_generation_autotuner_warmup(self):
+    def test_helix_cp_runs_only_the_generation_autotuner_warmup(self) -> None:
         """With Helix CP, can_run_general_warmup is False and the context
         warmups (general, Mamba hybrid) are skipped; the autotuner warmup still
         runs, on generation requests, followed by one empty_cache."""
@@ -763,7 +783,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(calls[calls.index("autotuner") + 1], "empty_cache")
 
     @pytest.mark.cpu_only
-    def test_generation_only_autotuner_warmup_tunes_one_full_generation_batch(self):
+    def test_generation_only_autotuner_warmup_tunes_one_full_generation_batch(self) -> None:
         """Helix CP tunes on max_batch_size generation requests (bounded by
         max_num_tokens), without the context batch."""
         tuner = SimpleNamespace(
@@ -831,12 +851,12 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(engine._completed_autotuner_warmup_num_tokens, 100)
 
     @pytest.mark.cpu_only
-    def test_flashinfer_mxfp8_respects_disabled_global_autotuner(self):
+    def test_flashinfer_mxfp8_respects_disabled_global_autotuner(self) -> None:
         """The global autotuner switch also disables automatic FlashInfer tuning."""
         calls = []
 
         @contextlib.contextmanager
-        def flashinfer_autotune():
+        def flashinfer_autotune() -> Iterator[None]:
             calls.append("flashinfer_autotune_enter")
             yield
             calls.append("flashinfer_autotune_exit")
@@ -883,19 +903,19 @@ class TestWarmupCleanup(unittest.TestCase):
         flashinfer_module.autotune.assert_not_called()
 
     @pytest.mark.cpu_only
-    def test_mxfp8_native_and_flashinfer_use_separate_warmup_passes(self):
+    def test_mxfp8_native_and_flashinfer_use_separate_warmup_passes(self) -> None:
         """Native and FlashInfer backends each receive an isolated tuning forward."""
         calls = []
 
         @contextlib.contextmanager
-        def trtllm_autotune(**kwargs):
+        def trtllm_autotune(**kwargs: object) -> Iterator[None]:
             self.assertIsNone(kwargs["cache_path"])
             calls.append("trtllm_autotune_enter")
             yield
             calls.append("trtllm_autotune_exit")
 
         @contextlib.contextmanager
-        def flashinfer_autotune():
+        def flashinfer_autotune() -> Iterator[None]:
             calls.append("flashinfer_autotune_enter")
             yield
             calls.append("flashinfer_autotune_exit")
@@ -1018,19 +1038,19 @@ class TestWarmupCleanup(unittest.TestCase):
         tuner.setup_distributed_state.assert_called_with(engine.mapping, engine.dist)
 
     @pytest.mark.cpu_only
-    def test_native_mxfp8_falls_back_after_missing_warmup_batch(self):
+    def test_native_mxfp8_falls_back_after_missing_warmup_batch(self) -> None:
         """A missing startup batch latches native MXFP8 to the default tactic."""
         calls = []
 
         @contextlib.contextmanager
-        def trtllm_autotune(**kwargs):
+        def trtllm_autotune(**kwargs: object) -> Iterator[None]:
             self.assertIsNone(kwargs["cache_path"])
             calls.append("autotune_enter")
             yield
             calls.append("autotune_exit")
 
         @contextlib.contextmanager
-        def flashinfer_autotune():
+        def flashinfer_autotune() -> Iterator[None]:
             calls.append("flashinfer_autotune_enter")
             yield
             calls.append("flashinfer_autotune_exit")
@@ -1143,7 +1163,7 @@ class TestWarmupCleanup(unittest.TestCase):
         engine._forward_warmup.assert_not_called()
 
     @pytest.mark.cpu_only
-    def test_flashinfer_mxfp8_rank_mismatch_falls_back_before_warmup(self):
+    def test_flashinfer_mxfp8_rank_mismatch_falls_back_before_warmup(self) -> None:
         """TP and PP ranks agree on fallback before the tuning forward."""
         flashinfer_module = ModuleType("flashinfer")
         flashinfer_module.mm_mxfp8 = Mock()
@@ -1244,7 +1264,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(engine._forward_warmup.call_count, 1)
 
     @pytest.mark.cpu_only
-    def test_native_mxfp8_respects_disabled_global_autotuner(self):
+    def test_native_mxfp8_respects_disabled_global_autotuner(self) -> None:
         """Avoid native MXFP8 warmup when the global autotuner is disabled."""
         with (
             patch(

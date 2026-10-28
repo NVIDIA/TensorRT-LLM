@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -316,10 +317,10 @@ def test_no_kv_cache_runner_default_lifecycle_with_no_kv_resources(
     assert runner.wait_for_input_copy() is None
 
 
-def test_no_kv_forward_enters_model_context():
+def test_no_kv_forward_enters_model_context() -> None:
     model = _model(is_generation=False)
 
-    def model_forward(**kwargs):
+    def model_forward(**kwargs: object) -> dict[str, object]:
         assert torch.is_inference_mode_enabled()
         assert get_model_extra_attrs() is model.extra_attrs
         return {"hidden_states": object()}
@@ -335,7 +336,7 @@ def test_no_kv_forward_enters_model_context():
     assert get_model_extra_attrs() is None
 
 
-def test_no_kv_forward_preserves_model_output_dictionary_without_length_update():
+def test_no_kv_forward_preserves_model_output_dictionary_without_length_update() -> None:
     outputs = {"hidden_states": object()}
     caller = Mock(return_value=outputs)
     runner = _make_runner(PoolingRunner, _model(is_generation=False), model_caller=caller)

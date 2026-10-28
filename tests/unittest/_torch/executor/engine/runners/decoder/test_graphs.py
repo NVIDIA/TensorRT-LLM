@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 import contextlib
 import unittest
 from collections.abc import Iterator
@@ -291,7 +292,9 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
     assert not runner._config.is_spec_decode
     batches = {}
 
-    def create_request(resources, batch_size, draft_len, *args, **kwargs):
+    def create_request(
+        resources: ResourceManager, batch_size: int, draft_len: int, *args: object, **kwargs: object
+    ) -> ScheduledRequests:
         return batches.setdefault(draft_len, ScheduledRequests())
 
     forward_warmup = Mock(side_effect=RuntimeError("capture failure") if fails else None)

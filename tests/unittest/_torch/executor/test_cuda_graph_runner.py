@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 import contextlib
 import unittest
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -22,6 +26,9 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import SeqLenAwareSparseAttentionConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 pytestmark = pytest.mark.cpu_only
 
@@ -284,11 +291,13 @@ class CaptureStateTestCase(unittest.TestCase):
         self.assertEqual(attn_metadata.on_update_kv_lens.call_count, 2)
 
 
-def test_encoder_capture_discards_warmup_and_capture_outputs(monkeypatch) -> None:
+def test_encoder_capture_discards_warmup_and_capture_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     discarded = []
 
     @contextlib.contextmanager
-    def discard(inputs):
+    def discard(inputs: dict[str, object]) -> Iterator[None]:
         discarded.append(inputs)
         yield
 

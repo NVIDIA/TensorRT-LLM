@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 import contextlib
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock, patch
 
 import torch
@@ -21,6 +24,9 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 
 @dataclass
 class Config:
@@ -28,8 +34,8 @@ class Config:
     num_key_value_heads: int = 16
     num_attention_heads: int = 16
     hidden_size: int = 256
-    architectures: list[str] = None
-    rope_scaling: dict | None = None
+    architectures: list[str] | None = None
+    rope_scaling: dict[str, object] | None = None
 
     @property
     def head_dim(self) -> int:
@@ -37,22 +43,22 @@ class Config:
 
 
 class DummyModel(torch.nn.Module):
-    def __init__(self, dtype: torch.dtype, rope_scaling: dict | None = None):
+    def __init__(self, dtype: torch.dtype, rope_scaling: dict[str, object] | None = None) -> None:
         super().__init__()
         self.model_config = ModelConfig(
             pretrained_config=Config(torch_dtype=dtype, rope_scaling=rope_scaling)
         )
-        self.recorded_position_ids = None
-        self.recorded_kwargs = []
+        self.recorded_position_ids: torch.Tensor | None = None
+        self.recorded_kwargs: list[dict[str, Any]] = []
 
-    def infer_max_seq_len(self):
+    def infer_max_seq_len(self) -> int:
         return 2048
 
     @property
-    def config(self):
+    def config(self) -> Config:
         return self.model_config.pretrained_config
 
-    def forward(self, *args, **kwargs) -> torch.Tensor:
+    def forward(self, *args: object, **kwargs: Any) -> dict[str, torch.Tensor]:
         input_ids = kwargs["input_ids"]
         self.recorded_position_ids = kwargs["position_ids"]
         # Input buffers are reused across steps, so keep copies.
@@ -89,7 +95,7 @@ class DummyModelEngine(ModelEngine):
         )
 
 
-def _create_request(num_tokens, req_id: int):
+def _create_request(num_tokens: int, req_id: int) -> LlmRequest:
     sampling_params = SamplingParams()
     kwargs = {
         "request_id": req_id,
@@ -151,7 +157,7 @@ def create_model_engine_and_kvcache(
     execution_stream: torch.cuda.Stream | None = None,
     spec_config: DecodingBaseConfig | None = None,
     model: DummyModel | None = None,
-):
+) -> Iterator[tuple[DummyModelEngine, KVCacheManagerV2]]:
     if llm_args is None:
         llm_args = TorchLlmArgs(
             model="dummy",
@@ -174,14 +180,14 @@ def create_model_engine_and_kvcache(
 @contextlib.contextmanager
 def kv_cache_manager(
     *,
-    model,
-    max_tokens=258,
-    max_batch_size=13,
-    mapping=None,
-    execution_stream=None,
-    config=None,
-    max_num_tokens=None,
-):
+    model: DummyModel,
+    max_tokens: int = 258,
+    max_batch_size: int = 13,
+    mapping: Mapping | None = None,
+    execution_stream: torch.cuda.Stream | None = None,
+    config: KvCacheConfig | None = None,
+    max_num_tokens: int | None = None,
+) -> Iterator[KVCacheManagerV2]:
     options = {} if max_num_tokens is None else {"max_num_tokens": max_num_tokens}
     manager = KVCacheManagerV2(
         config or KvCacheConfig(max_tokens=max_tokens),
@@ -203,7 +209,7 @@ def kv_cache_manager(
         manager.shutdown()
 
 
-def _clone_tensors(values: dict) -> dict:
+def _clone_tensors(values: dict[str, Any]) -> dict[str, Any]:
     return {
         name: value.clone() if isinstance(value, torch.Tensor) else value
         for name, value in values.items()
@@ -211,7 +217,7 @@ def _clone_tensors(values: dict) -> dict:
 
 
 @contextlib.contextmanager
-def _capture_tllm_logs():
+def _capture_tllm_logs() -> Iterator[list[str]]:
     """Capture logger.info calls emitted from the decoder runner module.
 
     tensorrt_llm.logger.logger is a custom Singleton (not a stdlib
@@ -222,7 +228,7 @@ def _capture_tllm_logs():
     """
     records = []
 
-    def _record(*msg):
+    def _record(*msg: object) -> None:
         records.append(" ".join(str(m) for m in msg))
 
     with patch.object(decoder_warmup_module.logger, "info", side_effect=_record):
@@ -250,7 +256,7 @@ def _agreement(
     agrees with whatever this rank reports.
     """
 
-    def _allgather(value):
+    def _allgather(value: int) -> list[int]:
         peers = [value] * (world_size - 1) if peer_values is None else list(peer_values)
         return [value, *peers]
 
@@ -273,7 +279,7 @@ def _agreement(
 
 
 class _AttentionMetadata:
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, **kwargs: object) -> None:
         self.__dict__.update(kwargs)
         self.block_ids_per_seq = object()
         self.kv_block_ids_per_seq = object()

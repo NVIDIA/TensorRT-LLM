@@ -1,11 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 import unittest
 import weakref
 from ast import literal_eval
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -54,6 +58,11 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from typing import Any
+
+    from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
+
 
 class DummyLegacyMultimodalIndexModel(MultimodalModelMixin, torch.nn.Module):
     class Config:
@@ -98,7 +107,9 @@ def _install_graph_runner_stub(runner: DecoderRunner, key: KeyType | None = None
     )
     stub.replayed_inputs = []
 
-    def replay(key, inputs, position_id_offsets=None):
+    def replay(
+        key: KeyType, inputs: dict[str, Any], position_id_offsets: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
         stub.replayed_inputs.append(_clone_tensors(inputs))
         return {"logits": torch.zeros((inputs["input_ids"].shape[0], 10), device="cuda")}
 
@@ -219,8 +230,8 @@ class DecoderForwardTestCase(unittest.TestCase):
         kv_cache_manager: KVCacheManagerV2,
         resource_manager: ResourceManager,
         batch: ScheduledRequests,
-        new_tensors_device=None,
-    ):
+        new_tensors_device: SampleStateTensors | None = None,
+    ) -> dict[str, torch.Tensor | int]:
         _prepare_kv_cache_resources(kv_cache_manager, batch)
         return engine.forward(batch, resource_manager, new_tensors_device)
 
@@ -230,13 +241,23 @@ class DecoderForwardTestCase(unittest.TestCase):
         request.py_seq_slot = seq_slot
         return request
 
-    def _prefill(self, engine, kv_cache_manager, resource_manager, *requests: LlmRequest) -> None:
+    def _prefill(
+        self,
+        engine: ModelEngine,
+        kv_cache_manager: KVCacheManagerV2,
+        resource_manager: ResourceManager,
+        *requests: LlmRequest,
+    ) -> None:
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = list(requests)
         self._forward(engine, kv_cache_manager, resource_manager, batch)
 
     def _prefill_all_but_last_token(
-        self, engine, kv_cache_manager, resource_manager, request: LlmRequest
+        self,
+        engine: ModelEngine,
+        kv_cache_manager: KVCacheManagerV2,
+        resource_manager: ResourceManager,
+        request: LlmRequest,
     ) -> None:
         """Leave `request` with a final one-token context chunk."""
         batch = ScheduledRequests()
@@ -248,7 +269,12 @@ class DecoderForwardTestCase(unittest.TestCase):
         request.move_to_next_context_chunk()
         request.context_chunk_size = 1
 
-    def _final_context_and_generation(self, engine, kv_cache_manager, resource_manager):
+    def _final_context_and_generation(
+        self,
+        engine: ModelEngine,
+        kv_cache_manager: KVCacheManagerV2,
+        resource_manager: ResourceManager,
+    ) -> tuple[LlmRequest, LlmRequest, ScheduledRequests]:
         context = self._request([11, 22, 33, 44], 1, seq_slot=0)
         generation = self._request([50, 51, 52, 53, 54], 2, seq_slot=1)
         self._prefill_all_but_last_token(engine, kv_cache_manager, resource_manager, context)
@@ -418,14 +444,14 @@ class DecoderForwardTestCase(unittest.TestCase):
                 self.assertEqual(observed, [[44]])
                 self.assertEqual(graphs.replay.call_count, int(graph_hit))
 
-    def _make_mrope_engine(self):
+    def _make_mrope_engine(self) -> tuple[ModelEngine, KVCacheManagerV2, ResourceManager, Mock]:
         return self._make_engine(DummyModel(torch.half, rope_scaling={"type": "mrope"}))
 
     def _mrope_generation(
         self,
-        engine,
-        kv_cache_manager,
-        resource_manager,
+        engine: ModelEngine,
+        kv_cache_manager: KVCacheManagerV2,
+        resource_manager: ResourceManager,
         num_tokens: int,
         req_id: int,
         seq_slot: int,
@@ -450,8 +476,12 @@ class DecoderForwardTestCase(unittest.TestCase):
         return request
 
     def _forward_generation(
-        self, engine, kv_cache_manager, resource_manager, requests: list[LlmRequest]
-    ) -> dict:
+        self,
+        engine: ModelEngine,
+        kv_cache_manager: KVCacheManagerV2,
+        resource_manager: ResourceManager,
+        requests: list[LlmRequest],
+    ) -> dict[str, Any]:
         batch = ScheduledRequests()
         batch.generation_requests = requests
         self._forward(engine, kv_cache_manager, resource_manager, batch)
@@ -738,7 +768,7 @@ class ModelEngineTestCase(unittest.TestCase):
         )
         self.assertIsNone(decoder.attn_metadata)
 
-    def test_position_id_preparation(self):
+    def test_position_id_preparation(self) -> None:
         (model_engine, kv_cache_manager) = self.enterContext(create_model_engine_and_kvcache())
         resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -774,7 +804,7 @@ class ModelEngineTestCase(unittest.TestCase):
             model_engine.model.recorded_position_ids, expected_gen_pos_id, atol=0, rtol=0
         )
 
-    def test_warmup(self):
+    def test_warmup(self) -> None:
         (model_engine, kv_cache_manager) = self.enterContext(create_model_engine_and_kvcache())
         resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -797,7 +827,7 @@ class ModelEngineTestCase(unittest.TestCase):
         kv_cache_manager.free_resources(padding_dummies[0])
         self.assertEqual(num_free_before, kv_cache_manager.get_num_free_blocks())
 
-    def test_warmup_skips_padding_dummy_when_padding_impossible(self):
+    def test_warmup_skips_padding_dummy_when_padding_impossible(self) -> None:
         # With max_batch_size=1 and a graph for batch size 1, every batch
         # already matches a graph size, so no padded batch can ever occur and
         # warmup must not retain a padding dummy (it would permanently hold
@@ -819,7 +849,7 @@ class ModelEngineTestCase(unittest.TestCase):
         self.assertEqual({}, model_engine.cuda_graph_runner.padding_dummy_requests)
         self.assertEqual(num_free_before, kv_cache_manager.get_num_free_blocks())
 
-    def test_warmup_skips_padding_dummy_during_estimation(self):
+    def test_warmup_skips_padding_dummy_during_estimation(self) -> None:
         # The estimation-phase KV cache is sized with no headroom for retained
         # dummies; holding blocks there can leave the estimation requests
         # unschedulable. Warmup must skip the preallocation for managers
@@ -834,7 +864,7 @@ class ModelEngineTestCase(unittest.TestCase):
         self.assertEqual({}, model_engine.cuda_graph_runner.padding_dummy_requests)
         self.assertEqual(num_free_before, kv_cache_manager.get_num_free_blocks())
 
-    def test_cuda_graph_padding_filters_huge_batch_size(self):
+    def test_cuda_graph_padding_filters_huge_batch_size(self) -> None:
         llm_args = TorchLlmArgs(
             model="dummy",
             cuda_graph_config=CudaGraphConfig(
@@ -1021,7 +1051,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
 
 class TestWarmupCleanup(unittest.TestCase):
     @pytest.mark.cpu_only
-    def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self):
+    def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self) -> None:
         """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
         model_engine = object.__new__(ModelEngine)
         model_engine._metrics = {}
@@ -1067,7 +1097,7 @@ class TestWarmupCleanup(unittest.TestCase):
             model_engine.metrics, {"kv_cache_cleanup_seconds": 3.0, "total_warmup_seconds": 7.0}
         )
 
-    def test_encoder_decoder_encoder_warmup_delegates_runner_lifecycle(self):
+    def test_encoder_decoder_encoder_warmup_delegates_runner_lifecycle(self) -> None:
         model_engine = object.__new__(ModelEngine)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
         model_engine.moe_load_balancer = None
@@ -1225,7 +1255,9 @@ def test_engine_passes_call_state_and_returns_length_update(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("raw_output", [torch.tensor([1.0]), None], ids=["tensor", "none"])
 @pytest.mark.parametrize("is_dummy", [False, True])
-def test_engine_forward_preserves_raw_decoder_outputs(raw_output, is_dummy):
+def test_engine_forward_preserves_raw_decoder_outputs(
+    raw_output: torch.Tensor | None, is_dummy: bool
+) -> None:
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
     engine._warmup_depth = int(is_dummy)
     engine._runner._forward_decoder = Mock(return_value=raw_output)

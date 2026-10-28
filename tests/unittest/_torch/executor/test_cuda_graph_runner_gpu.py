@@ -1,8 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 import contextlib
 import unittest
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import torch
@@ -14,9 +18,14 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
 
 @contextlib.contextmanager
-def cuda_graph_runner_and_kv_cache():
+def cuda_graph_runner_and_kv_cache() -> Iterator[tuple[CUDAGraphRunner, KVCacheManagerV2]]:
     runner = CUDAGraphRunner(
         CUDAGraphRunnerConfig(
             use_cuda_graph=True,
@@ -167,7 +176,7 @@ class CudaGraphPaddingTestCase(unittest.TestCase):
         for req in batch.generation_requests:
             self.assertFalse(getattr(req, "is_cuda_graph_dummy", False))
 
-    def test_preallocate_padding_dummies_uses_captured_draft_lens(self):
+    def test_preallocate_padding_dummies_uses_captured_draft_lens(self) -> None:
         # Speculative engines pad batches with the runtime draft length, so
         # the preallocation must create dummies for the draft lengths of the
         # captured graphs — not draft_len 0 unconditionally (an extra
@@ -189,7 +198,7 @@ class CudaGraphPaddingTestCase(unittest.TestCase):
             for dummy in runner.padding_dummy_requests.values():
                 kv_cache_manager.free_resources(dummy)
 
-    def test_release_padding_dummy_covers_every_manager(self):
+    def test_release_padding_dummy_covers_every_manager(self) -> None:
         # A padding dummy's request ID is spread across several managers, so
         # releasing only the main KV cache manager leaves the others holding
         # it — and re-creation reuses the same ID.

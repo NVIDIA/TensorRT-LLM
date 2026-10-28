@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -13,14 +14,14 @@ from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 
 
 @pytest.mark.cpu_only
-def test_model_caller_uses_current_forward_and_restores_outer_attribute_context():
+def test_model_caller_uses_current_forward_and_restores_outer_attribute_context() -> None:
     metadata = _AttentionMetadata()
     spec_metadata = object()
     attrs = {}
     outer_attrs = {"outer": True}
     model = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={"model_flag": True}))
 
-    def first_forward(**kwargs):
+    def first_forward(**kwargs: object) -> str:
         assert get_model_extra_attrs() is attrs
         assert attrs["attention_metadata"]() is metadata
         assert attrs["spec_metadata"] is spec_metadata
@@ -42,14 +43,14 @@ def test_model_caller_uses_current_forward_and_restores_outer_attribute_context(
 
 
 @pytest.mark.cpu_only
-def test_model_caller_borrows_live_compile_streams_and_events():
+def test_model_caller_borrows_live_compile_streams_and_events() -> None:
     streams = Backend.Streams()
     backend = SimpleNamespace(events=Backend.Events())
     metadata = _AttentionMetadata()
     current_stream = object()
     attrs = {}
 
-    def forward(**kwargs):
+    def forward(**kwargs: object) -> tuple[int, int]:
         assert get_model_extra_attrs() is attrs
         assert attrs["aux_streams"]() is streams
         assert attrs["events"]() is backend.events
@@ -66,6 +67,6 @@ def test_model_caller_borrows_live_compile_streams_and_events():
 
 
 @pytest.mark.cpu_only
-def test_model_caller_requires_streams_with_compile_backend():
+def test_model_caller_requires_streams_with_compile_backend() -> None:
     with pytest.raises(ValueError, match="requires its auxiliary stream container"):
         ModelCaller(SimpleNamespace(), compile_backend=SimpleNamespace(events=Backend.Events()))

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 import pytest
 import torch
 
@@ -8,7 +9,9 @@ from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 
 
 @pytest.mark.parametrize("draft_capacity", [None, 0, 8])
-def test_runner_input_buffers_support_repeated_cuda_graph_replay(draft_capacity):
+def test_runner_input_buffers_support_repeated_cuda_graph_replay(
+    draft_capacity: int | None,
+) -> None:
     buffers = InputBuffers.allocate(
         max_num_tokens=16,
         max_batch_size=2,

@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 import contextlib
 import unittest
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import torch
@@ -43,20 +47,30 @@ from tensorrt_llm.llmapi import MTPDecodingConfig, NGramDecodingConfig, SADecodi
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from typing import Any
 
-def _input_preparer(*, spec_config=None) -> DecoderInputPreparer:
+    from tensorrt_llm._torch.kernels.spec_step_copies.op import StepInputGather
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.config import DecoderRunnerConfig
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
+
+def _input_preparer(*, spec_config: DecodingBaseConfig | None = None) -> DecoderInputPreparer:
     return input_preparer(decoder_config(is_spec_decode=False, spec_config=spec_config), model=None)
 
 
 @contextlib.contextmanager
 def input_preparer_and_kv_cache(
-    config=None,
+    config: DecoderRunnerConfig | None = None,
     *,
-    spec_config=None,
-    model=None,
-    max_tokens=258,
-    max_batch_size=13,
-):
+    spec_config: DecodingBaseConfig | None = None,
+    model: DummyModel | None = None,
+    max_tokens: int = 258,
+    max_batch_size: int = 13,
+) -> Iterator[tuple[DecoderInputPreparer, KVCacheManagerV2]]:
     config = config or decoder_config(spec_config=spec_config)
     model = (
         model
@@ -435,7 +449,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             ),
         )
 
-        def step_inputs(step_input_gather):
+        def step_inputs(step_input_gather: StepInputGather | None) -> list[torch.Tensor]:
             """The buffers one step writes, from a filler they all start at."""
             inputs._step_input_gather = step_input_gather
             for request, slot in zip(requests, slots):
@@ -467,7 +481,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         launched = []
         launch = step_gather.gather
 
-        def recorded_launch(*args, **kwargs):
+        def recorded_launch(*args: object, **kwargs: object) -> bool:
             launched.append(launch(*args, **kwargs))
             return launched[-1]
 
@@ -592,10 +606,10 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
 
     def _setup_mrope_inputs(
         self,
-        max_num_tokens=32,
-        spec_config=None,
-        **config_changes,
-    ):
+        max_num_tokens: int = 32,
+        spec_config: DecodingBaseConfig | None = None,
+        **config_changes: Any,
+    ) -> tuple[DecoderInputPreparer, KVCacheManagerV2, AttentionMetadata]:
         config = decoder_config(
             **{
                 "max_num_tokens": max_num_tokens,
@@ -618,7 +632,9 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         return inputs, manager, metadata
 
     @staticmethod
-    def _make_mrope_gen_request(num_tokens: int, req_id: int, seq_slot: int, delta):
+    def _make_mrope_gen_request(
+        num_tokens: int, req_id: int, seq_slot: int, delta: int | None
+    ) -> LlmRequest:
         """Generation request carrying an MRoPE delta when `delta` is not None,
         and no multimodal data at all otherwise (a text-only prompt)."""
         request = _create_request(num_tokens, req_id)
@@ -636,7 +652,9 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             }
         return request
 
-    def _make_mrope_spec_batch(self, previous_batch: bool):
+    def _make_mrope_spec_batch(
+        self, previous_batch: bool
+    ) -> tuple[ScheduledRequests, list[LlmRequest]]:
         """Two multimodal verify groups around a text-only one, plus a CUDA graph
         padding dummy, each carrying one draft token.
 
@@ -752,7 +770,9 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         torch.testing.assert_close(inputs["position_ids"], corrected, atol=0, rtol=0)
 
     @staticmethod
-    def _make_mrope_ctx_request(num_tokens: int, req_id: int, seq_slot: int, delta: int):
+    def _make_mrope_ctx_request(
+        num_tokens: int, req_id: int, seq_slot: int, delta: int
+    ) -> LlmRequest:
         """Single-chunk context request carrying MRoPE metadata.
 
         Its position on axis `a` of token `i` is `100 + 1000 * a + i`, so a
@@ -776,7 +796,12 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         return request
 
     @staticmethod
-    def _prepare_mrope_spec_inputs(preparer, kv_cache_manager, attn_metadata, scheduled_requests):
+    def _prepare_mrope_spec_inputs(
+        preparer: DecoderInputPreparer,
+        kv_cache_manager: KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        scheduled_requests: ScheduledRequests,
+    ) -> dict[str, Any]:
         spec_metadata = Mock(
             _force_non_greedy_for_capture=False,
             context_prompt_lookahead_tokens=None,
@@ -792,7 +817,9 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         ).kwargs
         return result
 
-    def _assert_mrope_positions(self, result, rows) -> None:
+    def _assert_mrope_positions(
+        self, result: dict[str, Any], rows: list[int] | list[list[int]]
+    ) -> None:
         """`rows` is one list for all three axes, or one list per axis."""
         if not isinstance(rows[0], list):
             rows = [rows] * 3
@@ -875,7 +902,9 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(), [0, 1, 2])
         self.assertEqual(context.py_mrope_delta_cache_slot, 0)
 
-    def _setup_extend_as_context_inputs(self):
+    def _setup_extend_as_context_inputs(
+        self,
+    ) -> tuple[DecoderInputPreparer, KVCacheManagerV2, AttentionMetadata]:
         inputs, manager, metadata = self._setup_mrope_inputs(
             spec_config=NGramDecodingConfig(max_draft_len=1),
             attention_backend=VanillaAttention,

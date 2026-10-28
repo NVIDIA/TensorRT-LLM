@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import torch
@@ -25,8 +29,16 @@ from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from typing import Any
 
-def decoder_config(**changes) -> DecoderRunnerConfig:
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.engine.multimodal import MultimodalItemScheduler
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import ForwardWarmup
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
+
+
+def decoder_config(**changes: Any) -> DecoderRunnerConfig:
     config = DecoderRunnerConfig(
         max_batch_size=13,
         max_num_tokens=258,
@@ -88,10 +100,10 @@ def decoder_config(**changes) -> DecoderRunnerConfig:
 def input_preparer(
     config: DecoderRunnerConfig,
     *,
-    model,
+    model: torch.nn.Module | SimpleNamespace | None,
     mapping: Mapping | None = None,
     buffers: DecoderInputBuffers | None = None,
-    mm_item_scheduler=None,
+    mm_item_scheduler: MultimodalItemScheduler | None = None,
 ) -> DecoderInputPreparer:
     mapping = mapping or Mapping()
     return DecoderInputPreparer(
@@ -120,13 +132,13 @@ def input_preparer(
 def decoder_graphs(
     config: DecoderRunnerConfig,
     *,
-    model=None,
-    mapping=None,
-    cuda_graph_runner=None,
-    dummy_requests=None,
-    metadata=None,
-    forward_warmup=None,
-    lora=None,
+    model: torch.nn.Module | SimpleNamespace | None = None,
+    mapping: Mapping | None = None,
+    cuda_graph_runner: CUDAGraphRunner | None = None,
+    dummy_requests: DummyRequestFactory | None = None,
+    metadata: DecoderMetadata | None = None,
+    forward_warmup: ForwardWarmup | None = None,
+    lora: LoraParamBuilder | SimpleNamespace | None = None,
 ) -> DecoderCudaGraphs:
     mapping = mapping or Mapping()
     return DecoderCudaGraphs(
@@ -152,12 +164,12 @@ def decoder_graphs(
 def decoder_warmup(
     config: DecoderRunnerConfig,
     *,
-    model=None,
-    mapping=None,
-    agreement=None,
-    dummy_requests=None,
-    graphs=None,
-    forward_warmup=None,
+    model: torch.nn.Module | SimpleNamespace | None = None,
+    mapping: Mapping | None = None,
+    agreement: WarmupAgreement | None = None,
+    dummy_requests: DummyRequestFactory | None = None,
+    graphs: DecoderCudaGraphs | None = None,
+    forward_warmup: ForwardWarmup | None = None,
 ) -> DecoderWarmup:
     mapping = mapping or Mapping()
     model = model if model is not None else torch.nn.Identity()

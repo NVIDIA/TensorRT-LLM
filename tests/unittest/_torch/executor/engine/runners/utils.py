@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import Mock, patch
 
 import torch
@@ -18,7 +18,7 @@ from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 def _make_runner(
     runner_type: type[PoolingRunner] | type[MultimodalEncoderRunner],
-    model: Any,
+    model: torch.nn.Module | SimpleNamespace,
     config: NoKVCacheRunnerConfig | None = None,
     *,
     model_caller: Mock | None = None,
