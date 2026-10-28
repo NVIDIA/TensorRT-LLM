@@ -2721,6 +2721,7 @@ description = "Mistral-common is a library of common utilities for Mistral AI."
 optional = false
 python-versions = "<3.15,>=3.10.0"
 groups = ["main"]
+markers = "python_version == \"3.10\""
 files = [
     {file = "mistral_common-1.12.0-py3-none-any.whl", hash = "sha256:fa4504b66c30c0201ae4578c0340c5ee2abd22151c271532f62e373b985a53cf"},
     {file = "mistral_common-1.12.0.tar.gz", hash = "sha256:d0f150926733cf422d4750ca19b47568df1f714557c9054a432b866f1f30bf52"},
@@ -2741,6 +2742,40 @@ all = ["mistral_common[audio,guidance,hf-hub,image,opencv,sentencepiece,server]"
 audio = ["mistral_common[soundfile]", "mistral_common[soxr]"]
 guidance = ["jinja2 (>=3.1.0)", "llguidance (>=1.3.0,<1.4.0)"]
 hf-hub = ["huggingface-hub (>=1.0)"]
+image = ["mistral_common[opencv]"]
+opencv = ["opencv-python-headless (>=4.0.0)"]
+sentencepiece = ["sentencepiece (>=0.2.0)"]
+server = ["click (>=8.1.0)", "fastapi[standard] (>=0.118.3)", "pydantic-settings (>=2.9.1)", "uvloop (>=0.22.1) ; python_version >= \"3.14\""]
+soundfile = ["soundfile (>=0.12.1)"]
+soxr = ["soxr (>=0.5.0)"]
+
+[[package]]
+name = "mistral-common"
+version = "1.13.0"
+description = "Mistral-common is a library of common utilities for Mistral AI."
+optional = false
+python-versions = "<3.16,>=3.11.0"
+groups = ["main"]
+markers = "python_version >= \"3.11\""
+files = [
+    {file = "mistral_common-1.13.0-py3-none-any.whl", hash = "sha256:6304455b69ae9ca02cddb9bb3bb888ab8dcbe3945a3cafe3368897795611993d"},
+    {file = "mistral_common-1.13.0.tar.gz", hash = "sha256:8559b6e22e9b15d4d7445ae34db6d27578f3a6c0e3d74c5fd57b4bf2db543333"},
+]
+
+[package.dependencies]
+jsonschema = ">=4.21.1"
+numpy = {version = ">=1.25,<2.4", markers = "python_version <= \"3.12\""}
+pillow = ">=10.3.0"
+pydantic = ">=2.12,<3.0"
+pydantic-extra-types = {version = ">=2.10.5", extras = ["pycountry"]}
+requests = ">=2.0.0"
+tiktoken = {version = ">=0.7.0", markers = "python_version <= \"3.13\""}
+
+[package.extras]
+all = ["mistral_common[audio,guidance,hf-hub,image,opencv,sentencepiece,server]"]
+audio = ["mistral_common[soundfile]", "mistral_common[soxr]"]
+guidance = ["jinja2 (>=3.1.0)", "llguidance (>=1.3.0,<1.4.0)"]
+hf-hub = ["huggingface-hub (>=1.31.0)"]
 image = ["mistral_common[opencv]"]
 opencv = ["opencv-python-headless (>=4.0.0)"]
 sentencepiece = ["sentencepiece (>=0.2.0)"]
@@ -3428,14 +3463,14 @@ dill = ">=0.4.1"
 
 [[package]]
 name = "narwhals"
-version = "2.27.1"
+version = "2.28.0"
 description = "Extremely lightweight compatibility layer between dataframe libraries"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "narwhals-2.27.1-py3-none-any.whl", hash = "sha256:d057df13f5852b8e157596e82eb5e955fad267425df5e420e0ee9863da483b31"},
-    {file = "narwhals-2.27.1.tar.gz", hash = "sha256:aed93076a3ea42d9c32c88e4eb5ea422a21937011cbe1f480f9572a523c82094"},
+    {file = "narwhals-2.28.0-py3-none-any.whl", hash = "sha256:1f69d6385ec30e2fa6e1fdeb37c562ecabd0f713f6f3e3b58a668c5c9df9567f"},
+    {file = "narwhals-2.28.0.tar.gz", hash = "sha256:2d9860c80d6610820826e94c6e42ce4b1d92d89cdd479586e652a8d211dab345"},
 ]
 
 [package.extras]
@@ -4152,14 +4187,14 @@ dev = ["PyYAML (>=5.1.0)", "attrs", "build", "bump-my-version", "coveralls", "no
 
 [[package]]
 name = "openai"
-version = "3.39.0"
+version = "3.40.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.39.0-py3-none-any.whl", hash = "sha256:e29bc8d9785d9a386cffa0bed1726e7f3989e096245c0c003cb29f1d4ae67e32"},
-    {file = "openai-3.39.0.tar.gz", hash = "sha256:02687994f7bb6a4e80ed7796426d46c654889821ce4eb48699be15b3a425e1d3"},
+    {file = "openai-3.40.0-py3-none-any.whl", hash = "sha256:dfcfd4f65ee5a8bb824da90c9ad7fa0dda7f3bd472a7c564dffc6183f0a0b55c"},
+    {file = "openai-3.40.0.tar.gz", hash = "sha256:df309d434130e89a23e9c687fc4bcd3df0df705a33d3872503c87448df69f56f"},
 ]
 
 [package.dependencies]
@@ -7675,4 +7710,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "8c849e20b8e03399e2862c2f3ebd9748a2f4083b4b76d2fd14c16a934b257336"
+content-hash = "74896ec99d6d173fd35d292fce122c3ca070e8adde21c51da3d2e674ce03ec10"
