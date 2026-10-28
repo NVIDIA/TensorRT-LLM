@@ -110,6 +110,9 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
+  # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
+  # what runs it.
+  - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
