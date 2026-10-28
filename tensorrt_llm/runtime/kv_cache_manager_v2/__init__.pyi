@@ -798,6 +798,7 @@ class _KVCache:
     def resume(
         self,
         cuda_stream: CudaStream | None = None,
+        is_decoding: bool | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
     ) -> bool:
         """Lock this cache's pages at their required levels.
@@ -808,6 +809,10 @@ class _KVCache:
 
         Takes no sparse cache arena lease: that follows membership, so a request receiving
         its history costs the GPU cache nothing until it is seated.
+
+        ``is_decoding`` is accepted and ignored. Resuming no longer distinguishes a decoding
+        request; the parameter is kept so callers that still pass it keep working, and goes
+        with the full sparse attention support.
         """
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_swa_scratch_range(self, layer_group_id: LayerGroupId) -> HalfOpenRange:
