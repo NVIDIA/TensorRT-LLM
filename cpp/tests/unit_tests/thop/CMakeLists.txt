@@ -14,7 +14,14 @@
 # the License.
 
 if(${BUILD_PYT})
-  add_gtest(thUtilsTest thUtilsTest.cpp eagerMoeWorkspaceTest.cpp)
+  add_tllm_gtest(
+    thUtilsTest
+    SOURCES
+    thUtilsTest.cpp
+    eagerMoeWorkspaceTest.cpp
+    FULL_STACK
+    LABELS
+    "unit;full-stack;gpu")
   target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
                                            ${TORCH_LIBRARIES})
 endif()

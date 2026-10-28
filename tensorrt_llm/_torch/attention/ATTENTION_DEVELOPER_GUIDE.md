@@ -479,7 +479,11 @@ the selected library.
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
 defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
 block-sparse PrimTS remains enabled by default because a dense fallback cannot
-preserve its routing semantics. Delta entries update the
+preserve its routing semantics. The PrimTS sparse MLA library
+(`prims_ts_sparse_mla`) is also enabled by default: it serves only DeepSeek-V4
+generation on SM100 and sits ahead of the TRTLLM-Gen libraries, so DeepSeek-V4
+decode on B200/GB200 runs on it unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
+removes it. Delta entries update the
 default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
@@ -552,6 +556,10 @@ The FMHA package is split by role:
   With an FP8 KV cache it passes `mla_bmm1_scale` / `mla_bmm2_scale` to the
   kernel as device tensors (element 0 of each), so the scales need no host
   read and stay valid under CUDA graph replay.
+- `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
+  PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
+  it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
+  removes it.
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
@@ -742,7 +750,7 @@ Working rules:
 | `tensorrt_llm/_torch/attention/qk_norm_attention.py` | QK-norm attention module logic and fused QK-norm/RoPE/gate dispatch |
 | `tensorrt_llm/_torch/attention/cross_attention.py` | Encoder-decoder cross-attention module logic and cross-KV cache reuse |
 | `tensorrt_llm/_torch/attention/rotary_embedding.py` | Unfused RoPE and mRoPE modules shared across the attention stack |
-| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and unfused fallbacks |
+| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and decide what to do when a kernel does not apply |
 | `tensorrt_llm/_torch/attention/backends/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention/backends/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention/backends/trtllm.py` | TRTLLM backend execution and metadata |

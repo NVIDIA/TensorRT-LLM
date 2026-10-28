@@ -680,14 +680,36 @@ CudaGraphConfigType: TypeAlias = Annotated[
 class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
     """CUDA graph capture for multimodal vision / audio encoders.
 
-    One graph is captured per `buckets` entry; replay falls back to eager when the live workload's
-    padded shape does not match any bucket.
+    Set `max_batch_size` to generate capture shapes automatically. Advanced users can instead
+    specify `buckets`. Replay falls back to eager when no captured shape fits the live workload.
 
     NOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for
     `buckets` corresponding to lesser compute.
     """
 
-    buckets: list[tuple[PositiveInt, PositiveInt]] = Field(
+    max_batch_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        ("Maximum number of encoder contexts per CUDA graph. Automatically captures every "
+         "context count from 1 to this limit, with token capacities derived from the encoder "
+         "token budget. Contexts are encoder sequences, such as image or video frame groups "
+         "and audio chunks; they are not concurrent requests. Mutually exclusive with buckets."
+         ),
+        status="prototype",
+    )
+
+    max_num_tokens: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        ("Optional total token capacity for automatically generated graphs. Defaults to "
+         "encoder_max_num_tokens, or max_num_tokens when the encoder limit is unset. The "
+         "encoder adapter defines token units and layout. Larger workloads run eagerly. "
+         "Mutually exclusive with buckets."),
+        status="prototype",
+    )
+
+    buckets: Optional[list[tuple[PositiveInt, PositiveInt]]] = Field(
+        default=None,
         min_length=1,
         description=
         ("Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair "
@@ -723,6 +745,13 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def _normalize(self) -> 'MultimodalEncoderCudaGraphConfig':
+        if self.buckets is None:
+            if self.max_batch_size is None:
+                raise ValueError("Set max_batch_size or explicit buckets.")
+            return self
+        if self.max_batch_size is not None or self.max_num_tokens is not None:
+            raise ValueError("Explicit buckets cannot be combined with "
+                             "max_batch_size or max_num_tokens.")
         for total_tokens, num_contexts in self.buckets:
             if total_tokens < num_contexts:
                 raise ValueError("`buckets` entries must have total_tokens >= "
@@ -2700,6 +2729,23 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="Pool topology for the 'mooncake-store' connector. When "
         "set, trtllm-serve provisions the pool during bringup instead of "
         "requiring MOONCAKE_CONFIG_PATH from an external script.")
+
+    transfer_timeout_sec: float = Field(
+        default=600.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Deadline in seconds for an outstanding ADP KV connector "
+        "transfer. Checked at polling gates; cannot interrupt blocking callbacks. "
+        "Expiration fails all ADP owners and requires process restart. Unused without attention DP."
+    )
+    control_grace_sec: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Grace period in seconds for pending ADP KV connector "
+        "transfers after cancellation or shutdown. Can only shorten the "
+        "existing transfer deadline. Expiration fails all ADP owners and requires process restart. "
+        "Unused without attention DP.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":

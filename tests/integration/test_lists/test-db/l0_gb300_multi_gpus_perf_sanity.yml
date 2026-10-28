@@ -41,8 +41,6 @@ l0_gb300_multi_gpus_perf_sanity:
   # deepseek-v4-pro-fp4 8k1k
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] TIMEOUT (45)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] TIMEOUT (125)
-  # deepseek-v4.1-flash-fp4 dspark agentx: one 2-GPU DEP2 ctx server
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (110)
   # deepseek-v4.1-flash-fp4 8k1k dspark (aggregated)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_deepseek_v41_flash_nvfp4_grace_blackwell-v41_flash_nvfp4_tep4_dspark5_8k1k] TIMEOUT (30)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_deepseek_v41_flash_nvfp4_grace_blackwell-v41_flash_nvfp4_dep4_dspark5_8k1k] TIMEOUT (35)
@@ -58,10 +56,6 @@ l0_gb300_multi_gpus_perf_sanity:
   # nemotron-ultra-v3-fp4 50k2k (ctx_only)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL] TIMEOUT (30)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_50k2k_con1197_ctx16_dep4_gen1_dep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (40)
-  # minimax-m3-fp4 eagle3-gqa agentx (aggregated)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_minimax_m3_fp4_agentx_grace_blackwell-minimax_m3_fp4_tp4_eagle3_mtp7_con1_agentx] TIMEOUT (150)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_minimax_m3_fp4_agentx_grace_blackwell-minimax_m3_fp4_tp2_eagle3_mtp3_con20_agentx] TIMEOUT (150)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_minimax_m3_fp4_agentx_grace_blackwell-minimax_m3_fp4_tp2_eagle3_mtp3_con45_agentx] TIMEOUT (150)
   # gen_only_no_context tests (disagg config)
   # nemotron-ultra-v3-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL] TIMEOUT (40)

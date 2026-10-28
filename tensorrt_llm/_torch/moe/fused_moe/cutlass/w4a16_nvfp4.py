@@ -18,6 +18,7 @@ from dataclasses import replace
 
 import torch
 
+from ....utils import Fp4QuantizedTensor
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -55,6 +56,34 @@ class TrtllmCutlassW4a16Nvfp4Impl(CutlassFusedMoEBase):
 
     def _get_quant_method(self) -> object:
         return W4A16NVFP4CutlassFusedMoEMethod()
+
+    def quantize_input(
+        self,
+        x: torch.Tensor | Fp4QuantizedTensor,
+        post_quant_comm: bool = True,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply the AWQ pre-quant scale, keeping the activations high precision.
+
+        This path keeps activations high precision -- ``run_moe`` dequantizes
+        the NVFP4 weights and runs the unquantized kernel -- so unlike the
+        ``nvfp4`` leaf there is no FP4 activation quantization here. A pre-quant
+        scale is not part of that quantization, though: an AWQ-style checkpoint
+        stores ``W / s`` and ``load_quant_scales`` fills ``fc31_act_scale`` from
+        its ``*.pre_quant_scale`` keys regardless of ``quant_algo``, so the
+        dequantized weights expect the scaled activation ``x * s``. Matches the
+        dense ``W4A16NVFP4LinearMethod``, which applies ``pre_quant_scale`` the
+        same way.
+
+        See :meth:`CutlassFusedMoEBase.quantize_input` for the arguments.
+        """
+        del post_quant_comm, kwargs
+        if self.fc31_act_scale is not None:
+            assert not isinstance(x, Fp4QuantizedTensor), (
+                "Fp4QuantizedTensor is not expected for AWQ quantization."
+            )
+            x = x * self.fc31_act_scale
+        return x, None
 
     def run_moe(self, ctx: MoERunContext, *, workspace: dict | None = None) -> torch.Tensor:
         """Dequantize the active experts into a static workspace, then run unquantized.
