@@ -5001,15 +5001,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                     imagePullPolicy: Always
         """
     }
-    // CPU test pods mount the model scratch from 10.117.145.14, which can't be accessed from ipp6/ipp9 DC.
-    // Pods placed there stay in ContainerCreating. Build stage pods do not mount the model scratch,
-    // so they can still use these nodes.
-    def scratchUnreachableNodeAffinity = type == "cpu" ? '''
-                              - key: "region"
-                                operator: NotIn
-                                values:
-                                - "ipp6"
-                                - "ipp9"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -5063,7 +5054,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                                 values:
                                 - "core"
                                 - "qa_only"
-${scratchUnreachableNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -5101,7 +5091,7 @@ ${scratchUnreachableNodeAffinity}
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "L0_Test"])
 }
 
 def echoNodeAndGpuInfo(pipeline, stageName)
@@ -7381,7 +7371,8 @@ def runInKubernetes(pipeline, podSpec, containerName)
 {
     return {
         stageName, runner -> stage(stageName) {
-            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName) {
+            def stagePodSpec = ciNodePolicy.apply(podSpec, [pipeline: "L0_Test", stage: stageName])
+            trtllm_utils.launchKubernetesPod(pipeline, stagePodSpec, containerName) {
                 echoNodeAndGpuInfo(pipeline, stageName)
                 runner()
             }
@@ -7414,6 +7405,7 @@ def runInKubernetes(pipeline, podSpec, containerName)
 //                                       the worst-case attempt budget.
 def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerName, String stageName, Closure runner)
 {
+    podSpec = ciNodePolicy.apply(podSpec, [pipeline: "L0_Test", stage: stageName])
     boolean singleAttempt = opts.singleAttempt ?: false
     // SLURM dispatcher pods opt in to off-pod resource reconciliation: on a
     // mid-run pod death their SLURM job / Jenkins node would otherwise leak.
@@ -8649,6 +8641,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
         } else {
             stage(values.name) {
                 def imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                imageSanitySpec = ciNodePolicy.apply(imageSanitySpec, [pipeline: "L0_Test", stage: values.name])
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
                     def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
