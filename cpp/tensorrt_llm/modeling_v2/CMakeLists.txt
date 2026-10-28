@@ -34,6 +34,8 @@ file(
   GLOB family_lists
   LIST_DIRECTORIES false
   CONFIGURE_DEPENDS "${modeling_v2_models_dir}/*/csrc/CMakeLists.txt")
+# K3 objects and torch bindings are linked through the stock libraries.
+list(FILTER family_lists EXCLUDE REGEX "/kimi_k3_vl/csrc/CMakeLists[.]txt$")
 list(SORT family_lists)
 
 # A family removed or renamed since an earlier configure leaves its build
