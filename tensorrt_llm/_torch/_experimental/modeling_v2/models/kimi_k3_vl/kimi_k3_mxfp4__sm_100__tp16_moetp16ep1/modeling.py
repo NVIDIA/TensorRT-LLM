@@ -98,6 +98,7 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     k3_mla_decode_view,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops import native_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_drafter_attn_qknorm import (
     k3_drafter_attn_qknorm,
 )
@@ -647,7 +648,7 @@ def _apply_attn_res_rmsnorm_fused(
         _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
     try:
-        attn_res_rmsnorm_op = torch.ops.trtllm.k3_attn_res_rmsnorm_fwd
+        attn_res_rmsnorm_op = native_ops.k3_attn_res_rmsnorm_fwd
     except (AttributeError, RuntimeError):
         return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
@@ -721,7 +722,7 @@ def _apply_attn_res_add_rmsnorm_fused(
         _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
     try:
-        attn_res_add_rmsnorm_op = torch.ops.trtllm.k3_attn_res_add_rmsnorm_fwd
+        attn_res_add_rmsnorm_op = native_ops.k3_attn_res_add_rmsnorm_fwd
     except (AttributeError, RuntimeError):
         return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()

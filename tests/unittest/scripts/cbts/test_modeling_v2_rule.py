@@ -159,7 +159,7 @@ def test_scope(rule):
 
 
 @pytest.mark.parametrize("relative", ["csrc/kernel.cu", "ops/_native.py", "routing.py"])
-def test_stock_linked_k3_uses_baseline_selection(rule, relative):
+def test_k3_uses_modeling_v2_selection(rule, relative):
     path = f"{_PY}/models/kimi_k3_vl/{relative}"
-    assert not _is_mv2_claim(path)
-    assert _apply(rule, path) is None
+    assert _is_mv2_claim(path)
+    assert _apply(rule, path).scope == "modelingv2only"

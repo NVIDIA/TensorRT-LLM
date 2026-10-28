@@ -14,10 +14,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "k3MnnvlAllreduce.h"
+#include "kimi_k3_vl/csrc/k3MnnvlAllreduce.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/quantization.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
+#include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -28,7 +30,7 @@
 
 using tensorrt_llm::kernels::AllReduceFusionOp;
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -174,7 +176,7 @@ std::vector<torch::Tensor> k3MnnvlFusionAllReduce(torch::Tensor& input, torch::o
         }
     }
 
-    auto allreduce_params = tensorrt_llm::kernels::kimiK3MnnvlOneShot::AllReduceFusionParams();
+    auto allreduce_params = TRTLLM_MV2_NS::kernels::kimiK3MnnvlOneShot::AllReduceFusionParams();
     allreduce_params.nRanks = mcast_mem->getWorldSize();
     allreduce_params.rank = mcast_mem->getRank();
     allreduce_params.dType = dtype;
@@ -219,7 +221,7 @@ std::vector<torch::Tensor> k3MnnvlFusionAllReduce(torch::Tensor& input, torch::o
 
     if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= static_cast<size_t>(one_shot_max_bytes))
     {
-        tensorrt_llm::kernels::kimiK3MnnvlOneShot::oneshotAllreduceFusionOp(allreduce_params);
+        TRTLLM_MV2_NS::kernels::kimiK3MnnvlOneShot::oneshotAllreduceFusionOp(allreduce_params);
     }
     else
     {
@@ -244,9 +246,9 @@ std::vector<torch::Tensor> k3MnnvlFusionAllReduce(torch::Tensor& input, torch::o
 
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
+TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "k3_mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
@@ -254,7 +256,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? scale=None, int fusion_op=0, int one_shot_max_bytes=1048576, bool early_trigger=False) -> Tensor[]");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
-    m.impl("k3_mnnvl_fusion_allreduce", &tensorrt_llm::torch_ext::k3MnnvlFusionAllReduce);
+    m.impl("k3_mnnvl_fusion_allreduce", &TRTLLM_MV2_NS::torch_ext::k3MnnvlFusionAllReduce);
 }

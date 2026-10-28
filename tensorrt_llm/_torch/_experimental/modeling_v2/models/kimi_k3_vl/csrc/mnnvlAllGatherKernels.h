@@ -17,15 +17,17 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3Mnnvl
 {
+using namespace ::tensorrt_llm::kernels;
 
 struct AllGatherSplitParams
 {
@@ -50,4 +52,4 @@ void mnnvlAllGatherSplitOp(AllGatherSplitParams const& params);
 
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

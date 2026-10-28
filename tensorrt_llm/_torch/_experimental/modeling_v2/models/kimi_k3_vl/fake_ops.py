@@ -7,8 +7,12 @@ import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
+from ..._native import namespace_of
 
-@torch.library.register_fake("trtllm::k3_mnnvl_fusion_allreduce")
+_NS = namespace_of(__name__)
+
+
+@torch.library.register_fake(f"{_NS}::k3_mnnvl_fusion_allreduce")
 def _(
     input,
     gamma,
@@ -53,7 +57,7 @@ def _(
     return [torch.empty_like(input)]
 
 
-@torch.library.register_fake("trtllm::k3_attn_res_rmsnorm_fwd")
+@torch.library.register_fake(f"{_NS}::k3_attn_res_rmsnorm_fwd")
 def _(
     layer_residual: torch.Tensor,
     block_residual: torch.Tensor,
@@ -67,7 +71,7 @@ def _(
     return torch.empty_like(layer_residual)
 
 
-@torch.library.register_fake("trtllm::k3_attn_res_add_rmsnorm_fwd")
+@torch.library.register_fake(f"{_NS}::k3_attn_res_add_rmsnorm_fwd")
 def _(
     layer_residual: torch.Tensor,
     layer_residual_add: torch.Tensor,
@@ -82,7 +86,7 @@ def _(
     return torch.empty_like(layer_residual), torch.empty_like(layer_residual)
 
 
-@torch.library.register_fake("trtllm::mnnvl_allgather_split")
+@torch.library.register_fake(f"{_NS}::mnnvl_allgather_split")
 def _(input, bf16_columns, world_size, comm_buffer, buffer_flags):
     num_tokens, columns = input.shape
     return [
@@ -91,7 +95,7 @@ def _(input, bf16_columns, world_size, comm_buffer, buffer_flags):
     ]
 
 
-@torch.library.register_fake("trtllm::mnnvl_allreduce_attn_res")
+@torch.library.register_fake(f"{_NS}::mnnvl_allreduce_attn_res")
 def _(input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps, output_rms_eps,
       comm_buffer, buffer_flags):  # fmt: skip
     return [torch.empty_like(input), torch.empty_like(input)]

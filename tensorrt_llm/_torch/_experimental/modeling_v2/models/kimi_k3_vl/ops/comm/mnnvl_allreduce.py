@@ -3,6 +3,7 @@
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops import native_ops
 from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.distributed.ops import (
     MNNVLAllReduce,
@@ -56,7 +57,7 @@ class K3MnnvlAllReduce(MNNVLAllReduce):
         is_fusion = fusion_op != AllReduceFusionOp.NONE
         if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
             return None
-        outputs = torch.ops.trtllm.k3_mnnvl_fusion_allreduce(
+        outputs = native_ops.k3_mnnvl_fusion_allreduce(
             input,
             all_reduce_params.norm_weight,
             all_reduce_params.residual,

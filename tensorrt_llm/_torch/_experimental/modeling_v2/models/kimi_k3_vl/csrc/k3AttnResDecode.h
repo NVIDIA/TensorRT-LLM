@@ -17,11 +17,13 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/kimiK3AttnRes/attnResFwd.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3DecodeAttnRes
 {
+using namespace ::tensorrt_llm::kernels;
 
 struct AttnResFwdParams : kimiK3AttnRes::AttnResFwdParams
 {
@@ -33,4 +35,4 @@ void invokeAttnResAddRmsNormFwd(AttnResFwdParams const& params, cudaStream_t str
 
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

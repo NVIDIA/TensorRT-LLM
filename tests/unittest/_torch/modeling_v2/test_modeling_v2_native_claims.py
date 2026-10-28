@@ -9,8 +9,7 @@ targets (``_native``). Three things rest on that staying true: ``off`` loading
 nothing, a target never depending on a sibling, and CBTS testing a
 family-only change with that family's tests alone
 (``jenkins/scripts/cbts/cbts/rules/modeling_v2.py``). The tests here guard the
-rules that keep it true for per-family libraries; stock-linked K3 retains its
-explicit compatibility path. None imports a target or needs a GPU.
+rules that keep it true for per-family libraries. None imports a target or needs a GPU.
 
 The paths are the source checkout's, found from this file: these are claims
 about the tree a PR changes, C++ included, not about an installed wheel.
@@ -22,7 +21,6 @@ import ast
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -41,8 +39,6 @@ pytestmark = [
     pytest.mark.cpu_only,
     pytest.mark.skipif(not _INFRA.is_dir(), reason="needs the source checkout"),
 ]
-
-_STOCK_LINKED_FAMILIES = frozenset({"kimi_k3_vl"})
 
 _NATIVE_SUFFIXES = (".cu", ".cuh", ".h", ".hpp", ".inl", ".cpp")
 # A target name's sm segment that names a family of architectures.
@@ -86,8 +82,6 @@ def _families() -> dict[str, Path]:
     """family -> its csrc/ directory, from every models/<family>/csrc/CMakeLists.txt."""
     families = {}
     for cmake in sorted(_MODELS.glob("*/csrc/CMakeLists.txt")):
-        if cmake.parent.parent.name in _STOCK_LINKED_FAMILIES:
-            continue
         calls = _calls(cmake.read_text(), "add_modeling_v2_family")
         assert len(calls) == 1 and len(calls[0]) == 1, (
             f"{cmake.relative_to(_REPO)} must call add_modeling_v2_family(<family>) exactly once"
@@ -245,31 +239,16 @@ _STOCK_CPP_REFERENCE = re.compile(r'#\s*include\s*"tensorrt_llm/modeling_v2/')
 _STOCK_FAMILY_PATH = re.compile(r"_experimental/modeling_v2/models/[a-z]")
 
 
-_STOCK_COMPATIBILITY_REFERENCES = {
-    "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py": (
-        "from .._experimental.modeling_v2.models.kimi_k3_vl.ops import",
-    ),
-    "cpp/tensorrt_llm/CMakeLists.txt": ("_experimental/modeling_v2/models/kimi_k3_vl/csrc",),
-}
-
-
-def _stock_source(path: Path) -> str:
-    """Read stock code with its explicit stock-linked K3 references removed."""
-    text = path.read_text(errors="ignore")
-    for reference in _STOCK_COMPATIBILITY_REFERENCES.get(path.relative_to(_REPO).as_posix(), ()):
-        text = text.replace(reference, "")
-    return text
-
-
 def test_stock_does_not_reach_modeling_v2():
-    """Except for stock-linked K3 bindings, stock Python reaches modeling_v2 only through the resolver (no target
+    """Stock Python reaches modeling_v2 only through the resolver (no target
     import, op call or fake), and no stock CMake, C++ or packaging file names a
     family: a family reaches the build only through
     cpp/tensorrt_llm/modeling_v2/'s discovery, so adding one edits none of them."""
     offenders = [
         str(path.relative_to(_REPO))
         for path in sorted((_REPO / "tensorrt_llm").rglob("*.py"))
-        if not path.is_relative_to(_PY) and _STOCK_PY_REFERENCE.search(_stock_source(path))
+        if not path.is_relative_to(_PY)
+        and _STOCK_PY_REFERENCE.search(path.read_text(errors="ignore"))
     ]
     for root in ("cpp/tensorrt_llm", "cpp/include", "cpp/tests", "cpp/cmake"):
         for path in sorted((_REPO / root).rglob("*")):
@@ -282,10 +261,10 @@ def test_stock_does_not_reach_modeling_v2():
                 pattern = _STOCK_FAMILY_PATH
             else:
                 continue
-            if pattern.search(_stock_source(path)):
+            if pattern.search(path.read_text(errors="ignore")):
                 offenders.append(str(path.relative_to(_REPO)))
     for name in ("cpp/CMakeLists.txt", "setup.py", "scripts/build_wheel.py"):
-        if _STOCK_FAMILY_PATH.search(_stock_source(_REPO / name)):
+        if _STOCK_FAMILY_PATH.search((_REPO / name).read_text()):
             offenders.append(name)
     assert not offenders, f"stock code reaches modeling_v2 targets or families: {offenders}"
 
@@ -408,62 +387,4 @@ def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
     # The family namespace the build registers is the loader's.
     assert _native._namespace("gpt_oss", "gpt_oss_120b__sm_10x__default") == (
         "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"
-    )
-
-
-@pytest.mark.parametrize(
-    "relative, reference, pattern",
-    [
-        (
-            "tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py",
-            "from .._experimental.modeling_v2.models.kimi_k3_vl.ops import _native",
-            _STOCK_PY_REFERENCE,
-        ),
-        (
-            "cpp/tensorrt_llm/CMakeLists.txt",
-            '"_experimental/modeling_v2/models/kimi_k3_vl/csrc"',
-            _STOCK_FAMILY_PATH,
-        ),
-    ],
-)
-def test_stock_reference_exception_is_k3_only(tmp_path, monkeypatch, relative, reference, pattern):
-    monkeypatch.setattr(sys.modules[__name__], "_REPO", tmp_path)
-    path = tmp_path / relative
-    path.parent.mkdir(parents=True)
-    path.write_text(reference)
-    assert not pattern.search(_stock_source(path))
-    path.write_text(reference + "\n" + reference.replace("kimi_k3_vl", "other_family"))
-    assert pattern.search(_stock_source(path))
-    other = tmp_path / "unlisted.py"
-    other.write_text(reference)
-    assert pattern.search(_stock_source(other))
-
-
-@pytest.mark.skipif(shutil.which("cmake") is None, reason="needs cmake")
-def test_stock_linked_k3_is_not_discovered_twice(tmp_path):
-    project = tmp_path / "cpp"
-    project.mkdir()
-    models = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
-    for family, content in (
-        ("kimi_k3_vl", "add_library(kimi_k3_model_src INTERFACE)"),
-        ("other_family", "add_custom_target(discovered_native_family)"),
-    ):
-        csrc = models / family / "csrc"
-        csrc.mkdir(parents=True)
-        (csrc / "CMakeLists.txt").write_text(content + "\n")
-    (project / "CMakeLists.txt").write_text(
-        "cmake_minimum_required(VERSION 3.18)\n"
-        "project(discovery LANGUAGES NONE)\n"
-        f'list(APPEND CMAKE_MODULE_PATH "{_CMAKE_MODULE.parent}")\n'
-        "add_library(kimi_k3_model_src INTERFACE)\n"
-        f'add_subdirectory("{_INFRA}" "${{CMAKE_BINARY_DIR}}/native")\n'
-        "if(NOT TARGET discovered_native_family)\n"
-        '  message(FATAL_ERROR "native family discovery was disabled")\n'
-        "endif()\n"
-    )
-    subprocess.run(
-        ["cmake", "-S", str(project), "-B", str(tmp_path / "build")],
-        check=True,
-        capture_output=True,
-        text=True,
     )
