@@ -1047,23 +1047,26 @@ def test_gdn_verify_matches_replay_and_norm(heads, n, t, pnat, fp8):
 
 
 @skip_no_sm100f
-def test_gdn_verify_reads_state_after_pdl_wait():
+def test_gdn_verify_reads_inproj_rows_after_pdl_wait():
+    """The verify kernel reads this step's in_proj rows only after griddepcontrol.wait: a producer that
+    releases its dependents before writing them still gives the reference output and state."""
     n, t = 4, 7
     H, HV, cd, proj, ba, st, mut = _verify_case((2, 8), n, t, 12)
     y_ref, m_ref = _verify_op(H, HV, cd, n, t, proj, ba, st, mut, fp8=True)
-    _assert_late_copy_overlaps(mut["ssm"])
+    _assert_late_copy_overlaps(proj)
+    late = torch.empty_like(proj)
     y, m = _verify_op(
         H,
         HV,
         cd,
         n,
         t,
-        proj,
+        late,
         ba,
         st,
         mut,
         fp8=True,
-        before_launch=lambda m: _late_copy(m["ssm"], mut["ssm"]),
+        before_launch=lambda m: _late_copy(late, proj),
     )
     torch.cuda.synchronize()
     assert torch.equal(y.view(torch.uint8), y_ref.view(torch.uint8))

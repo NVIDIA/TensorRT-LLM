@@ -167,10 +167,10 @@ __device__ __forceinline__ void rowDot(float (&acc)[4], uint4 const (&a)[4], uin
     }
 }
 
-// PDL: the kernel reads only the layer weights (logA, dtBias, normWeight, fp8Scale) before griddepcontrol.wait; every
-// other input, including the replay state, is read after it, and the dependents are released once all of them are
-// read. Pointers to data that other launches write are not __restrict__, so their loads are never ld.global.nc, which
-// ptxas may move ahead of the wait.
+// PDL: before griddepcontrol.wait the kernel reads the layer weights and the data of earlier steps (slots, accepted
+// counts, history, replay state), none of which its producer (in_proj / conv1d) writes; this step's q / k / v / z / a /
+// b rows are read after it. Dependents are released once every input is read. Pointers to data that other launches
+// write are not __restrict__, so their loads are never ld.global.nc, which ptxas may move ahead of the wait.
 template <int kTokens, bool kOutFp8>
 __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x, int64_t xStride, uint16_t const* z,
     int64_t zStride, uint16_t const* aIn, uint16_t const* bIn, int64_t abStride, float const* __restrict__ logA,
@@ -222,10 +222,8 @@ __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x
     {
         rScale = rcpRn(fp8Scale[0]);
     }
-    cudaGridDependencySynchronize();
 
-    // The in_proj outputs do not depend on the slot: their loads are issued with the slot lookup, ahead of the
-    // dependent replay-state loads.
+    // This step's in_proj output rows (read after the dependency wait below).
     int const slot = stateIndices[n];
     bool const ok0 = t0 < kT;
     bool const ok1 = t1 < kT;
@@ -238,72 +236,20 @@ __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x
     uint16_t const* pa = aIn + (row0 + (lane < kT ? lane : 0)) * abStride + hv;
     uint16_t const* pb = bIn + (row0 + (lane < kT ? lane : 0)) * abStride + hv;
 
-    // Raw q / k rows (row r = token; rows >= T zero), v / z of this lane's (v, t), a / b of token = lane.
-    uint4 QR[4], KR[4];
-    bool const rowOk = r < kT;
-#pragma unroll
-    for (int c = 0; c < 4; ++c)
-    {
-        QR[c] = rowOk ? load16(xq + 32 * c) : zero4();
-        KR[c] = rowOk ? load16(xk + 32 * c) : zero4();
-    }
-    float vv[2][4], zz[2][4]; // [m][(h, t)]: 0 (h0, t0), 1 (h0, t1), 2 (h1, t0), 3 (h1, t1)
-#pragma unroll
-    for (int m = 0; m < 2; ++m)
-    {
-#pragma unroll
-        for (int h = 0; h < 2; ++h)
-        {
-            int const off = 16 * m + 8 * h;
-            vv[m][2 * h] = ok0 ? bfToFloat(xv0[off]) : 0.f;
-            vv[m][2 * h + 1] = ok1 ? bfToFloat(xv1[off]) : 0.f;
-            zz[m][2 * h] = ok0 ? bfToFloat(zv0[off]) : 0.f;
-            zz[m][2 * h + 1] = ok1 ? bfToFloat(zv1[off]) : 0.f;
-        }
-    }
-    float ga = 0.f;
-    float gb = 0.f;
-    if (lane < kT)
-    {
-        ga = bfToFloat(*pa);
-        gb = bfToFloat(*pb);
-    }
-
-    if (slot < 0)
-    {
-        // Padded request: defined zeros for out_proj.
-#pragma unroll
-        for (int i = 0; i < 8; ++i)
-        {
-            int const t = (i & 1) ? t1 : t0;
-            int const vs = vb + 16 * (i >> 2) + 8 * ((i >> 1) & 1) + r;
-            if (t < kT)
-            {
-                int64_t const idx = (row0 + t) * yStride + hv * kDim + vs;
-                if constexpr (kOutFp8)
-                {
-                    static_cast<uint8_t*>(y)[idx] = 0;
-                }
-                else
-                {
-                    static_cast<uint16_t*>(y)[idx] = 0;
-                }
-            }
-        }
-        return;
-    }
-
-    int const pn = prevNumAccepted[slot];
-    int const buf = cacheBufIdx[slot];
+    // Data of earlier steps (slot, accepted count, history, state), which the producer does not write: read
+    // before the dependency wait so the loads overlap it (a padded slot reads slot 0 and returns below).
+    int const slotR = slot < 0 ? 0 : slot;
+    int const pn = prevNumAccepted[slotR];
+    int const buf = cacheBufIdx[slotR];
     bool const isWrite = pn + kT > kHist;
     int const wBuf = isWrite ? 1 - buf : buf;
     int const wOff = isWrite ? 0 : pn;
-    int64_t const rb = static_cast<int64_t>(slot) * 2 + buf;
-    int64_t const wb = static_cast<int64_t>(slot) * 2 + wBuf;
+    int64_t const rb = static_cast<int64_t>(slotR) * 2 + buf;
+    int64_t const wb = static_cast<int64_t>(slotR) * 2 + wBuf;
     uint16_t const* khp = oldK + rb * (kHist * kStrideK) + hk * kDim;
     uint16_t const* uhp = oldU + rb * (kHist * kStrideU) + hv * kDim;
     float const* ghp = oldG + (rb * hv_ + hv) * kHist;
-    uint16_t* sp = state + slot * stateSlotStride + static_cast<int64_t>(hv) * kDim * kDim;
+    uint16_t* sp = state + slotR * stateSlotStride + static_cast<int64_t>(hv) * kDim * kDim;
 
     uint4 H[2][2][4]; // checkpoint state rows (h^T) of this lane: [m-tile][half][chunk]
 #pragma unroll
@@ -366,6 +312,63 @@ __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x
             KH[jt][c] = ok ? load16(khp + j * kStrideK + 32 * c + 8 * q) : zero4();
         }
     }
+    cudaGridDependencySynchronize();
+
+    // Raw q / k rows (row r = token; rows >= T zero), v / z of this lane's (v, t), a / b of token = lane.
+    uint4 QR[4], KR[4];
+    bool const rowOk = r < kT;
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+    {
+        QR[c] = rowOk ? load16(xq + 32 * c) : zero4();
+        KR[c] = rowOk ? load16(xk + 32 * c) : zero4();
+    }
+    float vv[2][4], zz[2][4]; // [m][(h, t)]: 0 (h0, t0), 1 (h0, t1), 2 (h1, t0), 3 (h1, t1)
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+    {
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            int const off = 16 * m + 8 * h;
+            vv[m][2 * h] = ok0 ? bfToFloat(xv0[off]) : 0.f;
+            vv[m][2 * h + 1] = ok1 ? bfToFloat(xv1[off]) : 0.f;
+            zz[m][2 * h] = ok0 ? bfToFloat(zv0[off]) : 0.f;
+            zz[m][2 * h + 1] = ok1 ? bfToFloat(zv1[off]) : 0.f;
+        }
+    }
+    float ga = 0.f;
+    float gb = 0.f;
+    if (lane < kT)
+    {
+        ga = bfToFloat(*pa);
+        gb = bfToFloat(*pb);
+    }
+
+    if (slot < 0)
+    {
+        // Padded request: defined zeros for out_proj.
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            int const t = (i & 1) ? t1 : t0;
+            int const vs = vb + 16 * (i >> 2) + 8 * ((i >> 1) & 1) + r;
+            if (t < kT)
+            {
+                int64_t const idx = (row0 + t) * yStride + hv * kDim + vs;
+                if constexpr (kOutFp8)
+                {
+                    static_cast<uint8_t*>(y)[idx] = 0;
+                }
+                else
+                {
+                    static_cast<uint16_t*>(y)[idx] = 0;
+                }
+            }
+        }
+        return;
+    }
+
     // Checkpoint commit (history full): h' = h e^{gStart} + kh^T Uc, Uc[j, v] = u[j, v] e^{gStart - G_j} (j < pn),
     // Uc split into bf16 hi + lo. Transposed: h'^T[v, kd] = h^T e^{gStart} + Uc^T[v, j] kh[j, kd]; the n-tile (c, wd)
     // covers the physical kd of word wd of chunk c of this lane's state rows, which only this lane reads and writes.
