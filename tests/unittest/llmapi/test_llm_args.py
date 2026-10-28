@@ -41,7 +41,7 @@ from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           CacheTransceiverConfig, CalibConfig,
-                                          ContextChunkingPolicy,
+                                          ContextChunkingPolicy, CpConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
@@ -298,6 +298,38 @@ def test_rejection_sampling_still_gated_on_context_parallel():
         TorchLlmArgs(model=llama_model_path,
                      context_parallel_size=2,
                      speculative_config=spec_cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cp_config",
+    [CpConfig(),
+     CpConfig(cp_type="ULYSSES"),
+     CpConfig(cp_type="RING")],
+    ids=["default", "ulysses", "ring"])
+def test_context_parallelism_rejects_cp_type_other_than_helix(cp_config):
+    with pytest.raises(ValueError,
+                       match="supports context parallelism only with cp_type "
+                       "HELIX"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     context_parallel_size=2,
+                     cp_config=cp_config)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "context_parallel_size,cp_config", [(1, CpConfig()),
+                                        (1, CpConfig(cp_type="RING")),
+                                        (2, CpConfig(cp_type="HELIX")),
+                                        (2, None)],
+    ids=["one_rank_default", "one_rank_ring", "helix", "no_cp_config"])
+def test_context_parallelism_accepts_supported_cp_config(
+        context_parallel_size, cp_config):
+    args = TorchLlmArgs(model="/tmp/dummy_model",
+                        context_parallel_size=context_parallel_size,
+                        cp_config=cp_config)
+    assert args.context_parallel_size == context_parallel_size
+    assert args.cp_config == cp_config
 
 
 @pytest.mark.cpu_only

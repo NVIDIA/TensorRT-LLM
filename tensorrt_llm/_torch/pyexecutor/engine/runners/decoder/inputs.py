@@ -725,7 +725,8 @@ class DecoderInputPreparer:
         buffers, and the attention and speculative metadata are prepared.
         """
         set_per_request_prefill_cuda_graph_flag(False)
-        if "cp_type" in self.mapping.cp_config:
+        # A cp_type takes effect only with context parallelism on.
+        if "cp_type" in self.mapping.cp_config and self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config["cp_type"]
             if cp_type not in (CpType.HELIX, CpType.ULYSSES):
                 raise NotImplementedError(
