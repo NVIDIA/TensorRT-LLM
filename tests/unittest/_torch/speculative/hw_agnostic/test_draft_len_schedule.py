@@ -141,9 +141,7 @@ def test_correctness_across_batch_sizes(
 
         def instrumented_handle_dynamic_draft_len(scheduled_batch):
             original_handle_dynamic_draft_len(scheduled_batch)
-            runtime_schedule.append(
-                (scheduled_batch.batch_size, executor.model_engine.runtime_draft_len)
-            )
+            runtime_schedule.append((scheduled_batch.batch_size, executor.runtime_draft_len))
 
         monkeypatch.setattr(
             executor, "_handle_dynamic_draft_len", instrumented_handle_dynamic_draft_len

@@ -60,8 +60,9 @@ class CoordinatorHarness:
     """One coordinator with its rank-local collaborators.
 
     ``dist`` defaults to a ``Mock`` carrying ``rank`` / ``tp_size`` /
-    ``world_size`` for single-rank tests; multi-rank tests pass one FakeDist
-    rank per harness instead, and the rank object then defines those sizes.
+    ``world_size`` / ``pp_size`` / ``cp_size`` for single-rank tests;
+    multi-rank tests pass one FakeDist rank (or a stub of one CP rank) per
+    harness instead, and that object then defines those sizes.
     """
 
     def __init__(
@@ -99,7 +100,7 @@ class CoordinatorHarness:
         self.dist = (
             dist
             if dist is not None
-            else Mock(rank=0, tp_size=tp_size, world_size=world_size, pp_size=pp_size)
+            else Mock(rank=0, tp_size=tp_size, world_size=world_size, pp_size=pp_size, cp_size=1)
         )
         self.coordinator = DisaggTransferCoordinator(
             transceiver=self.transceiver,

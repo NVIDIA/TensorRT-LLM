@@ -105,6 +105,11 @@ _KIMI_K3_ARCHITECTURES = {
     "KimiLinearForCausalLM",
 }
 
+_GLM5_NEXT_ARCHITECTURES = {
+    "Glm5NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
+}
+
 _MINIMAX_M3_ARCHITECTURES = {
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -288,6 +293,8 @@ class ModelConfig(Generic[TConfig]):
     # disables the optimization; hardware support is resolved by the backend.
     skip_correction_threshold: float = 0.0
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    # The backend the user requested, before AUTO resolution.
+    moe_backend_requested: str = 'AUTO'
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
@@ -381,6 +388,11 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        # Fused expert reduction can change accumulation order between runs.
+        if (os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+                or os.getenv("FORCE_MOE_KERNEL_DETERMINISTIC", "0") == "1"):
+            self.moe_disable_finalize_fusion = True
+
         if (self.sparse_attention_config is None
                 and getattr(self.pretrained_config, "model_type",
                             None) in ("deepseek_v41", "deepseek_v41_text")):
@@ -562,11 +574,15 @@ class ModelConfig(Generic[TConfig]):
             if 100 <= sm_version < 120:
                 return "TRTLLM"
 
+        if architecture in _GLM5_NEXT_ARCHITECTURES and is_sm_100f():
+            return "TRTLLM"
+
         is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
                           in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))
         if is_w4a16_nvfp4:
             sm_version = get_sm_version()
-            # CuteDslB12xFusedMoE on SM120/121, MarlinFusedMoE on Hopper. Any
+            # CuteDslB12xW4a16Nvfp4FusedMoE on SM120/121 (reached through the
+            # CUTEDSL family), MarlinFusedMoE on Hopper. Any
             # other SM falls through to CUTLASS, which dequantizes on the fly.
             if sm_version in (120, 121):
                 return "CUTEDSL"
@@ -1530,6 +1546,7 @@ class ModelConfig(Generic[TConfig]):
             architecture,
             quant_config=quant_config,
         )
+        kwargs['moe_backend_requested'] = requested_moe_backend
 
         # V4.1 names the routed experts exactly as V4 does and encodes MXFP4 the
         # same way (I8 storage), so the detector and setter apply verbatim.

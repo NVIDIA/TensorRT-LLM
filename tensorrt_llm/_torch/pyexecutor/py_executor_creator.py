@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from strenum import StrEnum
@@ -19,7 +19,8 @@ from strenum import StrEnum
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager, ResourceManagerType)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
@@ -34,6 +35,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.ipc import IpcQueue
+
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -43,9 +47,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    compute_max_num_sequences, create_py_executor_instance,
-                    instantiate_sampler, is_disagg_enabled, is_mla,
-                    validate_feature_combination)
+                    create_py_executor_instance, instantiate_sampler,
+                    is_disagg_enabled, is_mla, validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -55,7 +58,8 @@ from .dwdp import DwdpManager, get_global_dwdp_manager
 from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
-from .model_engine import PyTorchModelEngine
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .model_engine import ModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
@@ -306,6 +310,40 @@ def _enforce_overlap_spec_kv_correction(attn_backend: str,
     raise ValueError(message)
 
 
+def _branch_snapshot_ctx_chunk_config(
+    ctx_chunk_config: Optional[tuple],
+    kv_cache_manager: Optional[BaseResourceManager],
+    tokens_per_block: int,
+    configured_policy: Optional[ContextChunkingPolicy] = None
+) -> Optional[tuple]:
+    """Force chunk boundaries at SWA branch points if the manager records them.
+
+    Decided on the built manager, which alone knows whether branch points apply
+    (SWA layers present, no joint target/draft reuse). Otherwise the configured
+    chunking is kept unchanged.
+    """
+    if not (isinstance(kv_cache_manager, KVCacheManagerV2)
+            and kv_cache_manager.records_branch_snapshots):
+        return ctx_chunk_config
+    if ctx_chunk_config is None:
+        logger.warning_once(
+            "block_reuse_config.enable_branch_snapshot turns on chunked "
+            "prefill with the FORCE_CHUNK policy, although "
+            "enable_chunked_prefill is False.",
+            key="branch_snapshot_enables_chunking")
+    elif (configured_policy is not None
+          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
+        logger.warning_once(
+            "block_reuse_config.enable_branch_snapshot replaces "
+            f"scheduler_config.context_chunking_policy={configured_policy} "
+            "with FORCE_CHUNK.",
+            key="branch_snapshot_replaces_chunking_policy")
+    # Keep the unit chosen for this model; it only aligns budget-shortened chunks.
+    chunk_unit_size = (ctx_chunk_config[1]
+                       if ctx_chunk_config is not None else tokens_per_block)
+    return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
+
+
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -403,7 +441,7 @@ def create_encoder_executor(
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     dist = Distributed.get(mapping)
 
-    model_engine = PyTorchModelEngine(
+    model_engine = ModelEngine(
         model_path=checkpoint_dir,
         llm_args=llm_args,
         mapping=mapping,
@@ -434,8 +472,7 @@ def log_memory_usage(stage: str):
 
 
 def _move_model_engine_metrics(py_executor: PyExecutor,
-                               model_engine: PyTorchModelEngine,
-                               stage: str) -> None:
+                               model_engine: ModelEngine, stage: str) -> None:
     """Move model-engine metrics into the executor under a startup stage."""
     py_executor.metrics[f"{stage}_model_engine"] = dict(model_engine.metrics)
     model_engine.metrics.clear()
@@ -447,7 +484,7 @@ def _create_py_executor_impl(
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
-    resource_governor_queue=None,
+    resource_governor_queue: "Optional[IpcQueue]" = None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -641,6 +678,15 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
+    # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
+    if (mapping.has_cp_helix()
+            and not is_disagg_enabled(cache_transceiver_config)
+            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
+        raise NotImplementedError(
+            "Helix context parallelism is supported only on disaggregated "
+            "generation servers; aggregated serving with Helix is not "
+            "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
+            "development only).")
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -756,7 +802,7 @@ def _create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
-        model_engine = PyTorchModelEngine(
+        model_engine = ModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
             mapping=mapping,
@@ -780,9 +826,9 @@ def _create_py_executor(
                     layer_wise_benchmarks_config.calibration_layer_indices,
                     mapping=mapping,
                     dist=dist)
-    model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
+    calibrator.maybe_wrap_model(model_engine.model)
 
-    # PyTorchModelEngine modifies these fields, update them
+    # ModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
@@ -801,19 +847,13 @@ def _create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
-    sparse_attention_config = model_engine.sparse_attention_config
+    sparse_attention_config = model_engine.model.model_config.sparse_attention_config
 
     # Resolve this before cache reuse and cache manager selection consume it.
     resolve_cache_transceiver_config(cache_transceiver_config)
 
     config = model_engine.model.model_config.pretrained_config
-    max_num_seq_slots = getattr(
-        model_engine, "max_num_seq_slots", None) or compute_max_num_sequences(
-            mapping,
-            max_batch_size,
-            llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=getattr(model_engine,
-                                            "_enable_overlap_headroom", False))
+    max_num_seq_slots = model_engine.max_num_seq_slots
     if is_mla(config):
         if uses_fp4_mla_attention(model_engine.model.model_config):
             tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
@@ -1003,10 +1043,10 @@ def _create_py_executor(
                 "that implements the per-layer-group APIs, or use a single attention window."
             )
 
-        if mapping.enable_attention_dp:
+        if mapping.enable_attention_dp and v2_selection is False:
             raise NotImplementedError(
-                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
-            )
+                "KV connector attention data parallelism requires KVCacheManagerV2. "
+                "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
         try:
             module = importlib.import_module(
@@ -1016,6 +1056,13 @@ def _create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
+            if mapping.enable_attention_dp:
+                KvCacheConnectorManager.validate_attention_dp(
+                    worker_cls,
+                    scheduler_cls,
+                    pp_size=mapping.pp_size,
+                    cp_size=mapping.cp_size)
+
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -1023,7 +1070,8 @@ def _create_py_executor(
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                if scheduler_cls is not None and (rank == 0 or
+                                                  mapping.enable_attention_dp):
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -1039,7 +1087,9 @@ def _create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                enable_attention_dp=mapping.enable_attention_dp)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
@@ -1154,7 +1204,8 @@ def _create_py_executor(
         drafter = get_spec_drafter(model_engine,
                                    spec_resource_manager=spec_resource_manager)
 
-    model_engine._warmup_timer.purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
+    model_engine.set_warmup_purpose(
+        "memory_profiling" if estimating_kv_cache else "final_executor")
 
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
@@ -1166,7 +1217,10 @@ def _create_py_executor(
             resources=resources,
             mapping=mapping,
             llm_args=llm_args,
-            ctx_chunk_config=ctx_chunk_config,
+            ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                ctx_chunk_config,
+                resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                tokens_per_block, scheduler_config.context_chunking_policy),
             model_engine=model_engine,
             start_worker=False,
             sampler=sampler,
@@ -1215,11 +1269,6 @@ def _create_py_executor(
                 with _startup_timer.phase("profiling_kv_cache_teardown"):
                     kv_cache_creator.teardown_managers(resources)
 
-            # configure_kv_cache_capacity shuts down the Phase-1 executor, which
-            # releases its CUDA graphs before its resource managers. Only the
-            # profiling attention metadata remains to be discarded here.
-            model_engine.attn_metadata = None
-
             del py_executor  # free before constructing new
             gc.collect()
             torch.cuda.empty_cache()
@@ -1231,7 +1280,7 @@ def _create_py_executor(
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
 
-        model_engine._warmup_timer.purpose = "final_executor"
+        model_engine.set_warmup_purpose("final_executor")
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
@@ -1242,7 +1291,10 @@ def _create_py_executor(
                 resources=resources,
                 mapping=mapping,
                 llm_args=llm_args,
-                ctx_chunk_config=ctx_chunk_config,
+                ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                    ctx_chunk_config,
+                    resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                    tokens_per_block, scheduler_config.context_chunking_policy),
                 model_engine=model_engine,
                 start_worker=False,
                 sampler=sampler,

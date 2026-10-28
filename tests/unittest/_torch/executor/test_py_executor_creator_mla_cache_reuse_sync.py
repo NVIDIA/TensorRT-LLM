@@ -170,21 +170,19 @@ class _DummyModelEngine:
             enable_flash_mla: Whether to emulate the FlashMLA block-size override.
             max_seq_len: Effective sequence length reported by the model engine.
         """
-        from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-
-        self._warmup_timer = _WarmupTimer(rank=0)
+        self.warmup_purpose = None
         self.attn_runtime_features = attn_runtime_features
         self.metrics = {}
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
-        self.sparse_attention_config = (
+        self.max_num_seq_slots = 4
+        sparse_attention_config = (
             SimpleNamespace(algorithm=sparse_algorithm) if sparse_algorithm is not None else None
         )
-        self.attn_metadata = None
         self.model = SimpleNamespace(
             model_config=SimpleNamespace(
                 attn_backend=attn_backend,
-                sparse_attention_config=self.sparse_attention_config,
+                sparse_attention_config=sparse_attention_config,
                 enable_flash_mla=enable_flash_mla,
                 is_generation=True,
                 is_encoder_decoder=False,
@@ -197,6 +195,10 @@ class _DummyModelEngine:
             ),
             vocab_size_padded=32000,
         )
+
+    def set_warmup_purpose(self, purpose):
+        """Record the label the creator gives the following warmup passes."""
+        self.warmup_purpose = purpose
 
 
 def _make_llm_args():
@@ -302,6 +304,7 @@ def _run_create_py_executor(
         tp_size=1,
         pp_size=1,
         has_pp=lambda: False,
+        has_cp_helix=lambda: False,
         enable_attention_dp=False,
         is_last_pp_rank=lambda: True,
     )
@@ -357,7 +360,7 @@ def _run_create_py_executor(
             max_seq_len=model_max_seq_len,
         )
 
-    monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
+    monkeypatch.setattr(py_executor_creator, "ModelEngine", _create_model_engine)
 
     def _create_py_executor_instance(**kwargs):
         if ctx_chunk_configs is not None:
@@ -677,7 +680,7 @@ def test_startup_allocation_phases(monkeypatch, estimate):
             super().build_managers(resources, estimating_kv_cache)
 
         def configure_kv_cache_capacity(self, executor):
-            events.append(("profile", executor.model_engine._warmup_timer.purpose))
+            events.append(("profile", executor.model_engine.warmup_purpose))
 
         def teardown_managers(self, resources):
             events.append(("teardown", None))

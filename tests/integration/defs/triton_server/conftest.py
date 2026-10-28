@@ -304,18 +304,6 @@ def tiny_llama_lora_model_root():
     return tiny_llama_lora_model_root
 
 
-@pytest.fixture(scope="session")
-def test_video_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    test_video = os.path.join(models_root, "video-neva", "test_video")
-
-    assert os.path.exists(
-        test_video
-    ), f"{test_video} does not exist under NFS LLM_MODELS_ROOT dir"
-    return test_video
-
-
 # Returns an array of total memory for each available device
 @pytest.fixture(scope="session")
 def total_gpu_memory_mib():

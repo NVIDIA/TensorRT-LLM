@@ -28,5 +28,6 @@
 # H100_PCIe-*
 # DGX_H100-*
 
-Reason: B200 multi-GPU stages are paused to relieve the CI queue backlog (109 running / 459 pending on 2026-10-22). Owner: @sharabeshj-nvda. The CI team decides when to lift it.
-DGX_B200-*_GPUs-*
+Reason: L40S-PyTorch-2 is temporarily paused due to Kubernetes agent provisioning and node issues.
+L40S-PyTorch-2
+L40S-PyTorch-2-cbts

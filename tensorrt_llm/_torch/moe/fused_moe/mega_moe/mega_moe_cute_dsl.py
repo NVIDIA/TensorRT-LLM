@@ -375,8 +375,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     The per-architecture kernel variants dispatch inside this one identity,
     because architecture is not an id segment: all four segments hold whichever
     kernel runs. The class name carries its ``kernel_name`` segment because
-    ``CuteDslFusedMoE``'s ``trtllm.cutedsl.grouped_gemm.nvfp4`` will differ from
-    this id in that field alone.
+    ``TrtllmCutedslGroupedGemmNvfp4Impl``'s ``trtllm.cutedsl.grouped_gemm.nvfp4``
+    differs from this id in that field alone.
 
     Capability gate (``can_implement``): SM100/103/107 + NVFP4 +
     bfloat16 activation + CUDA 13 Cutlass DSL runtime present.
@@ -1167,6 +1167,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         registered by the quantization method's ``create_weights``; the
         value defaults to 1.0 until the checkpoint loader sets it.
 
+        A checkpoint that carries a per-channel pre-quant scale (NVFP4_AWQ /
+        NVFP4_ARC) gets it applied before quantization: the quantization
+        method loads it into ``self.fc31_act_scale`` (``[1, hidden]``), and
+        ``fc31_input_scale`` was calibrated on the scaled activation. The
+        kernel itself only ever sees the quantized input.
+
         Empty input (``x.shape[0] == 0``) short-circuits to empty NVFP4
         + empty SF without launching a quantization kernel, so the
         ``FusedCommMoEScheduler`` can call ``quantize_input`` uniformly
@@ -1187,6 +1193,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
             empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
             return empty_x, empty_sf
+        fc31_act_scale = getattr(self, "fc31_act_scale", None)
+        if fc31_act_scale is not None:
+            # Product stays bf16, which is what ``fp4_quantize`` below is given
+            # on every other route into it: ``_SUPPORTED_ACTIVATION_DTYPES``
+            # admits bf16 activations only, so ``fc31_act_scale``, created at
+            # ``module.dtype``, is bf16 as well.
+            x_bf16 = x_bf16 * fc31_act_scale
         x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
             x_bf16,
             self.fc31_input_scale,

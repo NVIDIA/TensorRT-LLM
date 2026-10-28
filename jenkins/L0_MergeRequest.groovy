@@ -885,6 +885,23 @@ def launchReleaseCheck(pipeline, globalVars)
     })
 }
 
+def launchTestListCheck(pipeline, globalVars)
+{
+    def key = "Check Test List"
+    def image = globalVars["LLM_DOCKER_IMAGE"]
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+        stage("[${key}] Run") {
+            echoNodeAndGpuInfo(pipeline, key)
+            sh "git config --global --add safe.directory \"*\""
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+
+            def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
+               "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+        }
+    })
+}
+
 def getGitlabMRChangedFile(pipeline, function, filePath="") {
     def result = null
     def pageId = 0
@@ -1247,12 +1264,32 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 // `import cbts.*` resolves without touching the rest of jenkins/scripts/.
 // ============================================================================
 
+def _cbtsEnsureCliDependencies(pipeline)
+{
+    try {
+        // The preparation pod is Debian; requirements.txt includes Click and PyYAML.
+        trtllm_utils.llmExecStepWithRetry(pipeline,
+            script: "apt-get update -qq && apt-get install -y -qq python3-pip")
+        trtllm_utils.llmExecStepWithRetry(pipeline,
+            script: "python3 -m pip install --break-system-packages --disable-pip-version-check " +
+                    "-r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
+        return true
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS CLI dependencies unavailable (non-fatal): ${e.message}")
+        return false
+    }
+}
+
 def getCbtsResult(pipeline, testFilter, globalVars)
 {
     // Explicit kill switch: `/bot run --disable-cbts` forces a full run.
     if (testFilter[(DISABLE_CBTS)]) {
         pipeline.echo("CBTS: disabled — user-specified /bot run --disable-cbts")
-        _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        if (_cbtsEnsureCliDependencies(pipeline)) {
+            _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        }
         return null
     }
 
@@ -1267,8 +1304,10 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
     if (!triggeredFlags.isEmpty()) {
         pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
-        _cbtsReportDecision(pipeline, globalVars, "deferred",
-                            "user flags: ${triggeredFlags.join(', ')}", null)
+        if (_cbtsEnsureCliDependencies(pipeline)) {
+            _cbtsReportDecision(pipeline, globalVars, "deferred",
+                                "user flags: ${triggeredFlags.join(', ')}", null)
+        }
         return null
     }
 
@@ -1279,9 +1318,10 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 
     try {
-        // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
-        sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
-
+        if (!_cbtsEnsureCliDependencies(pipeline)) {
+            pipeline.echo("CBTS: falling back to full run because CLI dependencies are unavailable")
+            return null
+        }
         def coveragePilotEligible = false
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -1838,7 +1878,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
@@ -2444,6 +2483,27 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 launchReleaseCheck(this, globalVars)
             }
         },
+        "Check Test List": {
+            script {
+                if (testFilter[INFRA_DRY_RUN]) {
+                    echo "Skipping Check Test List for the infrastructure dry run."
+                    return
+                } else if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping Check Test List (GenPostMergeBuilds mode: builds only)"
+                    return
+                } else if (runMode == "nightly_release") {
+                    echo "Skipping Check Test List for nightly_release."
+                    return
+                } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                    echo "Skipping Check Test List for Docs-only changes."
+                    return
+                } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                    echo "Skipping Check Test List for BuildDockerImageSanityTest."
+                    return
+                }
+                launchTestListCheck(this, globalVars)
+            }
+        },
         "OSS-Compliance-Check": {
             script {
                 stage("[OSS-Compliance-Check] Run") {
@@ -2487,7 +2547,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 string(name: 'postMergeBuildNumber', value: ''),
                                 string(name: 'scanMode', value: isNightlyRelease ? 'release' : 'pre_merge'),
                                 string(name: 'runSourceCodeScanning', value: 'true'),
-                                string(name: 'runContainerScanning', value: 'false'),
+                                string(name: 'runContainerOssScanning', value: 'false'),
+                                string(name: 'runContainerMalwareScanning', value: 'false'),
                                 string(name: 'runSonarQube', value: 'false'),
                             ]
                             def handle = build(
@@ -3028,7 +3089,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 name: 'scanMode',
                                 value: runMode == "nightly_release" ? 'release' : 'pre_merge'),
                             string(name: 'runSourceCodeScanning', value: 'false'),
-                            string(name: 'runContainerScanning', value: 'true'),
+                            string(name: 'runContainerOssScanning', value: 'true'),
+                            string(name: 'runContainerMalwareScanning', value: 'false'),
                             string(name: 'runSonarQube', value: 'false'),
                         ]
                         def logger = new Logger(pipeline)
@@ -3098,10 +3160,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         stages += dockerBuildJob
     }
 
+    def alwaysFailFastStages = ["Release-Check", "Check Test List"] as Set
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
             stage(key) {
-                value()
+                if (enableFailFast || key in alwaysFailFastStages) {
+                    value()
+                } else {
+                    // Avoid interrupting other stages on failure.
+                    catchError(catchInterruptions: false) {
+                        value()
+                    }
+                }
             }
         }
     }]}
@@ -3187,15 +3257,34 @@ pipeline {
             steps {
                 script {
                     if (isReleaseCheckMode) {
-                        stage("Release-Check") {
-                            script {
-                                if (testFilter[INFRA_DRY_RUN]) {
-                                    echo "Skipping Release-Check for the infrastructure dry run."
-                                } else {
-                                    launchReleaseCheck(this, globalVars)
+                        def releaseCheckStages = [
+                            "Release-Check": {
+                                stage("Release-Check") {
+                                    if (testFilter[INFRA_DRY_RUN]) {
+                                        echo "Skipping Release-Check for the infrastructure dry run."
+                                    } else {
+                                        launchReleaseCheck(this, globalVars)
+                                    }
                                 }
-                            }
-                        }
+                            },
+                            "Check Test List": {
+                                stage("Check Test List") {
+                                    if (testFilter[INFRA_DRY_RUN]) {
+                                        echo "Skipping Check Test List for the infrastructure dry run."
+                                    } else if (runMode == "nightly_release") {
+                                        echo "Skipping Check Test List for nightly_release."
+                                    } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                                        echo "Skipping Check Test List for Docs-only changes."
+                                    } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                                        echo "Skipping Check Test List for BuildDockerImageSanityTest."
+                                    } else {
+                                        launchTestListCheck(this, globalVars)
+                                    }
+                                }
+                            },
+                        ]
+                        releaseCheckStages.failFast = enableFailFast
+                        parallel releaseCheckStages
                     } else {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
                         // Remove it to workaround the "Argument list too long" error

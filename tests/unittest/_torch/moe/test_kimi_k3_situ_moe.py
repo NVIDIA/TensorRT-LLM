@@ -638,8 +638,9 @@ def test_kimi_k3_allow_list_matches_what_the_backends_declare():
 
     ``any`` rather than ``all`` over a family: resolution walks family members
     in ``IMPL_PRIORITY`` order, so a family serves SiTU when one member does.
-    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` does not
-    declare it, ``CuteDslFusedMoE`` does.
+    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` and the BF16
+    grouped-GEMM leaf do not declare it, ``TrtllmCutedslGroupedGemmNvfp4Impl``
+    does.
     """
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import BACKEND_FAMILY
     from tensorrt_llm._torch.utils import ActivationType
@@ -677,8 +678,8 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     """K3 must propagate strict backend selection through create_moe."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE
     from tensorrt_llm._torch.moe.fused_moe.activation import SiTuActivation
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEEligibility, MoERejectReason
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
         BACKEND_FAMILY,
@@ -699,7 +700,9 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
             ),
         )
     monkeypatch.setattr(
-        CutlassFusedMoE, "can_implement", classmethod(lambda cls, p, d: MoEEligibility.ok())
+        TrtllmCutlassNvfp4Impl,
+        "can_implement",
+        classmethod(lambda cls, p, d: MoEEligibility.ok()),
     )
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     pretrained_config = PretrainedConfig()
@@ -724,7 +727,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
         allow_degradation=True,
     )
     assert report.degraded
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
 
     # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
     with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:

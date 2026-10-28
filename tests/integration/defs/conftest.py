@@ -48,16 +48,13 @@ from _pytest.mark import ParameterSet
 # is harmless.
 from test_common import session_prefetcher_hooks as _prefetch_hooks
 
-from tensorrt_llm.bindings import ipc_nvls_supported
-from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
-
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
 from .test_list_parser import (TestCorrectionMode, apply_waives,
                                get_test_name_corrections_v2, handle_corrections,
                                modify_by_test_list, preprocess_test_list_lines)
-from .trt_test_alternative import (call, check_output, exists, is_windows,
-                                   is_wsl, makedirs, print_info, print_warning,
+from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
+                                   makedirs, print_info, print_warning,
                                    wsl_to_win_path)
 from .utils.periodic_junit import PeriodicJUnitXML
 
@@ -440,31 +437,9 @@ def _auto_install_media_deps(llm_venv):
     llm_venv.run_cmd(["-m", "pip", "install", "opencv-python-headless"])
 
 
-@pytest.fixture(scope="session")
-@cached_in_llm_models_root("gpt-next/megatron_converted_843m_tp1_pp1.nemo",
-                           True)
-def gpt_next_root():
-    "get gpt-next/megatron_converted_843m_tp1_pp1.nemo"
-    raise RuntimeError("megatron_converted_843m_tp1_pp1.nemo must be cached")
-
-
 def remove_file(fn):
     if os.path.isfile(fn) or os.path.islink(fn):
         os.remove(fn)
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("replit-code-v1_5-3b", True)
-def llm_replit_code_v1_5_3b_model_root():
-    "Get replit-code-v1_5-3b model root"
-    raise RuntimeError("replit-code-v1_5-3b must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("GPT-2B-001_bf16_tp1.nemo", True)
-def llm_gpt2_next_model_root():
-    "get gpt-2b-001_bf16_tp1.nemo"
-    raise RuntimeError("GPT-2B-001_bf16_tp1.nemo must be cached")
 
 
 @pytest.fixture(scope="module")
@@ -502,82 +477,6 @@ def llm_lora_model_root(request):
                              "gpt-oss-20b-lora-adapter_NIM_r8"))
 
     return ",".join(model_root_list)
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("LongAlpaca-7B", True)
-def llm_long_alpaca_model_root(llm_venv):
-    "return long alpaca model root"
-
-    workspace = llm_venv.get_working_directory()
-    long_alpaca_model_root = os.path.join(workspace, "LongAlpaca-7B")
-
-    return long_alpaca_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("email_composition", True)
-def llm_gpt2_next_8b_model_root():
-    raise RuntimeError("gpt-next 8b must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("internlm-chat-7b", True)
-def llm_internlm_7b_model_root(llm_venv):
-    "prepare internlm 7b model"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "internlm-chat-7b")
-
-    call(
-        f"git clone https://huggingface.co/internlm/internlm-chat-7b {model_root}",
-        shell=True,
-    )
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("internlm2-7b", True)
-def llm_internlm2_7b_model_root(llm_venv):
-    "prepare internlm2 7b model"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "internlm2-7b")
-
-    call(
-        f"git clone https://huggingface.co/internlm/internlm2-7b {model_root}",
-        shell=True,
-    )
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("internlm-chat-20b", True)
-def llm_internlm_20b_model_root(llm_venv):
-    "prepare internlm 20b model"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "internlm-chat-20b")
-
-    call(
-        f"git clone https://huggingface.co/internlm/internlm-chat-20b {model_root}",
-        shell=True,
-    )
-
-    return model_root
-
-
-@pytest.fixture(scope="session")
-@cached_in_llm_models_root("nemotron/Nemotron-3-8B-Base-4k.nemo", True)
-def llm_nemotron_3_8b_model_root():
-    "get nemotron/Nemotron-3-8B-Base-4k.nemo"
-    raise RuntimeError("nemotron/Nemotron-3-8B-Base-4k.nemo must be cached")
-
-
-@pytest.fixture(scope="session")
-@cached_in_llm_models_root("nemotron/Nemotron-4-15B-Base.nemo", True)
-def llm_nemotron_4_15b_model_root():
-    "get nemotron/Nemotron-4-15B-Base.nemo"
-    raise RuntimeError("nemotron/Nemotron-4-15B-Base.nemo must be cached")
 
 
 @pytest.fixture(scope="session")
@@ -728,6 +627,13 @@ def skip_by_device_count(request):
                 f"Device count {device_count} is less than {expected_count}")
 
 
+def get_mpi_world_size() -> int:
+    """Lazy wrapper so conftest import does not load MPI bindings."""
+    from tensorrt_llm.llmapi.mpi_session import \
+        get_mpi_world_size as _get_mpi_world_size
+    return _get_mpi_world_size()
+
+
 @pytest.fixture(autouse=True)
 def skip_by_mpi_world_size(request):
     "fixture for skip less mpi world size"
@@ -802,8 +708,9 @@ def is_ipc_nvls_supported():
     if not torch.cuda.is_available():
         return False
     try:
+        from tensorrt_llm.bindings import ipc_nvls_supported
         return ipc_nvls_supported()
-    except RuntimeError:
+    except (RuntimeError, ImportError):
         return False
 
 

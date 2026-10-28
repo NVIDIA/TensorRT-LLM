@@ -21,9 +21,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32
 from cutlass.experimental import primitives as prims
 
-# Softmax converts exp2 inputs with log2(e) and initializes masked scores to
-# negative Float32 max.
-LOG2_E = 1.4426950408889634074
+# Masked scores start at negative Float32 max.
 NEG_FLT_MAX = -3.4028235e38
 
 # E4M3FN finite maximum used when clamping FP8 output conversion.

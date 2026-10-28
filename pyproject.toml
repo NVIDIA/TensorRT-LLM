@@ -40,6 +40,9 @@ fix = true
 force-exclude = true
 exclude = [
     "**3rdparty/**",
+    # Preserve vendored FlashInfer KDA sources as recorded in the vendor lock.
+    "tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda/kda_chunked_bt16.py",
+    "tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda/kda_chunked_bt16_small_bh.py",
     "tensorrt_llm/_torch/attention/backends/prims_ts/**",
     "tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/**",
     "triton_kernels/**",
@@ -306,7 +309,6 @@ exclude = [
     "tensorrt_llm/_torch/moe/fused_moe/__init__.py",
     "tensorrt_llm/_torch/moe/fused_moe/create_moe.py",
     "tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py",
-    "tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py",
     "tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py",
     "tensorrt_llm/_torch/moe/fused_moe/fused_moe_deepgemm.py",
     "tensorrt_llm/_torch/moe/fused_moe/fused_moe_triton.py",

@@ -602,6 +602,11 @@
       "path": "kv_cache_config.avg_seq_len"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.enable_branch_snapshot"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.block_reuse_config.max_num_turns"
@@ -654,7 +659,10 @@
         "float32",
         "fp8",
         "fp8_ds_mla",
-        "nvfp4"
+        "nvfp4",
+        "mixed_nvfp4_fp8",
+        "mixed_nvfp4_float16",
+        "mixed_nvfp4_bfloat16"
       ],
       "capture_policy": "allowlist",
       "kind": "categorical",
@@ -797,11 +805,6 @@
       "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
     },
     {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
-    },
-    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.mamba_state_config.periodic_snapshot_interval"
@@ -825,6 +828,16 @@
       "capture_policy": "float",
       "kind": "value",
       "path": "kv_cache_config.max_util_for_resume"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mixed_precision_first_n"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mixed_precision_last_n"
     },
     {
       "capture_policy": "list[float]|none",
@@ -866,6 +879,11 @@
       "path": "kv_connector_config.connector"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.control_grace_sec"
+    },
+    {
       "allowed_values": [
         "both",
         "producer",
@@ -880,6 +898,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_connector_config.mooncake_store.segment_size"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.transfer_timeout_sec"
     },
     {
       "capture_policy": "list[int]|none",

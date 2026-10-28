@@ -52,7 +52,12 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .checkpoints.hf.weight_mapper import HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model, register_mapper
+from .modeling_utils import (
+    DecoderModel,
+    moe_experts_quant_config,
+    register_auto_model,
+    register_mapper,
+)
 
 # ---------------------------------------------------------------------------
 #  Gate (MoE router)
@@ -142,6 +147,9 @@ class LagunaMoE(nn.Module):
                 strategy=model_config.allreduce_strategy,
             )
 
+        experts_quant_config = moe_experts_quant_config(
+            model_config, f"model.layers.{layer_idx}.mlp.experts"
+        )
         self.gate = LagunaGate(
             hidden_size=self.hidden_dim,
             num_experts=self.num_experts,
@@ -149,12 +157,14 @@ class LagunaMoE(nn.Module):
             dtype=config.torch_dtype,
             moe_backend_cls=resolve_moe_cls(
                 model_config,
+                override_quant_config=experts_quant_config,
                 routing=RoutingMethodType.MiniMax2,
                 # Match the create_moe call below, which passes no bias and no
                 # swiglu alpha/beta. Left unknown, gates that create_moe
                 # rejects abstain here and the gate would name a backend the
                 # layer does not run.
                 swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
             ),
             scoring_func=getattr(config, "moe_router_score_func", "sigmoid"),
         )
@@ -168,6 +178,7 @@ class LagunaMoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            override_quant_config=experts_quant_config,
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
