@@ -25,7 +25,12 @@ monitoring is worse than one that prints a suspicious number.
 
 from dataclasses import dataclass
 
-__all__ = ["CheckResult", "check_kv_pool_conservation", "check_kv_quota"]
+__all__ = [
+    "CheckResult",
+    "check_kv_pool_conservation",
+    "check_kv_quota",
+    "check_tag_coverage",
+]
 
 
 @dataclass(frozen=True)
@@ -98,3 +103,53 @@ def check_kv_quota(rows: list[dict], quota_bytes: int, tolerance: float = 0.05) 
             f"(expected 1.0..{1.0 + tolerance:.2f}; rounding only adds)"
         ),
     )
+
+
+def check_tag_coverage(by_tag: dict[str, int], torch_live_bytes: int) -> list[CheckResult]:
+    """Check B: tagged bytes fit inside what torch says is live.
+
+    Non-vacuous because the two are counted independently: the tag totals
+    come from replaying ``device_traces`` against snapshot blocks, while
+    ``torch_live_bytes`` comes from ``memory_allocated()``. A stale frozen
+    tag -- an address reused by an untagged allocation whose reuse event the
+    ring buffer dropped -- inflates the first without touching the second.
+
+    The second result reports how much live memory no tag claims. It is not
+    a pass/fail condition: untagged memory is expected in steady state,
+    since activations are never tagged. It is surfaced because a tag
+    breakdown read without it looks complete when it is not.
+    """
+    from .tagging import UNTAGGED
+
+    if not by_tag:
+        return [
+            CheckResult(
+                name="B:tag_coverage",
+                passed=True,
+                detail="tagging unsupported or no window recorded; not reported as zero",
+            )
+        ]
+
+    tagged = sum(size for label, size in by_tag.items() if label != UNTAGGED)
+    untagged = by_tag.get(UNTAGGED, 0)
+
+    results = [
+        CheckResult(
+            name="B:tag_coverage",
+            passed=tagged <= torch_live_bytes,
+            detail=(f"tagged={tagged} torch_live={torch_live_bytes} (tagged must fit inside live)"),
+        )
+    ]
+
+    total = tagged + untagged
+    share = (untagged / total) if total else 0.0
+    results.append(
+        CheckResult(
+            name="B:tag_untagged_share",
+            passed=True,  # informational: activations are never tagged
+            detail=(
+                f"untagged={untagged} of {total} ({share:.1%}); expected non-zero in steady state"
+            ),
+        )
+    )
+    return results
