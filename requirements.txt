@@ -69,7 +69,7 @@ patchelf
 einops
 fla-core==0.5.2 # the Kimi Linear / Kimi K3 KDA layers import fla.modules and fla.ops when they load
 flashinfer-python==0.7.2
-xgrammar==0.1.32
+xgrammar==0.2.8
 llguidance==0.7.29
 jsonschema
 backoff

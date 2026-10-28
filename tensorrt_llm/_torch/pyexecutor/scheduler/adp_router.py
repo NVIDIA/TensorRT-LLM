@@ -201,6 +201,8 @@ class ADPRouter(ABC):
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
         forward_work: tuple[int, int] | None = None,
+        num_connector_transfers: int = 0,
+        connector_poll_failed: bool = False,
         include_kv_cache_load: bool = False,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
@@ -218,6 +220,10 @@ class ADPRouter(ABC):
                 piggyback on this allgather, if one is pending.
             forward_work: Context and generation work eligible before this
                 iteration polls transfers, used by conditional attention DP.
+            num_connector_transfers: Owner-local transfers or completed loads
+                awaiting response delivery before their slots can be freed.
+            connector_poll_failed: Whether the local completion poll failed;
+                all owners must then enter the executor's error vote.
         """
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -230,6 +236,8 @@ class ADPRouter(ABC):
         local_state.copy_iter_stats_from(iter_stats_payload)
         if forward_work is not None:
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
+        local_state.num_connector_transfers = num_connector_transfers
+        local_state.connector_poll_failed = connector_poll_failed
         if self.dist.has_cp_helix:
             self._use_max_load_across_cp(local_state)
         responses = self.dist.tp_allgather(local_state.serialize(include_kv_cache_load))

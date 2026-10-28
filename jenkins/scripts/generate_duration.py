@@ -44,6 +44,30 @@ def normalize_test_spec(name):
     return _TURTLE_DIRECTIVE_RE.sub("", name).strip()
 
 
+def to_pytest_split_key(name):
+    """Return the pytest node id that pytest-split looks durations up by.
+
+    Bare `unittest/...` specs are run through `test_unittests.py::test_unittests_v2[...]`,
+    so that is the node id the collected item carries. Other names already are node ids.
+    """
+    if name.startswith("unittest/"):
+        return f"test_unittests.py::test_unittests_v2[{name}]"
+    return name
+
+
+def with_pytest_split_keys(durations):
+    """Add the pytest node id next to every bare spec, keeping the spec itself.
+
+    pytest-split matches node ids, while test-list consumers (CBTS, the CI budget
+    estimator) match the specs as written in the test lists, so both forms are listed.
+    """
+    expanded = {}
+    for name, duration in durations.items():
+        expanded[name] = duration
+        expanded[to_pytest_split_key(name)] = duration
+    return expanded
+
+
 def load_test_list_specs(test_list_dir):
     """Collect the set of normalized test specs declared in the test-db YAMLs."""
     import yaml
@@ -219,6 +243,8 @@ def main():
             }
             dropped = raw_count - len(filtered)
             test_durations = filtered
+
+    test_durations = with_pytest_split_keys(test_durations)
 
     with open(NEW_TEST_DURATION, "w") as file:
         json.dump(test_durations, file, indent=3)
