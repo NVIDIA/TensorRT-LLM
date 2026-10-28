@@ -905,6 +905,86 @@ def test_native_staging_validation_and_fallback(monkeypatch):
 
 @skip_pre_hopper
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("logical_dtype", [torch.int32, torch.int64])
+def test_native_staging_maps_logical_main_rows(logical_dtype, monkeypatch):
+    """Logical MAIN selections resolve through the live page table inside the staging kernel."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+
+    _fused_rows_arch()
+    calls = []
+    original = kernel.stage_selected_rows
+
+    def stage(*args, **kwargs):
+        calls.append(kwargs["main_mapping"] is not None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "stage_selected_rows", stage)
+    queries, width, page_size, max_positions = 8, 17, 4, 30
+    metadata, inputs = _stage_fixture(queries, 128, width)
+    rows = inputs.main_pool.shape[0]
+    generator = torch.Generator(device="cuda").manual_seed(733)
+    # Strided table rows with holes. Physical pages 6 and 7 lie past the 23-row
+    # pool and page 5 straddles its end.
+    table_storage = torch.full((2, 16), -1, dtype=torch.int32, device="cuda")
+    table = table_storage[:, :8]
+    logical_storage = torch.empty(queries, width * 2, dtype=logical_dtype, device="cuda")
+    logical = logical_storage[:, ::2]
+    requests = torch.empty(queries, dtype=torch.int64, device="cuda")
+    visible = torch.empty(queries, dtype=torch.int32, device="cuda")
+
+    def refresh():
+        for request in range(2):
+            pages = torch.randperm(8, generator=generator, device="cuda")[:6].int()
+            pages[torch.randperm(6, generator=generator, device="cuda")[:2]] = -1
+            table[request, :6] = pages
+            table[request, 6:] = -1
+        logical.copy_(
+            torch.randint(-1, max_positions + 4, logical.shape, generator=generator, device="cuda")
+        )
+        requests.copy_(torch.randint(-1, 3, (queries,), generator=generator, device="cuda"))
+        visible.copy_(
+            torch.randint(0, max_positions + 2, (queries,), generator=generator, device="cuda")
+        )
+        physical = CSA2TrtllmMetadata._map_global_slots(
+            logical, requests, table, visible, page_size, max_positions
+        )
+        assert bool(((physical >= 0) & (physical < rows)).any())
+        reference = CSA2BackendForwardArgs(
+            swa_pool=inputs.swa_pool,
+            swa_indices=inputs.swa_indices,
+            main_pool=inputs.main_pool,
+            topk_indices=physical,
+        )
+        expected = _stage_oracle(metadata, reference)
+        metadata.swa_pool.fill_(13)
+        metadata.extra_pool.fill_(17)
+        metadata.prepared_counter.fill_(19)
+        return expected
+
+    mapped = CSA2BackendForwardArgs(
+        swa_pool=inputs.swa_pool,
+        swa_indices=inputs.swa_indices,
+        main_pool=inputs.main_pool,
+        topk_indices=logical,
+        main_mapping=(table, page_size, max_positions, requests, visible),
+    )
+    expected = refresh()
+    metadata.stage_selected(mapped)
+    _check_stage(metadata, expected)
+    assert calls == [True]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        metadata.stage_selected(mapped)
+    for _ in range(3):
+        expected = refresh()
+        graph.replay()
+        _check_stage(metadata, expected)
+
+
+@skip_pre_hopper
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cache_format,dim", [("index", 128), ("swa", 512)])
 @torch.inference_mode()
 def test_fused_store_changed_row_counts(cache_format, dim):
