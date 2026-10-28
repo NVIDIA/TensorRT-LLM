@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The CuTe DSL all-reduce + residual + RMSNorm kernels of MNNVLAllReduce against an FP32 reference over
-all ranks' inputs: the slot (one-shot) and two-shot launches, the in-kernel MoE finalize + shared-expert
-gate fold, the FP8 output, and the FP8 GEMM + all-reduce + norm launch."""
+all ranks' inputs: the slot (one-shot) and two-shot launches, the shared-expert gate fold (with or
+without the in-kernel MoE finalize), the FP8 output, and the FP8 GEMM + all-reduce + norm launch."""
 
 import os
 import pickle
@@ -136,7 +136,7 @@ def _moe_fold_cases(tp, top_k=10):
     norm_weight = _rand((H,), 2, 0.1) + 1
     for m in ROWS:
         assert ar.supports_moe_fold(m, H), m
-        routed, args = [], None
+        routed, finalized, args = [], [], None
         for r in range(tp):
             s = 1000 * m + 10 * r
             # FC2 rows of the permuted (token, k) pairs plus padding rows, with a stride past H.
@@ -151,11 +151,13 @@ def _moe_fold_cases(tp, top_k=10):
             gate = _rand((m, 1), s + 4)
             fin = (fc2.float()[perm.long()] * topw.float().unsqueeze(-1)).sum(1)
             routed.append(fin + torch.sigmoid(gate.float()) * shared.float())
+            fin_bf16 = fin.to(torch.bfloat16)
+            finalized.append(fin_bf16.float() + torch.sigmoid(gate.float()) * shared.float())
             if r == rank:
-                args = (fc2, topw, perm, shared, gate)
+                args = (fc2, topw, perm, shared, gate, fin_bf16)
         residual = _rand((m, H), 9 * m)
         ref_norm, ref_res = _ref_norm(sum(routed), residual, norm_weight)
-        fc2, topw, perm, shared, gate = args
+        fc2, topw, perm, shared, gate, fin_bf16 = args
         params = MoEAllReduceParams(
             expanded_idx_to_permuted_idx=perm,
             expert_scale_factor=topw,
@@ -169,6 +171,19 @@ def _moe_fold_cases(tp, top_k=10):
         norm, res = ar(fc2, all_reduce_params=params)
         _check(norm, ref_norm, ("moe fold norm", m))
         _check(res, ref_res, ("moe fold residual", m))
+        # A finalized routed output: only the shared-expert combine is folded.
+        ref_norm, ref_res = _ref_norm(sum(finalized), residual, norm_weight)
+        params = MoEAllReduceParams(
+            shared_expert_output=shared,
+            shared_expert_gate=gate,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=EPS,
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        )
+        norm, res = ar(fin_bf16, all_reduce_params=params)
+        _check(norm, ref_norm, ("finalized fold norm", m))
+        _check(res, ref_res, ("finalized fold residual", m))
 
 
 def _gemm_norm_cases(tp, k=1024):

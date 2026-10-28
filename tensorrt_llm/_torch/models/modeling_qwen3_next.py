@@ -206,8 +206,9 @@ def _post_moe_allreduce(layer: nn.Module, mlp_output, residual: torch.Tensor):
     """The MoE-output all-reduce + residual + ``next_layer_layernorm``; returns
     (hidden, residual).
 
-    ``mlp_output`` is the MLP output, or the MoE's un-finalized output
-    (``_DeferredSharedExpertFinalize``), which the all-reduce finalizes. With
+    ``mlp_output`` is the MLP output, or the MoE's routed output with its
+    shared expert and gate logits (``_DeferredSharedExpertFinalize``), which
+    the all-reduce combines (and finalizes, when un-finalized). With
     ``next_layer_input_scale`` set the same launch also quantizes the norm
     output for the next layer's FP8 input projection: the hidden is then the
     E4M3 tensor (attention), or ``_Fp8HiddenStates`` (GDN, whose in_proj_ba
@@ -227,14 +228,18 @@ def _post_moe_allreduce(layer: nn.Module, mlp_output, residual: torch.Tensor):
                   scale=scale,
                   eps=norm.variance_epsilon)
     if isinstance(mlp_output, _DeferredSharedExpertFinalize):
-        fc2, topk_weights, expanded_idx_to_permuted_idx = mlp_output.routed_output
+        routed = mlp_output.routed_output
+        if isinstance(routed, tuple):
+            routed, topk_weights, expanded_idx_to_permuted_idx = routed
+        else:
+            topk_weights = expanded_idx_to_permuted_idx = None
         params = MoEAllReduceParams(
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             expert_scale_factor=topk_weights,
             shared_expert_output=mlp_output.shared_output,
             shared_expert_gate=mlp_output.shared_gate_logits,
             **common)
-        outputs = layer.allreduce(fc2, all_reduce_params=params)
+        outputs = layer.allreduce(routed, all_reduce_params=params)
     else:
         outputs = layer.allreduce(mlp_output,
                                   all_reduce_params=AllReduceParams(
@@ -337,14 +342,16 @@ class _DeferredSharedExpertFinalize(NamedTuple):
     """The three tensors the shared-expert finalize would have combined.
 
     Returned in place of ``routed + sigmoid(gate) * shared`` when the caller
-    asks to defer and no collective follows, so that a downstream consumer can
+    asks to defer and no collective follows, or asks the MoE-output all-reduce
+    to fold it (``fold_shared_expert``), so that a downstream consumer can
     fold that expression into a kernel it already runs over these rows. With
     ``do_finalize=False`` ``routed_output`` is the experts' un-finalized
     ``(fc2, topk_weights, expanded_idx_to_permuted_idx)``, which the MoE-output
     all-reduce finalizes.
     """
 
-    routed_output: torch.Tensor
+    routed_output: torch.Tensor | Tuple[torch.Tensor, torch.Tensor,
+                                        torch.Tensor]
     shared_output: torch.Tensor
     shared_gate_logits: torch.Tensor
 
@@ -361,6 +368,9 @@ def _with_moe_backend(model_config: ModelConfig, backend: str) -> ModelConfig:
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
+
+    # The shared-expert combine can be handed to the MoE-output all-reduce.
+    has_shared_expert = True
 
     def __init__(
         self,
@@ -590,10 +600,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         do_finalize: Optional[bool] = True,
         lora_params: Optional[dict] = None,
         defer_shared_expert_finalize: bool = False,
+        fold_shared_expert: bool = False,
     ) -> torch.Tensor | _DeferredSharedExpertFinalize:
         """``do_finalize=False`` (``can_defer_finalize``): the experts' un-finalized output (fc2 rows, top-k
         weights, expanded -> permuted index) with the shared expert's output and gate logits, for a MoE-output
-        all-reduce that finalizes them."""
+        all-reduce that finalizes them. ``fold_shared_expert`` (the caller runs that all-reduce with
+        MoEAllReduceParams): the finalized routed output with the shared expert's output and gate logits."""
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -679,6 +691,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 shared_expert_output,
                 shared_expert_gate_logits,
             )
+        if fold_shared_expert:
+            return _DeferredSharedExpertFinalize(
+                final_hidden_states,
+                shared_expert_output,
+                shared_expert_gate_logits,
+            )
         # Deferring is sound only where no collective follows the finalize,
         # which is exactly the negation of the all-reduce condition below.
         # DP padding and >2D inputs are excluded: the rows handed over would no
@@ -718,8 +736,9 @@ class _DenseMlpAdapter(nn.Module):
     with the same arguments regardless of whether MoE or dense MLP is used.
     """
 
-    # A dense MLP has no finalize to defer.
+    # A dense MLP has no finalize to defer and no shared expert to fold.
     can_defer_finalize = False
+    has_shared_expert = False
 
     def __init__(self, mlp: GatedMLP, mapping):
         super().__init__()
@@ -738,8 +757,9 @@ class _DenseMlpAdapter(nn.Module):
         do_finalize=True,
         lora_params=None,
         defer_shared_expert_finalize=False,
+        fold_shared_expert=False,
     ):
-        assert not defer_shared_expert_finalize, \
+        assert not (defer_shared_expert_finalize or fold_shared_expert), \
             "a dense MLP has no shared-expert finalize to defer"
         all_rank_num_tokens = (attn_metadata.all_rank_num_tokens
                                if attn_metadata is not None else None)
@@ -877,11 +897,14 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # The MoE-output all-reduce finalizes the experts' output where it can.
-        do_finalize = not (self.fusion_config.POST_MOE_FUSION and lora_params
-                           is None and self.mlp.can_defer_finalize
-                           and self.allreduce.supports_moe_fold(
-                               hidden_states.shape[0], self.hidden_size))
+        # The MoE-output all-reduce combines the shared expert, and finalizes
+        # the experts' output where they can hand it back un-finalized.
+        fold_shared_expert = (self.fusion_config.POST_MOE_FUSION
+                              and self.mlp.has_shared_expert
+                              and self.allreduce.supports_moe_fold(
+                                  hidden_states.shape[0], self.hidden_size))
+        do_finalize = not (fold_shared_expert and lora_params is None
+                           and self.mlp.can_defer_finalize)
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
@@ -890,6 +913,7 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
             lora_params=lora_params,
+            fold_shared_expert=fold_shared_expert,
         )
 
         if self.fusion_config.POST_MOE_FUSION:

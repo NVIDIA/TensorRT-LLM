@@ -1226,29 +1226,31 @@ class MNNVLAllReduce(nn.Module):
                      norm_out=norm_out)
 
     def supports_moe_fold(self, num_tokens: int, hidden_size: int) -> bool:
-        """Whether ``forward`` takes MoEAllReduceParams (in-kernel MoE finalize + shared-expert gate) for
-        ``num_tokens`` tokens."""
+        """Whether ``forward`` takes MoEAllReduceParams (shared-expert gate combine, optionally with the
+        in-kernel MoE finalize) for ``num_tokens`` tokens."""
         return (self.fused_norm is not None
                 and hidden_size == self.fused_norm.hidden
                 and self.fused_norm.supports_rows(num_tokens))
 
     def _moe_fold_call(
-            self, fc2: torch.Tensor,
+            self, routed: torch.Tensor,
             params: MoEAllReduceParams) -> Optional[Tuple[torch.Tensor, ...]]:
-        """``finalize(fc2) + sigmoid(gate) * shared`` all-reduced, + residual, RMSNorm (``params.fusion_op``), or
-        None where the fold does not apply."""
+        """``routed + sigmoid(gate) * shared`` all-reduced, + residual, RMSNorm (``params.fusion_op``), or None
+        where the fold does not apply. ``routed`` is the finalized MoE output [M, H], or, with
+        ``params.expanded_idx_to_permuted_idx`` set, the experts' fc2 rows, finalized in-kernel."""
         outputs = self._FUSED_NORM_OUTPUTS.get(params.fusion_op)
         shared = params.shared_expert_output
         if (outputs is None or shared is None or
                 not self.supports_moe_fold(shared.shape[0], shared.shape[-1])):
             return None
+        if params.expanded_idx_to_permuted_idx is not None:
+            routed = (routed, params.expert_scale_factor,
+                      params.expanded_idx_to_permuted_idx)
         quant, norm_out = outputs
         return self.fused_norm(params.residual,
                                params.norm_weight,
                                params.eps,
-                               moe_fold=((fc2, params.expert_scale_factor,
-                                          params.expanded_idx_to_permuted_idx),
-                                         params.shared_expert_output,
+                               moe_fold=(routed, params.shared_expert_output,
                                          params.shared_expert_gate),
                                scale=params.scale if quant else None,
                                norm_out=norm_out)
@@ -1433,8 +1435,8 @@ class AllReduce(nn.Module):
                     self.mnnvl_allreduce = None
 
     def supports_moe_fold(self, num_tokens: int, hidden_size: int) -> bool:
-        """Whether ``forward`` takes MoEAllReduceParams for ``num_tokens`` tokens: the un-finalized MoE output
-        (fc2 rows) with the shared expert and its gate, finalized and folded in-kernel."""
+        """Whether ``forward`` takes MoEAllReduceParams for ``num_tokens`` tokens: the routed MoE output
+        (finalized, or the un-finalized fc2 rows) with the shared expert and its gate, folded in-kernel."""
         return (self.mnnvl_allreduce is not None
                 and self.mnnvl_allreduce.supports_moe_fold(
                     num_tokens, hidden_size))

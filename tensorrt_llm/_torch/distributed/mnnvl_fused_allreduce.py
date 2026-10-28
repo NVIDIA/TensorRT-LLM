@@ -15,7 +15,8 @@
 """CuTe DSL kernels ``MNNVLAllReduce`` runs for its residual RMSNorm fusions (kernels in ``kernels/blackwell``).
 
 * ``MnnvlAllReduceNorm``: all-reduce + residual + RMSNorm (+ FP8 output), optionally with the MoE fold
-  ``finalize(fc2 rows) + sigmoid(gate) * shared`` computed in-kernel. Calls below ``TWO_SHOT_ROWS`` rows run the
+  ``routed + sigmoid(gate) * shared`` computed in-kernel (``routed`` finalized, or finalized in-kernel from
+  the fc2 rows). Calls below ``TWO_SHOT_ROWS`` rows run the
   one-shot slot kernel on its own multicast workspace, larger ones the two-shot kernel on the library's Lamport
   workspace and flags. Both produce the library op's outputs.
 * ``GemmAllReduceNorm``: FP8 per-tensor row-parallel GEMM (low-M warp MMA) + one-shot all-reduce + residual +
@@ -344,9 +345,10 @@ class MnnvlAllReduceNorm:
         scale: Optional[torch.Tensor] = None,
         norm_out: bool = True,
     ) -> Tuple[torch.Tensor, ...]:
-        """Input ``x`` [M, H] BF16, or ``moe_fold`` = ((fc2 [P, >= H] BF16, topk_weights [M, K] BF16,
-        expanded_idx_to_permuted_idx [M, K] int32), shared [M, H], gate logits [M] / [M, 1]) giving
-        ``finalize(fc2) + sigmoid(gate) * shared``.
+        """Input ``x`` [M, H] BF16, or ``moe_fold`` = (routed, shared [M, H], gate logits [M] / [M, 1]) giving
+        ``routed + sigmoid(gate) * shared``. ``routed`` is the finalized routed output [M, H] BF16, or the
+        un-finalized (fc2 [P, >= H] BF16, topk_weights [M, K] BF16, expanded_idx_to_permuted_idx [M, K] int32),
+        finalized in-kernel.
 
         Returns ``(norm, residual_out)``, ``(norm, fp8, residual_out)`` with ``scale``, or ``(fp8, residual_out)``
         with ``scale`` and ``norm_out=False``, as the library op."""
@@ -359,15 +361,20 @@ class MnnvlAllReduceNorm:
         topk = fc2_row = 0
         fc2_ptr = topw_ptr = perm_ptr = 0
         if moe_fold is not None:
-            (fc2, topw, perm), shared, gate = moe_fold
-            assert perm.shape[0] == m and self.moe_fold_supported(fc2, topw, perm, hidden)
-            topk, fc2_row = perm.shape[1], fc2.stride(0)
-            fc2_ptr, topw_ptr, perm_ptr = (
-                fc2.data_ptr(),
-                topw.contiguous().data_ptr(),
-                perm.contiguous().data_ptr(),
-            )
-            xin, routed, shared, gate = shared, shared, shared.contiguous(), gate.reshape(-1)
+            routed, shared, gate = moe_fold
+            if isinstance(routed, torch.Tensor):
+                assert routed.shape == shared.shape and routed.dtype == torch.bfloat16
+            else:
+                fc2, topw, perm = routed
+                assert perm.shape[0] == m and self.moe_fold_supported(fc2, topw, perm, hidden)
+                topk, fc2_row = perm.shape[1], fc2.stride(0)
+                fc2_ptr, topw_ptr, perm_ptr = (
+                    fc2.data_ptr(),
+                    topw.contiguous().data_ptr(),
+                    perm.contiguous().data_ptr(),
+                )
+                routed = shared
+            xin, shared, gate = routed, shared.contiguous(), gate.reshape(-1)
         else:
             xin, routed, shared, gate = x, x, x, self._unused_gate
         res_out = torch.empty_like(residual)

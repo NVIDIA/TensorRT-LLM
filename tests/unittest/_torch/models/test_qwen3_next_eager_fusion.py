@@ -20,11 +20,12 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.distributed import AllReduceFusionOp
+from tensorrt_llm._torch.distributed import AllReduceFusionOp, MoEAllReduceParams
 from tensorrt_llm._torch.models.modeling_qwen3_next import (
     Qwen3NextForCausalLM,
     Qwen3NextFullAttentionDecoderLayer,
     Qwen3NextMTP,
+    _DeferredSharedExpertFinalize,
     _eager_fusion_enabled,
     _Qwen3NextDecoderLayerBase,
 )
@@ -195,6 +196,7 @@ def test_pre_moe_allreduce_runs_in_mixer_output_projection() -> None:
     )
     mlp = MagicMock(side_effect=lambda hidden_states, *args, **kwargs: hidden_states)
     mlp.can_defer_finalize = False
+    mlp.has_shared_expert = False
     layer = SimpleNamespace(
         layer_idx=0,
         hidden_size=4,
@@ -270,3 +272,81 @@ def test_attention_takes_the_gqa_decode_kernel_on_qwen3_5_sm103_only(
     modeling_qwen3_next.Qwen3NextAttention(config, layer_idx=0, fuse_qk_norm_rope=True)
 
     assert built["use_gqa_decode_fmha"] is enabled
+
+
+@pytest.mark.parametrize("can_defer_finalize", [False, True])
+def test_post_moe_allreduce_folds_the_shared_expert(can_defer_finalize) -> None:
+    """Where the MoE-output all-reduce takes the fold, the MoE hands back its routed output with the shared
+    expert and gate logits; a finalized routed output is folded without an expert index."""
+    rows, hidden = 3, 4
+    hidden_states = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    residual = torch.randn_like(hidden_states)
+    next_layer_norm = RMSNorm(hidden_size=hidden, eps=1e-6, dtype=torch.bfloat16, use_gemma=True)
+    routed = torch.randn_like(hidden_states)
+    shared = torch.randn_like(hidden_states)
+    gate = torch.randn(rows, 1, dtype=torch.bfloat16)
+    fc2, topw, perm = torch.randn(8, hidden), torch.rand(rows, 2), torch.zeros(rows, 2)
+
+    def mlp_forward(hidden_states, *args, do_finalize, fold_shared_expert, **kwargs):
+        assert fold_shared_expert
+        assert do_finalize is not can_defer_finalize
+        return _DeferredSharedExpertFinalize(
+            (fc2, topw, perm) if not do_finalize else routed, shared, gate
+        )
+
+    mlp = MagicMock(side_effect=mlp_forward)
+    mlp.can_defer_finalize = can_defer_finalize
+    mlp.has_shared_expert = True
+    allreduce = MagicMock(
+        side_effect=lambda hidden_states, *, all_reduce_params: (
+            hidden_states,
+            all_reduce_params.residual,
+        )
+    )
+    allreduce.supports_moe_fold.return_value = True
+    layer = SimpleNamespace(
+        layer_idx=0,
+        hidden_size=hidden,
+        input_layernorm=MagicMock(),
+        mixer_forward=MagicMock(
+            side_effect=lambda pos, h, md, sm, lora, all_reduce_params, **kw: (
+                h,
+                all_reduce_params.residual,
+            )
+        ),
+        post_attention_layernorm=RMSNorm(
+            hidden_size=hidden, eps=1e-6, dtype=torch.bfloat16, use_gemma=True
+        ),
+        next_layer_layernorm=next_layer_norm,
+        next_layer_input_scale=None,
+        next_layer_reads_bf16=False,
+        allreduce_fp8_payload=False,
+        fusion_config=SimpleNamespace(PRE_MOE_FUSION=True, POST_MOE_FUSION=True),
+        disable_attn_allreduce=True,
+        allreduce=allreduce,
+        mlp=mlp,
+        mapping=SimpleNamespace(tp_size=2),
+    )
+
+    _Qwen3NextDecoderLayerBase.forward(
+        layer,
+        position_ids=torch.arange(rows),
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(),
+        residual=residual,
+    )
+
+    allreduce.supports_moe_fold.assert_called_once_with(rows, hidden)
+    ar_input = allreduce.call_args.args[0]
+    params = allreduce.call_args.kwargs["all_reduce_params"]
+    assert isinstance(params, MoEAllReduceParams)
+    assert params.shared_expert_output is shared
+    assert params.shared_expert_gate is gate
+    if can_defer_finalize:
+        assert ar_input is fc2
+        assert params.expanded_idx_to_permuted_idx is perm
+        assert params.expert_scale_factor is topw
+    else:
+        assert ar_input is routed
+        assert params.expanded_idx_to_permuted_idx is None
+        assert params.expert_scale_factor is None
