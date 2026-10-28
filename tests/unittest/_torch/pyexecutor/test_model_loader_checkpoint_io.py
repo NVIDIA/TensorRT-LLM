@@ -20,6 +20,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import (
 )
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.mistral.checkpoint_loader import MistralCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loading
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
     WeightDemand,
@@ -146,7 +147,7 @@ def test_hf_subclass_disk_loads_report_final_native_policy(
     )
     weight_loader = checkpoint_loader.weight_loader
     native_load = MagicMock(return_value={})
-    assert checkpoint_io_policy_metadata(checkpoint_loader) is None
+    assert checkpoint_io_policy_metadata(checkpoint_loader, weights_preloaded=False) is None
     monkeypatch.setattr(weight_loader, "_load_weights_native", native_load)
     _record_weight_copies(monkeypatch, [])
     fallback_reason = weight_loader.last_checkpoint_io_status.fallback_reason
@@ -177,21 +178,21 @@ def test_hf_subclass_disk_loads_report_final_native_policy(
 
 
 @pytest.mark.parametrize("loader_kind", ["unfinalized", "custom", "mx", "preloaded"])
-def test_unobserved_checkpoint_policy_is_not_reported_as_native(
-    monkeypatch: pytest.MonkeyPatch,
-    loader_kind: str,
-) -> None:
+def test_unobserved_checkpoint_policy_is_not_reported_as_native(loader_kind: str) -> None:
     if loader_kind == "custom":
         checkpoint_loader = HfCheckpointLoader(weight_loader=MagicMock())
     elif loader_kind == "mx":
         checkpoint_loader = MXCheckpointLoader()
     else:
         checkpoint_loader = HfCheckpointLoader()
-    if loader_kind in ("mx", "preloaded"):
+    weights_preloaded = loader_kind in ("mx", "preloaded")
+    if weights_preloaded:
         checkpoint_loader.weight_loader._last_checkpoint_io_status.effective = "native"
-        monkeypatch.setattr(checkpoint_loader, "is_weights_preloaded", lambda: True)
 
-    assert checkpoint_io_policy_metadata(checkpoint_loader) is None
+    assert (
+        checkpoint_io_policy_metadata(checkpoint_loader, weights_preloaded=weights_preloaded)
+        is None
+    )
 
 
 @pytest.mark.parametrize("loader_cls", [MistralCheckpointLoader, MXCheckpointLoader])
@@ -588,13 +589,11 @@ class _RecordingCheckpointLoader(HfCheckpointLoader):
         events: list[str],
         weights: dict[str, object] | None = None,
         *,
-        weights_preloaded: bool = False,
         target_weight_mapper: object | None = None,
     ) -> None:
         super().__init__()
         self.events = events
         self.weights = {"model.weight": object()} if weights is None else weights
-        self.weights_preloaded = weights_preloaded
         self.target_weight_mapper = (
             object() if target_weight_mapper is None else target_weight_mapper
         )
@@ -605,9 +604,6 @@ class _RecordingCheckpointLoader(HfCheckpointLoader):
         self.read_kwargs[checkpoint_dir] = dict(kwargs, mapping=mapping)
         self.events.append(f"read:{checkpoint_dir}")
         return self.weights
-
-    def is_weights_preloaded(self) -> bool:
-        return self.weights_preloaded
 
     def get_initialized_weight_mapper(self, model: object, config: object) -> object:
         del model, config
@@ -678,16 +674,11 @@ def test_sessionless_loader_times_its_read_as_preparation(
     }
 
 
-@pytest.mark.parametrize("weights_preloaded", [False, True])
 def test_target_mapper_is_initialized_before_checkpoint_read(
-    monkeypatch: pytest.MonkeyPatch, weights_preloaded: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events = []
-    # A preloading loader (MX P2P) writes the weights into the model itself
-    # and returns none to copy.
-    checkpoint_loader = _RecordingCheckpointLoader(
-        events, weights={} if weights_preloaded else None, weights_preloaded=weights_preloaded
-    )
+    checkpoint_loader = _RecordingCheckpointLoader(events)
     _record_weight_copies(monkeypatch, events)
     model = SimpleNamespace(load_weights=object())
     mapping, source_identity = object(), object()
@@ -708,11 +699,9 @@ def test_target_mapper_is_initialized_before_checkpoint_read(
     )
 
     assert weight_mapper is checkpoint_loader.target_weight_mapper
-    assert loaded_weights_preloaded is weights_preloaded
-    expected_events = ["mapper_init", "read:/checkpoint"]
-    if not weights_preloaded:
-        expected_events.append("materialize")
-    assert events == expected_events
+    # Only an MX P2P load writes the weights into the model itself.
+    assert loaded_weights_preloaded is False
+    assert events == ["mapper_init", "read:/checkpoint", "materialize"]
     # The target read gets the model, so a context-only worker reads lazily.
     assert checkpoint_loader.read_kwargs == {
         "/checkpoint": {
@@ -724,7 +713,7 @@ def test_target_mapper_is_initialized_before_checkpoint_read(
     # The read is timed as preparation, with nothing to finalize.
     assert "checkpoint_preparation_seconds" in metrics
     assert metrics["checkpoint_finalization_seconds"] == 0.0
-    assert ("weight_population_seconds" in metrics) is not weights_preloaded
+    assert "weight_population_seconds" in metrics
 
 
 def test_read_ahead_copies_inside_weight_session_and_reports_its_timings(
@@ -974,10 +963,11 @@ def test_mtp_draft_reuses_target_mapper(
     # to copy. The draft read is still copied, even when it reads nothing, so
     # the model's draft load can reject an empty draft checkpoint.
     checkpoint_loader = _RecordingCheckpointLoader(
-        events,
-        weights={} if target_preloaded else None,
-        weights_preloaded=target_preloaded,
-        target_weight_mapper=target_mapper,
+        events, weights={} if target_preloaded else None, target_weight_mapper=target_mapper
+    )
+    # Only an MX loader reports preloaded weights; stand in for one.
+    monkeypatch.setattr(
+        mx_loading, "is_mx_weights_preloaded", lambda _checkpoint_loader: target_preloaded
     )
     checkpoint_loader.build_checkpoint_catalog = MagicMock(
         side_effect=lambda checkpoint_dir, **_kwargs: (

@@ -131,19 +131,21 @@ class HfCheckpointLoader(BaseCheckpointLoader):
 
 
 def checkpoint_io_policy_metadata(
-    checkpoint_loader: BaseCheckpointLoader
-) -> dict[str, str | bool | None] | None:
+        checkpoint_loader: BaseCheckpointLoader, *,
+        weights_preloaded: bool) -> dict[str, str | bool | None] | None:
     """Snapshot observed policy for loads using the built-in HF weight loader.
 
     Args:
         checkpoint_loader: Loader whose completed weight load is observed.
+        weights_preloaded: Whether the load wrote the weights into the model
+            directly (MX P2P) instead of reading the checkpoint.
 
     Returns:
         A detached policy snapshot, or None for unsupported or unobserved loads.
     """
-    if (not isinstance(checkpoint_loader, HfCheckpointLoader)
-            or type(checkpoint_loader.weight_loader) is not HfWeightLoader
-            or checkpoint_loader.is_weights_preloaded()):
+    if (weights_preloaded
+            or not isinstance(checkpoint_loader, HfCheckpointLoader)
+            or type(checkpoint_loader.weight_loader) is not HfWeightLoader):
         return None
     status = checkpoint_loader.weight_loader.last_checkpoint_io_status
     if status.effective not in (CheckpointIOPolicy.NATIVE,

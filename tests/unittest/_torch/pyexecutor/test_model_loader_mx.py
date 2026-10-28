@@ -1610,6 +1610,7 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     )
     checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.is_weights_preloaded.return_value = True
+    checkpoint_loader.is_post_transform_weights_preloaded.return_value = False
     checkpoint_loader.load_weights.return_value = {}
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
@@ -1633,11 +1634,8 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     checkpoint_loader.get_initialized_weight_mapper.assert_called_once()
     assert loader.weight_mapper is checkpoint_loader.get_initialized_weight_mapper.return_value
     # The publish carries the same identity that the read got.
-    checkpoint_loader.post_load_publish.assert_called_once_with(
-        model,
-        checkpoint_dir="/ckpt",
-        weights_preloaded=True,
-        source_identity=source_identity,
+    checkpoint_loader.publish_as_source.assert_called_once_with(
+        model, source_identity=source_identity
     )
 
     # reload() uses self.weight_mapper unconditionally; MX success must
@@ -1741,6 +1739,7 @@ def test_mx_partial_fallback_merges_returned_weights(
     )
     checkpoint_loader = _mock_mx_checkpoint_loader()
     checkpoint_loader.is_weights_preloaded.return_value = True
+    checkpoint_loader.is_post_transform_weights_preloaded.return_value = False
     fallback_weights = {"mismatched.weight": MagicMock()}
     checkpoint_loader.load_weights.return_value = fallback_weights
 
@@ -1751,15 +1750,19 @@ def test_mx_partial_fallback_merges_returned_weights(
     assert load_fn == model.load_weights
     assert weights is fallback_weights
     assert mapper is loader.weight_mapper
-    checkpoint_loader.post_load_publish.assert_called_once_with(
+    checkpoint_loader.publish_as_source.assert_called_once_with(
         model,
-        checkpoint_dir="/ckpt",
-        weights_preloaded=True,
         source_identity=checkpoint_loader.load_weights.call_args.kwargs["source_identity"],
     )
 
 
 class _PostTransformMxLoader(MXCheckpointLoader):
+    """MX loader whose P2P read delivers post-transform weights.
+
+    When the load is not allowed to take post-transform weights, the read
+    falls back to disk weights instead.
+    """
+
     def __init__(self, *, post_transform: bool) -> None:
         super().__init__()
         self._post_transform = post_transform
@@ -1768,8 +1771,7 @@ class _PostTransformMxLoader(MXCheckpointLoader):
         self.load_weights = MagicMock(side_effect=self._load_weights)
         self.is_weights_preloaded = MagicMock(side_effect=lambda: self._weights_preloaded)
         self.get_initialized_weight_mapper = MagicMock(return_value=MagicMock())
-        self.post_load_apply = MagicMock()
-        self.post_load_publish = MagicMock()
+        self.publish_as_source = MagicMock()
 
     def _load_weights(self, *_args: object, **kwargs: object) -> dict[str, object]:
         if self._post_transform and kwargs.get("allow_post_transform_weights") is False:
@@ -1819,11 +1821,8 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
         == mx_loading_mod.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
     )
     assert callable(kwargs["prepare_post_transform_receiver"])
-    checkpoint_loader.post_load_publish.assert_called_once_with(
-        model,
-        checkpoint_dir="/ckpt",
-        weights_preloaded=True,
-        source_identity=kwargs["source_identity"],
+    checkpoint_loader.publish_as_source.assert_called_once_with(
+        model, source_identity=kwargs["source_identity"]
     )
     # Post-transform receivers skip transform_weights(), but the accepted
     # tensors are already in final layout. Keep the transform guard in sync so
@@ -1967,16 +1966,13 @@ def test_mx_load_offers_post_transform_weights_only_for_the_registered_scope(
     if with_encoder:
         assert source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
         model_hooks_mod.call_load_weights.assert_not_called()
-        checkpoint_loader.post_load_publish.assert_called_once_with(
-            model,
-            checkpoint_dir="/ckpt",
-            weights_preloaded=True,
-            source_identity=source_identity,
+        checkpoint_loader.publish_as_source.assert_called_once_with(
+            model, source_identity=source_identity
         )
     else:
         assert source_identity.transform_abi_id is None
         assert model_hooks_mod.call_load_weights.call_count == 1
-        checkpoint_loader.post_load_publish.assert_not_called()
+        checkpoint_loader.publish_as_source.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -4468,7 +4464,7 @@ def test_mx_donor_publishes_only_on_a_qualified_sm_version(
 
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is publishes
-    assert checkpoint_loader.post_load_publish.called is publishes
+    assert checkpoint_loader.publish_as_source.called is publishes
 
 
 def test_staged_llama_finalization_preserves_mx_tensor_catalog(
@@ -4617,12 +4613,11 @@ def test_skipped_mx_publish_logs_only_reported_details(
     """
     messages: list[str] = []
     monkeypatch.setattr(mx_loading_mod.logger, "info", messages.append)
-    checkpoint_loader = SimpleNamespace(checkpoint_format="MX", post_load_publish=MagicMock())
+    checkpoint_loader = _mock_mx_checkpoint_loader()
 
-    mx_loading_mod.post_load_publish(
+    mx_loading_mod.publish_mx_weights(
         checkpoint_loader,
         _TinyModel([]),
-        checkpoint_dir="/checkpoint",
         weights_preloaded=False,
         qualification=decision,
         source_identity=None,
@@ -4632,7 +4627,7 @@ def test_skipped_mx_publish_logs_only_reported_details(
         "Skipping MX post-transform publish for _TinyModel: qualification "
         f"reason={decision.reason.value}{expected_details}."
     ]
-    checkpoint_loader.post_load_publish.assert_not_called()
+    checkpoint_loader.publish_as_source.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -4761,7 +4756,7 @@ def test_mx_post_transform_receiver_falls_back_for_unqualified_model(
     assert mapper is loader.weight_mapper
     assert kwargs["source_identity"].transform_abi_id is None
     assert events == ["load_weights", "post_load_weights"]
-    checkpoint_loader.post_load_publish.assert_not_called()
+    checkpoint_loader.publish_as_source.assert_not_called()
 
 
 def test_load_qualifies_with_preconstruction_identity_after_model_normalization(
@@ -4810,7 +4805,7 @@ def test_mx_rejects_post_transform_preload_after_failed_qualification(
 
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is False
-    checkpoint_loader.post_load_publish.assert_not_called()
+    checkpoint_loader.publish_as_source.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -4834,10 +4829,8 @@ def test_mx_fallback_runs_standard_weight_mapping(
     assert model_hooks_mod.call_load_weights.call_count == 1
     assert events[0] == "load_weights"
     assert "post_load_weights" in events
-    checkpoint_loader.post_load_publish.assert_called_once_with(
+    checkpoint_loader.publish_as_source.assert_called_once_with(
         model,
-        checkpoint_dir="/ckpt",
-        weights_preloaded=False,
         source_identity=checkpoint_loader.load_weights.call_args.kwargs["source_identity"],
     )
 
@@ -4879,12 +4872,7 @@ def test_mx_artifact_identity_failure_falls_back_to_disk(monkeypatch):
     assert "falling back to regular checkpoint loading" in warning.call_args.args[0]
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["source_identity"] is None
-    checkpoint_loader.post_load_publish.assert_called_once_with(
-        model,
-        checkpoint_dir="/ckpt",
-        weights_preloaded=False,
-        source_identity=None,
-    )
+    checkpoint_loader.publish_as_source.assert_called_once_with(model, source_identity=None)
 
 
 class _HookRecorder(nn.Module):
@@ -5084,7 +5072,6 @@ def _make_manifest_loader(
 def _hf_checkpoint_loader() -> MagicMock:
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
-    checkpoint_loader.is_weights_preloaded.return_value = False
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
     return checkpoint_loader
 
