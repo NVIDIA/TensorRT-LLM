@@ -93,6 +93,60 @@ class _NVFP4Codec:
         cute.autovec_copy(restored, destination)
 
 
+class _NativeCodec:
+    """History pool at the active dtype: 16-element groups are copied bit for bit.
+
+    Cold-page mixed precision keeps the GPU history pool at the runtime KV type and
+    quantizes only its cold pages, so the staging conversion is a plain copy.
+    """
+
+    group_size = 16
+    element_bytes = 1
+
+    @classmethod
+    def row_bytes(cls, head_dim: int) -> int:
+        """One head's record is its native row."""
+        if head_dim % cls.group_size:
+            raise ValueError("Mixed-precision KV requires head_dim divisible by 16")
+        return head_dim * cls.element_bytes
+
+    def __init__(self, dtype: torch.dtype, head_dim: int) -> None:
+        if torch.empty((), dtype=dtype).element_size() != self.element_bytes:
+            raise ValueError(f"{dtype} is not a {self.element_bytes}-byte KV element")
+        self.group_bytes = self.group_size * self.element_bytes
+
+    @cute.jit
+    def encode(
+        self,
+        source: cute.Tensor,
+        destination: cute.Tensor,
+        group: cutlass.Int64,
+    ) -> None:
+        """Copy one 16-element group of ``source`` into ``destination``."""
+        _copy_native(
+            cute.local_tile(source, (self.group_size,), (group,)),
+            cute.local_tile(destination, (self.group_bytes,), (group,)),
+        )
+
+    @cute.jit
+    def decode(
+        self,
+        source: cute.Tensor,
+        group: cutlass.Int64,
+        destination: cute.Tensor,
+    ) -> None:
+        """Copy one 16-element group of ``source`` into ``destination``."""
+        _copy_native(cute.local_tile(source, (self.group_bytes,), (group,)), destination)
+
+
+class _NativeCodec1B(_NativeCodec):
+    element_bytes = 1
+
+
+class _NativeCodec2B(_NativeCodec):
+    element_bytes = 2
+
+
 class _PagedMixedPrecisionKV:
     """Paged gather (read) or scatter (write) between staging and the two pools."""
 
@@ -195,7 +249,12 @@ class _PagedMixedPrecisionKV:
                     )
 
 
-_LOW_PRECISION_CODECS = {DataType.NVFP4: _NVFP4Codec}
+_LOW_PRECISION_CODECS = {
+    DataType.NVFP4: _NVFP4Codec,
+    DataType.FP8: _NativeCodec1B,
+    DataType.HALF: _NativeCodec2B,
+    DataType.BF16: _NativeCodec2B,
+}
 _compiled_kernels = {}
 
 

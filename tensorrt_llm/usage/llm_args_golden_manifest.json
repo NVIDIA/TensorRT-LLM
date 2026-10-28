@@ -565,6 +565,16 @@
       "path": "kv_cache_compression_config.eviction_mode"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.mixed_precision_first_n"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_compression_config.mixed_precision_last_n"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"

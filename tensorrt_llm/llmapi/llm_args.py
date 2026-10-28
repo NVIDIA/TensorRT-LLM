@@ -4534,6 +4534,29 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         description=
         "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
         "K/V global scales. Omit it to use identity global scales.")
+    mixed_precision_first_n: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Number of leading tokens per sequence whose KV stays at the active-cache "
+        "precision in the cold tiers instead of NVFP4. The KV cache manager keeps "
+        "these tokens in a retained-token layer group, as the mixed-precision KV "
+        "cache does, and migrates that group unchanged. Retention follows the "
+        "cache page granularity. Requires KV cache manager V2.")
+    mixed_precision_last_n: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Number of most recent tokens per sequence whose KV stays at the "
+        "active-cache precision in the cold tiers instead of NVFP4; see "
+        "mixed_precision_first_n.")
+
+    @property
+    def retained_token_window(self) -> Optional[tuple[int, int]]:
+        """``(first_n, last_n)`` kept at the active precision, else None."""
+        if self.mixed_precision_first_n or self.mixed_precision_last_n:
+            return (self.mixed_precision_first_n, self.mixed_precision_last_n)
+        return None
 
     def supports_block_reuse(self) -> bool:
         """Block reuse is unchanged because token identity is preserved."""
@@ -7178,34 +7201,44 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
-        """Reject runtime features the mixed-precision KV cache does not support."""
-        if self.kv_cache_config.mixed_precision_kv is None:
+        """Reject runtime features the retained-token KV layers do not support.
+
+        ``kv_cache_config.dtype="mixed_nvfp4_*"`` and cold-page compression with
+        ``mixed_precision_first_n/last_n`` both add a retained-token layer group.
+        """
+        hot = self.kv_cache_config.mixed_precision_kv is not None
+        cold = getattr(self.kv_cache_compression_config,
+                       "retained_token_window", None) is not None
+        if not hot and not cold:
             return self
+        feature = "Mixed-precision KV" if hot else "Mixed-precision cold pages"
         if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
             raise ValueError(
-                "Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."
+                f"{feature} requires kv_cache_config.use_kv_cache_manager_v2=True."
             )
         # get_attention_backend matches the name case-insensitively.
         if self.attn_backend.upper() not in ("TRTLLM", "FLASHINFER"):
             raise ValueError(
-                "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
+                f"{feature} supports the TRTLLM and FLASHINFER attention "
                 f"backends; got attn_backend={self.attn_backend!r}.")
         if self.sparse_attention_config is not None:
             raise ValueError(
-                "Mixed-precision KV is not supported together with sparse attention."
-            )
+                f"{feature} is not supported together with sparse attention.")
         # The connector layout maps every cache layer to one model layer; the
         # retained-token layers break that mapping.
         if self.kv_connector_config is not None:
             raise ValueError(
-                "Mixed-precision KV is not supported together with a KV connector."
-            )
-        if (self.speculative_config is not None
-                or self.kv_cache_compression_config is not None
-                or self.max_beam_width != 1):
+                f"{feature} is not supported together with a KV connector.")
+        if hot and (self.speculative_config is not None
+                    or self.kv_cache_compression_config is not None
+                    or self.max_beam_width != 1):
             raise ValueError(
                 "Mixed-precision KV currently requires single-beam execution "
                 "without speculative decoding or cold-page compression.")
+        if self.speculative_config is not None or self.max_beam_width != 1:
+            raise ValueError(
+                f"{feature} currently requires single-beam execution without "
+                "speculative decoding.")
         return self
 
     @model_validator(mode="after")

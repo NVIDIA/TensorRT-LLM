@@ -1851,7 +1851,11 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             raise ValueError("layer_specs does not support mixed-precision KV cache.")
         self._init_mixed_precision(
-            kv_cache_config, kwargs.get("pretrained_config"), max_seq_len, dtype
+            kv_cache_config,
+            kwargs.get("pretrained_config"),
+            max_seq_len,
+            dtype,
+            cold_page_codec_provider=cold_page_codec_provider,
         )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
@@ -2324,7 +2328,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         def create_cold_page_codec(cache_config: object) -> Optional[object]:
-            if cold_page_codec_provider is None:
+            # The estimation run only takes the provider's retained-token window.
+            if cold_page_codec_provider is None or self.is_estimating_kv_cache:
                 return None
             if (
                 self.layer_specs is not None
@@ -2340,6 +2345,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
                 head_dim_per_layer=self.head_dim_per_layer,
                 is_draft=self.is_draft,
+                retained_layers=tuple(self.high_layers.values()),
             )
 
         candidate: Optional[KVCacheManagerPy] = None
@@ -3922,9 +3928,15 @@ class KVCacheManagerV2(BaseResourceManager):
     # attention dtype. Attention reads a staging copy prepared by the attention metadata.
 
     def _init_mixed_precision(
-        self, kv_cache_config: KvCacheConfig, pretrained_config, max_seq_len: int, dtype: DataType
+        self,
+        kv_cache_config: KvCacheConfig,
+        pretrained_config,
+        max_seq_len: int,
+        dtype: DataType,
+        cold_page_codec_provider: Optional[object] = None,
     ) -> None:
-        """Record the mixed-precision layout requested through kv_cache_config.dtype."""
+        """Record the retained-token layout requested through kv_cache_config.dtype or
+        through the cold-page codec provider's retained_token_window."""
         # Local layer id -> layer id of its retained-token (high-precision) twin.
         self.high_layers: dict[int, int] = {}
         self.low_precision_dtype: Optional[DataType] = None
@@ -3936,24 +3948,40 @@ class KVCacheManagerV2(BaseResourceManager):
         self._shared_kv_layers: set[int] = set()
         # Tests pass plain config stand-ins that predate the mixed-precision fields.
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
-        if mixed is None:
+        retained = getattr(cold_page_codec_provider, "retained_token_window", None)
+        if not isinstance(retained, tuple):
+            # Providers without the property, and Mock providers in tests.
+            retained = None
+        if mixed is None and retained is None:
             return
+        requested = (
+            f"kv_cache_config.dtype={kv_cache_config.dtype!r}"
+            if mixed is not None
+            else "kv_cache_compression_config.mixed_precision_first_n/last_n"
+        )
         # Managers with their own pools (hybrid, sparse) are not wired up yet.
         if type(self) is not KVCacheManagerV2:
             raise NotImplementedError(
-                f"kv_cache_config.dtype={kv_cache_config.dtype!r} is only supported by the "
-                f"standard KV cache manager, not {type(self).__name__}"
+                f"{requested} is only supported by the standard KV cache manager, "
+                f"not {type(self).__name__}"
             )
-        self.first_n, self.last_n = mixed.first_n, mixed.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
-            raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
-        self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
-        retained_dtype = str_dtype_to_binding(mixed.high)
-        if dtype != retained_dtype:
-            raise ValueError(
-                f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
-                f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
-            )
+            raise NotImplementedError("Mixed-precision KV requires Blackwell")
+        if mixed is not None:
+            self.first_n, self.last_n = mixed.first_n, mixed.last_n
+            self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
+            retained_dtype = str_dtype_to_binding(mixed.high)
+            if dtype != retained_dtype:
+                raise ValueError(
+                    f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained "
+                    f"tokens in {mixed.high}, but the model's KV cache dtype resolved to {dtype}."
+                )
+        else:
+            # Cold-page mixed precision: the history pool keeps the active dtype and
+            # only its cold pages are quantized. The retained-token group migrates
+            # unchanged, and attention reads both pools through the staging copy.
+            self.first_n, self.last_n = retained
+            self.low_precision_dtype = dtype
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
             config = pretrained_config
             first_shared = config.num_hidden_layers - config.num_kv_shared_layers
