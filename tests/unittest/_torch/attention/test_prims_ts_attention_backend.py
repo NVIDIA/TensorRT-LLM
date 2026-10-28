@@ -33,8 +33,8 @@ from backend_case import (
 from utils.util import getSMVersion
 
 pytestmark = pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="PrimsTS attention kernels require SM100 or SM103",
+    getSMVersion() not in (100, 103, 107),
+    reason="PrimsTS attention kernels require SM100, SM103 or SM107",
 )
 
 

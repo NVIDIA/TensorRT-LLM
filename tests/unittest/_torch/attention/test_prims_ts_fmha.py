@@ -743,6 +743,9 @@ def test_unsupported_matrix_falls_through(case: dict, expected_reason: str) -> N
         (100, "4.7.0", "13.4", True),
         (100, "4.7.0", "13.2", False),
         (107, "4.7.0", "13.3", False),
+        (107, "4.8.0", "13.4", True),
+        (107, "4.8.0", "13.2", False),
+        (107, "4.8.0.dev0", "13.4", False),
         (120, "4.7.0", "13.3", False),
         (100, "4.6.2", "13.3", False),
     ],
@@ -771,7 +774,8 @@ def test_static_availability_gate(
     monkeypatch.setattr(PrimsTSFmha, "_missing_fused_nanobind_ops", staticmethod(lambda: []))
 
     assert PrimsTSFmha.is_available(_Attention()) is expected
-    if sm in (100, 103) and Version(cutlass_version) >= Version("4.7.0"):
+    min_dsl_version = Version("4.8.0" if sm == 107 else "4.7.0")
+    if sm in (100, 103, 107) and Version(cutlass_version) >= min_dsl_version:
         target_version.assert_called_once_with(min_version="13.3")
     else:
         target_version.assert_not_called()
