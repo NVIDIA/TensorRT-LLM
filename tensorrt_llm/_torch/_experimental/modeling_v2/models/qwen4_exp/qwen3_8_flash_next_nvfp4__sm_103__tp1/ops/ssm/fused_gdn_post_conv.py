@@ -62,58 +62,22 @@ class FusedGdnPostConv(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: num_prefill, num_decode; layout "contiguous" | "target_mixed"
-    # (decode a row slice of a [T, 10240] projection, as the target's split
-    # makes it) | "production" (the stock mixer's views: decode a row slice of
-    # a column slice of [T, 10240 + 6144], a/b column halves of [T, 96]) |
-    # "prefill_view" (prefill a `.t()` of a wider buffer, stride (1, 16384));
-    # beta_dtype, gate_dtype (A_log/dt_bias), dt_bias_fill.
+    # spec: num_prefill, num_decode; dt_bias_fill. Every cell is the target's
+    # one [T, 16480] input projection: `decode` the q|k|v column view of its
+    # decode rows, `a`/`b` its column views, `prefill` the transposing
+    # extraction of its prefill rows.
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(why=f"prefill only, {n} tokens", spec=dict(num_prefill=n, num_decode=0))
-            for n in (1, 37, 129, 2048)
-        )
-        + tuple(
+        *(
             Cell(
-                why=f"mixed batch, {p} prefill + {d} decode tokens",
+                why=f"target in_proj views, {p} prefill + {d} decode tokens",
                 spec=dict(num_prefill=p, num_decode=d),
             )
-            for p, d in ((128, 16), (37, 8), (1, 1), (0, 8))
-        )
-        + (
-            Cell(
-                why="target mixed call: decode a row slice of the projection",
-                spec=dict(num_prefill=200, num_decode=32, layout="target_mixed"),
-            ),
-            Cell(
-                why="stock mixer views: strided decode, a/b column halves",
-                spec=dict(num_prefill=96, num_decode=12, layout="production"),
-            ),
-            Cell(
-                why="prefill a non-contiguous .t() view, read through both strides",
-                spec=dict(num_prefill=96, num_decode=0, layout="prefill_view"),
-            ),
-            Cell(
-                why="beta_dtype bf16 (the MTP verify-path convention)",
-                spec=dict(num_prefill=37, num_decode=0, beta_dtype=torch.bfloat16),
-            ),
-            Cell(
-                why="A_log/dt_bias bf16, as stored in the checkpoint",
-                spec=dict(num_prefill=64, num_decode=8, gate_dtype=torch.bfloat16),
-            ),
-            Cell(
-                why="every head below softplus_threshold",
-                spec=dict(num_prefill=64, num_decode=0, dt_bias_fill=SOFTPLUS_THRESHOLD - 8.0),
-            ),
-            Cell(
-                why="every head above softplus_threshold: the linear branch",
-                spec=dict(num_prefill=64, num_decode=0, dt_bias_fill=SOFTPLUS_THRESHOLD + 8.0),
-            ),
-            Cell(
-                why="zero tokens: five empty tensors, no launch",
-                spec=dict(num_prefill=0, num_decode=0),
-            ),
-        )
+            for p, d in ((200, 32), (2048, 0))
+        ),
+        Cell(
+            why="every head above softplus_threshold: the linear branch",
+            spec=dict(num_prefill=64, num_decode=0, dt_bias_fill=SOFTPLUS_THRESHOLD + 8.0),
+        ),
     )
 
     note = """
@@ -124,13 +88,16 @@ class FusedGdnPostConv(OpWrapper):
     `(mq_p_t, mq_d, a, b, ...)` and the MTP-verify context half
     `(mq_p_t, None, a_p, b_p, ...)`, all with `l2_norm_eps=1e-6`,
     `softplus_threshold=20.0` and the fp32 `beta_dtype` default; `prefill` is
-    `extract_transpose_prefill_slice`'s contiguous output, `a`/`b` the
-    `[T, 48]` projections. The stock mixer's verify call passes
-    `beta_dtype=b.dtype`.
+    `extract_transpose_prefill_slice`'s contiguous output; `decode` and `a`/`b`
+    column views (row stride 16480) of the layer's one `[T, 16480]`
+    input-projection output. The stock mixer's verify call passes
+    `beta_dtype=b.dtype` (not certified here). Certified in that form at a
+    mixed step of 200 prefill and 32 decode tokens, a 2048-token prefill-only
+    step, and a 64-token step with every head past the softplus threshold.
 
     Preconditions: `prefill.shape[0]` and `decode.shape[1]` >= qkv_dim (extra
     trailing features ignored; a short one is read out of bounds); `decode`
-    has `prefill`'s dtype. `a`/`b` may have extra columns (the production
+    has `prefill`'s dtype. `a`/`b` may have extra columns (the in_proj
     case) and are read through their own strides. `head_k_dim`/`head_v_dim`
     are rounded up to a power of two and masked.
 
@@ -148,7 +115,10 @@ class FusedGdnPostConv(OpWrapper):
     (`tl.where` is a select); harmless below fp32 overflow at x ~ 88, which no
     checkpoint `a + dt_bias` reaches.
 
-    Not certified: fp16/fp32 activations, other head geometries.
+    Not certified: fp16/fp32 activations, other head geometries, a bf16
+    `beta_dtype`, bf16 `A_log`/`dt_bias`, a non-contiguous `prefill`, contiguous
+    `decode`/`a`/`b` (not views of the projection), single-token halves, an
+    empty batch.
 
     Hard limits
       none probed.

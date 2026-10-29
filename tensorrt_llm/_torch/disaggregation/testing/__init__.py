@@ -3,9 +3,10 @@
 """Test tooling for store drivers, shipped so a driver's own CI can import it from the wheel.
 
 ``driver_conformance`` holds the checks every ``StoreDriver`` must pass and the harness that runs
-them; ``memory_store`` holds the in-process store and driver that stand in for a real store;
-``broken_drivers`` holds drivers that each break one rule, proving the checks bite;
-``host_memory`` and ``object_trailer`` are their helpers.
+them; ``memory_store`` holds the in-process store and the drivers over it that stand in for a
+real store, one registering regions singly and one in batches; ``broken_drivers`` holds drivers
+that each break one rule, proving the checks bite; ``host_memory`` and ``object_trailer`` are
+their helpers.
 
 This package depends on pytest and is imported by tests only. No engine module imports it, and a
 test guards that. It provides no public configuration: the in-memory driver cannot be selected

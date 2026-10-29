@@ -28,10 +28,13 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
     _extend_swa_windows_for_reuse,
     _KVCacheManagerInitStatus,
+    _swa_branch_snapshot_point,
     _swa_endpoint_priority,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
@@ -42,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
@@ -53,6 +57,7 @@ from tensorrt_llm.llmapi.llm_args import (
     PARDDecodingConfig,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     DEFAULT_BEAM_INDEX,
@@ -71,6 +76,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManager,
     KVCacheManagerConfig,
     LayerId,
+    PageIndexMode,
     ReuseScope,
     SsmLayerConfig,
     _introspection,
@@ -78,6 +84,19 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_layer_spec_rejects_odd_head_dim() -> None:
+    with pytest.raises(ValueError, match="NVFP4 head_dim must be even"):
+        KVCacheLayerSpec(
+            global_layer_id=0,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=DataType.NVFP4,
+            num_kv_heads=16,
+            head_dim=1,
+            buffer_roles=(Role.KEY, Role.KEY_BLOCK_SCALE),
+        )
 
 
 @pytest.mark.cpu_only
@@ -314,6 +333,7 @@ def _make_cache_config_for_test(
     assert len(max_attention_window_vec) == len(pp_layers)
 
     cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager.layer_specs = None
     cache_manager.max_beam_width = 1
     cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = dtype
@@ -363,6 +383,8 @@ def _make_manager_for_cache_tier_test(
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
     vocab_size: int | None = 16,
+    dtype: DataType = DataType.HALF,
+    layer_specs: list[KVCacheLayerSpec] | None = None,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -425,7 +447,8 @@ def _make_manager_for_cache_tier_test(
             max_seq_len=MAX_SEQ_LEN,
             max_batch_size=1,
             mapping=mapping,
-            dtype=DataType.HALF,
+            dtype=dtype,
+            layer_specs=layer_specs,
             spec_config=spec_config,
             is_draft=is_draft,
             is_disagg=is_disagg,
@@ -633,6 +656,229 @@ def test_zero_size_layers_are_removed_before_pool_allocation(
             assert torch.all(buffer[0] == global_layer_id)
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize("kv_first", [False, True], ids=["key-first", "kv-first"])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layout: str) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    key_layer_id, kv_layer_id = 0, 1
+    key_spec = KVCacheLayerSpec(
+        global_layer_id=key_layer_id,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.HALF,
+        num_kv_heads=2,
+        head_dim=8,
+        buffer_roles=(Role.KEY,),
+    )
+    kv_spec = replace(key_spec, global_layer_id=kv_layer_id, buffer_roles=(Role.KEY, Role.VALUE))
+    layer_specs = [kv_spec, key_spec] if kv_first else [key_spec, kv_spec]
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=8,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        layer_specs=layer_specs,
+    )
+    try:
+        key_local_id = manager.layer_offsets[key_layer_id]
+        kv_local_id = manager.layer_offsets[kv_layer_id]
+        pool_id = manager.layer_to_pool_mapping_dict[key_local_id]
+        assert manager.layer_to_pool_mapping_dict[kv_local_id] == pool_id
+        assert manager.num_pools == 1
+        assert manager.get_layer_page_index_scale(key_layer_id) == 3
+        assert manager.get_layer_page_index_scale(kv_layer_id) == 3
+
+        key_buffer = manager.get_buffers(key_layer_id, kv_layout=kv_layout)
+        kv_buffer = manager.get_buffers(kv_layer_id, kv_layout=kv_layout)
+        page_stride = manager.impl.get_page_stride(kv_local_id, Role.KEY)
+        key_base = manager.impl.get_mem_pool_base_address(
+            kv_local_id, Role.KEY, PageIndexMode.SHARED
+        )
+        value_base = manager.impl.get_mem_pool_base_address(
+            kv_local_id, Role.VALUE, PageIndexMode.SHARED
+        )
+        page_shape = (TOKENS_PER_BLOCK, 2, 8) if kv_layout == "NHD" else (2, TOKENS_PER_BLOCK, 8)
+        assert kv_buffer.shape[1:] == (2, *page_shape)
+        assert kv_buffer.stride(0) * kv_buffer.element_size() == 3 * page_stride
+        # Slot 1 begins three physical pages later, even though this layer
+        # exposes only two roles. Reversing the specs also exercises a base
+        # pointer offset within the coalesced slot.
+        assert kv_buffer[1, 0].data_ptr() == key_base + 3 * page_stride
+        assert kv_buffer[1, 1].data_ptr() == value_base + 3 * page_stride
+        assert key_buffer.stride(0) * key_buffer.element_size() == page_stride
+
+        request_id = 7
+        cache = manager._create_kv_cache(request_id, None, None)
+        assert cache.resume(manager._stream.cuda_stream)
+        assert cache.resize(3 * TOKENS_PER_BLOCK, 0)
+        raw_slots = [int(slot) for slot in cache.get_base_page_indices(pool_id)[: cache.num_blocks]]
+        assert len(raw_slots) == 3
+        assert any(slot % 2 == 1 for slot in raw_slots)
+        for layer_id, buffer, expected in (
+            (key_layer_id, key_buffer, [3 * slot for slot in raw_slots]),
+            (kv_layer_id, kv_buffer, raw_slots),
+        ):
+            batch_indices = manager.get_batch_cache_indices([request_id], layer_idx=layer_id)
+            flat_indices = manager.get_batch_cache_indices_flat(
+                [request_id], [len(raw_slots)], layer_idx=layer_id
+            ).tolist()
+            assert batch_indices == [expected]
+            assert flat_indices == expected
+            local_id = manager.layer_offsets[layer_id]
+            for indices in (batch_indices[0], flat_indices):
+                for slot, index in zip(raw_slots, indices):
+                    for role_index, role in enumerate(manager.get_layer_buffer_roles(layer_id)):
+                        role_base = manager.impl.get_mem_pool_base_address(
+                            local_id, role, PageIndexMode.SHARED
+                        )
+                        assert (
+                            buffer[index, role_index].data_ptr()
+                            == role_base + 3 * slot * page_stride
+                        )
+
+        # Give each role and slot a distinct value. Writing an odd K/V slot
+        # must preserve the K-only page and both neighboring K/V slots.
+        for ordinal, slot in enumerate(raw_slots):
+            key_buffer[3 * slot, 0].fill_(10 + ordinal)
+        for ordinal, slot in enumerate(raw_slots):
+            kv_buffer[slot, 0].fill_(20 + ordinal)
+            kv_buffer[slot, 1].fill_(30 + ordinal)
+        for ordinal, slot in enumerate(raw_slots):
+            assert torch.all(key_buffer[3 * slot, 0] == 10 + ordinal)
+            assert torch.all(kv_buffer[slot, 0] == 20 + ordinal)
+            assert torch.all(kv_buffer[slot, 1] == 30 + ordinal)
+    finally:
+        manager.shutdown()
+
+
+def test_nvfp4_scale_indices_with_mixed_bf16_storage() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    nvfp4 = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.NVFP4,
+        num_kv_heads=4,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE),
+    )
+    bf16 = replace(
+        nvfp4,
+        global_layer_id=1,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.BF16,
+        num_kv_heads=1,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=4,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.NVFP4,
+        layer_specs=[nvfp4, bf16],
+    )
+    try:
+        assert manager.num_pools == 1
+        (group,) = manager.impl.pool_group_descs
+        assert len(group.pools) == 3
+        assert group.num_slots > 1
+        slots = [1, int(group.num_slots) - 1]
+        for offset, (data_role, scale_role) in enumerate(
+            ((Role.KEY, Role.KEY_BLOCK_SCALE), (Role.VALUE, Role.VALUE_BLOCK_SCALE))
+        ):
+            data_converter = manager.impl.get_page_index_converter(0, data_role)
+            scale_converter = manager.impl.get_page_index_converter(0, scale_role)
+            pages = data_converter(slots, PageIndexMode.PER_LAYER)
+            assert pages == [2 * slot + offset for slot in slots]
+            assert scale_converter(slots, PageIndexMode.PER_LAYER) == pages
+
+            scale_base = manager.impl.get_mem_pool_base_address(
+                0, scale_role, PageIndexMode.PER_LAYER
+            )
+            scale_pool = next(pool for pool in group.pools if pool.base_address == scale_base)
+            page_bytes = manager.impl.get_page_stride(0, scale_role)
+            # Attention reuses data indices for scales, including at the final slot.
+            for slot, page in zip(slots, pages):
+                address = scale_base + page * page_bytes
+                assert address == scale_base + slot * scale_pool.slot_bytes + offset * page_bytes
+                assert address + page_bytes <= scale_base + group.num_slots * scale_pool.slot_bytes
+    finally:
+        manager.shutdown()
+
+
+def test_mixed_nvfp4_bf16_pool_pointer_views() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    bf16 = torch.empty((2, 1, 32, 128), dtype=torch.bfloat16, device="cuda")
+    nvfp4 = torch.empty((2, 1, 32, 64), dtype=torch.uint8, device="cuda")
+    scales = torch.empty((2, 1, 32, 8), dtype=torch.float8_e4m3fn, device="cuda")
+    pointers = torch.tensor(
+        [
+            [[nvfp4.data_ptr(), scales.data_ptr()], [0, 0]],
+            # A nonzero scale pointer must be ignored for the BF16 layer.
+            [[bf16.data_ptr(), scales.data_ptr()], [0, 0]],
+        ],
+        dtype=torch.int64,
+        device="cpu",
+    )
+    mapping = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32, device="cpu")
+    block_offsets = torch.zeros((2, 1, 2, 1), dtype=torch.int32, device="cuda")
+    for table, layer_id, quant_mode, expected_data, expected_scales in (
+        (pointers, 1, 0, bf16, None),
+        (pointers, 0, int(QuantMode.NVFP4_KV_CACHE), nvfp4, scales),
+        (pointers[:, :, 0].contiguous(), 1, 0, bf16, None),
+    ):
+        data, blocks, block_scales = thop.build_trtllm_gen_kv_cache_metadata(
+            host_kv_cache_pool_pointers=table,
+            host_kv_cache_pool_mapping=mapping,
+            kv_cache_block_offsets=block_offsets,
+            layer_idx=layer_id,
+            num_kv_heads=1,
+            tokens_per_block=32,
+            head_dim=128,
+            kv_factor=2,
+            total_num_blocks=2,
+            kv_cache_quant_mode=quant_mode,
+            batch_start=0,
+            batch_size=1,
+            dtype=torch.bfloat16,
+        )
+        assert data.data_ptr() == expected_data.data_ptr()
+        assert data.shape == expected_data.shape
+        assert data.dtype == expected_data.dtype
+        assert blocks.data_ptr() == block_offsets[layer_id].data_ptr()
+        if expected_scales is None:
+            assert block_scales is None
+        else:
+            assert block_scales is not None
+            assert block_scales.data_ptr() == expected_scales.data_ptr()
+            assert block_scales.shape == expected_scales.shape
 
 
 def test_zero_size_filter_preserves_ssm_and_nonempty_extra_buffers() -> None:
@@ -1240,6 +1486,85 @@ def test_cold_codec_provider_receives_draft_role() -> None:
     assert codec_provider.create_cold_page_codec.call_args.kwargs["is_draft"] is True
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "manager_dtype,layer_dtype",
+    [
+        (DataType.HALF, DataType.BF16),
+        (DataType.BF16, DataType.HALF),
+        (DataType.HALF, DataType.FP8),
+    ],
+)
+def test_cold_codec_provider_receives_layer_spec_dtype(
+    manager_dtype: DataType, layer_dtype: DataType
+) -> None:
+    codec_provider = Mock()
+    layer = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=layer_dtype,
+        num_kv_heads=1,
+        head_dim=1,
+        buffer_roles=(Role.KEY,),
+    )
+    manager, _ = _make_manager_for_cache_tier_test(
+        KvCacheConfig(max_gpu_total_bytes=16 << 20),
+        [Mock()],
+        cold_page_codec_provider=codec_provider,
+        dtype=manager_dtype,
+        layer_specs=[layer],
+    )
+
+    assert manager.dtype == manager_dtype
+    codec_provider.create_cold_page_codec.assert_called_once()
+    assert codec_provider.create_cold_page_codec.call_args.kwargs["runtime_dtype"] == layer_dtype
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("manager_dtype", [DataType.HALF, DataType.BF16])
+def test_cold_codec_provider_receives_legacy_manager_dtype(manager_dtype: DataType) -> None:
+    codec_provider = Mock()
+    _make_manager_for_cache_tier_test(
+        KvCacheConfig(max_gpu_total_bytes=16 << 20),
+        [Mock()],
+        cold_page_codec_provider=codec_provider,
+        dtype=manager_dtype,
+    )
+
+    codec_provider.create_cold_page_codec.assert_called_once()
+    assert codec_provider.create_cold_page_codec.call_args.kwargs["runtime_dtype"] == manager_dtype
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "layer_dtypes", [(DataType.BF16, DataType.HALF), (DataType.BF16, DataType.FP8)]
+)
+def test_cold_codec_provider_rejects_mixed_layer_spec_dtypes(
+    layer_dtypes: tuple[DataType, DataType],
+) -> None:
+    codec_provider = Mock()
+    layer_specs = [
+        KVCacheLayerSpec(
+            global_layer_id=layer_id,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=layer_dtype,
+            num_kv_heads=1,
+            head_dim=1,
+            buffer_roles=(Role.KEY,),
+        )
+        for layer_id, layer_dtype in enumerate(layer_dtypes)
+    ]
+    with pytest.raises(NotImplementedError, match="mixed-dtype KV-cache layer specs"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(max_gpu_total_bytes=16 << 20),
+            [Mock()],
+            cold_page_codec_provider=codec_provider,
+            layer_specs=layer_specs,
+        )
+
+    codec_provider.create_cold_page_codec.assert_not_called()
+
+
 def test_extra_tokens_are_in_context_capacity() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(avg_seq_len=264),
@@ -1276,6 +1601,66 @@ def test_try_commit_blocks_at_context_end(guard: str | None) -> None:
     assert list(kv_cache.committed_tokens) == [4, 5, 6, 7, 8, 9]
     assert kv_cache.num_committed_tokens == 10
     assert kv_cache.stopped_committing is (guard is not None)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("divergence", "num_lookup_tokens", "reused", "expected"),
+    [
+        # A sibling diverges at 34,400; the point aligns down to the 64-token block.
+        (34400, 34999, 0, 34368),
+        # The whole lookup matched, so there is no fork.
+        (34999, 34999, 0, None),
+        # Less than one shared block.
+        (40, 999, 0, None),
+        # Reuse already reached the fork.
+        (34400, 34999, 34368, None),
+    ],
+)
+def test_swa_branch_snapshot_point(
+    divergence: int, num_lookup_tokens: int, reused: int, expected: int | None
+) -> None:
+    assert (
+        _swa_branch_snapshot_point(divergence, num_lookup_tokens, reused, num_lookup_tokens + 1, 64)
+        == expected
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("record", "is_dummy_request", "num_lookup_tokens", "points", "expected"),
+    [
+        (True, False, 999, [], [512]),
+        # A later lookup that matches in full clears the earlier point.
+        (True, False, 512, [256], []),
+        # A resumed cache does no lookup and keeps the point.
+        (True, False, None, [256], [256]),
+        (False, False, 999, [], []),
+        (True, True, 999, [], []),
+    ],
+)
+def test_record_branch_snapshot_point(
+    record: bool,
+    is_dummy_request: bool,
+    num_lookup_tokens: int | None,
+    points: list[int],
+    expected: list[int],
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._record_branch_snapshots = record
+    manager.tokens_per_block = 64
+    request = SimpleNamespace(
+        py_request_id=1,
+        is_dummy_request=is_dummy_request,
+        prompt_len=1000,
+        expect_snapshot_points=points,
+    )
+    kv_cache = Mock(num_committed_tokens=0)
+    kv_cache._get_num_reusable_tokens_before_pruning.return_value = 512
+
+    manager._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens)
+
+    assert request.expect_snapshot_points == expected
 
 
 def test_generation_allocation_reserves_dynamic_width() -> None:
@@ -1710,7 +2095,6 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
                 max_beam_width=1,
                 use_mrope=False,
             ),
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             model=SimpleNamespace(
                 model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
             ),
@@ -2967,6 +3351,7 @@ def _make_fresh_fill_manager(
     manager = object.__new__(KVCacheManagerV2)
     manager._stream = SimpleNamespace(device=torch.device("cuda:0"))
     manager._fresh_page_fill = fill_value
+    manager.layer_specs = None
     manager._fresh_pages_filled = {}
     manager._fresh_fill_announced = True
     manager.kv_cache_map = {1: kv_cache}
@@ -3287,6 +3672,7 @@ def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) ->
 
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_offsets = {0: 0}
+    manager.layer_specs = None
     manager.layer_to_pool_mapping_dict = {0: 0}
     manager.get_buffers = lambda layer_idx, kv_layout="NHD": buffer
     manager._guard_page_by_layer = {0: guard_page}

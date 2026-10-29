@@ -1,16 +1,28 @@
 schema_version: 1
 vendors:
+  flashinfer-kda-bt16:
+    url: https://github.com/flashinfer-ai/flashinfer.git
+    branch: main
+    commit: b8e81a7dae6c2aa5c9aa19c06e81e9a729271493
+    source: flashinfer/kda_kernels
+    destination: tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda
+    include:
+    - kda_chunked_bt16.py
+    - kda_chunked_bt16_small_bh.py
+    patch: 3rdparty/vendor_patches/flashinfer-kda-bt16.patch
+    patch_digest: sha256:bc9b96a69873e0ddfcba66ab899c666cf52766976f24d850048d2a0bf8d967ff
+    digest: sha256-tree-v1:d2d382335ccb68b55078523e63835c28b699607227afb81308cb7bb1d85845ac
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
     branch: trtllm-prims-ts-dev-20261012
-    commit: ae312f7cc1723b06fda5168105ade0f328ee47d8
+    commit: aa709061230a58858375c513056e7733fa74294a
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:a4360ca506d25545db408d22875e678871970fec94bdc1166dd6108d3b504d1c
-    digest: sha256-tree-v1:1bd57713d2487e94c0fc4b134bed4f7eff275282cb8ef471775e87db503ded03
+    patch_digest: sha256:fc5c23ec3d65c562025a1845f211fdac66bfcd3da156dbb8385f4c4407d20d07
+    digest: sha256-tree-v1:f2f444f7e6d4ad688fbf4e1e9eed11ff7c78d835cfd0af5ef9d7660780b059e0
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

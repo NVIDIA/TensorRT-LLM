@@ -370,15 +370,7 @@ class GenerationResultBase:
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
         output._last_logprobs_len = len(output.logprobs)
-        # With n > 1 each candidate is its own child request with its own
-        # counters, while the request-level copies on self are overwritten by
-        # every candidate's response. Capture this sequence's here so a choice
-        # never reports whichever candidate happened to respond last.
-        output._spec_dec_counters = _SpecDecCounters(
-            per_pos_drafted=getattr(response_tensors, 'per_pos_drafted', None),
-            per_pos_accepted=getattr(response_tensors, 'per_pos_accepted',
-                                     None),
-            spec_dec_totals=getattr(response_tensors, 'spec_dec_totals', None))
+        output._spec_dec_counters = _SpecDecCounters()
         decoder_output_prefix = ()
         if (self.sampling_params.exclude_input_from_output
                 or getattr(self, "_streaming", False)):
@@ -449,20 +441,32 @@ class GenerationResultBase:
                         f"logprobs length: {len(output.logprobs)} != "
                         f"output.length: {output.length}")
 
-        if (generation_logits :=
-                response_tensors.generation_logits) is not None:
-            output.generation_logits = generation_logits[
-                src_idx, :output.length]
+        if not isinstance(response_tensors, tllm.Result):
+            # With n > 1 each candidate is its own child request with its own
+            # counters, while the request-level copies on self are overwritten by
+            # every candidate's response. Capture this sequence's here so a choice
+            # never reports whichever candidate happened to respond last.
+            output._spec_dec_counters = _SpecDecCounters(
+                per_pos_drafted=response_tensors.per_pos_drafted,
+                per_pos_accepted=response_tensors.per_pos_accepted,
+                spec_dec_totals=response_tensors.spec_dec_totals)
 
-        if (additional_context_outputs :=
-                getattr(response_tensors, 'additional_context_outputs',
-                        None)) is not None:
-            output.additional_context_outputs = additional_context_outputs
+            if (generation_logits :=
+                    response_tensors.generation_logits) is not None:
+                output.generation_logits = generation_logits[
+                    src_idx, :output.length]
 
-        if (additional_generation_outputs :=
-                getattr(response_tensors, 'additional_generation_outputs',
-                        None)) is not None:
-            output.additional_generation_outputs = additional_generation_outputs
+            if (additional_context_outputs :=
+                    response_tensors.additional_context_outputs) is not None:
+                output.additional_context_outputs = additional_context_outputs
+
+            if (additional_generation_outputs :=
+                    response_tensors.additional_generation_outputs) is not None:
+                output.additional_generation_outputs = additional_generation_outputs
+
+            if (time_breakdown_metrics :=
+                    response_tensors.time_breakdown_metrics) is not None:
+                self.time_breakdown_metrics = time_breakdown_metrics
 
         # when sampling_params.n > 1 and is cancelled, make sure all the outputs
         # be marked as cancelled.
@@ -474,12 +478,6 @@ class GenerationResultBase:
                 response_tensors.request_perf_metrics) is not None:
             output.request_perf_metrics = request_perf_metrics
             self._maybe_fill_spec_dec_perf_metrics(output.request_perf_metrics)
-
-        # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
-        if (time_breakdown_metrics :=
-                getattr(response_tensors, 'time_breakdown_metrics',
-                        None)) is not None:
-            self.time_breakdown_metrics = time_breakdown_metrics
 
         # Check if this specific sequence is finished (not just if the entire request is done)
         # This is important for best_of > n sampling where sequences finish at different times
@@ -721,7 +719,9 @@ class GenerationResultBase:
                     self._disaggregated_params.first_gen_logits = \
                         first_gen_logits
 
-            if (context_logits := response_result.context_logits) is not None:
+            if not isinstance(response_result, tllm.Result) and (
+                    context_logits :=
+                    response_result.context_logits) is not None:
                 self._context_logits = context_logits
 
             if (mm_embedding_handles :=

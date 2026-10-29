@@ -46,7 +46,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3KVCacheManagerV2,
-    resolve_sparse_layer_schedule,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseConfig,
@@ -1521,26 +1520,6 @@ def test_index_projection_quant_config_follows_declared_entries() -> None:
     del mismatched["model.layers.4.self_attn.index_k_proj"]
     with pytest.raises(ValueError, match="same quantization"):
         _get_index_projection_quant_config(SimpleNamespace(quant_config_dict=mismatched), 4)
-
-
-def test_kv_cache_schedule_follows_the_checkpoint_attention_schedule() -> None:
-    all_layers = list(range(_NUM_HIDDEN_LAYERS))
-    assert resolve_sparse_layer_schedule(
-        None, None, _make_packaged_text_config(), _NUM_HIDDEN_LAYERS
-    ) == (all_layers, all_layers)
-    assert resolve_sparse_layer_schedule(None, None, _make_text_config(), _NUM_HIDDEN_LAYERS) == (
-        [3, 4, 5, 6],
-        [3, 4, 5, 6],
-    )
-    # Explicit ids win; without a checkpoint schedule the public convention holds.
-    assert resolve_sparse_layer_schedule([5], None, _make_packaged_text_config(), 7) == ([5], [5])
-    for config in (None, SimpleNamespace(num_hidden_layers=_NUM_HIDDEN_LAYERS)):
-        assert resolve_sparse_layer_schedule(None, None, config, _NUM_HIDDEN_LAYERS) == (
-            [3, 4, 5, 6],
-            [3, 4, 5, 6],
-        )
-    with pytest.raises(ValueError, match="outside the 4 target layers"):
-        resolve_sparse_layer_schedule(None, None, _make_packaged_text_config(), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -3080,15 +3059,19 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "libraries,available,use_native",
+    "libraries,available,extra_pages_only,use_native",
     [
-        ("flashinfer_trtllm_gen,fallback", True, True),
-        ("fallback,flashinfer_trtllm_gen", True, False),
-        ("fallback", True, False),
-        ("flashinfer_trtllm_gen,fallback", False, False),
+        ("flashinfer_trtllm_gen,fallback", True, False, True),
+        ("fallback,flashinfer_trtllm_gen", True, False, False),
+        ("fallback", True, False, False),
+        ("flashinfer_trtllm_gen,fallback", False, False, False),
+        # SM107: the library serves only extra page sizes; dense layers keep SDPA.
+        ("flashinfer_trtllm_gen,fallback", True, True, False),
     ],
 )
-def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, available, use_native):
+def test_minimax_m3_dense_backend_library_order(
+    monkeypatch, libraries, available, extra_pages_only, use_native
+):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -3109,6 +3092,7 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
         "is_available",
         classmethod(lambda cls, attn: available),
     )
+    monkeypatch.setattr(model_module, "get_sm_version", lambda: 107 if extra_pages_only else 100)
     layer = SimpleNamespace(
         attn=legacy,
         layer_idx=0,
@@ -3126,7 +3110,7 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
     )
     assert layer.attn is (native if use_native else legacy)
     assert layer.support_fused_qkv is use_native
-    if libraries == "flashinfer_trtllm_gen,fallback" and available:
+    if libraries == "flashinfer_trtllm_gen,fallback" and available and not extra_pages_only:
         construct.assert_called_once()
         assert construct.call_args.kwargs["pos_embd_params"] is None
     else:

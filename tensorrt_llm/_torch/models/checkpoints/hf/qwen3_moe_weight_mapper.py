@@ -24,6 +24,15 @@ class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
             tensors_to_duplicate.append("weight_scale")
         if module.quant_config.quant_mode.has_fp8_block_scales():
             tensors_to_duplicate.append("weight_scale_inv")
+        if module.quant_config.quant_mode.has_mxfp8():
+            # MXFP8 keeps one UE8M0 scale per weight row, so the scale rows
+            # must be duplicated exactly like the rows they describe -- unlike
+            # 128x128 block FP8, whose scale rows are out_features/128 and are
+            # remapped instead. Both spellings are listed because
+            # MXFP8LinearMethod._get_scale_name probes weight_scale_inv first
+            # and falls back to weight_scale; only the key actually present is
+            # touched.
+            tensors_to_duplicate.extend(["weight_scale_inv", "weight_scale"])
 
         if new_name in ['k_proj', 'v_proj']:
             num_kv_heads_list = [self._num_kv_heads

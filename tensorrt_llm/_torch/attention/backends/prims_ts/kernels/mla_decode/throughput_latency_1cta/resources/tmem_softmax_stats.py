@@ -23,7 +23,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.experimental.task_scheduling.enums import WorkAttr
-from cutlass.experimental.task_scheduling.memory import TmemAllocation
+from cutlass.experimental.task_scheduling.memory import TmemAllocation, SmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
     StageInfo,
     TaskLocalVariable,
@@ -39,6 +39,7 @@ from ...helpers.layout import (
     _TASK_CACHE_TMEM_BASE_OFFSET,
     decode_gen_task_cache,
     num_softmax_scale_groups,
+    smem_array,
 )
 from ...helpers.math import (
     neg_max_f32,
@@ -50,6 +51,7 @@ from ...helpers.ops import (
 from .common import (
     MlaResource,
 )
+
 
 # =====================================================================
 # TmemSoftmaxLocalResource — Local softmax stats in TMEM
@@ -561,3 +563,75 @@ class TmemSoftmaxGlobalResource(MlaResource):
         # This resource has no payload.  Its producer work gives TS a named
         # dependency edge between the two softmax instances and correction.
         del stage_info
+
+
+@dataclass(kw_only=True)
+class SmemSoftmaxLocalResource(TmemSoftmaxLocalResource):
+    """Keep correction statistics alive independently of recycled QK/P slots.
+
+    Sparse loads can change task pacing enough for a future QK to overwrite
+    the score TMEM before correction reads aliased statistics. The stats pipe
+    owns these small shared-memory slots until its consumer releases them.
+    """
+
+    def get_tmem_requirements(self):
+        return []
+
+    def get_smem_requirements(self):
+        if self._alloc is None:
+            self._alloc = SmemAllocation(
+                name=self.name + "_stats",
+                size_bytes=self.pipeline_config.num_stages
+                * 128
+                * 2
+                * num_softmax_scale_groups(self.cfg)
+                * 4,
+                alignment=16,
+            )
+        return [self._alloc]
+
+    @cute.jit
+    def _stats_pointer(self, stage_info):
+        storage = smem_array(
+            stage_info.context,
+            self._alloc,
+            Float32,
+            self.pipeline_config.num_stages
+            * 128
+            * 2
+            * num_softmax_scale_groups(self.cfg),
+        )
+        local_thread = cute.arch.thread_idx()[0] & Int32(127)
+        return storage.data_ptr(
+            (stage_info.stage_idx * Int32(128) + local_thread)
+            * Int32(2 * num_softmax_scale_groups(self.cfg))
+        )
+
+    @producer_work
+    @cute.jit
+    def store_loop_stats(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr,
+        new_max_arr,
+        sum_arr,
+        inst_idx: cutlass.Constexpr[int],
+    ):
+        n = num_softmax_scale_groups(self.cfg)
+        values = tuple(
+            old_max_arr[i] if inst_idx == 0 else sum_arr[i] for i in range(n)
+        )
+        values += tuple(new_max_arr[i] for i in range(n))
+        self._stats_pointer(stage_info).store(
+            vector_from_scalars(values, Float32),
+            alignment=16 if n > 1 else 8,
+        )
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _load_stats_payload(self, stage_info: StageInfo):
+        return self._stats_pointer(stage_info).load(
+            count=2 * num_softmax_scale_groups(self.cfg),
+            alignment=16 if num_softmax_scale_groups(self.cfg) > 1 else 8,
+        )
