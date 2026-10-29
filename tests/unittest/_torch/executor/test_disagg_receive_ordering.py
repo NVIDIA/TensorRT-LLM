@@ -324,3 +324,9 @@ def test_admission_history_is_the_prompt_the_transfer_brings(
     manager.disagg_transfer_length = lambda req: 96
     assert manager.prepare_disagg_gen_init(request)
     assert resize.call_args.args == (128, 96)
+
+    # Under Helix only the rank's whole slice stands for a whole prompt; a part of it is refused
+    # rather than recorded as a history in the wrong units.
+    manager._has_cp_helix = True
+    with pytest.raises(ValueError, match="whole slice of 128 prompt tokens, not 96"):
+        manager.prepare_disagg_gen_init(request)

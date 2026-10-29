@@ -571,6 +571,19 @@ def test_the_last_chunk_reports_the_prompt_end_not_the_block_end():
     assert chunk.token_range.end == prompt_len
 
 
+def test_a_chunk_keeps_the_buffers_it_leaves_out_as_a_frozenset():
+    """A manager may answer with any collection; transfers key their runs by it."""
+    chunk = Chunk(
+        block_ids_per_layer_groups=[np.array([0], dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=4),
+        is_last=True,
+        excluded_buffers={(3, "key"), (3, "value")},
+    )
+    assert chunk.excluded_buffers == frozenset({(3, "key"), (3, "value")})
+    assert hash(chunk.excluded_buffers) == hash(frozenset({(3, "key"), (3, "value")}))
+
+
 def test_pipelined_transfer_rejects_context_parallelism():
     """Refused for the configuration, not for the piece.
 

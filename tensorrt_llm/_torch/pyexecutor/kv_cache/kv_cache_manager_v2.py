@@ -3810,8 +3810,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # requests overrides them, so the transfer itself knows no manager.
 
     def disagg_transfer_length(self, request: LlmRequest) -> int:
-        """The prompt tokens whose pages a disaggregated transfer of the request moves: the whole
-        prompt. A manager whose receiver recomputes a tail of the prompt overrides this."""
+        """The prompt tokens whose pages a disaggregated transfer of the request moves, of this
+        rank's prompt (``request.prompt_len``, under Helix its slice): the whole prompt. A manager
+        whose receiver recomputes a tail of the prompt overrides this; under Helix a transfer
+        moves the whole slice."""
         return request.prompt_len
 
     def disagg_untransferred_buffers(self, request: LlmRequest) -> frozenset[tuple[int, str]]:
@@ -4812,6 +4814,13 @@ class KVCacheManagerV2(BaseResourceManager):
         # of the whole local slice stands for the whole prompt.
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
         transfer_len = self.disagg_transfer_length(req)
+        if self._has_cp_helix and transfer_len != req.prompt_len:
+            # Only the whole local slice stands for a whole prompt; a part of it names no global
+            # history.
+            raise ValueError(
+                f"request {req.py_request_id}: under Helix a transfer moves this rank's whole "
+                f"slice of {req.prompt_len} prompt tokens, not {transfer_len}"
+            )
         history_len = prompt_len if transfer_len == req.prompt_len else transfer_len
         target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)

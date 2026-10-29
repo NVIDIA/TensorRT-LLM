@@ -85,6 +85,8 @@ class Chunk:
                 f"{len(self.block_ids_per_layer_groups)} layer groups but "
                 f"{len(self.kind_per_layer_group)} kinds"
             )
+        # Hashable whatever collection the manager answered with: transfers key their runs by it.
+        self.excluded_buffers = frozenset(self.excluded_buffers)
 
 
 @dataclass
