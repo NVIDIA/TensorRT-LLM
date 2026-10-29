@@ -458,6 +458,10 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
+    # Set per instance in __init__ from the model engine's
+    # spec_decode_fast_paths; False for an executor built without __init__.
+    _overlap_loop_on_execution_stream: bool = False
+
     def __init__(
         self,
         resource_manager,
