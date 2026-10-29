@@ -27,8 +27,7 @@ from tensorrt_llm.bench.benchmark import (collect_explicit_cli_keys,
                                           generate_json_report,
                                           get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-from tensorrt_llm.bench.benchmark.utils.general import (generate_warmup_dataset,
-                                                        measurement_gc)
+from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -340,7 +339,7 @@ def latency_command(
             logger.info("Warmup done.")
 
         iteration_writer = options.iteration_writer
-        with iteration_writer.capture(), measurement_gc():
+        with iteration_writer.capture():
             statistics = asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,

@@ -49,9 +49,6 @@ exclude = [
     "tensorrt_llm/_torch/moe/kernels/rubin/manual_mma_128dp.py",
     "tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py",
     "tensorrt_llm/grpc/openengine/_generated/**",
-    # Keep vendored MegaMoE sources in upstream formatting.
-    "tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/**",
-    "tensorrt_llm/_torch/moe/kernels/megamoe_scheduler/**",
 ]
 
 

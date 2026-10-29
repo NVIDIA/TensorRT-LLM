@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import gc
-import os
-from contextlib import contextmanager
 from pathlib import Path
 from random import choices, shuffle
-from typing import Dict, Iterator, List, Union
+from typing import Dict, List, Union
 
 import yaml
 
@@ -169,32 +166,6 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "pytorch_config": pyt_options,
         }
     }
-
-
-@contextmanager
-def measurement_gc() -> Iterator[None]:
-    """Keep Python's cyclic GC out of the measured run if TRTLLM_BENCH_DISABLE_GC=1.
-
-    The benchmark process submits every request and handles every response. A
-    full collection over its in-flight and finished requests can stop it long
-    enough for the executors to run out of requests. This collects once,
-    freezes the surviving objects and disables the GC until the measured run
-    ends, as TRTLLM_SERVER_DISABLE_GC and TRTLLM_WORKER_DISABLE_GC disable it
-    in the server and the workers.
-    """
-    if os.getenv("TRTLLM_BENCH_DISABLE_GC", "0") != "1":
-        yield
-        return
-    gc.collect()
-    gc.freeze()
-    gc.disable()
-    logger.info("Python GC disabled for the measured run "
-                "(TRTLLM_BENCH_DISABLE_GC=1).")
-    try:
-        yield
-    finally:
-        gc.enable()
-        gc.unfreeze()
 
 
 def generate_warmup_dataset(requests, steps) -> List[InferenceRequest]:

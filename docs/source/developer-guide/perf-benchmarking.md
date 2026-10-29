@@ -256,13 +256,10 @@ trtllm-bench --model meta-llama/Llama-3.1-8B \
 
 With many short requests, for example context-only runs at high concurrency,
 rank 0 can be bound by host work, and a pause there makes every other rank wait
-at the next collective. With `TRTLLM_BENCH_DISABLE_GC=1`, the `throughput` and
-`latency` commands collect once after warmup, freeze the surviving objects, and
-disable Python's cyclic garbage collector for the measured run, so a full
-collection over the in-flight requests cannot pause the benchmark process.
-`TRTLLM_WORKER_DISABLE_GC=1` does the same in the worker processes. Memory held
-in reference cycles is then not freed until the run ends, so set the variables
-identically in every run you compare.
+at the next collective. `TRTLLM_WORKER_DISABLE_GC=1` disables Python's cyclic
+garbage collector in the worker processes, so a full collection over the
+in-flight requests cannot pause a rank. Memory held in reference cycles is then
+not freed until the run ends, so set it identically in every run you compare.
 
 With `TRTLLM_PROXY_BATCH_REQUESTS=1`, the executor proxy pickles each request on
 the submitting thread and a background thread sends each burst to the rank-0
