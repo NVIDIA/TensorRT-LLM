@@ -1557,6 +1557,7 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
 
     wrapper = plan(torch.bfloat16, True)
     fp16_wrapper = plan(torch.float16, False)
+    bf16_host_wrapper = plan(torch.bfloat16, False)
 
     def run() -> torch.Tensor:
         if mode == "gmem_reduction":
@@ -1601,6 +1602,21 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
             validate=False,
         )
         torch.testing.assert_close(output.float(), fp16_output.float(), atol=0.0005, rtol=0.008)
+
+        if mode == "gmem_reduction":
+            bf16_host_wrapper._plan_state.workspace.split_kv_counter.zero_()
+        bf16_host_output = bf16_host_wrapper.run(
+            q,
+            (k, v),
+            lengths,
+            table,
+            bmm1_scale=bmm1.item(),
+            bmm2_scale=bmm2.item(),
+            validate=False,
+        )
+        torch.testing.assert_close(
+            output.float(), bf16_host_output.float(), atol=0.0005, rtol=0.008
+        )
 
     run()
     torch.cuda.synchronize()

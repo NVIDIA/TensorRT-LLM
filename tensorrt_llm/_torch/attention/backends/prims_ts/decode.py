@@ -1968,7 +1968,12 @@ def _get_compiled_decode(
 
     with torch.cuda.device(device_index):
         compiled_main = build_and_load_attention_kernel(
-            "decode", "main", compile_spec, _COMPILE_OPTIONS, compile_main
+            "decode",
+            "main",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_main,
+            extra=(use_device_scales,),
         )
         compiled_reducer = None
         if cfg.use_separate_reduction_kernel:
