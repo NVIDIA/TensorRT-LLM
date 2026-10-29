@@ -59,7 +59,6 @@ from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
-_VARIABLE_WINDOW_SUPPORTED_SMS = frozenset((100, 103))
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -2180,8 +2179,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output_dtype: torch.dtype,
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
-        if get_sm_version() not in _VARIABLE_WINDOW_SUPPORTED_SMS:
-            return False
         return torch.ops.trtllm.attention_supports_variable_window(
             dtype,
             output_dtype,
@@ -2278,6 +2275,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        has_variable_window_starts = (forward_args.variable_window_token_starts
+                                      is not None)
+        has_variable_window_ends = forward_args.variable_window_token_ends is not None
+        if has_variable_window_starts != has_variable_window_ends:
+            raise ValueError(
+                "variable_window_token_starts and variable_window_token_ends "
+                "must be provided together")
+        if (has_variable_window_starts and forward_args.attention_input_type
+                == AttentionInputType.generation_only):
+            raise ValueError(
+                "variable-window bounds are supported only for context attention"
+            )
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,

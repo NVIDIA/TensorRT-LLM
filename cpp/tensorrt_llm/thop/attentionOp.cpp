@@ -1182,8 +1182,8 @@ static std::shared_ptr<AttentionOp> get_attention_op(
     std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
     op->initialize();
     // initialize() ends with mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported(), so the flag
-    // reflects the exact Q/KV/output precision, mask type and page size this op will run with. Checking here rather
-    // than inside initialize() keeps the throw out of that noexcept function.
+    // reflects the exact Q/KV/output precision, mask type and page size this op will run with. Keep this check here
+    // because it enforces the PyTorch paged-context fallback contract rather than AttentionOp initialization policy.
     //
     // Paged-context attention exists to attend to KV already in the cache. The unfused self-attention fallback
     // builds K and V from the current chunk alone, so it drops the cached prefix and then overwrites it: without

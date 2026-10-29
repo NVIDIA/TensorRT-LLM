@@ -866,9 +866,12 @@ def test_fmha_cache_keeps_combined_selections_immutable() -> None:
 
 @pytest.mark.parametrize("variable_window_first", [False, True])
 def test_fmha_cache_separates_variable_window_selections(variable_window_first: bool) -> None:
+    class _VariableWindowFmha(FakeFmha):
+        supports_variable_window = True
+
     events: list[tuple] = []
     attn, manager = _make_manager()
-    variable_window_fmha = FakeFmha(
+    variable_window_fmha = _VariableWindowFmha(
         attn,
         "variable-window",
         events,

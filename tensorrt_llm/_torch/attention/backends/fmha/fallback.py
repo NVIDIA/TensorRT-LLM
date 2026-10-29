@@ -65,6 +65,7 @@ class FallbackFmha(Fmha):
 
     supports_skip_correction = True
     supports_workspace_reclamation = True
+    supports_variable_window = True
 
     # Head sizes whose fused context FMHA kernel is proven absent for at
     # least one KV cache dtype, per SM version. This is a blocklist of
@@ -281,10 +282,6 @@ class FallbackFmha(Fmha):
         ):
             return False
         if q is not None and q.dtype == torch.float8_e4m3fn:
-            return False
-        has_variable_window_starts = forward_args.variable_window_token_starts is not None
-        has_variable_window_ends = forward_args.variable_window_token_ends is not None
-        if has_variable_window_starts != has_variable_window_ends:
             return False
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
             return False
