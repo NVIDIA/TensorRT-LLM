@@ -240,6 +240,48 @@ def _register_fake():
           trigger_completion_at_end):
         return [torch.empty_like(q), torch.empty_like(k)]
 
+    @torch.library.register_fake("trtllm::vae_upsample_gather")
+    def _(temp, shortcut, batch, frames, factor_t, repeats, crop, bias=None):
+        cout = temp.shape[1] // 4
+        return temp.new_empty((batch, cout, frames, 2 * (temp.shape[2] - 1),
+                               2 * (temp.shape[3] - 1)))
+
+    @torch.library.register_fake("trtllm::vae_avg_down_add")
+    def _(x,
+          r,
+          out_height,
+          out_width,
+          in_width,
+          factor_t,
+          factor_s,
+          group_size,
+          pad_t,
+          bias=None):
+        return x.new_empty(x.shape)
+
+    @torch.library.register_fake("trtllm::vae_unpatchify_clamp")
+    def _(chunk, out, frame0, patch):
+        return out
+
+    @torch.library.register_fake("trtllm::vae_interleave_bias")
+    def _(u, bias):
+        return u.new_empty((2 * u.shape[0], u.shape[1], u.shape[2] // 2))
+
+    @torch.library.register_fake("trtllm::vae_wino_spatial_in")
+    def _(frames, components, row0, row1, tile=2, stack_frames=False):
+        n, _, w, c = frames.shape
+        ntiles = (row1 - row0) * ((w + tile - 1) // tile)
+        if stack_frames:
+            return frames.new_empty(((tile + 2) * (tile + 2), ntiles, n * c),
+                                    dtype=torch.float16)
+        return frames.new_empty((components * (tile + 2) * (tile + 2),
+                                 (n // components) * ntiles, c),
+                                dtype=torch.float16)
+
+    @torch.library.register_fake("trtllm::vae_wino_spatial_out")
+    def _(m, frames, components, row0, row1, tile=2, bias=None):
+        return frames
+
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)
