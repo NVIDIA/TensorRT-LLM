@@ -28,8 +28,6 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep4_moetp4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[tp4_ep4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
-  # GLM-5.2 NVFP4 modeling_v2 target at tep4, GSM8K under modeling_v2="require". Measured 25 min on 4 GB300.
-  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103Default::test_gsm8k_tep4 TIMEOUT (60)
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
@@ -57,6 +55,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # DWDP expert prefetch on real streams and copies, incl. the gather from
+  # peer GPUs.
+  - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
@@ -115,3 +116,7 @@ l0_gb300_multi_gpus:
   # DeepSeek-V4-Pro NVFP4 export with the embedded DSpark drafter on MegaMoE
   # CuTe DSL, DEP4 on one node: GSM8K plus an acceptance-length gate.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl TIMEOUT (30)
+  # DeepSeek-V4 DP4 on 4x GB300 (288 GB/GPU); Pro needs 288 GB-class GPUs for 4 ranks.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph[dp4] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy[dp4] TIMEOUT (240)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4] TIMEOUT (240)

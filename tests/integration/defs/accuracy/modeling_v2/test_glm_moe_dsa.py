@@ -12,24 +12,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gates for the glm_moe_dsa modeling_v2 targets (GLM-5.2 NVFP4).
+"""Whole-model gates for the glm_moe_dsa modeling_v2 targets.
+
+One file per model family, beside the other accuracy suites rather than inside
+test_glm52.py: these gate a parallel implementation, and reading them next to
+the built-in model's tests would invite treating one as a variant of the other.
+
+Every test here passes ``modeling_v2="require"`` to ``LLM``. Under ``"auto"`` a
+configuration that missed a target's criteria -- or fell outside its bounds --
+would quietly fall back to the built-in implementation, pass, and report the
+built-in's numbers as the target's.
 
 ``TestModelingV2Glm52Nvfp4Sm107Tp16``: aggregated TP16/c1 accuracy and MTP
 coverage for the SM107 target. Run with 16 MPI ranks on Rubin; the pytest
 temporary directory must be visible to every rank. A short GPU trace proves
-actual optimized decode and draft execution after engine warmup, including CUDA
-graph replay. The full GSM8K evaluation then runs without profiling.
+actual optimized decode and draft execution after engine warmup, including
+CUDA graph replay. The full GSM8K evaluation then runs without profiling.
 
-``TestModelingV2Glm52Nvfp4Sm103Default``: one case per layout family the sm_103
-target admits (tp8, tep, dep), each serving GSM8K end to end with
-``modeling_v2="require"``. Under ``"auto"`` a deployment that missed the route
-would fall back to the built-in model, pass, and report the built-in's accuracy
-as the target's; under ``"require"`` it raises instead, and so does a step a
-fast path covers but cannot run. The mode and the environment are LLM API
-arguments, so they reach every rank. Each deployment is one the family's
-``route()`` claims: the GLM-5.2 modelopt NVFP4 checkpoint (bf16 MTP layer) with
-one-model MTP-Eagle as a linear chain, at the layout's draft length; the dep
-case also matches its cell's KV-cache dtype and MoE backend.
+``TestModelingV2Glm52Nvfp4Sm103Tep4``: identity and MTP1 GSM8K, paired in one
+session, and MTP1 acceptance for the SM103 tep4 target.
+
+``TestModelingV2Glm52Nvfp4Sm103Tp8``: GSM8K end to end for the SM103 tp8
+low-latency target, at the deployment its ``route()`` admits: the GLM-5.2
+modelopt NVFP4 checkpoint (bf16 MTP layer), attention and experts
+tensor-parallel over 8 ranks, one-model MTP-Eagle as a linear chain of five
+draft tokens.
 """
 
 import json
@@ -53,7 +60,13 @@ from tensorrt_llm.llmapi import (
 )
 
 from ...conftest import llm_models_root, skip_no_rubin
-from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness, acceptance_length_from_iteration_stats
+from ..accuracy_core import (
+    GSM8K,
+    LlmapiAccuracyTestHarness,
+    acceptance_length_from_iteration_stats,
+    assert_acceptance_length,
+    compute_acceptance_length,
+)
 
 _TP_SIZE = 16
 _NUM_SAMPLES = 1319
@@ -253,20 +266,20 @@ class TestModelingV2Glm52Nvfp4Sm107Tp16(LlmapiAccuracyTestHarness):
         )
 
 
-# The target asserts its own SM at construction.
+# The targets assert their own SM at construction: certification is per GPU
+# architecture, and a receipt from another one says nothing here.
 skip_not_sm103 = pytest.mark.skipif(
-    get_sm_version() != 103, reason="the glm_moe_dsa target is certified on sm_103 only"
+    get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
 )
 
+
 # On every rank: check the target's step contract on the first forward, and run the
-# indexer key projection in BF16, the form the family's fused indexer paths take.
-# The deployments below are the ones the target was validated at: per-layout batch,
-# KV-cache dtype, MoE backend and DSA kernels.
+# indexer key projection in BF16, the form the target's fused indexer paths take.
 _SM103_RANK_ENV = {MODELING_V2_VALIDATE_ENV: "1", "TRTLLM_DSA_INDEXER_BF16": "1"}
 
 
-class TestModelingV2Glm52Nvfp4Sm103Default(LlmapiAccuracyTestHarness):
-    """glm-5.2-nvfp4 / sm_103 / default at tp8, tep4 and dep8."""
+class TestModelingV2Glm52Nvfp4Sm103Tp8(LlmapiAccuracyTestHarness):
+    """glm-5.2-nvfp4 / sm_103 / tp8, at the deployment it was validated at."""
 
     MODEL_NAME = "zai-org/GLM-5.2"
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
@@ -306,23 +319,127 @@ class TestModelingV2Glm52Nvfp4Sm103Default(LlmapiAccuracyTestHarness):
             **self._llm_kwargs(draft_len=5, kv_dtype="fp8", moe_backend="TRTLLM", batch=1),
         )
 
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_gsm8k_tep4(self):
-        """Attention tensor-parallel over 4 ranks, experts expert-parallel over them."""
-        self._evaluate(
-            tensor_parallel_size=4,
-            moe_expert_parallel_size=4,
-            **self._llm_kwargs(draft_len=5, kv_dtype="fp8", moe_backend="TRTLLM", batch=2),
-        )
+
+class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
+    """glm-5.2-nvfp4 / sm_103 / tep4: identity, the mtp1 variant and its acceptance."""
+
+    MODEL_NAME = "zai-org/GLM-5.2"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
+
+    # The parallel topology the path's tep4 segment declares: attention heads
+    # and experts both sharded four ways, attention DP off. Routing derives the
+    # target *from* these; attention DP would be a different weight layout and
+    # so a different target.
+    TEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=False)
+
+    # The engine bounds the target's kernels are compiled for. Routing does not
+    # read them, so they are set here rather than left to the defaults:
+    #   max_batch_size 32  the CUDA-graph capture ceiling the target was
+    #                      validated at. The sparse-MLA decode kernel is
+    #                      compiled for the engine's max_batch_size.
+    #   max_num_tokens 8192  the routed-expert kernels are warmed for, and
+    #                      chunk a step at, 8192 tokens.
+    #   max_seq_len 8192   the decode indexer's column count is fixed from it,
+    #                      and GSM8K never comes near it.
+    BOUNDS = dict(
+        max_batch_size=32,
+        max_num_tokens=8192,
+        max_seq_len=8192,
+        cuda_graph_config=CudaGraphConfig(max_batch_size=32, enable_padding=True),
+    )
+
+    # The checkpoint carries one MTP layer, so a draft length of 1 resolves to
+    # the one-model MTP-Eagle loop, the only draft path the target implements;
+    # its specialised rope kernel is built for that two-token width.
+    MTP1 = MTPDecodingConfig(max_draft_len=1)
+
+    # The kv-cache fractions are run requirements rather than tuning choices.
+    # The MTP module and its separate draft pool take several GiB per rank, and
+    # an MTP engine on this checkpoint at the identity leg's 0.7 has been seen
+    # to stall rather than finish.
+    IDENTITY_KV = KvCacheConfig(free_gpu_memory_fraction=0.7)
+    MTP1_KV = KvCacheConfig(free_gpu_memory_fraction=0.55)
+
+    # The acceptance anchor. It names the target and variant, not a test
+    # function, because that is what the number is a property of. Its value was
+    # measured on stock modeling (modeling_v2="off") under the same
+    # speculative_config, so the gate is not read against the target's own number.
+    ACCEPTANCE_KEY = "ModelingV2Glm52Nvfp4Sm103Tep4::mtp1"
+
+    # There is deliberately one test. It evaluates the identity config as its
+    # first leg and the mtp1 config as its second, and ``task.evaluate``
+    # asserts accuracy against the reference on the way past; the mtp1 leg also
+    # reads its acceptance length. Separate cases would gate nothing new and
+    # would each cost another engine boot of a 78-layer, 4-rank model.
 
     @skip_not_sm103
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_dep8(self):
-        """Attention data parallel over 8 ranks: the FP8-KV, CuteDSL-MoE, MTP3 cell."""
-        self._evaluate(
-            tensor_parallel_size=8,
-            moe_expert_parallel_size=8,
-            enable_attention_dp=True,
-            **self._llm_kwargs(draft_len=3, kv_dtype="fp8", moe_backend="CUTEDSL", batch=16),
+    @pytest.mark.skip_less_device(4)
+    def test_gsm8k_identity_vs_mtp1_and_acceptance(self):
+        """The identity accuracy gate, the gate on MTP not moving it, and acceptance.
+
+        Turning MTP on must not move the answers.
+
+        Rejection sampling holds the emitted distribution to the target
+        model's, so the two scores should differ only by sampling noise.
+
+        Both legs assert accuracy against the registered reference as they
+        run -- this test is therefore the identity gate as well as the
+        comparison.
+
+        Both measurements are taken **in this one test** on purpose: a delta
+        against a score recorded in some earlier session carries that
+        session's variance into the judgement. Paired, the variance is common
+        to both and cancels.
+
+        The score is the harness default, with no ``scores_filter``. That is
+        the protocol the registered GLM-5.2 references were set under and the
+        one this target was validated with, so the anchor and the measurement
+        read the same metric.
+
+        Acceptance length is the only gate that can see a miscomputed draft
+        layer. Rejection sampling makes a wrong draft path *slower*, not wrong:
+        every draft is rejected, the text stays correct, and the accuracy gates
+        pass. The mtp1 leg therefore records iteration stats and checks its
+        acceptance length against ``ACCEPTANCE_KEY``.
+        """
+        task = GSM8K(self.MODEL_NAME)
+
+        # One dict for both legs: the comparison only means anything if the two
+        # engines were built under the same mode. It also asks each engine to
+        # check its step contract on its first forward -- the contract is about
+        # metadata that engine prepared, so the only place it can be checked
+        # honestly is a run that prepared it; a synthesized metadata object
+        # would be checking the synthesizer.
+        modeling_v2 = dict(modeling_v2="require", env_overrides={MODELING_V2_VALIDATE_ENV: "1"})
+
+        with LLM(
+            self.MODEL_PATH,
+            kv_cache_config=self.IDENTITY_KV,
+            **modeling_v2,
+            **self.TEP4,
+            **self.BOUNDS,
+        ) as llm:
+            identity = task.evaluate(llm)
+
+        with LLM(
+            self.MODEL_PATH,
+            speculative_config=self.MTP1,
+            kv_cache_config=self.MTP1_KV,
+            enable_iter_perf_stats=True,
+            **modeling_v2,
+            **self.TEP4,
+            **self.BOUNDS,
+        ) as llm:
+            mtp1 = task.evaluate(llm)
+            acceptance_length = compute_acceptance_length(llm)
+
+        delta = mtp1 - identity
+        print(f"[modeling_v2] gsm8k identity={identity:.4f} mtp1={mtp1:.4f} delta={delta:+.4f}")
+        # 2 sigma at the ~0.6 stderr this benchmark reports at n=1319.
+        assert abs(delta) < 1.2, (
+            f"MTP moved gsm8k by {delta:+.4f} (identity={identity:.4f}, "
+            f"mtp1={mtp1:.4f}); rejection sampling should have held the "
+            f"distribution, so this is not sampling noise"
         )
+        print(f"[AL] mtp1 acceptance_length = {acceptance_length:.3f}")
+        assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)

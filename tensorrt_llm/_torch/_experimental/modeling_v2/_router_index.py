@@ -221,3 +221,57 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         return None
     _RESOLVED_MODES[target] = mode
     return target
+
+
+def _qualified(target: Optional[type]) -> Optional[str]:
+    return None if target is None else f"{target.__module__}.{target.__qualname__}"
+
+
+def modeling_v2_resolve_on_all_ranks(
+    config: "ModelConfig", llm_args: "TorchLlmArgs"
+) -> Optional[type]:
+    """:func:`modeling_v2_resolve`, agreed by every rank of the engine.
+
+    Each rank routes on its own facts -- its device, and whether this
+    installation built the target's native code -- so one rank can land on the
+    built-in model while its peers build the target, and the first collective
+    then hangs instead of failing. Every rank therefore reports its outcome, and
+    all of them raise unless the outcomes agree. A rank's error is reported
+    after the exchange, not before, so its peers are never left waiting in it.
+
+    ``off`` returns before any exchange: nothing in this package runs then.
+    """
+    if ModelingV2Mode.of(llm_args) is ModelingV2Mode.OFF:
+        return None
+
+    target = error = None
+    try:
+        target = modeling_v2_resolve(config, llm_args)
+    except Exception as caught:  # noqa: BLE001 -- re-raised below, after every rank has reported
+        error = caught
+    outcome = (_qualified(target), None if error is None else f"{type(error).__name__}: {error}")
+
+    mapping = config.mapping
+    outcomes = [outcome]
+    if mapping.world_size > 1:
+        from tensorrt_llm._torch.distributed.communicator import Distributed
+
+        outcomes = Distributed.get(mapping).allgather(outcome)
+
+    if error is not None:
+        raise error
+    failed = {rank: why for rank, (_, why) in enumerate(outcomes) if why is not None}
+    if failed:
+        detail = "; ".join(f"rank {rank}: {why}" for rank, why in sorted(failed.items()))
+        raise RuntimeError(f"modeling_v2: other ranks failed to resolve a target ({detail})")
+    if len({built for built, _ in outcomes}) > 1:
+        detail = "; ".join(
+            f"rank {rank}: {built or 'built-in'}" for rank, (built, _) in enumerate(outcomes)
+        )
+        raise RuntimeError(
+            f"modeling_v2: ranks disagree on the implementation to build ({detail}); "
+            "every rank has to run the same code"
+        )
+    if target is not None and mapping.rank == 0:
+        logger.warning(f"modeling_v2: building {_qualified(target)} on all {len(outcomes)} rank(s)")
+    return target

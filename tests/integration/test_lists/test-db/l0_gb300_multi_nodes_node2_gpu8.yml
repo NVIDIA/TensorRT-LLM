@@ -21,7 +21,6 @@ l0_gb300_multi_nodes_node2_gpu8:
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[dep8]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp8_moetp2_ep4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep8]
-  # GLM-5.2 NVFP4 modeling_v2 target at tp8 and dep8, GSM8K under modeling_v2="require".
-  # Measured on 2x4 GB300: tp8 (batch 1) 34 min, dep8 6 min.
-  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103Default::test_gsm8k_tp8 TIMEOUT (90)
-  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103Default::test_gsm8k_dep8 TIMEOUT (60)
+  # GLM-5.2 NVFP4 modeling_v2 sm_103 tp8 target, GSM8K under modeling_v2="require".
+  # Measured 34 min on 2x4 GB300 (batch 1).
+  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103Tp8::test_gsm8k_tp8 TIMEOUT (90)

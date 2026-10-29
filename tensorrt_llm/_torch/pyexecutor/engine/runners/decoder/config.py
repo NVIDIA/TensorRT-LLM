@@ -23,7 +23,6 @@ class DecoderRunnerConfig(RunnerConfig):
     dtype: torch.dtype
     enable_attention_dp: bool
     disable_overlap_scheduler: bool
-    is_encode_only: bool
     is_spec_decode: bool
     spec_config: DecodingBaseConfig | None
     max_draft_len: int
