@@ -253,11 +253,29 @@ def _meta_init_cases(tp):
     _check(res, ref_res, ("meta-init residual", m))
 
 
+def _opt_in_cases(tp):
+    """AllReduce builds the kernels only where the model declares them (extra_attrs
+    ``allreduce_mnnvl_fused_norm``); otherwise its MNNVL path keeps the library op."""
+    from tensorrt_llm._torch.distributed import AllReduce
+    from tensorrt_llm._torch.utils import model_extra_attrs
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    _, rank = _mnnvl(tp)
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    shape = {"allreduce_max_num_tokens": max(ROWS), "allreduce_hidden_size": H}
+    for declared in (False, True):
+        with model_extra_attrs({**shape, "allreduce_mnnvl_fused_norm": declared}):
+            ar = AllReduce(mapping, strategy=AllReduceStrategy.MNNVL, dtype=torch.bfloat16)
+        assert ar.mnnvl_allreduce is not None
+        assert (ar.mnnvl_allreduce.fused_norm is not None) == declared
+
+
 CASES = {
     "norm": _norm_cases,
     "moe_fold": _moe_fold_cases,
     "gemm_norm": _gemm_norm_cases,
     "meta_init": _meta_init_cases,
+    "opt_in": _opt_in_cases,
 }
 
 

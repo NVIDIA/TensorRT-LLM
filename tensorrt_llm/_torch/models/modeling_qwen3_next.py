@@ -1413,6 +1413,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             model_config.extra_attrs["allreduce_exclude_nccl_symmetric"] = True
             # Its FP4 MoE layers tune for the decode steps.
             model_config.extra_attrs["moe_decode_tuning"] = True
+            # Its MNNVL all-reduces run the residual RMSNorm fusions on the CuTe DSL kernels.
+            model_config.extra_attrs["allreduce_mnnvl_fused_norm"] = True
             logger.info("Qwen3.5 decode kernels enabled")
         if (model_config.spec_config is not None
                 and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):

@@ -918,8 +918,10 @@ class MNNVLAllReduce(nn.Module):
                  hidden_size: Optional[int] = None):
         """
         Args:
-            max_num_tokens, hidden_size: The largest call. With both, the workspace is created at the
-                size that call needs, so it never grows later (growth is a collective allocation).
+            max_num_tokens, hidden_size: The largest call where the model runs its residual RMSNorm fusions
+                of ``hidden_size`` on the CuTe DSL kernels (see ``_fused_norm_call``); None keeps them on the
+                library op. With both, the workspace is created at the size that call needs, so it never
+                grows later (growth is a collective allocation).
         """
         super().__init__()
         self.mapping = mapping
@@ -1354,13 +1356,18 @@ class AllReduce(nn.Module):
         self._exclude_nccl_symmetric = bool(
             extra_attrs
             and extra_attrs.get("allreduce_exclude_nccl_symmetric", False))
-        prealloc_max_num_tokens = prealloc_hidden_size = None
+        # Declared by the model: the MNNVL path runs its residual RMSNorm fusions on the CuTe DSL kernels.
+        fused_norm = bool(
+            extra_attrs
+            and extra_attrs.get("allreduce_mnnvl_fused_norm", False))
+        fused_norm_max_num_tokens = fused_norm_hidden_size = None
         if extra_attrs:
             from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
                 AllReduceRunner
             max_num_tokens = extra_attrs.get('allreduce_max_num_tokens')
             hidden_size = extra_attrs.get('allreduce_hidden_size')
-            prealloc_max_num_tokens, prealloc_hidden_size = max_num_tokens, hidden_size
+            if fused_norm:
+                fused_norm_max_num_tokens, fused_norm_hidden_size = max_num_tokens, hidden_size
             if max_num_tokens is not None:
                 AllReduceRunner._prealloc_max_num_tokens = max_num_tokens
             if hidden_size is not None:
@@ -1421,8 +1428,8 @@ class AllReduce(nn.Module):
                         self.mnnvl_allreduce = MNNVLAllReduce(
                             self.mapping,
                             dtype,
-                            max_num_tokens=prealloc_max_num_tokens,
-                            hidden_size=prealloc_hidden_size,
+                            max_num_tokens=fused_norm_max_num_tokens,
+                            hidden_size=fused_norm_hidden_size,
                         ) if dtype else None
                     except Exception as e:
                         logger.debug(
