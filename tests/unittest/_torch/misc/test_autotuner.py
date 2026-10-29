@@ -22,6 +22,7 @@ import re
 import statistics
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any, List
 
 import cloudpickle
@@ -846,6 +847,48 @@ def test_load_cache_skips_non_literal_tactic():
     # ... and the non-literal entry was skipped, not silently mis-decoded.
     bad = ("op_bad", "R", "0", ((2, 128), ))
     assert bad not in cache.cache
+
+
+@pytest.mark.parametrize("cache_section", ["shared", "rank_0"])
+@pytest.mark.parametrize("tactic", [
+    pytest.param([1, 2], id="list"),
+    pytest.param({"tile": 16}, id="dict"),
+    pytest.param(None, id="null"),
+    pytest.param(7, id="int"),
+    pytest.param(1.5, id="float"),
+    pytest.param(True, id="bool"),
+])
+def test_load_cache_skips_non_string_tactic(
+    tmp_path: Path,
+    cache_section: str,
+    tactic: list[int] | dict[str, int] | int | float | None,
+) -> None:
+    cache = autotuner.AutoTunerProfilingCache()
+    good_before = ("op_before", "R", "0", ((1, 128), ))
+    bad = ("op_bad", "R", "0", ((2, 128), ))
+    good_after = ("op_after", "R", "0", ((3, 128), ))
+    bad_repeat = ("op_bad_repeat", "R", "0", ((4, 128), ))
+    expected = {
+        good_before: (0, 7, 0.001),
+        good_after: (1, (1, 2), 0.002),
+    }
+    entries = cache._serialize_cache_data(expected)
+    invalid_entry = {"runner_id": 0, "tactic": tactic, "min_time": 0.003}
+    doc = {
+        "metadata": cache._serialize_metadata(),
+        cache_section: {
+            str(good_before): entries[str(good_before)],
+            str(bad): invalid_entry,
+            str(good_after): entries[str(good_after)],
+            str(bad_repeat): invalid_entry,
+        },
+    }
+    cache_path = tmp_path / "non_string_tactic.json"
+    cache_path.write_text(json.dumps(doc))
+
+    cache.load_cache(cache_path, rank=0)
+
+    assert cache.cache == expected
 
 
 def test_kernel_testing_single_context():
