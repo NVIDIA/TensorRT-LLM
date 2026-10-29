@@ -20,6 +20,7 @@ import torch
 
 import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -2480,3 +2481,80 @@ def test_helix_estimation_profiles_agg_and_keeps_fraction_for_disagg(is_disagg) 
         py_executor.start_worker.assert_called_once()  # dummy prefill ran
         assert kv_cache_config.max_gpu_total_bytes == 512  # measured, per GPU
         assert kv_cache_config.max_tokens is None  # temporary estimation size not kept
+
+
+def test_agg_helix_syncs_context_mla_admission_cap() -> None:
+    """Aggregated helix ranks must admit the same context batches, so the
+    context-MLA admission cap is the minimum across ranks."""
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    model_engine = Mock()
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    model_engine.model.model_config.is_encoder_decoder = False
+    model_engine.model.model_config.quant_config = None
+    model_engine.attn_runtime_features = AttentionRuntimeFeatures(chunked_prefill=True)
+    model_engine.mm_encoder_output_budget_bytes = None
+    model_engine.mm_encoder_cache = None
+    with patch.object(
+        KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            mapping=Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+            net_max_seq_len=4096,
+            kv_connector_manager=None,
+            max_num_tokens=256,
+            max_beam_width=1,
+            tokens_per_block=128,
+            max_seq_len=4096,
+            max_batch_size=8,
+            kv_cache_config=kv_cache_config,
+            llm_args=Mock(cache_transceiver_config=None, enable_chunked_prefill=True),
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
+    # The chunked MLA profile did not run, so the context-MLA reserve applies.
+    creator._mla_chunked_profile_length = None
+    py_executor = Mock()
+    py_executor.warmup_scope.return_value = nullcontext()
+    py_executor.dist.mapping.rank = 0
+    py_executor.dist.broadcast.side_effect = lambda value, root: value
+    # Another rank has a smaller budget and so a smaller cap.
+    py_executor.dist.allreduce.return_value = 100
+    py_executor.enqueue_requests.return_value = [1]
+    py_executor.await_responses.return_value = []
+    kv_manager = Mock()
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
+    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+
+    with (
+        patch("tensorrt_llm._torch.pyexecutor._util.get_sm_version", return_value=100),
+        patch.object(creator, "_get_token_num_for_estimation", return_value=256),
+        patch.object(creator, "_cal_max_memory", return_value=512),
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(
+            torch.cuda,
+            "memory_stats",
+            return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 256},
+        ),
+        patch.object(creator, "_encode_dummy_inputs", return_value=None),
+        patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=3)),
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
+            return_value=1,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_is_chunked_prefill_bounded",
+            return_value=True,
+        ),
+    ):
+        assert creator.try_prepare_estimation()
+        creator.configure_kv_cache_capacity(py_executor)
+
+    # Local cap: the 512-byte budget split at k=3, w=1 reserves 128 bytes -> 128 tokens.
+    py_executor.dist.allreduce.assert_called_once_with(128, op=ReduceOp.MIN)
+    assert creator._fp8_ctx_mla_kv_len_cap == 100
+    assert kv_cache_config.max_gpu_total_bytes == 512 - 100

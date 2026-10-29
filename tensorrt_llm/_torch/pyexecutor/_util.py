@@ -48,6 +48,7 @@ from ..attention.backends.sparse.params import \
     get_indexer_mqa_logits_workspace_bytes
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
+from ..distributed.communicator import ReduceOp
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -2136,6 +2137,14 @@ class KvCacheCreator:
                     budget_before,
                     self._get_kv_size_per_token().slope, w_bytes_per_token,
                     kv_len_cap))
+            if (mapping.cp_config.get('cp_type') == CpType.HELIX
+                    and not self._is_disagg):
+                # Aggregated helix ranks schedule independently but must admit
+                # the same context batches, so they agree on the smallest cap.
+                local_cap = self._fp8_ctx_mla_kv_len_cap or 0
+                cap = py_executor.dist.allreduce(local_cap, op=ReduceOp.MIN)
+                self._fp8_ctx_mla_kv_len_cap = cap
+                workspace_reserve = cap * w_bytes_per_token
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
                 logger.info(
