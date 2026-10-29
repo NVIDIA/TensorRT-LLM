@@ -50,7 +50,6 @@ def _capability(**overrides) -> Capability:
         snapshot_api_present=True,
         oom_observer_present=True,
         nvml_available=True,
-        unsupported_stats=(),
     )
     defaults.update(overrides)
     return Capability(**defaults)
@@ -168,25 +167,60 @@ class TestUnknownIsNotZero:
         assert "UPPER BOUND" in text
 
 
-class TestUnsupportedBackend:
-    """Zeros from a backend that never populates a field are not measurements."""
+class TestUnreportedReserved:
+    """A reserved figure the allocator did not report is not a measurement.
 
-    def test_unsupported_stats_are_announced(self):
-        capability = _capability(
-            allocator_backend="cudaMallocAsync",
-            unsupported_stats=("reserved_bytes.all.current",),
+    Whether it is reported depends on the backend and the torch version --
+    torch 2.14 populates it under cudaMallocAsync, older versions leave it at
+    zero -- so it is judged from the data, not from the backend name.
+    """
+
+    def test_reserved_unknown_is_rendered_unknown_not_zero(self):
+        frame = build_frame(
+            DeviceReading(total=180 * GIB, free=10 * GIB, process_used=100 * GIB),
+            TorchReading(reserved=None, live=40 * GIB),
+            [],
         )
-        assert not capability.stats_trustworthy
-        text = render(
-            build_frame(
-                DeviceReading(total=180 * GIB, free=10 * GIB, process_used=100 * GIB),
-                TorchReading(reserved=50 * GIB, live=40 * GIB),
-                [],
-            ),
-            capability,
+        text = render(frame, _capability(allocator_backend="cudaMallocAsync"))
+        assert (
+            "torch reserved" in text
+            and "0.00 GiB" not in text.split("torch reserved")[1].splitlines()[0]
         )
-        assert "unsupported" in text
-        assert "not as zero" in text
+        assert "not reported" in text
+
+    def test_residual_uses_live_and_is_marked_upper_bound(self):
+        frame = build_frame(
+            DeviceReading(total=180 * GIB, free=10 * GIB, process_used=100 * GIB),
+            TorchReading(reserved=None, live=40 * GIB),
+            [],
+        )
+        # Subtracting a zero reserved would have put all 40 GiB of torch
+        # memory into "unexplained".
+        assert frame.nontorch_residual == 60 * GIB
+        assert frame.residual_is_upper_bound
+        assert "UPPER BOUND" in render(frame, _capability())
+
+    def test_populated_reserved_is_trusted_on_any_backend(self):
+        frame = build_frame(
+            DeviceReading(total=180 * GIB, free=10 * GIB, process_used=100 * GIB),
+            TorchReading(reserved=50 * GIB, live=40 * GIB),
+            [],
+        )
+        text = render(frame, _capability(allocator_backend="cudaMallocAsync"))
+        assert frame.nontorch_residual == 50 * GIB
+        assert not frame.residual_is_upper_bound
+        assert "meaningless" not in text and "not reported" not in text
+
+    def test_read_torch_refuses_reserved_below_live(self, monkeypatch):
+        import tensorrt_llm._torch.memory.monitor as mon
+
+        monkeypatch.setattr(
+            mon.torch.cuda, "memory_stats", lambda i: {"allocated_bytes.all.current": 40 * GIB}
+        )
+        monkeypatch.setattr(mon.torch.cuda, "memory_reserved", lambda i: 0)
+        assert mon._read_torch(0).reserved is None
+        monkeypatch.setattr(mon.torch.cuda, "memory_reserved", lambda i: 50 * GIB)
+        assert mon._read_torch(0).reserved == 50 * GIB
 
 
 class TestNamingRules:
@@ -284,3 +318,86 @@ class TestSchemaGuards:
         assert "cuda_graph" not in names
         assert "locality_domain" not in names
         assert Placement.TORCH_GRAPH_POOL.value == "torch_graph_pool"
+
+
+class TestNvmlDeviceMapping:
+    """torch and NVML number devices differently under CUDA_VISIBLE_DEVICES."""
+
+    def _fake_nvml(self, monkeypatch, pid):
+        import contextlib
+        import sys
+        import types
+
+        from tensorrt_llm import profiler
+
+        looked_up = []
+        proc = types.SimpleNamespace(pid=pid, usedGpuMemory=7 * GIB)
+
+        def by_index(i):
+            raise AssertionError("looked up by index; that is the wrong GPU when remapped")
+
+        fake = types.SimpleNamespace(
+            nvmlDeviceGetHandleByIndex=by_index,
+            nvmlDeviceGetHandleByUUID=lambda u: looked_up.append(u) or "handle",
+            nvmlDeviceGetComputeRunningProcesses_v3=lambda h: [proc],
+            nvmlDeviceGetCount=lambda: 3,
+        )
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        monkeypatch.setattr(profiler, "pynvml_context", contextlib.nullcontext)
+        return looked_up
+
+    def test_looked_up_by_uuid(self, monkeypatch):
+        import os
+        import types
+
+        import tensorrt_llm._torch.memory.monitor as mon
+
+        looked_up = self._fake_nvml(monkeypatch, os.getpid())
+        monkeypatch.setattr(
+            mon.torch.cuda,
+            "get_device_properties",
+            lambda i: types.SimpleNamespace(uuid="6b4fa2a7-2f22-4b34-1f72-7e6c4a551774"),
+        )
+        assert mon._nvml_process_used(0) == 7 * GIB
+        assert looked_up == ["GPU-6b4fa2a7-2f22-4b34-1f72-7e6c4a551774"]
+
+    def test_capability_reports_nvml_only_when_it_answers(self, monkeypatch):
+        import contextlib
+        import sys
+        import types
+
+        from tensorrt_llm import profiler
+        from tensorrt_llm._torch.memory.monitor.capability import _nvml_available
+
+        monkeypatch.setattr(profiler, "pynvml_context", contextlib.nullcontext)
+
+        def broken():
+            raise RuntimeError("NVML_ERROR_UNINITIALIZED")
+
+        monkeypatch.setitem(sys.modules, "pynvml", types.SimpleNamespace(nvmlDeviceGetCount=broken))
+        # The helper is always importable; that alone used to yield nvml=yes.
+        assert _nvml_available() is False
+        monkeypatch.setitem(
+            sys.modules, "pynvml", types.SimpleNamespace(nvmlDeviceGetCount=lambda: 1)
+        )
+        assert _nvml_available() is True
+
+
+class TestColumnsStaySeparated:
+    def test_every_source_and_basis_leaves_a_gap(self):
+        # Renaming LEDGER to the longer COMPONENT once filled the source
+        # column exactly and ran it into the basis column.
+        from tensorrt_llm._torch.memory.monitor.report import _entry_line
+
+        for source in Source:
+            for basis in Basis:
+                line = _entry_line(
+                    Entry(
+                        category=Category.WEIGHTS,
+                        size_bytes=GIB,
+                        source=source,
+                        placement=Placement.NON_TORCH,
+                        basis=basis,
+                    )
+                )
+                assert f"{source} " in line and f"{basis} " in line, line

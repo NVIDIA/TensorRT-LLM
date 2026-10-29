@@ -190,42 +190,37 @@ class TestMnnvlSubclasses:
         assert provider.collect() == []
 
 
-class TestDwdpRefusesConfiguredCapacity:
+class TestDwdpReadsHeldPages:
     """``num_pages()`` keeps reporting capacity after the pages are gone."""
 
-    class _LegacyPool:
-        """Only the pre-statistics API, as on current main."""
-
+    class _Pool:
         page_size = 16 * MB
         num_slots = 2
+        release_failed = 0
 
         def num_pages(self, slot):
             return 4  # configured; unchanged by release()
 
-    def test_reports_unavailable_without_a_physical_accessor(self, monkeypatch):
+        def configured_pages(self, slot):
+            return 4
+
+        def held_pages(self, slot):
+            return 0  # everything released
+
+    def test_reports_held_not_configured(self, monkeypatch):
         provider = DwdpPagePoolProvider()
-        monkeypatch.setattr(provider, "_pool", lambda: self._LegacyPool())
+        monkeypatch.setattr(provider, "_pool", lambda: self._Pool())
         entry = provider.collect()[0]
-        # 8 pages * 16 MiB = 128 MiB would be invented out of nothing.
-        assert entry.size_bytes is None
-        assert entry.basis is Basis.CONFIGURED_CAPACITY
-
-    def test_uses_held_pages_once_available(self, monkeypatch):
-        class _Pool:
-            page_size = 16 * MB
-            num_slots = 2
-
-            def configured_pages(self, slot):
-                return 4
-
-            def held_pages(self, slot):
-                return 0  # everything released
-
-        provider = DwdpPagePoolProvider()
-        monkeypatch.setattr(provider, "_pool", lambda: _Pool())
-        entry = provider.collect()[0]
+        # 8 configured pages * 16 MiB = 128 MiB would be invented out of nothing.
         assert entry.size_bytes == 0
         assert entry.basis is Basis.PHYSICAL_BACKING
+
+    def test_release_failures_make_it_a_lower_bound(self, monkeypatch):
+        pool = self._Pool()
+        pool.release_failed = 3
+        provider = DwdpPagePoolProvider()
+        monkeypatch.setattr(provider, "_pool", lambda: pool)
+        assert "at least" in (provider.collect()[0].note or "")
 
 
 class TestMemoryCountersIsDiagnosticOnly:
