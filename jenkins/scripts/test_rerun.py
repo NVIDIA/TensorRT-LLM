@@ -127,10 +127,9 @@ def load_rerun_policy(stage_name=None, policy_file=RERUN_POLICY_FILE):
     return policy, matched_rule
 
 
-def _failed_tests_from_xml(xml_filename, failSignaturesList):
+def _failed_tests_from_xml(xml_filename):
     # Returns (names of all tests in the results xml, failed or errored tests).
-    # Each failed test is (name, duration in seconds, whether its failure
-    # matches a failure signature).
+    # Each failed test is (name, duration in seconds, its <testcase> element).
     ran_tests = set()
     failed_tests = []
     if not os.path.exists(xml_filename):
@@ -149,12 +148,14 @@ def _failed_tests_from_xml(xml_filename, failSignaturesList):
             ran_tests.add(test_name)
             if case.find('failure') is not None or \
                case.find('error') is not None:
-                case_text = ET.tostring(case, encoding='unicode').lower()
                 failed_tests.append(
-                    (test_name, float(case.attrib.get('time', 0)),
-                     any(failSig.lower() in case_text
-                         for failSig in failSignaturesList)))
+                    (test_name, float(case.attrib.get('time', 0)), case))
     return ran_tests, failed_tests
+
+
+def _matches_fail_signature(case, failSignaturesList):
+    case_text = ET.tostring(case, encoding='unicode').lower()
+    return any(failSig.lower() in case_text for failSig in failSignaturesList)
 
 
 def extract_passed_tests(output_file, xml_filenames):
@@ -274,14 +275,13 @@ def generate_rerun_tests_list(outdir,
     decisions = []
 
     # Part 1: process failed/error tests from results xml
-    ran_tests, failed_tests = _failed_tests_from_xml(xml_filename,
-                                                     failSignaturesList)
-    for test, duration, has_signature in failed_tests:
+    ran_tests, failed_tests = _failed_tests_from_xml(xml_filename)
+    for test, duration, case in failed_tests:
         if duration <= twice_max:
             decisions.append((test, 2, f"duration <= {twice_max}s"))
         elif duration <= once_max:
             decisions.append((test, 1, f"duration <= {once_max}s"))
-        elif has_signature:
+        elif _matches_fail_signature(case, failSignaturesList):
             decisions.append((test, 1, "of fail signature"))
         else:
             decisions.append(
