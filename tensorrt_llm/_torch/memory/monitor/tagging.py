@@ -68,6 +68,7 @@ __all__ = [
     "CUDA_GRAPHS",
     "UNTAGGED",
     "claim_module_memory",
+    "claimed_modules",
     "clear_claims",
     "TagSnapshot",
     "freeze_tag_map",
@@ -348,6 +349,15 @@ def claim_module_memory(module, label: str) -> bool:
     ]
     _claimed_modules.append((reference, label))
     return True
+
+
+def claimed_modules() -> list:
+    """Claimed modules that are still alive.
+
+    Lets a provider whose objects hang off the model -- with no registry of
+    their own -- walk it without holding it.
+    """
+    return [module for module in (ref() for ref, _ in list(_claimed_modules)) if module is not None]
 
 
 def clear_claims() -> None:

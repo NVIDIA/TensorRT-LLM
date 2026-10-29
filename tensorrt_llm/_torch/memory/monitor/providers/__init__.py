@@ -33,11 +33,14 @@ from typing import Protocol, runtime_checkable
 from tensorrt_llm.logger import logger
 
 from ..schema import Category, Entry
+from .comm import McastAllReduceProvider, SymmMemProvider
 from .misc import DeepEpProvider, DwdpPagePoolProvider, MemoryCountersProvider
 from .mnnvl import MnnvlProvider
 
 __all__ = [
     "DeepEpProvider",
+    "McastAllReduceProvider",
+    "SymmMemProvider",
     "clear_registered_providers",
     "DwdpPagePoolProvider",
     "MonitorProvider",
@@ -88,13 +91,12 @@ def default_providers() -> list[MonitorProvider]:
     """Providers that can find their host object without cooperation.
 
     Includes anything handed to :func:`register_provider`, which is how
-    components that cannot be found from here get in. ``SymmetricMemoryAllReduce``
-    is still absent: each instance is a model submodule, so it needs a model
-    reference to walk rather than a single handle, and guessing zero would
-    be a lie.
+    components that cannot be found from here get in.
     """
     return [
         MnnvlProvider(),
+        McastAllReduceProvider(),
+        SymmMemProvider(),
         DeepEpProvider(),
         DwdpPagePoolProvider(),
         MemoryCountersProvider(),
