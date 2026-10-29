@@ -66,7 +66,7 @@ def test_gate_routes_outside_the_kernel(target):
 
 
 def _sm_100():
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
 def _gate(target):
@@ -172,7 +172,7 @@ def _clear_rows(logits, bias, routed_scaling_factor):
 
 
 @pytest.mark.skipif(
-    not _sm_100(), reason="the TRTLLM-Gen MXFP4 cubins and the fused route + quant run on sm_100"
+    not _sm_100(), reason="the TRTLLM-Gen MXFP4 cubins and fused route + quant need SM100 or SM103"
 )
 @TARGETS
 def test_routing_outside_the_kernel_matches_inside(target, monkeypatch):

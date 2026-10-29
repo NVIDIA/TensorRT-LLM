@@ -50,8 +50,8 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
-    reason="the K3 decode kernels run on sm_100 only",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the K3 decode kernels run on sm_100 and sm_103",
 )
 
 TOL = 8e-3  # max |y - ref| / max |ref|, ref a float64 product

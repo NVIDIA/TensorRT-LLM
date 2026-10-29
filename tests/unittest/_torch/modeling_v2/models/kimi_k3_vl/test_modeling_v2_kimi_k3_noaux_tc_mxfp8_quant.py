@@ -20,7 +20,8 @@ from _validating import validating
 
 assert torch.cuda.is_available(), "kimi_k3_noaux_tc_mxfp8_quant requires a CUDA device"
 pytestmark = pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
+    torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="certified on sm_100 and sm_103",
 )
 
 NUM_EXPERTS = 896

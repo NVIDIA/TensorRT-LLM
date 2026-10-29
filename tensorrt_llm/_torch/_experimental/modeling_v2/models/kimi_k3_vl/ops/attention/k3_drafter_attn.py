@@ -18,7 +18,7 @@ class K3DrafterAttn(OpWrapper):
     """Write ``out`` [R T, num_heads * 64]: request r's T rows of ``qkv`` attend to its ``ctx_len[r]`` cached rows
     (pages: row r of ``page_table``) and to its block's own k / v in ``qkv``. Returns None."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

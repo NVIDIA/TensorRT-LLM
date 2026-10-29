@@ -49,8 +49,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
-    reason="the K3 drafter entries run on sm_100 only",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the K3 drafter entries run on sm_100 and sm_103",
 )
 
 HIDDEN, INTER, HEADS, KV_HEADS, HEAD_DIM, LAYERS, PAGE = 7168, 896, 6, 1, 64, 2, 64

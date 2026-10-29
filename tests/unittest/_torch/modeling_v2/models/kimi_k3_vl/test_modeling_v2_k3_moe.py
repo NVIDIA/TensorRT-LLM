@@ -62,10 +62,10 @@ _CASE_SALT = {"random": 0, "16_local_disjoint": 1, "none_local": 2, "group_cap":
 
 
 def _is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
-pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_moe needs sm_100")
+pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_moe needs sm_100 or sm_103")
 
 
 @pytest.fixture(autouse=True)

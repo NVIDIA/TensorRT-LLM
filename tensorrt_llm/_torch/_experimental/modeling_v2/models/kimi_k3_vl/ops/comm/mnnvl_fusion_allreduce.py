@@ -38,7 +38,7 @@ class MnnvlFusionAllreduce(OpWrapper):
     must hold the call (:func:`required_buffer_bytes`). Advances ``workspace`` by one call: every rank of the group
     makes the same MNNVL calls on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=(

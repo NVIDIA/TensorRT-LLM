@@ -18,10 +18,10 @@ import _rank_job  # noqa: E402
 
 
 def _is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
-pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_moe_front needs sm_100")
+pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_moe_front needs sm_100 or sm_103")
 
 
 # Each case starts its own W-rank mpirun over the visible devices; under xdist several workers would fight for them.

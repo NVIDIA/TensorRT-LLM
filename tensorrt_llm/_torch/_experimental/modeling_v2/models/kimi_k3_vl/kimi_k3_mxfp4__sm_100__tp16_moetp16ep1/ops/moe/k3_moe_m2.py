@@ -20,7 +20,7 @@ class K3MoeM2(OpWrapper):
     """This rank's routed partial ``[2, 3584]`` bf16 of ``layer``'s experts for two tokens. Advances the state's
     workspace by one call: the calls on one state run in one stream order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="TP16 x EP1 two-token grouped schedule with 192 real columns padded to 256",

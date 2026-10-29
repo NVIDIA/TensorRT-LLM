@@ -19,7 +19,7 @@ class AttnResRmsnormFwd(OpWrapper):
     it writes the output, so a dependent PDL kernel must wait on the grid dependency before reading it.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

@@ -15,8 +15,8 @@ import torch
 
 assert torch.cuda.is_available(), "k3_sandwich_oproj requires CUDA devices"
 
-if torch.cuda.get_device_capability() != (10, 0):
-    pytest.skip("k3_sandwich_oproj is certified on sm_100 only", allow_module_level=True)
+if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    pytest.skip("k3_sandwich_oproj is certified on sm_100 and sm_103", allow_module_level=True)
 
 
 # Each case starts its own W-rank mpirun over the visible devices; under xdist several workers would fight for them.

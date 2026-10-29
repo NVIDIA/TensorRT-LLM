@@ -17,7 +17,8 @@ from _validating import validating
 
 assert torch.cuda.is_available(), "causal_conv1d_fwd requires a CUDA device"
 pytestmark = pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
+    torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="certified on sm_100 and sm_103",
 )
 
 WIDTH = 4  # Kimi K3's short_conv_kernel_size

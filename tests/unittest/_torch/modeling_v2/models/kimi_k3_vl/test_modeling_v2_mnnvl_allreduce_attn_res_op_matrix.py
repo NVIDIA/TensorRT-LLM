@@ -15,8 +15,10 @@ import torch
 
 assert torch.cuda.is_available(), "mnnvl_allreduce_attn_res requires CUDA devices"
 
-if torch.cuda.get_device_capability() != (10, 0):
-    pytest.skip("mnnvl_allreduce_attn_res is certified on sm_100 only", allow_module_level=True)
+if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    pytest.skip(
+        "mnnvl_allreduce_attn_res is certified on sm_100 and sm_103", allow_module_level=True
+    )
 
 
 # Each case starts its own W-rank mpirun over the visible devices; under xdist several workers would fight for them.

@@ -938,7 +938,9 @@ def _run_one_rank(args) -> int:
     global R, OPS, WS_A, WS_B, PLAIN, FLAGS, LAYER_WEIGHTS, BIAS, EXPERT_BUFFERS, OFFSET, WL, WE
     global EXPERT_RAW
     R = ls.Rank(args)
-    assert torch.cuda.get_device_capability() == (10, 0), "k3_moe_front and k3_moe need sm_100"
+    assert torch.cuda.get_device_capability() in ((10, 0), (10, 3)), (
+        "k3_moe_front and k3_moe need sm_100"
+    )
     import tensorrt_llm._torch.custom_ops  # noqa: F401 -- registers the stock path's ops
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe import (
         k3_moe as moe,

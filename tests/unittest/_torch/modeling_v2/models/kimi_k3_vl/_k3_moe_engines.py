@@ -26,7 +26,7 @@ STEPS = 12
 
 
 def is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:

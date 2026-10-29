@@ -95,7 +95,7 @@ M_ALL = list(range(1, 9))
 def _supported() -> bool:
     if MPI is None or not torch.cuda.is_available() or torch.cuda.device_count() < WORLD:
         return False
-    return torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
 pytestmark = [

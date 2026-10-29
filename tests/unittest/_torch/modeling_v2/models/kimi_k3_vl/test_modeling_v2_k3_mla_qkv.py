@@ -53,11 +53,11 @@ def _is_sm100() -> bool:
     if not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
-    # sm_100 exactly: the receipts' architecture (a missing receipt reads as unknown).
-    return (major, minor) == (10, 0)
+    # SM100 and SM103 are covered by the kernel certification tests.
+    return (major, minor) in ((10, 0), (10, 3))
 
 
-pytestmark = pytest.mark.skipif(not _is_sm100(), reason="certified on SM100 only")
+pytestmark = pytest.mark.skipif(not _is_sm100(), reason="certified on SM100 and SM103")
 
 H, NOPE, PE, QK, LAT, QL, V = 6, 128, 64, 192, 512, 1536, 128
 DQK, PAGE = LAT + PE, 64

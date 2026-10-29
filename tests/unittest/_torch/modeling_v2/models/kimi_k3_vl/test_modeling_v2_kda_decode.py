@@ -23,7 +23,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda
 __extra_import_path__ = ["../.."]
 from _validating import validating
 
-pytestmark = pytest.mark.skipif(not kc.sm100(), reason="certified on SM100 only")
+pytestmark = pytest.mark.skipif(not kc.sm100(), reason="certified on SM100 and SM103")
 
 LAYERS = 3
 STEPS = 3

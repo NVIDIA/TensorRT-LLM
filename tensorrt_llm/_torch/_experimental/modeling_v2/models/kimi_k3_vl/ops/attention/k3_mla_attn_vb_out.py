@@ -44,7 +44,7 @@ class K3MlaAttnVbOut(OpWrapper):
     ``gate``) for the decode attention o of R <= 8 requests of T <= 8 tokens over their pages of ``pool``. Uses
     ``workspace``'s partial slots and, past 7 clusters, advances its counters."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
         Cell(

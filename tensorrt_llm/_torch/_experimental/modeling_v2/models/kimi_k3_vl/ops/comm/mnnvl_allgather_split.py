@@ -32,7 +32,7 @@ class MnnvlAllgatherSplit(OpWrapper):
     Takes one turn of the workspace's Lamport rotation, as an all-reduce on it does: every rank of the group makes the
     same MNNVL calls on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"{label}: bf16 rounding and fp32 words at every decode and wide token count",

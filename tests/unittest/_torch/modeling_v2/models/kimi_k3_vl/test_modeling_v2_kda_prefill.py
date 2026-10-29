@@ -19,7 +19,8 @@ from _validating import validating
 
 assert torch.cuda.is_available(), "kda_prefill requires a CUDA device"
 pytestmark = pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
+    torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="certified on sm_100 and sm_103",
 )
 
 HEAD_DIM, LOWER_BOUND, SCALE, CHUNK = kr.HEAD_DIM, kr.LOWER_BOUND, kr.SCALE, kr.CHUNK

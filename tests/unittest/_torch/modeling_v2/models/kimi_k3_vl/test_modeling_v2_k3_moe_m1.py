@@ -18,7 +18,7 @@ k3_moe_m1 = importlib.import_module(
     "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.ops.moe.k3_moe_m1"
 ).k3_moe_m1
 
-pytestmark = pytest.mark.skipif(not engines.is_sm100(), reason="k3_moe_m1 needs sm_100")
+pytestmark = pytest.mark.skipif(not engines.is_sm100(), reason="k3_moe_m1 needs sm_100 or sm_103")
 
 ENGINES = [engines.Engine("k3_moe_m1", cell.spec["m"]) for cell in k3_moe_m1.CELLS]
 IDS = [f"m{cell.spec['m']}" for cell in k3_moe_m1.CELLS]

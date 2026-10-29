@@ -21,7 +21,7 @@ class K3MlaQkv(OpWrapper):
     """Return ``fused_q`` [M, heads * 576] bf16 of the M <= 64 rows of ``ag``, and store each token's cache row
     ``[bf16(rmsnorm(ag[t, 1536:2048]) * w_kv) | ag[t, 2048:2112]]`` into ``pool`` at its request's position."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
         Cell(

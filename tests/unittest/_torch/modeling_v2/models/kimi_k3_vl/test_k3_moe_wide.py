@@ -41,10 +41,10 @@ import torch
 def _is_sm100() -> bool:
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
-pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_moe needs sm_100")
+pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_moe needs sm_100 or sm_103")
 
 H, TOP_K, NUM_EXPERTS, SV = 3584, 16, 896, 32
 I_TP, E_LOCAL, MOE_TP, TP_RANK, EP_RANK = 768, 224, 4, 1, 1  # one rank of experts TP4 x EP4

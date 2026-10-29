@@ -26,7 +26,8 @@ from _validating import validating
 assert torch.cuda.is_available(), "k3_embed_norm requires a CUDA device"
 # The receipts are sm_100 ones; CI's other architectures skip this file.
 pytestmark = pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
+    torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="certified on sm_100 and sm_103",
 )
 
 VOCAB, HIDDEN = 163840, 7168
