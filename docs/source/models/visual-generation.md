@@ -56,22 +56,22 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | SOL-Attn |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | Yes |
-| **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | No |
-| **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
-| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
-| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
-| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | Text Encoder TP | SOL-Attn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
+| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
+| **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
+| **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
+| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
+| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
@@ -118,7 +118,8 @@ The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queue
 Qwen-Image-Layered supports BF16 image-conditioned layer decomposition through
 `trtllm-serve` image-edit routing. It returns one RGBA image per generated layer;
 set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable
-image grid. Quantization, cache acceleration, attention-parallel/Sage/VSA backends,
+image grid. FP8 block-scale quantization and Cache-DiT are supported; NVFP4,
+TeaCache, the attention-parallel backends (CFG, Ulysses, Attention2D, ring), VSA,
 and Tensor Parallelism are not enabled for this pipeline yet.
 
 Conditioning references are supplied through the typed fields `image_reference`, `video_reference`, and `audio_reference`. Each field takes a single reference or a list. A reference is `MediaRef(content=..., format=...)`, and `format` is required.
@@ -328,12 +329,12 @@ cache_config:
 |---|---|---|---|
 | `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for all other supported models. |
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
-| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
+| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. When not supplied, filled automatically at load time if a built-in coefficient table matches the checkpoint; otherwise, set explicitly. |
 
 Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables. Set
-`cache_config.coefficients` explicitly for LTX-2. Wan 2.2 requires both
-`cache_config.coefficients` for its high-noise transformer and
-`cache_config.coefficients_2` for its low-noise transformer.
+`cache_config.coefficients` explicitly for LTX-2 and Wan 2.2 TI2V-5B. Wan 2.2
+A14B models require both `cache_config.coefficients` for the high-noise
+transformer and `cache_config.coefficients_2` for the low-noise transformer.
 
 #### Cache-DiT
 
@@ -405,6 +406,10 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
     - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on `1/tp_size` of the tokens. Requires `tp_size > 1`; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2.
+- **Text encoder tensor parallelism** (`text_encoder_tp_size: N`): MiniMax-H3
+  only. Shards the Qwen3-VL text encoder over the first N ranks for text-only
+  prompt encoding, then broadcasts prompt embeddings to the remaining VisualGen
+  ranks. This does not enable DiT tensor parallelism for MiniMax-H3.
 
 For multi-node execution, VisualGen relies on the external launcher to terminate
 the remaining ranks when any rank exits. `torchrun` provides this behavior. With

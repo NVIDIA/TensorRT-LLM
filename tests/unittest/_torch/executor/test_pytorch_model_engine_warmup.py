@@ -1156,7 +1156,7 @@ class TestWarmupCleanup(unittest.TestCase):
             config=SimpleNamespace(
                 enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE
             ),
-            mapping=None,
+            mapping=Mapping(),
             model=SimpleNamespace(modules=lambda: []),
             sparse_attention_config=None,
             metrics={},
