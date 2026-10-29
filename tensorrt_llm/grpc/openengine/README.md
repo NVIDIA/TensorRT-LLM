@@ -142,8 +142,11 @@ their existing meaning. Cache hashing continues to include image content.
 
 The publisher retains at most `max_entries` digest-to-UUID associations and skips
 UUIDs longer than 256 UTF-8 bytes. Conflicting hints mark a digest ambiguous until
-its entry is evicted, without failing inference. Missing, evicted, or ambiguous
-hints omit the UUID while retaining the image-routing metadata. Consumers
+its entry is evicted or the publisher restarts, without failing inference.
+Every registration refreshes the entry's LRU position, including ambiguous entries,
+so a frequently registered digest can remain ambiguous for the publisher's lifetime.
+An agreeing registration does not restore a hint after a conflict. Missing, evicted,
+or ambiguous hints omit the UUID while retaining the image-routing metadata. Consumers
 must ignore unmapped image stores while continuing to process removals. Routing
 identities must refer to stable media content. This extension does not change the
 OpenEngine schema.

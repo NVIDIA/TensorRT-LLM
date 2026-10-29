@@ -323,6 +323,16 @@ prompt = TextPrompt(
 
 V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence.
 
+Streaming V2 events can also include an optional `uuid` in each `mm_keys` entry.
+It is a bounded routing hint; it does not replace the content-sensitive digest.
+Missing, evicted, or conflicting hints omit `uuid`.
+For multimodal blocks, the optional `BlockStored.trtllm_image_routing` extension
+provides the routing format version and token-ID offset. The extension can accompany
+video and audio keys as well as image keys; the OpenEngine capability flag advertises
+only the currently validated image-routing support. See the
+[OpenEngine image routing contract](source:tensorrt_llm/grpc/openengine/README.md#image-routing-metadata)
+for capability requirements and consumer handling.
+
 
 ### Enable Offloading to Host Memory
 

@@ -1903,7 +1903,6 @@ class DecoderForwardTestCase(unittest.TestCase):
         """Every beam row gets its request's `past + delta` on all 3 axes."""
         beam_width = 2
         engine, kv_cache_manager = create_model_engine_and_kvcache(
-            self,
             llm_args=TorchLlmArgs(model="dummy",
                                   max_batch_size=4,
                                   max_num_tokens=64,
@@ -1973,7 +1972,6 @@ class DecoderForwardTestCase(unittest.TestCase):
             self) -> None:
         """Mixed scalar batching matches the old per-request writes exactly."""
         engine, kv_cache_manager = create_model_engine_and_kvcache(
-            self,
             llm_args=TorchLlmArgs(model="dummy",
                                   max_batch_size=2,
                                   max_num_tokens=64),
