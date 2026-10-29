@@ -56,7 +56,9 @@ from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper,
+    copy_base_page_rows_to_device,
     copy_batch_block_offsets_to_device,
+    gather_base_page_rows,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.logger import logger
@@ -1445,6 +1447,314 @@ def _swa_branch_snapshot_point(
     return point
 
 
+_DEVICE_PAGE_TABLE_ENV = "TLLM_KVCM_V2_DEVICE_PAGE_TABLE"
+_ENV_TRUE = frozenset(("1", "true", "on", "yes"))
+_ENV_FALSE = frozenset(("0", "false", "off", "no"))
+
+
+def _use_device_page_table(host_block_offsets: torch.Tensor) -> bool:
+    """Whether the per-step page table must be expanded from device memory.
+
+    ``copyBatchBlockOffsetsToDevice`` dereferences the host page table (and
+    ``index_scales``/``kv_offset``) from *inside* the kernel, so it only works
+    while those allocations are mapped into the GPU's address space. Pageable
+    memory never is, and Confidential Compute does not map host memory at all,
+    so pinning would not make the kernel safe there either. ``auto`` therefore
+    keys off :func:`prefer_pinned`, the allocation policy whose CC-mode
+    ``False`` first exposed the mismatch (NVBug 6248648).
+    """
+    setting = os.getenv(_DEVICE_PAGE_TABLE_ENV, "auto").strip().lower()
+    if setting in _ENV_TRUE:
+        return True
+    if setting in _ENV_FALSE:
+        return False
+    if setting != "auto":
+        raise ValueError(
+            f"{_DEVICE_PAGE_TABLE_ENV} must be 'auto', one of "
+            f"{sorted(_ENV_TRUE)}, or one of {sorted(_ENV_FALSE)}; got {setting!r}"
+        )
+    return not prefer_pinned() or not host_block_offsets.is_pinned()
+
+
+def _check_page_table_is_gpu_addressable(**tensors: torch.Tensor) -> None:
+    """Fail at startup instead of with an async illegal access mid-run.
+
+    See :func:`_use_device_page_table` for the contract being checked. Without
+    this the symptom is a CUDA fault reported at an arbitrary later point --
+    in NVBug 6248648 it surfaced as an unrelated CUDA graph teardown abort.
+    """
+    pageable = sorted(name for name, tensor in tensors.items() if not tensor.is_pinned())
+    if pageable:
+        raise RuntimeError(
+            f"KVCacheManagerV2 page-table tensors {pageable} are pageable, but "
+            "copyBatchBlockOffsetsToDevice dereferences them from the GPU. The native "
+            "path also requires a host mapping in the GPU address space, which CC does "
+            f"not provide even for pinned memory. Set {_DEVICE_PAGE_TABLE_ENV} to "
+            "'auto' or '1' to expand the page table from device memory instead."
+        )
+
+
+class _BasePageTableMaterializer:
+    """Materialize batch-dense tables from V2's stable base-page rows.
+
+    The native kernel pulls the batch's page-table rows straight out of host
+    memory over the zero-copy mapping when all inputs are GPU-addressable. CC
+    gathers stable rows on the host and moves those base indices through a
+    runtime-managed H2D copy before invoking that same K/V expansion kernel.
+    Pinned snapshots can invoke the kernel directly from their dense host
+    staging. This deliberately shares materialization semantics without
+    forcing the established non-CC paths through the CC transport policy.
+
+    Deleting that gather needs KVCM to report which stable rows changed since
+    the previous step; both the gather and the upload would then shrink to the
+    dirty rows. That is the intended follow-up. The upload is issued separately
+    for each pool and skips the unused V plane, minimizing H2D volume. CUDA does
+    not guarantee host-asynchronous ``cudaMemcpy2DAsync`` from pageable memory,
+    however, so its CPU critical-path cost must be measured on CC hardware.
+    """
+
+    def __init__(
+        self,
+        host_block_offsets: torch.Tensor,
+        stream: torch.cuda.Stream,
+        index_scales: Optional[torch.Tensor] = None,
+        kv_offset: Optional[torch.Tensor] = None,
+        allocate_device_source: bool = True,
+        output_row_capacity: Optional[int] = None,
+    ) -> None:
+        assert host_block_offsets.ndim == 4 and host_block_offsets.shape[2] == 2
+        self._host_block_offsets = host_block_offsets
+        self._host_base_page_indices = host_block_offsets[:, :, 0, :]
+        self._num_pools, self._row_capacity, self._max_blocks_per_seq = (
+            self._host_base_page_indices.shape
+        )
+        self._stream = stream
+        self._device = stream.device
+        if (index_scales is None) != (kv_offset is None):
+            raise ValueError("index_scales and kv_offset must be provided together")
+        self._index_scales = index_scales
+        self._kv_offset = kv_offset
+        self._use_device_staging = _use_device_page_table(host_block_offsets)
+        self._use_device_expansion = index_scales is not None and self._use_device_staging
+        if index_scales is not None and not self._use_device_expansion:
+            _check_page_table_is_gpu_addressable(
+                host_kv_cache_block_offsets=host_block_offsets,
+                index_scales=index_scales,
+                kv_offset=kv_offset,
+            )
+        self._index_scales_device = (
+            index_scales.to(device=self._device) if self._use_device_expansion else None
+        )
+        self._kv_offset_device = (
+            kv_offset.to(device=self._device) if self._use_device_expansion else None
+        )
+        if self._use_device_expansion:
+            # Cross-attention broadcasts source beam zero to multiple output beams.
+            output_row_capacity = (
+                self._row_capacity if output_row_capacity is None else output_row_capacity
+            )
+            self._identity_copy_idx_device = torch.arange(
+                output_row_capacity,
+                dtype=torch.int32,
+                device=self._device,
+            )
+            # Only plane 0 is initialized by the pitched H2D. The existing
+            # expansion kernel reads exactly that plane and materializes both
+            # K and V in its destination.
+            self._device_base_page_rows = (
+                torch.empty(
+                    (self._num_pools, output_row_capacity, 2, self._max_blocks_per_seq),
+                    dtype=host_block_offsets.dtype,
+                    device=self._device,
+                )
+                if allocate_device_source
+                else None
+            )
+        else:
+            self._identity_copy_idx_device = None
+            self._device_base_page_rows = None
+
+    @property
+    def uses_device_expansion(self) -> bool:
+        return self._use_device_expansion
+
+    @property
+    def uses_device_staging(self) -> bool:
+        """Whether host pointers must be hidden behind runtime-managed H2D copies."""
+        return self._use_device_staging
+
+    def _prepare_host_rows(
+        self,
+        num_seqs: int,
+        *,
+        num_blocks: Optional[int] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Prepare the dense destination used by a native host-row gather.
+
+        A fresh output is the default because an asynchronous H2D may still be
+        reading iteration N after the overlap scheduler starts iteration N+1.
+        ``out`` is a reusable, base-aligned staging tensor: it must already
+        own enough storage for the exact batch shape, is resized in place, and
+        is populated. The resize is forbidden from reallocating so its pinned
+        state cannot change. Callers supplying it must externally order its
+        reuse.
+        """
+        num_blocks = self._max_blocks_per_seq if num_blocks is None else num_blocks
+        assert 0 < num_blocks <= self._max_blocks_per_seq
+        expected_shape = (self._num_pools, num_seqs, 2, num_blocks)
+        if out is None:
+            rows = torch.empty(
+                expected_shape,
+                dtype=self._host_base_page_indices.dtype,
+                device="cpu",
+                # Fresh staging on the device path must be pageable: this raw
+                # CUDA copy is not visible to PyTorch's pinned allocator, so a
+                # freshly freed pinned buffer could otherwise be recycled while
+                # the transfer is still in flight. Reusable caller-owned pinned
+                # staging has an explicit lifetime/reuse contract instead.
+                pin_memory=prefer_pinned() and not self._use_device_staging,
+            )
+        else:
+            assert out.ndim == 4
+            assert out.shape[0] == self._num_pools and out.shape[2:] == (2, num_blocks)
+            assert out.device.type == "cpu" and out.dtype == self._host_base_page_indices.dtype
+            assert out.is_contiguous() and out.storage_offset() == 0, (
+                "out must be a contiguous, base-aligned staging tensor"
+            )
+            required_storage_bytes = math.prod(expected_shape) * out.element_size()
+            available_storage_bytes = out.untyped_storage().nbytes()
+            if available_storage_bytes < required_storage_bytes:
+                raise ValueError(
+                    f"out storage holds {available_storage_bytes} bytes, "
+                    f"but gathering {expected_shape} requires {required_storage_bytes}"
+                )
+            data_ptr = out.data_ptr()
+            was_pinned = out.is_pinned()
+            out.resize_(expected_shape)
+            if out.data_ptr() != data_ptr:
+                raise RuntimeError("out resize unexpectedly reallocated storage")
+            if out.is_pinned() != was_pinned:
+                raise RuntimeError("out resize unexpectedly changed pinned state")
+            rows = out
+
+        return rows
+
+    def _gather_host_rows(
+        self,
+        copy_idx: torch.Tensor,
+        *,
+        num_blocks: Optional[int] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Snapshot ``copy_idx`` rows in batch order with native row copies."""
+        assert copy_idx.ndim == 1 and copy_idx.device.type == "cpu"
+        num_blocks = self._max_blocks_per_seq if num_blocks is None else num_blocks
+        rows = self._prepare_host_rows(copy_idx.shape[0], num_blocks=num_blocks, out=out)
+        gather_base_page_rows(self._host_block_offsets, rows, copy_idx, num_blocks)
+        return rows
+
+    def _get_device_conversion_metadata(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        # These immutable copies are built before any CUDA graph capture and
+        # may therefore be consumed safely from every materialization stream.
+        assert self._index_scales_device is not None and self._kv_offset_device is not None
+        return self._index_scales_device, self._kv_offset_device
+
+    def copy_gathered_rows_to(
+        self,
+        dst_tensor: torch.Tensor,
+        host_rows: torch.Tensor,
+        *,
+        device_source: Optional[torch.Tensor] = None,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Expand already-dense host base rows into the attention ABI."""
+        assert self._use_device_expansion
+        assert host_rows.ndim == 4 and host_rows.device.type == "cpu" and host_rows.is_contiguous()
+        num_pools, num_seqs, kv_factor, num_blocks = host_rows.shape
+        assert kv_factor == 2
+        assert dst_tensor.ndim == 4 and dst_tensor.is_cuda
+        assert dst_tensor.shape[0] == num_pools == self._num_pools
+        assert dst_tensor.shape[1] >= num_seqs and dst_tensor.shape[2] == 2
+        assert dst_tensor.shape[3] == num_blocks
+        if num_seqs == 0:
+            return
+        assert num_blocks % 4 == 0, "blocks per sequence must be a multiple of 4"
+        assert self._identity_copy_idx_device is not None
+        assert num_seqs <= self._identity_copy_idx_device.numel(), (
+            "Batch rows exceed the materializer's output row capacity"
+        )
+        assert self._index_scales is not None and self._kv_offset is not None
+        stream = self._stream if stream is None else stream
+
+        with torch.cuda.stream(stream):
+            source = (
+                torch.empty_like(host_rows, device=self._device)
+                if device_source is None
+                else device_source
+            )
+            assert source.ndim == 4 and source.is_cuda and source.is_contiguous()
+            assert source.shape[0] == num_pools and source.shape[1] >= num_seqs
+            assert source.shape[2:] == (2, num_blocks)
+            copy_base_page_rows_to_device(
+                host_rows,
+                source,
+                num_seqs,
+                stream.cuda_stream,
+            )
+        copy_idx = self._identity_copy_idx_device[:num_seqs]
+        index_scales, kv_offset = self._get_device_conversion_metadata()
+
+        copy_batch_block_offsets_to_device(
+            source,
+            dst_tensor,
+            copy_idx,
+            index_scales,
+            kv_offset,
+            stream.cuda_stream,
+        )
+
+    def copy_block_offsets_to(
+        self,
+        dst_tensor: torch.Tensor,
+        copy_idx: torch.Tensor,
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Materialize the attention ABI ``[pool, batch, K/V, block]`` table."""
+        assert self._use_device_expansion
+        assert dst_tensor.ndim == 4 and dst_tensor.is_cuda
+        num_pools, _, kv_factor, max_blocks_per_seq = dst_tensor.shape
+        assert num_pools == self._num_pools and kv_factor == 2, (
+            f"dst_tensor has {num_pools} pools and kv factor {kv_factor}, "
+            f"expected {self._num_pools} and 2"
+        )
+        assert max_blocks_per_seq <= self._max_blocks_per_seq, (
+            f"dst_tensor holds {max_blocks_per_seq} blocks per sequence, "
+            f"but the stable table holds only {self._max_blocks_per_seq}"
+        )
+        num_seqs = copy_idx.shape[0]
+        if num_seqs == 0:
+            return
+        assert max_blocks_per_seq % 4 == 0, "blocks per sequence must be a multiple of 4"
+        assert self._index_scales is not None and self._kv_offset is not None
+        stream = self._stream if stream is None else stream
+
+        host_rows = self._gather_host_rows(
+            copy_idx,
+            num_blocks=max_blocks_per_seq,
+        )
+        device_source = (
+            self._device_base_page_rows if max_blocks_per_seq == self._max_blocks_per_seq else None
+        )
+        self.copy_gathered_rows_to(
+            dst_tensor,
+            host_rows,
+            device_source=device_source,
+            stream=stream,
+        )
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
@@ -1485,6 +1795,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # the class for instances built without running __init__.
     _commit_branch_snapshots = False
     _record_branch_snapshots = False
+    # Request id -> points of its prompt that requests waiting for its prefix
+    # need snapshotted (request_prefix_snapshot); kept apart from the request's
+    # own expect_snapshot_points, which other code rewrites. Created on first use.
+    _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
 
     def __init__(
         self,
@@ -2203,6 +2517,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and not self.enable_joint_kv_cache_reuse
             and not self._has_cp_helix
         )
+        self.can_share_inflight_prefix = self._can_share_inflight_prefix()
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -2812,8 +3127,32 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device="cpu",
         )
+        self._prepare_page_table_materializer(index_mapper_capacity)
         if self._use_per_layer_page_tables:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+
+    def _prepare_page_table_materializer(self, index_mapper_capacity: int) -> None:
+        """Initialize transport after a layout has allocated its host tables."""
+        self._page_table_materializer = _BasePageTableMaterializer(
+            self.host_kv_cache_block_offsets,
+            self._stream,
+            self.index_scales,
+            self.kv_offset,
+            allocate_device_source=not self._use_per_layer_page_tables,
+            output_row_capacity=index_mapper_capacity * self.max_copy_beam_width,
+        )
+        if not self._page_table_materializer.uses_device_expansion:
+            # get_copy_index always slices the mapper's persistent copy-index
+            # allocation. Probe that allocation once here instead of adding a
+            # pinned-memory query to the non-CC per-step critical path.
+            _check_page_table_is_gpu_addressable(
+                copy_idx=self.index_mapper.get_copy_index([], 0, 1)
+            )
+        if self._page_table_materializer.uses_device_expansion:
+            logger.info(
+                "[KVCacheManager] Expanding the V2 page table from device memory: "
+                "the host table is not addressable by the native page-table kernel."
+            )
 
     def _kv_pool_mapping_offset(
         self, layer_id: LayerId, layer_group_id: int, key_base_addr: int
@@ -3922,6 +4261,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._draft_prompt_lookahead
 
     @property
+    def uses_device_page_table(self) -> bool:
+        """Whether attention page tables are materialized through device staging."""
+        return self._page_table_materializer.uses_device_staging
+
+    @property
     def blocks_in_primary_pool(self) -> int:
         """
         Get the number of blocks in the primary pool.
@@ -4603,17 +4947,96 @@ class KVCacheManagerV2(BaseResourceManager):
         point = _swa_branch_snapshot_point(
             divergence, num_lookup_tokens, reused, req.prompt_len, self.tokens_per_block
         )
-        if point is None:
-            # Drop a point left by an earlier lookup of this request.
-            req.expect_snapshot_points = []
-            return
-        # Only recurrent-state managers rewrite this list each scheduler pass, so
-        # the point persists here until the request finishes.
-        req.expect_snapshot_points = [point]
-        logger.debug(
-            f"[KVCacheManagerV2] request {req.py_request_id} branch snapshot at {point} "
-            f"(divergence={divergence}, reused={reused}, prompt_len={req.prompt_len})"
+        # A fresh lookup replaces the point of an earlier lookup of this request.
+        # Points requested by waiting requests (request_prefix_snapshot) may
+        # already be in the list, so they are merged back in.
+        req.expect_snapshot_points = [] if point is None else [point]
+        self._merge_waiter_snapshot_points(req)
+        if point is not None:
+            logger.debug(
+                f"[KVCacheManagerV2] request {req.py_request_id} branch snapshot at {point} "
+                f"(divergence={divergence}, reused={reused}, prompt_len={req.prompt_len})"
+            )
+
+    def _can_share_inflight_prefix(self) -> bool:
+        """Whether a request can wait for another to make a shared prefix reusable.
+
+        Without SWA layers whose window reaches the radix tree only at a context
+        chunk end, every block a request computes is committed, at the latest
+        when its context ends. Otherwise the request computing the prefix must
+        end a chunk at the shared depth, which needs SWA branch snapshots.
+        Decided at construction; see :meth:`request_prefix_snapshot`.
+        """
+        if not (self.enable_block_reuse and self._can_publish_block_reuse):
+            return False
+        if self._record_branch_snapshots:
+            return True
+        # Only the SWA window at a context chunk end reaches the radix tree: SWA
+        # scratch reuse gives no other window real pages, and a policy other
+        # than all_reusable commits the window at a prompt end only.
+        swa_window_only_at_chunk_end = (
+            self.enable_swa_scratch_reuse
+            or self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
         )
+        return not (
+            swa_window_only_at_chunk_end
+            and any(
+                getattr(layer, "sliding_window_size", None)
+                for layer in self.impl.init_config.layers
+            )
+        )
+
+    def request_prefix_snapshot(self, owner: LlmRequest, num_tokens: int) -> bool:
+        """Make the first ``num_tokens`` of ``owner``'s prompt reusable once computed.
+
+        ``owner`` is a context request that has not finished its context; a
+        request sharing that prefix waits for it (``PrefixWaitPlanner``). Only
+        called when :attr:`can_share_inflight_prefix`. Where only the SWA window
+        at a context chunk end reaches the radix tree (SWA branch snapshots, see
+        :meth:`_record_branch_snapshot_point`), ``owner`` ends a chunk at the
+        block-aligned depth. Returns False when that is no longer possible.
+        """
+        if not self._record_branch_snapshots:
+            return True
+        return self._add_waiter_snapshot_point(owner, num_tokens)
+
+    def _add_waiter_snapshot_point(self, owner: LlmRequest, point: int) -> bool:
+        """Add the block-aligned ``point`` to ``owner``'s snapshot points.
+
+        The point is also kept apart from the request, so that whatever rewrites
+        ``expect_snapshot_points`` later (a fresh lookup's branch point, or a
+        recurrent-state manager's per-pass placement) merges it back in with
+        :meth:`_merge_waiter_snapshot_points`. Returns False when the point is
+        not inside ``owner``'s prompt or not past the context ``owner`` has
+        computed or holds pages for: a chunk already allocated (an in-flight
+        chunk, or one grown under SWA scratch reuse whose forward was skipped)
+        cannot end at the point any more.
+        """
+        point = point // self.tokens_per_block * self.tokens_per_block
+        allocated_end = owner.context_current_position
+        kv_cache = self.kv_cache_map.get(owner.py_request_id)
+        if kv_cache is not None:
+            allocated_end = max(allocated_end, kv_cache.capacity - self.num_extra_kv_tokens)
+        if not allocated_end < point < owner.prompt_len:
+            return False
+        if self._waiter_snapshot_points is None:
+            self._waiter_snapshot_points = {}
+        self._waiter_snapshot_points.setdefault(owner.py_request_id, set()).add(point)
+        self._merge_waiter_snapshot_points(owner)
+        return True
+
+    def _merge_waiter_snapshot_points(self, request: LlmRequest) -> None:
+        """Merge into ``request``'s snapshot points the waiters' points it has not passed yet."""
+        points_by_id = self._waiter_snapshot_points
+        points = points_by_id.get(request.py_request_id) if points_by_id else None
+        if not points:
+            return
+        start = request.context_current_position
+        points.difference_update([point for point in points if point <= start])
+        if not points:
+            del points_by_id[request.py_request_id]
+            return
+        request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
 
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
@@ -6665,6 +7088,24 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
+    def _remove_kv_cache(self, request_id: int) -> None:
+        """Forget a sequence made by `_create_kv_cache`: drop it from the map,
+        close it, clear its stats exclusion and free its index slot. Calling
+        this again for the same id does nothing."""
+        kv_cache = self.kv_cache_map.pop(request_id, None)
+        if kv_cache is None:
+            self.impl.clear_stats_excluded(request_id)
+            return
+        kv_cache.discard_pending_stats()
+        if self._sharing is not None:
+            self._sharing._on_free(request_id, kv_cache)
+        kv_cache.close()
+        self.impl.clear_stats_excluded(request_id)
+        if request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request_id)
+        else:
+            self.index_mapper.remove_sequence(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
         # its saves drain, and a dead entry here would block every later
@@ -6690,6 +7131,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.reset_request_state(request)
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
+        if self._waiter_snapshot_points is not None:
+            self._waiter_snapshot_points.pop(request.py_request_id, None)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         self._inflight_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
@@ -6699,19 +7142,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready.pop(request.py_request_id, None)
         self._on_allocation_stream.discard(request.py_request_id)
         self._allocation_ready.pop(request.py_request_id, None)
-        kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
-        if kv_cache is None:
-            self.impl.clear_stats_excluded(request.py_request_id)
-            return
-        kv_cache.discard_pending_stats()
-        if self._sharing is not None:
-            self._sharing._on_free(request.py_request_id, kv_cache)
-        kv_cache.close()
-        self.impl.clear_stats_excluded(request.py_request_id)
-        if request.py_request_id in self._early_freed_index_requests:
-            self._early_freed_index_requests.discard(request.py_request_id)
-        else:
-            self.index_mapper.remove_sequence(request.py_request_id)
+        self._remove_kv_cache(request.py_request_id)
 
     def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
         """Tell the lender, if one is attached, that ``kv_cache`` may have shrunk in place: blocks
@@ -7032,6 +7463,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # its plan, which mutates manager state.
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
+        if self._waiter_snapshot_points is not None:
+            self._waiter_snapshot_points.clear()
         self.impl.shutdown()
         if self._sharing is not None:
             # After the runtime's shutdown, which raises while any cache is open, in the map or not;
@@ -7640,13 +8073,51 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
-        copy_batch_block_offsets_to_device(
+        if self._page_table_materializer.uses_device_expansion:
+            self._page_table_materializer.copy_block_offsets_to(dst_tensor, copy_idx)
+        else:
+            copy_batch_block_offsets_to_device(
+                self.host_kv_cache_block_offsets,
+                dst_tensor,
+                copy_idx,
+                self.index_scales,
+                self.kv_offset,
+                self._stream.cuda_stream,
+            )
+
+    def materialize_block_offsets_snapshot(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        *,
+        host_staging: Optional[torch.Tensor] = None,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Materialize a stable snapshot for an asynchronous consumer.
+
+        A caller that reuses ``host_staging`` must order that reuse after the
+        prior asynchronous consumer has finished reading it.
+        """
+        if not self._page_table_materializer.uses_device_expansion:
+            raise RuntimeError(
+                "Block-offset snapshot materialization requires device expansion metadata"
+            )
+        num_blocks = dst_tensor.shape[-1]
+        host_rows = self._page_table_materializer._prepare_host_rows(
+            len(request_ids),
+            num_blocks=num_blocks,
+            out=host_staging,
+        )
+        self.index_mapper.gather_k_block_offsets(
             self.host_kv_cache_block_offsets,
+            host_rows,
+            request_ids,
+            num_blocks,
+        )
+        self._page_table_materializer.copy_gathered_rows_to(
             dst_tensor,
-            copy_idx,
-            self.index_scales,
-            self.kv_offset,
-            self._stream.cuda_stream,
+            host_rows,
+            stream=stream,
         )
 
     @staticmethod

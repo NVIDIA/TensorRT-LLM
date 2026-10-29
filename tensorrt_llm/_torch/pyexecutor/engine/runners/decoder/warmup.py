@@ -481,6 +481,8 @@ class DecoderWarmup:
         # creates; build it when every forward above was skipped.
         with self._warmup_timer.phase("dsa_prewarm"):
             self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
+            if getattr(self._inputs, "_dspark_confidence_enabled", False):
+                self._metadata._warmup_dspark_ragged_compressor_metadata()
             with timing_metric("dg_paged_mqa_warmup_seconds", self._metrics):
                 self._warmup_dg_paged_mqa_logits_metadata()
             log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")

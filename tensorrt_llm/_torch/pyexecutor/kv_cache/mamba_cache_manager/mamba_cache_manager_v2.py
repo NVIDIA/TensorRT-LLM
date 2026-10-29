@@ -464,22 +464,69 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         capacity: int,
         kv_cache_config: KvCacheConfig,
     ) -> int:
-        fixed_rules, _ = _mamba_snapshot_rule_counts(
-            kv_cache_config,
-            capacity,
-            self.tokens_per_block,
+        """Estimate live state plus retained snapshots for the pool ratio.
+
+        Periodic and from-start snapshot placement treats capacity (avg_seq_len, or its
+        fallback) as prompt length. Each unique from-end offset below max_seq_len adds a
+        snapshot independently of that estimate, since its actual position depends on the
+        request's prompt length.
+
+        Because avg_seq_len includes output tokens, periodic retention is an upper-bound
+        estimate for decode-heavy workloads. Longer prompts can still exceed this estimate.
+
+        Data-dependent divergence points are not modeled, only the branch prompt-end fallback.
+
+        Args:
+            capacity: Estimated total sequence length of one typical request, in tokens (prompt plus
+                output). Serves as the estimated prompt length for snapshot placement.
+            kv_cache_config: Cache configuration controlling block reuse and Mamba snapshot
+                placement.
+        """
+        if not kv_cache_config.enable_block_reuse:
+            return 1
+
+        state_config = kv_cache_config.mamba_state_config
+        # From-start positions are fixed, so model only those within the typical
+        # length and deduplicate them against each other and periodic boundaries.
+        fixed_points = {
+            offset
+            for offset in state_config.additional_snapshot_offsets_from_start
+            if offset <= capacity
+        }
+        interval = _mamba_regular_snapshot_interval(kv_cache_config, capacity)
+        if interval is None:
+            num_snapshots = len(fixed_points)
+        else:
+            # Runtime includes the endpoint when it is a periodic boundary and deduplicates
+            # coincident from-start / periodic points, whose alignment is length-independent.
+            num_snapshots = capacity // interval + sum(
+                point % interval != 0 for point in fixed_points
+            )
+        # From-end positions depend on the actual prompt length. Do not assume
+        # they coincide with from-start or periodic points at the estimated length.
+        # Include offsets beyond capacity when longer prompts can reach them.
+        # Offsets at or above max_seq_len cannot produce a positive position.
+        # Repeated identical offsets always coincide, so count each offset only once.
+        num_snapshots += len(
+            {
+                offset
+                for offset in state_config.additional_snapshot_offsets_from_end
+                if offset < self.max_seq_len
+            }
         )
-        # Additional snapshots are stable boundaries that must remain alive.
-        # Periodic snapshots are evictable cache entries and therefore do not
-        # increase the guaranteed state count represented by BatchDesc.
-        return 1 + fixed_rules
+        if kv_cache_config.block_reuse_config.enable_branch_snapshot and num_snapshots == 0:
+            num_snapshots = 1
+        return 1 + num_snapshots
 
     def _typical_request_descs(
         self,
         capacity: int,
         kv_cache_config: KvCacheConfig,
     ) -> List[KVCacheDesc]:
-        """Model one request with one descriptor per live SSM state."""
+        """Model desired retention, independently of minimum live capacity.
+
+        Each retained state is modeled as an equal slice of the sequence.
+        """
         num_states = self._num_ssm_states_per_typical_request(capacity, kv_cache_config)
         capacity_per_state, capacity_remainder = divmod(capacity, num_states)
         capacities = [capacity_per_state + int(i < capacity_remainder) for i in range(num_states)]
@@ -504,8 +551,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             "model using KV cache manager V2. Falling back to "
             f"max_seq_len / 2={fallback_capacity} for cache-pool sizing. Set "
             "'kv_cache_config.avg_seq_len' in the YAML configuration to the "
-            "workload's average total sequence length for an accurate KV/SSM "
-            "pool ratio."
+            "workload's average total sequence length for KV/SSM pool sizing. "
+            "This fallback also estimates snapshot retention using "
+            "the total sequence length as a prompt-length upper bound."
         )
         return fallback_capacity
 
@@ -1124,8 +1172,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             has_pending_snapshot = any(
                 point > request.context_current_position for point in request.expect_snapshot_points
             )
+            # commit_min_snapshot accepts a commit only if it starts or ends at
+            # history_length. While a snapshot point is pending, history stays
+            # at the committed end, so the next commit starts there. Once
+            # history has passed it (chunks without a pending point, then a
+            # waiter's point arrived, see request_prefix_snapshot), the next
+            # commit can only end at history, so history follows the context.
             should_resize = not should_block_reuse or (
-                not is_all_reusable and not has_pending_snapshot
+                not is_all_reusable
+                and (
+                    not has_pending_snapshot
+                    or kv_cache.history_length > kv_cache.num_committed_tokens
+                )
             )
             should_commit = (
                 is_all_reusable or is_snapshot_boundary or request.context_remaining_length == 0
@@ -1148,13 +1206,31 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @override
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
-        if (
-            not self.enable_block_reuse
-            or not self.kv_cache_config.block_reuse_config.enable_branch_snapshot
-        ):
-            return
-        for request in requests:
-            self._apply_branch_snapshot_point(request)
+        block_reuse_config = self.kv_cache_config.block_reuse_config
+        if self.enable_block_reuse and block_reuse_config.enable_branch_snapshot:
+            for request in requests:
+                self._apply_branch_snapshot_point(request)
+        if self.enable_block_reuse and self._waiter_snapshot_points:
+            for request in requests:
+                self._merge_waiter_snapshot_points(request)
+
+    @override
+    def _can_share_inflight_prefix(self) -> bool:
+        """Snapshots requested for waiting requests need no branch snapshot config."""
+        return self.enable_block_reuse and self._can_publish_block_reuse
+
+    @override
+    def request_prefix_snapshot(self, owner: LlmRequest, num_tokens: int) -> bool:
+        """Snapshot ``owner`` at ``num_tokens`` for a request waiting for that prefix.
+
+        The recurrent state reaches the radix tree only at snapshot points, so
+        ``owner`` always needs one there; its context chunk ends there too. The
+        point may arrive after ``owner``'s history has passed its committed
+        tokens; update_context_resources then advances history to each chunk
+        end, so the commit at the point ends at history as commit_min_snapshot
+        requires.
+        """
+        return self._add_waiter_snapshot_point(owner, num_tokens)
 
     def _skip_branch_snapshot(self, reason: str) -> None:
         self._branch_snapshots_skipped_total[reason] = (

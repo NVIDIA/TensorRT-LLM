@@ -246,8 +246,15 @@ def route(
         if num_sms < b <= 2 * num_sms and 2048 < n4 <= 3072:
             return _reg(512, (n4 + 511) // 512, 2, NB)
 
+    # Wide K=2048 rows that fit one wave of register CTAs (<= 4 streaming splits).
+    k2048_reg_rung = False
+    if wide and k == 2048 and sm_version in (100, 103) and n4 <= 8192:
+        streaming_splits = min(148 // b, (n4 + 1023) // 1024) if b <= 32 else 1
+        k2048_reg_rung = streaming_splits <= 4 or (b <= 16 and n == 32768)
+
     # ---- clustered register-resident path ----
-    if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
+    # K=2048 runs with two hint slots per thread (tuple slot KH); the one-wave rung keeps its rows.
+    if n4 > 4096 and n4 <= 8 * BLKC * 4 and (k <= BLKC or (k == 2 * BLKC and not k2048_reg_rung)):
         av = 148 // (b if b > 0 else 1)  # truncating
         amax = 1
         while (amax << 1) <= av and amax < 8:
@@ -271,7 +278,7 @@ def route(
             smc = (3 * NB + 2 * CMPC) * 4
             return {
                 "kernel": "reg_clus",
-                "tpl": (BLKC, vsel, cs),
+                "tpl": (BLKC, vsel, cs, k),
                 "rt": {"n": n, "npad": npad, "k": k},  # dims only
                 "grid": (cs, b),
                 "cluster": cs,
@@ -307,10 +314,8 @@ def route(
     if long_register:
         return _reg(512, 5 if n4 <= 2560 else 6, 2, NB)
 
-    if wide and k == 2048 and sm_version in (100, 103) and n4 <= 8192:
-        streaming_splits = min(148 // b, (n4 + 1023) // 1024) if b <= 32 else 1
-        if streaming_splits <= 4 or (b <= 16 and n == 32768):
-            return _reg(1024, (n4 + 1023) // 1024, 1, 2 * NB)
+    if k2048_reg_rung:
+        return _reg(1024, (n4 + 1023) // 1024, 1, 2 * NB)
 
     if n <= 12288:
         return _reg(512, (n4 + 511) // 512, 2, NBSEL)
