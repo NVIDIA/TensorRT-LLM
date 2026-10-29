@@ -119,9 +119,12 @@ if (( ! FULL_PROJECT && $# == 0 )); then
         echo "ERROR: could not discover changed files" >&2
         exit 2
     fi
-    mapfile -d '' -t changed_paths < "$CHANGED_PATHS_FILE"
+    changed_paths=()
+    while IFS= read -r -d '' path; do
+        changed_paths+=("$path")
+    done < "$CHANGED_PATHS_FILE"
     rm -f "$CHANGED_PATHS_FILE"
-    set -- "${changed_paths[@]}"
+    set -- "${changed_paths[@]+"${changed_paths[@]}"}"
 fi
 
 FILTERED_ARGS=()
@@ -157,7 +160,7 @@ if (( ! FULL_PROJECT && KEPT_SOURCES == 0 )); then
     echo "No eligible changed Python files to check"
     exit 0
 fi
-set -- "${FILTERED_ARGS[@]}"
+set -- "${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}"
 if (( ! FULL_PROJECT )); then
     printf 'Checking %s changed product Python file(s):\n' "$KEPT_SOURCES"
     printf '  %s\n' "$@"
