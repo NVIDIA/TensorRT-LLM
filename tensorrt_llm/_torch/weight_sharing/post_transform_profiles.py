@@ -48,6 +48,11 @@ QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
 # Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
 # tensors, Q/K norm state, and target-only receiver finalization.
 QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for the Qwen3 dense layout above when `lm_head.weight` is an
+# alias of `model.embed_tokens.weight`. The shared table is one transferred
+# tensor, named `model.embed_tokens.weight`; no `lm_head.weight` tensor is
+# transferred, and the receiver's constructor rebuilds the alias.
+QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-tied-target-layout-v1"
 # Stable contract for unquantized Mistral dense fused-QKV and fused-gate-up
 # tensors plus target-only receiver finalization. Mistral shares the dense
 # decoder base class with Llama but is a distinct root with its own contract.
@@ -118,6 +123,59 @@ def _realized_sliding_window(model: nn.Module) -> str | None:
     return "uniform" if len(realized_values) == 1 else "mixed"
 
 
+def _same_weight_memory(first: object, second: object) -> bool | None:
+    """Whether two weights are one tensor or identical views of the same memory.
+
+    Meta tensors have no memory to compare, so distinct meta tensors count as
+    unshared. Returns `None` when either weight is not a tensor.
+    """
+    if first is second:
+        return True
+    try:
+        if first.is_meta or second.is_meta:
+            return False
+        first_view = (
+            first.device,
+            first.dtype,
+            first.data_ptr(),
+            tuple(first.shape),
+            first.stride(),
+        )
+        second_view = (
+            second.device,
+            second.dtype,
+            second.data_ptr(),
+            tuple(second.shape),
+            second.stride(),
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    # Distinct empty tensors can both report a null data pointer.
+    return first_view == second_view and first_view[2] != 0
+
+
+def _realized_tied_word_embeddings(model: nn.Module) -> bool | None:
+    """Report whether a constructed model's LM head reads its token-embedding table.
+
+    The head is the one submodule named `lm_head` and the table is the one
+    submodule named `embed_tokens`, at any depth. The result is `True` when
+    their weights are the same tensor or identical views of the same memory,
+    and `False` when they are distinct tensors. It is `None` when the model
+    does not have exactly one of each, or when either has no tensor weight.
+    """
+    weights: dict[str, list[object]] = {"lm_head": [], "embed_tokens": []}
+    for name, module in model.named_modules():
+        module_weights = weights.get(name.rpartition(".")[2])
+        if module_weights is not None:
+            module_weights.append(getattr(module, "weight", None))
+    head_weights, table_weights = weights["lm_head"], weights["embed_tokens"]
+    if len(head_weights) != 1 or len(table_weights) != 1:
+        return None
+    if head_weights[0] is None or table_weights[0] is None:
+        return None
+    return _same_weight_memory(head_weights[0], table_weights[0])
+
+
 def _canonical_optional_string(container: object, attribute: str) -> str | None:
     value = getattr(container, attribute, _MISSING)
     if value is _MISSING:
@@ -172,6 +230,8 @@ class PostTransformRuntimeConfig:
     attention_cp_size: int | None
     attention_dp: bool | None
     multi_node: bool | None
+    # The declared `tie_word_embeddings` flag, or `None` when a constructed
+    # model does not realize the declared value.
     tied_word_embeddings: bool | None
     rope_type: str | None
     rope_fusion: bool | None
@@ -212,6 +272,13 @@ class PostTransformRuntimeConfig:
 
         rope_fusion = _realized_rope_fusion(model) if model is not None else None
         sliding_window = _realized_sliding_window(model) if model is not None else None
+        # A constructed model must realize the declared tie, so the config flag
+        # can neither claim nor hide an `lm_head`/`embed_tokens` alias.
+        tied_word_embeddings = _canonical_bool(
+            getattr(pretrained_config, "tie_word_embeddings", None)
+        )
+        if model is not None and _realized_tied_word_embeddings(model) != tied_word_embeddings:
+            tied_word_embeddings = None
 
         return cls(
             dtype=_canonical_string(getattr(model_config, "torch_dtype", None)),
@@ -238,9 +305,7 @@ class PostTransformRuntimeConfig:
             attention_cp_size=_canonical_int(getattr(mapping, "attn_cp_size", None)),
             attention_dp=_canonical_bool(getattr(mapping, "enable_attention_dp", None)),
             multi_node=multi_node,
-            tied_word_embeddings=_canonical_bool(
-                getattr(pretrained_config, "tie_word_embeddings", None)
-            ),
+            tied_word_embeddings=tied_word_embeddings,
             rope_type=rope_type,
             rope_fusion=rope_fusion,
             sliding_window=sliding_window,

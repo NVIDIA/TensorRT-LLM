@@ -28,6 +28,7 @@ profiles:
 | `llama-for-causal-lm-target-v1` | `LlamaForCausalLM` | `LlamaForCausalLM` / `llama` | Target model | 1 | `trtllm-llama-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `qwen3-for-causal-lm-bf16-tied-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-tied-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, tied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `mistral-for-causal-lm-bf16-target-v1` | `MistralForCausalLM` | `MistralForCausalLM` / `mistral` | Target model | 1 | `trtllm-mistral-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, no sliding window, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `phi3-for-causal-lm-bf16-target-v1` | `Phi3ForCausalLM` | `Phi3ForCausalLM` / `phi3` | Target model | 1 | `trtllm-phi3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
@@ -41,6 +42,22 @@ The Qwen2 identity includes Qwen2 and Qwen2.5 dense checkpoints that resolve to
 the exact `Qwen2ForCausalLM` / `qwen2` pair and satisfy the constraints above.
 Other Qwen roots and variants, including checkpoints with tied embeddings, do
 not match this profile.
+
+The Qwen3 identity has two sibling profiles that differ only in
+`tie_word_embeddings`. Untied checkpoints match
+`qwen3-for-causal-lm-bf16-target-v1`; Qwen3-8B is the untied canary. Tied
+checkpoints match `qwen3-for-causal-lm-bf16-tied-target-v1`; Qwen3-4B is the
+tied canary, and Qwen3-0.6B, Qwen3-1.7B, and Qwen3-4B-Instruct-2507 are also
+tied. A tied model makes `lm_head.weight` an alias of
+`model.embed_tokens.weight` at construction on both sides, so MX registers and
+transfers the shared table once, as `model.embed_tokens.weight`, and the
+`lm_head.weight` tensor that some tied checkpoints also store is never loaded.
+Because the two profiles transfer different tensor sets, the tied profile has
+its own transform-layout ABI, and a tied source never pairs with an untied
+receiver, even under the `ENFORCE` identity policy.
+The constructed model must realize the tie that the checkpoint declares: when
+the `tie_word_embeddings` flag and the constructed `lm_head` and `embed_tokens`
+weights disagree, no profile matches.
 
 The Mistral identity covers dense Hugging Face-format checkpoints that resolve
 to the exact `MistralForCausalLM` / `mistral` pair and whose realized attention
@@ -208,7 +225,10 @@ prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
 row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout used for the
 baseline worker, receiver worker, and donor-readiness wait; increase it for
-slow model storage or startup.
+slow model storage or startup. The tied Qwen3 profile rows
+`qwen3-tied-bf16-tp1` / `qwen3-tied-bf16-tp2` load the tied Qwen3-4B
+checkpoint, with an optional model path override in
+`TRTLLM_MX_QWEN3_TIED_MODEL`.
 
 The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
 sidecars. Coverage is tiered so that pull requests pay for one lightweight
@@ -217,7 +237,7 @@ end-to-end canary while every qualified family still runs on each main commit:
 | Stage | When it runs | Rows |
 | --- | --- | --- |
 | `DGX_H100-2_GPUs-PyTorch-ModelExpress-1` | Pre-merge and post-merge | `llama-bf16-tp1` and `test_mx_source_identity_gate.py` |
-| `DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` | Post-merge only | The other TP=1 family rows and the accuracy canaries below |
+| `DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` | Post-merge only | The other TP=1 rows and the accuracy canaries below |
 | `DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1` | On demand only | Every TP=2 row |
 
 The two-GPU stages are classified as multi-GPU, so running either of them on a
@@ -269,8 +289,8 @@ A canary needs a bare BF16 reference for its task that was measured on the
 PyTorch backend. The Qwen3 GSM8K entry is the one gated by
 `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B`,
 so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
-Qwen2, or Mistral checkpoint has such a reference today, so those families are
-covered by their smoke rows until one is added.
+Qwen2, Mistral, or tied Qwen3 checkpoint has such a reference today, so those
+profiles are covered by their smoke rows until one is added.
 
 The rows are registered as `stage: post_merge` entries in
 `tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
