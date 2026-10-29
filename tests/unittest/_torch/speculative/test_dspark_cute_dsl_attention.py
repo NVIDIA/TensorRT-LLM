@@ -479,6 +479,7 @@ def test_preparation_self_jit_covers_dynamic_batches():
 def force_fallback(request, monkeypatch):
     if request.param:
         monkeypatch.setattr(preparation_op, "_get_dspark_arch_str", lambda: None)
+        monkeypatch.setattr(preparation_op, "_is_dspark_rmsnorm_rope_sm_supported", lambda: False)
         monkeypatch.setattr(dspark, "_get_dspark_arch_str", lambda: None)
 
         def unsupported_kernel(*args, **kwargs):
