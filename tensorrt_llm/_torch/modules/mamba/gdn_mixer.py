@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...attention.backends import AttentionMetadata
+from ...autotuner import AutoTuner
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
@@ -37,7 +38,7 @@ from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
 from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..low_m_gemm import low_m_gemm_dispatcher
-from ..low_m_mma_gemm import conv_supported, low_m_mma_gemm
+from ..low_m_mma_gemm import conv_supported, low_m_mma_gemm, warp_mma_supported
 from ..multi_stream_utils import maybe_execute_in_parallel_deferred_join
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
@@ -548,6 +549,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             and self.num_v_heads_per_tp % self.num_k_heads_per_tp == 0
             and self.norm.weight.dtype == torch.bfloat16
         )
+        # The verify in_proj always runs the warp-MMA GEMM with the conv1d update in its epilogue: its low-M race
+        # takes only the tactics that epilogue supports (no split-K), instead of the separate conv1d kernel.
+        self.fuse_conv1d_into_in_proj = self.fused_verify and warp_mma_supported()
 
     def cache_derived_state(self) -> None:
         """Attach downstream static quantization state after loading weights."""
@@ -594,8 +598,23 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             return None
         act = "fp8" if h_fp8 is not None else "quant"
         m = hidden_states.shape[0]
+        if self.fuse_conv1d_into_in_proj and AutoTuner.get().is_tuning_mode:
+            # Tune the race the fused launch below reads (the plain projection tunes the unrestricted one).
+            dispatcher.apply_fp8(
+                hidden_states if h_fp8 is None else h_fp8,
+                qkvz.weight,
+                qkvz.weight_scale,
+                input_scale,
+                hidden_states.dtype,
+                single_cta_k=True,
+            )
         tactic = dispatcher.warp_mma_tactic(
-            m, qkvz.weight, qkvz.weight_scale, input_scale, quantize=h_fp8 is None
+            m,
+            qkvz.weight,
+            qkvz.weight_scale,
+            input_scale,
+            quantize=h_fp8 is None,
+            single_cta_k=self.fuse_conv1d_into_in_proj,
         )
         if tactic is None:
             return None

@@ -281,6 +281,40 @@ def test_attach_force_survives_a_lazy_init_by_an_ordinary_apply(monkeypatch) -> 
     assert output is not None and mock_at.choose_one.call_count == 1
 
 
+@torch.inference_mode()
+def test_single_cta_k_fp8_race(monkeypatch) -> None:
+    """single_cta_k races the warp-MMA tactics without split-K alone (own runner id); an untuned shape takes the
+    heuristic tactic, so the fused user always gets one."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    monkeypatch.setattr(_mod.low_m_mma_gemm, "warp_mma_supported", lambda: True)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._init_runners()
+    plain, single = dispatcher._fp8_runners[True][1], dispatcher._fp8_runners_single_cta_k[True][0]
+    assert dispatcher._fp8_runners_single_cta_k[True] == [single]
+    assert single.unique_id() != plain.unique_id()
+
+    tactics = [(16, 2, 1, 0, 1), (8, 4, 2, 0, 1), (8, 2, 4, 1, 1)]
+    monkeypatch.setattr(_mod, "_warp_mma_tactics", lambda *args, **kwargs: tactics)
+    x = torch.empty((7, 4096), dtype=torch.bfloat16)
+    w = torch.empty((1024, 4096), dtype=torch.float8_e4m3fn)
+    scale = torch.ones((1,), dtype=torch.float32)
+    assert single.get_valid_tactics([x, w], None) == [(16, 2, 1, 0, 1)]
+    assert plain.get_valid_tactics([x, w], None) == tactics
+
+    mock_at = MagicMock(is_tuning_mode=False)
+    mock_at.choose_one.return_value = (single, (16, 2, 1, 0, 1))
+    mock_at.profiling_cache.search_cache.return_value = (False, 0, -1, None)
+    monkeypatch.setattr(_mod, "AutoTuner", MagicMock(get=staticmethod(lambda: mock_at)))
+    runner, tactic, _ = dispatcher._fp8_choice(
+        x, w, scale, scale, torch.bfloat16, single_cta_k=True
+    )
+    assert mock_at.choose_one.call_args[0][1] == [single] and runner is single
+    assert dispatcher.warp_mma_tactic(
+        7, w, scale, scale, single_cta_k=True
+    ) == _mod.low_m_mma_gemm.default_tactic(7, 1024, 4096)
+    assert dispatcher.warp_mma_tactic(7, w, scale, scale) is None
+
+
 # ---------------------------------------------------------------------------
 # _SplitKGemmRunner
 # ---------------------------------------------------------------------------

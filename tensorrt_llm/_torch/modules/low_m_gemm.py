@@ -412,11 +412,13 @@ class _WarpMmaFp8GemmRunner(TunableRunner):
     inputs: as ``_CuBLASFp8GemmRunner``.
     """
 
-    def __init__(self, *, quantize: bool) -> None:
+    def __init__(self, *, quantize: bool, single_cta_k: bool = False) -> None:
         self.quantize = quantize
+        # Only tactics without split-K (ksplit 1): the ones a conv1d epilogue can run with.
+        self.single_cta_k = single_cta_k
 
     def unique_id(self) -> tuple:
-        return ("warp_mma_fp8", self.quantize)
+        return ("warp_mma_fp8", self.quantize) + (("single_cta_k",) if self.single_cta_k else ())
 
     def get_valid_tactics(
         self,
@@ -425,7 +427,8 @@ class _WarpMmaFp8GemmRunner(TunableRunner):
         **kwargs: Any,
     ) -> List[Any]:
         a, w = inputs[0], inputs[1]
-        return _warp_mma_tactics(int(a.shape[0]), int(a.shape[1]), int(w.shape[0]), fp8=True)
+        tactics = _warp_mma_tactics(int(a.shape[0]), int(a.shape[1]), int(w.shape[0]), fp8=True)
+        return [t for t in tactics if t[2] == 1] if self.single_cta_k else tactics
 
     def forward(
         self,
@@ -502,6 +505,8 @@ class LowMGemmDispatcher:
         # whether the input is quantized in the kernel (BF16 input).
         self._warp_mma: Optional[_WarpMmaGemmRunner] = None
         self._fp8_runners: dict = {}
+        # The FP8 race of callers that need a single-CTA K warp-MMA tactic: that runner alone.
+        self._fp8_runners_single_cta_k: dict = {}
         # cuBLAS runners compete in every AutoTuner race as a safety baseline.
         self._cublas_no_bias: Optional[_CuBLASGemmRunner] = None
         self._cublas_with_bias: Optional[_CuBLASGemmRunner] = None
@@ -578,6 +583,10 @@ class LowMGemmDispatcher:
                 _CuBLASFp8GemmRunner(quantize=quantize),
                 _WarpMmaFp8GemmRunner(quantize=quantize),
             ]
+            for quantize in (False, True)
+        }
+        self._fp8_runners_single_cta_k = {
+            quantize: [_WarpMmaFp8GemmRunner(quantize=quantize, single_cta_k=True)]
             for quantize in (False, True)
         }
         self._tuning_config = TuningConfig(
@@ -762,8 +771,10 @@ class LowMGemmDispatcher:
         weight_scale: torch.Tensor,
         input_scale: torch.Tensor,
         out_dtype: torch.dtype,
+        single_cta_k: bool = False,
     ):
-        """(runner, tactic, inputs) of the FP8 race for this call, or None when the shape is no candidate."""
+        """(runner, tactic, inputs) of the FP8 race for this call, or None when the shape is no candidate.
+        ``single_cta_k``: the race of the warp-MMA tactics without split-K alone."""
         if not self._prepared:
             self._init_runners()
         k = int(input_2d.shape[-1])
@@ -783,7 +794,7 @@ class LowMGemmDispatcher:
         inputs = [input_2d, weight, weight_scale, input_scale]
         runner, tactic = AutoTuner.get().choose_one(
             _FP8_AUTOTUNER_OP_NAME,
-            self._fp8_runners[quantize],
+            (self._fp8_runners_single_cta_k if single_cta_k else self._fp8_runners)[quantize],
             self._tuning_config,
             inputs,
             out_dtype=out_dtype,
@@ -797,15 +808,19 @@ class LowMGemmDispatcher:
         weight_scale: torch.Tensor,
         input_scale: torch.Tensor,
         out_dtype: torch.dtype,
+        single_cta_k: bool = False,
     ) -> Optional[torch.Tensor]:
         """``input @ weight.T`` for an FP8 per-tensor (static input scale) projection from the FP8 race, or None
-        for the normal path. A BF16 input is quantized with ``input_scale``."""
+        for the normal path. A BF16 input is quantized with ``input_scale``. ``single_cta_k``: as
+        :meth:`warp_mma_tactic`."""
         if not LOW_M_GEMM_ACTIVE and not self._force:
             return None
         if torch.compiler.is_compiling():
             return None
         input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
-        choice = self._fp8_choice(input_2d, weight, weight_scale, input_scale, out_dtype)
+        choice = self._fp8_choice(
+            input_2d, weight, weight_scale, input_scale, out_dtype, single_cta_k
+        )
         if choice is None:
             return None
         runner, tactic, inputs = choice
@@ -819,6 +834,7 @@ class LowMGemmDispatcher:
         weight_scale: Optional[torch.Tensor] = None,
         input_scale: Optional[torch.Tensor] = None,
         quantize: bool = True,
+        single_cta_k: bool = False,
     ) -> Optional[Tuple[int, ...]]:
         """The warp-MMA tactic this dispatcher's race picked for ``num_rows`` rows of the projection ``weight``
         (the FP8 race for an E4M3 weight, with a BF16 input when ``quantize``; else the BF16 race), or None:
@@ -827,6 +843,10 @@ class LowMGemmDispatcher:
 
         Fused users launch the warp-MMA kernel with this tactic, so they run where the plain projection would,
         with its summation order.
+
+        ``single_cta_k`` (E4M3 weight): the race of the warp-MMA tactics without split-K alone, for a fused user
+        whose epilogue needs one CTA per output tile (``apply_fp8(..., single_cta_k=True)`` tunes it); an untuned
+        shape takes the heuristic tactic, so the fused kernel always runs outside tuning.
         """
         # The race is host code that torch.compile cannot trace.
         if torch.compiler.is_compiling():
@@ -840,7 +860,10 @@ class LowMGemmDispatcher:
             self._init_runners()
         n, k = int(weight.shape[0]), int(weight.shape[1])
         if weight.dtype == torch.float8_e4m3fn:
-            op, runners = _FP8_AUTOTUNER_OP_NAME, self._fp8_runners[quantize]
+            op = _FP8_AUTOTUNER_OP_NAME
+            runners = (self._fp8_runners_single_cta_k if single_cta_k else self._fp8_runners)[
+                quantize
+            ]
             shapes = (
                 torch.Size((num_rows, k)),
                 weight.shape,
@@ -855,7 +878,8 @@ class LowMGemmDispatcher:
             op, runners, shapes, self._tuning_config
         )
         if not hit or runners[runner_id] is not runners[-1] or tactic == -1:
-            return None
+            single = single_cta_k and weight.dtype == torch.float8_e4m3fn
+            return low_m_mma_gemm.default_tactic(num_rows, n, k) if single else None
         return tuple(tactic)
 
 
