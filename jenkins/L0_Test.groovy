@@ -526,10 +526,10 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
         try {
-            sh """
+            sh(label: "Run pytest (isolated_${i})", script: """
                 cd ${llmSrc}/tests/integration/defs && \
                 ${isolateTestCmdLine.join(" ")}
-            """
+            """)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -5207,7 +5207,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
     def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
     def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
     def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
-    sh """
+    sh(label: "Generate rerun test lists (${testType})", script: """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
@@ -5216,7 +5216,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
         --stage-name='${stageName}' \
         ${testListArg} \
         ${unfinishedTestArg}
-    """
+    """)
 
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
@@ -5261,7 +5261,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
                     credentialsId: 'urm-artifactory-creds',
                     usernameVariable: 'ART_USER',
                     passwordVariable: 'ART_PASS')]) {
-                sh """
+                sh(label: "Rerun pytest (${testType}, rerun ${times})", script: """
                     set +e
                     export STAGE_NAME='${stageName}'
                     export PROGRESS_TAR='${rerunProgressTar}'
@@ -5288,7 +5288,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
                     bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
 
                     exit \$rc
-                """
+                """)
             }
         } catch(InterruptedException e) {
             throw e
@@ -6025,7 +6025,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                     credentialsId: 'urm-artifactory-creds',
                                     usernameVariable: 'ART_USER',
                                     passwordVariable: 'ART_PASS')]) {
-                                sh """
+                                sh(label: "Run pytest (regular)", script: """
                                     set +e
                                     export STAGE_NAME='${stageName}'
                                     export PROGRESS_TAR='${progressTar}'
@@ -6056,7 +6056,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                     fi
 
                                     exit \$rc
-                                """
+                                """)
                             }
                         } else {
                             echo "No regular tests to run for stage ${stageName}"

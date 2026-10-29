@@ -234,7 +234,6 @@ def generate_rerun_tests_list(outdir,
     # more than max_failed_tests tests failed or are unfinished.
     if policy is None:
         policy, _ = load_rerun_policy()
-    print(failSignaturesList)
 
     rerun_0_filename = os.path.join(outdir, 'rerun_0.txt')
     rerun_1_filename = os.path.join(outdir, 'rerun_1.txt')
