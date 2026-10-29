@@ -51,11 +51,11 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from ..pyexecutor.sampler.watermark import WatermarkHandler
 from .fused_accept import MAX_DRAFT_LEN, fused_strict_accept
 from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
 from .vocab_parallel import VocabParallelHead, VocabShardedLogits
-from ..pyexecutor.sampler.watermark import WatermarkHandler
 
 
 def supports_sharded_target_sampling(spec_config, mapping) -> bool:
@@ -3774,11 +3774,10 @@ class SpecWorkerBase(nn.Module, ABC):
                 watermark_plans = self._plan_watermark(spec_metadata,
                                                        num_contexts, batch_size,
                                                        draft_tokens)
-                planned = [
-                    plan for plan in watermark_plans if plan is not None
-                ]
+                planned = [plan for plan in watermark_plans if plan is not None]
                 seeds = torch.cat([plan.seeds.reshape(-1) for plan in planned])
-                active = torch.cat([plan.active.reshape(-1) for plan in planned])
+                active = torch.cat(
+                    [plan.active.reshape(-1) for plan in planned])
                 assert seeds.shape[0] == num_tokens, (
                     "watermark windows do not match the sampled rows")
                 probs = self._compute_probs_from_logits(
