@@ -13,8 +13,8 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3, Kimi-K2               | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
 | `DeepseekV4ForCausalLM` [^11]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
-| `DeepseekV41ForCausalLM`            | DeepSeek-V4.1 (text decoder)       | —                                          |
-| `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | —                                          |
+| `DeepseekV41ForCausalLM` [^21]      | DeepSeek-V4.1 (text decoder)       | —                                          |
+| `DeepseekV41ForConditionalGeneration` [^21] | DeepSeek-V4.1              | —                                          |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoeForCausalLM`               | K-EXAONE, K-EXAONE 2.0             | `LGAI-EXAONE/K-EXAONE-236B-A23B`, `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B` |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
@@ -100,6 +100,7 @@ statuses for the same architecture in the two matrices.
 [^18]: NGram and standalone Suffix Automaton (SA) use model-free drafting on the PyTorch backend, so they are not listed in individual entries. This does not imply universal end-to-end support: compatibility depends on each model's multi-token verification and cache-management paths and may be untested or explicitly restricted.
 [^19]: KV cache reuse for hybrid recurrent-attention models requires an explicit recurrent-state snapshot policy, such as `kv_cache_config.mamba_state_config.periodic_snapshot_interval`; the model default disables reuse when no snapshot policy is configured.
 [^20]: Supports text, image, and video inputs, MTP (including with attention data parallelism), and FP8 KV cache. Image and video inputs require `transformers==5.17.0`. Beam search is not supported. See the [GLM-5.3-Flash deployment guide](../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.md) for setup and feature-specific requirements.
+[^21]: Off SM100/SM103, the DeepSeek-V4.1 CSA2 attention projections run in BF16 instead of native MXFP8. SM120/SM121 and other SM10x GPUs are untested.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 

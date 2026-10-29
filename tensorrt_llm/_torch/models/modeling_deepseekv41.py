@@ -40,6 +40,7 @@ from ..attention.backends.sparse.csa2.decoder_replay import (
 )
 from ..attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from ..attention.backends.sparse.csa2.module import DeepseekV41Attention as CSA2Attention
+from ..attention.backends.sparse.csa2.module import supports_native_mxfp8
 from ..attention.backends.sparse.csa2.params import CSA2Mode
 from ..configs.deepseek_v41 import (
     DeepseekV41QuantLayout,
@@ -129,6 +130,11 @@ class DeepseekV41Attention(CSA2Attention):
             raise ValueError("DeepSeek-V4.1 requires CSA2 sparse attention configuration")
         params = sparse_config.to_sparse_params(pretrained_config=config)
         positional = _deepseek_v41_pos_embd_params(config, model_config, layer_idx)
+        projection_quantization = "mxfp8" if supports_native_mxfp8() else "bf16"
+        logger.info_once(
+            f"DeepSeek-V4.1 CSA2 attention projections: {projection_quantization}",
+            key="deepseek_v41_csa2_projection_quantization",
+        )
         super().__init__(
             params.layout,
             layer_idx,
@@ -145,7 +151,7 @@ class DeepseekV41Attention(CSA2Attention):
             eps=config.rms_norm_eps,
             mapping=model_config.mapping,
             sparse_params=params,
-            projection_quantization="mxfp8",
+            projection_quantization=projection_quantization,
             aux_stream=(aux_stream_dict or {}).get(AuxStreamType.MlaCompressor),
             allreduce_strategy=model_config.allreduce_strategy,
             kv_cache_dtype=model_config.extra_attrs.get("kv_cache_dtype", "auto"),
@@ -1690,6 +1696,13 @@ def _v41_load_coverage(
     }
     parameters = {name: param for name, param in model.named_parameters() if included(name)}
     targets = set(parameters) | {name for name, _ in model.named_buffers() if included(name)}
+    # BF16 projections fold the grouped output scale into o_a_proj at load, so
+    # o_a_proj_scale stays a None buffer, which named_buffers() skips.
+    targets |= {
+        f"{name}.o_a_proj_scale"
+        for name, module in modules.items()
+        if isinstance(module, CSA2Attention) and module.projection_quantization == "bf16"
+    }
 
     def enclosing(name: str) -> List[str]:
         parts = name.split(".")

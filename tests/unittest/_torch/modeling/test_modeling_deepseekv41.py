@@ -26,7 +26,7 @@ import torch
 from _torch.attention.sparse.csa2._utils import _FakeMetadata
 from torch import nn
 from transformers import AutoConfig
-from utils.util import skip_blackwell_geforce, skip_pre_blackwell
+from utils.util import skip_blackwell_geforce, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.configs import deepseek_v41 as v41_config
@@ -1224,10 +1224,15 @@ def _audited_loader(model, weights, monkeypatch):
                 torch.empty(tuple(forwarded[key].shape), dtype=torch.float32, device="meta"),
                 requires_grad=False,
             )
-        # The grouped projection loader materializes this registered buffer;
+        # The native grouped projection loader materializes this registered buffer;
         # coverage runs after loading, while this fixture skips the numeric load.
+        # BF16 projections fold the scale into o_a_proj and leave the buffer None.
         scale_key = f"{name}.o_a_proj.weight_scale_inv"
-        if scale_key in forwarded and target.o_a_proj_scale is None:
+        if (
+            scale_key in forwarded
+            and target.o_a_proj_scale is None
+            and target.projection_quantization == "mxfp8"
+        ):
             target.o_a_proj_scale = torch.empty_like(forwarded[scale_key], device="meta")
     loader.assert_load_complete()
     return loader
@@ -1436,7 +1441,7 @@ def test_context_only_checkpoint_filter_preserves_default_full_load():
 # --------------------------------------------------------------------------- #
 
 
-@skip_pre_blackwell
+@skip_pre_hopper
 @requires_cuda
 @requires_release_checkpoint
 def test_release_census_closes_and_coverage_is_empty(
@@ -1821,6 +1826,56 @@ def test_csa2_loader_fuses_shared_compressor_value_then_gate():
     module.compressor.wkv_gate = None
     unexpected, _ = v41._v41_load_coverage(root, keys)
     assert unexpected == ["model.layers.0.self_attn.compressor.wkv_gate.weight"]
+
+
+@pytest.mark.parametrize("projection_quantization", ["bf16", "mxfp8"])
+def test_csa2_grouped_output_scale_passes_load_coverage(monkeypatch, projection_quantization):
+    monkeypatch.setattr(
+        v41,
+        "_dequantize_block32",
+        lambda weight, scale: (
+            weight.float() * scale.float().repeat_interleave(32, 0).repeat_interleave(32, 1)
+        ).bfloat16(),
+    )
+    native = projection_quantization == "mxfp8"
+    module = v41.DeepseekV41Attention.__new__(v41.DeepseekV41Attention)
+    torch.nn.Module.__init__(module)
+    module.o_a_proj = nn.Parameter(
+        torch.empty(1, 128, 128, dtype=torch.float8_e4m3fn if native else torch.bfloat16),
+        requires_grad=False,
+    )
+    module.register_buffer("o_a_proj_scale", None)
+    module.num_groups, module.o_lora_rank = 1, 128
+    module.mapping = Mapping()
+    module.projection_quantization = projection_quantization
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(128, 128, generator=generator).to(torch.float8_e4m3fn)
+    scale = torch.exp2(torch.randint(-4, 0, (4, 4), generator=generator).float())
+    remapped = v41._remap_deepseek_v41_checkpoint_keys(
+        {
+            "layers.0.attn.wo_a.weight": weight,
+            "layers.0.attn.wo_a.scale": scale.to(torch.float8_e8m0fnu),
+        },
+        num_hidden_layers=1,
+    )
+    prefix = "model.layers.0.self_attn."
+    keys = sorted(remapped)
+    assert keys == [prefix + "o_a_proj", prefix + "o_a_proj.weight_scale_inv"]
+    module.load_weights([{key.removeprefix(prefix): value for key, value in remapped.items()}])
+    if not native:
+        folded = remapped[keys[0]].float() * remapped[keys[1]].float()
+        torch.testing.assert_close(module.o_a_proj[0], folded.bfloat16(), atol=0, rtol=0)
+        assert module.o_a_proj_scale is None
+    root = torch.nn.Module()
+    root.model = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.self_attn = module
+    root.model.layers = torch.nn.ModuleList([layer])
+    assert v41._v41_load_coverage(root, keys) == ([], [])
+    if native:
+        module.o_a_proj_scale = None
+        unexpected, _ = v41._v41_load_coverage(root, keys)
+        assert unexpected == [keys[1]]
 
 
 @pytest.mark.parametrize("malformation", ["short", "transposed"])
@@ -2973,6 +3028,75 @@ def test_v41_attention_topology_has_no_per_head_query_norm() -> None:
     assert DeepseekV4Attention.q_b_norm_enabled is True
 
     assert not issubclass(DeepseekV41Attention, DeepseekV4Attention)
+
+
+@requires_cuda
+def test_attention_uses_native_mxfp8_projections_only_on_sm100_and_sm103():
+    model_config, _ = _tiny_v41_model_config()
+    attention = DeepseekV41Attention(model_config, layer_idx=0)
+    native = torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    assert attention.projection_quantization == ("mxfp8" if native else "bf16")
+    del attention
+    torch.cuda.empty_cache()
+
+
+def _mock_csa2_device(monkeypatch, capability, gemm_compiled, cuda_available=True):
+    trtllm_ops = SimpleNamespace(mxfp8_mxfp8_gemm=Mock()) if gemm_compiled else SimpleNamespace()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(torch.ops, "trtllm", trtllm_ops)
+
+
+# The CSA2 module can only be built on a GPU, so this records the projection
+# the adapter requests instead of constructing it.
+@pytest.mark.parametrize(
+    ("capability", "gemm_compiled", "expected"),
+    [
+        ((9, 0), True, "bf16"),
+        ((10, 0), True, "mxfp8"),
+        ((10, 3), True, "mxfp8"),
+        ((12, 0), True, "bf16"),
+        ((10, 0), False, "bf16"),
+    ],
+)
+def test_attention_projection_quantization_follows_device_capability(
+    monkeypatch, capability, gemm_compiled, expected
+):
+    requested = []
+    logged = []
+
+    def record_csa2_init(self, *args, projection_quantization, **kwargs):
+        nn.Module.__init__(self)
+        requested.append(projection_quantization)
+        self.o_b_proj = SimpleNamespace()
+
+    model_config, _ = _tiny_v41_model_config()
+    _mock_csa2_device(monkeypatch, capability, gemm_compiled)
+    monkeypatch.setattr(v41.CSA2Attention, "__init__", record_csa2_init)
+    monkeypatch.setattr(v41.logger, "_appeared_keys", set())
+    monkeypatch.setattr(v41.logger, "log", lambda severity, *msg: logged.append((severity, msg)))
+    DeepseekV41Attention(model_config, layer_idx=0)
+    DeepseekV41Attention(model_config, layer_idx=1)
+    assert requested == [expected, expected]
+    assert logged == [(v41.logger.INFO, (f"DeepSeek-V4.1 CSA2 attention projections: {expected}",))]
+
+
+@pytest.mark.parametrize(
+    ("cuda_available", "capability", "gemm_compiled", "error", "message"),
+    [
+        (False, (10, 0), True, ValueError, "CSA2 native MXFP8 projections require SM100/SM103"),
+        (True, (9, 0), True, ValueError, "CSA2 native MXFP8 projections require SM100/SM103"),
+        (True, (10, 0), False, RuntimeError, "CSA2 native MXFP8 GEMM is not compiled"),
+    ],
+)
+def test_csa2_rejects_native_mxfp8_projections_the_device_cannot_run(
+    monkeypatch, cuda_available, capability, gemm_compiled, error, message
+):
+    model_config, _ = _tiny_v41_model_config()
+    _mock_csa2_device(monkeypatch, capability, gemm_compiled, cuda_available)
+    monkeypatch.setattr(v41, "supports_native_mxfp8", lambda: True)
+    with pytest.raises(error, match=f"^{message}$"):
+        DeepseekV41Attention(model_config, layer_idx=0)
 
 
 @skip_pre_blackwell
