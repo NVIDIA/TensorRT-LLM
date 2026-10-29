@@ -1723,8 +1723,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         fast paths (``spec_decode_fast_paths``): greedy and temperature-only
         tokens of vocabulary-sharded logits through the TP key exchange, the
         temperature-only CUDA graph variant, the overlap loop on the execution
-        stream, the hoisted position ids and the MTP-Eagle draft loop's step-0
-        epilogue. A model enables them where they are validated."""
+        stream, the hoisted position ids, the MTP-Eagle draft loop's step-0
+        epilogue and the recorded steady decode-step prepare. A model enables
+        them where they are validated."""
         return False
 
     def __init__(self,

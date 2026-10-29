@@ -767,8 +767,9 @@ class DecoderInputPreparer:
         """Take the runner's CUDA graph runners (built after this preparer, which they read).
 
         Also builds the steady one-model MTP decode prepare when it applies to
-        this engine: one-engine linear speculative decoding with the overlap
-        scheduler, no attention DP, beams or helix CP.
+        this engine: one-engine linear speculative decoding of a model with the
+        speculative fast paths, with the overlap scheduler, no attention DP,
+        beams or helix CP.
         """
         self.cuda_graph_runner = cuda_graph_runner
         self.breakable_cuda_graph_runner = breakable_cuda_graph_runner
@@ -776,6 +777,7 @@ class DecoderInputPreparer:
         if (
             spec_config is not None
             and self._config.is_spec_decode
+            and self._config.spec_decode_fast_paths
             and spec_config.spec_dec_mode.use_one_engine()
             and spec_config.is_linear_tree
             and not self._config.disable_overlap_scheduler
