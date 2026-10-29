@@ -138,8 +138,6 @@ MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 KITMAKER_CREDENTIALS_ID = env.kitmakerCredentialsId ? env.kitmakerCredentialsId : "svc_tensorrt_kitmaker_api_token"
 KITMAKER_DRY_RUN_PIC_EMAIL = env.kitmakerDryRunPicEmail ? env.kitmakerDryRunPicEmail : "kefu@nvidia.com"
 KITMAKER_PUBLISH_TO = env.kitmakerPublishTo ? env.kitmakerPublishTo : "both_devzone_pypi"
-RELEASE_SCRIPT_REPO = env.releaseScriptRepo ? env.releaseScriptRepo.trim() : ""
-RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim() : ""
 
 // GPU types that require open driver
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
@@ -3245,6 +3243,8 @@ def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 // BOLT_CONSUME_ENABLED the same way.
 BOLT_PINNED_REF = ""
 BOLT_TEST_BOLTED_TARBALL = false
+// Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
+TRTLLM_RELEASE_REPO = null
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3262,6 +3262,7 @@ def globalVars = [
     (BOLT_PUBLISH_VARIANT): false,
     (BOLT_PROFILE_BRANCH): "",
     (JOB_TYPE): null,
+    "TRTLLM_RELEASE_REPO": null,
 ]
 
 class GlobalState {
@@ -5742,8 +5743,11 @@ def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
     def kitmakerDryRunMetadata = null
     stage("Kitmaker Publish Dry Run") {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            if (!TRTLLM_RELEASE_REPO?.url || !TRTLLM_RELEASE_REPO?.commit) {
+                error "TRTLLM_RELEASE_REPO is missing from globalVars; it is resolved by L0_MergeRequest"
+            }
             sh "rm -rf ${releaseScriptsDir}"
-            trtllm_utils.checkoutSource(RELEASE_SCRIPT_REPO, RELEASE_SCRIPT_COMMIT, releaseScriptsDir, false, true)
+            trtllm_utils.checkoutSource(TRTLLM_RELEASE_REPO.url, TRTLLM_RELEASE_REPO.commit, releaseScriptsDir, false, true)
             trtllm_utils.llmExecStepWithRetry(
                 pipeline,
                 script: "${python_bin} -m pip install -r ${releaseScriptsDir}/requirements.txt")
@@ -5769,12 +5773,6 @@ def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
         }
     }
     return kitmakerDryRunMetadata
-}
-
-
-def isKitmakerWheelDryRunEnabled()
-{
-    return RELEASE_SCRIPT_REPO && RELEASE_SCRIPT_COMMIT
 }
 
 
@@ -5901,7 +5899,8 @@ def runLLMBuild(
     is_dlfw=false,
     boltConsume=false,
     boltProfileRef="",
-    boltProfileBranch="")
+    boltProfileBranch="",
+    kitmakerDryRun=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -6009,8 +6008,8 @@ def runLLMBuild(
     def kitmakerDryRunMetadata = null
     if (version_override?.contains("+")) {
         echo "Skipping Kitmaker wheel dry run for local version '${version_override}'"
-    } else if (!isKitmakerWheelDryRunEnabled()) {
-        echo "Skipping Kitmaker wheel dry run because releaseScriptRepo or releaseScriptCommit is not set"
+    } else if (!kitmakerDryRun) {
+        echo "Skipping Kitmaker wheel dry run outside post-merge"
     } else {
         def kitmakerPython = "tensorrt_llm/.venv-${pythonVersionFromCpver(cpver)}/bin/python3"
         kitmakerDryRunMetadata = runKitmakerWheelDryRun(pipeline, uploadedWheelPath, kitmakerPython, KITMAKER_PUBLISH_TO)
@@ -6461,6 +6460,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
     BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
+    TRTLLM_RELEASE_REPO = globalVars["TRTLLM_RELEASE_REPO"]
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
@@ -7057,11 +7057,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             // behaviour.
             def boltProfileRef = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
             def boltProfileBranch = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
+            def kitmakerDryRun = globalVars[JOB_TYPE] == "L0_PostMerge"
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
                     pipeline, cpu_arch, values[3], "", versionOverride, cpver,
-                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch)
+                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch,
+                    kitmakerDryRun)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.

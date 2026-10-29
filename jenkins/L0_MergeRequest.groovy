@@ -332,6 +332,11 @@ def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 def RELEASE_TARGET = "release_target"
 @Field
 def JOB_TYPE = "job_type"
+// Release scripts repository (nspect.py, kitmaker_wheel.py) as [url: ..., commit: ...],
+// resolved once in setupPipelineEnvironment from the TRTLLM_RELEASE_REPO credential and
+// jenkins/ci_versions.properties.
+@Field
+def TRTLLM_RELEASE_REPO = "TRTLLM_RELEASE_REPO"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (BASE_COMMIT): gitlabParamsFromBot.get('base_commit', null),
@@ -349,6 +354,7 @@ def globalVars = [
     (BOLT_PROFILE_BRANCH): "",
     (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
     (JOB_TYPE): env.JOB_BASE_NAME,
+    (TRTLLM_RELEASE_REPO): null,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
@@ -547,6 +553,23 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
+    globalVars[TRTLLM_RELEASE_REPO] = getReleaseRepo()
+}
+
+def getReleaseRepo()
+{
+    def ciVersions = readProperties file: "${LLM_ROOT}/jenkins/ci_versions.properties"
+    def commit = ciVersions.TRTLLM_RELEASE_REPO
+    def overrideCommit = env."TRTLLM_RELEASE_REPO_OVERRIDE_${commit}"
+    if (overrideCommit) {
+        echo "Overriding TRTLLM_RELEASE_REPO commit with value from environment variable \$TRTLLM_RELEASE_REPO_OVERRIDE_${commit}: ${overrideCommit}"
+        commit = overrideCommit
+    }
+    def url = ""
+    withCredentials([string(credentialsId: "TRTLLM_RELEASE_REPO", variable: "RELEASE_REPO_URL")]) {
+        url = RELEASE_REPO_URL
+    }
+    return [url: url, commit: commit]
 }
 
 def checkoutTargetBranchFile(String targetBranch, String targetCommit, String sourcePath, String outputPrefix)

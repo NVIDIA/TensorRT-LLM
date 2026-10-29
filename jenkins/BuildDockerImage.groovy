@@ -99,6 +99,8 @@ def MAINTENANCE_ENTRIES = "maintenance_entries"
 def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def TRTLLM_RELEASE_REPO = "TRTLLM_RELEASE_REPO"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -112,6 +114,8 @@ def globalVars = [
     // without saying so.
     (BOLT_PROFILE_REF): "",
     (BOLT_PROFILE_BRANCH): "",
+    // Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
+    (TRTLLM_RELEASE_REPO): null,
 ]
 
 @Field
@@ -1152,15 +1156,11 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install 'requests>=2.32.4,<3'")
-                            def nspect_commit = "f1a83d7cedc4cae9ecd592b3a8458e006d49d9c2"
-                            def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
-                            if (override_commit) {
-                                echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
-                            nspect_commit = override_commit
+                            def releaseRepo = globalVars[TRTLLM_RELEASE_REPO]
+                            if (!releaseRepo?.url || !releaseRepo?.commit) {
+                                error "TRTLLM_RELEASE_REPO is missing from globalVars; it is resolved by L0_MergeRequest"
                             }
-                            withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
-                                trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
-                            }
+                            trtllm_utils.checkoutSource(releaseRepo.url, releaseRepo.commit, "nspect")
                             def nspect_env = params.nspect_env ? params.nspect_env : "prod"
                             def nspectReleaseVersion = params.program_version_name ?: "PostMerge"
                             def cmd = """./nspect/nspect.py \
