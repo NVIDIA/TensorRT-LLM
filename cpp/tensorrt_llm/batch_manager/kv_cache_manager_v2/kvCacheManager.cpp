@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/kvCacheManager.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -1418,12 +1419,48 @@ void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
     }
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* locked = nullptr;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> lockedPages;
+    TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratch = nullptr;
+    TypedVec<PoolGroupIndex, ScratchSlotLockList> scratchSlots;
     if (level == kHotLevel && mStorage->isInPlaceRelocation())
     {
         lockedPages = _gatherLockedHotPages();
         locked = &lockedPages;
+        scratchSlots = _gatherActiveScratchSlots();
+        scratch = &scratchSlots;
     }
-    mStorage->adjustCacheLevel(level, quota, ratioList, persistent, locked);
+    // Relocated scratch slots change only their locks; each cache's index mirror (which may be a
+    // caller-bound buffer) is rewritten from them afterwards, even if the adjust stops part way.
+    auto republishScratch = FuncGuard(
+        [this, scratch]()
+        {
+            if (scratch == nullptr)
+                return;
+            for (KvCache* kvc : mLivingKvCaches)
+            {
+                if (!kvc->isActive())
+                    continue;
+                for (auto& slots : kvc->scratchSlotLocks())
+                    slots.republish();
+            }
+        });
+    mStorage->adjustCacheLevel(level, quota, ratioList, persistent, locked, scratch);
+}
+
+TypedVec<PoolGroupIndex, ScratchSlotLockList> KvCacheManager::_gatherActiveScratchSlots() const
+{
+    TypedVec<PoolGroupIndex, ScratchSlotLockList> result(mStorage->numPoolGroups(kHotLevel));
+    for (KvCache* kvc : mLivingKvCaches)
+    {
+        if (!kvc->isActive())
+            continue;
+        auto& perLifeCycle = kvc->scratchSlotLocks();
+        for (LifeCycleId lc{0}; lc < perLifeCycle.size(); ++lc)
+        {
+            for (auto& lock : perLifeCycle[lc].locksForRelocation())
+                result[mStorage->getPoolGroupIndex(kHotLevel, lc)].push_back(&lock);
+        }
+    }
+    return result;
 }
 
 TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLockedHotPages() const

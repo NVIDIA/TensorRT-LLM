@@ -189,11 +189,6 @@ void KVCacheManagerConfig::validate() const
     }
 
     poolRebalance.validate();
-    if (poolRebalance.inPlaceRelocation && swaScratchReuse.has_value())
-    {
-        // Active caches hold scratch slots outside the page machinery; relocating them is not implemented.
-        throw std::invalid_argument("PoolRebalanceConfig: in_place_relocation does not support SWA scratch reuse");
-    }
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.

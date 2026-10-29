@@ -37,6 +37,9 @@ FULL_LAYER, SWA_LAYER = 0, 1
 FULL_BUF_BYTES = 16 << 10  # slot: K+V = 32 KiB
 SWA_BUF_BYTES = 40 << 10  # slot: K+V = 80 KiB
 SWA_WINDOW = 2 * BLOCKS_PER_REQUEST * TOKENS_PER_BLOCK  # wider than any sequence: no stale blocks
+# With SWA scratch reuse: a narrow window, so most of a request's SWA blocks are stale by the end of its
+# prefill and are written to scratch slots instead of pages.
+SCRATCH_SWA_WINDOW = 2 * TOKENS_PER_BLOCK
 QUOTA = 128 << 20
 
 
@@ -62,12 +65,17 @@ def _pattern(seed: int, ordinal: int, lc: int) -> int:
     return (seed * 1000 + ordinal) * 4 + lc + 1
 
 
+def _scratch_pattern(seed: int, j: int, lc: int) -> int:
+    return _pattern(seed, 500 + j, lc)
+
+
 class _Arena:
     """A manager plus the bookkeeping needed to check its arena."""
 
-    def __init__(self, drop_unreferenced: bool, ratio: list[float], in_place: bool = False):
+    def __init__(self, drop_unreferenced: bool, ratio: list[float], in_place: bool = False, scratch: bool = False):
         torch.zeros(1, device="cuda")  # the manager needs a current CUDA context
         self.in_place = in_place
+        self.scratch = scratch
         layers = [
             kvm.AttentionLayerConfig(
                 layer_id=FULL_LAYER,
@@ -82,7 +90,7 @@ class _Arena:
                     kvm.BufferConfig(role="key", size=SWA_BUF_BYTES),
                     kvm.BufferConfig(role="value", size=SWA_BUF_BYTES),
                 ],
-                sliding_window_size=SWA_WINDOW,
+                sliding_window_size=SCRATCH_SWA_WINDOW if scratch else SWA_WINDOW,
             ),
         ]
         config = kvm.KVCacheManagerConfig(
@@ -96,6 +104,7 @@ class _Arena:
                 drop_unreferenced_on_rebalance=drop_unreferenced,
                 in_place_relocation=in_place,
             ),
+            swa_scratch_reuse=kvm.SwaScratchReuseConfig() if scratch else None,
         )
         self.mgr = kvm.KVCacheManager(config)
         self.stream = torch.cuda.current_stream().cuda_stream
@@ -124,23 +133,39 @@ class _Arena:
         nbytes = self.slot_bytes[lc]
         return torch.as_tensor(_DevicePtr(self.base(layer) + slot * nbytes, nbytes), device="cuda")
 
+    def scratch_slots(self, kv) -> dict[int, list[int]]:
+        """{lc: scratch slot ids} of an ACTIVE cache (SWA scratch reuse)."""
+        if not self.scratch:
+            return {}
+        out = {}
+        for lc in self.lcs.values():
+            desc = kv.get_scratch_desc(lc)
+            if desc:
+                out[lc] = [int(i) for i in desc.slot_ids]
+        return out
+
     def indices(self, kv) -> dict[int, list[int]]:
         # The binding returns an int32 numpy view; plain ints keep address arithmetic 64-bit.
         return {lc: [int(i) for i in kv.get_base_page_indices(lc)] for lc in self.lcs.values()}
 
     # ---- workload -------------------------------------------------------------------------
 
-    def add_request(self, seed: int, commit: bool) -> object:
+    def add_request(self, seed: int, commit: bool, scratch: bool = False) -> object:
         tokens = _tokens(seed)
         kv = self.mgr.create_kv_cache(input_tokens=tokens, id=seed)
         self.bufs[seed] = {lc: np.full(BLOCKS_PER_REQUEST, -2, dtype=np.int32) for lc in self.lcs.values()}
         self.bind_bufs(seed, kv)
         assert kv.resume(self.stream), f"resume failed for request {seed}"
+        if scratch:
+            kv.enable_swa_scratch_reuse = True
         assert kv.resize(len(tokens)), f"resize failed for request {seed}"
         for lc, idx in self.indices(kv).items():
             for ordinal, slot in enumerate(idx):
                 if slot != kvm.BAD_PAGE_INDEX:
                     self.slot_view(lc, slot).fill_(_pattern(seed, ordinal, lc))
+        for lc, slots in self.scratch_slots(kv).items():
+            for j, slot in enumerate(slots):
+                self.slot_view(lc, slot).fill_(_scratch_pattern(seed, j, lc))
         torch.cuda.synchronize()
         if commit:
             kv.commit(tokens)
@@ -202,6 +227,8 @@ class _Arena:
                                f"req {seed} lc {lc}: bound page-index buffer is stale")
                 b, e = windows[self.pg_of_lc[lc]]
                 for ordinal, slot in enumerate(idx):
+                    if self.scratch and slot == kvm.BAD_PAGE_INDEX:
+                        continue  # stale SWA block: written to a scratch slot, checked below
                     tc.assertTrue(b <= slot < e, f"req {seed} lc {lc} block {ordinal}: {slot} not in [{b}, {e})")
                     expected = _pattern(seed, ordinal, lc)
                     view = self.slot_view(lc, slot)
@@ -214,6 +241,28 @@ class _Arena:
                         if old != slot:
                             moved += 1
                             tc.assertFalse(b <= old < e, f"block at {old} moved although still inside its window")
+        return moved
+
+    def check_scratch(self, tc: unittest.TestCase, before: dict | None = None) -> int:
+        """Check every live request's scratch slots (inside the window, data intact); return how many
+        changed slot since `before` ({seed: {lc: slot ids}})."""
+        moved = 0
+        windows = self.windows()
+        for seed, (kv, _) in self.live.items():
+            for lc, slots in self.scratch_slots(kv).items():
+                b, e = windows[self.pg_of_lc[lc]]
+                if before is not None:
+                    tc.assertEqual(len(slots), len(before[seed][lc]), f"req {seed} lc {lc}: scratch slot count changed")
+                for j, slot in enumerate(slots):
+                    tc.assertTrue(b <= slot < e, f"req {seed} lc {lc} scratch {j}: {slot} not in [{b}, {e})")
+                    tc.assertTrue(
+                        bool((self.slot_view(lc, slot) == _scratch_pattern(seed, j, lc)).all()),
+                        f"req {seed} lc {lc} scratch {j} at slot {slot}: data corrupted",
+                    )
+                    if before is not None and before[seed][lc][j] != slot:
+                        moved += 1
+                        old = before[seed][lc][j]
+                        tc.assertFalse(b <= old < e, f"scratch slot {old} moved although still inside its window")
         return moved
 
     def check_cached(self, tc: unittest.TestCase) -> int:
@@ -350,6 +399,45 @@ class TestCopyBasedRebalancing(unittest.TestCase):
             print(f"  full={fs:.2f}: windows {wa} / in place {wa_i}; moved {moved_s} / {moved_i}; "
                   f"cached matched {cached_s} / {cached_i}")
         self.assertGreater(sum(h[3] for h in in_place), 0, "no live block was relocated in place")
+
+    def test_in_place_rebalance_moves_scratch_slots(self):
+        """SWA scratch reuse with in-place relocation: active prefills hold scratch slots outside the
+        page machinery; those outside the SWA group's new window are copied into it and the caches'
+        scratch descriptors report the new slots. SWA ids are issued from the top of the window
+        down: placeholders first (closed afterwards, leaving holes at the top), then the live
+        requests, nearer the moving edge."""
+        arena = _Arena(drop_unreferenced=False, ratio=[0.4, 0.6], in_place=True, scratch=True)
+        try:
+            placeholders = [arena.add_request(seed, commit=False) for seed in range(200, 240)]
+            for seed in range(300, 330):
+                arena.live[seed] = (arena.add_request(seed, commit=False, scratch=True), _tokens(seed))
+            for kv in placeholders:
+                kv.close()
+            torch.cuda.synchronize()
+            swa_lc = arena.lcs[SWA_LAYER]
+            num_scratch = sum(len(arena.scratch_slots(kv).get(swa_lc, [])) for kv, _ in arena.live.values())
+            self.assertGreater(num_scratch, 0, "the live requests hold no scratch slots")
+            arena.check_live(self)
+            arena.check_scratch(self)
+
+            pg_full = arena.pg_of_lc[arena.lcs[FULL_LAYER]]
+            moved_pages = moved_scratch = 0
+            for full_share in (0.75, 0.4, 0.78):
+                target = [0.0, 0.0]
+                target[pg_full], target[1 - pg_full] = full_share, 1.0 - full_share
+                windows_before = arena.windows()
+                before = {seed: arena.indices(kv) for seed, (kv, _) in arena.live.items()}
+                before_scratch = {seed: arena.scratch_slots(kv) for seed, (kv, _) in arena.live.items()}
+                arena.rebalance(target)
+                arena.check_layout(self)
+                moved_pages += arena.check_live(self, before)
+                n = arena.check_scratch(self, before_scratch)
+                moved_scratch += n
+                print(f"  full={full_share:.2f} windows {windows_before} -> {arena.windows()}: "
+                      f"{num_scratch} scratch slots, {n} moved")
+            self.assertGreater(moved_scratch, 0, "no scratch slot was relocated")
+        finally:
+            arena.close()
 
     def test_drop_unreferenced(self):
         self._check_drop(in_place=False)
