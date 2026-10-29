@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from ...llmapi.llm_args import DecodingBaseConfig
+    from ...quantization.utils.fp8_utils import Fp8BlockScaleWeightSliceCache
 
 # Identity-RoPE table positions for the MLA backends. K3 is NoPE (the table
 # holds cos=1/sin=0), but the chunked-context path indexes the table by
@@ -859,6 +860,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         self.out_features = out_features
         self._weights_transformed = True
         self._fused_projection = None
+        self._output_slice_cache: Optional[Fp8BlockScaleWeightSliceCache] = None
         # Buffers (not parameters): these are the module's weights post-load;
         # there is nothing further to load into them and they must not be
         # touched by any later autocast/dtype move.
@@ -944,6 +946,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
 
     def transform_weights(self) -> None:
         if not self._weights_transformed:
+            self._output_slice_cache = None
             self.weight, self.weight_scale = self._prepare_weights(self.weight, self.weight_scale)
             if self._fused_projection is not None:
                 owner_ref, start = self._fused_projection
@@ -974,6 +977,22 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         else:
             self._low_m, self._low_m_weight_scale = Fp8BlockScaleLowMGemmRange(), None
 
+    def forward_slice(self, x: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        self.prepare_output_slice(start, end)
+        assert self._output_slice_cache is not None
+        weight, scale, crop = self._output_slice_cache.get(self.weight, start, end)
+        out = self._apply_with_weights(x, weight, scale)
+        return out[..., crop : crop + end - start].contiguous()
+
+    def prepare_output_slice(self, start: int, end: int) -> None:
+        """Prepare fixed output-slice scales after checkpoint transformation."""
+        from ...quantization.utils.fp8_utils import Fp8BlockScaleWeightSliceCache
+
+        self.transform_weights()
+        if self._output_slice_cache is None:
+            self._output_slice_cache = Fp8BlockScaleWeightSliceCache()
+        self._output_slice_cache.prepare(self.weight, self.weight_scale, start, end)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -982,13 +1001,19 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        out_shape = (*x.shape[:-1], self.out_features)
+        return self._apply_with_weights(x, self.weight, self.weight_scale)
+
+    def _apply_with_weights(
+        self, x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+    ) -> torch.Tensor:
+        out_shape = (*x.shape[:-1], weight.shape[0])
         x_flat = x.reshape(-1, x.shape[-1])
         if not _rubin_mxfp8_is_available():
+            low_m = self._low_m if weight is self.weight else Fp8BlockScaleLowMGemmRange()
             out = fp8_block_scale_ue8m0_gemm(
-                x_flat, self.weight, self.weight_scale, self._low_m, output_dtype=x.dtype
+                x_flat, weight, weight_scale, low_m, output_dtype=x.dtype
             )
-        elif self._low_m.serves(x_flat):
+        elif weight is self.weight and self._low_m.serves(x_flat):
             out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
                 x_flat, self.weight, self._low_m_weight_scale
             )
@@ -996,9 +1021,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
             out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
                 act_fp8,
-                self.weight,
+                weight,
                 act_scale,
-                self.weight_scale,
+                weight_scale,
                 output_dtype=torch.bfloat16,
                 fine_grained_m=True,
             )

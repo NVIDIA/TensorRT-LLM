@@ -21,7 +21,7 @@
 # Usage: build.sh <repo_dir> [build_wheel_args...]
 #
 # Default build_wheel.py flags (used when no extra args are provided):
-#   -a "100-real" --nvtx
+#   -a "100" --nvtx
 # Any extra arguments after repo_dir are forwarded verbatim to build_wheel.py.
 
 set -euo pipefail
@@ -37,6 +37,6 @@ if [[ $# -gt 0 ]]; then
 else
     echo "[build.sh] Running default build"
     python3 ./scripts/build_wheel.py \
-        -a "100-real" \
+        -a "100" \
         --nvtx
 fi

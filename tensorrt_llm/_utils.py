@@ -746,6 +746,13 @@ def is_sm_100f(sm_version=None):
 
 
 @lru_cache(maxsize=1)
+def is_sm_120f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version >= 120 and sm_version < 130
+
+
+@lru_cache(maxsize=1)
 def is_flashinfer_gdn_prefill_supported_arch(sm_version=None):
     """Whether FlashInfer ships the GDN (gated-delta-rule) chunk-prefill kernel.
 
