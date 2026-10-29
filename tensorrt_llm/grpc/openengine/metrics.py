@@ -94,6 +94,10 @@ class RequestMetrics:
         # An accepted request that closes before a terminal result is cancelled.
         self._outcome = RpcOutcome.CANCELLED
 
+    def unavailable(self) -> None:
+        if not self._finished:
+            self._outcome = RpcOutcome.UNAVAILABLE
+
     def observe_exception(self, error: BaseException) -> None:
         if self._finished:
             return
@@ -102,7 +106,7 @@ class RequestMetrics:
         if isinstance(error, asyncio.CancelledError):
             self._outcome = RpcOutcome.CANCELLED
         elif isinstance(error, CoordinationError):
-            self._outcome = RpcOutcome.UNAVAILABLE
+            self.unavailable()
         else:
             self._outcome = RpcOutcome.ENGINE_ERROR
 

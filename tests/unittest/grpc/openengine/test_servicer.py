@@ -1604,8 +1604,9 @@ def test_oversized_prompt_logprobs_are_refused_not_built(error_on_final_result: 
     assert outcomes == [("aggregated", "engine_error")]
 
 
-def test_generate_reserve_failure_is_unavailable() -> None:
-    """A coordination failure before submission is not an engine failure."""
+@pytest.mark.parametrize("stopping", [False, True])
+def test_generate_reserve_failure_is_unavailable(stopping) -> None:
+    """Shutdown and coordination failures report unavailable before submission."""
     from tensorrt_llm.grpc.openengine.coordinator import CoordinationError
 
     class Frontend:
@@ -1615,7 +1616,11 @@ def test_generate_reserve_failure_is_unavailable() -> None:
     outcomes = []
     metrics = SimpleNamespace(record_outcome=lambda *args: outcomes.append(args))
     servicer = OpenEngineInferenceServicer(
-        _FakeLlm([]), "test-model", frontend=Frontend(), metrics=metrics
+        _FakeLlm([]),
+        "test-model",
+        frontend=Frontend(),
+        metrics=metrics,
+        is_stopping=lambda: stopping,
     )
     context = FakeServicerContext()
     request = generation_pb2.GenerateRequest(

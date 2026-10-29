@@ -16,7 +16,7 @@ class OpenEngineHealthServicer(health_pb2_grpc.HealthServicer):
     def __init__(self) -> None:
         self._statuses = {
             service: health_pb2.HealthCheckResponse.NOT_SERVING
-            for service in ("", "inference", "liveness")
+            for service in ("", "readiness", "liveness")
         }
         self._changed = asyncio.Condition()
         self._shutting_down = False
@@ -51,10 +51,15 @@ class OpenEngineHealthServicer(health_pb2_grpc.HealthServicer):
 
     async def set(self, service: str, status: int) -> None:
         async with self._changed:
-            if self._shutting_down or self._statuses.get(service) == status:
+            fatal_liveness = (
+                service == "liveness" and status == health_pb2.HealthCheckResponse.NOT_SERVING
+            )
+            if (self._shutting_down and not fatal_liveness) or self._statuses.get(
+                service
+            ) == status:
                 return
             self._statuses[service] = status
-            if service == "inference":
+            if service == "readiness":
                 self._statuses[""] = status
             self._changed.notify_all()
 
@@ -63,6 +68,6 @@ class OpenEngineHealthServicer(health_pb2_grpc.HealthServicer):
             if self._shutting_down:
                 return
             self._shutting_down = True
-            self._statuses["inference"] = health_pb2.HealthCheckResponse.NOT_SERVING
+            self._statuses["readiness"] = health_pb2.HealthCheckResponse.NOT_SERVING
             self._statuses[""] = health_pb2.HealthCheckResponse.NOT_SERVING
             self._changed.notify_all()

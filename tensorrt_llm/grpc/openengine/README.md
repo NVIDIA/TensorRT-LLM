@@ -26,18 +26,28 @@ trtllm-serve <model> \
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
 
+## Engine shutdown
+
+`Control.Shutdown` requests orderly shutdown of the entire engine serving group. Pass the intended lifetime's `GetServerInfo.instance_id` as `ShutdownRequest.expected_instance_id`. Missing IDs return `INVALID_ARGUMENT`; mismatches return `FAILED_PRECONDITION` without changing the running group. Identity is checked again by the launcher when an attached frontend forwards the request. The ID is a lifetime fence, not an authentication credential.
+
+`ACCEPTED` acknowledges that the launcher has committed to shutdown and closed new inference admission. `ALREADY_STOPPING` acknowledges a repeat for that same lifetime. Neither response means that process exit or engine cleanup has completed. Accepted shutdown proceeds after RPC cancellation or a lost reply. After an uncertain outcome, check lifecycle and identity and retry only with the original expected ID. Older servers return `UNIMPLEMENTED`. An embedded `OpenEngineServer` without an injected engine lifecycle owner also returns `UNIMPLEMENTED`; stopping its listener alone would leave the engine running.
+
+Shutdown uses the same stop event and cleanup path as SIGTERM/SIGINT. The `readiness` service becomes `NOT_SERVING` before the shutdown acknowledgement, including when owner cleanup is deferred; `Control.Health` reports not-ready and suppresses new inference probes. Healthy liveness remains `SERVING` until listener closure, and known fatal failures retain their fatal status. Late health results cannot restore readiness. Work admitted before shutdown follows the existing grace policy: the gRPC listener allows up to five seconds for active RPCs, then cancels them; attached frontends receive SIGTERM and share a ten-second termination deadline before SIGKILL. The launcher then closes coordination and shuts down the engine. These grace periods are not a total cleanup deadline: media-pool drain and engine shutdown can take longer. An independent fatal failure remains a failure even when it races an intentional shutdown.
+
+The listener's existing trusted-network/TLS-proxy requirements also apply to this destructive control operation. Engine shutdown does not authenticate a caller merely because the expected identity matches.
+
 ## Health checks
 
 OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC port as Inference and Control.
 
-`Check` returns the current status. `Watch` sends the current status and later status changes. Rapid changes can merge into one update. The empty service has the same status as `inference`. Use these named services for health probes:
+`Check` returns the current status. `Watch` sends the current status and later status changes. Rapid changes can merge into one update. The empty service has the same status as `readiness`. Use these named services for health probes:
 
 | Service | Meaning | Probe use |
 |---------|---------|----------------|
-| `inference` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Readiness probe |
+| `readiness` | The executor is healthy and, with multiple frontends, the frontend group is ready. | Readiness probe |
 | `liveness` | The gRPC server is running and no known fatal engine failure requires a restart. | Startup and liveness probes |
 
-The server refreshes inference status in a background task, so health RPCs read the published value without probing the executor on each request. A check that runs longer than five seconds makes inference `NOT_SERVING`; the server keeps at most one engine check in flight and discards a late result before polling again. `Control.Health` reads the same engine predicate directly, so its result can lead the published status by a poll interval or the check deadline. The multi-frontend coordinator reads the monitor's latest engine result without running another engine check. A known fatal executor or worker failure makes both services `NOT_SERVING` and stops the serving process. Other readiness failures leave liveness `SERVING` and can recover. During orderly shutdown, inference reports `NOT_SERVING` while liveness retains its previous status until the listener closes. Each `Watch` ends after its final status. A stopped server cannot answer the probe.
+The server refreshes readiness status in a background task, so health RPCs read the published value without probing the executor on each request. A check that runs longer than five seconds makes readiness `NOT_SERVING`; the server keeps at most one engine check in flight and discards a late result before polling again. `Control.Health` reads the same engine predicate directly, so its result can lead the published status by a poll interval or the check deadline. The multi-frontend coordinator reads the monitor's latest engine result without running another engine check. A known fatal executor or worker failure makes both services `NOT_SERVING` and stops the serving process. Other readiness failures leave liveness `SERVING` and can recover. During orderly shutdown, readiness reports `NOT_SERVING` while liveness retains its previous status until the listener closes. During shutdown, each `Watch` sends its current status and ends; clients must treat stream closure as unknown and recheck health. Liveness can still fail before the listener closes. A stopped server cannot answer the probe.
 
 For a Pod with a Dynamo sidecar and native Kubernetes gRPC probes, bind one listener to all Pod interfaces:
 
@@ -58,7 +68,7 @@ startupProbe:
 readinessProbe:
   grpc:
     port: 30001
-    service: inference
+    service: readiness
 livenessProbe:
   grpc:
     port: 30001
@@ -67,13 +77,13 @@ livenessProbe:
 
 Set `failureThreshold * periodSeconds` to cover the longest expected model startup. The listener has no general client authentication or encryption, and Inference and Control are reachable through the Pod IP along with Health. Review that exposure for the deployment. If only same-Pod clients need access, bind to `127.0.0.1` and use exec probes instead.
 
-OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
+OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `readiness=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
 
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health`, `Abort`, and `Shutdown`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
 
 ### Disaggregated serving
 
@@ -232,7 +242,7 @@ Multiple frontends require the default classic IPC executor and a nonzero port. 
 
 ## Schema and binding provenance
 
-The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
+The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository. This shutdown implementation uses source commit `78ac56152781559b5e4e8ae9ef357aaee833f19f`, recorded in the vendor lock and schema manifest. It is an unpublished protocol revision: `bsr.release` is unset and `ServerInfo.schema_release` reports the source commit. Before upstream release, land the canonical protocol change and refresh both the immutable source pin and any published BSR release metadata. Do not reuse the earlier `v0.1.0` BSR release identifier for the extended schema.
 
 TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 

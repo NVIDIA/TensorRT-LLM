@@ -215,6 +215,8 @@ l0_cpu:
   - unittest/grpc/openengine/test_coordinator.py
   - unittest/_torch/test_shared_tensor_cpu.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py
+  - unittest/grpc/openengine/test_shutdown_gpu.py::test_engine_fixture_reaps_detached_worker_on_startup_failure
+  - unittest/grpc/openengine/test_shutdown_gpu.py::test_engine_fixture_rejects_worker_created_after_readiness
   - unittest/grpc/openengine/test_control.py
   - unittest/grpc/openengine/test_multimodal.py
   - unittest/grpc/openengine/test_node.py

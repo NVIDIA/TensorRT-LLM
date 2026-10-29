@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Health and abort operations.
+// Health, abort, and engine shutdown operations.
 
 syntax = "proto3";
 
@@ -61,4 +61,27 @@ enum AbortStatus {
   ABORT_STATUS_UNSPECIFIED = 0;
   ABORT_STATUS_ABORTED = 1;
   ABORT_STATUS_ALREADY_FINISHED = 2;
+}
+
+message ShutdownRequest {
+  // Required. Must equal ServerInfo.instance_id for the intended engine lifetime.
+  // Empty returns INVALID_ARGUMENT; a mismatch returns FAILED_PRECONDITION.
+  // Neither rejection may change admission, health, or engine lifecycle state.
+  string expected_instance_id = 1;
+}
+
+message ShutdownResponse {
+  ShutdownStatus status = 1;
+  // The engine lifetime that accepted shutdown, equal to expected_instance_id.
+  string instance_id = 2;
+}
+
+enum ShutdownStatus {
+  SHUTDOWN_STATUS_UNSPECIFIED = 0;
+  // Shutdown is committed to the lifecycle owner, independently of RPC
+  // cancellation. New inference and inference probes are no longer admitted.
+  // This acknowledges acceptance, not completed cleanup or process exit.
+  SHUTDOWN_STATUS_ACCEPTED = 1;
+  // This same engine lifetime is already stopping. No additional cleanup starts.
+  SHUTDOWN_STATUS_ALREADY_STOPPING = 2;
 }

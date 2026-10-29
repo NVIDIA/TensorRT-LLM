@@ -6,6 +6,7 @@
 import json
 import os
 import selectors
+import signal
 
 # Re-exec the serving CLI with sys.executable and an argument list, without a shell.
 import subprocess  # nosec B404
@@ -21,6 +22,10 @@ from tensorrt_llm.logger import logger
 
 class FrontendStartupCancelled(RuntimeError):
     """Frontend startup was interrupted; the caller determines the exit status."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.failures: list[tuple[int, int]] = []
 
 
 class MultiFrontendMode(NamedTuple):
@@ -122,8 +127,10 @@ def _spawn_attached_frontends(
             children.append(child)
             logger.info(f"Launched attached serving frontend {frontend_id} (pid {child.pid})")
         _wait_attached_frontends_ready(children, ready_fds, cancelled, report_failure)
-    except BaseException:
-        _terminate_attached_frontends(children)
+    except BaseException as error:
+        failures = _terminate_attached_frontends(children)
+        if isinstance(error, FrontendStartupCancelled):
+            error.failures = failures
         raise
     finally:
         for fd in ready_fds:
@@ -228,15 +235,24 @@ def _watch_attached_frontends(children: list, interval_s: float = 1.0) -> thread
     return stopping
 
 
-def _terminate_attached_frontends(children: list) -> None:
-    """Stop and reap the group with one shared grace deadline."""
+def _terminate_attached_frontends(children: list) -> list[tuple[int, int]]:
+    """Stop and reap the group, returning unexpected frontend exits."""
+    expected_signals = {}
     for child in children:
-        child.terminate()
+        if child.poll() is None:
+            expected_signals[child.pid] = {-signal.SIGTERM}
+            child.terminate()
     deadline = time.monotonic() + 10
     for child in children:
         try:
             child.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
+            expected_signals[child.pid].add(-signal.SIGKILL)
             child.kill()
     for child in children:
         child.wait()
+    return [
+        (child.pid, child.returncode)
+        for child in children
+        if child.returncode != 0 and child.returncode not in expected_signals.get(child.pid, set())
+    ]

@@ -135,7 +135,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         metrics: OpenEngineMetrics | None = None,
         input_executor: Executor | None = None,
         media_executor: Executor | None = None,
+        is_stopping: Callable[[], bool] = lambda: False,
     ) -> None:
+        self._is_stopping = is_stopping
         self._frontend = frontend
         self._input_executor = input_executor
         self._media_executor = media_executor
@@ -150,6 +152,11 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         self.subagent_affinity_auth_key = subagent_affinity_auth_key
         self._active_requests: dict[str, Any] = {}
         self._metrics = metrics
+
+    @property
+    def stopping(self) -> bool:
+        """Canonical local admission state, also used by control-plane health."""
+        return self._is_stopping()
 
     @property
     def supported_media_modalities(self) -> frozenset[str]:
@@ -216,6 +223,10 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         reservation = None
         request_metrics = RequestMetrics(self._metrics) if self._metrics else None
         try:
+            if self.stopping:
+                if request_metrics is not None:
+                    request_metrics.unavailable()
+                await context.abort(grpc.StatusCode.UNAVAILABLE, "Engine is stopping")
             if not request.request_id:
                 await context.abort(
                     grpc.StatusCode.INVALID_ARGUMENT, "request_id must be non-empty"

@@ -18,11 +18,21 @@ import pytest
 
 pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 
-from tensorrt_llm.grpc.openengine import server as openengine_server
-from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2 as lifecycle
-from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc
+from tensorrt_llm.grpc.openengine import server as openengine_server  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2 as lifecycle  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import server_pb2 as server_info  # noqa: E402
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
+
+
+def test_cleanup_reports_a_frontend_killed_before_termination():
+    from tensorrt_llm.serve._frontend_processes import _terminate_attached_frontends
+
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    process.kill()
+    process.wait(timeout=5)
+    assert _terminate_attached_frontends([process]) == [(process.pid, -signal.SIGKILL)]
 
 
 def test_second_frontend_group_rejects_occupied_port_before_model_load(monkeypatch):
@@ -140,6 +150,7 @@ def test_ready_child_death_fails_startup(monkeypatch, last_child_ready):
 # Replace only the GPU engine boundary. The real launcher, readiness pipes,
 # signals, gRPC servers, coordinator, and subprocess cleanup remain in use.
 _LAUNCHER = """
+import asyncio
 import os
 from pathlib import Path
 import signal
@@ -156,8 +167,10 @@ frontend = int(os.environ.get("TLLM_EXECUTOR_FRONTEND_ID", "0"))
 
 class Engine:
     def __init__(self, **kwargs):
-        if sys.argv[3] == "startup-signal" or (
-            frontend and sys.argv[3] in ("child-startup-signal", "child-startup-engine-failure")
+        if sys.argv[3] in ("startup-signal", "startup-signal-fatal") or (
+            frontend and sys.argv[3] in (
+                "child-startup-signal", "child-startup-signal-fatal", "child-startup-engine-failure"
+            )
         ):
             if frontend:
                 previous = signal.getsignal(signal.SIGTERM)
@@ -174,21 +187,69 @@ class Engine:
         if frontend and sys.argv[3] == "child-startup":
             raise RuntimeError("injected attach failure")
         self.llm_id = "shared-engine"
-        self.args = SimpleNamespace(guided_decoding_backend=None)
+        self.args = SimpleNamespace(
+            guided_decoding_backend=None, tensor_parallel_size=1,
+            pipeline_parallel_size=1, context_parallel_size=1,
+            max_batch_size=2, max_num_tokens=2048,
+            kv_cache_config=SimpleNamespace(tokens_per_block=32),
+        )
         self.tokenizer = None
         self._executor = Mock(spec=GenerationExecutorProxy)
         self._executor.multi_frontend_attach_info.return_value = {"mode": "classic"}
+        if sys.argv[3] == "startup-signal-fatal":
+            self._executor._fatal_error = RuntimeError("injected fatal startup failure")
     def _check_health(self):
         return not (
             frontend == 0 and sys.argv[3] == "child-startup-engine-failure"
             and (root / "initializing").exists()
         )
     def shutdown(self):
-        (root / f"shutdown-{frontend}").touch()
+        with (root / f"shutdown-{frontend}").open("a") as marker:
+            marker.write("shutdown\\n")
+        if frontend and sys.argv[3] in ("rpc-close-fatal-attached", "child-startup-signal-fatal"):
+            raise RuntimeError("injected failure after coordinator close")
+        if not frontend and sys.argv[3] == "rpc-close-fatal-owner":
+            self._executor._engine_dead = True
 
 server.PyTorchLLM = Engine
+if frontend and sys.argv[3] == "child-server-start-signal":
+    original_start = server.OpenEngineServer.start
+    original_ready = server._signal_frontend_ready
+    async def held_start(self):
+        (root / "server-starting").touch()
+        await asyncio.sleep(1.5)
+        await original_start(self)
+    def ready(mode):
+        (root / "child-ready").touch()
+        original_ready(mode)
+    server.OpenEngineServer.start = held_start
+    server._signal_frontend_ready = ready
+if frontend and sys.argv[3] == "rpc-delayed-peer":
+    original_dispatch = server.FrontendClient._dispatch
+    async def delayed_dispatch(self, message, context):
+        if message.get("operation") == "shutdown":
+            await asyncio.sleep(1.5)
+        return await original_dispatch(self, message, context)
+    server.FrontendClient._dispatch = delayed_dispatch
+if sys.argv[3].startswith("rpc-"):
+    original_info = server.OpenEngineControlServicer.GetServerInfo
+    async def info(self, request, context):
+        result = await original_info(self, request, context)
+        result.extra["test_frontend_id"] = frontend
+        return result
+    server.OpenEngineControlServicer.GetServerInfo = info
+    original_shutdown = server.OpenEngineControlServicer.Shutdown
+    async def shutdown(self, request, context):
+        if sys.argv[3].startswith("rpc-fatal") and request.expected_instance_id == self._instance_id:
+            self._llm._executor._fatal_error = RuntimeError("injected fatal worker failure")
+        result = await original_shutdown(self, request, context)
+        if sys.argv[3] == "rpc-signal":
+            os.kill(os.getpid(), signal.SIGTERM)
+        return result
+    server.OpenEngineControlServicer.Shutdown = shutdown
 server.launch_server("127.0.0.1", int(sys.argv[2]),
-                     {"model": "test", "backend": "pytorch", "num_serve_frontends": 2})
+                     {"model": "test", "backend": "pytorch",
+                      "num_serve_frontends": 1 if sys.argv[3] == "rpc-single" else 2})
 """
 
 
@@ -210,8 +271,20 @@ def _wait_until(predicate, timeout=90):
         "launcher-death",
         "shutdown",
         "startup-signal",
+        "startup-signal-fatal",
         "child-startup-signal",
+        "child-startup-signal-fatal",
         "child-startup-engine-failure",
+        "child-server-start-signal",
+        "rpc-single",
+        "rpc-launcher",
+        "rpc-attached",
+        "rpc-delayed-peer",
+        "rpc-fatal",
+        "rpc-fatal-attached",
+        "rpc-close-fatal-attached",
+        "rpc-close-fatal-owner",
+        "rpc-signal",
     ],
 )
 def test_frontend_group_cleanup(tmp_path, failure):
@@ -231,15 +304,24 @@ def test_frontend_group_cleanup(tmp_path, failure):
             env={**os.environ, "TLLM_FRONTEND_READY_TIMEOUT": "45"},
         )
     try:
-        if failure == "startup-signal":
+        if failure in ("startup-signal", "startup-signal-fatal"):
             _wait_until(lambda: (tmp_path / "initializing").exists())
             process.terminate()
             (tmp_path / "continue-initialization").touch()
-            assert process.wait(timeout=20) == 0
+            assert (process.wait(timeout=20) == 0) == (failure == "startup-signal")
             assert (tmp_path / "shutdown-0").exists()
-        elif failure in ("child-startup-signal", "child-startup-engine-failure"):
+        elif failure == "child-server-start-signal":
+            _wait_until(lambda: (tmp_path / "server-starting").exists())
+            process.terminate()
+            assert process.wait(timeout=30) == 0
+            assert not (tmp_path / "child-ready").exists()
+        elif failure in (
+            "child-startup-signal",
+            "child-startup-signal-fatal",
+            "child-startup-engine-failure",
+        ):
             _wait_until(lambda: (tmp_path / "initializing").exists())
-            if failure == "child-startup-signal":
+            if failure in ("child-startup-signal", "child-startup-signal-fatal"):
                 process.terminate()
             # Resume only after the launcher starts terminating its child:
             # otherwise READY could race cancellation and bypass the wait path.
@@ -266,7 +348,7 @@ def test_frontend_group_cleanup(tmp_path, failure):
                         return False
 
                 _wait_until(ready)
-            child_pid = int((tmp_path / "pid-1").read_text())
+            child_pid = None if failure == "rpc-single" else int((tmp_path / "pid-1").read_text())
             if failure == "child-runtime":
                 os.kill(child_pid, signal.SIGKILL)
                 assert process.wait(timeout=30) != 0
@@ -279,6 +361,43 @@ def test_frontend_group_cleanup(tmp_path, failure):
                 process.kill()
                 process.wait(timeout=10)
                 _wait_until(lambda: (tmp_path / "shutdown-1").exists(), timeout=20)
+            elif failure.startswith("rpc-"):
+                target = int(failure.endswith("-attached"))
+                # A private subchannel per attempt creates a fresh TCP socket,
+                # so SO_REUSEPORT can select either frontend. Select by the
+                # test-only identity response rather than assuming dispatch.
+                for _ in range(64):
+                    with grpc.insecure_channel(
+                        f"127.0.0.1:{port}", options=[("grpc.use_local_subchannel_pool", 1)]
+                    ) as channel:
+                        control = rpc.ControlStub(channel)
+                        info = control.GetServerInfo(server_info.GetServerInfoRequest(), timeout=3)
+                        if int(info.extra["test_frontend_id"]) != target:
+                            continue
+                        with pytest.raises(grpc.RpcError) as stale:
+                            control.Shutdown(
+                                lifecycle.ShutdownRequest(expected_instance_id="old-engine"),
+                                timeout=3,
+                            )
+                        assert stale.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                        assert (
+                            control.Health(lifecycle.HealthRequest(), timeout=3).state
+                            == lifecycle.HEALTH_STATE_READY
+                        )
+                        response = control.Shutdown(
+                            lifecycle.ShutdownRequest(expected_instance_id=info.instance_id),
+                            timeout=3,
+                        )
+                        assert response.status == lifecycle.SHUTDOWN_STATUS_ACCEPTED
+                        assert response.instance_id == info.instance_id
+                        break
+                else:
+                    pytest.fail("Could not connect to the target frontend")
+                assert (process.wait(timeout=30) == 0) == ("fatal" not in failure)
+                for frontend in range(1 if failure == "rpc-single" else 2):
+                    assert (tmp_path / f"shutdown-{frontend}").read_text().splitlines() == [
+                        "shutdown"
+                    ]
             else:
                 process.terminate()
                 assert process.wait(timeout=30) == 0

@@ -1,9 +1,13 @@
 {
-  "schema_revision": 1,
+  "schema_revision": 2,
   "minimum_client_revision": 1,
   "bsr": {
     "module": "buf.build/openengine/openengine",
-    "release": "768a93c7b44e40f28c692ad0b471a8f2"
+    "release": null
+  },
+  "source": {
+    "url": "https://github.com/ai-dynamo/openengine.git",
+    "commit": "78ac56152781559b5e4e8ae9ef357aaee833f19f"
   },
   "generator": {
     "grpcio": "1.67.1",

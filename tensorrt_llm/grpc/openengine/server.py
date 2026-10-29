@@ -101,6 +101,8 @@ class OpenEngineServer:
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
+        request_shutdown: Synchronous engine-owner callback. Returns whether
+            shutdown was already committed. Omit when no lifecycle owner exists.
     """
 
     def __init__(
@@ -113,6 +115,7 @@ class OpenEngineServer:
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
         subagent_affinity_auth_key: str | None = None,
+        request_shutdown: Callable[[], bool] | None = None,
         metrics: OpenEngineMetrics | None = None,
     ) -> None:
         self.host = host
@@ -120,8 +123,13 @@ class OpenEngineServer:
         self._llm = llm
         self._metrics = metrics
         self._frontend = frontend
+        self._shutdown_owner = request_shutdown
+        if frontend is not None:
+            frontend.begin_shutdown = self.begin_shutdown
         self._stopping = False
         self._health_task: asyncio.Task | None = None
+        self._shutdown_health_task: asyncio.Task[None] | None = None
+        self._fatal_health_task: asyncio.Task[None] | None = None
         self._engine_health_task: asyncio.Task[bool] | None = None
         self._health_refresh_lock = asyncio.Lock()
         self._inference_serving = False
@@ -148,6 +156,7 @@ class OpenEngineServer:
             metrics=metrics,
             input_executor=self._input_executor,
             media_executor=self._media_executor,
+            is_stopping=lambda: self._stopping,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
@@ -159,6 +168,7 @@ class OpenEngineServer:
             kv_transfer_backend=kv_transfer_backend,
             frontend=frontend,
             instance_id=instance_id,
+            shutdown=self._shutdown_engine,
         )
         openengine_pb2_grpc.add_ControlServicer_to_server(self._control, self._server)
         bind_address = _format_bind_address(host, port)
@@ -195,11 +205,50 @@ class OpenEngineServer:
         if self._metrics is not None:
             await self._metrics.start()
         await self._server.start()
-        await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
+        if not self._fatal_engine_failure:
+            await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
         await self._refresh_inference_health()
         self._health_task = asyncio.create_task(self._monitor_inference_health())
         address = _format_bind_address(self.host, self.port)
         logger.info(f"OpenEngine server started on {address}")
+
+    async def _shutdown_engine(self, expected: str, context: grpc.aio.ServicerContext) -> bool:
+        """Commit owner shutdown and publish local unready before acknowledging it."""
+        if self._frontend is not None:
+            try:
+                result = await self._frontend.request("shutdown", expected_instance_id=expected)
+            except CoordinationError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            # Rejections are private response data, not transport failures that
+            # would fail the entire frontend group closed.
+            if not result["matched"]:
+                await context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION, "Engine instance ID mismatch"
+                )
+            if not result["supported"]:
+                await context.abort(grpc.StatusCode.UNIMPLEMENTED, "No engine lifecycle owner")
+            already_stopping = result["already_stopping"]
+        else:
+            if self._shutdown_owner is None:
+                await context.abort(grpc.StatusCode.UNIMPLEMENTED, "No engine lifecycle owner")
+            # Identity validation and the synchronous commit cannot interleave.
+            already_stopping = self._shutdown_owner()
+        await asyncio.shield(self.begin_shutdown())
+        return already_stopping
+
+    def begin_shutdown(self) -> asyncio.Task[None]:
+        """Close local admission and own readiness publication independently of RPCs."""
+        self._stopping = True
+        self._inference_serving = False
+        if self._shutdown_health_task is None:
+            self._shutdown_health_task = asyncio.create_task(
+                self._health.set("readiness", health_pb2.HealthCheckResponse.NOT_SERVING)
+            )
+        if self._fatal_engine_failure and self._fatal_health_task is None:
+            self._fatal_health_task = asyncio.create_task(
+                self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
+            )
+        return self._shutdown_health_task
 
     async def _refresh_inference_health(self) -> None:
         async with self._health_refresh_lock:
@@ -226,7 +275,7 @@ class OpenEngineServer:
             if ready != self._inference_serving:
                 self._inference_serving = ready
                 await self._health.set(
-                    "inference",
+                    "readiness",
                     health_pb2.HealthCheckResponse.SERVING
                     if ready
                     else health_pb2.HealthCheckResponse.NOT_SERVING,
@@ -267,7 +316,7 @@ class OpenEngineServer:
                 logger.error(f"OpenEngine inference health monitor failed: {error}")
                 self._engine_healthy = False
                 self._inference_serving = False
-                await self._health.set("inference", health_pb2.HealthCheckResponse.NOT_SERVING)
+                await self._health.set("readiness", health_pb2.HealthCheckResponse.NOT_SERVING)
 
     async def stop(self, grace: float = 5.0) -> None:
         """Stop accepting OpenEngine requests.
@@ -275,8 +324,10 @@ class OpenEngineServer:
         Args:
             grace: Maximum time in seconds to allow active RPCs to finish.
         """
-        self._stopping = True
         try:
+            await asyncio.shield(self.begin_shutdown())
+            if self._fatal_health_task is not None:
+                await asyncio.shield(self._fatal_health_task)
             await self._health.enter_graceful_shutdown()
             if self._health_task is not None:
                 self._health_task.cancel()
@@ -340,6 +391,9 @@ def launch_server(
     """
     _warn_if_python_protobuf()
 
+    class StartupStopped(Exception):
+        """Leave startup through the common cleanup and failure check."""
+
     async def serve() -> None:
         logger.info("Initializing TensorRT-LLM OpenEngine server...")
         backend = llm_args.get("backend")
@@ -381,19 +435,36 @@ def launch_server(
         serving = False
         parent_pid = os.getppid()
 
+        def request_stop() -> bool:
+            already_stopping = stop_event.is_set()
+            startup_cancelled.set()
+            if server is not None:
+                server.begin_shutdown()
+            if coordinator is not None:
+                coordinator.ready = False
+                coordinator.stopping = True
+            stop_event.set()
+            return already_stopping
+
         def fail(reason: str) -> None:
             nonlocal failure
-            if not stop_event.is_set():
+            if failure is None:
                 failure = reason
                 logger.error(reason)
-            startup_cancelled.set()
-            stop_event.set()
+            if server is not None:
+                server._fatal_engine_failure = True
+            request_stop()
+
+        def check_startup() -> None:
+            if stop_event.is_set():
+                if failure is not None:
+                    raise RuntimeError(failure)
+                raise StartupStopped
 
         def signal_handler(signum: int, frame: Any) -> None:
             # A Python handler also observes signals while synchronous model
             # initialization is running. Cleanup starts at its next safe boundary.
-            startup_cancelled.set()
-            stop_event.set()
+            request_stop()
 
         previous_handlers = {
             sig: signal.signal(sig, signal_handler) for sig in (signal.SIGTERM, signal.SIGINT)
@@ -414,6 +485,22 @@ def launch_server(
                 or getattr(executor, "_engine_dead", False)
             )
 
+        def record_terminal_engine_failure() -> None:
+            if terminal_engine_failure():
+                fail("OpenEngine terminal engine failure")
+
+        async def report_frontend_exit() -> None:
+            record_terminal_engine_failure()
+            if mode.is_attached_frontend and frontend is not None:
+                try:
+                    await frontend.request(
+                        "failure" if failure is not None else "withdraw",
+                        frontend=frontend.frontend_id,
+                        reason=failure,
+                    )
+                except CoordinationError:
+                    pass
+
         async def supervise() -> None:
             while not stop_event.is_set():
                 if mode.is_attached_frontend and os.getppid() != parent_pid:
@@ -431,7 +518,7 @@ def launch_server(
                         fail("OpenEngine engine health check failed during startup")
                         return
                 if terminal_engine_failure():
-                    fail("OpenEngine terminal engine failure")
+                    record_terminal_engine_failure()
                     return
                 if serving and metrics is not None:
                     metrics.check_health()
@@ -440,8 +527,8 @@ def launch_server(
                         status = await frontend.request("heartbeat", frontend=frontend.frontend_id)
                     except CoordinationError:
                         return
-                    if status["stopping"]:
-                        stop_event.set()
+                    if status["stopping"] and not status["shutdown_pending"]:
+                        request_stop()
                         return
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=1.0)
@@ -464,10 +551,7 @@ def launch_server(
                 "port": port,
             }
             llm = PyTorchLLM(**llm_args)
-            if stop_event.is_set():
-                if failure is not None:
-                    raise RuntimeError(failure)
-                return
+            check_startup()
             logger.info("Model loaded successfully")
             if metrics_enabled:
                 metrics = OpenEngineMetrics(
@@ -488,7 +572,12 @@ def launch_server(
                         "Set TMPDIR to a shorter directory."
                     )
                 coordinator = Coordinator(
-                    directory.name, mode.num_frontends, instance_id, healthy, fail
+                    directory.name,
+                    mode.num_frontends,
+                    instance_id,
+                    healthy,
+                    fail,
+                    request_shutdown=request_stop,
                 )
                 await coordinator.start()
                 frontend = FrontendClient(directory.name, 0, fail)
@@ -518,14 +607,12 @@ def launch_server(
                         cancelled=startup_cancelled,
                         report_failure=report_failure,
                     )
-                except FrontendStartupCancelled:
+                except FrontendStartupCancelled as error:
                     # The spawn helper has already reaped its children. The
                     # stop check below distinguishes SIGTERM from engine failure.
-                    pass
-            if stop_event.is_set():
-                if failure is not None:
-                    raise RuntimeError(failure)
-                return
+                    for pid, code in error.failures:
+                        fail(f"OpenEngine frontend {pid} exited with code {code} during startup")
+            check_startup()
             server = OpenEngineServer(
                 host=host,
                 port=port,
@@ -534,10 +621,12 @@ def launch_server(
                 frontend=frontend,
                 instance_id=instance_id,
                 subagent_affinity_auth_key=subagent_affinity_auth_key,
+                request_shutdown=request_stop,
                 metrics=metrics,
             )
             _disable_gc_if_requested()
             await server.start()
+            check_startup()
             serving = True
             if any(child.poll() is not None for child in children):
                 raise RuntimeError("An OpenEngine frontend exited during startup")
@@ -546,16 +635,14 @@ def launch_server(
                 coordinator.ready = True
                 await server._refresh_inference_health()
             await stop_event.wait()
+        except StartupStopped:
+            pass
         finally:
             startup_cancelled.set()
+            await report_frontend_exit()
             if coordinator is not None:
                 coordinator.ready = False
                 coordinator.stopping = True
-            elif mode.is_attached_frontend and frontend is not None:
-                try:
-                    await frontend.request("withdraw", frontend=frontend.frontend_id)
-                except CoordinationError:
-                    pass
             if monitor is not None:
                 monitor.cancel()
                 await asyncio.gather(monitor, return_exceptions=True)
@@ -565,15 +652,27 @@ def launch_server(
             finally:
                 try:
                     if children:
-                        await asyncio.to_thread(_terminate_attached_frontends, children)
+                        child_failures = await asyncio.to_thread(
+                            _terminate_attached_frontends, children
+                        )
+                        # Cleanup after closing the private channel can still
+                        # fail. Preserve those failures in the group result,
+                        # while allowing the termination helper's grace policy.
+                        for pid, code in child_failures:
+                            fail(
+                                f"OpenEngine frontend {pid} exited with code {code} during shutdown"
+                            )
                     if frontend is not None:
+                        await report_frontend_exit()
                         await frontend.close()
                     if coordinator is not None:
                         await coordinator.close()
                 finally:
                     try:
                         if llm is not None:
+                            record_terminal_engine_failure()
                             await asyncio.to_thread(llm.shutdown)
+                            record_terminal_engine_failure()
                     finally:
                         if metrics is not None:
                             await metrics.wait_for_collection()

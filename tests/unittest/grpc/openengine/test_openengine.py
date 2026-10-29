@@ -61,8 +61,11 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> 
         server._server = SimpleNamespace(
             stop=AsyncMock(side_effect=RuntimeError("stop failed") if fail_stop else None)
         )
-        server._health = SimpleNamespace(enter_graceful_shutdown=AsyncMock())
+        server._health = SimpleNamespace(enter_graceful_shutdown=AsyncMock(), set=AsyncMock())
         server._health_task = None
+        server._shutdown_health_task = None
+        server._fatal_health_task = None
+        server._fatal_engine_failure = False
         server._metrics = SimpleNamespace(stop=AsyncMock())
         server._input_executor = ThreadPoolExecutor(max_workers=1)
         server._media_executor = ThreadPoolExecutor(max_workers=1)
@@ -83,6 +86,84 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> 
                 pool.submit(lambda: None)
 
     asyncio.run(exercise_stop())
+
+
+def test_fatal_failure_during_drain_updates_liveness() -> None:
+    async def exercise():
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            llm_id="test-instance",
+            tokenizer=None,
+            _check_health=lambda: True,
+        )
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test")
+        await server.start()
+        original = server._server
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def stop(grace):
+            entered.set()
+            await release.wait()
+            await original.stop(grace)
+
+        server._server = SimpleNamespace(stop=stop)
+        task = asyncio.create_task(server.stop(grace=0))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            server._fatal_engine_failure = True
+            server.begin_shutdown()
+            await server._fatal_health_task
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                request = health_pb2.HealthCheckRequest(service="liveness")
+                assert (
+                    await health.Check(request, timeout=3)
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                watch = health.Watch(request, timeout=3)
+                assert (await watch.read()).status == health_pb2.HealthCheckResponse.NOT_SERVING
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(exercise())
+
+
+def test_fatal_failure_during_start_does_not_restore_liveness() -> None:
+    async def exercise():
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            llm_id="test-instance",
+            tokenizer=None,
+            _check_health=lambda: True,
+        )
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test")
+        original = server._server
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def start():
+            entered.set()
+            await release.wait()
+            await original.start()
+
+        server._server = SimpleNamespace(start=start, stop=original.stop)
+        task = asyncio.create_task(server.start())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            server._fatal_engine_failure = True
+            server.begin_shutdown()
+            await server._fatal_health_task
+            release.set()
+            await task
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                response = await health_pb2_grpc.HealthStub(channel).Check(
+                    health_pb2.HealthCheckRequest(service="liveness"), timeout=3
+                )
+                assert response.status == health_pb2.HealthCheckResponse.NOT_SERVING
+        finally:
+            release.set()
+            await server.stop(grace=0)
+
+    asyncio.run(exercise())
 
 
 def test_openengine_server_serves_the_control_contract() -> None:
@@ -131,9 +212,9 @@ def test_openengine_server_serves_the_control_contract() -> None:
                 ):
                     pass
             assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
-            assert info.schema_revision == 1
+            assert info.schema_revision == 2
             assert info.minimum_client_revision == 1
-            assert info.schema_release == "768a93c7b44e40f28c692ad0b471a8f2"
+            assert info.schema_release == "78ac56152781559b5e4e8ae9ef357aaee833f19f"
         finally:
             await channel.close()
             await server.stop(grace=0)
@@ -166,7 +247,7 @@ def test_health_and_control_are_reachable_on_pod_address() -> None:
             async with grpc.aio.insecure_channel(f"{pod_ip}:{server.port}") as channel:
                 health = health_pb2_grpc.HealthStub(channel)
                 response = await health.Check(
-                    health_pb2.HealthCheckRequest(service="inference"), timeout=5
+                    health_pb2.HealthCheckRequest(service="readiness"), timeout=5
                 )
                 assert response.status == health_pb2.HealthCheckResponse.SERVING
                 control = openengine_pb2_grpc.ControlStub(channel)
@@ -207,7 +288,7 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
                     return response.status
 
                 assert await check("liveness") == health_pb2.HealthCheckResponse.SERVING
-                assert await check("inference") == health_pb2.HealthCheckResponse.NOT_SERVING
+                assert await check("readiness") == health_pb2.HealthCheckResponse.NOT_SERVING
                 assert await check("") == health_pb2.HealthCheckResponse.NOT_SERVING
                 with pytest.raises(grpc.aio.AioRpcError) as unknown:
                     await check("unknown")
@@ -220,8 +301,8 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
                 finally:
                     unknown_stream.cancel()
 
-                stream = health.Watch(health_pb2.HealthCheckRequest(service="inference"))
-                remaining_stream = health.Watch(health_pb2.HealthCheckRequest(service="inference"))
+                stream = health.Watch(health_pb2.HealthCheckRequest(service="readiness"))
+                remaining_stream = health.Watch(health_pb2.HealthCheckRequest(service="readiness"))
                 try:
                     initial = await asyncio.wait_for(stream.read(), 5)
                     assert initial.status == health_pb2.HealthCheckResponse.NOT_SERVING
@@ -234,7 +315,7 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
                     assert (
                         await asyncio.wait_for(remaining_stream.read(), 5)
                     ).status == serving.status
-                    assert await check("inference") == serving.status
+                    assert await check("readiness") == serving.status
                     assert await check("") == serving.status
 
                     stream.cancel()
@@ -242,7 +323,7 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
                     engine["healthy"] = False
                     unavailable = await asyncio.wait_for(remaining_stream.read(), 5)
                     assert unavailable.status == health_pb2.HealthCheckResponse.NOT_SERVING
-                    assert await check("inference") == unavailable.status
+                    assert await check("readiness") == unavailable.status
                     assert await check("") == unavailable.status
                     assert await check("liveness") == health_pb2.HealthCheckResponse.SERVING
                 finally:
@@ -271,7 +352,7 @@ def test_standard_grpc_health_watch_reports_shutdown() -> None:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
                 health = health_pb2_grpc.HealthStub(channel)
                 liveness = health.Watch(health_pb2.HealthCheckRequest(service="liveness"))
-                inference = health.Watch(health_pb2.HealthCheckRequest(service="inference"))
+                inference = health.Watch(health_pb2.HealthCheckRequest(service="readiness"))
                 for stream in (liveness, inference):
                     assert (
                         await asyncio.wait_for(stream.read(), 5)
@@ -324,7 +405,7 @@ def test_inference_health_timeout_does_not_start_overlapping_checks(
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
                 health = health_pb2_grpc.HealthStub(channel)
-                inference = health_pb2.HealthCheckRequest(service="inference")
+                inference = health_pb2.HealthCheckRequest(service="readiness")
                 stream = health.Watch(inference)
                 try:
                     assert (
@@ -380,7 +461,7 @@ def test_fatal_engine_failure_fails_liveness_after_temporary_unavailability(
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
                 health = health_pb2_grpc.HealthStub(channel)
-                inference = health_pb2.HealthCheckRequest(service="inference")
+                inference = health_pb2.HealthCheckRequest(service="readiness")
                 liveness = health_pb2.HealthCheckRequest(service="liveness")
                 stream = health.Watch(inference)
                 live_stream = health.Watch(liveness)
@@ -455,7 +536,7 @@ def test_inference_health_recovers_after_monitor_error(monkeypatch: pytest.Monke
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
                 health = health_pb2_grpc.HealthStub(channel)
-                inference = health_pb2.HealthCheckRequest(service="inference")
+                inference = health_pb2.HealthCheckRequest(service="readiness")
                 liveness = health_pb2.HealthCheckRequest(service="liveness")
                 assert (
                     await health.Check(inference, timeout=5)
@@ -702,3 +783,129 @@ def test_launch_server_disables_gc_only_when_requested(
 
     assert seen["gc_enabled"] is gc_enabled
     assert seen["instance_id"] == seen["engine_id"]
+
+
+@pytest.mark.parametrize(
+    "fatal,pending_probe",
+    [(False, False), (True, False), (False, True)],
+    ids=["healthy", "fatal", "pending-probe"],
+)
+def test_shutdown_rpc_closes_admission_and_preserves_health(fatal, pending_probe):
+    """Hold owner cleanup to observe admission and health before listener teardown."""
+    from unittest.mock import Mock
+
+    from tensorrt_llm.grpc.openengine.bindings import generation_pb2, lifecycle_pb2
+
+    async def exercise():
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            llm_id="engine-A",
+            tokenizer=None,
+            _check_health=lambda: True,
+            generate_async=Mock(side_effect=AssertionError("submitted work after shutdown")),
+        )
+        accepted, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        def request_stop():
+            already = accepted.is_set()
+            accepted.set()
+            return already
+
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test", request_shutdown=request_stop)
+        await server.start()
+        server._fatal_engine_failure = fatal
+        if fatal:
+            await server._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
+
+        async def cleanup():
+            await accepted.wait()
+            cleaning.set()
+            await release.wait()
+            await server.stop(grace=0)
+
+        task = asyncio.create_task(cleanup())
+        channel = grpc.aio.insecure_channel(f"127.0.0.1:{server.port}")
+        probe_entered, probe_release = asyncio.Event(), asyncio.Event()
+        try:
+            control = openengine_pb2_grpc.ControlStub(channel)
+            pending_health = None
+            if pending_probe:
+                original_probe = server._control._run_inference_probe
+
+                async def held_probe(model):
+                    probe_entered.set()
+                    await probe_release.wait()
+                    return await original_probe(model)
+
+                server._control._run_inference_probe = held_probe
+                pending_health = asyncio.ensure_future(
+                    control.Health(
+                        lifecycle_pb2.HealthRequest(include_inference_probe=True), timeout=5
+                    )
+                )
+                await asyncio.wait_for(probe_entered.wait(), 3)
+            responses = await asyncio.gather(
+                *(
+                    control.Shutdown(
+                        lifecycle_pb2.ShutdownRequest(expected_instance_id="engine-A"), timeout=3
+                    )
+                    for _ in range(3)
+                )
+            )
+            assert sorted(response.status for response in responses) == [1, 2, 2]
+            assert all(response.instance_id == "engine-A" for response in responses)
+            await asyncio.wait_for(cleaning.wait(), 3)
+            with pytest.raises(grpc.aio.AioRpcError) as stale:
+                await control.Shutdown(
+                    lifecycle_pb2.ShutdownRequest(expected_instance_id="old"), timeout=3
+                )
+            assert stale.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+            health = health_pb2_grpc.HealthStub(channel)
+            assert (
+                await health.Check(health_pb2.HealthCheckRequest(service="readiness"))
+            ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+            expected_liveness = (
+                health_pb2.HealthCheckResponse.NOT_SERVING
+                if fatal
+                else health_pb2.HealthCheckResponse.SERVING
+            )
+            assert (
+                await health.Check(health_pb2.HealthCheckRequest(service="liveness"))
+            ).status == expected_liveness
+            probe_release.set()
+            state = (
+                await pending_health
+                if pending_health is not None
+                else await control.Health(
+                    lifecycle_pb2.HealthRequest(include_inference_probe=True), timeout=3
+                )
+            )
+            assert state.state == lifecycle_pb2.HEALTH_STATE_NOT_READY
+            stream = openengine_pb2_grpc.InferenceStub(channel).Generate(
+                generation_pb2.GenerateRequest(request_id="late", model="test"), timeout=3
+            )
+            with pytest.raises(grpc.aio.AioRpcError) as rejected:
+                await stream.read()
+            assert rejected.value.code() == grpc.StatusCode.UNAVAILABLE
+            llm.generate_async.assert_not_called()
+            await server._refresh_inference_health()
+            assert (
+                await health.Check(health_pb2.HealthCheckRequest(service="readiness"))
+            ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+            if not fatal and not pending_probe:
+                # A fatal error during an orderly shutdown must become visible
+                # even while owner cleanup is still held.
+                server._fatal_engine_failure = True
+                server.begin_shutdown()
+                await asyncio.wait_for(server._fatal_health_task, 3)
+                assert (
+                    await health.Check(health_pb2.HealthCheckRequest(service="liveness"))
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+        finally:
+            probe_release.set()
+            accepted.set()
+            release.set()
+            await asyncio.wait_for(task, 5)
+            await channel.close()
+
+    asyncio.run(exercise())
