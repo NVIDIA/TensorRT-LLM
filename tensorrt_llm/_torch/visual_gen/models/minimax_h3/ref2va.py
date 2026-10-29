@@ -379,9 +379,10 @@ def prepare_references(
             )
             visual_latents.append(pipeline._encode_visual_condition(pixels))
         if reference.has_audio:
-            posterior = pipeline.audio_vae.encode(
-                reference.audio.to(pipeline.device)[:, None], return_dict=False
-            )[0]
+            with pipeline.offloader.context_if_requested("audio_vae"):
+                posterior = pipeline.audio_vae.encode(
+                    reference.audio.to(pipeline.device)[:, None], return_dict=False
+                )[0]
             latents = posterior.mode().float().cpu().transpose(1, 2)
             audio_latents.append(
                 ((latents - audio_mean) / audio_std).reshape(
