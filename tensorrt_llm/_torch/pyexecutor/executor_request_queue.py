@@ -42,6 +42,9 @@ class RequestQueueItem:
     _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
+    # A completed frontend result may no longer map its client identity to an
+    # engine request. Resolve this only against retained CTX transfers.
+    cancel_context_client_id: Optional[int] = None
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler
     # step boundary with in-flight requests still in the engine.
@@ -275,12 +278,25 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
+    def enqueue_context_transfer_cancel(self, client_id: int) -> None:
+        """Queue a late CTX cancellation in the client-ID namespace.
+
+        Args:
+            client_id: Original frontend identity, not an executor request ID.
+        """
+        with self.enqueue_lock:
+            self.request_queue.put(
+                RequestQueueItem(client_id,
+                                 is_canceled_request=True,
+                                 cancel_context_client_id=client_id))
+
     def pending_cancellation_ids(self) -> set[int]:
         """Inspect cancellation sentinels without consuming queued requests."""
         with self.request_queue.mutex:
             return {
                 item.id
                 for item in self.request_queue.queue if item.is_canceled_request
+                and item.cancel_context_client_id is None
             }
 
     def enqueue_control_request(self,

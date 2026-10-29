@@ -112,8 +112,11 @@ class AsyncTransferManager:
             if self.should_store_blocks:
                 self.kv_cache_manager.unpin_blocks_by_id(transfer_metadata.block_id)
 
-            # We don't want to overwrite any error state.
-            if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
+            # Physical settlement must not rewrite a committed logical result.
+            if request.state not in (
+                LlmRequestState.DISAGG_TRANS_ERROR,
+                LlmRequestState.GENERATION_COMPLETE,
+            ):
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
             return True
