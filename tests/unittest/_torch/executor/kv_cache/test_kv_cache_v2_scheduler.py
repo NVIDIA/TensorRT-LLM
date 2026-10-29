@@ -1078,19 +1078,31 @@ class TestKVCacheFailuresGen:
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
 
-    def test_recompute_pause_waits_while_requests_in_flight(self):
-        """No teardown while an in-flight request can still release pages."""
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False, can_evict=True)
+    def test_requests_in_flight_do_not_hold_back_recompute_pause(self):
+        """Work in flight from an earlier pass does not count as progress.
+
+        Under pipeline parallelism the previous micro-batch is still in flight
+        while this one is scheduled. When only a teardown makes room for the
+        first generation request of the pass, it still happens, so the
+        micro-batch does not run empty.
+        """
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
         sched = make_scheduler(mgr, max_num_tokens=100)
         in_flight = make_gen_request(7)
         victim = make_gen_request(99)
         out = sched.schedule_request(
             [in_flight, make_gen_request(1), victim], {in_flight.request_id}
         )
-        assert out.generation_requests == []
-        assert set(ids(out.paused_requests)) == {1, 99}
-        assert out.recompute_paused_requests == []
-        mgr.free_resources.assert_not_called()
+        assert ids(out.generation_requests) == [1]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(victim)
 
     def test_recompute_pause_gate_stops_destructive_fallback(self):
         """Disabling recompute pause keeps ordinary suspension as the last fallback."""

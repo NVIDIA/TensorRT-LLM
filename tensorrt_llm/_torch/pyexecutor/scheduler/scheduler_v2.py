@@ -572,12 +572,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     recompute_paused,
                     inflight_request_ids,
                     scheduled_beam_width,
-                    # Tearing down a started request only pays off when
-                    # nothing else can run. While other generation work
-                    # progresses this pass (scheduled here or in flight),
-                    # it releases pages as it finishes, so this request
-                    # waits instead of costing another one a re-prefill.
-                    allow_recompute_pause=not scheduled_gen and not inflight_request_ids,
+                    # Tearing down a started request only pays off when this
+                    # pass has nothing else to run. Once a generation request
+                    # is scheduled here, it releases pages as it finishes, so
+                    # this request waits instead of costing another one a
+                    # re-prefill. Requests still in flight from an earlier
+                    # pass (another pipeline-parallel micro-batch) do not
+                    # count: without the teardown this pass would run empty.
+                    allow_recompute_pause=not scheduled_gen,
                 )
                 if action is ScheduleAction.STOP:
                     break
