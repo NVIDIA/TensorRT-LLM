@@ -282,6 +282,7 @@ class _FakeManagerConfig:
             )
         ]
     )
+    max_live_kv_caches: int | None = None
 
 
 class _FakeKVCache:

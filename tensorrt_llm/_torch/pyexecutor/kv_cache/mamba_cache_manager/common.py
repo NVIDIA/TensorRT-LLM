@@ -108,6 +108,9 @@ class MambaAcceptanceBatch:
     source_state_indices: torch.Tensor
     destination_state_indices: torch.Tensor
     is_dummy_request: torch.Tensor | None
+    # Replay-history slots of the generation rows; None means the
+    # destination state slots.
+    replay_indices: torch.Tensor | None = None
 
 
 class MambaState(Protocol):
@@ -129,7 +132,9 @@ class MambaState(Protocol):
         conv_states: list[torch.Tensor],
     ) -> None: ...
 
-    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None: ...
+    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+        """Reset context slots. States with PRIVATE replay buffers also take
+        ``replay_slots``, the requests' replay-history slots."""
 
     def update(self, batch: MambaAcceptanceBatch) -> None: ...
 
@@ -171,6 +176,11 @@ class _PrefixReuseDiagnostics(Protocol):
     def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int: ...
 
     def _get_num_reusable_tokens_before_pruning(self) -> int: ...
+
+
+def _is_disagg_context_server(is_disagg: bool) -> bool:
+    """Whether this worker only serves the context phase of disagg requests."""
+    return is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
 
 
 def _get_num_cuda_graph_padding_dummy_slots(

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -25,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaStateLayout,
     _get_local_mamba_cache_layout,
     _host_slots_to_device,
+    _is_disagg_context_server,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
@@ -125,11 +125,6 @@ _KDA_SEEDED_ROLES = (
     "kda_beta_cache",
 )
 _KDA_DRAFT_RECORDS_ROLE = "kda_state_tok"
-
-
-def _is_disagg_context_server(is_disagg: bool) -> bool:
-    """Whether this worker only serves the context phase of disagg requests."""
-    return is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
 
 
 def _kda_replay_layout(
