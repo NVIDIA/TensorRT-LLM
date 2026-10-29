@@ -4,7 +4,6 @@
 
 import json
 import secrets
-import socket
 from types import SimpleNamespace
 from unittest import mock
 
@@ -34,11 +33,13 @@ ETCD_USER = secrets.token_hex(4)
 ETCD_SECRET = secrets.token_hex(16)
 
 
-def _reset_prometheus_registry():
+@pytest.fixture
+def isolated_prometheus_registry(monkeypatch):
+    """Let each test register its own collectors and restore the registry afterwards."""
     from prometheus_client.registry import REGISTRY
 
-    REGISTRY._names_to_collectors = {}
-    REGISTRY._collector_to_names = {}
+    monkeypatch.setattr(REGISTRY, "_names_to_collectors", {})
+    monkeypatch.setattr(REGISTRY, "_collector_to_names", {})
 
 
 class InMemoryDictionary(RemoteDictionary):
@@ -320,10 +321,7 @@ def test_server_base_url(server, expected):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_scheme", [False, True])
-async def test_send_request_reaches_server_url(with_scheme):
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+async def test_send_request_reaches_server_url(isolated_prometheus_registry, with_scheme):
     seen = []
 
     async def completions(request):
@@ -343,14 +341,14 @@ async def test_send_request_reaches_server_url(with_scheme):
     app.router.add_post("/v1/completions", completions)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", port)
+    site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
+    port = runner.addresses[0][1]
 
     server = f"127.0.0.1:{port}"
     if with_scheme:
         server = f"http://{server}"
     router = mock.AsyncMock()
-    _reset_prometheus_registry()
     client = OpenAIHttpClient(router, ServerRole.CONTEXT, timeout_secs=10)
     try:
         request = CompletionRequest(model="m", prompt="hi", max_tokens=1)
