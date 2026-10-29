@@ -33,23 +33,7 @@ default:
   rerun_once_max_duration_s: 600
   max_failed_tests: null
 
-stages:
-  # TEMPORARY (rerun policy validation): exercises these rules with deliberate
-  # failures in l0_cpu.yml entries; each unittest wrapper adds about 20 s.
-  # CPU-Generic-x86-1:
-  #   unittest/utils/test_llm_data.py          always fails -> rerun twice, fails
-  #   unittest/executor/test_stats_serializer.py fails once after 70 s -> rerun once, passes
-  #   unittest/test_s3_output.py               fails once after 150 s with a fail
-  #                                            signature -> rerun once, passes
-  #   unittest/executor/test_base_worker.py    hangs once, TIMEOUT (1), isolated ->
-  #                                            not rerun, terminated unexpectedly
-  # CPU-Generic-x86-2:
-  #   unittest/utils/test_logger.py            fails once -> rerun twice, passes
-  #   unittest/visual_gen/test_output.py       fails after 150 s -> not rerun
-  # Remove these rules and revert those tests before merging.
-  - match: "CPU-Generic-*"
-    rerun_twice_max_duration_s: 60
-    rerun_once_max_duration_s: 120
+stages: []
 # Example:
 # stages:
 #   - match: "*-PerfSanity-*"
