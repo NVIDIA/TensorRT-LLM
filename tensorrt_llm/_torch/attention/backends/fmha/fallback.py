@@ -51,6 +51,9 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "qk_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
         "v_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
         "sage_quantized",  # for libraries taking quantized Sage inputs; the op quantizes its own
+        "output_gate",  # offered to the GQA decode FMHA; the caller gates this op's output
+        "output_gate_applied",  # set by a library that applied ``output_gate``; this op never does
+        "kv_append",  # GQA decode FMHA KV-append plan; a deferred prologue never selects this op
     }
 )
 
