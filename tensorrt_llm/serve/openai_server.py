@@ -51,7 +51,7 @@ from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import (ConversationMessage,
-                                       async_apply_chat_template)
+                                       async_apply_chat_template_with_mm)
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
@@ -94,6 +94,8 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.extensions.kimi_k3 import dynamic_tool_dicts
+from tensorrt_llm.serve.extensions.mistral_large_4 import \
+    native_tool_guided_decoding
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
@@ -883,7 +885,8 @@ class OpenAIServer(_VideoRoutesMixin):
         trust_remote_code = self.generator.args.trust_remote_code
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
-        if checkpoint_format in ("mistral", "mistral_large_3"):
+        if checkpoint_format in ("mistral", "mistral_large_3",
+                                 "mistral_large_4"):
             # Do not load HF processor for mistral native checkpoints
             # even if it is available
             self.processor = None
@@ -911,6 +914,11 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model_config = None
 
         self.chat_template = load_chat_template(chat_template)
+        if checkpoint_format == "mistral_large_4" and self.chat_template:
+            logger.warning(
+                "Mistral Large 4 renders chats with mistral-common; ignoring "
+                "the server chat template.")
+            self.chat_template = None
 
         # Enable response storage for Responses API
         self.enable_store = (len(
@@ -944,6 +952,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tool_call_id_type = "kimi_k2"
             elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
+            elif self.model_config.model_type == "mistral_large_4":
+                self.tool_call_id_type = "mistral"
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
@@ -1974,13 +1984,24 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
+            max_seq_len = getattr(self.generator.args, "max_seq_len", None)
+            requested_tokens = request.max_completion_tokens
+            if (max_seq_len is not None and requested_tokens is not None
+                    and requested_tokens > max_seq_len):
+                raise ValueError(
+                    f"Requested {requested_tokens} output tokens exceeds the "
+                    f"maximum context length of {max_seq_len} tokens.")
             model_type = resolve_top_level_model_type(self.model_config)
             is_kimi_k3 = model_type == "kimi_k3"
+            native_tool_choice = (
+                model_type == "mistral_large_4"
+                and self.tool_parser == "mistral_large_4"
+                and (request.tool_choice == "required" or isinstance(
+                    request.tool_choice, ChatCompletionNamedToolChoiceParam)))
             apply_model_chat_extensions(request, model_type)
-            if request.tool_choice == "required" and not is_kimi_k3:
-                # Schema-accepting "required" everywhere but enforcing it only
-                # for kimi_k3 would silently degrade to "auto" elsewhere;
-                # reject loudly for models that cannot honor it.
+            if request.tool_choice == "required" and not (is_kimi_k3 or
+                                                          native_tool_choice):
+                # Required calls need a model-specific enforcement path.
                 raise ValueError(
                     "tool_choice='required' is not supported for this model.")
             conversation: List[ConversationMessage] = []
@@ -2003,6 +2024,17 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            if native_tool_choice:
+                if self.generator.args.guided_decoding_backend != "llguidance":
+                    raise ValueError(
+                        "Mistral required and named tool calls require "
+                        "guided_decoding_backend='llguidance'.")
+                if sampling_params.guided_decoding is not None:
+                    raise ValueError(
+                        "Required or named tool calls cannot be combined with response_format."
+                    )
+                sampling_params.guided_decoding = native_tool_guided_decoding(
+                    request, self.tokenizer)
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
@@ -2025,8 +2057,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # the tool call.
             forced_tool_name = None
             forced_tool_begin_prefix = None
-            if isinstance(request.tool_choice,
-                          ChatCompletionNamedToolChoiceParam):
+            if not native_tool_choice and isinstance(
+                    request.tool_choice, ChatCompletionNamedToolChoiceParam):
                 if not request.tools:
                     return self.create_error_response(
                         message=("tool_choice with a named function requires "
@@ -2239,22 +2271,25 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt_task = async_apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
-                    conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                )
-                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
-                    prompt_task, mm_coroutines)
+                prompt, (
+                    mm_data,
+                    mm_embeddings) = await async_apply_chat_template_with_mm(
+                        mm_coroutines,
+                        model_type=resolve_top_level_model_type(
+                            self.model_config),
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        conversation=conversation,
+                        add_generation_prompt=request.add_generation_prompt,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template
+                        or self.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs or {},
+                        injected_chat_template_kwargs=request.
+                        injected_chat_template_kwargs,
+                    )
                 if isinstance(prompt, str):
                     # Captured before the forced-tool prefix is appended:
                     # resolve_prefilled_thinking() inspects what the chat
@@ -2263,6 +2298,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 if forced_tool_begin_prefix is not None:
                     # Force the model to start generation inside the tool call.
                     # See ``_build_forced_tool_call_decoding`` for details.
+                    if not isinstance(prompt, str):
+                        # The prefix is text; appending it to rendered token
+                        # ids would need a re-encode that loses control tokens.
+                        raise ValueError(
+                            "tool_choice with a named function is not "
+                            "supported for this model, whose chat template "
+                            "renders token ids.")
                     prompt = prompt + forced_tool_begin_prefix
             prompt = prompt_inputs(prompt)
 
@@ -2761,22 +2803,24 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt_task = async_apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
-                    conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                )
-                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
-                    prompt_task, mm_coroutines)
+                prompt, (
+                    mm_data,
+                    mm_embeddings) = await async_apply_chat_template_with_mm(
+                        mm_coroutines,
+                        model_type=resolve_top_level_model_type(
+                            self.model_config),
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        conversation=conversation,
+                        add_generation_prompt=request.add_generation_prompt,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs or {},
+                        injected_chat_template_kwargs=request.
+                        injected_chat_template_kwargs,
+                    )
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:

@@ -485,10 +485,13 @@ class DSACacheManagerV2(KVCacheManagerV2):
             raise ValueError("DSA requires at least one local attention layer")
         primary_converters = [
             self.impl.get_page_index_converter(local_layer_idx, Role.KEY)
+            if self.has_buffer(local_layer_idx, Role.KEY)
+            else None
             for local_layer_idx in range(self.num_local_layers)
         ]
         self._primary_pool_page_index_params = [
-            (int(converter.scale), int(converter.layer_offset)) for converter in primary_converters
+            (int(converter.scale), int(converter.layer_offset)) if converter is not None else None
+            for converter in primary_converters
         ]
         local_indexer_mask = self.indexer_k_cache_local_layer_mask
         full_indexer_local_layers = [
@@ -532,7 +535,10 @@ class DSACacheManagerV2(KVCacheManagerV2):
 
     def get_primary_pool_page_index_params(self, local_layer_idx: int) -> Tuple[int, int]:
         """Return the formal V2 page scale and layer offset for sparse MLA."""
-        return self._primary_pool_page_index_params[local_layer_idx]
+        params = self._primary_pool_page_index_params[local_layer_idx]
+        if params is None:
+            raise ValueError(f"Local layer {local_layer_idx} owns no latent KEY buffer")
+        return params
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {

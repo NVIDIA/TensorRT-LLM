@@ -1241,6 +1241,7 @@ class DSparkWorker(DFlashWorker):
         gen_logits: torch.Tensor,
         inputs: dict,
         spec_metadata,
+        draft_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Add the greedy-chained Markov intra-block bias to the block logits.
 
@@ -1251,7 +1252,11 @@ class DSparkWorker(DFlashWorker):
         if not getattr(draft_model, "has_markov_head", False):
             return gen_logits
         return self._apply_dspark_markov_bias(
-            draft_model, gen_logits, inputs["first_prev_tokens"], spec_metadata
+            draft_model,
+            gen_logits,
+            inputs["first_prev_tokens"],
+            spec_metadata,
+            draft_hidden_states,
         )
 
     def _apply_dspark_markov_bias(
@@ -1260,6 +1265,7 @@ class DSparkWorker(DFlashWorker):
         gen_logits: torch.Tensor,
         first_prev_tokens: torch.Tensor,
         spec_metadata,
+        draft_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply the dspark vanilla-Markov intra-block bias to block logits.
 
@@ -1304,9 +1310,17 @@ class DSparkWorker(DFlashWorker):
             # draft-vocab space, which is what markov_w1 indexes.
             return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
 
+        head_kwargs = {}
+        if getattr(draft_model, "has_recurrent_markov_head", False):
+            if draft_hidden_states is None:
+                raise ValueError(
+                    "A recurrent DSpark head requires the draft backbone hidden states"
+                )
+            head_kwargs["hidden_states"] = draft_hidden_states
         return draft_model.apply_markov_chain_logits(
             gen_logits,
             first_prev_tokens,
             argmax_fn=argmax_fn,
             vocab_slice=vocab_slice,
+            **head_kwargs,
         )

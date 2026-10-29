@@ -592,6 +592,12 @@ models:
         default: <factory:list>
         status: stable
         required: false
+      store:
+        kind: openai
+        type: Optional[Literal[False]]
+        default: false
+        status: stable
+        required: false
       stream:
         kind: openai
         type: Optional[bool]
@@ -771,6 +777,12 @@ models:
         type: bool
         default: true
         status: stable
+        required: false
+      continue_final_message:
+        kind: extension
+        type: bool
+        default: false
+        status: prototype
         required: false
       add_special_tokens:
         kind: extension

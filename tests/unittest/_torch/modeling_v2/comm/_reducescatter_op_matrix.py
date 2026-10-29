@@ -3,45 +3,61 @@
 """GPU certification matrix for the reducescatter catalog entry.
 
 A collective cannot be exercised in one process, so this script is its own
-launcher: run it plainly and it spawns one worker process per device, with one
-rank per device named in CUDA_VISIBLE_DEVICES, under a deadline the parent
-enforces by killing the whole process group. A wedged collective hangs
-rather than raising — and this op wedges rather than raising when the ranks
-disagree about the split — so the deadline is what keeps a broken kernel
-from taking the calling run down with it.
+launcher: run it plainly and it starts one rank per device named in
+CUDA_VISIBLE_DEVICES, under a deadline the parent enforces by killing the
+ranks. A wedged collective hangs rather than raising -- and this op wedges
+rather than raising when the ranks disagree about the split -- so the
+deadline is what keeps a broken kernel from taking the calling run down with
+it.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _reducescatter_op_matrix.py
 
-That runs two jobs, in this order. The first is the matrix proper: every
-`CHECKS` entry on `world_size` ranks, and it must exit 0. The second is a
-four-rank sub-job of its own that deliberately mispairs this op against an
-all-gather of a *different* byte count, which is the one call-order
-divergence that hangs instead of returning wrong data — it cannot live in
-the first job, because a job that wedges never reports. The launcher
-certifies it out of band: every rank marks the file system before issuing
-the pair, none marks it afterwards, and the job is ended by its own
-watchdog. That sub-job doubles as the harness's positive control, since it
-is a real collective deadlock this launcher has to survive.
+That runs two jobs, in this order, and both must exit 0:
+
+- the `_pg` job: plain worker processes that rendezvous through
+  torch.distributed's env://, every `CHECKS` entry on `world_size` ranks. It
+  drives the cells that do not state `process_group`, through the
+  `reducescatter_pg` symbol on a boxed c10d group;
+- the MPI-session job: the same number of ranks started by `mpirun`, every
+  `MPI_CHECKS` entry. It drives the cells that state `process_group=None` at
+  that world size, through `torch.ops.trtllm.reducescatter` on the
+  communicator the MPI session builds -- the symbol and communicator a dep4
+  world launched under mpirun reaches. Its `mpirun` gets an environment with
+  the launching allocation's PMI/PMIx/Open MPI/Slurm variables removed, so it
+  starts its own ranks on this node rather than joining the allocation's step.
+
+The world-8 cells -- the dep8 combine, eight ranks over two nodes of four --
+are a third job, the MPI-session checks again on ranks an MPI launcher starts
+across both nodes, one per device, as the dep8 engine's ranks are. One
+process cannot place ranks on another node, so the launcher is the
+environment's (the collected test takes it from `MODELING_V2_MPI_LAUNCH`):
+
+    <launcher> python _reducescatter_op_matrix.py --mpi-rank-worker
+
+Each MPI-session job drives the cells of its own world size and node count.
+A rank that wedges inside a collective is ended by faulthandler at
+`MPI_DEADLINE_S`, and the launcher ends its siblings.
 
 Not a pytest module, despite the `check_*` bodies. They are one fixed
-sequence inside a single 4-rank job rather than independent cases: each reads
-module-global rank state that only `_run_one_rank` binds, and several assert
+sequence inside a single job rather than independent cases: each reads
+module-global rank state that only the rank body binds, and several assert
 on communicator state the previous one left behind. Collected as tests they
-would run at world size 1 against unbound globals — so neither this file's
+would run at world size 1 against unbound globals -- so neither this file's
 name nor its function names match pytest's collection patterns, which is what
 keeps it uncollectable however pytest is pointed at this tree.
 
-The collected entry point is
-`tests/unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py`:
-it starts this job and turns its exit code into an assertion. Both halves are
-started by file path: the launcher must not import `tensorrt_llm` (that calls
-CUDA nor torch.distributed state of its own), and the
+The collected entry point is `test_modeling_v2_reducescatter_op_matrix.py`
+beside this file: it starts these jobs and turns their exit codes into
+assertions. Both halves are started by file path: the launcher must not import
+`tensorrt_llm` (that would give it CUDA and MPI state of its own), and the
 ranks reach the catalog by absolute import, so neither needs a package.
 """
 
+import faulthandler
 import functools
 import os
 import random
+import shutil
 import signal
 import socket
 import subprocess
@@ -56,14 +72,13 @@ import torch.distributed as dist
 assert torch.cuda.is_available(), "reducescatter requires CUDA devices"
 
 _WORKER_FLAG = "--rank-worker"
-DEADLINE_S = 1800
-
-# The wedge sub-job's budget. A pair that is going to return does so in
-# microseconds, so a rank still inside it GRACE seconds later is wedged; the
-# watchdog then ends its own process, because a rank blocked in a NCCL kernel
-# that will never complete has no other way out. CAP covers the sub-job's
-# import and communicator bring-up before the pair is issued (~50 s measured)
-# plus the driver's teardown of four contexts holding a spinning kernel.
+_MPI_WORKER_FLAG = "--mpi-rank-worker"
+# Each job's own deadline; `_rank_job` reads their sum off DEADLINE_S. Each
+# MPI-session rank also ends itself at MPI_DEADLINE_S, and the collected test
+# allows the world-8 job's launcher that plus a grace.
+PG_DEADLINE_S = 1800
+MPI_DEADLINE_S = 600
+DEADLINE_S = PG_DEADLINE_S + MPI_DEADLINE_S
 
 HIDDEN = 2560  # DeepSeek-V3-Lite hidden size, the caller that motivates this
 
@@ -87,13 +102,17 @@ SITES_PER_DECODE_GRAPH = 29
 BF16_U = 2.0**-8
 
 # Bound inside the rank body, never in the launcher: importing the entry
-# pulls in tensorrt_llm, which calls MPI_Init at import, and an
+# pulls in tensorrt_llm, which calls MPI_Init at import, and the launcher has
+# to stay free of MPI and CUDA state.
 reducescatter: Any = None
 entry: Any = None
 PG_BOXED: Any = None
+MPI_COMM: Any = None
 SUBGROUPS: Dict[Tuple[int, ...], Any] = {}
 RANK = 0
 WORLD = 1
+#: Distinct hosts the MPI-session job's ranks run on.
+NODES = 1
 GROUP: List[int] = [0]
 
 
@@ -419,15 +438,24 @@ def check_cuda_graph_captures_a_cold_first_call() -> None:
     dist.barrier()
 
 
-def check_certified_cells() -> None:
-    """Drive the entry's own cell list, inside `validating`.
+def _on_mpi_session(cell: Any) -> bool:
+    """Whether `cell` drives the MPI-session symbol: it states `process_group=None`."""
+    return "process_group" in cell.spec and cell.spec["process_group"] is None
 
-    The rest of this file says things no cell can -- CUDA graph behaviour, call
-    order, which stream the call lands on. This one says the plain thing: for
-    every configuration the entry claims, the slice is the sum, bitwise, and the
-    guard admits the input a shipped target passes.
+
+def check_certified_cells() -> None:
+    """Drive the entry's `_pg` cells, inside `validating`.
+
+    The rest of this job says things none of these cells can -- CUDA graph
+    behaviour, call order, which stream the call lands on. This one says the
+    plain thing: for every configuration these cells claim, the slice is the
+    sum, bitwise, and the guard admits the input a shipped target passes.
     """
+    driven = 0
     for i, cell in enumerate(entry.reducescatter.CELLS):
+        if _on_mpi_session(cell):
+            continue  # the MPI-session job drives it (`MPI_CHECKS`)
+        driven += 1
         spec = cell.spec
         rows, trailing, dtype = spec["rows_per_rank"], spec["trailing"], spec["dtype"]
         seed = 9000 + 13 * i
@@ -438,6 +466,7 @@ def check_certified_cells() -> None:
         assert out.shape == (rows, *trailing), (cell.why, out.shape)
         _assert_bitwise(out, _ref(sizes, RANK, seed, dtype, trailing), cell.why)
         dist.barrier()
+    assert driven > 0, "no cell drives the _pg symbol"
 
 
 def check_uniform_reduce_scatter() -> None:
@@ -1400,6 +1429,692 @@ def _run_one_rank() -> int:
     os._exit(0)
 
 
+# ---- the MPI-session job ------------------------------------------------------
+#
+# Everything from here to `MPI_CHECKS` drives the cells that state
+# `process_group=None`, on the symbol and the communicator a dep4 or dep8
+# serving world reaches: ranks started by mpirun, `torch.ops.trtllm.reducescatter`,
+# and the NCCL communicator tensorrt_llm's MPI session builds for `group` at its
+# first call. These ranks have no torch.distributed group; they synchronize
+# through the MPI session itself. One job drives the cells of its own world
+# size: four ranks of one node (`_mpirun_ranks`), or eight over two nodes
+# (started by the environment's launcher).
+
+#: bf16 carries 8 significant bits, so one round-to-nearest is off by at most
+#: 2^-8 of the value it rounds: the format's unit roundoff.
+BF16_UNIT_ROUNDOFF = 2.0**-8
+
+#: The share of elements the "one rank's addend left out" variant must move
+#: outside `_band`, per world size. That variant differs from the reference by
+#: the left-out addend x_k alone, so it lands inside the band wherever |x_k| is
+#: below (gamma_{W-1} + u) * sum_r |x_r|: a band that widens with W while x_k
+#: does not. Measured at 32768 rows of standard normal payloads: at least
+#: 0.9694 at world 4, and 0.8536..0.8537 on the eight ranks of world 8 (the
+#: neighbouring slice, which differs in every addend, stays above 0.96 at both).
+MISSING_ADDEND_FLOOR = {4: 0.9, 8: 0.8}
+
+#: The entry's own `__call__` and `reference`, counted (`_count_entry_calls`).
+SEEN: Dict[str, int] = {"__call__": 0, "reference": 0}
+#: What each MPI-session cell ran through the entry: [calls, references].
+DRIVEN: Dict[int, List[int]] = {}
+
+
+def _mpi_cells() -> List[Tuple[int, Any]]:
+    """(index, cell) of every cell this MPI-session job drives: its world size's."""
+    return [
+        (i, c)
+        for i, c in enumerate(entry.reducescatter.CELLS)
+        if _on_mpi_session(c) and c.spec["world_size"] == WORLD
+    ]
+
+
+def _mpi_sync() -> None:
+    """Every rank's device work done, then every rank here."""
+    torch.cuda.synchronize()
+    MPI_COMM.Barrier()
+
+
+def _count_entry_calls() -> None:
+    """What `_validating.certifying` does under pytest, for this rank body.
+
+    The entry's own `__call__` (with `is_valid` interposed first, as
+    `validating` does) and its own `reference` are wrapped to count, so every
+    cell can assert that both ran for it rather than a local copy.
+    """
+    cls = type(entry.reducescatter)
+    call, ref = cls.__dict__["__call__"], cls.__dict__["reference"]
+
+    def counted_call(self, *args, **kwargs):
+        SEEN["__call__"] += 1
+        self.is_valid(*args, **kwargs)
+        return call(self, *args, **kwargs)
+
+    def counted_reference(self, *args, **kwargs):
+        SEEN["reference"] += 1
+        return ref(self, *args, **kwargs)
+
+    cls.__call__ = counted_call
+    cls.reference = counted_reference
+
+
+def _account(i: int, before: Dict[str, int]) -> None:
+    """Add what the entry ran since `before` to cell `i`."""
+    got = DRIVEN.setdefault(i, [0, 0])
+    got[0] += SEEN["__call__"] - before["__call__"]
+    got[1] += SEEN["reference"] - before["reference"]
+
+
+def _combine(x: torch.Tensor, spec: Dict[str, Any]) -> torch.Tensor:
+    """The call the dep4 and dep8 targets make, with the arguments the cell states."""
+    return entry.reducescatter(x, spec["sizes"], GROUP, process_group=spec["process_group"])
+
+
+def _width(spec: Dict[str, Any]) -> int:
+    assert len(spec["trailing"]) == 1 and spec["dtype"] is torch.bfloat16, spec
+    assert spec["world_size"] == WORLD and spec["sizes"] is None, (spec, WORLD)
+    # A cell without `nodes` is one node's, as the dep4 cells are.
+    assert spec.get("nodes", 1) == NODES, (spec, NODES)
+    return spec["trailing"][0]
+
+
+def _payload(rank: int, shape: Tuple[int, ...], seed: int, exact: bool = True) -> torch.Tensor:
+    """`rank`'s input of `shape`, regenerable on every rank from the shared seed.
+
+    `exact` draws `_block`'s value set, multiples of 1/8 with |x| <= 31/8: every
+    partial sum of WORLD of them is exact in bf16, so any correct reduction is
+    bitwise the reference. Otherwise standard normal values cast to bf16, on
+    which the order of the sum shows.
+    """
+    gen = torch.Generator(device="cuda").manual_seed((seed * 977 + rank) * 131 + 7)
+    if exact:
+        raw = torch.randint(-31, 32, shape, generator=gen, device="cuda", dtype=torch.int8)
+        return raw.to(torch.bfloat16).div_(8.0)
+    return torch.randn(shape, generator=gen, device="cuda", dtype=torch.float32).to(torch.bfloat16)
+
+
+def _slices_of_every_rank(
+    shape: Tuple[int, ...], seed: int, starts: Sequence[int], rows: int, exact: bool = True
+) -> List[List[torch.Tensor]]:
+    """Rows [start, start + rows) of every rank's `_payload`, one list per start.
+
+    Each rank's whole payload is drawn, sliced and dropped in turn, so a rank
+    holds one whole payload at a time rather than WORLD of them -- 3.2 GB each
+    at world 8 and 32768 rows per rank. A slice is bitwise those rows of the
+    whole payload, so what a check computes from it is unchanged.
+    """
+    per_start: List[List[torch.Tensor]] = [[] for _ in starts]
+    for r in range(WORLD):
+        block = _payload(r, shape, seed, exact)
+        for got, start in zip(per_start, starts):
+            got.append(block[start : start + rows].clone())
+        del block
+    return per_start
+
+
+def _differs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Whether two bf16 tensors differ anywhere: a device bool, compared as int64 words."""
+    assert a.shape == b.shape and a.dtype == b.dtype == torch.bfloat16, (a.shape, b.shape)
+    return torch.ne(a.reshape(-1).view(torch.int64), b.reshape(-1).view(torch.int64)).any()
+
+
+def _sweep_rows(spec: Dict[str, Any]) -> List[int]:
+    """The row counts a sweep cell names, largest first."""
+    lo, hi = spec["sweep_rows"]
+    rows = set(range(lo, hi + 1, spec["sweep_step"])) | set(spec.get("sweep_also", ())) | {hi}
+    assert spec["rows_per_rank"] == hi and all(lo <= r <= hi for r in rows), spec
+    # Largest first, so the caching allocator sizes its blocks for the top once.
+    return sorted(rows, reverse=True)
+
+
+def _band(contributions: Sequence[torch.Tensor]) -> torch.Tensor:
+    """How far a bf16 reduction of `contributions` may sit from the entry's reference.
+
+    Two terms, with u = 2^-8, bf16's unit roundoff. The reference accumulates
+    in fp32 and rounds once to bf16, so it is within u * sum_r |x_r| of the
+    exact sum. The op adds the same WORLD addends in bf16 in some order,
+    rounding each of its k = WORLD - 1 partial sums, so it is within
+    gamma_k * sum_r |x_r| of the exact sum, gamma_k = k u / (1 - k u): the
+    classical bound for recursive summation in any order. The band is their
+    sum. Measured on the op at 32768 rows of standard normal payloads: the
+    largest error over the four ranks is 0.890 of the band, and the two wrong
+    results `check_mpi_random_payload_cells` builds fall outside it in at least
+    0.9694 of the elements. At world 8 over two nodes (k = 7) the largest error
+    over the eight ranks is 0.623 of the band, over three payloads; the wrong
+    results fall outside it in at least 0.8536 of the elements, the share
+    `MISSING_ADDEND_FLOOR` explains.
+    """
+    absum = torch.zeros(contributions[0].shape, dtype=torch.float32, device="cuda")
+    for block in contributions:
+        absum += block.float().abs()
+    k = WORLD - 1
+    gamma = k * BF16_UNIT_ROUNDOFF / (1 - k * BF16_UNIT_ROUNDOFF)
+    return (gamma + BF16_UNIT_ROUNDOFF) * absum
+
+
+def check_mpi_session_is_the_launchers_world() -> None:
+    """The ranks are mpirun's, one device each, and the MPI session spans them all.
+
+    `getComm` builds the communicator through the MPI session, so a session of
+    one process per rank -- what a launch without the ranks in place gives --
+    would wedge the first call instead of failing it. Over several nodes each
+    node's ranks hold that node's devices 0..n-1, in rank order, as the
+    launcher places them.
+    """
+    from tensorrt_llm._utils import mpi_rank, mpi_world_size
+
+    assert os.environ.get("TLLM_DISABLE_MPI") != "1", "the MPI-session job runs with MPI"
+    assert mpi_world_size() == MPI_COMM.Get_size() == WORLD, (mpi_world_size(), WORLD)
+    assert mpi_rank() == MPI_COMM.Get_rank() == RANK, (mpi_rank(), RANK)
+    placed = MPI_COMM.allgather((socket.gethostname(), torch.cuda.current_device()))
+    hosts = list(dict.fromkeys(host for host, _ in placed))
+    assert len(hosts) == NODES and WORLD % NODES == 0, placed
+    per_node = WORLD // NODES
+    assert [hosts.index(h) for h, _ in placed] == [r // per_node for r in range(WORLD)], placed
+    assert [d for _, d in placed] == [r % per_node for r in range(WORLD)], placed
+    if RANK == 0:
+        print(
+            f"[mpi] {torch.cuda.get_device_name()} sm_"
+            f"{''.join(map(str, torch.cuda.get_device_capability()))}, NCCL "
+            f"{torch.cuda.nccl.version()}; {WORLD} ranks on {NODES} node(s): {placed}",
+            flush=True,
+        )
+    cells = _mpi_cells()
+    assert cells, "no cell states process_group=None"
+    for _, cell in cells:
+        _width(cell.spec)
+    _mpi_sync()
+
+
+def check_mpi_eager_sweep_cells() -> None:
+    """Every sweep cell: at each row count it names, the slice is the reference's, bitwise.
+
+    One full-height input per rank, regenerated for every rank of the world
+    from the shared seeds. A row count passes the leading WORLD x rows rows,
+    which is a contiguous input of exactly that height, so rank r's addend for
+    this slice is rows [RANK x rows, (RANK + 1) x rows) of rank r's buffer.
+    These are the group's first calls, so the first of them builds the
+    communicator, eagerly. A mismatch is agreed across the ranks before any
+    rank raises, so the call that counts it is made by all of them.
+    """
+    for i, cell in _mpi_cells():
+        spec = cell.spec
+        if "sweep_rows" not in spec:
+            continue
+        width = _width(spec)
+        rows_list = _sweep_rows(spec)
+        top = rows_list[0]
+        seed = 20000 + 13 * i
+        full = [_payload(r, (WORLD * top, width), seed) for r in range(WORLD)]
+        mine = full[RANK]
+        bad = torch.zeros(len(rows_list), dtype=torch.bool, device="cuda")
+        before = dict(SEEN)
+        _mpi_sync()
+        for k, rows in enumerate(rows_list):
+            out = _combine(mine[: WORLD * rows], spec)
+            assert out.shape == (rows, width), (cell.why, rows, out.shape)
+            ref = entry.reducescatter.reference(
+                [block[RANK * rows : (RANK + 1) * rows] for block in full]
+            )
+            bad[k] = _differs(out, ref)
+        torch.cuda.synchronize()
+        everyone = MPI_COMM.allgather(bad.nonzero().flatten().tolist())
+        failing = sorted({rows_list[k] for got in everyone for k in got})
+        if failing:
+            rows = failing[0]
+            out = _combine(mine[: WORLD * rows], spec)
+            ref = entry.reducescatter.reference(
+                [block[RANK * rows : (RANK + 1) * rows] for block in full]
+            )
+            wrong = int((out != ref).sum().item())
+            raise AssertionError(
+                f"{cell.why}: {len(failing)} of {len(rows_list)} row counts differ from the "
+                f"reference on some rank, the smallest {rows} here in {wrong} of "
+                f"{out.numel()} elements"
+            )
+        _account(i, before)
+        del full, mine
+        _mpi_sync()
+
+
+def check_mpi_random_payload_cells() -> None:
+    """Every cell with one row count and a random payload, at that row count.
+
+    The exact payload first: the slice is the reference's bitwise, the input is
+    left as it was and the output is a tensor of its own. Then standard normal
+    payloads, where the bf16 sum cannot be bitwise the fp32 reference: four
+    calls return the same bits, every element sits inside `_band` of the
+    reference, and the band is shown to discriminate -- the same slice with one
+    rank's addend left out lands outside it in at least `MISSING_ADDEND_FLOOR`
+    of the elements, and the neighbouring position's slice in nearly every
+    element.
+    """
+    for i, cell in _mpi_cells():
+        spec = cell.spec
+        if spec.get("payload") != "random":
+            continue
+        width, rows = _width(spec), spec["rows_per_rank"]
+        before = dict(SEEN)
+        seed = 30000 + 13 * i
+        mine = _payload(RANK, (WORLD * rows, width), seed)
+        kept = mine.clone()
+        _mpi_sync()
+        out = _combine(mine, spec)
+        assert out.shape == (rows, width) and out.data_ptr() != mine.data_ptr(), cell.why
+        (addends,) = _slices_of_every_rank((WORLD * rows, width), seed, [RANK * rows], rows)
+        ref = entry.reducescatter.reference(addends)
+        assert not bool(_differs(out, ref)), f"{cell.why}: exact payload differs"
+        assert not bool(_differs(mine, kept)), f"{cell.why}: the input was written"
+        del mine, kept, out, ref, addends
+        _mpi_sync()
+
+        seed += 1
+        x = _payload(RANK, (WORLD * rows, width), seed, exact=False)
+        outs = [_combine(x, spec) for _ in range(4)]
+        for k, again in enumerate(outs[1:], start=1):
+            assert not bool(_differs(again, outs[0])), f"{cell.why}: repeat {k} differs"
+        nb = (RANK + 1) % WORLD
+        mine_blocks, neighbour = _slices_of_every_rank(
+            (WORLD * rows, width), seed, [RANK * rows, nb * rows], rows, exact=False
+        )
+        ref = entry.reducescatter.reference(mine_blocks).float()
+        band = _band(mine_blocks)
+        ratio = ((outs[0].float() - ref).abs() / band.clamp_min(1e-30)).max().item()
+        assert ratio <= 1.0, (
+            f"{cell.why}: an element sits {ratio:.3f} of the band from the reference"
+        )
+        missing = ref - mine_blocks[nb].float()
+        caught = []
+        for name, wrong, floor in (
+            ("one rank's addend left out", missing, MISSING_ADDEND_FLOOR[WORLD]),
+            ("the neighbouring slice", entry.reducescatter.reference(neighbour).float(), 0.9),
+        ):
+            outside = ((wrong - ref).abs() > band).float().mean().item()
+            assert outside > floor, f"{cell.why}: {name} is outside the band in only {outside:.4f}"
+            caught.append(outside)
+        ratios, caught = MPI_COMM.allgather(ratio), MPI_COMM.allgather(caught)
+        if RANK == 0:
+            print(
+                f"[mpi] {cell.why[:44]}: largest error {max(ratios):.3f} of the band over "
+                f"{WORLD} ranks; outside it, the left-out addend in >= "
+                f"{min(c[0] for c in caught):.4f} and the neighbouring slice in >= "
+                f"{min(c[1] for c in caught):.4f} of the elements",
+                flush=True,
+            )
+        _account(i, before)
+        del x, outs, mine_blocks, neighbour, ref, band, missing
+        _mpi_sync()
+
+
+def check_mpi_graph_cells() -> None:
+    """The graph cells together: the decode graphs a dep4 or dep8 engine holds, one pool.
+
+    One graph per captured batch, largest first as the engine's graph runner
+    captures, each with `sites` combines that read their own persistent input
+    and copy into their own persistent output (outside the pool, whose blocks a
+    later capture reuses). The group is warmed eagerly at each batch before its
+    capture, as the engine's warmup does. Then four replay orders, each twice:
+    one replay at a time on fresh exact payloads checked bitwise against the
+    reference, then every graph's payload staged and all replayed back to back
+    with no synchronization. Last, random payloads: each replay bitwise equal to
+    the same calls made eagerly.
+    """
+    cells = [(i, c) for i, c in _mpi_cells() if "graph_rows" in c.spec]
+    assert cells, "no graph cell"
+    spec0 = cells[0][1].spec
+    pool_rows, sites, width = tuple(spec0["graph_rows"]), spec0["sites"], _width(spec0)
+    by_rows = {c.spec["rows_per_rank"]: i for i, c in cells}
+    assert sorted(by_rows) == sorted(pool_rows), (sorted(by_rows), pool_rows)
+    for _, c in cells:
+        assert c.spec["sites"] == sites and tuple(c.spec["graph_rows"]) == pool_rows, c.why
+
+    inputs: Dict[int, torch.Tensor] = {}
+    outputs: Dict[int, torch.Tensor] = {}
+    graphs: Dict[int, Any] = {}
+    pool = None
+    for rows in sorted(pool_rows, reverse=True):
+        spec = entry.reducescatter.CELLS[by_rows[rows]].spec
+        before = dict(SEEN)
+        x = _payload(RANK, (sites, WORLD * rows, width), 40000 + rows)
+        out = torch.empty(sites, rows, width, dtype=torch.bfloat16, device="cuda")
+
+        def body(x: torch.Tensor = x, out: torch.Tensor = out, spec: Dict[str, Any] = spec) -> None:
+            for s in range(sites):
+                out[s].copy_(_combine(x[s], spec))
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                body()
+        torch.cuda.current_stream().wait_stream(side)
+        _mpi_sync()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            body()
+        pool = graph.pool() if pool is None else pool
+        inputs[rows], outputs[rows], graphs[rows] = x, out, graph
+        _account(by_rows[rows], before)
+        _mpi_sync()
+
+    def stage(rows: int, seed: int, exact: bool = True) -> None:
+        inputs[rows].copy_(_payload(RANK, (sites, WORLD * rows, width), seed, exact))
+
+    def verify(rows: int, seed: int, where: str) -> None:
+        before = dict(SEEN)
+        ref = entry.reducescatter.reference(
+            [
+                _payload(r, (sites, WORLD * rows, width), seed)[:, RANK * rows : (RANK + 1) * rows]
+                for r in range(WORLD)
+            ]
+        )
+        _account(by_rows[rows], before)
+        if bool(_differs(outputs[rows], ref)):
+            bad = [s for s in range(sites) if not torch.equal(outputs[rows][s], ref[s])]
+            raise AssertionError(f"{where} rows={rows}: sites {bad} differ from the reference")
+
+    asc = sorted(pool_rows)
+    shuffled = list(asc)
+    random.Random(1234).shuffle(shuffled)
+    extremes = [r for pair in zip(reversed(asc), asc) for r in pair][: len(asc)]
+    seed = 50000
+    for name, order in (
+        ("ascending", asc),
+        ("descending", list(reversed(asc))),
+        ("shuffled", shuffled),
+        ("extremes", extremes),
+    ):
+        assert sorted(order) == asc, (name, order)
+        for pos, rows in enumerate(order):
+            seed += 1
+            stage(rows, seed)
+            _mpi_sync()
+            graphs[rows].replay()
+            torch.cuda.synchronize()
+            verify(rows, seed, f"{name}/checked@{pos}")
+        _mpi_sync()
+        staged: Dict[int, int] = {}
+        for rows in order:
+            seed += 1
+            staged[rows] = seed
+            stage(rows, seed)
+        _mpi_sync()
+        for rows in order:
+            graphs[rows].replay()
+        torch.cuda.synchronize()
+        for pos, rows in enumerate(order):
+            verify(rows, staged[rows], f"{name}/burst@{pos}")
+        _mpi_sync()
+
+    # A replay that did not happen leaves the previous payload's result; the
+    # gate of exactly zero sees it only if two consecutive references differ.
+    prev = entry.reducescatter.reference(
+        [
+            _payload(r, (WORLD * 16, width), seed - 1)[RANK * 16 : (RANK + 1) * 16]
+            for r in range(WORLD)
+        ]
+    )
+    last = entry.reducescatter.reference(
+        [_payload(r, (WORLD * 16, width), seed)[RANK * 16 : (RANK + 1) * 16] for r in range(WORLD)]
+    )
+    margin = (last.float() - prev.float()).abs().max().item()
+    assert margin > 8.0, f"stale-replay margin {margin}"
+
+    for rows in shuffled:
+        seed += 1
+        stage(rows, seed, exact=False)
+        _mpi_sync()
+        graphs[rows].replay()
+        torch.cuda.synchronize()
+        before = dict(SEEN)
+        spec = entry.reducescatter.CELLS[by_rows[rows]].spec
+        eager = torch.stack([_combine(inputs[rows][s], spec) for s in range(sites)])
+        _account(by_rows[rows], before)
+        if bool(_differs(outputs[rows], eager)):
+            raise AssertionError(f"random payload, rows={rows}: a replay differs from eager")
+        _mpi_sync()
+    graphs.clear()
+    _mpi_sync()
+
+
+def check_mpi_sum_is_the_ring_chain() -> None:
+    """What the MPI-session sum is, on payloads with no exactness property.
+
+    The bf16 chain in ring order from the destination's successor,
+    `x_{pos+1} + x_{pos+2} + ... + x_pos` (indices mod WORLD), bitwise -- the
+    order `check_reduction_is_deterministic_and_accumulates_in_the_input_dtype`
+    pins on the `_pg` symbol, so the two symbols compute the same arithmetic.
+    NCCL's algorithm choice for this topology (every ring of the world's
+    communicator runs in rank order, at world 4 on one node and at world 8 over
+    two): if this fails, the reduction order changed and the entry's numerics
+    note is re-measured, not this gate loosened.
+    """
+    spec = _mpi_cells()[0][1].spec
+    width = _width(spec)
+    for rows in (1, 16, 256, 2048, 32768):
+        seed = 60000 + rows
+        x = _payload(RANK, (WORLD * rows, width), seed, exact=False)
+        out = _combine(x, spec)
+        (mine,) = _slices_of_every_rank(
+            (WORLD * rows, width), seed, [RANK * rows], rows, exact=False
+        )
+        chain = mine[(RANK + 1) % WORLD].clone()
+        for k in range(2, WORLD + 1):
+            chain = chain + mine[(RANK + k) % WORLD]
+        assert not bool(_differs(out, chain)), f"rows={rows}: not the ring-order chain"
+        del x, out, mine, chain
+        _mpi_sync()
+
+
+def check_mpi_round_trip_through_a_gather_in_one_graph() -> None:
+    """The dep4 or dep8 decode step's collective sequence, captured: gather, window, combine.
+
+    Per MoE layer the target gathers every rank's rows, lets this rank's expert
+    window act on all of them and combines the world's partials, all on the one
+    communicator `getComm` caches for the group. Here each of the `sites`
+    layers gathers with `torch.ops.trtllm.allgather` -- a fixture building the
+    input the way the target does, never the reference -- scales by a
+    per-rank factor standing in for the window, and combines; every batch's
+    graph in one pool. Rank i gets back its own rows times the sum of the world's
+    factors, computed locally; the gathered rows are checked against a local
+    concatenation too, so a wrong gather cannot pass as a right combine.
+    """
+    cells = [(i, c) for i, c in _mpi_cells() if "graph_rows" in c.spec]
+    spec = cells[0][1].spec
+    sites, width, pool_rows = spec["sites"], _width(spec), spec["graph_rows"]
+    # Payload k/8 with |k| <= 7 and factors (r + 1) / 4: every product and every
+    # partial sum is exact in bf16, so the gate is bitwise. At world 8 a partial
+    # sum is k * s / 32 with s at most 1 + 2 + ... + 8 = 36, so |k * s| stays at
+    # or below 252, inside bf16's exact integers.
+    factor = (RANK + 1) / 4.0
+    total = sum((r + 1) / 4.0 for r in range(WORLD))
+    pool = None
+    for rows in sorted(pool_rows, reverse=True):
+        own = torch.empty(sites, rows, width, dtype=torch.bfloat16, device="cuda")
+        gathered = torch.empty(sites, WORLD * rows, width, dtype=torch.bfloat16, device="cuda")
+        back = torch.empty(sites, rows, width, dtype=torch.bfloat16, device="cuda")
+
+        def body() -> None:
+            for s in range(sites):
+                g = torch.ops.trtllm.allgather(own[s], None, GROUP)
+                gathered[s].copy_(g)
+                back[s].copy_(_combine(torch.mul(g, factor), spec))
+
+        def payload(rank: int, seed: int) -> torch.Tensor:
+            gen = torch.Generator(device="cuda").manual_seed(seed * 131 + rank)
+            raw = torch.randint(-7, 8, (sites, rows, width), generator=gen, device="cuda")
+            return raw.to(torch.bfloat16).div_(8.0)
+
+        own.copy_(payload(RANK, 70000 + rows))
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            body()
+        torch.cuda.current_stream().wait_stream(side)
+        _mpi_sync()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            body()
+        pool = graph.pool() if pool is None else pool
+        for seed in (71000 + rows, 72000 + rows):
+            own.copy_(payload(RANK, seed))
+            _mpi_sync()
+            graph.replay()
+            torch.cuda.synchronize()
+            everyone = torch.cat([payload(r, seed) for r in range(WORLD)], dim=1)
+            assert torch.equal(gathered, everyone), f"rows={rows}: the gather fixture is wrong"
+            expected = (own.float() * total).to(torch.bfloat16)
+            assert torch.equal(back, expected), f"rows={rows}: the round trip is wrong"
+            _mpi_sync()
+        del graph
+    _mpi_sync()
+
+
+def check_mpi_every_cell_was_driven() -> None:
+    """Each MPI-session cell ran through the entry's own `__call__` and `reference`."""
+    for i, cell in _mpi_cells():
+        calls, refs = DRIVEN.get(i, [0, 0])
+        assert calls > 0 and refs > 0, (
+            f"cell {cell.why!r}: the entry's __call__ / reference ran {calls} / {refs} times"
+        )
+
+
+MPI_CHECKS = (
+    check_mpi_session_is_the_launchers_world,
+    # Before any capture: the group's first call builds the communicator.
+    check_mpi_eager_sweep_cells,
+    check_mpi_random_payload_cells,
+    check_mpi_graph_cells,
+    check_mpi_sum_is_the_ring_chain,
+    check_mpi_round_trip_through_a_gather_in_one_graph,
+    check_mpi_every_cell_was_driven,
+)
+
+
+def _run_one_mpi_rank() -> int:
+    """Body of one mpirun rank: run every MPI check; a failing rank exits nonzero
+    without finalizing, and mpirun then ends its siblings and fails. A rank
+    still running at `MPI_DEADLINE_S` -- wedged in a collective a sibling never
+    joined -- dumps its stack and exits."""
+    global RANK, WORLD, NODES, GROUP, MPI_COMM, entry
+    faulthandler.dump_traceback_later(MPI_DEADLINE_S, exit=True)
+    rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+    world = int(os.environ["OMPI_COMM_WORLD_SIZE"])
+    torch.cuda.set_device(int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"]))
+
+    from mpi4py import MPI
+
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as module
+    from tensorrt_llm._utils import mpi_comm
+
+    entry = module
+    MPI_COMM = mpi_comm()
+    RANK, WORLD = rank, world
+    NODES = len(set(MPI_COMM.allgather(socket.gethostname())))
+    GROUP = list(range(WORLD))
+    assert WORLD >= 2, f"a collective needs at least 2 ranks, got {WORLD}"
+    _count_entry_calls()
+
+    for check in MPI_CHECKS:
+        started = time.monotonic()
+        try:
+            check()
+        except BaseException:
+            import traceback
+
+            print(f"[mpi rank {RANK}] FAILED {check.__name__}", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(13)
+        if RANK == 0:
+            print(f"[mpi] {check.__name__}: {time.monotonic() - started:.1f}s", flush=True)
+    _mpi_sync()
+    print(
+        f"[mpi rank {RANK}] {len(MPI_CHECKS)} checks passed over {len(_mpi_cells())} cells at "
+        f"world {WORLD} on {NODES} node(s); peak allocated "
+        f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB, reserved "
+        f"{torch.cuda.max_memory_reserved() / 2**30:.2f} GiB",
+        flush=True,
+    )
+    sys.stdout.flush()
+    faulthandler.cancel_dump_traceback_later()
+    # mpirun fails a rank that exits without finalizing. The communicators are
+    # left as they are, as in the `_pg` job: these processes end here.
+    MPI.Finalize()
+    os._exit(0)
+
+
+def _session_members(sid: int) -> List[int]:
+    """Every process in session `sid`, read from /proc."""
+    members = []
+    for entry_dir in Path("/proc").iterdir():
+        if not entry_dir.name.isdigit():
+            continue
+        try:
+            stat = (entry_dir / "stat").read_text()
+        except OSError:
+            continue
+        # pid (comm) state ppid pgrp session ...; comm may hold spaces.
+        fields = stat[stat.rindex(")") + 2 :].split()
+        if int(fields[3]) == sid:
+            members.append(int(entry_dir.name))
+    return members
+
+
+def _end_mpi_job(job: Any) -> None:
+    """End mpirun and every rank it started.
+
+    mpirun runs as a session leader; its ranks stay in that session but each in
+    a process group of its own, so killing mpirun's group would leave them
+    running. mpirun is asked first, then the session's members are killed.
+    """
+    if job.poll() is None:
+        job.terminate()
+        try:
+            job.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+    for pid in _session_members(job.pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if job.poll() is None:
+        job.kill()
+    job.wait()
+
+
+def _mpirun_ranks(world_size: int) -> None:
+    """Start the MPI-session job under mpirun, one rank per device, and wait for it.
+
+    The environment loses the launching allocation's PMI/PMIx/Open MPI/Slurm
+    variables, so this mpirun starts its own ranks on this node instead of
+    joining the allocation's step (where every rank would read rank 0 of one),
+    and `--oversubscribe` lets it place them whatever slot count it detects.
+    """
+    mpirun = shutil.which("mpirun")
+    assert mpirun is not None, "the MPI-session cells start their ranks with mpirun; none on PATH"
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_")) and k != "TLLM_DISABLE_MPI"
+    }
+    command = [mpirun, "-n", str(world_size), "--oversubscribe", "--allow-run-as-root"]
+    command += [sys.executable, str(Path(__file__).resolve()), _MPI_WORKER_FLAG]
+    print(f"[launcher] starting {world_size} MPI-session ranks under mpirun", flush=True)
+    job = subprocess.Popen(command, env=env, start_new_session=True)
+    try:
+        code = job.wait(timeout=MPI_DEADLINE_S)
+    except subprocess.TimeoutExpired:
+        _end_mpi_job(job)
+        raise AssertionError(
+            f"the {world_size}-rank MPI-session run did not finish in {MPI_DEADLINE_S}s (wedged)"
+        ) from None
+    if code != 0:
+        _end_mpi_job(job)
+        raise AssertionError(f"the {world_size}-rank MPI-session run failed: mpirun exited {code}")
+
+
 def _spawn_children(
     world_size: int, flag: str, extra_env: Optional[Dict[str, str]] = None
 ) -> List[Any]:
@@ -1446,7 +2161,8 @@ def _kill_children(children: List[Any]) -> None:
 
 
 def _spawn_ranks() -> None:
-    """Start one worker process per claimed device; no external launcher."""
+    """Run the `_pg` job, one worker process per claimed device and no external
+    launcher, then the MPI-session job under mpirun."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     assert visible, (
         "set CUDA_VISIBLE_DEVICES to the devices this run owns, "
@@ -1457,12 +2173,12 @@ def _spawn_ranks() -> None:
         f"CUDA_VISIBLE_DEVICES names {world_size} device(s); a collective test needs at least 2"
     )
     children = _spawn_children(world_size, _WORKER_FLAG)
-    deadline = time.monotonic() + DEADLINE_S
+    deadline = time.monotonic() + PG_DEADLINE_S
     live = set(range(world_size))
     failure = None
     while live and failure is None:
         if time.monotonic() > deadline:
-            failure = f"did not finish in {DEADLINE_S}s (wedged)"
+            failure = f"did not finish in {PG_DEADLINE_S}s (wedged)"
             break
         for r in sorted(live):
             code = children[r].poll()
@@ -1476,10 +2192,13 @@ def _spawn_ranks() -> None:
     if failure is not None:
         _kill_children(children)
         raise AssertionError(f"the {world_size}-rank run failed: {failure}")
+    _mpirun_ranks(world_size)
 
 
 if __name__ == "__main__":
     if _WORKER_FLAG in sys.argv:
         sys.exit(_run_one_rank())
+    if _MPI_WORKER_FLAG in sys.argv:
+        sys.exit(_run_one_mpi_rank())
     _spawn_ranks()
     print("OK")

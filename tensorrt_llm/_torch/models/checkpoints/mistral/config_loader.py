@@ -14,18 +14,65 @@
 # limitations under the License.
 
 import json
+import os
+from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from transformers import PretrainedConfig, WhisperConfig
 
+from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+
+
+def resolve_native_dspark_config(
+    params: dict, spec: "DSparkDecodingConfig", checkpoint: str, target_model: str
+) -> None:
+    """Adapt the native draft's trained geometry and checkpoint ownership."""
+    mtp = params.get("mtp") or {}
+    dspark = mtp.get("dspark")
+    if dspark is None:
+        return
+    if os.path.realpath(checkpoint) != os.path.realpath(target_model):
+        raise ValueError("Native Mistral DSpark must use the target checkpoint")
+    layers = [int(layer) for layer in mtp["target_activation_layers"].split(",")]
+    if not layers or layers != sorted(set(layers)) or layers[0] < 0:
+        raise ValueError("Mistral DSpark target activation layers must be unique and ascending")
+    trained = dict(
+        target_layer_ids=layers,
+        block_size=int(mtp["depth"]),
+        markov_rank=int(dspark["markov_rank"]),
+        markov_head_type=dspark["head_type"],
+        mask_token_id=int(params["vocab_size"]),
+    )
+    for field, value in trained.items():
+        override = getattr(spec, field)
+        if override is not None and override != value:
+            raise ValueError(
+                f"Mistral DSpark {field} must match the checkpoint: {value}, got {override}"
+            )
+    if spec.max_draft_len != trained["block_size"]:
+        raise ValueError(
+            "Mistral DSpark max_draft_len must equal the trained block depth "
+            f"{trained['block_size']}"
+        )
+    for field, value in trained.items():
+        setattr(spec, field, value)
+    spec._draft_model_config = mtp
+    # Native draft weights are part of the target's manifest, while its paged
+    # draft runtime and KV cache remain independent of the target's cache.
+    spec._draft_weights_in_target = True
+    spec.speculative_model = checkpoint
+
 
 ###################
 # vllm code here
@@ -65,6 +112,20 @@ def adapt_config_dict(
     config_dict: dict[str, Any],
     defaults: dict[str, Any] = {},
 ) -> PretrainedConfig:
+    if _is_mistral_large4(config_dict):
+        if config_dict.get("quantization"):
+            raise ValueError(
+                "Mistral-Large-4 is served from the ModelOpt MIXED_PRECISION export, whose "
+                "params.json states quantization_config; found quantization="
+                f"{config_dict['quantization']!r}"
+            )
+        config_dict = deepcopy(config_dict)
+        config_dict = _remap_general_mistral_args(config_dict)
+        config_dict = _remap_moe_args(config_dict)
+        for key, value in defaults.items():
+            config_dict.setdefault(key, value)
+        return _adapt_mistral_large4_config(config_dict)
+
     config_dict = _remap_general_mistral_args(config_dict)
 
     if bool(config_dict.get("quantization")):
@@ -118,6 +179,55 @@ def adapt_config_dict(
     config = _mistral_pretrained_config_from_dict(config_dict)
 
     return config
+
+
+def _is_mistral_large4(config: dict) -> bool:
+    return bool(config.get("dsa") and config.get("kv_lora_rank") and config.get("lerope"))
+
+
+def _adapt_mistral_large4_config(config: dict) -> MistralLarge4Config:
+    """Adapt the native MLA/DSA language model, preserving the quantized-layer policy."""
+    dsa = config.pop("dsa")
+    config.update(
+        model_type="mistral_large_4",
+        architectures=["MistralLarge4ForCausalLM"],
+        dtype=config.get("dtype") or "bfloat16",
+        index_n_heads=dsa["n_heads"],
+        index_head_dim=dsa["head_dim"],
+        index_topk=dsa["topk"],
+        indexer_norm_eps=dsa["norm_eps"],
+        indexer_ssmax_scaling=dsa["ssmax_scaling"],
+        index_sharing=dsa["sharing"].split(","),
+        fp8_kv_cache=dsa["fp8_kv_cache"],
+    )
+    num_layers = config["num_hidden_layers"]
+    pattern = config.pop("nope").split(",")
+    if set(pattern) - {"rope", "nope"} or num_layers % len(pattern):
+        raise ValueError("nope must be a rope/nope pattern dividing n_layers")
+    config["nope_layer_flags"] = [
+        pattern[layer % len(pattern)] == "nope" for layer in range(num_layers)
+    ]
+    config["indexer_nope_layer_flags"] = (
+        list(config["nope_layer_flags"]) if dsa["match_nope"] else [False] * num_layers
+    )
+    config["kv_source_layers"] = [
+        int(layer) for layer in config.pop("kv_sharing")["source_layers_str"].split(",")
+    ]
+    if len(config["kv_source_layers"]) != num_layers or len(config["index_sharing"]) != num_layers:
+        raise ValueError("KV and indexer sharing must contain one entry per layer")
+    config = _remap_mistral_yarn_args(config)
+    rope = config.pop("rope_scaling")
+    if rope.pop("apply_yarn_scaling", False):
+        raise ValueError("Mistral-Large-4 requires YaRN without magnitude scaling")
+    config["rope_parameters"] = {
+        **rope,
+        "rope_theta": config["rope_theta"],
+        "attention_factor": 1.0,
+    }
+    vision = config.pop("vision_encoder", None)
+    if vision is not None:
+        config["vision_config"] = vision
+    return MistralLarge4Config.from_dict(config)
 
 
 def _remap_mistral_vision_args(config: dict) -> dict:
@@ -269,10 +379,19 @@ def _remap_moe_args(config: dict) -> dict:
 ######################
 
 
+@register_config_loader("mistral_large_4")
 @register_config_loader("mistral")
 @register_config_loader("mistral_large_3")
 class MistralConfigLoader(BaseConfigLoader):
-    def _load_mistral_config_dict(self, checkpoint_dir: str, config_file_name: str) -> dict | None:
+    def load_pretrained_config(self, checkpoint_dir: str) -> PretrainedConfig:
+        """Read and adapt the native params.json for an explicit Mistral format."""
+        _, config = self._parse_mistral_config(checkpoint_dir)
+        config._name_or_path = str(checkpoint_dir)
+        return config
+
+    def _load_mistral_config_dict(
+        self, checkpoint_dir: str | Path, config_file_name: str
+    ) -> dict | None:
         file_path = Path(checkpoint_dir) / Path(config_file_name)
 
         if file_path.exists() and file_path.is_file():
@@ -320,6 +439,13 @@ class MistralConfigLoader(BaseConfigLoader):
         # Re-write from ModelConfig.from_pretrained
 
         config_dict, pretrained_config = self._parse_mistral_config(checkpoint_dir)
+
+        if isinstance(pretrained_config, MistralLarge4Config):
+            # The shared builder derives DSA metadata and per-layer ModelOpt quantization
+            # from the native config returned by load_pretrained_config.
+            return ModelConfig.from_pretrained(
+                checkpoint_dir, checkpoint_format="mistral_large_4", **kwargs
+            )
 
         # Some checkpoints lack torch_dtype, populate with dtype
         pretrained_config.torch_dtype = (

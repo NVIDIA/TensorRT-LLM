@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 version: 0.0.1
 l0_gb300_multi_nodes_node2_gpu8:
 - condition:
@@ -13,7 +15,15 @@ l0_gb300_multi_nodes_node2_gpu8:
       stage: post_merge
       backend: pytorch
   tests:
+  - accuracy/test_mistral_large4_disaggregated.py::test_mistral_large4_disagg TIMEOUT (130)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_tp8_mtp3_trtllm TIMEOUT (60)
   # Kimi K3 GSM8K accuracy plus an acceptance-length gate on the TEP8 DSpark
   # recipe. Measured 25m45s on 2x4 GB300.
   - accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8 TIMEOUT (60)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep8::test_gsm8k TIMEOUT (60)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp8::test_gsm8k TIMEOUT (60)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep8::test_gsm8k TIMEOUT (60)
+  # Native DSpark quick coverage; full adds GPQA/RULER and spec-off GSM8K.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-tep8] TIMEOUT (180)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-dep8] TIMEOUT (180)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-tp8] TIMEOUT (180)

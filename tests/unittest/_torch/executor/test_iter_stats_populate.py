@@ -860,6 +860,80 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert buffer.next_payload() is None
 
 
+@pytest.mark.parametrize("rank0_idle", [False, True])
+@pytest.mark.parametrize("include_kv_cache_load", [False, True])
+def test_attention_dp_specdec_fanout_uses_rank_local_counts(
+    rank0_idle: bool, include_kv_cache_load: bool
+) -> None:
+    """Transport asymmetric real/dummy work without copying rank 0's AL."""
+    real_requests = [
+        [] if rank0_idle else [_StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=2)],
+        [
+            _StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=0),
+            _StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=1),
+            _StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=2),
+        ],
+    ]
+    buffers = []
+    rank_states = []
+    for rank, requests in enumerate(real_requests):
+        dummies = [
+            _StubRequest(py_draft_tokens=[1, 1, 1], is_attention_dp_dummy=True),
+            _StubRequest(py_draft_tokens=[1, 1, 1], is_cuda_graph_dummy=True),
+        ]
+        stats = _invoke_update_iter_stats(
+            _StubScheduledBatch(gen_reqs=requests + dummies),
+            [],
+            num_ctx_tokens=0,
+            specdec=True,
+        )
+        stats.iter = 7
+        buffer = _build_adp_stats_buffer(stats, is_rank0=rank == 0)
+        buffers.append(buffer)
+        state = RankState(rank=rank, iter_stats=buffer.next_payload())
+        rank_states.append(RankState.deserialize(state.serialize(include_kv_cache_load)))
+
+    records = buffers[0].finalize(rank_states, is_rank0=True)
+    assert len(records) == 2
+    expected_counts = [(0, 0, 0) if rank0_idle else (3, 2, 1), (9, 3, 3)]
+    for record, (drafted, accepted, requests) in zip(records, expected_counts):
+        spec = record.stats.specdec_stats
+        assert spec is not None
+        assert spec.num_draft_tokens == drafted
+        assert spec.num_accepted_tokens == accepted
+        assert spec.num_requests_with_draft_tokens == requests
+        assert spec.acceptance_length == pytest.approx(
+            (accepted + requests) / requests if requests else 0.0
+        )
+
+    accepted = sum(record.stats.specdec_stats.num_accepted_tokens for record in records)
+    requests = sum(record.stats.specdec_stats.num_requests_with_draft_tokens for record in records)
+    assert (accepted + requests) / requests == pytest.approx(2.0 if rank0_idle else 2.25)
+
+
+def test_attention_dp_specdec_fanout_does_not_fill_synthetic_rank_from_rank0() -> None:
+    """An explicit zero payload must not inherit another rank's drafting."""
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(
+            gen_reqs=[_StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=2)]
+        ),
+        [],
+        num_ctx_tokens=0,
+        specdec=True,
+    )
+    stats.iter = 7
+    buffer = _build_adp_stats_buffer(stats)
+    records = buffer.finalize(
+        [
+            RankState(rank=0, iter_stats=buffer.next_payload()),
+            RankState(rank=1, iter_stats=RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=7)),
+        ],
+        is_rank0=True,
+    )
+    assert records[0].stats.specdec_stats.num_requests_with_draft_tokens == 1
+    assert records[1].stats.specdec_stats is None
+
+
 def test_attention_dp_fanout_waits_for_complete_matching_payloads():
     """Verify ADP fanout waits until every rank reports the rank-0 iteration."""
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
@@ -962,7 +1036,7 @@ def test_attention_dp_fanout_copy_lists_cover_iteration_stats_fields():
     copied_fields = (
         set(_ITERATION_STATS_SCALAR_FIELDS)
         | set(_ITERATION_STATS_OPTIONAL_FIELDS)
-        | {"inflight_batching_stats"}
+        | {"inflight_batching_stats", "specdec_stats"}
     )
 
     assert copied_fields == actual_fields

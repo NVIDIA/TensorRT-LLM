@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+mistralai/Mistral-Large-4-1T-A52B:
+  # An independent reference implementation, NVFP4, TP4 on 4 GB300s.
+  # RULER v1: 9 tasks x 50 samples per length; minima of three baseline runs.
+  # The explicit floors use the engineering acceptance margin of 1.5 points.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    extra_acc_spec: full-4096
+    num_samples: 450
+    accuracy: 95.67
+    threshold: 94.17
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    extra_acc_spec: full-8192
+    num_samples: 450
+    accuracy: 95.37
+    threshold: 93.87
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    extra_acc_spec: full-16384
+    num_samples: 450
+    accuracy: 94.26
+    threshold: 92.76
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    extra_acc_spec: full-32768
+    num_samples: 450
+    accuracy: 94.78
+    threshold: 93.28
+  # long_full: RULER at 64K and 128K, 9 tasks x 10 samples per length on the 1M specialization.
+  # References are the reference implementation's on an earlier NVFP4 checkpoint than the
+  # released one (the full references above are the released checkpoint's), over 50 samples per
+  # cell on the same long-context sets; the floors use an engineering margin of 3 points for the
+  # smaller sample.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    extra_acc_spec: long_full-65536
+    num_samples: 90
+    accuracy: 96.03
+    threshold: 93.03
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    extra_acc_spec: long_full-131072
+    num_samples: 90
+    accuracy: 95.22
+    threshold: 92.22

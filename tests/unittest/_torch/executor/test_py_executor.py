@@ -2428,6 +2428,8 @@ class _StubADPExecutor:
 
         kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
         self.kv_cache_manager = kv_cache_manager
+        self.draft_kv_cache_manager = None
+        self.enable_joint_kv_cache_reuse = False
 
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
@@ -2986,24 +2988,38 @@ def test_adp_pad_dummy_capacity_includes_draft_reserve():
     assert stub._pending_adp_dummy_request is None
 
 
-def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate():
-    stub = _StubADPExecutor()
+@pytest.mark.parametrize("has_transceiver", [False, True])
+@pytest.mark.parametrize("joint_draft", [False, True])
+def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate(
+    has_transceiver: bool, joint_draft: bool
+) -> None:
+    stub = _StubADPExecutor(kv_cache_transceiver=object() if has_transceiver else None)
+    stub.enable_joint_kv_cache_reuse = joint_draft
+    stub.draft_kv_cache_manager = Mock() if joint_draft else None
     terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
-    stub.active_requests = [terminal_request]
-    stub.expected_num_active_requests = 2
+    original_requests = [terminal_request] if has_transceiver else []
+    stub.active_requests = original_requests.copy()
+    stub.expected_num_active_requests = len(original_requests) + 1
     spec_resource_manager = Mock()
     spec_resource_manager.add_dummy_requests.side_effect = NoFreeSlotsError("No free slots")
     stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
 
     _run_pad(stub)
 
-    assert stub.active_requests == [terminal_request]
+    assert stub.active_requests == original_requests
     assert stub._pending_adp_dummy_request is None
     stub.kv_cache_manager.free_resources.assert_called_once()
+    if joint_draft:
+        stub.draft_kv_cache_manager.free_resources.assert_called_once_with(
+            stub.kv_cache_manager.free_resources.call_args.args[0]
+        )
 
 
-def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
+@pytest.mark.parametrize("joint_draft", [False, True])
+def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds(joint_draft: bool) -> None:
     stub = _StubADPExecutor()
+    stub.enable_joint_kv_cache_reuse = joint_draft
+    stub.draft_kv_cache_manager = Mock() if joint_draft else None
     spec_resource_manager = Mock()
     stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
     terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
@@ -3022,6 +3038,8 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     assert stub.active_requests == [terminal_request]
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
+    if joint_draft:
+        stub.draft_kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
     stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1], [1]]))
     _run_pad(stub)
@@ -3038,6 +3056,8 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     assert spec_resource_manager.add_dummy_requests.call_count == 2
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
+    if joint_draft:
+        stub.draft_kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
 
 def test_adp_dummy_rollback_only_frees_pending_candidate():
@@ -3390,13 +3410,16 @@ def test_pad_empty_batch_degrades_on_allocation_error(error):
 
 
 @pytest.mark.parametrize("enable_adp_dummy_fixes", [False, True])
+@pytest.mark.parametrize("joint_draft", [False, True])
 def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
-    enable_adp_dummy_fixes,
-):
+    enable_adp_dummy_fixes: bool, joint_draft: bool
+) -> None:
     # can_queue=False skips the forward, so the usual dummy teardown in
     # _handle_responses is not reached. Rollback must not depend on whether
     # ADP dummy fixes are enabled.
     stub, scheduled_batch = _unfittable_rank(enable_adp_dummy_fixes=enable_adp_dummy_fixes)
+    stub.enable_joint_kv_cache_reuse = joint_draft
+    stub.draft_kv_cache_manager = Mock() if joint_draft else None
     active_request = stub.active_requests[0]
     spec_resource_manager = Mock()
     stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
@@ -3411,6 +3434,28 @@ def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
     assert stub._pending_adp_dummy_request is None
     spec_resource_manager.free_resources.assert_called_once_with(dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(dummy)
+    if joint_draft:
+        stub.draft_kv_cache_manager.free_resources.assert_called_once_with(dummy)
+
+
+def test_pad_empty_batch_spec_allocation_failure_releases_both_kv_pools() -> None:
+    stub, scheduled_batch = _unfittable_rank()
+    original_requests = stub.active_requests.copy()
+    stub.enable_joint_kv_cache_reuse = True
+    stub.draft_kv_cache_manager = Mock()
+    spec_resource_manager = Mock()
+    spec_resource_manager.add_dummy_requests.side_effect = NoFreeSlotsError("No free slots")
+    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.active_requests == original_requests
+    assert scheduled_batch.batch_size == 0
+    assert stub._pending_adp_dummy_request is None
+    stub.kv_cache_manager.free_resources.assert_called_once()
+    stub.draft_kv_cache_manager.free_resources.assert_called_once_with(
+        stub.kv_cache_manager.free_resources.call_args.args[0]
+    )
 
 
 def test_pad_empty_batch_dummy_kept_when_fleet_can_queue():
@@ -3447,7 +3492,7 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
 
 def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
     # The V2 scheduler grows both pools together, so a skipped batch hands both
-    # back. Attention DP keeps one unified pool and never reaches this pairing.
+    # back, including an attention-DP rank whose peer could not schedule work.
     stub = object.__new__(PyExecutor)
     stub._is_kv_manager_v2 = True
     stub.kv_cache_manager = Mock()

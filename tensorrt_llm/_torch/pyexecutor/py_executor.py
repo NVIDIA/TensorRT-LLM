@@ -4127,6 +4127,8 @@ class PyExecutor:
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
         self.kv_cache_manager.free_resources(dummy_request)
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.free_resources(dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
@@ -7823,6 +7825,9 @@ class PyExecutor:
                     is_gen=self._adp_dummy_is_gen,
                     prepare_resource=True,
                     max_num_draft_tokens=self.max_total_draft_tokens,
+                    draft_kv_cache_manager=(self.draft_kv_cache_manager
+                                            if self.enable_joint_kv_cache_reuse
+                                            else None),
                 )
             except OutOfPagesError:
                 dummy_requests = None
@@ -7841,7 +7846,13 @@ class PyExecutor:
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                try:
+                    spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                except NoFreeSlotsError:
+                    self.kv_cache_manager.free_resources(llm_request)
+                    if self.enable_joint_kv_cache_reuse:
+                        self.draft_kv_cache_manager.free_resources(llm_request)
+                    return
             self.active_requests.append(llm_request)
             return
 
@@ -7859,6 +7870,9 @@ class PyExecutor:
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=(self.draft_kv_cache_manager
+                                        if self.enable_joint_kv_cache_reuse else
+                                        None),
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -7875,6 +7889,8 @@ class PyExecutor:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
                 self.kv_cache_manager.free_resources(dummy_request)
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.free_resources(dummy_request)
                 return
 
         assert dummy_request is not None
@@ -7948,6 +7964,9 @@ class PyExecutor:
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=(self.draft_kv_cache_manager
+                                        if self.enable_joint_kv_cache_reuse else
+                                        None),
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -7966,6 +7985,8 @@ class PyExecutor:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
                 self.kv_cache_manager.free_resources(dummy_request)
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.free_resources(dummy_request)
                 return
 
         dummy_request.is_attention_dp_dummy = True

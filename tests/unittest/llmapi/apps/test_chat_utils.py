@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -199,6 +202,49 @@ class TestParseAssistantMessages:
         with pytest.raises(ValueError, match=r"tool_calls\[0\]\.function"):
             parse_chat_message_content(message, mock_mm_data_tracker)
 
+    @pytest.mark.parametrize("arguments", ["not json {", "", "[]", "0", '"text"'])
+    def test_assistant_message_tool_call_coerces_non_object_arguments(
+        self, mock_mm_data_tracker, arguments
+    ) -> None:
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": arguments},
+                }
+            ],
+        }
+
+        result = parse_chat_message_content(
+            message, mock_mm_data_tracker, coerce_invalid_tool_call_arguments=True
+        )
+
+        assert result["tool_calls"][0]["function"] == {"name": "get_weather", "arguments": {}}
+
+    def test_assistant_message_tool_call_coercion_keeps_object_arguments(
+        self, mock_mm_data_tracker
+    ) -> None:
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"location": "Paris"}'},
+                }
+            ],
+        }
+
+        result = parse_chat_message_content(
+            message, mock_mm_data_tracker, coerce_invalid_tool_call_arguments=True
+        )
+
+        assert result["tool_calls"][0]["function"]["arguments"] == {"location": "Paris"}
+
     @pytest.mark.parametrize("tool_call", [123, "foo", None])
     def test_assistant_message_tool_call_non_object_item(
         self, mock_mm_data_tracker, tool_call
@@ -366,6 +412,49 @@ class TestParseToolMessages:
 
         expected = {**message, "media": []}
         assert result == expected
+
+
+class TestHistoryToolCallArgumentsByModel:
+    """A history tool call whose arguments are not a JSON object, per model type."""
+
+    @staticmethod
+    def _parse(model_type: str, arguments: str):
+        class _StubConfig:
+            pass
+
+        _StubConfig.model_type = model_type
+        messages = [
+            {"role": "user", "content": "Weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "abcdefghi",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": arguments},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "abcdefghi", "content": "sunny"},
+        ]
+        conversation, mm_coroutine, _, _ = parse_chat_messages_coroutines(
+            messages, _StubConfig(), None
+        )
+        mm_coroutine.close()
+        return conversation
+
+    @pytest.mark.parametrize("arguments", ['{"location": "Par', "[]"])
+    def test_mistral_large_4_coerces_to_empty_object(self, arguments) -> None:
+        conversation = self._parse("mistral_large_4", arguments)
+
+        assert conversation[1]["tool_calls"][0]["function"]["arguments"] == {}
+
+    def test_other_models_reject(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"tool_calls\[0\]\.function\.arguments must be valid JSON"
+        ):
+            self._parse("llama", '{"location": "Par')
 
 
 # ruff: noqa: E501

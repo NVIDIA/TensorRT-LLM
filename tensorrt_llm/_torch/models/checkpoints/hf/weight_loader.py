@@ -104,6 +104,7 @@ class _CheckpointIOStatus:
 
 @register_checkpoint_weight_loader("MX")
 @register_checkpoint_weight_loader("mistral")
+@register_checkpoint_weight_loader("mistral_large_4")
 @register_checkpoint_weight_loader("mistral_large_3")
 @register_checkpoint_weight_loader("HF")
 class HfWeightLoader(BaseWeightLoader):
@@ -371,6 +372,14 @@ class HfWeightLoader(BaseWeightLoader):
         rank-local slices (expert-parallel expert ranges) out of the lazy
         handles during `load_weights`.
         """
+        # Mistral-Large-4 is Mistral-native: its params.json says what it is.
+        native_path = os.path.join(checkpoint_dir, "params.json")
+        if os.path.isfile(native_path):
+            with open(native_path) as f:
+                native = json.load(f)
+            if (native.get("dsa") and native.get("kv_lora_rank")
+                    and native.get("lerope")):
+                return True
         config_path = os.path.join(checkpoint_dir, "config.json")
         if not os.path.isfile(config_path):
             return False

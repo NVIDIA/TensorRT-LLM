@@ -1,5 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import os
 from abc import ABC, abstractmethod
+from typing import Callable, Optional
 
 import llguidance
 import llguidance.torch
@@ -165,9 +168,30 @@ class LLGuidanceMatcher(GrammarMatcher):
 
 class LLGuidanceMatcherFactory(GrammarMatcherFactory):
 
-    def __init__(self, guided_decoding_config: GuidedDecodingConfig,
-                 vocab_size_padded: int):
+    def __init__(self,
+                 guided_decoding_config: GuidedDecodingConfig,
+                 vocab_size_padded: int,
+                 tokenizer: Optional[llguidance.LLTokenizer] = None,
+                 json_schema_lark: Optional[Callable[[str], str]] = None):
+        """Build the factory's llguidance tokenizer.
+
+        Args:
+            guided_decoding_config: The guided decoding config; its
+                `tokenizer_str` is the Hugging Face tokenizer JSON to build the
+                llguidance tokenizer from, unless `tokenizer` is given.
+            vocab_size_padded: The vocabulary size the token bitmask covers.
+            tokenizer: A ready llguidance tokenizer, for vocabularies with no
+                Hugging Face tokenizer JSON (Tekken).
+            json_schema_lark: Renders the Lark grammar of a JSON response from
+                its serialized schema, for models whose structured responses
+                may open with a reasoning section (Mistral-Large-4). Without
+                it, a JSON response is constrained from its first token.
+        """
         super().__init__()
+        self._json_schema_lark = json_schema_lark
+        if tokenizer is not None:
+            self._tokenizer = tokenizer
+            return
         tokenizer_str = guided_decoding_config.tokenizer_str
         stop_token_ids = guided_decoding_config.stop_token_ids
 
@@ -193,10 +217,9 @@ class LLGuidanceMatcherFactory(GrammarMatcherFactory):
         grammar = None
         match guide_type:
             case GuidedDecodingParams.GuideType.JSON:
-                grammar = llguidance.LLMatcher.grammar_from_json_schema(
-                    '{"type": "object"}')
+                grammar = self._json_grammar('{"type": "object"}')
             case GuidedDecodingParams.GuideType.JSON_SCHEMA:
-                grammar = llguidance.LLMatcher.grammar_from_json_schema(guide)
+                grammar = self._json_grammar(guide)
             case GuidedDecodingParams.GuideType.REGEX:
                 grammar = llguidance.LLMatcher.grammar_from_regex(guide)
             case GuidedDecodingParams.GuideType.EBNF_GRAMMAR:
@@ -212,3 +235,9 @@ class LLGuidanceMatcherFactory(GrammarMatcherFactory):
             raise ValueError(f"LLGuidance matcher error: {matcher.get_error()}")
 
         return LLGuidanceMatcher(matcher, self._tokenizer.eos_token)
+
+    def _json_grammar(self, json_schema: str) -> str:
+        if self._json_schema_lark is None:
+            return llguidance.LLMatcher.grammar_from_json_schema(json_schema)
+        return llguidance.LLMatcher.grammar_from_lark(
+            self._json_schema_lark(json_schema))

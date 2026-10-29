@@ -7,7 +7,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
-from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, RequestStats
+from tensorrt_llm.bindings.executor import (
+    InflightBatchingStats,
+    IterationStats,
+    RequestStats,
+    SpecDecodingStats,
+)
 from tensorrt_llm.logger import logger
 
 from .scheduler.adp_router import RankIterStatsPayload, RankState
@@ -31,7 +36,6 @@ _ITERATION_STATS_OPTIONAL_FIELDS = (
     "kv_cache_stats",
     "cross_kv_cache_stats",
     "static_batching_stats",
-    "specdec_stats",
 )
 
 
@@ -86,6 +90,7 @@ class ADPIterStatsBuffer:
     def make_payload(stats: IterationStats) -> RankIterStatsPayload:
         """Pack local IterationStats fields for ADP allgather."""
         ifb = stats.inflight_batching_stats
+        spec = stats.specdec_stats
         return RankIterStatsPayload(
             has_iter_stats=1,
             iter_stats_iter=stats.iter,
@@ -96,6 +101,12 @@ class ADPIterStatsBuffer:
             num_gen_kv_tokens=ifb.num_gen_kv_tokens,
             num_paused_requests=ifb.num_paused_requests,
             num_paused_kv_tokens=ifb.num_paused_kv_tokens,
+            has_specdec_stats=int(spec is not None),
+            num_draft_tokens=spec.num_draft_tokens if spec is not None else 0,
+            num_accepted_tokens=spec.num_accepted_tokens if spec is not None else 0,
+            num_requests_with_draft_tokens=spec.num_requests_with_draft_tokens
+            if spec is not None
+            else 0,
         )
 
     def queue(
@@ -213,6 +224,22 @@ class ADPIterStatsBuffer:
             nested_stats = getattr(rank0_stats, attr)
             if nested_stats is not None:
                 setattr(stats, attr, nested_stats)
+
+        if payload.has_specdec_stats:
+            spec = SpecDecodingStats()
+            spec.num_draft_tokens = payload.num_draft_tokens
+            spec.num_accepted_tokens = payload.num_accepted_tokens
+            spec.num_requests_with_draft_tokens = payload.num_requests_with_draft_tokens
+            num_requests = payload.num_requests_with_draft_tokens
+            spec.acceptance_length = (
+                (payload.num_accepted_tokens + num_requests) / num_requests if num_requests else 0.0
+            )
+            # Timings retain the same rank-0 provenance as the enclosing row;
+            # request/token counters and acceptance length are rank-local.
+            source_spec = rank0_stats.specdec_stats
+            spec.iter_latency_ms = source_spec.iter_latency_ms if source_spec is not None else 0.0
+            spec.draft_overhead = source_spec.draft_overhead if source_spec is not None else 0.0
+            stats.specdec_stats = spec
 
         ifb = InflightBatchingStats()
         ifb.num_context_requests = payload.num_context_requests

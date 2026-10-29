@@ -1,3 +1,16 @@
+mistralai/Mistral-Large-4-1T-A52B:
+  # NVFP4, AA zero-shot, greedy, 32K total context budget, set on an earlier NVFP4 checkpoint
+  # at reasoning effort none. The released checkpoint declares no `none` effort; the test runs
+  # at `low` against this value.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 82.83
+    threshold: 75.1
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DSpark
+    accuracy: 82.83
+    threshold: 75.1
 deepseek-ai/DeepSeek-R1:
   - quant_algo: NVFP4
     accuracy: 70.45

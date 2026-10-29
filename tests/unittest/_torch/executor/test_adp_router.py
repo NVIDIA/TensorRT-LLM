@@ -261,6 +261,79 @@ class TestRankState:
         assert state.iter_stats == payload
         assert state.iter_stats is not payload
 
+    @pytest.mark.parametrize("include_kv_cache_load", [False, True])
+    @pytest.mark.parametrize("include_forward_work", [False, True])
+    def test_specdec_payload_roundtrip(
+        self, include_kv_cache_load: bool, include_forward_work: bool
+    ) -> None:
+        payload = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=7,
+            num_context_requests=2,
+            num_gen_requests=5,
+            has_specdec_stats=1,
+            num_draft_tokens=15,
+            num_accepted_tokens=9,
+            num_requests_with_draft_tokens=5,
+        )
+        if include_kv_cache_load:
+            payload.kv_used_blocks = 4
+            payload.kv_total_blocks = 10
+            payload.kv_load_timestamp_ns = 123
+        assert RankIterStatsPayload.deserialize(payload.serialize(include_kv_cache_load)) == payload
+
+        state = RankState(
+            rank=2,
+            num_active_requests=7,
+            num_active_tokens=100,
+            num_retiring_requests=1,
+            iter_stats=payload,
+            num_context_requests=2,
+            num_generation_requests=5,
+        )
+        wire = state.serialize(include_kv_cache_load)
+        if not include_forward_work:
+            wire = wire[:-2]
+            state.num_context_requests = 0
+            state.num_generation_requests = 0
+        assert RankState.deserialize(wire) == state
+
+    @pytest.mark.parametrize("include_kv_cache_load", [False, True])
+    @pytest.mark.parametrize("include_forward_work", [False, True])
+    def test_payload_without_specdec_fields_remains_readable(
+        self, include_kv_cache_load: bool, include_forward_work: bool
+    ) -> None:
+        stats_wire = [1, 7, 2, 128, 16, 3, 1024, 1, 256]
+        if include_kv_cache_load:
+            stats_wire.extend([4, 10, 123])
+        expected_payload = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=7,
+            num_context_requests=2,
+            num_ctx_tokens=128,
+            num_ctx_kv_tokens=16,
+            num_gen_requests=3,
+            num_gen_kv_tokens=1024,
+            num_paused_requests=1,
+            num_paused_kv_tokens=256,
+            kv_used_blocks=4 if include_kv_cache_load else -1,
+            kv_total_blocks=10 if include_kv_cache_load else -1,
+            kv_load_timestamp_ns=123 if include_kv_cache_load else 0,
+        )
+        assert RankIterStatsPayload.deserialize(stats_wire) == expected_payload
+        wire = [2, 7, 100, 1, *stats_wire]
+        if include_forward_work:
+            wire.extend([2, 5])
+        assert RankState.deserialize(wire) == RankState(
+            rank=2,
+            num_active_requests=7,
+            num_active_tokens=100,
+            num_retiring_requests=1,
+            iter_stats=expected_payload,
+            num_context_requests=2 if include_forward_work else 0,
+            num_generation_requests=5 if include_forward_work else 0,
+        )
+
 
 class TestDefaultADPRouter:
     # Router tests model strict placement, relaxed placement, and capacity
@@ -554,10 +627,10 @@ class TestDefaultADPRouter:
         )
 
         disabled = state.serialize()
-        assert len(disabled) == 15
+        assert len(disabled) == 19
         assert RankState.deserialize(disabled).num_context_requests == 2
         enabled = state.serialize(include_kv_cache_load=True)
-        assert len(enabled) == 18
+        assert len(enabled) == 22
         restored = RankState.deserialize(enabled)
         assert restored.iter_stats.kv_used_blocks == 4
         assert restored.num_context_requests == 2

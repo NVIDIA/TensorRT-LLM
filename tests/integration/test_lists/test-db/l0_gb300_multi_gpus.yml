@@ -20,6 +20,21 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
+  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 tep4 target: the GSM8K identity gate.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep4::test_gsm8k TIMEOUT (180)
+  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 dep4 target: the GSM8K identity gate.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep4::test_gsm8k TIMEOUT (180)
+  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 tp4 target: the GSM8K identity gate.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp4::test_gsm8k TIMEOUT (180)
+  # Native DSpark: GSM8K precision/acceptance, RULER-lite and reuse/envelope.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-tep4] TIMEOUT (180)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-dep4] TIMEOUT (180)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-tp4] TIMEOUT (180)
+  # llguidance guided decoding over frontend-rendered chat ids: JSON, JSON after reasoning, tool grammars.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_llguidance TIMEOUT (60)
+  # Its expert path's attention-DP round trip over four ranks with unequal token counts; the
+  # single-GPU directory entry skips it.
+  - unittest/_torch/modeling_v2/models/mistral_large4/mistral_large_4_nvfp4__sm_103__dep4/test_modeling_v2_moe_round_trip.py
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:

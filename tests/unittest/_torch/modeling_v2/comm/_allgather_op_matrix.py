@@ -3,39 +3,69 @@
 """GPU certification matrix for the allgather catalog entry.
 
 A collective cannot be exercised in one process, so this script is its own
-launcher: run it plainly and it spawns one worker process per device, with one
-rank per device named in CUDA_VISIBLE_DEVICES, under a deadline the parent
-enforces by killing the whole process group. A wedged collective hangs
-rather than raising — and this op wedges rather than raising for every
-rank-argument-disagreement case probed — so the deadline is what keeps a
-broken kernel from taking the calling run down with it.
+launcher: run it plainly and it starts one rank per device named in
+CUDA_VISIBLE_DEVICES, under a deadline the parent enforces by killing the
+ranks. A wedged collective hangs rather than raising — and this op wedges
+rather than raising for every rank-argument-disagreement case probed — so the
+deadline is what keeps a broken kernel from taking the calling run down with
+it.
 
 Beyond the lockstep surface (uniform / ragged / dtypes / CUDA graphs) the
-file covers what a serving engine adds: the engine's own attention-DP
+`_pg` job covers what a serving engine adds: the engine's own attention-DP
 synchronisation interleaved with the op, the engine's stream switching, and
 what disagreeing on call order actually does.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _allgather_op_matrix.py
 
+That runs two jobs, in this order, and both must exit 0:
+
+- the `_pg` job: plain worker processes that rendezvous through
+  torch.distributed's env://, every `CHECKS` entry on `world_size` ranks. It
+  drives the cells that do not state `process_group`, through the
+  `allgather_pg` symbol on a boxed c10d group;
+- the MPI-session job: the same number of ranks started by `mpirun`, every
+  `MPI_CHECKS` entry. It drives the cells that state `process_group=None` at
+  that world size, through `torch.ops.trtllm.allgather` on the communicator
+  the MPI session builds -- the symbol and communicator a dep4, tep4 or tp4
+  world launched under mpirun reaches. Its `mpirun` gets an environment with
+  the launching allocation's PMI/PMIx/Open MPI/Slurm variables removed, so it
+  starts its own ranks on this node rather than joining the allocation's step.
+
+The world-8 cells -- the dep8 gather and the tep8 q-split gather, eight ranks
+over two nodes of four -- are a third job, the MPI-session checks again on
+ranks an MPI launcher starts across both nodes, one per device, as the dep8
+and tep8 engines' ranks are. One process cannot place ranks on another node,
+so the launcher is the environment's (the collected test takes it from
+`MODELING_V2_MPI_LAUNCH`):
+
+    <launcher> python _allgather_op_matrix.py --mpi-rank-worker
+
+Each MPI-session job drives the cells of its own world size and node count,
+and runs each check on the kind of cell it holds: the four-rank job the dep4
+gather's and the tep4 and tp4 q-split's, the eight-rank job the dep8 gather's
+and the tep8 q-split's. A rank that wedges inside a collective is ended by
+faulthandler at `MPI_DEADLINE_S`, and the launcher ends its siblings.
+
 Not a pytest module, despite the `check_*` bodies. They are one fixed
-sequence inside a single 4-rank job rather than independent cases: each reads
-module-global rank state that only `_run_one_rank` binds, and several assert
+sequence inside a single job rather than independent cases: each reads
+module-global rank state that only the rank body binds, and several assert
 on communicator state the previous one left behind. Collected as tests they
 would run at world size 1 against unbound globals — so neither this file's
 name nor its function names match pytest's collection patterns, which is what
 keeps it uncollectable however pytest is pointed at this tree.
 
-The collected entry point is
-`tests/unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py`:
-it starts this job and turns its exit code into an assertion. Both halves are
-started by file path: the launcher must not import `tensorrt_llm` (that calls
-CUDA nor torch.distributed state of its own), and the
+The collected entry point is `test_modeling_v2_allgather_op_matrix.py` beside
+this file: it starts these jobs and turns their exit codes into assertions.
+Both halves are started by file path: the launcher must not import
+`tensorrt_llm` (that would give it CUDA and MPI state of its own), and the
 ranks reach the catalog by absolute import, so neither needs a package.
 """
 
+import faulthandler
 import functools
 import os
 import random
+import shutil
 import signal
 import socket
 import subprocess
@@ -50,7 +80,13 @@ import torch.distributed as dist
 assert torch.cuda.is_available(), "allgather requires CUDA devices"
 
 _WORKER_FLAG = "--rank-worker"
-DEADLINE_S = 1200
+_MPI_WORKER_FLAG = "--mpi-rank-worker"
+# Each job's own deadline; `_rank_job` reads their sum off DEADLINE_S. Each
+# MPI-session rank also ends itself at MPI_DEADLINE_S, and the collected test
+# allows the world-8 job's launcher that plus a grace.
+PG_DEADLINE_S = 1200
+MPI_DEADLINE_S = 600
+DEADLINE_S = PG_DEADLINE_S + MPI_DEADLINE_S
 
 HIDDEN = 2560  # DeepSeek-V3-Lite hidden size, the caller that motivates this
 
@@ -70,11 +106,15 @@ GRAPH_BATCH_SIZES: Tuple[int, ...] = tuple(range(1, 33)) + (64, 128, 256)
 SITES_PER_DECODE_GRAPH = 29
 
 # Bound inside the rank body, never in the launcher: importing the entry
-# pulls in tensorrt_llm, which calls MPI_Init at import, and an
+# pulls in tensorrt_llm, which calls MPI_Init at import, and the launcher has
+# to stay free of MPI and CUDA state.
 allgather: Any = None
 entry: Any = None
+MPI_COMM: Any = None
 RANK = 0
 WORLD = 1
+#: Distinct hosts the MPI-session job's ranks run on.
+NODES = 1
 GROUP: List[int] = [0]
 # The engine's own cross-rank synchronisation object, built from the real
 # Mapping a serving engine builds under attention data parallelism. Bound in
@@ -350,16 +390,25 @@ def check_cuda_graph_captures_a_cold_first_call() -> None:
     dist.barrier()
 
 
-def check_certified_cells() -> None:
-    """Drive the entry's own cell list, inside `validating`.
+def _on_mpi_session(cell: Any) -> bool:
+    """Whether `cell` drives the MPI-session symbol: it states `process_group=None`."""
+    return "process_group" in cell.spec and cell.spec["process_group"] is None
 
-    The other checks in this file say things no cell can -- CUDA graph
+
+def check_certified_cells() -> None:
+    """Drive the entry's `_pg` cells, inside `validating`.
+
+    The other checks in this job say things no cell can -- CUDA graph
     behaviour, call-order disagreement, which stream the call lands on. This one
-    says the plain thing: for every configuration the entry claims to be
-    certified over, the gather is the concatenation, and the guard admits the
-    input a shipped target passes.
+    says the plain thing: for every configuration these cells claim, the
+    gather is the concatenation, and the guard admits the input a shipped
+    target passes.
     """
+    driven = 0
     for i, cell in enumerate(entry.allgather.CELLS):
+        if _on_mpi_session(cell):
+            continue  # the MPI-session job drives it (`MPI_CHECKS`)
+        driven += 1
         spec = cell.spec
         rows, trailing, dtype = spec["rows"], spec["trailing"], spec["dtype"]
         seed = 9000 + 13 * i
@@ -369,6 +418,7 @@ def check_certified_cells() -> None:
         assert out.shape == (rows * WORLD, *trailing), (cell.why, out.shape)
         _assert_bitwise(out, _gather_ref([rows] * WORLD, seed, dtype, trailing), cell.why)
         dist.barrier()
+    assert driven > 0, "no cell drives the _pg symbol"
 
 
 def check_uniform_gather() -> None:
@@ -1002,11 +1052,1258 @@ def _run_one_rank() -> int:
     os._exit(0)
 
 
-def _spawn_ranks() -> None:
-    """Start one worker process per claimed device; no external launcher.
+# ---- the MPI-session job ------------------------------------------------------
+#
+# Everything from here to `MPI_CHECKS` drives the cells that state
+# `process_group=None`, on the symbol and the communicator a dep4, tep4, tp4,
+# dep8 or tep8 serving world reaches: ranks started by mpirun,
+# `torch.ops.trtllm.allgather`, and the NCCL communicator tensorrt_llm's MPI
+# session builds for `group` at its first call. These ranks have no
+# torch.distributed group; they synchronize through the MPI session itself. One
+# job drives the cells of its own world size: four ranks of one node
+# (`_mpirun_ranks`), or eight over two nodes (started by the environment's
+# launcher).
 
-    The ranks rendezvous through torch.distributed's env:// method, so the only
-    thing this needs is a free port. Each child gets its own session; on the
+#: The entry's own `__call__` and `reference`, counted (`_count_entry_calls`).
+SEEN: Dict[str, int] = {"__call__": 0, "reference": 0}
+#: What each MPI-session cell ran through the entry: [calls, references].
+DRIVEN: Dict[int, List[int]] = {}
+
+
+def _mpi_cells() -> List[Tuple[int, Any]]:
+    """(index, cell) of every cell this MPI-session job drives: its world size's."""
+    return [
+        (i, c)
+        for i, c in enumerate(entry.allgather.CELLS)
+        if _on_mpi_session(c) and c.spec["world_size"] == WORLD
+    ]
+
+
+def _mpi_sync() -> None:
+    """Every rank's device work done, then every rank here."""
+    torch.cuda.synchronize()
+    MPI_COMM.Barrier()
+
+
+def _count_entry_calls() -> None:
+    """What `_validating.certifying` does under pytest, for this rank body.
+
+    The entry's own `__call__` (with `is_valid` interposed first, as
+    `validating` does) and its own `reference` are wrapped to count, so every
+    cell can assert that both ran for it rather than a local copy.
+    """
+    cls = type(entry.allgather)
+    call, ref = cls.__dict__["__call__"], cls.__dict__["reference"]
+
+    def counted_call(self, *args, **kwargs):
+        SEEN["__call__"] += 1
+        self.is_valid(*args, **kwargs)
+        return call(self, *args, **kwargs)
+
+    def counted_reference(self, *args, **kwargs):
+        SEEN["reference"] += 1
+        return ref(self, *args, **kwargs)
+
+    cls.__call__ = counted_call
+    cls.reference = counted_reference
+
+
+def _account(i: int, before: Dict[str, int]) -> None:
+    """Add what the entry ran since `before` to cell `i`."""
+    got = DRIVEN.setdefault(i, [0, 0])
+    got[0] += SEEN["__call__"] - before["__call__"]
+    got[1] += SEEN["reference"] - before["reference"]
+
+
+def _gather(x: torch.Tensor, spec: Dict[str, Any]) -> torch.Tensor:
+    """The call the dep4 and dep8 targets make, with the arguments the cell states."""
+    return entry.allgather(x, spec["sizes"], GROUP, process_group=spec["process_group"])
+
+
+def _width(spec: Dict[str, Any]) -> int:
+    assert len(spec["trailing"]) == 1 and spec["dtype"] is torch.bfloat16, spec
+    assert spec["world_size"] == WORLD and spec["sizes"] is None, (spec, WORLD)
+    # A cell without `nodes` is one node's, as the dep4 cells are.
+    assert spec.get("nodes", 1) == NODES, (spec, NODES)
+    return spec["trailing"][0]
+
+
+def _rows(rank: int, shape: Tuple[int, ...], seed: int) -> torch.Tensor:
+    """`rank`'s rows of `shape`, regenerable on every rank from the shared seed.
+
+    Multiples of 1/8 with |x| <= 31/8, 63 values: two ranks' rows agree in about
+    one element in 63, so a block from the wrong rank or at the wrong offset
+    changes nearly every element it covers.
+    """
+    gen = torch.Generator(device="cuda").manual_seed((seed * 977 + rank) * 131 + 7)
+    raw = torch.randint(-31, 32, shape, generator=gen, device="cuda", dtype=torch.int8)
+    return raw.to(torch.bfloat16).div_(8.0)
+
+
+def _bits(rank: int, shape: Tuple[int, ...], seed: int) -> torch.Tensor:
+    """Every bf16 bit pattern equally likely: NaNs, infinities, -0.0, subnormals."""
+    gen = torch.Generator(device="cuda").manual_seed((seed * 977 + rank) * 131 + 11)
+    raw = torch.randint(-(2**15), 2**15, shape, generator=gen, device="cuda", dtype=torch.int32)
+    return raw.to(torch.int16).view(torch.bfloat16)
+
+
+def _differs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Whether two bf16 tensors differ in any bit: a device bool, compared as int64 words."""
+    assert a.shape == b.shape and a.dtype == b.dtype == torch.bfloat16, (a.shape, b.shape)
+    return torch.ne(a.reshape(-1).view(torch.int64), b.reshape(-1).view(torch.int64)).any()
+
+
+def _fraction_moved(a: torch.Tensor, b: torch.Tensor) -> float:
+    """The fraction of elements whose bits differ between two bf16 tensors."""
+    return (a.view(torch.int16) != b.view(torch.int16)).float().mean().item()
+
+
+def _sweep_rows(spec: Dict[str, Any]) -> List[int]:
+    """The row counts a sweep cell names, largest first."""
+    lo, hi = spec["sweep_rows"]
+    rows = set(range(lo, hi + 1, spec["sweep_step"])) | set(spec.get("sweep_also", ())) | {hi}
+    assert spec["rows"] == hi and all(lo <= r <= hi for r in rows), spec
+    # Largest first, so the caching allocator sizes its blocks for the top once.
+    return sorted(rows, reverse=True)
+
+
+def check_mpi_session_is_the_launchers_world() -> None:
+    """The ranks are mpirun's, one device each, and the MPI session spans them all.
+
+    `getComm` builds the communicator through the MPI session, so a session of
+    one process per rank -- what a launch without the ranks in place gives --
+    would wedge the first call instead of failing it. Over several nodes each
+    node's ranks hold that node's devices 0..n-1, in rank order, as the
+    launcher places them.
+    """
+    from tensorrt_llm._utils import mpi_rank, mpi_world_size
+
+    assert os.environ.get("TLLM_DISABLE_MPI") != "1", "the MPI-session job runs with MPI"
+    assert mpi_world_size() == MPI_COMM.Get_size() == WORLD, (mpi_world_size(), WORLD)
+    assert mpi_rank() == MPI_COMM.Get_rank() == RANK, (mpi_rank(), RANK)
+    placed = MPI_COMM.allgather((socket.gethostname(), torch.cuda.current_device()))
+    hosts = list(dict.fromkeys(host for host, _ in placed))
+    assert len(hosts) == NODES and WORLD % NODES == 0, placed
+    per_node = WORLD // NODES
+    assert [hosts.index(h) for h, _ in placed] == [r // per_node for r in range(WORLD)], placed
+    assert [d for _, d in placed] == [r % per_node for r in range(WORLD)], placed
+    if RANK == 0:
+        print(
+            f"[mpi] {torch.cuda.get_device_name()} sm_"
+            f"{''.join(map(str, torch.cuda.get_device_capability()))}, NCCL "
+            f"{torch.cuda.nccl.version()}; {WORLD} ranks on {NODES} node(s): {placed}",
+            flush=True,
+        )
+    cells = _mpi_cells()
+    assert cells, "no cell states process_group=None"
+    for _, cell in cells:
+        if _on_split(cell):
+            _split_width(cell.spec)
+        else:
+            _width(cell.spec)
+    _mpi_sync()
+
+
+def check_mpi_eager_sweep_cells() -> None:
+    """Every sweep cell: at each row count it names, the gather is the reference's, bitwise.
+
+    One full-height block per rank, regenerated for every rank of the world
+    from the shared seeds. A row count passes the leading `rows` rows of this rank's
+    block, as a rank whose rows were padded to that T_max does. These are the
+    group's first calls, so the first of them builds the communicator, eagerly.
+    A mismatch is agreed across the ranks before any rank raises, so the
+    collective that counts it is made by all of them.
+    """
+    for i, cell in _mpi_cells():
+        spec = cell.spec
+        if "sweep_rows" not in spec:
+            continue
+        width = _width(spec)
+        rows_list = _sweep_rows(spec)
+        top = rows_list[0]
+        seed = 20000 + 13 * i
+        full = [_rows(r, (top, width), seed) for r in range(WORLD)]
+        mine = full[RANK]
+        bad = torch.zeros(len(rows_list), dtype=torch.bool, device="cuda")
+        before = dict(SEEN)
+        _mpi_sync()
+        for k, rows in enumerate(rows_list):
+            out = _gather(mine[:rows], spec)
+            assert out.shape == (WORLD * rows, width), (cell.why, rows, out.shape)
+            bad[k] = _differs(out, entry.allgather.reference([block[:rows] for block in full]))
+        torch.cuda.synchronize()
+        everyone = MPI_COMM.allgather(bad.nonzero().flatten().tolist())
+        failing = sorted({rows_list[k] for got in everyone for k in got})
+        if failing:
+            rows = failing[0]
+            out = _gather(mine[:rows], spec)
+            ref = entry.allgather.reference([block[:rows] for block in full])
+            raise AssertionError(
+                f"{cell.why}: {len(failing)} of {len(rows_list)} row counts differ from the "
+                f"reference on some rank, the smallest {rows} here in "
+                f"{_fraction_moved(out, ref):.4f} of the elements"
+            )
+        _account(i, before)
+        del full, mine
+        _mpi_sync()
+
+
+def check_mpi_the_gate_discriminates_a_wrong_gather() -> None:
+    """The bitwise gate, on the sweep cells' payload, rejects every plausible wrong gather.
+
+    At the top of the first sweep cell: rank blocks in the wrong order, rank 0's
+    block standing in for the last rank's, the last rank never contributing
+    (its block left zero), and every block taken one row late. Each has the
+    right shape, so only the payload can tell them apart; each moves nearly
+    every element of the blocks it gets wrong, which is at most 1/WORLD of the
+    result when it gets one block wrong. A job holding only q-split cells skips
+    it: the q-split's own discrimination check is in `check_mpi_split_cells`.
+    """
+    if _only_split_cells():
+        return
+    i, cell = next((i, c) for i, c in _mpi_cells() if "sweep_rows" in c.spec)
+    spec = cell.spec
+    width, rows = _width(spec), spec["rows"]
+    before = dict(SEEN)
+    blocks = [_rows(r, (rows + 1, width), 25000) for r in range(WORLD)]
+    got = [block[:rows] for block in blocks]
+    out = _gather(got[RANK], spec)
+    assert not bool(_differs(out, entry.allgather.reference(got))), "baseline differs"
+    one_block = 0.9 / WORLD
+    last = WORLD - 1
+    fractions = []
+    for name, wrong, floor in (
+        ("rank blocks reversed", torch.cat(got[::-1]), 0.9),
+        (f"rank 0's block in rank {last}'s place", torch.cat(got[:-1] + got[:1]), one_block),
+        (
+            f"rank {last} never contributed",
+            torch.cat(got[:-1] + [torch.zeros_like(got[-1])]),
+            one_block,
+        ),
+        ("every block one row late", torch.cat([block[1:] for block in blocks]), 0.9),
+    ):
+        assert wrong.shape == out.shape, (name, wrong.shape, out.shape)
+        fraction = _fraction_moved(out, wrong)
+        assert fraction > floor, f"{name}: only {fraction:.4f} of elements differ"
+        fractions.append(round(fraction, 4))
+    _account(i, before)
+    everyone = MPI_COMM.allgather(fractions)
+    if RANK == 0:
+        print(
+            f"[mpi] wrong gathers at rows {rows} move (reversed, substituted, missing, late) "
+            f"{everyone[0]} of the elements on rank 0, min over ranks "
+            f"{[min(f[k] for f in everyone) for k in range(4)]}",
+            flush=True,
+        )
+    _mpi_sync()
+
+
+def check_mpi_bits_payload_cells() -> None:
+    """Every `payload="bits"` cell: the dep4 or dep8 padding skew at its row count, bitwise.
+
+    Rank r's leading `valid_rows[r]` rows are arbitrary bf16 bit patterns and
+    the rest is +0.0, the zero padding the target writes up to T_max. The op
+    moves bytes, so the gather is the concatenation bit for bit -- NaN payloads
+    and -0.0 included, which a float comparison could not show. Four calls
+    return the same bits in four distinct tensors, none of them the input, and
+    the input is unchanged.
+    """
+    for i, cell in _mpi_cells():
+        spec = cell.spec
+        if spec.get("payload") != "bits" or _on_split(cell):
+            continue  # the q-split's bits cell runs in `check_mpi_split_cells`
+        width, rows, valid = _width(spec), spec["rows"], tuple(spec["valid_rows"])
+        assert len(valid) == WORLD and max(valid) == rows, (cell.why, valid)
+        seed = 30000 + 13 * i
+        blocks = []
+        for r in range(WORLD):
+            block = torch.zeros(rows, width, dtype=torch.bfloat16, device="cuda")
+            block[: valid[r]] = _bits(r, (valid[r], width), seed)
+            blocks.append(block)
+        mine = blocks[RANK]
+        kept = mine.clone()
+        before = dict(SEEN)
+        _mpi_sync()
+        outs = [_gather(mine, spec) for _ in range(4)]
+        ref = entry.allgather.reference(blocks)
+        for k, out in enumerate(outs):
+            assert out.shape == (WORLD * rows, width) and out.is_contiguous(), (cell.why, k)
+            assert not bool(_differs(out, ref)), f"{cell.why}: call {k} differs from the reference"
+        pointers = {out.data_ptr() for out in outs}
+        assert len(pointers) == len(outs) and mine.data_ptr() not in pointers, cell.why
+        assert not bool(_differs(mine, kept)), f"{cell.why}: the input was written"
+        # The payload holds every class of bit pattern the cell names.
+        full = blocks[valid.index(rows)]
+        tiny = torch.finfo(torch.bfloat16).tiny
+        counts = [
+            int(torch.isnan(full).sum()),
+            int(torch.isinf(full).sum()),
+            int(((full == 0) & torch.signbit(full)).sum()),
+            int(((full != 0) & (full.abs() < tiny)).sum()),
+        ]
+        assert min(counts) > 0, f"{cell.why}: (NaN, inf, -0.0, subnormal) counts {counts}"
+        if RANK == 0:
+            print(
+                f"[mpi] {cell.why[:44]}: (NaN, inf, -0.0, subnormal) elements in the full "
+                f"block {counts}, moved bitwise",
+                flush=True,
+            )
+        _account(i, before)
+        del blocks, mine, kept, outs, ref, full
+        _mpi_sync()
+
+
+def check_mpi_graph_cells() -> None:
+    """The graph cells together: the decode graphs a dep4 or dep8 engine holds, one pool.
+
+    One graph per captured batch, largest first as the engine's graph runner
+    captures, each with `sites` gathers that read their own persistent input
+    and copy into their own persistent output (outside the pool, whose blocks a
+    later capture reuses). The group is warmed eagerly at each batch before its
+    capture, as the engine's warmup does. Then four replay orders, each twice:
+    one replay at a time on fresh payloads checked bitwise against the
+    reference, then every graph's payload staged and all replayed back to back
+    with no synchronization. Last, arbitrary bit patterns: each replay bitwise
+    the reference and the same calls made eagerly. A job holding only q-split
+    cells (context steps, never captured) has no graph and skips it.
+    """
+    if _only_split_cells():
+        return
+    cells = [(i, c) for i, c in _mpi_cells() if "graph_rows" in c.spec]
+    assert cells, "no graph cell"
+    spec0 = cells[0][1].spec
+    pool_rows, sites, width = tuple(spec0["graph_rows"]), spec0["sites"], _width(spec0)
+    by_rows = {c.spec["rows"]: i for i, c in cells}
+    assert sorted(by_rows) == sorted(pool_rows), (sorted(by_rows), pool_rows)
+    for _, c in cells:
+        assert c.spec["sites"] == sites and tuple(c.spec["graph_rows"]) == pool_rows, c.why
+
+    inputs: Dict[int, torch.Tensor] = {}
+    outputs: Dict[int, torch.Tensor] = {}
+    graphs: Dict[int, Any] = {}
+    pool = None
+    for rows in sorted(pool_rows, reverse=True):
+        spec = entry.allgather.CELLS[by_rows[rows]].spec
+        before = dict(SEEN)
+        x = _rows(RANK, (sites, rows, width), 40000 + rows)
+        out = torch.empty(sites, WORLD * rows, width, dtype=torch.bfloat16, device="cuda")
+
+        def body(x: torch.Tensor = x, out: torch.Tensor = out, spec: Dict[str, Any] = spec) -> None:
+            for s in range(sites):
+                out[s].copy_(_gather(x[s], spec))
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                body()
+        torch.cuda.current_stream().wait_stream(side)
+        _mpi_sync()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            body()
+        pool = graph.pool() if pool is None else pool
+        inputs[rows], outputs[rows], graphs[rows] = x, out, graph
+        _account(by_rows[rows], before)
+        _mpi_sync()
+
+    def payload(rank: int, rows: int, seed: int, bits: bool) -> torch.Tensor:
+        return (_bits if bits else _rows)(rank, (sites, rows, width), seed)
+
+    def stage(rows: int, seed: int, bits: bool = False) -> None:
+        inputs[rows].copy_(payload(RANK, rows, seed, bits))
+
+    def verify(rows: int, seed: int, where: str, bits: bool = False) -> None:
+        before = dict(SEEN)
+        everyone = [payload(r, rows, seed, bits) for r in range(WORLD)]
+        ref = torch.stack(
+            [entry.allgather.reference([p[s] for p in everyone]) for s in range(sites)]
+        )
+        _account(by_rows[rows], before)
+        if bool(_differs(outputs[rows], ref)):
+            bad = [s for s in range(sites) if bool(_differs(outputs[rows][s], ref[s]))]
+            raise AssertionError(f"{where} rows={rows}: sites {bad} differ from the reference")
+
+    asc = sorted(pool_rows)
+    shuffled = list(asc)
+    random.Random(1234).shuffle(shuffled)
+    extremes = [r for pair in zip(reversed(asc), asc) for r in pair][: len(asc)]
+    seed = 50000
+    for name, order in (
+        ("ascending", asc),
+        ("descending", list(reversed(asc))),
+        ("shuffled", shuffled),
+        ("extremes", extremes),
+    ):
+        assert sorted(order) == asc, (name, order)
+        for pos, rows in enumerate(order):
+            seed += 1
+            stage(rows, seed)
+            _mpi_sync()
+            graphs[rows].replay()
+            torch.cuda.synchronize()
+            verify(rows, seed, f"{name}/checked@{pos}")
+        _mpi_sync()
+        staged: Dict[int, int] = {}
+        for rows in order:
+            seed += 1
+            staged[rows] = seed
+            stage(rows, seed)
+        _mpi_sync()
+        for rows in order:
+            graphs[rows].replay()
+        torch.cuda.synchronize()
+        for pos, rows in enumerate(order):
+            verify(rows, staged[rows], f"{name}/burst@{pos}")
+        _mpi_sync()
+
+    # A replay that did not happen leaves the previous payload's gather; the
+    # gate of exactly zero sees it in every element where consecutive payloads
+    # differ.
+    stale = _fraction_moved(payload(RANK, 16, seed - 1, False), payload(RANK, 16, seed, False))
+    assert stale > 0.9, f"consecutive payloads differ in only {stale:.4f} of elements"
+
+    for rows in shuffled:
+        seed += 1
+        stage(rows, seed, bits=True)
+        _mpi_sync()
+        graphs[rows].replay()
+        torch.cuda.synchronize()
+        verify(rows, seed, "bit patterns", bits=True)
+        before = dict(SEEN)
+        spec = entry.allgather.CELLS[by_rows[rows]].spec
+        eager = torch.stack([_gather(inputs[rows][s], spec) for s in range(sites)])
+        _account(by_rows[rows], before)
+        if bool(_differs(outputs[rows], eager)):
+            raise AssertionError(f"bit patterns, rows={rows}: a replay differs from eager")
+        _mpi_sync()
+    graphs.clear()
+    _mpi_sync()
+
+
+def check_mpi_round_trip_through_a_combine_in_one_graph() -> None:
+    """The dep4 or dep8 decode step's collective sequence, captured: gather, window, combine.
+
+    Per MoE layer the target gathers every rank's rows, lets this rank's expert
+    window act on all of them and combines the world's partials, all on the one
+    communicator `getComm` caches for the group. Here each of the `sites`
+    layers gathers through the entry, scales by a per-rank factor standing in
+    for the window, and combines with `torch.ops.trtllm.reducescatter` -- a
+    fixture standing in for the combine, never the reference -- every batch's
+    graph in one pool. The gathered rows are checked against the entry's
+    reference, and rank i gets back its own rows times the sum of the world's
+    factors, computed locally, so a wrong combine cannot hide behind a right
+    gather or the reverse. A job holding only q-split cells has no graph and
+    skips it.
+    """
+    if _only_split_cells():
+        return
+    cells = [(i, c) for i, c in _mpi_cells() if "graph_rows" in c.spec]
+    spec = cells[0][1].spec
+    by_rows = {c.spec["rows"]: i for i, c in cells}
+    sites, width, pool_rows = spec["sites"], _width(spec), spec["graph_rows"]
+    # Payload k/8 with |k| <= 7 and factors (r + 1) / 4: every product and every
+    # partial sum is exact in bf16, so both gates are bitwise. At world 8 a
+    # partial sum is k * s / 32 with s at most 1 + 2 + ... + 8 = 36, so |k * s|
+    # stays at or below 252, inside bf16's exact integers.
+    factor = (RANK + 1) / 4.0
+    total = sum((r + 1) / 4.0 for r in range(WORLD))
+    pool = None
+    for rows in sorted(pool_rows, reverse=True):
+        own = torch.empty(sites, rows, width, dtype=torch.bfloat16, device="cuda")
+        gathered = torch.empty(sites, WORLD * rows, width, dtype=torch.bfloat16, device="cuda")
+        back = torch.empty(sites, rows, width, dtype=torch.bfloat16, device="cuda")
+
+        def body() -> None:
+            for s in range(sites):
+                g = _gather(own[s], spec)
+                gathered[s].copy_(g)
+                back[s].copy_(torch.ops.trtllm.reducescatter(torch.mul(g, factor), None, GROUP))
+
+        def payload(rank: int, seed: int) -> torch.Tensor:
+            gen = torch.Generator(device="cuda").manual_seed(seed * 131 + rank)
+            raw = torch.randint(-7, 8, (sites, rows, width), generator=gen, device="cuda")
+            return raw.to(torch.bfloat16).div_(8.0)
+
+        before = dict(SEEN)
+        own.copy_(payload(RANK, 70000 + rows))
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            body()
+        torch.cuda.current_stream().wait_stream(side)
+        _mpi_sync()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            body()
+        pool = graph.pool() if pool is None else pool
+        for seed in (71000 + rows, 72000 + rows):
+            own.copy_(payload(RANK, seed))
+            _mpi_sync()
+            graph.replay()
+            torch.cuda.synchronize()
+            everyone = [payload(r, seed) for r in range(WORLD)]
+            ref = torch.stack(
+                [entry.allgather.reference([p[s] for p in everyone]) for s in range(sites)]
+            )
+            assert not bool(_differs(gathered, ref)), f"rows={rows}: the gather is wrong"
+            expected = (own.float() * total).to(torch.bfloat16)
+            assert not bool(_differs(back, expected)), f"rows={rows}: the round trip is wrong"
+            _mpi_sync()
+        _account(by_rows[rows], before)
+        del graph
+    _mpi_sync()
+
+
+# ---- the q-split selection gather (the cells stating `q_split`) ---------------
+#
+# Mistral Large 4 NVFP4 tep4 and tp4 (four ranks of one node) and tep8 (eight ranks
+# over two nodes) under chunked prefill: once a step's tc context rows reach the
+# engine's q_split_threshold, TP rank r of WORLD selects for rows
+# [q_begin, q_end) = [tc * r // WORLD, tc * (r + 1) // WORLD) only, and every
+# selecting indexer layer gathers the shares -- `topk_buf[q_begin:q_end]`, sizes
+# = q_sizes -- into rows [0, tc) of the step's selection buffer, over the nodes
+# the ranks span. A selection row holds key positions, so the payloads are int32
+# in [-1, 2^20) unless a cell asks for every bit pattern (`bits`) or for rows
+# shaped as the top-k writes them (`indices`). Each job drives the q-split cells
+# of its own world size: `_q_split` and every share below follow WORLD.
+
+#: The engine's default q_split_threshold: the smallest tc it splits.
+Q_SPLIT_THRESHOLD = 8192
+#: A value no selection holds (positions are >= -1, salts stay below 2^30): a
+#: row still holding it was never written.
+SPLIT_SENTINEL = -(2**31)
+
+
+def _on_split(cell: Any) -> bool:
+    """Whether `cell` is one of the q-split gather's: it states `q_split`."""
+    return bool(cell.spec.get("q_split"))
+
+
+def _split_cells() -> List[Tuple[int, Any]]:
+    """(index, cell) of every q-split cell this job drives, all on the MPI-session symbol."""
+    return [(i, c) for i, c in _mpi_cells() if _on_split(c)]
+
+
+def _only_split_cells() -> bool:
+    """Whether this job's cells are all the q-split's (then it has no gather sweep or graph)."""
+    return all(_on_split(c) for _, c in _mpi_cells())
+
+
+def _q_split(tc: int, rank: int) -> Tuple[int, int, List[int]]:
+    """`rank`'s (q_begin, q_end) of `tc` context rows and the q_sizes, as the engine splits."""
+    sizes = [(r + 1) * tc // WORLD - r * tc // WORLD for r in range(WORLD)]
+    return tc * rank // WORLD, tc * (rank + 1) // WORLD, sizes
+
+
+def _split_width(spec: Dict[str, Any]) -> int:
+    assert len(spec["trailing"]) == 1 and spec["dtype"] is torch.int32, spec
+    assert spec["world_size"] == WORLD and spec["process_group"] is None, (spec, WORLD)
+    # A cell without `nodes` is one node's, as the tep4 and tp4 cells are.
+    assert spec.get("nodes", 1) == NODES, (spec, NODES)
+    return spec["trailing"][0]
+
+
+def _split_tokens(spec: Dict[str, Any]) -> List[int]:
+    """The tc values a q-split cell names, largest first, checked against its keys.
+
+    A sweep names its totals as `sweep_tokens` or `sweep_totals`; its sizes are
+    the floor split at each (`sizes="floor_split"`, or no `sizes`).
+    """
+    if "sweep_tokens" in spec or "sweep_totals" in spec:
+        lo, hi = spec["sweep_tokens"] if "sweep_tokens" in spec else spec["sweep_totals"]
+        tcs = set(range(lo, hi + 1, spec["sweep_step"])) | set(spec.get("sweep_also", ())) | {hi}
+        assert all(lo <= tc <= hi for tc in tcs), spec
+        assert spec.get("sizes", "floor_split") == "floor_split", spec
+    else:
+        tcs = {spec["tokens"]}
+        assert list(spec["sizes"]) == _q_split(spec["tokens"], RANK)[2], spec
+    assert min(tcs) >= Q_SPLIT_THRESHOLD, spec
+    assert spec["rows"] == max(max(_q_split(tc, RANK)[2]) for tc in tcs), spec
+    return sorted(tcs, reverse=True)
+
+
+def _selections(tc: int, seed: int, width: int, bits: bool = False) -> torch.Tensor:
+    """A step's [tc, width] selection rows, the same on every rank for one seed.
+
+    Rank r's input is its rows [q_begin, q_end) of these, so the gather is
+    supposed to give back exactly this tensor. Key positions in [-1, 2^20): two
+    rows agree in about one element in a million, so a block from the wrong rank
+    or at the wrong offset changes nearly every element it covers. With `bits`,
+    every int32 bit pattern equally likely.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(seed * 7919 + 3)
+    if bits:
+        shape = (tc, width)
+        raw = torch.randint(-(2**31), 2**31, shape, generator=gen, device="cuda", dtype=torch.int64)
+        return raw.to(torch.int32)
+    return torch.randint(-1, 2**20, (tc, width), generator=gen, device="cuda", dtype=torch.int32)
+
+
+def _shares(rows: torch.Tensor, tc: int) -> List[torch.Tensor]:
+    """Every rank's share of a step's `tc` selection rows, in rank order."""
+    return [rows[_q_split(tc, r)[0] : _q_split(tc, r)[1]] for r in range(WORLD)]
+
+
+def _salted(shares: List[torch.Tensor], salt: int) -> List[torch.Tensor]:
+    return [torch.bitwise_xor(share, salt) for share in shares]
+
+
+def _words_differ(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Whether two int32 tensors differ in any bit: a device bool, compared as int64 words."""
+    assert a.shape == b.shape and a.dtype == b.dtype == torch.int32, (a.shape, b.shape, a.dtype)
+    return torch.ne(a.reshape(-1).view(torch.int64), b.reshape(-1).view(torch.int64)).any()
+
+
+def _int_fraction_moved(a: torch.Tensor, b: torch.Tensor) -> float:
+    """The fraction of elements that differ between two int32 tensors."""
+    return torch.ne(a, b).float().mean().item()
+
+
+def _split_gather(x: torch.Tensor, sizes: List[int]) -> torch.Tensor:
+    """The call the tep4, tp4 and tep8 targets make: the share, q_sizes, the TP group, MPI."""
+    return entry.allgather(x, sizes, GROUP, process_group=None)
+
+
+def check_mpi_split_sizes_are_the_engines() -> None:
+    """Every q-split cell's tc splits as the engine splits it, by the engine's own function.
+
+    `_split_prefill_queries` (the DSA indexer's) at the default threshold, on
+    this rank's Mappings at tp WORLD, each with attention DP off and the job's
+    GROUP as its TP group: the default one and the one with the MoE
+    tensor-parallel over the same ranks (tep4's and tp4's at four ranks), and
+    the one with moe_ep over every rank and moe_tp 1 (tep8's at eight ranks, as
+    the tep8 target builds it). Unsplit below 8192, and at every tc a cell names
+    the (q_begin, q_end, q_sizes) `_q_split` gives. So the cells' shares are the
+    targets', and a change to the engine's split fails here first.
+    """
+    if not _split_cells():
+        return
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _split_prefill_queries
+    from tensorrt_llm.mapping import Mapping
+
+    checked = 0
+    for mapping in (
+        Mapping(world_size=WORLD, rank=RANK, tp_size=WORLD),
+        Mapping(world_size=WORLD, rank=RANK, tp_size=WORLD, moe_tp_size=WORLD, moe_ep_size=1),
+        Mapping(world_size=WORLD, rank=RANK, tp_size=WORLD, moe_ep_size=WORLD, moe_tp_size=1),
+    ):
+        assert mapping.tp_rank == RANK and not mapping.enable_attention_dp, mapping.tp_rank
+        assert list(mapping.tp_group) == GROUP, (list(mapping.tp_group), GROUP)
+        for tc in (1, Q_SPLIT_THRESHOLD - 1):
+            assert _split_prefill_queries(tc, mapping, Q_SPLIT_THRESHOLD) == (0, tc, None), tc
+        for _, cell in _split_cells():
+            for tc in _split_tokens(cell.spec):
+                got = _split_prefill_queries(tc, mapping, Q_SPLIT_THRESHOLD)
+                assert tuple(got) == _q_split(tc, RANK), (cell.why[:44], tc, got)
+                checked += 1
+    assert checked > 0, "no q-split cell"
+    _mpi_sync()
+
+
+def check_mpi_split_cells() -> None:
+    """Every q-split cell at one tc: the target's call on its share, bitwise the reference.
+
+    Each rank stages its share of a step's selection rows at [q_begin, q_end) of
+    a sentinel-filled [tc, width] buffer and passes that view, as the target
+    passes `topk_buf[q_begin:q_end]`. Three calls on three payloads (a `bits`
+    cell: four calls on one payload of every int32 bit pattern), each the
+    reference's concatenation of the shares bit for bit, in a fresh tensor
+    outside the buffer, with the buffer left as staged.
+    """
+    for i, cell in _split_cells():
+        spec = cell.spec
+        if "tokens" not in spec or "sites" in spec:
+            continue
+        width = _split_width(spec)
+        (tc,) = _split_tokens(spec)
+        begin, end, sizes = _q_split(tc, RANK)
+        bits = spec.get("payload") == "bits"
+        seeds = [60000 + 13 * i] * 4 if bits else [60000 + 13 * i + k for k in range(3)]
+        before = dict(SEEN)
+        outs = []
+        rows = None
+        for k, seed in enumerate(seeds):
+            prev, rows = rows, _selections(tc, seed, width, bits)
+            buf = torch.full((tc, width), SPLIT_SENTINEL, dtype=torch.int32, device="cuda")
+            buf[begin:end] = rows[begin:end]
+            kept = buf.clone()
+            _mpi_sync()
+            out = _split_gather(buf[begin:end], sizes)
+            where = f"{cell.why[:44]}: call {k}"
+            assert out.shape == (tc, width) and out.is_contiguous(), (where, out.shape)
+            ref = entry.allgather.reference(_shares(rows, tc))
+            assert not bool(_words_differ(out, ref)), f"{where} differs from the reference"
+            assert not bool(_words_differ(buf, kept)), f"{where} wrote its input buffer"
+            span = (buf.data_ptr(), buf.data_ptr() + buf.numel() * buf.element_size())
+            assert not span[0] <= out.data_ptr() < span[1], f"{where}: the result is in the buffer"
+            outs.append(out)
+        assert len({out.data_ptr() for out in outs}) == len(outs), cell.why[:44]
+        if bits:
+            assert bool(((rows < -1) | (rows >= 2**20)).any()), (
+                "the bits payload holds no wide value"
+            )
+        if tc == Q_SPLIT_THRESHOLD + 1:
+            _split_gate_discriminates(rows, prev, tc, out)
+        _account(i, before)
+        del outs, rows, prev, buf, kept
+        _mpi_sync()
+
+
+def _split_gate_discriminates(
+    rows: torch.Tensor, stale: torch.Tensor, tc: int, out: torch.Tensor
+) -> None:
+    """The bitwise gate, on a ragged split's payload, rejects every plausible wrong gather.
+
+    Shares in reversed rank order, the last rank's share never arriving (left
+    zero), every share one row late, and the previous call's rows (a call that
+    did not happen). Each has the right shape; each moves nearly every element
+    of the blocks it gets wrong, at most 1/WORLD of the result when it gets one
+    block wrong.
+    """
+    shares = _shares(rows, tc)
+    late = []
+    for r in range(WORLD):
+        begin, end, _ = _q_split(tc, r)
+        late.append(torch.cat([rows[begin + 1 : end], rows[end % tc : end % tc + 1]]))
+    missing = shares[:-1] + [torch.zeros_like(shares[-1])]
+    fractions = []
+    for name, wrong, floor in (
+        ("shares in reversed rank order", torch.cat(shares[::-1]), 0.9),
+        (f"rank {WORLD - 1}'s share never arrived", torch.cat(missing), 0.9 / WORLD),
+        ("every share one row late", torch.cat(late), 0.9),
+        ("the previous call's rows", stale, 0.9),
+    ):
+        assert wrong.shape == out.shape, (name, wrong.shape, out.shape)
+        fraction = _int_fraction_moved(out, wrong)
+        assert fraction > floor, f"{name}: only {fraction:.4f} of elements differ"
+        fractions.append(round(fraction, 4))
+    everyone = MPI_COMM.allgather(fractions)
+    if RANK == 0:
+        print(
+            f"[mpi] q-split gate at tc {tc}: wrong gathers move (reversed, missing, late, "
+            f"stale) {everyone[0]} of the elements on rank 0, min over ranks "
+            f"{[min(f[k] for f in everyone) for k in range(4)]}",
+            flush=True,
+        )
+
+
+def check_mpi_split_sweep_cells() -> None:
+    """Every q-split sweep cell: at each tc it names, the target's call, bitwise the reference.
+
+    One [top, width] payload regenerated on every rank, and at each tc a salt
+    XORed into it -- a different one per call, below 2^30 so no selection becomes
+    the sentinel -- so a call that did not happen, leaving a block the caching
+    allocator hands back with an earlier call's rows, differs in every element.
+    Rank r stages its share of the salted rows at [q_begin, q_end) of a buffer
+    and passes that view. Verdicts stay on the device and are read once; a
+    mismatch is agreed across the ranks before any rank raises.
+    """
+    for i, cell in _split_cells():
+        spec = cell.spec
+        if "sweep_tokens" not in spec:
+            continue
+        width = _split_width(spec)
+        tcs = _split_tokens(spec)
+        top = tcs[0]
+        base = _selections(top, 61000 + 13 * i, width)
+        buf = torch.empty(top, width, dtype=torch.int32, device="cuda")
+        bad = torch.zeros(len(tcs), dtype=torch.bool, device="cuda")
+        before = dict(SEEN)
+        _mpi_sync()
+        for k, tc in enumerate(tcs):
+            begin, end, sizes = _q_split(tc, RANK)
+            salt = (k + 1) * 40503 % 2**30
+            torch.bitwise_xor(base[begin:end], salt, out=buf[begin:end])
+            out = _split_gather(buf[begin:end], sizes)
+            assert out.shape == (tc, width), (cell.why[:44], tc, out.shape)
+            ref = entry.allgather.reference(_salted(_shares(base[:tc], tc), salt))
+            bad[k] = _words_differ(out, ref)
+        torch.cuda.synchronize()
+        everyone = MPI_COMM.allgather(bad.nonzero().flatten().tolist())
+        failing = sorted({tcs[k] for got in everyone for k in got})
+        if failing:
+            raise AssertionError(
+                f"{cell.why[:44]}: {len(failing)} of {len(tcs)} tc differ from the reference "
+                f"on some rank, the smallest {failing[0]}"
+            )
+        if RANK == 0:
+            print(
+                f"[mpi] q-split sweep: {len(tcs)} tc {tcs[-1]}..{tcs[0]}, each bitwise", flush=True
+            )
+        _account(i, before)
+        del base, buf, bad
+        _mpi_sync()
+
+
+def check_mpi_split_step_cells() -> None:
+    """Every q-split step cell: `sites` gathers in layer order, as the target issues them.
+
+    One selection buffer per rank, as the target keeps one per step. Per layer
+    its rows [0, tc) are set to the sentinel, the rank's share of that layer's
+    selections is written at [q_begin, q_end), and the view is gathered with the
+    result copied into rows [0, tc) -- the target's `topk_buf[:tc].copy_(
+    allgather(topk_buf[q_begin:q_end], q_sizes, ...))` -- then the rows a layer
+    reads are kept. Nothing synchronizes between layers. Afterwards every layer's
+    rows are checked against the reference bitwise, and for the sentinel: a row
+    the gather did not write would still hold it.
+    """
+    for i, cell in _split_cells():
+        spec = cell.spec
+        if "sites" not in spec or spec.get("payload") == "indices":
+            continue  # an `indices` step runs in `check_mpi_split_copy_back_cells`
+        width, sites = _split_width(spec), spec["sites"]
+        (tc,) = _split_tokens(spec)
+        begin, end, sizes = _q_split(tc, RANK)
+        base = _selections(tc, 62000 + 13 * i, width)
+        salts = [(997 * i + layer + 1) * 40503 % 2**30 for layer in range(sites)]
+        topk = torch.empty(tc, width, dtype=torch.int32, device="cuda")
+        read = torch.empty(sites, tc, width, dtype=torch.int32, device="cuda")
+        before = dict(SEEN)
+        _mpi_sync()
+        for layer, salt in enumerate(salts):
+            topk.fill_(SPLIT_SENTINEL)
+            torch.bitwise_xor(base[begin:end], salt, out=topk[begin:end])
+            topk[:tc].copy_(_split_gather(topk[begin:end], sizes))
+            read[layer].copy_(topk)
+        bad = torch.zeros(sites, dtype=torch.bool, device="cuda")
+        holes = torch.zeros(sites, dtype=torch.bool, device="cuda")
+        for layer, salt in enumerate(salts):
+            ref = entry.allgather.reference(_salted(_shares(base, tc), salt))
+            bad[layer] = _words_differ(read[layer], ref)
+            holes[layer] = torch.eq(read[layer], SPLIT_SENTINEL).any()
+        torch.cuda.synchronize()
+        everyone = MPI_COMM.allgather(
+            (bad.nonzero().flatten().tolist(), holes.nonzero().flatten().tolist())
+        )
+        wrong = sorted({layer for got, _ in everyone for layer in got})
+        unwritten = sorted({layer for _, got in everyone for layer in got})
+        if wrong or unwritten:
+            raise AssertionError(
+                f"{cell.why[:44]}: layers {wrong} differ from the reference and layers "
+                f"{unwritten} hold unwritten rows, on some rank"
+            )
+        _account(i, before)
+        del read, topk, base, bad, holes
+        _mpi_sync()
+
+
+def _indices(tc: int, seed: int, width: int, top: int) -> torch.Tensor:
+    """A step's [tc, width] selection rows as the top-k leaves them, the same on every rank.
+
+    Row j holds key positions in [0, top] in its first `seen` slots and -1 in
+    the rest: a query that sees fewer than `width` keys -- early in a request,
+    or in a chunk with no key at all -- leaves a -1 tail. Every third row sees
+    `width` keys or more and holds both 0 and `top`, every 97th from row 1 sees
+    none, and the others see 0..width keys, uniformly. Two rows' positions agree
+    in about one slot in a million, so a block from the wrong rank or at the
+    wrong offset changes every slot where either holds a position.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(seed * 7919 + 5)
+    rows = torch.randint(0, top + 1, (tc, width), generator=gen, device="cuda", dtype=torch.int32)
+    seen = torch.randint(0, width + 1, (tc, 1), generator=gen, device="cuda", dtype=torch.int32)
+    seen[::3] = width
+    seen[1::97] = 0
+    rows[::3, 0] = 0
+    rows[::3, -1] = top
+    slots = torch.arange(width, device="cuda", dtype=torch.int32)
+    return rows.masked_fill_(slots >= seen, -1)
+
+
+def _indices_payload_and_gate(rows: torch.Tensor, other: torch.Tensor, tc: int, top: int) -> None:
+    """An `indices` payload holds what it claims, and the bitwise gate sees a wrong gather on it.
+
+    The payload: positions 0 and `top` present, nothing outside [-1, top], rows
+    with -1 tails, rows of -1 only and rows without a tail. The gate: shares in
+    reversed rank order, every share one row late, another call's rows at this
+    tc, and the last rank's share never arriving (left zero) each move more than
+    half the slots of the blocks they get wrong (1/WORLD of the result for one
+    block); the rows that agree are the -1 tails both sides share.
+    """
+    assert int(rows.min()) == -1 and int(rows.max()) == top, (int(rows.min()), int(rows.max()))
+    assert bool((rows == 0).any()), "no position 0"
+    tails = rows[:, -1] == -1
+    empty = rows[:, 0] == -1
+    counts = [int((~tails).sum()), int((tails & ~empty).sum()), int(empty.sum())]
+    assert min(counts) > 0, f"(full, tailed, empty) rows {counts}"
+    shares = _shares(rows, tc)
+    late = []
+    for r in range(WORLD):
+        begin, end, _ = _q_split(tc, r)
+        late.append(torch.cat([rows[begin + 1 : end], rows[end % tc : end % tc + 1]]))
+    fractions = []
+    for name, wrong, floor in (
+        ("shares in reversed rank order", torch.cat(shares[::-1]), 0.5),
+        ("every share one row late", torch.cat(late), 0.5),
+        ("another call's rows", other, 0.5),
+        (
+            f"rank {WORLD - 1}'s share never arrived",
+            torch.cat(shares[:-1] + [torch.zeros_like(shares[-1])]),
+            0.5 / WORLD,
+        ),
+    ):
+        assert wrong.shape == rows.shape, (name, wrong.shape, rows.shape)
+        fraction = _int_fraction_moved(rows, wrong)
+        assert fraction > floor, f"{name}: only {fraction:.4f} of slots differ"
+        fractions.append(round(fraction, 4))
+    everyone = MPI_COMM.allgather(fractions)
+    if RANK == 0:
+        print(
+            f"[mpi] indices payload at tc {tc}: (full, tailed, empty) rows {counts}, positions "
+            f"-1..{top}; wrong gathers move (reversed, late, other call, missing) "
+            f"{everyone[0]} of the slots on rank 0, min over ranks "
+            f"{[min(f[k] for f in everyone) for k in range(4)]}",
+            flush=True,
+        )
+
+
+def check_mpi_split_copy_back_cells() -> None:
+    """Every `payload="indices"` q-split cell, through the target's copy-back.
+
+    The tp4 target's own form of the call, on rows shaped as its top-k leaves
+    them (`_indices`). One selection buffer per rank, as the target keeps one
+    per step: per call its rows [0, tc) are set to the sentinel, the rank's
+    share of a fresh payload is written at [q_begin, q_end), and the view is
+    gathered with the result copied into rows [0, tc) -- `topk_buf[:tc].copy_(
+    allgather(topk_buf[q_begin:q_end], q_sizes, ...))`. A `sites` cell makes
+    that many calls at its tc in layer order with nothing synchronizing between
+    them, keeps the rows each layer reads and checks them afterwards; a sweep
+    cell makes one call per tc, largest first, each checked as it goes. Every
+    call's rows must be bitwise the reference's concatenation of the shares and
+    hold no sentinel. Verdicts stay on the device and are read once; a mismatch
+    is agreed across the ranks before any rank raises.
+    """
+    for i, cell in _split_cells():
+        spec = cell.spec
+        if spec.get("payload") != "indices":
+            continue
+        started = time.monotonic()
+        torch.cuda.reset_peak_memory_stats()
+        width, top = _split_width(spec), spec["top_position"]
+        tcs = _split_tokens(spec)
+        sites = spec.get("sites", 1)
+        calls = [(tc, layer) for tc in tcs for layer in range(sites)]
+        seed = (64000 + 13 * i) * 4096
+        topk = torch.empty(tcs[0], width, dtype=torch.int32, device="cuda")
+        read = None
+        if sites > 1:
+            read = torch.empty(sites, tcs[0], width, dtype=torch.int32, device="cuda")
+        bad = torch.zeros(len(calls), dtype=torch.bool, device="cuda")
+        holes = torch.zeros(len(calls), dtype=torch.bool, device="cuda")
+        _indices_payload_and_gate(
+            _indices(tcs[0], seed, width, top), _indices(tcs[0], seed - 1, width, top), tcs[0], top
+        )
+        # The control: with the gather withheld, the other ranks' rows still hold the sentinel.
+        begin, end, _ = _q_split(tcs[0], RANK)
+        topk.fill_(SPLIT_SENTINEL)
+        topk[begin:end].copy_(_indices(tcs[0], seed - 1, width, top)[begin:end])
+        assert bool(torch.eq(topk, SPLIT_SENTINEL).any()), "a withheld gather left no sentinel"
+        before = dict(SEEN)
+        _mpi_sync()
+        for k, (tc, layer) in enumerate(calls):
+            begin, end, sizes = _q_split(tc, RANK)
+            rows = _indices(tc, seed + k, width, top)
+            topk[:tc].fill_(SPLIT_SENTINEL)
+            topk[begin:end].copy_(rows[begin:end])
+            topk[:tc].copy_(_split_gather(topk[begin:end], sizes))
+            if read is not None:
+                read[layer, :tc].copy_(topk[:tc])
+                continue
+            bad[k] = _words_differ(topk[:tc], entry.allgather.reference(_shares(rows, tc)))
+            holes[k] = torch.eq(topk[:tc], SPLIT_SENTINEL).any()
+        if read is not None:
+            for k, (tc, layer) in enumerate(calls):
+                ref = entry.allgather.reference(_shares(_indices(tc, seed + k, width, top), tc))
+                bad[k] = _words_differ(read[layer, :tc], ref)
+                holes[k] = torch.eq(read[layer, :tc], SPLIT_SENTINEL).any()
+        torch.cuda.synchronize()
+        everyone = MPI_COMM.allgather(
+            (bad.nonzero().flatten().tolist(), holes.nonzero().flatten().tolist())
+        )
+        wrong = sorted({calls[k] for got, _ in everyone for k in got})
+        unwritten = sorted({calls[k] for _, got in everyone for k in got})
+        if wrong or unwritten:
+            raise AssertionError(
+                f"{cell.why[:44]}: {len(wrong)} of {len(calls)} (tc, layer) calls differ from "
+                f"the reference, the first {wrong[:4]}, and {len(unwritten)} hold unwritten "
+                f"rows, the first {unwritten[:4]}, on some rank"
+            )
+        if RANK == 0:
+            print(
+                f"[mpi] {cell.why[:44]}: {len(calls)} copy-back calls at tc "
+                f"{tcs[-1]}..{tcs[0]}, each bitwise, none unwritten; "
+                f"{time.monotonic() - started:.2f}s, peak allocated "
+                f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB",
+                flush=True,
+            )
+        _account(i, before)
+        del topk, read, bad, holes
+        _mpi_sync()
+
+
+def check_mpi_split_guards_a_share_that_is_not_its_sizes_entry() -> None:
+    """`sizes[i]` must be the i-th rank's input height, and the op never checks it.
+
+    Run in a job that holds q-split cells, on its world. With `per` = 8192 //
+    WORLD rows (2048 at four ranks, 1024 at eight), unguarded -- the op itself,
+    at tc 8193's q_sizes [per, ..., per, per + 1] ([2048, 2048, 2048, 2049] at
+    four ranks): the last rank's input one row short of its entry, a leading
+    view of a buffer whose next row is a marker row, gives a result whose last
+    row is the marker, a row no rank passed; rank 0's input one row long, its
+    share then the marker, gives the shares' concatenation with the marker
+    nowhere in it. With every entry per + 1 and every input `per` rows (equal
+    entries: one ncclAllGather of `input.numel()`), the blocks land at
+    `per`-row offsets rather than where `sizes` puts them, and the result's
+    last WORLD rows are never written (the caching allocator's previous block
+    there, sentinel-filled, shows through when it is reused). Every rank gets
+    the same wrong result, and nothing raises.
+
+    Guarded: with every rank's input one row short of its entry, and with every
+    entry per + 1 over `per`-row inputs, the entry's `is_valid` refuses the call
+    on every rank, so no rank enters the collective. Each refusal is first asked
+    of `is_valid` alone and agreed across the ranks, so a rank it admitted
+    cannot sit in the collective alone.
+    """
+    if not _split_cells():
+        return
+    width, tc = 2048, Q_SPLIT_THRESHOLD + 1
+    per, last = Q_SPLIT_THRESHOLD // WORLD, WORLD - 1
+    rows = _selections(tc, 63000, width)
+    begin, end, sizes = _q_split(tc, RANK)
+    assert sizes == [per] * last + [per + 1], sizes
+    marker = torch.full((1, width), 0x5A5A5A5A, dtype=torch.int32, device="cuda")
+    op = torch.ops.trtllm.allgather
+
+    # One row short on the last rank: the op reads the row after its input.
+    share = rows[begin : end - 1] if RANK == last else rows[begin:end]
+    x = torch.cat([share, marker])[: share.shape[0]]
+    _mpi_sync()
+    out = op(x, sizes, GROUP)
+    torch.cuda.synchronize()
+    assert out.shape == (tc, width), out.shape
+    assert not bool(_words_differ(out[: tc - 1], rows[: tc - 1])), "short: the passed rows moved"
+    assert bool((out[tc - 1] == marker[0]).all()), "short: the result's last row is not the marker"
+
+    # One row long on rank 0: its last row is dropped.
+    x = torch.cat([rows[begin:end], marker]) if RANK == 0 else rows[begin:end].clone()
+    _mpi_sync()
+    out = op(x, sizes, GROUP)
+    torch.cuda.synchronize()
+    assert not bool(_words_differ(out, rows)), "long: the result is not the shares"
+    assert not bool((out == marker[0]).all(dim=1).any()), "long: the extra row arrived"
+
+    # Every entry per + 1, every input `per` rows: one ncclAllGather of input.numel().
+    equal = [per + 1] * WORLD
+    x = rows[per * RANK : per * RANK + per].clone()
+    bait = torch.full((sum(equal), width), SPLIT_SENTINEL, dtype=torch.int32, device="cuda")
+    bait_at = bait.data_ptr()
+    del bait
+    _mpi_sync()
+    out = op(x, equal, GROUP)
+    torch.cuda.synchronize()
+    assert out.shape == (sum(equal), width), out.shape
+    packed = WORLD * per
+    assert not bool(_words_differ(out[:packed], rows[:packed])), "equal: not packed"
+    assert bool(_words_differ(out[per + 1 : 2 * per + 1], rows[per : 2 * per])), (
+        "equal: rank 1 placed"
+    )
+    reused = out.data_ptr() == bait_at
+    if reused:
+        assert bool((out[packed:] == SPLIT_SENTINEL).all()), "equal: the tail was written"
+    if RANK == 0:
+        print(
+            f"[mpi] q-split heights at world {WORLD}: short -> the row after the input, long -> "
+            f"cut, equal entries -> packed at {per}-row offsets (tail unwritten, sentinel block "
+            f"reused: {reused})",
+            flush=True,
+        )
+    _mpi_sync()
+
+    for name, x, sizes_ in (
+        ("every input one row short", rows[begin : end - 1].clone(), sizes),
+        (
+            f"every entry {per + 1} over {per}-row inputs",
+            rows[per * RANK : per * RANK + per].clone(),
+            equal,
+        ),
+    ):
+        try:
+            entry.allgather.is_valid(x, sizes_, GROUP, process_group=None)
+        except AssertionError:
+            refused = True
+        else:
+            refused = False
+        everyone = MPI_COMM.allgather(refused)
+        assert all(everyone), f"{name}: is_valid admitted it on ranks {everyone}"
+        try:
+            _split_gather(x, sizes_)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"{name}: the entry made the call")
+        _mpi_sync()
+
+
+def check_mpi_every_cell_was_driven() -> None:
+    """Each MPI-session cell ran through the entry's own `__call__` and `reference`."""
+    for i, cell in _mpi_cells():
+        calls, refs = DRIVEN.get(i, [0, 0])
+        assert calls > 0 and refs > 0, (
+            f"cell {cell.why!r}: the entry's __call__ / reference ran {calls} / {refs} times"
+        )
+
+
+MPI_CHECKS = (
+    check_mpi_session_is_the_launchers_world,
+    # Before any capture: the group's first call builds the communicator.
+    check_mpi_eager_sweep_cells,
+    check_mpi_the_gate_discriminates_a_wrong_gather,
+    check_mpi_bits_payload_cells,
+    # The q-split gather's cells (tep4 and tp4 at four ranks, tep8 at eight):
+    # context steps, so eager only.
+    check_mpi_split_sizes_are_the_engines,
+    check_mpi_split_cells,
+    check_mpi_split_sweep_cells,
+    check_mpi_split_step_cells,
+    check_mpi_split_copy_back_cells,
+    check_mpi_split_guards_a_share_that_is_not_its_sizes_entry,
+    check_mpi_graph_cells,
+    check_mpi_round_trip_through_a_combine_in_one_graph,
+    check_mpi_every_cell_was_driven,
+)
+
+
+def _run_one_mpi_rank() -> int:
+    """Body of one mpirun rank: run every MPI check; a failing rank exits nonzero
+    without finalizing, and mpirun then ends its siblings and fails. A rank
+    still running at `MPI_DEADLINE_S` -- wedged in a collective a sibling never
+    joined -- dumps its stack and exits."""
+    global RANK, WORLD, NODES, GROUP, MPI_COMM, entry
+    faulthandler.dump_traceback_later(MPI_DEADLINE_S, exit=True)
+    rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+    world = int(os.environ["OMPI_COMM_WORLD_SIZE"])
+    torch.cuda.set_device(int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"]))
+
+    from mpi4py import MPI
+
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allgather as module
+    from tensorrt_llm._utils import mpi_comm
+
+    entry = module
+    MPI_COMM = mpi_comm()
+    RANK, WORLD = rank, world
+    NODES = len(set(MPI_COMM.allgather(socket.gethostname())))
+    GROUP = list(range(WORLD))
+    assert WORLD >= 2, f"a collective needs at least 2 ranks, got {WORLD}"
+    _count_entry_calls()
+
+    for check in MPI_CHECKS:
+        started = time.monotonic()
+        try:
+            check()
+        except BaseException:
+            import traceback
+
+            print(f"[mpi rank {RANK}] FAILED {check.__name__}", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(13)
+        if RANK == 0:
+            print(f"[mpi] {check.__name__}: {time.monotonic() - started:.1f}s", flush=True)
+    _mpi_sync()
+    print(
+        f"[mpi rank {RANK}] {len(MPI_CHECKS)} checks passed over {len(_mpi_cells())} cells at "
+        f"world {WORLD} on {NODES} node(s); peak allocated "
+        f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB, reserved "
+        f"{torch.cuda.max_memory_reserved() / 2**30:.2f} GiB",
+        flush=True,
+    )
+    sys.stdout.flush()
+    faulthandler.cancel_dump_traceback_later()
+    # mpirun fails a rank that exits without finalizing. The communicators are
+    # left as they are, as in the `_pg` job: these processes end here.
+    MPI.Finalize()
+    os._exit(0)
+
+
+def _session_members(sid: int) -> List[int]:
+    """Every process in session `sid`, read from /proc."""
+    members = []
+    for entry_dir in Path("/proc").iterdir():
+        if not entry_dir.name.isdigit():
+            continue
+        try:
+            stat = (entry_dir / "stat").read_text()
+        except OSError:
+            continue
+        # pid (comm) state ppid pgrp session ...; comm may hold spaces.
+        fields = stat[stat.rindex(")") + 2 :].split()
+        if int(fields[3]) == sid:
+            members.append(int(entry_dir.name))
+    return members
+
+
+def _end_mpi_job(job: Any) -> None:
+    """End mpirun and every rank it started.
+
+    mpirun runs as a session leader; its ranks stay in that session but each in
+    a process group of its own, so killing mpirun's group would leave them
+    running. mpirun is asked first, then the session's members are killed.
+    """
+    if job.poll() is None:
+        job.terminate()
+        try:
+            job.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+    for pid in _session_members(job.pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if job.poll() is None:
+        job.kill()
+    job.wait()
+
+
+def _mpirun_ranks(world_size: int) -> None:
+    """Start the MPI-session job under mpirun, one rank per device, and wait for it.
+
+    The environment loses the launching allocation's PMI/PMIx/Open MPI/Slurm
+    variables, so this mpirun starts its own ranks on this node instead of
+    joining the allocation's step (where every rank would read rank 0 of one),
+    and `--oversubscribe` lets it place them whatever slot count it detects.
+    """
+    mpirun = shutil.which("mpirun")
+    assert mpirun is not None, "the MPI-session cells start their ranks with mpirun; none on PATH"
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_")) and k != "TLLM_DISABLE_MPI"
+    }
+    command = [mpirun, "-n", str(world_size), "--oversubscribe", "--allow-run-as-root"]
+    command += [sys.executable, str(Path(__file__).resolve()), _MPI_WORKER_FLAG]
+    print(f"[launcher] starting {world_size} MPI-session ranks under mpirun", flush=True)
+    job = subprocess.Popen(command, env=env, start_new_session=True)
+    try:
+        code = job.wait(timeout=MPI_DEADLINE_S)
+    except subprocess.TimeoutExpired:
+        _end_mpi_job(job)
+        raise AssertionError(
+            f"the {world_size}-rank MPI-session run did not finish in {MPI_DEADLINE_S}s (wedged)"
+        ) from None
+    if code != 0:
+        _end_mpi_job(job)
+        raise AssertionError(f"the {world_size}-rank MPI-session run failed: mpirun exited {code}")
+
+
+def _spawn_ranks() -> None:
+    """Run the `_pg` job, one worker process per claimed device and no external
+    launcher, then the MPI-session job under mpirun.
+
+    The `_pg` ranks rendezvous through torch.distributed's env:// method, so the
+    only thing they need is a free port. Each child gets its own session; on the
     first nonzero exit or on the deadline, every session is killed, which is
     what keeps one wedged collective from outliving the run.
     """
@@ -1056,12 +2353,12 @@ def _spawn_ranks() -> None:
         for p in children:
             p.wait()
 
-    deadline = time.monotonic() + DEADLINE_S
+    deadline = time.monotonic() + PG_DEADLINE_S
     live = set(range(world_size))
     failure = None
     while live and failure is None:
         if time.monotonic() > deadline:
-            failure = f"did not finish in {DEADLINE_S}s (wedged)"
+            failure = f"did not finish in {PG_DEADLINE_S}s (wedged)"
             break
         for r in sorted(live):
             code = children[r].poll()
@@ -1075,10 +2372,13 @@ def _spawn_ranks() -> None:
     if failure is not None:
         _kill_all()
         raise AssertionError(f"the {world_size}-rank run failed: {failure}")
+    _mpirun_ranks(world_size)
 
 
 if __name__ == "__main__":
     if _WORKER_FLAG in sys.argv:
         sys.exit(_run_one_rank())
+    if _MPI_WORKER_FLAG in sys.argv:
+        sys.exit(_run_one_mpi_rank())
     _spawn_ranks()
     print("OK")

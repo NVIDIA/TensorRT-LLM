@@ -565,3 +565,31 @@ zai-org/GLM-5.3-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 92.91
+mistralai/Mistral-Large-4-1T-A52B:
+  # The ModelOpt MIXED_PRECISION export (NVFP4 routed experts, FP8 128x128 block linears), FP8
+  # latent KV cache, set on an earlier NVFP4 checkpoint than the released one. Measured on an
+  # independent reference implementation, TP4 on 4 GB300s, harness protocol (5-shot, no chat
+  # template, greedy, 256 new tokens): 91.888 strict-match, 91.964 flexible-extract over the
+  # 1319-sample split.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 91.926
+    threshold: 90.43
+  # DSpark target verification keeps the same target accuracy requirement.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DSpark
+    accuracy: 91.926
+    threshold: 90.43
+mistralai/Mistral-Large-4-1T-A52B-gsm8k-24shot:
+  # The NVFP4 (MIXED_PRECISION) checkpoint on a long-context GSM8K protocol: 24 exemplars, so
+  # every prompt is 3152-5115 tokens and the DSA indexer's top-2048 selection prunes context on
+  # every sample. `trtllm-eval gsm8k --num_fewshot 24 --max_input_length 8192`, otherwise the
+  # 5-shot protocol above. Scored on 2026-10-21, on an earlier NVFP4 checkpoint than the released
+  # one, by an independent reference implementation (TP4 on 4 GB300s) through
+  # tensorrt_llm.evaluate.GSM8K's task code, all 1319 samples, mean of strict-match and
+  # flexible-extract, on its fp8_ds_mla latent cache: 91.96 (strict 91.89, flexible 92.04); bf16
+  # latent cache 92.23.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 91.96

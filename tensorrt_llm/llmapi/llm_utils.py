@@ -178,14 +178,33 @@ class ModelLoader:
 
         hf_config_path = f"{self._model_dir}/config.json"
         hf_quant_config = None
-        if os.path.exists(hf_config_path):
+        hf_config = None
+        if self.llm_args.checkpoint_format == "mistral_large_4":
+            from .._torch.models.checkpoints.mistral.config_loader import \
+                MistralConfigLoader
+            hf_config = MistralConfigLoader().load_pretrained_config(
+                self._model_dir).to_dict()
+            hf_config_path = f"{self._model_dir}/params.json"
+        elif os.path.exists(hf_config_path):
             with open(hf_config_path, "r") as f:
                 hf_config = json.load(f)
-                hf_quant_config = hf_config.get("quantization_config", None)
-                if hf_quant_config is not None:
-                    logger.info(
-                        f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
-                    )
+        if hf_config is not None:
+            hf_quant_config = hf_config.get("quantization_config", None)
+            if hf_quant_config is not None:
+                logger.info(
+                    f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
+                )
+            # Mistral-Large-4 states its FP8 latent cache as `fp8_kv_cache`;
+            # read it as the checkpoint's kv_cache_quant_algo, which only an
+            # explicit kv_cache_config.dtype overrides.
+            if (self.llm_args.checkpoint_format == "mistral_large_4"
+                    and hf_config.get("fp8_kv_cache")
+                    and explicit_kv_cache_quant_algo is None
+                    and self.llm_args.quant_config.kv_cache_quant_algo is None):
+                logger.info(
+                    f"Setting kv_cache_quant_algo={QuantAlgo.FP8} from fp8_kv_cache in {hf_config_path}."
+                )
+                self.llm_args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         if self.llm_args.model_kwargs is not None and "quantization_config" in self.llm_args.model_kwargs:
             logger.info(
                 f"Update hf_quant_config from model_kwargs: quantization_config={self.llm_args.model_kwargs['quantization_config']} (previous value: {hf_quant_config})"

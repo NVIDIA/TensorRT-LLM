@@ -623,6 +623,35 @@ class TransformersTokenizer(TokenizerBase):
         return self.tokenizer.decode(pending_ids, **kwargs)
 
 
+def _load_mistral_common_tokenizer(
+        model_dir: Union[str, Path],
+        trust_remote_code: bool = True,
+        use_fast: bool = True) -> Optional[TokenizerBase]:
+    """Load a Mistral-native checkpoint directory through ``MistralTokenizer``.
+
+    A directory that ships mistral-common's ``tekken.json`` is Mistral-native
+    unless it is also a complete HF checkpoint, with both ``config.json`` and
+    ``tokenizer.json``. A native directory is read through the
+    ``mistral_common`` alias, exactly as ``custom_tokenizer="mistral_common"``
+    would read it, even when it also ships HF tokenizer files, so that every
+    reader of the directory tokenizes as mistral-common does. AutoTokenizer
+    would convert a bare ``tekken.json`` into a fast tokenizer whose ids lack
+    the special-token offset and whose ``encode`` prepends no BOS.
+
+    Returns None for any other path, which keeps the AutoTokenizer route.
+    """
+    model_dir = Path(model_dir)
+    if not (model_dir / "tekken.json").is_file():
+        return None
+    if ((model_dir / "config.json").is_file()
+            and (model_dir / "tokenizer.json").is_file()):
+        return None
+    return load_custom_tokenizer("mistral_common",
+                                 str(model_dir),
+                                 trust_remote_code=trust_remote_code,
+                                 use_fast=use_fast)
+
+
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
                                           TokenizerBase]] = None,
                       **kwargs) -> Optional[TokenizerBase]:
@@ -637,6 +666,11 @@ def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
             'use_fast': True,
         }
         default_kwargs.update(kwargs)
+        if (tokenizer := _load_mistral_common_tokenizer(
+                obj,
+                trust_remote_code=default_kwargs['trust_remote_code'],
+                use_fast=default_kwargs['use_fast'])) is not None:
+            return tokenizer
         return TransformersTokenizer.from_pretrained(obj, **default_kwargs)
     elif isinstance(obj, TokenizerBase):
         return obj
@@ -754,9 +788,17 @@ def load_hf_tokenizer(model_dir: str,
 
     Returns:
         A TransformersTokenizer object if the tokenizer is loaded successfully.
+        A directory that ships tekken.json and no tokenizer.json loads as
+        MistralTokenizer, a TransformersTokenizer subclass.
     '''
 
     _ensure_gpt2_bytes_to_unicode_compat()
+
+    if (tokenizer :=
+            _load_mistral_common_tokenizer(model_dir,
+                                           trust_remote_code=trust_remote_code,
+                                           use_fast=use_fast)) is not None:
+        return tokenizer
 
     try:
         tokenizer = TransformersTokenizer.from_pretrained(

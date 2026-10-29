@@ -427,7 +427,8 @@ def get_kv_cache_manager_cls(
                 "QSA sparse attention currently requires a hybrid Mamba / "
                 "linear-attention model.")
         return get_sparse_attn_kv_cache_manager(sparse_attn_config,
-                                                use_kv_cache_manager_v2=use_v2)
+                                                use_kv_cache_manager_v2=use_v2,
+                                                pretrained_config=config)
     else:
         return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 

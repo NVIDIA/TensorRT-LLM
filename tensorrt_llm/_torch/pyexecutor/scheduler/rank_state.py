@@ -24,6 +24,10 @@ class RankIterStatsPayload:
     kv_used_blocks: int = -1
     kv_total_blocks: int = -1
     kv_load_timestamp_ns: int = 0
+    has_specdec_stats: int = 0
+    num_draft_tokens: int = 0
+    num_accepted_tokens: int = 0
+    num_requests_with_draft_tokens: int = 0
 
     def serialize(self, include_kv_cache_load: bool = False) -> list[int]:
         """Serialize to a flat list for allgather transport."""
@@ -46,12 +50,23 @@ class RankIterStatsPayload:
                     self.kv_load_timestamp_ns,
                 ]
             )
+        values.extend(
+            [
+                self.has_specdec_stats,
+                self.num_draft_tokens,
+                self.num_accepted_tokens,
+                self.num_requests_with_draft_tokens,
+            ]
+        )
         return values
 
     @classmethod
     def deserialize(cls, data: list[int]) -> RankIterStatsPayload:
         """Deserialize a flat payload, filling omitted trailing defaults."""
         values = list(data)
+        if len(values) == 13:
+            # The compact form omits the three KV-load fields before spec stats.
+            values[9:9] = [-1, -1, 0]
         payload_fields = fields(cls)
         if len(values) > len(payload_fields):
             raise ValueError(
@@ -115,10 +130,15 @@ class RankState:
                 rank_values.append(field_info.default_factory())
             else:
                 raise ValueError(f"RankState payload is missing required field {field_info.name}")
-        # The telemetry fields are optional on the wire; forward-work counters
-        # always follow the iteration payload. The full message length identifies
-        # whether telemetry was included in this allgather.
-        stats_field_count = len(fields(RankIterStatsPayload)) if len(values) >= 16 else 9
+        # The compact/full stats payloads have 13/16 fields; forward-work
+        # counters follow them. Also accept the 9/12-field payloads without
+        # spec stats, including legacy messages without forward-work counters.
+        if len(values) in (17, 19):
+            stats_field_count = 13
+        elif len(values) >= 20:
+            stats_field_count = 16
+        else:
+            stats_field_count = 12 if len(values) >= 16 else 9
         stats_end = prefix_field_count + stats_field_count
         return cls(
             rank=rank_values[0],

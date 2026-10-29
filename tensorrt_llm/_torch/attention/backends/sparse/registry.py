@@ -24,7 +24,10 @@ if TYPE_CHECKING:
 def get_sparse_attn_kv_cache_manager(
     sparse_attention_config: "SparseAttentionConfig",
     use_kv_cache_manager_v2: bool = False,
+    pretrained_config=None,
 ) -> type:
+    """``pretrained_config``, when given, lets a model-specific manager be chosen by the
+    checkpoint's config class, which the sparse config does not identify."""
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
     from .deepseek_v4 import DeepseekV4CacheManager
@@ -40,6 +43,15 @@ def get_sparse_attn_kv_cache_manager(
     if sparse_attention_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
+        from tensorrt_llm._torch.configs.mistral_large4 import MistralLarge4Config
+
+        # Mistral-Large-4 (cross-layer KV sharing): owner-only fp8_ds_mla latent pages.
+        if isinstance(pretrained_config, MistralLarge4Config):
+            if not use_kv_cache_manager_v2:
+                raise ValueError("DSA for Mistral-Large-4 requires KV cache manager V2")
+            from .mistral_large4 import MistralLarge4CacheManager
+
+            return MistralLarge4CacheManager
         return DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
     elif sparse_attention_config.algorithm == "deepseek_v4":
         return DeepseekV4CacheManager

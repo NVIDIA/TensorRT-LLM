@@ -18,6 +18,7 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/disaggregated/test_mistral_large4_kv_transfer.py
   # ------------- PyTorch tests ---------------
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py

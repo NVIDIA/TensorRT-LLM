@@ -1,13 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fp4_block_scale_moe_runner catalog entry."""
+"""GPU test for the fp4_block_scale_moe_runner catalog entry.
 
-import zlib
+The entry's other cases come first; the Mistral Large 4 NVFP4 tep4 section
+(H 6144 / I 6144, top-4 of 128 experts, 32-wide windows, operands at the
+checkpoint's magnitudes, 1..32768 tokens) follows them, then the dep4 section
+(the same windows over the four ranks' gathered tokens, up to 131072), the tp4
+and tp8 section (all 128 experts on every rank, each cut to its 1536- or
+768-wide slice of the intermediate, 1..32768 tokens), the dep8 section (16-wide
+windows over the eight ranks' gathered tokens, in calls of at most 32768), and
+the tep8 section (the same windows, every rank over all of a step's 1..32768
+tokens, decode graphs on windows (0, 16) and (112, 16)) closes the file.
+"""
+
+import math
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner as moe,
 )
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -58,8 +69,13 @@ E4M3_MAX = 448.0  # largest finite e4m3 magnitude
 # ── NVFP4 arithmetic (pure torch) ─────────────────────────────────────────
 
 
-def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
-    """16 ulp per element against the row's own scale, 2 ulp relative RMS.
+def _compare(
+    out: torch.Tensor, ref: torch.Tensor, elt_ulp: float = 16.0, rms_ulp: float | None = 2.0
+) -> None:
+    """16 ulp per element against the row's own scale (`elt_ulp`, which the
+    Mistral Large 4 cells scale with the FC2 contraction width, below), 2 ulp
+    relative RMS (`rms_ulp`; None gates the element figure alone, which the
+    Mistral Large 4 decode graph replays pass -- see the decode paragraphs).
 
     Kernel and reference consume bit-identical NVFP4 weights and activations
     and model the same FC1-output requantization, so they differ only in
@@ -93,17 +109,154 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     any of them reaches is 39.8 at the deepseek geometries; at qwen4_exp's the
     same five land 223, 62, 265, 362 and 23 RMS ulp out, the last the closest
     any wrong variant comes.
+
+    Mistral Large 4 tep4 (H = I = 6144, 32 of 128 experts, top-4, operands at the
+    checkpoint's magnitudes and per-expert global scales folded into the
+    reference's fp32 block scales) adds nothing the band has to absorb: its
+    cells land at 2.38 elt / 0.903 rms over the decode graphs and 6.89-11.28
+    elt / 0.727-0.781 rms at 32768 tokens. At 32768 tokens the element figure
+    is a max over 201M elements: re-drawn over 56 fresh seeds there (layers 1,
+    3, 45, 65 and 71, two of them with every slot in one window) it reached
+    14.86, near this gate, while the RMS figure stayed at or below 0.792. Read
+    the RMS gate. `test_sw_wrong_variants_land_outside_the_gate` measures the
+    wrong readings a Mistral Large 4 loader could make: every one lands outside
+    the RMS gate, all but one by more than 20 ulp.
+
+    Mistral Large 4 dep4 (the same windows over up to 131072 gathered tokens, so
+    an element figure over 805M elements) adds nothing either: its cells land
+    at 9.34-12.97 elt / 0.731-0.780 rms at 131072 tokens and 1.50-7.47 elt /
+    0.700-0.808 rms over the decode graphs at 4..64. Re-drawn over 132 fresh
+    seeds at 131072 tokens (80 uniform over the four windows, 26 with every
+    slot in one window, 26 under the padding skew) the element figure reached
+    16.31 once -- past this gate on a correct kernel, as R1's 16.33 at its own
+    top -- and at most 14.73 on the other 131, while the RMS figure stayed at
+    or below 0.790. The cells' seeds are fixed; read the RMS gate.
+
+    Mistral Large 4 tp4 cuts every expert to a 1536-wide slice of its
+    intermediate, so FC2 contracts over 1536 terms instead of 6144, and the
+    element figure grows while the RMS figure does not. The element tail is a
+    marginal FC1-output value rounding to the neighbouring e2m1 code in one
+    of kernel and reference: it moves an output element by one W2 term,
+    while the row it is divided by is a sum over the contraction, so at a
+    quarter of the width the same flip reads up to sqrt(6144 / 1536) = 2
+    times larger (2 when one slot carries the token's weight, 1 when four
+    slots carry a quarter each). Measured under one draw protocol at 32768
+    tokens (layers 1, 3, 45, 65 and 71, fresh seeds): at I 1536 over all 128
+    experts, 180 draws, element median 14.15, p90 18.82, max 25.42 -- 52 of
+    them past 16, 2 past 24, none past 32; at I 6144 over 32-wide windows,
+    90 draws, median 9.33, p90 12.11, max 14.85 -- a ratio of 1.5-1.7. The
+    RMS figure stayed at or below 0.800 and 0.798. So the Mistral Large 4 drivers
+    gate elements at 16 * sqrt(6144 / I) ulp (`_ml4_elt_ulp`): 16 at the
+    whole width, as before for tep4 and dep4, and 32 at tp4's slice; the
+    four slices summed are gated against the whole-width layer at 16. The
+    RMS gate stays 2 everywhere. `test_sw_tp4_wrong_variants_land_outside_the_gate`
+    measures the wrong readings at the slice: all land at 115 element ulp or
+    more but one, the layer-45 scalar-role swap (25.1 elt, inside the element
+    band, and 3.56 rms, outside the RMS gate), as at tep4.
+
+    Mistral Large 4 tep8 (16-wide windows, every rank over all T tokens, so a
+    window carries an eighth of the slots) adds nothing either: its cells
+    land at 1.08-1.97 elt / 0.702-0.766 rms over the decode counts and
+    7.20-10.50 elt / 0.732-0.783 rms at 32768 tokens, and the eight windows'
+    partials summed at 9.93 / 0.875 in fp32 and 10.09 / 0.974 as a bf16
+    running sum. Re-drawn over 48 fresh seeds at 32768 tokens (40 uniform
+    over the eight windows, 8 with every slot in one window) the element
+    figure reached 14.59 (median 9.10) and the RMS figure 0.805. Rank 7's
+    decode graphs on window (112, 16) land at 0.98-6.43 elt / 0.708-1.453
+    rms.
+
+    At decode counts a 16-wide window has few live rows (1..13), and there
+    the RMS figure is a small-sample one. Re-drawn over 5120 fresh steps
+    (1..16 tokens, 40 per count at each of the eight windows) it passed
+    this gate on 31, at most 4.30 (median 0.72), every one with 1..9 live
+    rows, at seven of the eight windows, window 0 among them (window 112's
+    640 reached 1.99); the element figure stayed at or below 8.44. The
+    kernel is not what moves: against an fp64 twin of `reference` the same
+    steps land the same (32 past 2 ulp), the fp32 and fp64 references
+    differ by 3.55 rms on one step, and the FC1 output read out of the
+    kernel on all 5120 (an identity down projection and
+    `do_finalize=False`, as `test_intermediate_is_nvfp4_requantized` reads
+    it) departs from the fp64 requantization only where a value sits within
+    5.24e-5 relative of a rounding midpoint -- 992 e2m1 codes and 400 e4m3
+    block scales, each the neighbour of the fp64 choice, over 161323008
+    elements. One such flip on one of a few live rows is what crosses: the
+    tep8 decode cell's own step at T=4 on sm_103 (one live row) lands at
+    6.99 elt / 4.98 rms, its FC1 output read out of the kernel differing from
+    the reference's in one e2m1 code of 6144, 4.94e-7 relative from the
+    midpoint, and the reference's FC2 over the kernel's own FC1 output lands
+    at 1.40 / 0.740. So the decode graph replays (`_ml4_replay`) gate the
+    element figure alone and print the RMS one.
+
+    Mistral Large 4 dep8 (16-wide windows over a call of at most 32768 of the
+    eight ranks' gathered tokens, so a window carries an eighth of the
+    slots) adds nothing either: its cells land at 1.57-5.76 elt /
+    0.694-0.982 rms over the decode graphs at 8..128 on windows (0, 16) and
+    (112, 16), 3.80 / 0.789 at 128 tokens and 7.62-9.41 elt / 0.733-0.785
+    rms at 32768 tokens (the padding chunk, one live row, at 1.21 / 0.732),
+    and the eight windows' partials sum at 9.97 / 0.866 in fp32 and 9.97 /
+    0.966 as a bf16 running sum. Re-drawn over 36 fresh seeds at 32768
+    tokens (32 uniform over the eight windows, 4 with every slot in one
+    window) the element figure reached 12.31 and the RMS figure 0.799. At
+    decode counts a 16-wide window has few live rows (1..73 of 8..128
+    gathered tokens), where the RMS figure is a small-sample one: re-drawn
+    over 2560 fresh steps (20 per count at each of the eight windows) it
+    reached 1.98 (median 0.73) on a correct kernel, though none crossed this
+    gate, while the element figure stayed at or below 10.27. The decode
+    graph replays gate the element figure alone, as at tep8.
+
+    Mistral Large 4 tp8 cuts every expert to a 768-wide slice of its
+    intermediate, so FC2 contracts over 768 terms instead of 6144, and the
+    element figure grows while the RMS figure does not. The element tail is a
+    marginal FC1-output value rounding to the neighbouring e2m1 code in one
+    of kernel and reference: it moves an output element by one W2 term,
+    while the row it is divided by is a sum over the contraction, so at an
+    eighth of the width the same flip reads up to sqrt(6144 / 768) = 2.83
+    times larger. Measured under one draw protocol at 32768 tokens (layers
+    1, 3, 45, 65 and 71 in turn, fresh seeds, every sixth draw with all four
+    slots on experts 124..127): at I 768 over all 128 experts, 180 draws,
+    element median 17.12, p90 23.54, p99 31.11, max 35.56 -- 110 of them
+    past 16, 14 past 24, 1 past 32, none past 40; at I 6144 over 32-wide
+    windows, 90 draws, median 9.33, p90 12.11, max 14.85 -- a ratio of
+    1.8-2.4. The RMS figure stayed at or below 0.833 and 0.798. So the
+    Mistral Large 4 drivers gate elements at 16 * sqrt(6144 / I) ulp
+    (`_ml4_elt_ulp`): 16 at the whole width, as before for tep4 and dep4, and
+    45.25 at tp8's slice; the eight slices summed are gated against the
+    whole-width layer at 16. The RMS gate stays 2 everywhere.
+    `test_sw_tp8_wrong_variants_land_outside_the_gate` measures the wrong
+    readings at the slice: all land at 120 element ulp or more but one, the
+    layer-45 scalar-role swap (34.5 elt, inside the element band, and 3.95
+    rms, outside the RMS gate), as at tep4.
+
+    At tp8 decode every token is live on every rank, so a step of T tokens
+    gates T rows of 4 x 768 FC1 outputs each, and the RMS figure is a
+    small-sample one: one FC1 output rounded to the neighbouring e2m1 code
+    (or one block to the neighbouring e4m3 scale) moves the whole call's
+    figure. Measured over fresh decode draws (layers 1 and 45, T 1..16, 160
+    seeds each, one generator seed per draw, the cold fallback eager; a
+    replay is bitwise the eager call): the RMS figure exceeds 2 on 21 of
+    5120 (7 past 3, max 7.05, a single flipped element at T 3) while the
+    element figure stays at or below 22.61. Against an fp64 twin of the
+    reference the same 21 exceed it, and the fp32 and fp64 references differ
+    from each other by at most 1.56 rms. Read out of the kernel through an
+    identity down projection, every FC1-output difference from the fp64
+    requantization is an adjacent rounding at a midpoint -- 676 e2m1 codes
+    within 6.5e-5 relative and 352 e4m3 block scales within 2.0e-5, of
+    134M elements, none non-adjacent -- and the 4205 draws with no such
+    difference stay at or below 0.767 rms. So the 2 ulp RMS gate is not a
+    bound for a correct kernel at decode counts at this width, nor at tep8's
+    16-wide windows: the decode graph replays gate the element figure alone.
     """
     assert out.dtype == ref.dtype == torch.bfloat16, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
     ulp = 2.0**-8
     row = ref.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
-    torch.testing.assert_close(out.float() / row, ref.float() / row, rtol=0.0, atol=16 * ulp)
+    torch.testing.assert_close(out.float() / row, ref.float() / row, rtol=0.0, atol=elt_ulp * ulp)
     rel_rms = (
         (out.float() - ref.float()).pow(2).mean().sqrt()
         / ref.float().pow(2).mean().sqrt().clamp_min(1e-9)
     ).item() / ulp
-    assert rel_rms <= 2.0, f"relative RMS {rel_rms:.2f} ulp > 2 ulp"
+    if rms_ulp is not None:
+        assert rel_rms <= rms_ulp, f"relative RMS {rel_rms:.2f} ulp > {rms_ulp:g} ulp"
 
 
 def _e2m1_rne(a: torch.Tensor) -> torch.Tensor:
@@ -568,12 +721,13 @@ def _many_experts():
 
 
 # The token column swept at that geometry. The pre-routed path picks its
-# permutation kernel by row count: `BlockKernelMaxNumTokens` takes 4 rows and
-# below, the dynamic-block kernel is out of reach here because
-# `DynBlockKernelMaxNumExperts` is 256, and `MaxNumTokensSingleCluster` carries
-# everything from 5 rows up to 8192 (all three in
-# `cpp/tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingCustomPolicy.cuh`). So
-# the column brackets the 4/5 boundary as well as the decode and prefill ends.
+# permutation kernel by row count (`runPostTopKPipeline` in
+# `cpp/tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingFromTopKIds.cu`): the
+# static-block kernel takes 4 rows and below, the dynamic-block one 5..12 rows
+# (it reaches 1024 experts on this path, so 512 is inside it), and the
+# single-cluster one everything from 13 rows up to 8192 -- read back from the
+# launched kernels at 512 experts / top-10 on sm_103. So the column brackets
+# the 4/5 boundary as well as the decode and prefill ends.
 _MANY_TOKENS = (1, 2, 3, 4, 5, 8, 16, 64, 256, 1024, 4096, 8192)
 
 
@@ -596,14 +750,29 @@ def _renorm_routing(num_tokens, num_experts, top_k, gen):
 def test_layout_helpers_match():
     """The trtllm preprocessing ops reproduce the pure-torch layout exactly.
 
-    The last two scale shapes are the DeepSeek-R1 routed geometry's, at
+    The middle two scale shapes are the DeepSeek-R1 routed geometry's, at
     H = 7168 / I = 2048: FC1 `[E, 2*I, H/16] = [E, 4096, 448]` and FC2
-    `[E, H, I/16] = [E, 7168, 128]`. Both satisfy the swizzle's `M % 128 == 0`
-    and `C % 4 == 0`, so `block_scale_interleave` returns exactly `E*M*C` bytes
-    and reshapes back — no padding enters either operand at this geometry.
+    `[E, H, I/16] = [E, 7168, 128]`; the next two are Mistral Large 4's, at
+    H = I = 6144: FC1 `[E, 12288, 384]` and FC2 `[E, 6144, 384]`; the next two
+    are Mistral Large 4 tp4's 1536-wide slice: FC1 `[E, 3072, 384]` and FC2
+    `[E, 6144, 96]`; the last two tp8's 768-wide slice: FC1 `[E, 1536, 384]`
+    and FC2 `[E, 6144, 48]`. All satisfy the swizzle's `M % 128 == 0` and `C % 4 == 0`,
+    so `block_scale_interleave` returns exactly `E*M*C` bytes and reshapes
+    back — no padding enters either operand at these geometries.
     """
     gen = torch.Generator(device=DEV).manual_seed(201)
-    for rows, cols in ((256, 12), (4096, 448), (7168, 128)):
+    shapes = (
+        (256, 12),
+        (4096, 448),
+        (7168, 128),
+        (12288, 384),
+        (6144, 384),
+        (3072, 384),
+        (6144, 96),
+        (1536, 384),
+        (6144, 48),
+    )
+    for rows, cols in shapes:
         x = torch.randint(0, 256, (4, rows, cols), dtype=torch.uint8, device=DEV, generator=gen)
         perm = _fc1_perm(rows)
         for e in range(x.shape[0]):
@@ -2294,6 +2463,1906 @@ def test_strided_inputs_are_silently_wrong():
     print("  test_strided_inputs_are_silently_wrong OK")
 
 
+# ── Mistral Large 4 tep4 routed experts, at the checkpoint's magnitudes ───────
+
+# Read off the Mistral-Large-4-1T-A52B-NVFP4 checkpoint, every routed expert of
+# layers 1..71: per layer, `input_scale` is one value for all 128 experts and
+# the same for w1 and w3; `weight_scale_2` is per expert, the same for w1 and
+# w3. The layers kept are the extremes the cells drive: 1 and 45 hold the
+# largest and smallest FC2 global scale (1 / input_scale(w2): 6898.53 and
+# 1.36898), 3 and 65 the largest and smallest input global scale
+# (1 / input_scale(w1): 9039.45 and 23.0112), and 71 is the last layer.
+_ML4_INPUT_SCALES = {  # layer: (input_scale of w1 and w3, input_scale of w2)
+    1: (2.2411346e-04, 1.449585e-04),
+    3: (1.1062622e-04, 4.4822693e-04),
+    45: (1.0864258e-02, 7.3046875e-01),
+    65: (4.345703e-02, 1.5136719e-01),
+    71: (2.0751953e-02, 2.6953125e-01),
+}
+# `weight_scale_2` extremes over all 9088 routed experts: w1 (== w3) and w2.
+_ML4_WS13 = (1.7620268e-05, 1.6348703e-04)
+_ML4_WS2 = (1.7438617e-05, 3.226144e-04)
+# Block scales are drawn as e4m3 bytes, uniformly. Weights: 8..448 (the
+# checkpoint's expert block scales read 12..448). Activations: the whole
+# non-negative e4m3 range -- 0, the subnormals, through 448, where a static
+# input global scale saturates a live activation past its calibrated amax.
+_ML4_WEIGHT_SF_BYTES = (80, 126)
+_ML4_ACT_SF_BYTES = (0, 126)
+_ML4_HIDDEN = _ML4_INTER = 6144
+_ML4_LOCAL = 32
+_ML4_LOCAL16 = 16
+
+
+def _ml4_elt_ulp(spec) -> float:
+    """The element band of a Mistral Large 4 cell: 16 ulp at an expert's whole
+    width 6144, scaled by sqrt(6144 / I) at a width slice I -- 32 at tp4's
+    1536, 45.25 at tp8's 768. The derivation and the measurements are in
+    `_compare`."""
+    return 16.0 * math.sqrt(_ML4_INTER / spec["intermediate"])
+
+
+_ML4_STACK = None
+_ML4_STACK16 = None
+
+
+def _ml4_build_stack(local: int, seed: int):
+    """`local` whole experts at the checkpoint's magnitudes: kernel-ready, and
+    as reference operands.
+
+    Local experts 0 and 1 carry the checkpoint's smallest and largest w1/w3
+    `weight_scale_2`, `local - 1` and `local - 2` its smallest and largest w2
+    one, the rest are log-uniform between. The reference operands fold each
+    expert's global scale into fp32 block scales.
+    """
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    lo, hi = _ML4_WEIGHT_SF_BYTES
+
+    def stack(n, k):
+        codes = torch.randint(0, 16, (local, n, k), dtype=torch.uint8, device=DEV, generator=gen)
+        sf = torch.randint(
+            lo, hi + 1, (local, n, k // SV), dtype=torch.uint8, device=DEV, generator=gen
+        ).view(torch.float8_e4m3fn)
+        return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous(), sf, codes
+
+    def global_scales(smallest, largest):
+        v = torch.empty(local, dtype=torch.float64, device=DEV)
+        v.uniform_(math.log(smallest), math.log(largest), generator=gen)
+        v = v.exp().float()
+        v[0], v[1] = smallest, largest
+        return v
+
+    up_p, up_s, up_c = stack(_ML4_INTER, _ML4_HIDDEN)
+    gt_p, gt_s, gt_c = stack(_ML4_INTER, _ML4_HIDDEN)
+    dn_p, dn_s, dn_c = stack(_ML4_HIDDEN, _ML4_INTER)
+    ws13 = global_scales(*_ML4_WS13)
+    ws2 = global_scales(*_ML4_WS2).flip(0).contiguous()
+    w1, s1 = _prep_fc1(up_p, gt_p, up_s, gt_s)
+    w2, s2 = _prep_fc2(dn_p, dn_s)
+
+    def fold(sf, ws):
+        return sf.float() * ws.view(-1, 1, 1)
+
+    return dict(
+        gemm1_weights=w1,
+        gemm1_weights_scale=s1,
+        gemm2_weights=w2,
+        gemm2_weights_scale=s2,
+        ws13=ws13,
+        ws2=ws2,
+        up=(up_c, fold(up_s, ws13)),
+        gate=(gt_c, fold(gt_s, ws13)),
+        down=(dn_c, fold(dn_s, ws2)),
+        raw=(up_p, gt_p, up_s, gt_s, dn_p, dn_s),
+    )
+
+
+def _ml4_stack():
+    """The 32 experts one tep4 rank holds (dep4's too). Every rank's window
+    holds this one stack -- the offset only names which global ids it answers
+    for. ~8 GiB, built once."""
+    global _ML4_STACK
+    if _ML4_STACK is None:
+        _ML4_STACK = _ml4_build_stack(_ML4_LOCAL, seed=61446144)
+    return _ML4_STACK
+
+
+def _ml4_stack16():
+    """The 16 experts one dep8 rank holds, every rank's window alike. ~4 GiB,
+    built once."""
+    global _ML4_STACK16
+    if _ML4_STACK16 is None:
+        _ML4_STACK16 = _ml4_build_stack(_ML4_LOCAL16, seed=61441616)
+    return _ML4_STACK16
+
+
+def _ml4_scalars(layer: int, ws13: torch.Tensor, ws2: torch.Tensor):
+    """The three per-local-expert scalars, computed in fp32 the way a loader does.
+
+    `output1_scale_gate_scalar = input_scale(w1) * weight_scale_2(w1)`
+    dequantizes the FC1 accumulator; `output1_scale_scalar` divides that by
+    `input_scale(w2)`, applying the FC2 input's global scale to the linear
+    half; `output2_scale_scalar = input_scale(w2) * weight_scale_2(w2)`
+    dequantizes the FC2 accumulator. Returned in the op's argument order.
+    """
+    isc1, isc2 = (
+        torch.tensor(v, dtype=torch.float32, device=DEV) for v in _ML4_INPUT_SCALES[layer]
+    )
+    gate = isc1 * ws13
+    return (gate / isc2).contiguous(), gate.contiguous(), (isc2 * ws2).contiguous()
+
+
+def _ml4_activation(tokens: int, layer: int, gen: torch.Generator):
+    """NVFP4 hidden states in the layout `fp4_quantize(x, 1 / input_scale(w1),
+    16, False, False)` returns, and their exact fp32 value."""
+    codes = torch.randint(
+        0, 16, (tokens, _ML4_HIDDEN), dtype=torch.uint8, device=DEV, generator=gen
+    )
+    lo, hi = _ML4_ACT_SF_BYTES
+    sf = torch.randint(
+        lo, hi + 1, (tokens, _ML4_HIDDEN // SV), dtype=torch.uint8, device=DEV, generator=gen
+    )
+    data = (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous()
+    scale = sf.view(torch.float8_e4m3fn).float().repeat_interleave(SV, dim=1)
+    x = E2M1[codes.long()] * scale * _ML4_INPUT_SCALES[layer][0]
+    return data, sf.reshape(-1).view(torch.float8_e4m3fn).contiguous(), x
+
+
+def _ml4_routing(spec, tokens: int, gen: torch.Generator, far: int = 0):
+    """Pre-routed ids and bf16 weights, the way renorm_moe_routing_op emits them.
+
+    Top-k of the logits, softmax over those k. Token 0 always has a slot in
+    the window, so no call is vacuously all-zero. With `far`, slot 0 of every
+    token is one of the window's last `far` experts, in turn (tep4: local 29,
+    30, 31). With `skew="one_window"` every slot of every token lands in the
+    window: its last expert on every token (tep4: local 31, tep8 and dep8:
+    15), three distinct others drawn from the rest of it. With
+    `skew="top_experts"` every token's slots are the window's last `top_k`
+    experts, in an order drawn per token.
+    """
+    num_experts, top_k = spec["num_experts"], spec["top_k"]
+    off, local = spec["local_expert_offset"], spec["local_num_experts"]
+    if spec.get("skew") == "top_experts":
+        order = torch.rand(tokens, top_k, device=DEV, generator=gen).argsort(dim=1)
+        weights = torch.softmax(torch.randn(tokens, top_k, device=DEV, generator=gen), dim=-1)
+        ids = off + local - top_k + order
+        return ids.to(torch.int32).contiguous(), weights.to(torch.bfloat16).contiguous()
+    if spec.get("skew") == "one_window":
+        rest = torch.rand(tokens, local - 1, device=DEV, generator=gen).argsort(dim=1)
+        ids = torch.cat(
+            [
+                torch.full((tokens, 1), local - 1, device=DEV, dtype=torch.long),
+                rest[:, : top_k - 1],
+            ],
+            dim=1,
+        )
+        weights = torch.softmax(torch.randn(tokens, top_k, device=DEV, generator=gen), dim=-1)
+        return (ids + off).to(torch.int32).contiguous(), weights.to(torch.bfloat16).contiguous()
+    logits = torch.randn(tokens, num_experts, device=DEV, generator=gen)
+    force = torch.zeros_like(logits)
+    rows = torch.arange(tokens, device=DEV)
+    if far:
+        force[rows, off + local - far + rows % far] = 1e4
+    else:
+        force[0, off + 7] = 1e4
+    ids = torch.topk(logits + force, top_k, dim=-1).indices
+    weights = torch.softmax(logits.gather(1, ids), dim=-1)
+    return ids.to(torch.int32).contiguous(), weights.to(torch.bfloat16).contiguous()
+
+
+def _ml4_padding_rows(spec, tokens: int) -> torch.Tensor:
+    """Which of the gathered rows are padding, for `spec["rank_tokens"]`: each
+    rank's live rows lead its `T_max = max(rank_tokens)` gathered rows, and the
+    rest of them are padding. With `chunk`, the call is that `tokens`-row slice
+    of the gathered rows (dep8 issues them in chunks); without, all of them
+    (dep4's one call)."""
+    rank_tokens = spec["rank_tokens"]
+    t_max = max(rank_tokens)
+    gathered = len(rank_tokens) * t_max
+    pad = torch.ones(gathered, dtype=torch.bool, device=DEV)
+    for rank, live in enumerate(rank_tokens):
+        pad[rank * t_max : rank * t_max + live] = False
+    lo = spec.get("chunk", 0) * tokens
+    whole = lo + tokens <= gathered if "chunk" in spec else tokens == gathered
+    assert whole, (tokens, rank_tokens, spec.get("chunk"))
+    return pad[lo : lo + tokens]
+
+
+def _ml4_pad(args, ref, pad: torch.Tensor):
+    """Padding rows as the dep4 target hands them to the op: `fp4_quantize` of
+    an all-zero row -- every code and every block scale 0, read back from that
+    op -- routed the way renorm_moe_routing_op routes the all-+0.0 logits the
+    router makes of it, to experts 0..top_k-1 at 1/top_k each."""
+    tokens, top_k = args["topk_ids"].shape
+    rows = pad.unsqueeze(1)
+    scale = args["hidden_states_scale"].view(torch.uint8).view(tokens, -1).masked_fill(rows, 0)
+    ids = torch.where(rows, torch.arange(top_k, dtype=torch.int32, device=DEV), args["topk_ids"])
+    weights = torch.where(
+        rows,
+        torch.tensor(1.0 / top_k, dtype=torch.bfloat16, device=DEV),
+        args["topk_weights"],
+    )
+    args = dict(
+        args,
+        hidden_states=args["hidden_states"].masked_fill(rows, 0),
+        hidden_states_scale=scale.reshape(-1).view(torch.float8_e4m3fn),
+        topk_ids=ids.contiguous(),
+        topk_weights=weights.contiguous(),
+    )
+    ref = dict(
+        ref,
+        hidden_states=ref["hidden_states"].masked_fill(rows, 0.0),
+        topk_ids=args["topk_ids"],
+        topk_weights=args["topk_weights"],
+    )
+    return args, ref
+
+
+def _ml4_stack_for(spec):
+    """The expert stack a Mistral Large 4 cell's geometry names: tep4's (and dep4's)
+    32 whole experts, tep8's and dep8's 16, or tp4's and tp8's 128 experts at
+    their 1536- and 768-wide slices."""
+    geometry = (spec["hidden"], spec["intermediate"], spec["local_num_experts"])
+    if geometry == (_ML4_HIDDEN, _ML4_INTER, _ML4_LOCAL):
+        return _ml4_stack()
+    if geometry == (_ML4_HIDDEN, _ML4_INTER, _ML4_LOCAL16):
+        return _ml4_stack16()
+    assert geometry in (
+        (_ML4_HIDDEN, _ML4_TP4_INTER, _ML4_TP4_LOCAL),
+        (_ML4_HIDDEN, _ML4_TP8_INTER, _ML4_TP8_LOCAL),
+    ), spec
+    return _ml4_width_stack(spec["intermediate"])
+
+
+def _ml4_args(spec, tokens: int, seed: int, far: int = 0):
+    """One Mistral Large 4 call (tep4, dep4 over gathered tokens, tep8 on a 16-wide
+    window, dep8 on one over a chunk of the gathered tokens, or tp4 or tp8 on
+    one width slice): the op's arguments and `reference`'s. With `skew="padded_zero_rows"` the rows `rank_tokens`
+    leaves to padding are zero rows, routed as dep4 and dep8 route them."""
+    st = _ml4_stack_for(spec)
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    data, sf, x = _ml4_activation(tokens, spec["layer"], gen)
+    ids, wts = _ml4_routing(spec, tokens, gen, far=far)
+    s1, sg, s2 = _ml4_scalars(spec["layer"], st["ws13"], st["ws2"])
+    args = dict(
+        routing_logits=None,
+        routing_bias=None,
+        hidden_states=data,
+        hidden_states_scale=sf,
+        gemm1_weights=st["gemm1_weights"],
+        gemm1_weights_scale=st["gemm1_weights_scale"],
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=st["gemm2_weights"],
+        gemm2_weights_scale=st["gemm2_weights_scale"],
+        gemm2_bias=None,
+        output1_scale_scalar=s1,
+        output1_scale_gate_scalar=sg,
+        output2_scale_scalar=s2,
+        num_experts=spec["num_experts"],
+        top_k=spec["top_k"],
+        n_group=None,
+        topk_group=None,
+        intermediate_size=spec["intermediate"],
+        local_expert_offset=spec["local_expert_offset"],
+        local_num_experts=spec["local_num_experts"],
+        routed_scaling_factor=None,
+        routing_method_type=1,
+        do_finalize=True,
+        act_type=0,
+        topk_weights=wts,
+        topk_ids=ids,
+        tune_max_num_tokens=spec["tune_max_num_tokens"],
+    )
+    ref = dict(
+        hidden_states=x,
+        topk_ids=ids,
+        topk_weights=wts,
+        up=st["up"],
+        gate=st["gate"],
+        down=st["down"],
+        fc2_global_scale=1.0 / _ML4_INPUT_SCALES[spec["layer"]][1],
+        local_expert_offset=spec["local_expert_offset"],
+        local_num_experts=spec["local_num_experts"],
+    )
+    if spec.get("skew") == "padded_zero_rows":
+        args, ref = _ml4_pad(args, ref, _ml4_padding_rows(spec, tokens))
+    return args, ref
+
+
+#: The arguments that change every step; the rest is weights and configuration.
+_ML4_PER_STEP = ("hidden_states", "hidden_states_scale", "topk_ids", "topk_weights")
+
+
+def _ml4_prefix(args, ref, m: int):
+    """The same call on its first `m` tokens, every operand contiguous."""
+    a = dict(
+        args,
+        hidden_states=args["hidden_states"][:m],
+        hidden_states_scale=args["hidden_states_scale"][: m * _ML4_HIDDEN // SV],
+        topk_ids=args["topk_ids"][:m],
+        topk_weights=args["topk_weights"][:m],
+    )
+    r = dict(
+        ref,
+        hidden_states=ref["hidden_states"][:m],
+        topk_ids=ref["topk_ids"][:m],
+        topk_weights=ref["topk_weights"][:m],
+    )
+    return a, r
+
+
+#: Tokens per slice of the reference. A token's row depends on that token
+#: alone; in one piece, the fp32 reference of 131072 gathered tokens with every
+#: slot in one window took 30.7 GiB beyond its operands.
+_ML4_REF_TOKENS = 65536
+
+
+def _ml4_reference(ref) -> torch.Tensor:
+    """The entry's `reference`, cross-checked bitwise against this file's
+    `_ref_moe` on the same inputs, rounded to bf16 for the gate -- over slices
+    of `_ML4_REF_TOKENS` tokens, which bounds its memory."""
+    tokens = ref["hidden_states"].shape[0]
+    rows = []
+    for start in range(0, tokens, _ML4_REF_TOKENS):
+        part = dict(ref)
+        for name in ("hidden_states", "topk_ids", "topk_weights"):
+            part[name] = ref[name][start : start + _ML4_REF_TOKENS]
+        entry_ref = moe.reference(**part)
+        local_ref = _ref_moe(
+            part["hidden_states"],
+            part["topk_ids"],
+            part["topk_weights"],
+            part,
+            part["fc2_global_scale"],
+            offset=part["local_expert_offset"],
+            num_local=part["local_num_experts"],
+        )
+        torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
+        rows.append(entry_ref.to(torch.bfloat16))
+        del entry_ref, local_ref
+    return torch.cat(rows)
+
+
+def _ml4_assert_window(out: torch.Tensor, args) -> None:
+    """A token with no slot in the window is bitwise zero; some token has one."""
+    local = args["topk_ids"].long() - args["local_expert_offset"]
+    live = ((local >= 0) & (local < args["local_num_experts"])).any(dim=-1)
+    assert bool(live.any()), "no token has a slot in the window: the call checks nothing"
+    assert bool((out[~live] == 0).all()), "a token with no slot in the window must be zero"
+
+
+def _ml4_replay(spec, tokens: int, seed: int) -> None:
+    """Capture one call, replay it on new tokens and new routing: bitwise the
+    eager call on that data, which is gated against `reference` on the element
+    figure (a decode step has few live rows; `_compare` has why).
+
+    At a non-zero window the new routing holds slots both inside the window
+    and outside it, and the same data at offset 0 lands far outside the gate,
+    so a graph that kept window 0's offset would fail here."""
+    static, _ = _ml4_args(spec, tokens, seed)
+    fresh, fresh_ref = _ml4_args(spec, tokens, seed + 7919)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        moe(**static)  # the runner and its kernels' modules, before capture
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = moe(**static)[0]
+    for name in _ML4_PER_STEP:
+        static[name].copy_(fresh[name])
+    graph.replay()
+    eager = moe(**fresh)[0]
+    assert torch.equal(captured, eager), f"T={tokens}: graph replay differs from eager"
+    ref = _ml4_reference(fresh_ref)
+    elt, rms = _dev(eager, ref)
+    print(f"  graph T={tokens}: {elt:.2f} elt / {rms:.3f} rms ulp")
+    _compare(eager, ref, _ml4_elt_ulp(spec), rms_ulp=None)
+    _ml4_assert_window(eager, fresh)
+    off = spec["local_expert_offset"]
+    if off:
+        local = fresh["topk_ids"].long() - off
+        inside = int(((local >= 0) & (local < spec["local_num_experts"])).sum())
+        assert 0 < inside < local.numel(), f"T={tokens}: {inside} of {local.numel()} slots inside"
+        _, far = _dev(moe(**dict(fresh, local_expert_offset=0))[0], ref)
+        print(f"    {inside} of {local.numel()} slots inside; at offset 0: {far:.1f} rms ulp")
+        assert far > 20.0, f"T={tokens}: offset 0 is only {far:.2f} rms ulp from offset {off}"
+
+
+def _ml4_counts(spec) -> tuple:
+    """The token counts a cell drives: `sweep`, or every count of the inclusive
+    `sweep_range` and then `sweep_also`, or `tokens` alone."""
+    if "sweep_range" in spec:
+        lo, hi = spec["sweep_range"]
+        return (*range(lo, hi + 1), *spec["sweep_also"])
+    return spec.get("sweep", (spec["tokens"],))
+
+
+def _ml4_sweep(spec, seed: int) -> None:
+    """The largest count gated against `reference`; every smaller count bitwise
+    the leading rows of that call, so each is gated too."""
+    counts = _ml4_counts(spec)
+    assert len(set(counts)) == len(counts), "a count is driven twice"
+    top = max(counts)
+    assert top == spec["tokens"], (top, spec["tokens"])
+    args, ref = _ml4_args(spec, top, seed)
+    if spec.get("skew") == "one_window":
+        rows = torch.bincount(
+            args["topk_ids"].flatten().long() - spec["local_expert_offset"],
+            minlength=spec["local_num_experts"],
+        )
+        assert (
+            rows.numel() == spec["local_num_experts"] and int(rows.sum()) == top * spec["top_k"]
+        ), rows
+        assert int(rows.max()) == top, f"no local expert carries all {top} tokens: {rows.max()}"
+    if spec.get("skew") == "top_experts":
+        last = spec["local_expert_offset"] + spec["local_num_experts"]
+        rows = torch.bincount(args["topk_ids"].flatten().long(), minlength=spec["num_experts"])
+        tail = rows[last - spec["top_k"] : last]
+        assert bool((tail == top).all()) and int(rows.sum() - tail.sum()) == 0, tail
+    pad = None
+    if spec.get("skew") == "padded_zero_rows":
+        pad = _ml4_padding_rows(spec, top)
+        rows = torch.bincount(args["topk_ids"].flatten().long(), minlength=spec["num_experts"])
+        assert int(rows[: spec["top_k"]].min()) >= int(pad.sum()) > 0, (int(pad.sum()), rows[:4])
+    full = moe(**args)[0]
+    assert full.shape == (top, spec["hidden"]) and full.dtype == torch.bfloat16, full.shape
+    exp = _ml4_reference(ref)
+    elt, rms = _dev(full, exp)
+    print(f"  T={top}: {elt:.2f} elt / {rms:.3f} rms ulp; {len(counts)} counts")
+    _compare(full, exp, _ml4_elt_ulp(spec))
+    _ml4_assert_window(full, args)
+    if pad is not None:
+        assert bool((full[pad].view(torch.int16) == 0).all()), "a padding row is not +0.0"
+    differ = [
+        m
+        for m in counts
+        if m < top and not torch.equal(moe(**_ml4_prefix(args, ref, m)[0])[0], full[:m])
+    ]
+    assert not differ, f"token counts whose rows differ from the {top}-token call: {differ}"
+
+
+# The Mistral Large 4 tep4 call the tests below drive, at window (0, 32).
+_ML4_SPEC = next(c.spec for c in moe.CELLS if c.spec.get("layer") == 1 and "graph" in c.spec)
+
+_BLOCK_ROUTING, _DYN_ROUTING = "routingIndicesBlockKernel<", "routingIndicesDynBlockKernel<"
+_CLUSTER_ROUTING, _COOP_ROUTING = "routingIndicesClusterKernel<", "routingIndicesCoopKernel<"
+_SCALAR_FIN, _VECTOR_FIN = "finalizeKernel<", "finalizeKernelVecLoad<"
+
+#: (tokens, routing kernel, token tile of both GEMMs, finalize kernel) the
+#: Mistral Large 4 tep4 call launches on the cold path, at each side of every
+#: switch the sweep cell's token counts claim to straddle. The tile is
+#: `nextPowerOfTwo(int(T * top_k / local_num_experts))` clamped to 8..256.
+_ML4_KERNELS = (
+    (1, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (4, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (5, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (12, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (13, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (49, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (50, _CLUSTER_ROUTING, 8, _VECTOR_FIN),
+    (71, _CLUSTER_ROUTING, 8, _VECTOR_FIN),
+    (72, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (135, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (136, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (263, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (264, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (519, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (520, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (1031, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (1032, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8192, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8193, _COOP_ROUTING, 256, _VECTOR_FIN),
+    (32768, _COOP_ROUTING, 256, _VECTOR_FIN),
+)
+
+
+def test_sw_kernels_by_token_count():
+    """The switches the Mistral Large 4 sweep cell straddles are where it says:
+    read back from the kernels each call launches, on the cold path."""
+    from torch.profiler import ProfilerActivity, profile
+
+    args, ref = _ml4_args(_ML4_SPEC, 32768, seed=5)
+    for tokens, routing, tile, finalize in _ML4_KERNELS:
+        call = _ml4_prefix(args, ref, tokens)[0]
+        moe(**call)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            moe(**call)
+            torch.cuda.synchronize()
+        names = [e.name for e in prof.events() if str(e.device_type) == "DeviceType.CUDA"]
+        gemms = [n for n in names if n.startswith("bmm_")]
+        assert len(gemms) == 2 and all(f"_t128x{tile}x" in n for n in gemms), (tokens, gemms)
+        for want in (routing, finalize):
+            assert any(want in n for n in names), (tokens, want, names)
+    print(f"  test_sw_kernels_by_token_count OK ({len(_ML4_KERNELS)} token counts)")
+
+
+#: The token counts whose every valid tactic is driven: each decode count the
+#: graphs capture, and each autotuner bucket above it (powers of two to 8192,
+#: then `tune_max_num_tokens` 32768, which carries 8193..32768).
+_ML4_TACTIC_TOKENS = (*range(1, 17), 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 32768)
+
+
+def test_sw_every_valid_tactic_passes_the_gate():
+    """What lets the cold cells certify the tuned path an engine warms up.
+
+    The engine profiles this op at warm-up and keeps one tactic per token
+    bucket; every call in the cells runs the cold fallback. So each tactic the
+    op's own tunable runner offers at each count is run here: one whose bits
+    equal the fallback's is certified by the cells, and one whose bits do not
+    is gated against `reference` itself.
+    """
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    spec = _ML4_SPEC
+    summary = []
+    for tokens in _ML4_TACTIC_TOKENS:
+        args, ref = _ml4_args(spec, tokens, seed=300 + tokens)
+        base = moe(**args)[0]
+        runner = FP4BlockScaleMoERunner(
+            spec["num_experts"],
+            spec["top_k"],
+            None,
+            None,
+            spec["intermediate"],
+            spec["local_expert_offset"],
+            spec["local_num_experts"],
+            None,
+            1,
+            True,
+            0,
+            tune_max_num_tokens=spec["tune_max_num_tokens"],
+        )
+        inputs = [args[k] for k in ("routing_logits", "routing_bias", "hidden_states")] + [
+            args[k]
+            for k in (
+                "hidden_states_scale",
+                "gemm1_weights",
+                "gemm1_weights_scale",
+                "gemm1_bias",
+                "gemm1_alpha",
+                "gemm1_beta",
+                "gemm1_clamp_limit",
+                "gemm2_weights",
+                "gemm2_weights_scale",
+                "gemm2_bias",
+                "output1_scale_scalar",
+                "output1_scale_gate_scalar",
+                "output2_scale_scalar",
+                "topk_weights",
+                "topk_ids",
+            )
+        ]
+        valid = runner.get_runner().get_valid_configs(
+            spec["top_k"], spec["hidden"], spec["intermediate"], spec["local_num_experts"], tokens
+        )
+        assert len({t[0] for t in valid}) > 1, f"T={tokens}: one tile only, {valid}"
+        exp = None
+        worst = (0.0, 0.0)
+        differ = []
+        for tactic in valid:
+            y = runner.forward(inputs, list(tactic))[0]
+            if torch.equal(y, base):
+                continue
+            differ.append(tuple(tactic))
+            if exp is None:
+                exp = _ml4_reference(ref)
+                _compare(base, exp)
+            _compare(y, exp)
+            worst = tuple(max(a, b) for a, b in zip(worst, _dev(y, exp)))
+        summary.append((tokens, len(valid), len(differ), worst))
+        if differ:
+            print(
+                f"  T={tokens}: {len(differ)} of {len(valid)} tactics differ from the fallback, "
+                f"all inside the gate (worst {worst[0]:.2f} elt / {worst[1]:.3f} rms): {differ}"
+            )
+    bitwise = [t for t, _, d, _ in summary if d == 0]
+    print(
+        "  test_sw_every_valid_tactic_passes_the_gate OK ("
+        + ", ".join(f"T={t}: {n}" for t, n, _, _ in summary)
+        + f" valid tactics; every tactic bitwise the fallback at T in {bitwise})"
+    )
+
+
+def test_sw_experts_past_2_31_elements_give_the_same_bits_below_it():
+    """FC1 weights of local experts 29..31 start past 2^31 e2m1 elements
+    (75,497,472 per expert); moved to slot 1, each expert's tokens come back
+    bitwise the same."""
+    spec = _ML4_SPEC
+    args, ref = _ml4_args(spec, 64, seed=31, far=3)
+    out = moe(**args)[0]
+    _compare(out, _ml4_reference(ref))
+    per_expert = args["gemm1_weights"][0].numel() * 2
+    assert 28 * per_expert < 2**31 < 29 * per_expert, "experts 29..31 must start past 2^31"
+    ids, off = args["topk_ids"], spec["local_expert_offset"]
+    per_local = (
+        "gemm1_weights",
+        "gemm1_weights_scale",
+        "gemm2_weights",
+        "gemm2_weights_scale",
+        "output1_scale_scalar",
+        "output1_scale_gate_scalar",
+        "output2_scale_scalar",
+    )
+    for far in (29, 30, 31):
+        order = list(range(spec["local_num_experts"]))
+        order[1], order[far] = far, 1
+        index = torch.tensor(order, device=DEV)
+        near_id, far_id = off + 1, off + far
+        swapped = torch.where(ids == far_id, near_id, torch.where(ids == near_id, far_id, ids))
+        moved = dict(args, topk_ids=swapped.to(torch.int32).contiguous())
+        for name in per_local:
+            moved[name] = args[name].index_select(0, index).contiguous()
+        assert bool((ids == far_id).any()), f"no token reaches expert {far}"
+        assert torch.equal(moe(**moved)[0], out), f"expert {far} differs from itself at slot 1"
+        del moved
+        torch.cuda.empty_cache()
+    print("  test_sw_experts_past_2_31_elements_give_the_same_bits_below_it OK")
+
+
+@pytest.mark.parametrize("layer", [1, 45])
+def test_sw_wrong_variants_land_outside_the_gate(layer):
+    """How far the wrong computations a Mistral Large 4 loader could make land from
+    the result the gate accepts, at 1024 tokens over window (0, 32).
+
+    Every one lands outside the 2 ulp RMS gate, and all but one more than ten
+    times outside it. The exception is real, not a blind spot: swapping the two
+    `output1_*` scalars moves the FC2 input's global scale from the linear half
+    onto the gate's SiLU argument, and at layer 45 that scale is 1.36898 -- the
+    two readings differ by that factor inside a SiLU only, and land 4.10 rms
+    ulp apart. At layer 1 (6898.53) the same swap is 183.86 rms ulp out.
+    """
+    spec = dict(_ML4_SPEC, layer=layer)
+    args, ref = _ml4_args(spec, 1024, seed=4242 + layer)
+    y = moe(**args)[0]
+    exp = _ml4_reference(ref)
+    _compare(y, exp)
+    st = _ml4_stack()
+    scalars = ("output1_scale_scalar", "output1_scale_gate_scalar", "output2_scale_scalar")
+    wrong_calls = {
+        "output1 scalar roles swapped": dict(
+            output1_scale_scalar=args["output1_scale_gate_scalar"],
+            output1_scale_gate_scalar=args["output1_scale_scalar"],
+        ),
+        "per-expert scalars of the wrong experts": {
+            k: args[k].flip(0).contiguous() for k in scalars
+        },
+        "w1's weight_scale_2 in output2_scale_scalar": dict(
+            output2_scale_scalar=_ml4_scalars(layer, st["ws13"], st["ws13"])[2]
+        ),
+    }
+    dist = {name: _dev(moe(**dict(args, **kw))[0], exp) for name, kw in wrong_calls.items()}
+    swapped = moe.reference(**dict(ref, up=ref["gate"], gate=ref["up"]))
+    dist["gate/up swapped"] = _dev(y, swapped.to(torch.bfloat16))
+    unquantized = _ref_moe(
+        ref["hidden_states"],
+        ref["topk_ids"],
+        ref["topk_weights"],
+        ref,
+        ref["fc2_global_scale"],
+        quantize_intermediate=False,
+    )
+    dist["no FC1-output requantization"] = _dev(y, unquantized.to(torch.bfloat16))
+    up_p, gt_p, up_s, gt_s, dn_p, dn_s = st["raw"]
+    for name, prep in (("no scale swizzle", "swizzle"), ("no row shuffle", "shuffle")):
+        w1, s1 = _prep_fc1(up_p, gt_p, up_s, gt_s, **{prep: False})
+        w2, s2 = _prep_fc2(dn_p, dn_s, **{prep: False})
+        layout = dict(
+            gemm1_weights=w1, gemm1_weights_scale=s1, gemm2_weights=w2, gemm2_weights_scale=s2
+        )
+        dist[name] = _dev(moe(**dict(args, **layout))[0], exp)
+        del w1, s1, w2, s2, layout
+        torch.cuda.empty_cache()
+    print(f"  layer {layer}: correct {_dev(y, exp)}")
+    for name, (elt, rms) in dist.items():
+        print(f"    {name:44s} {elt:10.3g} elt / {rms:8.2f} rms ulp")
+        assert rms > 2.0, f"{name} is {rms:.2f} rms ulp from the correct result: inside the gate"
+        if not (layer == 45 and name == "output1 scalar roles swapped"):
+            assert rms > 20.0, f"{name} is only {rms:.2f} rms ulp from the correct result"
+
+
+# ── Mistral Large 4 dep4: the same windows over the four ranks' gathered tokens ─
+
+
+def _ml4_dep4_cell(skew: str):
+    """The dep4 cell (`tune_max_num_tokens` 131072) with this `skew`."""
+    return next(
+        c
+        for c in moe.CELLS
+        if c.spec.get("tune_max_num_tokens") == 131072 and c.spec.get("skew") == skew
+    )
+
+
+_ML4_DEP4_ONE_WINDOW = _ml4_dep4_cell("one_window")
+_ML4_DEP4_PADDED = _ml4_dep4_cell("padded_zero_rows")
+# Window (0, 32), layer 1, 131072 gathered tokens, routed uniformly.
+_ML4_DEP4_UNIFORM = {k: v for k, v in _ML4_DEP4_ONE_WINDOW.spec.items() if k != "skew"}
+
+#: Gathered token counts the dep4 kernel test reads back under uniform routing.
+_ML4_DEP4_KERNEL_TOKENS = (8193, 32768, 32769, 65536, 131072)
+
+
+def test_sw_dep4_kernels_by_token_count():
+    """From 8193 to 131072 gathered tokens the call launches the same kernels
+    -- the expert-count init and the cooperative routing kernel, both GEMMs at
+    token tile 256, the vector-load finalize -- under uniform routing at each
+    count, and at 131072 with every slot in one window and under the padding
+    skew. So the sweep cell's counts sit on one kernel set."""
+    from torch.profiler import ProfilerActivity, profile
+
+    args, ref = _ml4_args(_ML4_DEP4_UNIFORM, 131072, seed=7)
+    calls = [(f"uniform T={m}", _ml4_prefix(args, ref, m)[0]) for m in _ML4_DEP4_KERNEL_TOKENS]
+    del ref
+    for cell in (_ML4_DEP4_ONE_WINDOW, _ML4_DEP4_PADDED):
+        calls.append((cell.spec["skew"], _ml4_args(cell.spec, 131072, seed=7)[0]))
+    for name, call in calls:
+        moe(**call)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            moe(**call)
+            torch.cuda.synchronize()
+        names = [e.name for e in prof.events() if str(e.device_type) == "DeviceType.CUDA"]
+        gemms = [n for n in names if n.startswith("bmm_")]
+        assert len(gemms) == 2 and all("_t128x256x" in n for n in gemms), (name, gemms)
+        for want in ("routingInitExpertCounts<", _COOP_ROUTING, _VECTOR_FIN):
+            assert any(want in n for n in names), (name, want, names)
+    print(f"  test_sw_dep4_kernels_by_token_count OK ({len(calls)} calls)")
+
+
+def test_sw_dep4_every_valid_tactic_passes_the_gate():
+    """The tuned path at dep4. With `tune_max_num_tokens` 131072 the tuner
+    profiles 8193..131072 as one bucket at 131072 and keeps one tactic for
+    all of it. Every valid tactic is run at 8193, 65537 and 131072 gathered
+    tokens under uniform routing, and at 131072 with every slot in one window
+    and under the padding skew: one whose bits equal the fallback's is
+    certified by the cells, and one whose bits do not is gated against
+    `reference` itself."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    uniform, uniform_ref = _ml4_args(_ML4_DEP4_UNIFORM, 131072, seed=9)
+    calls = [
+        (f"uniform T={m}", *_ml4_prefix(uniform, uniform_ref, m)) for m in (8193, 65537, 131072)
+    ]
+    for cell in (_ML4_DEP4_ONE_WINDOW, _ML4_DEP4_PADDED):
+        calls.append((cell.spec["skew"], *_ml4_args(cell.spec, 131072, seed=9)))
+    spec = _ML4_DEP4_UNIFORM
+    runner = FP4BlockScaleMoERunner(
+        spec["num_experts"],
+        spec["top_k"],
+        None,
+        None,
+        spec["intermediate"],
+        spec["local_expert_offset"],
+        spec["local_num_experts"],
+        None,
+        1,
+        True,
+        0,
+        tune_max_num_tokens=spec["tune_max_num_tokens"],
+    )
+    names = ("routing_logits", "routing_bias", "hidden_states", "hidden_states_scale")
+    names += ("gemm1_weights", "gemm1_weights_scale", "gemm1_bias", "gemm1_alpha", "gemm1_beta")
+    names += ("gemm1_clamp_limit", "gemm2_weights", "gemm2_weights_scale", "gemm2_bias")
+    names += ("output1_scale_scalar", "output1_scale_gate_scalar", "output2_scale_scalar")
+    names += ("topk_weights", "topk_ids")
+    summary = []
+    for name, args, ref in calls:
+        tokens = args["hidden_states"].shape[0]
+        base = moe(**args)[0]
+        inputs = [args[k] for k in names]
+        valid = runner.get_runner().get_valid_configs(
+            spec["top_k"], spec["hidden"], spec["intermediate"], spec["local_num_experts"], tokens
+        )
+        assert len({t[0] for t in valid}) > 1, f"{name}: one tile only, {valid}"
+        exp = None
+        differ = []
+        for tactic in valid:
+            y = runner.forward(inputs, list(tactic))[0]
+            if torch.equal(y, base):
+                continue
+            differ.append(tuple(tactic))
+            if exp is None:
+                exp = _ml4_reference(ref)
+                _compare(base, exp)
+            _compare(y, exp)
+        summary.append(f"{name}: {len(valid)} valid, {len(differ)} differ {differ}")
+    print("  test_sw_dep4_every_valid_tactic_passes_the_gate OK (" + "; ".join(summary) + ")")
+
+
+def test_sw_dep4_four_windows_sum_to_the_layer():
+    """The four ranks' calls over one gathered token set answer every slot
+    exactly once: their partials, summed, pass the gate against the summed
+    window references -- in fp32, and as a bf16 running sum in rank order.
+    Leaving one window out, or running window (0, 32) in place of (32, 32),
+    lands far outside it. Gathered layout: ranks at 2048, 700, 1 and 1
+    tokens, so 8192 rows, 5442 of them padding."""
+    spec = dict(_ML4_DEP4_PADDED.spec, tokens=8192, rank_tokens=(2048, 700, 1, 1))
+    args, ref = _ml4_args(spec, 8192, seed=11)
+    offsets = (0, 32, 64, 96)
+    ids = args["topk_ids"]
+    slots = [int(((ids >= o) & (ids < o + spec["local_num_experts"])).sum()) for o in offsets]
+    assert sum(slots) == ids.numel() and min(slots) > 0, slots
+    outs = [moe(**dict(args, local_expert_offset=o))[0] for o in offsets]
+    want = sum(moe.reference(**dict(ref, local_expert_offset=o)) for o in offsets)
+    want = want.to(torch.bfloat16)
+    summed = sum(y.float() for y in outs).to(torch.bfloat16)
+    running = ((outs[0] + outs[1]) + outs[2]) + outs[3]
+    for name, y in (("fp32 sum", summed), ("bf16 running sum", running)):
+        elt, rms = _dev(y, want)
+        print(f"  four windows, {name}: {elt:.2f} elt / {rms:.3f} rms ulp")
+        _compare(y, want)
+    wrong = {
+        "window (96, 32) left out": outs[:3],
+        "window (0, 32) in place of (32, 32)": (outs[0], outs[0], outs[2], outs[3]),
+    }
+    for name, partials in wrong.items():
+        y = sum(p.float() for p in partials)
+        elt, rms = _dev(y.to(torch.bfloat16), want)
+        print(f"    {name}: {elt:.3g} elt / {rms:.2f} rms ulp")
+        assert rms > 20.0, f"{name} is only {rms:.2f} rms ulp from the summed layer"
+
+
+def test_sw_dep4_one_window_rows_cross_2_31():
+    """The one-window dep4 cell's own draw puts per-slot FC2 rows past both
+    2^31 marks of the op's bf16 FC2 buffer -- row 174763, where a row's byte
+    offset passes 2^31, and row 349526, where its element offset does -- read
+    back from the op's expanded-slot -> row map (`do_finalize=False`).
+    Gathered and weighted in torch they equal the finalized output bitwise, so
+    the cell's gate reads rows past both marks."""
+    cell = _ML4_DEP4_ONE_WINDOW
+    spec = cell.spec
+    args, _ = _ml4_args(spec, spec["tokens"], cell.seed_base() % 2**31)
+    out = moe(**args)[0]
+    rows, _, slot_rows = moe(**dict(args, do_finalize=False))
+    byte_mark = 2**31 // (2 * spec["hidden"]) + 1
+    elt_mark = 2**31 // spec["hidden"] + 1
+    past_bytes = int((slot_rows >= byte_mark).sum())
+    past_elts = int((slot_rows >= elt_mark).sum())
+    print(
+        f"  {tuple(rows.shape)} per-slot rows; slot rows up to {int(slot_rows.max())}: "
+        f"{past_bytes} at or past {byte_mark}, {past_elts} at or past {elt_mark}"
+    )
+    assert past_elts > 0 and past_bytes > past_elts, (past_bytes, past_elts)
+    finalized = torch.zeros(out.shape, dtype=torch.float32, device=DEV)
+    weights = args["topk_weights"].float()
+    for j in range(spec["top_k"]):
+        finalized += rows[slot_rows[:, j].long()].float() * weights[:, j].unsqueeze(1)
+    assert torch.equal(finalized.to(torch.bfloat16), out), (
+        "the per-slot rows, gathered and weighted, differ from the finalized output"
+    )
+
+
+# ── Mistral Large 4 tp4 and tp8: all 128 experts on every rank, each cut along its width ─
+
+# moe_expert_parallel_size 1: every rank holds all 128 experts of a layer, each cut to its
+# slice of the intermediate -- 6144 / 4 at tp4 (moe_tensor_parallel_size 4), 6144 / 8 at tp8.
+_ML4_WIDTH_LOCAL = 128
+_ML4_TP4_INTER = 1536
+_ML4_TP4_LOCAL = _ML4_WIDTH_LOCAL
+_ML4_TP8_INTER = 768
+_ML4_TP8_LOCAL = _ML4_WIDTH_LOCAL
+
+
+#: Rank 0's width slice of each width drawn so far, with its reference operands.
+_ML4_WIDTH_STACKS = {}
+
+
+def _ml4_width_global_scales(inter: int):
+    """The width-sliced layer's per-expert `weight_scale_2`, (w1 == w3, w2),
+    fp32 [128].
+
+    Unsplit, so every width slice carries the same values. Experts 0 and 1
+    hold the checkpoint's smallest and largest w1/w3 one, 127 and 126 its
+    smallest and largest w2 one, the rest are log-uniform between. The seed
+    names the two widths, 6144 and the slice's `inter`.
+    """
+    gen = torch.Generator(device=DEV).manual_seed(int(f"{_ML4_INTER}{inter}"))
+
+    def draw(smallest, largest):
+        v = torch.empty(_ML4_WIDTH_LOCAL, dtype=torch.float64, device=DEV)
+        v.uniform_(math.log(smallest), math.log(largest), generator=gen)
+        v = v.exp().float()
+        v[0], v[1] = smallest, largest
+        return v
+
+    return draw(*_ML4_WS13), draw(*_ML4_WS2).flip(0).contiguous()
+
+
+def _unpack_codes(packed: torch.Tensor) -> torch.Tensor:
+    """One e2m1 code per byte, from two per byte (the even element in the low nibble)."""
+    return torch.stack([packed & 0x0F, packed >> 4], dim=-1).flatten(-2)
+
+
+def _ml4_fold(sf: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
+    """e4m3 block scales `[E, M, C]` with each expert's global scale folded in, fp32."""
+    return sf.float() * ws.view(-1, 1, 1)
+
+
+def _ml4_width_slice(inter: int, rank: int, reference: bool = True):
+    """Rank `rank`'s slice, `inter` wide, of a width-sliced layer's 128 experts.
+
+    The layer is drawn one slice at a time, slice r from its own seed, so a
+    whole expert is its slices side by side: w1 and w3 output rows
+    [inter*r, inter*(r + 1)) are slice r's FC1 rows, and w2 input columns
+    [inter*r, inter*(r + 1)) -- bytes [inter*r/2, ...), block-scale columns
+    [inter*r/16, ...) -- its FC2 columns. The layout is applied to the slice,
+    as the tp8 loader applies it: at tp8's 768, FC1 [128, 1536, 3072] u8 and
+    its scales [128, 1536, 384], FC2 [128, 6144, 384] u8 and its scales
+    [128, 6144, 48]. Codes and block scales are drawn as in tep4's stack.
+    `raw` keeps the packed codes and e4m3 scales; with `reference`, the
+    reference operands (one code per byte, each expert's global scale folded
+    into fp32 block scales) come too. ~4.3 GiB with them at 768, ~2 GiB
+    without.
+    """
+    gen = torch.Generator(device=DEV).manual_seed(int(f"{inter}{_ML4_INTER}") + rank)
+    lo, hi = _ML4_WEIGHT_SF_BYTES
+
+    def stack(n, k):
+        codes = torch.randint(
+            0, 16, (_ML4_WIDTH_LOCAL, n, k), dtype=torch.uint8, device=DEV, generator=gen
+        )
+        sf = torch.randint(
+            lo, hi + 1, (_ML4_WIDTH_LOCAL, n, k // SV), dtype=torch.uint8, device=DEV, generator=gen
+        ).view(torch.float8_e4m3fn)
+        return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous(), sf
+
+    up_p, up_s = stack(inter, _ML4_HIDDEN)
+    gt_p, gt_s = stack(inter, _ML4_HIDDEN)
+    dn_p, dn_s = stack(_ML4_HIDDEN, inter)
+    ws13, ws2 = _ml4_width_global_scales(inter)
+    w1, s1 = _prep_fc1(up_p, gt_p, up_s, gt_s)
+    w2, s2 = _prep_fc2(dn_p, dn_s)
+    st = dict(
+        gemm1_weights=w1,
+        gemm1_weights_scale=s1,
+        gemm2_weights=w2,
+        gemm2_weights_scale=s2,
+        ws13=ws13,
+        ws2=ws2,
+        raw=(up_p, gt_p, up_s, gt_s, dn_p, dn_s),
+    )
+    if reference:
+        st.update(
+            up=(_unpack_codes(up_p), _ml4_fold(up_s, ws13)),
+            gate=(_unpack_codes(gt_p), _ml4_fold(gt_s, ws13)),
+            down=(_unpack_codes(dn_p), _ml4_fold(dn_s, ws2)),
+        )
+    return st
+
+
+def _ml4_width_stack(inter: int):
+    """Rank 0's slice at width `inter`, with its reference operands; built once."""
+    if inter not in _ML4_WIDTH_STACKS:
+        _ML4_WIDTH_STACKS[inter] = _ml4_width_slice(inter, 0)
+    return _ML4_WIDTH_STACKS[inter]
+
+
+#: Experts per piece of the whole-width reference: at I 6144 one piece of 16
+#: experts is 1.8 GiB of codes, one per byte.
+_ML4_WIDTH_REF_EXPERTS = 16
+
+
+def _cat_e4m3(scales, dim: int) -> torch.Tensor:
+    return torch.cat([s.view(torch.uint8) for s in scales], dim=dim).view(torch.float8_e4m3fn)
+
+
+def _ml4_whole_width_reference(ref, raws, ws13, ws2) -> torch.Tensor:
+    """The entry's `reference` over whole experts (I 6144), fp32.
+
+    Each expert's slices are put back side by side in rank order -- w1 and w3
+    codes and block scales by rows, w2 codes and block scales by columns --
+    and the reference runs over windows of `_ML4_WIDTH_REF_EXPERTS` experts,
+    its own expert-parallel split, whose outputs are summed.
+    """
+    out = None
+    for e0 in range(0, _ML4_WIDTH_LOCAL, _ML4_WIDTH_REF_EXPERTS):
+        e = slice(e0, e0 + _ML4_WIDTH_REF_EXPERTS)
+        up = (
+            torch.cat([_unpack_codes(r[0][e]) for r in raws], dim=1),
+            _ml4_fold(_cat_e4m3([r[2][e] for r in raws], dim=1), ws13[e]),
+        )
+        gate = (
+            torch.cat([_unpack_codes(r[1][e]) for r in raws], dim=1),
+            _ml4_fold(_cat_e4m3([r[3][e] for r in raws], dim=1), ws13[e]),
+        )
+        down = (
+            torch.cat([_unpack_codes(r[4][e]) for r in raws], dim=2),
+            _ml4_fold(_cat_e4m3([r[5][e] for r in raws], dim=2), ws2[e]),
+        )
+        assert up[0].shape[1:] == down[0].shape[1:] == (_ML4_HIDDEN, _ML4_INTER), up[0].shape
+        part = moe.reference(
+            **dict(
+                ref,
+                up=up,
+                gate=gate,
+                down=down,
+                local_expert_offset=e0,
+                local_num_experts=_ML4_WIDTH_REF_EXPERTS,
+            )
+        )
+        out = part if out is None else out.add_(part)
+        del up, gate, down, part
+    return out
+
+
+_ML4_WIDTH_LAYOUT = ("gemm1_weights", "gemm1_weights_scale", "gemm2_weights", "gemm2_weights_scale")
+
+
+def _ml4_width_slices(spec, seed: int) -> None:
+    """The ranks' calls over one token set, each on its own width slice of the
+    same 128 experts with the same scalars, sum to the whole-width layer:
+    their partials, summed in fp32 and as a bf16 running sum in rank order,
+    pass the gate against the entry's `reference` over the whole experts
+    (I 6144). Leaving the last slice out, or running slice 0 in place of
+    slice 1, lands far outside it."""
+    tokens, slices, inter = spec["tokens"], spec["width_slices"], spec["intermediate"]
+    assert slices * inter == _ML4_INTER, spec
+    args, ref = _ml4_args(spec, tokens, seed)
+    st = _ml4_stack_for(spec)
+    outs, raws = [moe(**args)[0]], [st["raw"]]
+    for rank in range(1, slices):
+        other = _ml4_width_slice(inter, rank, reference=False)
+        outs.append(moe(**dict(args, **{k: other[k] for k in _ML4_WIDTH_LAYOUT}))[0])
+        raws.append(other["raw"])
+        del other
+    want = _ml4_whole_width_reference(ref, raws, st["ws13"], st["ws2"]).to(torch.bfloat16)
+    del raws
+    summed = sum(y.float() for y in outs).to(torch.bfloat16)
+    running = outs[0]
+    for y in outs[1:]:
+        running = running + y
+    for name, y in (("fp32 sum", summed), ("bf16 running sum", running)):
+        elt, rms = _dev(y, want)
+        print(f"  {slices} width slices at T={tokens}, {name}: {elt:.2f} elt / {rms:.3f} rms ulp")
+        _compare(y, want)  # the whole-width layer: the I 6144 band
+    wrong = {
+        f"slice {slices - 1} left out": outs[:-1],
+        "slice 0 run in place of slice 1": (outs[0], outs[0], *outs[2:]),
+    }
+    for name, partials in wrong.items():
+        y = sum(p.float() for p in partials).to(torch.bfloat16)
+        elt, rms = _dev(y, want)
+        print(f"    {name}: {elt:.3g} elt / {rms:.2f} rms ulp")
+        assert rms > 20.0, f"{name} is only {rms:.2f} rms ulp from the whole-width layer"
+
+
+# The Mistral Large 4 tp4 call the tests below drive: all 128 experts at the slice.
+_ML4_TP4_SPEC = next(
+    c.spec for c in moe.CELLS if c.spec.get("intermediate") == _ML4_TP4_INTER and "graph" in c.spec
+)
+
+
+#: (tokens, routing kernel, token tile of both GEMMs, finalize kernel) the
+#: Mistral Large 4 tp4 call launches on the cold path, at each side of every
+#: switch the tp4 sweep cell's token counts claim to straddle. The tile is
+#: `nextPowerOfTwo(int(T * top_k / local_num_experts))` clamped to 8..256,
+#: which at 128 local experts is T / 32.
+_ML4_TP4_KERNELS = (
+    (1, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (4, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (5, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (12, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (13, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (49, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (50, _CLUSTER_ROUTING, 8, _VECTOR_FIN),
+    (287, _CLUSTER_ROUTING, 8, _VECTOR_FIN),
+    (288, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (543, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (544, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (1055, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (1056, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (2079, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (2080, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (4127, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (4128, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8192, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8193, _COOP_ROUTING, 256, _VECTOR_FIN),
+    (32768, _COOP_ROUTING, 256, _VECTOR_FIN),
+)
+
+
+def test_sw_tp4_kernels_by_token_count():
+    """The switches the Mistral Large 4 tp4 sweep cell straddles are where it says:
+    read back from the kernels each call launches, on the cold path."""
+    from torch.profiler import ProfilerActivity, profile
+
+    args, ref = _ml4_args(_ML4_TP4_SPEC, 32768, seed=6)
+    for tokens, routing, tile, finalize in _ML4_TP4_KERNELS:
+        call = _ml4_prefix(args, ref, tokens)[0]
+        moe(**call)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            moe(**call)
+            torch.cuda.synchronize()
+        names = [e.name for e in prof.events() if str(e.device_type) == "DeviceType.CUDA"]
+        gemms = [n for n in names if n.startswith("bmm_")]
+        assert len(gemms) == 2 and all(f"_t128x{tile}x" in n for n in gemms), (tokens, gemms)
+        for want in (routing, finalize):
+            assert any(want in n for n in names), (tokens, want, names)
+    print(f"  test_sw_tp4_kernels_by_token_count OK ({len(_ML4_TP4_KERNELS)} token counts)")
+
+
+_ML4_RUNNER_INPUTS = (
+    "routing_logits",
+    "routing_bias",
+    "hidden_states",
+    "hidden_states_scale",
+    "gemm1_weights",
+    "gemm1_weights_scale",
+    "gemm1_bias",
+    "gemm1_alpha",
+    "gemm1_beta",
+    "gemm1_clamp_limit",
+    "gemm2_weights",
+    "gemm2_weights_scale",
+    "gemm2_bias",
+    "output1_scale_scalar",
+    "output1_scale_gate_scalar",
+    "output2_scale_scalar",
+    "topk_weights",
+    "topk_ids",
+)
+
+
+def test_sw_tp4_every_valid_tactic_passes_the_gate():
+    """The tuned path at tp4: each tactic the op's own tunable runner offers at
+    I 1536 / 128 local experts, run at each decode count the graphs capture and
+    each autotuner bucket above it (`_ML4_TACTIC_TOKENS`). One whose bits equal
+    the fallback's is certified by the cells; one whose bits do not is gated
+    against `reference` itself."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    spec = _ML4_TP4_SPEC
+    band = _ml4_elt_ulp(spec)
+    runner = FP4BlockScaleMoERunner(
+        spec["num_experts"],
+        spec["top_k"],
+        None,
+        None,
+        spec["intermediate"],
+        spec["local_expert_offset"],
+        spec["local_num_experts"],
+        None,
+        1,
+        True,
+        0,
+        tune_max_num_tokens=spec["tune_max_num_tokens"],
+    )
+    summary = []
+    for tokens in _ML4_TACTIC_TOKENS:
+        args, ref = _ml4_args(spec, tokens, seed=1536 + tokens)
+        base = moe(**args)[0]
+        inputs = [args[k] for k in _ML4_RUNNER_INPUTS]
+        valid = runner.get_runner().get_valid_configs(
+            spec["top_k"], spec["hidden"], spec["intermediate"], spec["local_num_experts"], tokens
+        )
+        assert len({t[0] for t in valid}) > 1, f"T={tokens}: one tile only, {valid}"
+        exp = None
+        worst = (0.0, 0.0)
+        differ = []
+        for tactic in valid:
+            y = runner.forward(inputs, list(tactic))[0]
+            if torch.equal(y, base):
+                continue
+            differ.append(tuple(tactic))
+            if exp is None:
+                exp = _ml4_reference(ref)
+                _compare(base, exp, band)
+            _compare(y, exp, band)
+            worst = tuple(max(a, b) for a, b in zip(worst, _dev(y, exp)))
+        summary.append((tokens, len(valid), len(differ)))
+        if differ:
+            print(
+                f"  T={tokens}: {len(differ)} of {len(valid)} tactics differ from the fallback, "
+                f"all inside the gate (worst {worst[0]:.2f} elt / {worst[1]:.3f} rms): {differ}"
+            )
+    bitwise = [t for t, _, d in summary if d == 0]
+    print(
+        "  test_sw_tp4_every_valid_tactic_passes_the_gate OK ("
+        + ", ".join(f"T={t}: {n}" for t, n, _ in summary)
+        + f" valid tactics; every tactic bitwise the fallback at T in {bitwise})"
+    )
+
+
+def test_sw_tp4_experts_past_2_31_elements_give_the_same_bits_below_it():
+    """FC1 codes of local expert e start at e2m1 element e * 2I * H, 18,874,368
+    per expert at I 1536: expert 113 straddles 2^31, 114..127 start past it.
+    Moved to slot 1, each of those 15 experts' tokens come back bitwise the
+    same."""
+    spec = _ML4_TP4_SPEC
+    far = 15
+    args, ref = _ml4_args(spec, 64, seed=113, far=far)
+    out = moe(**args)[0]
+    _compare(out, _ml4_reference(ref), _ml4_elt_ulp(spec))
+    per_expert = args["gemm1_weights"][0].numel() * 2
+    first = spec["local_num_experts"] - far
+    assert first * per_expert < 2**31 < (first + 1) * per_expert, "expert 113 must straddle 2^31"
+    ids, off = args["topk_ids"], spec["local_expert_offset"]
+    per_local = _ML4_WIDTH_LAYOUT + (
+        "output1_scale_scalar",
+        "output1_scale_gate_scalar",
+        "output2_scale_scalar",
+    )
+    for far_e in range(first, spec["local_num_experts"]):
+        order = list(range(spec["local_num_experts"]))
+        order[1], order[far_e] = far_e, 1
+        index = torch.tensor(order, device=DEV)
+        near_id, far_id = off + 1, off + far_e
+        swapped = torch.where(ids == far_id, near_id, torch.where(ids == near_id, far_id, ids))
+        moved = dict(args, topk_ids=swapped.to(torch.int32).contiguous())
+        for name in per_local:
+            moved[name] = args[name].index_select(0, index).contiguous()
+        assert bool((ids == far_id).any()), f"no token reaches expert {far_e}"
+        assert torch.equal(moe(**moved)[0], out), f"expert {far_e} differs from itself at slot 1"
+        del moved
+    torch.cuda.empty_cache()
+    print(
+        f"  test_sw_tp4_experts_past_2_31_elements_give_the_same_bits_below_it OK ({far} experts)"
+    )
+
+
+@pytest.mark.parametrize("layer", [1, 45])
+def test_sw_tp4_wrong_variants_land_outside_the_gate(layer):
+    """How far the wrong computations a tp4 loader could make land from the
+    result the gate accepts, at 1024 tokens over all 128 experts at the
+    1536-wide slice: the tep4 test's readings, and the slice's own -- w2 codes,
+    w2 block scales or w1/w3 block scales taken from the neighbouring rank's
+    slice of the same experts."""
+    spec = dict(_ML4_TP4_SPEC, layer=layer)
+    args, ref = _ml4_args(spec, 1024, seed=1536 + layer)
+    y = moe(**args)[0]
+    exp = _ml4_reference(ref)
+    _compare(y, exp, _ml4_elt_ulp(spec))
+    st = _ml4_width_stack(_ML4_TP4_INTER)
+    scalars = ("output1_scale_scalar", "output1_scale_gate_scalar", "output2_scale_scalar")
+    neighbour = _ml4_width_slice(_ML4_TP4_INTER, 1, reference=False)
+    wrong_calls = {
+        "output1 scalar roles swapped": dict(
+            output1_scale_scalar=args["output1_scale_gate_scalar"],
+            output1_scale_gate_scalar=args["output1_scale_scalar"],
+        ),
+        "per-expert scalars of the wrong experts": {
+            k: args[k].flip(0).contiguous() for k in scalars
+        },
+        "w1's weight_scale_2 in output2_scale_scalar": dict(
+            output2_scale_scalar=_ml4_scalars(layer, st["ws13"], st["ws13"])[2]
+        ),
+        "w2 codes of the neighbouring slice": dict(gemm2_weights=neighbour["gemm2_weights"]),
+        "w2 block scales of the neighbouring slice": dict(
+            gemm2_weights_scale=neighbour["gemm2_weights_scale"]
+        ),
+        "w1/w3 block scales of the neighbouring slice": dict(
+            gemm1_weights_scale=neighbour["gemm1_weights_scale"]
+        ),
+    }
+    dist = {name: _dev(moe(**dict(args, **kw))[0], exp) for name, kw in wrong_calls.items()}
+    del neighbour, wrong_calls
+    swapped = moe.reference(**dict(ref, up=ref["gate"], gate=ref["up"]))
+    dist["gate/up swapped"] = _dev(y, swapped.to(torch.bfloat16))
+    unquantized = _ref_moe(
+        ref["hidden_states"],
+        ref["topk_ids"],
+        ref["topk_weights"],
+        ref,
+        ref["fc2_global_scale"],
+        quantize_intermediate=False,
+    )
+    dist["no FC1-output requantization"] = _dev(y, unquantized.to(torch.bfloat16))
+    up_p, gt_p, up_s, gt_s, dn_p, dn_s = st["raw"]
+    for name, prep in (("no scale swizzle", "swizzle"), ("no row shuffle", "shuffle")):
+        w1, s1 = _prep_fc1(up_p, gt_p, up_s, gt_s, **{prep: False})
+        w2, s2 = _prep_fc2(dn_p, dn_s, **{prep: False})
+        layout = dict(
+            gemm1_weights=w1, gemm1_weights_scale=s1, gemm2_weights=w2, gemm2_weights_scale=s2
+        )
+        dist[name] = _dev(moe(**dict(args, **layout))[0], exp)
+        del w1, s1, w2, s2, layout
+    torch.cuda.empty_cache()
+    print(f"  layer {layer}: correct {_dev(y, exp)}")
+    for name, (elt, rms) in dist.items():
+        print(f"    {name:44s} {elt:10.3g} elt / {rms:8.2f} rms ulp")
+        assert rms > 2.0, f"{name} is {rms:.2f} rms ulp from the correct result: inside the gate"
+        if not (layer == 45 and name == "output1 scalar roles swapped"):
+            assert rms > 20.0, f"{name} is only {rms:.2f} rms ulp from the correct result"
+
+
+# The Mistral Large 4 tp8 call the tests below drive: all 128 experts at the slice.
+_ML4_TP8_SPEC = next(
+    c.spec for c in moe.CELLS if c.spec.get("intermediate") == _ML4_TP8_INTER and "graph" in c.spec
+)
+
+
+#: (tokens, routing kernel, token tile of both GEMMs, finalize kernel) the
+#: Mistral Large 4 tp8 call launches on the cold path, at each side of every
+#: switch the tp8 sweep cell's token counts claim to straddle. The tile is
+#: `nextPowerOfTwo(int(T * top_k / local_num_experts))` clamped to 8..256,
+#: which at 128 local experts is T / 32.
+_ML4_TP8_KERNELS = (
+    (1, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (4, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (5, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (12, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (13, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (49, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (50, _CLUSTER_ROUTING, 8, _VECTOR_FIN),
+    (287, _CLUSTER_ROUTING, 8, _VECTOR_FIN),
+    (288, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (543, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (544, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (1055, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (1056, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (2079, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (2080, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (4127, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (4128, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8192, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8193, _COOP_ROUTING, 256, _VECTOR_FIN),
+    (32768, _COOP_ROUTING, 256, _VECTOR_FIN),
+)
+
+
+def test_sw_tp8_kernels_by_token_count():
+    """The switches the Mistral Large 4 tp8 sweep cell straddles are where it says:
+    read back from the kernels each call launches, on the cold path."""
+    from torch.profiler import ProfilerActivity, profile
+
+    args, ref = _ml4_args(_ML4_TP8_SPEC, 32768, seed=8)
+    for tokens, routing, tile, finalize in _ML4_TP8_KERNELS:
+        call = _ml4_prefix(args, ref, tokens)[0]
+        moe(**call)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            moe(**call)
+            torch.cuda.synchronize()
+        names = [e.name for e in prof.events() if str(e.device_type) == "DeviceType.CUDA"]
+        gemms = [n for n in names if n.startswith("bmm_")]
+        assert len(gemms) == 2 and all(f"_t128x{tile}x" in n for n in gemms), (tokens, gemms)
+        for want in (routing, finalize):
+            assert any(want in n for n in names), (tokens, want, names)
+    print(f"  test_sw_tp8_kernels_by_token_count OK ({len(_ML4_TP8_KERNELS)} token counts)")
+
+
+def test_sw_tp8_every_valid_tactic_passes_the_gate():
+    """The tuned path at tp8: each tactic the op's own tunable runner offers at
+    I 768 / 128 local experts, run at each decode count the graphs capture and
+    each autotuner bucket above it (`_ML4_TACTIC_TOKENS`). One whose bits equal
+    the fallback's is certified by the cells; one whose bits do not is gated
+    against `reference` itself."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    spec = _ML4_TP8_SPEC
+    band = _ml4_elt_ulp(spec)
+    runner = FP4BlockScaleMoERunner(
+        spec["num_experts"],
+        spec["top_k"],
+        None,
+        None,
+        spec["intermediate"],
+        spec["local_expert_offset"],
+        spec["local_num_experts"],
+        None,
+        1,
+        True,
+        0,
+        tune_max_num_tokens=spec["tune_max_num_tokens"],
+    )
+    summary = []
+    for tokens in _ML4_TACTIC_TOKENS:
+        args, ref = _ml4_args(spec, tokens, seed=768 + tokens)
+        base = moe(**args)[0]
+        inputs = [args[k] for k in _ML4_RUNNER_INPUTS]
+        valid = runner.get_runner().get_valid_configs(
+            spec["top_k"], spec["hidden"], spec["intermediate"], spec["local_num_experts"], tokens
+        )
+        assert len({t[0] for t in valid}) > 1, f"T={tokens}: one tile only, {valid}"
+        exp = None
+        worst = (0.0, 0.0)
+        differ = []
+        for tactic in valid:
+            y = runner.forward(inputs, list(tactic))[0]
+            if torch.equal(y, base):
+                continue
+            differ.append(tuple(tactic))
+            if exp is None:
+                exp = _ml4_reference(ref)
+                _compare(base, exp, band)
+            _compare(y, exp, band)
+            worst = tuple(max(a, b) for a, b in zip(worst, _dev(y, exp)))
+        summary.append((tokens, len(valid), len(differ)))
+        if differ:
+            print(
+                f"  T={tokens}: {len(differ)} of {len(valid)} tactics differ from the fallback, "
+                f"all inside the gate (worst {worst[0]:.2f} elt / {worst[1]:.3f} rms): {differ}"
+            )
+    bitwise = [t for t, _, d in summary if d == 0]
+    print(
+        "  test_sw_tp8_every_valid_tactic_passes_the_gate OK ("
+        + ", ".join(f"T={t}: {n}" for t, n, _ in summary)
+        + f" valid tactics; every tactic bitwise the fallback at T in {bitwise})"
+    )
+
+
+@pytest.mark.parametrize("layer", [1, 45])
+def test_sw_tp8_wrong_variants_land_outside_the_gate(layer):
+    """How far the wrong computations a tp8 loader could make land from the
+    result the gate accepts, at 1024 tokens over all 128 experts at the
+    768-wide slice: the tep4 test's readings, and the slice's own -- w2 codes,
+    w2 block scales or w1/w3 block scales taken from the neighbouring rank's
+    slice of the same experts."""
+    spec = dict(_ML4_TP8_SPEC, layer=layer)
+    args, ref = _ml4_args(spec, 1024, seed=768 + layer)
+    y = moe(**args)[0]
+    exp = _ml4_reference(ref)
+    _compare(y, exp, _ml4_elt_ulp(spec))
+    st = _ml4_stack_for(spec)
+    scalars = ("output1_scale_scalar", "output1_scale_gate_scalar", "output2_scale_scalar")
+    neighbour = _ml4_width_slice(spec["intermediate"], 1, reference=False)
+    wrong_calls = {
+        "output1 scalar roles swapped": dict(
+            output1_scale_scalar=args["output1_scale_gate_scalar"],
+            output1_scale_gate_scalar=args["output1_scale_scalar"],
+        ),
+        "per-expert scalars of the wrong experts": {
+            k: args[k].flip(0).contiguous() for k in scalars
+        },
+        "w1's weight_scale_2 in output2_scale_scalar": dict(
+            output2_scale_scalar=_ml4_scalars(layer, st["ws13"], st["ws13"])[2]
+        ),
+        "w2 codes of the neighbouring slice": dict(gemm2_weights=neighbour["gemm2_weights"]),
+        "w2 block scales of the neighbouring slice": dict(
+            gemm2_weights_scale=neighbour["gemm2_weights_scale"]
+        ),
+        "w1/w3 block scales of the neighbouring slice": dict(
+            gemm1_weights_scale=neighbour["gemm1_weights_scale"]
+        ),
+    }
+    dist = {name: _dev(moe(**dict(args, **kw))[0], exp) for name, kw in wrong_calls.items()}
+    del neighbour, wrong_calls
+    swapped = moe.reference(**dict(ref, up=ref["gate"], gate=ref["up"]))
+    dist["gate/up swapped"] = _dev(y, swapped.to(torch.bfloat16))
+    unquantized = _ref_moe(
+        ref["hidden_states"],
+        ref["topk_ids"],
+        ref["topk_weights"],
+        ref,
+        ref["fc2_global_scale"],
+        quantize_intermediate=False,
+    )
+    dist["no FC1-output requantization"] = _dev(y, unquantized.to(torch.bfloat16))
+    up_p, gt_p, up_s, gt_s, dn_p, dn_s = st["raw"]
+    for name, prep in (("no scale swizzle", "swizzle"), ("no row shuffle", "shuffle")):
+        w1, s1 = _prep_fc1(up_p, gt_p, up_s, gt_s, **{prep: False})
+        w2, s2 = _prep_fc2(dn_p, dn_s, **{prep: False})
+        layout = dict(
+            gemm1_weights=w1, gemm1_weights_scale=s1, gemm2_weights=w2, gemm2_weights_scale=s2
+        )
+        dist[name] = _dev(moe(**dict(args, **layout))[0], exp)
+        del w1, s1, w2, s2, layout
+    torch.cuda.empty_cache()
+    print(f"  layer {layer}: correct {_dev(y, exp)}")
+    for name, (elt, rms) in dist.items():
+        print(f"    {name:44s} {elt:10.3g} elt / {rms:8.2f} rms ulp")
+        assert rms > 2.0, f"{name} is {rms:.2f} rms ulp from the correct result: inside the gate"
+        if not (layer == 45 and name == "output1 scalar roles swapped"):
+            assert rms > 20.0, f"{name} is only {rms:.2f} rms ulp from the correct result"
+
+
+# ── Mistral Large 4 dep8: 16-wide windows over chunks of the gathered tokens ────
+
+
+def _ml4_dep8_cell(**match):
+    """The dep8 cell (`local_num_experts` 16) whose spec holds `match`."""
+    return next(
+        c
+        for c in moe.CELLS
+        if c.spec.get("local_num_experts") == _ML4_LOCAL16
+        and all(c.spec.get(k) == v for k, v in match.items())
+    )
+
+
+# The Mistral Large 4 dep8 call the tests below drive: window (0, 16), layer 1.
+_ML4_DEP8_SPEC = next(
+    c.spec
+    for c in moe.CELLS
+    if c.spec.get("local_num_experts") == _ML4_LOCAL16 and "graph" in c.spec
+)
+_ML4_DEP8_ONE_WINDOW = _ml4_dep8_cell(skew="one_window").spec
+_ML4_DEP8_PADDED = _ml4_dep8_cell(skew="padded_zero_rows").spec
+
+#: (tokens, routing kernel, token tile of both GEMMs, finalize kernel) the
+#: Mistral Large 4 dep8 call launches on the cold path, at each side of every
+#: switch the sweep cell's token counts claim to straddle. The tile is
+#: `nextPowerOfTwo(int(T * top_k / local_num_experts))` clamped to 8..256,
+#: so at 16 local experts its edges sit at half tep4's token counts; the
+#: routing and finalize kernels switch where they do at tep4.
+_ML4_DEP8_KERNELS = (
+    (1, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (4, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (5, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (12, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (13, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (35, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (36, _CLUSTER_ROUTING, 16, _SCALAR_FIN),
+    (49, _CLUSTER_ROUTING, 16, _SCALAR_FIN),
+    (50, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (67, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (68, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (131, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (132, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (259, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (260, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (515, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (516, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8192, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8193, _COOP_ROUTING, 256, _VECTOR_FIN),
+    (32768, _COOP_ROUTING, 256, _VECTOR_FIN),
+)
+
+#: Rows of a bf16 `[rows, 6144]` buffer at which a row's byte offset passes 2^31.
+_ML4_ROW_2_31_BYTES = 2**31 // (2 * _ML4_HIDDEN) + 1
+
+
+def _ml4_permuted_rows(tokens: int, top_k: int, local: int, tile: int) -> int:
+    """Rows of the op's per-slot FC2 buffer: one tile per local expert while
+    slots last, a tile per further `tile` slots, at least 128 KiB of bf16."""
+    slots = tokens * top_k
+    filled = min(local, slots)
+    least = math.ceil(128 * 1024 / (_ML4_HIDDEN * 2))
+    return max((filled + (slots - filled) // tile) * tile, least)
+
+
+def test_sw_dep8_kernels_by_token_count():
+    """The switches the Mistral Large 4 dep8 sweep cell straddles are where it
+    says, read back from the kernels each call launches on the cold path; a
+    whole 32768-token chunk with every slot in window (0, 16), and the padding
+    chunk with 131068 slots on experts 0..3, launch the same kernels. The
+    per-slot FC2 buffer (`do_finalize=False`) has the rows `_ml4_permuted_rows`
+    gives at each count, 134,912 at 32768 tokens, and every slot's row in it
+    stays below 174,763, where a bf16 row's byte offset passes 2^31."""
+    from torch.profiler import ProfilerActivity, profile
+
+    args, ref = _ml4_args(_ML4_DEP8_SPEC, 32768, seed=5)
+    calls = [
+        (f"T={tokens}", tokens, routing, tile, finalize, _ml4_prefix(args, ref, tokens)[0])
+        for tokens, routing, tile, finalize in _ML4_DEP8_KERNELS
+    ]
+    del ref
+    for spec in (_ML4_DEP8_ONE_WINDOW, _ML4_DEP8_PADDED):
+        call = _ml4_args(spec, 32768, seed=5)[0]
+        calls.append((spec["skew"], 32768, _COOP_ROUTING, 256, _VECTOR_FIN, call))
+    top_rows = {}
+    for name, tokens, routing, tile, finalize, call in calls:
+        moe(**call)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            moe(**call)
+            torch.cuda.synchronize()
+        names = [e.name for e in prof.events() if str(e.device_type) == "DeviceType.CUDA"]
+        gemms = [n for n in names if n.startswith("bmm_")]
+        assert len(gemms) == 2 and all(f"_t128x{tile}x" in n for n in gemms), (name, gemms)
+        for want in (routing, finalize):
+            assert any(want in n for n in names), (name, want, names)
+        rows, _, slot_rows = moe(**dict(call, do_finalize=False))
+        want_rows = _ml4_permuted_rows(tokens, 4, _ML4_LOCAL16, tile)
+        assert rows.shape[0] == want_rows, (name, rows.shape[0], want_rows)
+        top_rows[name] = int(slot_rows.max())
+        assert top_rows[name] < rows.shape[0] < _ML4_ROW_2_31_BYTES, (name, top_rows[name])
+    assert _ml4_permuted_rows(32768, 4, _ML4_LOCAL16, 256) == 134912
+    print(
+        f"  test_sw_dep8_kernels_by_token_count OK ({len(calls)} calls; slot rows up to "
+        + ", ".join(
+            f"{n}: {r}" for n, r in top_rows.items() if not n.startswith("T=") or "32768" in n
+        )
+        + ")"
+    )
+
+
+#: The gathered token counts whose every valid tactic is driven at dep8: each
+#: decode graph's 8 x 1..16, with every tactic valid at the autotuner bucket the
+#: count maps to (a warm engine runs that bucket's tactic there), and each bucket
+#: above them (256 to 8192, then `tune_max_num_tokens` 32768, which carries
+#: 8193..32768).
+_ML4_DEP8_TACTIC_TOKENS = (*range(8, 129, 8), 256, 512, 1024, 2048, 4096, 8192, 32768)
+
+
+def test_sw_dep8_every_valid_tactic_passes_the_gate():
+    """The tuned path at dep8. The engine profiles this op at warm-up and keeps
+    one tactic per token bucket, and runs it at every count the bucket takes:
+    a decode graph's 8 x b gathered tokens map to the power of two at or below
+    them. So every tactic valid at that bucket is run at each decode count,
+    at each bucket above, and on the one-window and padding chunks at 32768:
+    one whose bits equal the fallback's is certified by the cells, and one
+    whose bits do not is gated against `reference` itself."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    spec = _ML4_DEP8_SPEC
+    calls = [(f"T={m}", *_ml4_args(spec, m, seed=300 + m)) for m in _ML4_DEP8_TACTIC_TOKENS]
+    for skewed in (_ML4_DEP8_ONE_WINDOW, _ML4_DEP8_PADDED):
+        calls.append((f"{skewed['skew']} T=32768", *_ml4_args(skewed, 32768, seed=300)))
+    runner = FP4BlockScaleMoERunner(
+        spec["num_experts"],
+        spec["top_k"],
+        None,
+        None,
+        spec["intermediate"],
+        spec["local_expert_offset"],
+        spec["local_num_experts"],
+        None,
+        1,
+        True,
+        0,
+        tune_max_num_tokens=spec["tune_max_num_tokens"],
+    )
+    bucket_of = runner.tuning_config.dynamic_tensor_specs[0].map_to_tuning_buckets
+    names = ("routing_logits", "routing_bias", "hidden_states", "hidden_states_scale")
+    names += ("gemm1_weights", "gemm1_weights_scale", "gemm1_bias", "gemm1_alpha", "gemm1_beta")
+    names += ("gemm1_clamp_limit", "gemm2_weights", "gemm2_weights_scale", "gemm2_bias")
+    names += ("output1_scale_scalar", "output1_scale_gate_scalar", "output2_scale_scalar")
+    names += ("topk_weights", "topk_ids")
+    summary = []
+    for name, args, ref in calls:
+        tokens = args["hidden_states"].shape[0]
+        bucket = bucket_of(tokens)
+        base = moe(**args)[0]
+        inputs = [args[k] for k in names]
+        valid = runner.get_runner().get_valid_configs(
+            spec["top_k"], spec["hidden"], spec["intermediate"], spec["local_num_experts"], bucket
+        )
+        assert len({t[0] for t in valid}) > 1, f"{name}: one tile only, {valid}"
+        exp = None
+        worst = (0.0, 0.0)
+        differ = []
+        for tactic in valid:
+            y = runner.forward(inputs, list(tactic))[0]
+            if torch.equal(y, base):
+                continue
+            differ.append(tuple(tactic))
+            if exp is None:
+                exp = _ml4_reference(ref)
+                _compare(base, exp)
+            _compare(y, exp)
+            worst = tuple(max(a, b) for a, b in zip(worst, _dev(y, exp)))
+        summary.append(f"{name} (bucket {bucket}): {len(valid)} valid, {len(differ)} differ")
+        if differ:
+            print(
+                f"  {name}: {len(differ)} of {len(valid)} bucket-{bucket} tactics differ from the "
+                f"fallback, all inside the gate (worst {worst[0]:.2f} elt / {worst[1]:.3f} rms): "
+                f"{differ}"
+            )
+    print("  test_sw_dep8_every_valid_tactic_passes_the_gate OK (" + "; ".join(summary) + ")")
+
+
+class _SwTiled:
+    """`stack[e % n]` for every global expert `e`: the 128-expert layer whose
+    16-wide windows each hold the same `n`-expert stack, indexed the way
+    `reference` indexes its `(codes, scales)` operands."""
+
+    def __init__(self, stack: torch.Tensor):
+        self.stack = stack
+
+    def __getitem__(self, e: int) -> torch.Tensor:
+        return self.stack[e % self.stack.shape[0]]
+
+
+def _ml4_windows(spec, seed: int) -> None:
+    """The eight tep8 or dep8 ranks' calls over one step's tokens (at dep8 a
+    chunk of the gathered tokens), each at its own window of the same
+    16-expert stack, answer every slot exactly once: their partials, summed in fp32 and as a bf16 running sum in rank
+    order, pass the gate against the entry's `reference` over all 128 experts
+    at once (expert `e` holding stack expert `e % 16`, as every window does).
+    Leaving one window out, or running window (0, 16) in place of (16, 16),
+    lands far outside it."""
+    tokens, windows, local = spec["tokens"], spec["windows"], spec["local_num_experts"]
+    num_experts = spec["num_experts"]
+    assert windows * local == num_experts and spec["local_expert_offset"] == 0, spec
+    args, ref = _ml4_args(spec, tokens, seed)
+    offsets = tuple(range(0, num_experts, local))
+    ids = args["topk_ids"]
+    slots = [int(((ids >= o) & (ids < o + local)).sum()) for o in offsets]
+    assert sum(slots) == ids.numel() and min(slots) > 0, slots
+    outs = [moe(**dict(args, local_expert_offset=o))[0] for o in offsets]
+    for o, y in zip(offsets, outs):
+        _ml4_assert_window(y, dict(args, local_expert_offset=o))
+    layer = dict(
+        ref,
+        up=tuple(_SwTiled(t) for t in ref["up"]),
+        gate=tuple(_SwTiled(t) for t in ref["gate"]),
+        down=tuple(_SwTiled(t) for t in ref["down"]),
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+    )
+    entry_ref = moe.reference(**layer)
+    local_ref = _ref_moe(
+        layer["hidden_states"],
+        layer["topk_ids"],
+        layer["topk_weights"],
+        layer,
+        layer["fc2_global_scale"],
+        offset=0,
+        num_local=num_experts,
+    )
+    torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
+    del local_ref
+    want = entry_ref.to(torch.bfloat16)
+    del entry_ref
+    summed = sum(y.float() for y in outs).to(torch.bfloat16)
+    running = outs[0]
+    for y in outs[1:]:
+        running = running + y
+    for name, y in (("fp32 sum", summed), ("bf16 running sum", running)):
+        elt, rms = _dev(y, want)
+        print(f"  {windows} windows, {name}: {elt:.2f} elt / {rms:.3f} rms ulp")
+        _compare(y, want)
+    wrong = {
+        f"window ({offsets[-1]}, {local}) left out": outs[:-1],
+        f"window (0, {local}) in place of ({local}, {local})": (outs[0], outs[0], *outs[2:]),
+    }
+    for name, partials in wrong.items():
+        y = sum(p.float() for p in partials)
+        elt, rms = _dev(y.to(torch.bfloat16), want)
+        print(f"    {name}: {elt:.3g} elt / {rms:.2f} rms ulp")
+        assert rms > 20.0, f"{name} is only {rms:.2f} rms ulp from the layer"
+
+
+# ── Mistral Large 4 tep8: 16-wide windows, every rank over the step's tokens ───
+
+
+def _ml4_tep8_cell(**match):
+    """The tep8 cell (`local_num_experts` 16) whose spec holds `match`."""
+    return next(
+        c
+        for c in moe.CELLS
+        if c.spec["local_num_experts"] == _ML4_LOCAL16
+        and all(c.spec.get(k) == v for k, v in match.items())
+    )
+
+
+# The Mistral Large 4 tep8 call the tests below drive, at window (0, 16).
+_ML4_TEP8_SPEC = next(
+    c.spec
+    for c in moe.CELLS
+    if c.spec["local_num_experts"] == _ML4_LOCAL16
+    and c.spec.get("layer") == 1
+    and c.spec.get("graph") == tuple(range(1, 17))
+)
+_ML4_TEP8_ONE_WINDOW = _ml4_tep8_cell(skew="one_window").spec
+
+#: (tokens, routing kernel, token tile of both GEMMs, finalize kernel) the
+#: Mistral Large 4 tep8 call launches on the cold path, at each side of every
+#: switch the sweep cell's token counts claim to straddle. The tile is
+#: `nextPowerOfTwo(int(T * top_k / local_num_experts))` clamped to 8..256,
+#: so at 16 local experts its edges sit at half tep4's token counts; the
+#: routing and finalize kernels switch where they do at tep4.
+_ML4_TEP8_KERNELS = (
+    (1, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (4, _BLOCK_ROUTING, 8, _SCALAR_FIN),
+    (5, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (12, _DYN_ROUTING, 8, _SCALAR_FIN),
+    (13, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (35, _CLUSTER_ROUTING, 8, _SCALAR_FIN),
+    (36, _CLUSTER_ROUTING, 16, _SCALAR_FIN),
+    (49, _CLUSTER_ROUTING, 16, _SCALAR_FIN),
+    (50, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (67, _CLUSTER_ROUTING, 16, _VECTOR_FIN),
+    (68, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (131, _CLUSTER_ROUTING, 32, _VECTOR_FIN),
+    (132, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (259, _CLUSTER_ROUTING, 64, _VECTOR_FIN),
+    (260, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (515, _CLUSTER_ROUTING, 128, _VECTOR_FIN),
+    (516, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8192, _CLUSTER_ROUTING, 256, _VECTOR_FIN),
+    (8193, _COOP_ROUTING, 256, _VECTOR_FIN),
+    (32768, _COOP_ROUTING, 256, _VECTOR_FIN),
+)
+
+
+def test_sw_tep8_kernels_by_token_count():
+    """The switches the Mistral Large 4 tep8 sweep cell straddles are where it
+    says, read back from the kernels each call launches on the cold path; at
+    32768 tokens with every slot in window (0, 16) the call launches the same
+    kernels. The per-slot FC2 buffer (`do_finalize=False`) has the rows
+    `_ml4_permuted_rows` gives at each count: 134,912 at 32768 tokens, below the
+    174,763 rows where a bf16 row's byte offset passes 2^31."""
+    from torch.profiler import ProfilerActivity, profile
+
+    args, ref = _ml4_args(_ML4_TEP8_SPEC, 32768, seed=5)
+    calls = [
+        (tokens, routing, tile, finalize, _ml4_prefix(args, ref, tokens)[0])
+        for tokens, routing, tile, finalize in _ML4_TEP8_KERNELS
+    ]
+    del ref
+    one_window = _ml4_args(_ML4_TEP8_ONE_WINDOW, 32768, seed=5)[0]
+    calls.append((32768, _COOP_ROUTING, 256, _VECTOR_FIN, one_window))
+    for tokens, routing, tile, finalize, call in calls:
+        moe(**call)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            moe(**call)
+            torch.cuda.synchronize()
+        names = [e.name for e in prof.events() if str(e.device_type) == "DeviceType.CUDA"]
+        gemms = [n for n in names if n.startswith("bmm_")]
+        assert len(gemms) == 2 and all(f"_t128x{tile}x" in n for n in gemms), (tokens, gemms)
+        for want in (routing, finalize):
+            assert any(want in n for n in names), (tokens, want, names)
+        rows = moe(**dict(call, do_finalize=False))[0].shape[0]
+        assert rows == _ml4_permuted_rows(tokens, 4, _ML4_LOCAL16, tile), (tokens, rows)
+    assert _ml4_permuted_rows(32768, 4, _ML4_LOCAL16, 256) == 134912 < 2**31 // (2 * _ML4_HIDDEN)
+    print(f"  test_sw_tep8_kernels_by_token_count OK ({len(calls)} calls)")
+
+
+#: The token counts whose every valid tactic is driven at tep8: each decode
+#: count the graphs capture, and each autotuner bucket above it (powers of two
+#: to 8192, then `tune_max_num_tokens` 32768, which carries 8193..32768).
+_ML4_TEP8_TACTIC_TOKENS = (*range(1, 17), 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 32768)
+
+
+def test_sw_tep8_every_valid_tactic_passes_the_gate():
+    """The tuned path at tep8. The engine profiles this op at warm-up and keeps
+    one tactic per token bucket; every call in the cells runs the cold
+    fallback. So each valid tactic the op's tunable runner offers at 16 local
+    experts is run at every decode count and every bucket, and at 32768 tokens
+    with every slot in one window too: one whose bits equal the fallback's is
+    certified by the cells, and one whose bits do not is gated against
+    `reference` itself."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    spec = _ML4_TEP8_SPEC
+    calls = [(f"T={m}", *_ml4_args(spec, m, seed=300 + m)) for m in _ML4_TEP8_TACTIC_TOKENS]
+    calls.append(("one window T=32768", *_ml4_args(_ML4_TEP8_ONE_WINDOW, 32768, seed=300)))
+    runner = FP4BlockScaleMoERunner(
+        spec["num_experts"],
+        spec["top_k"],
+        None,
+        None,
+        spec["intermediate"],
+        spec["local_expert_offset"],
+        spec["local_num_experts"],
+        None,
+        1,
+        True,
+        0,
+        tune_max_num_tokens=spec["tune_max_num_tokens"],
+    )
+    names = ("routing_logits", "routing_bias", "hidden_states", "hidden_states_scale")
+    names += ("gemm1_weights", "gemm1_weights_scale", "gemm1_bias", "gemm1_alpha", "gemm1_beta")
+    names += ("gemm1_clamp_limit", "gemm2_weights", "gemm2_weights_scale", "gemm2_bias")
+    names += ("output1_scale_scalar", "output1_scale_gate_scalar", "output2_scale_scalar")
+    names += ("topk_weights", "topk_ids")
+    summary = []
+    for name, args, ref in calls:
+        tokens = args["hidden_states"].shape[0]
+        base = moe(**args)[0]
+        inputs = [args[k] for k in names]
+        valid = runner.get_runner().get_valid_configs(
+            spec["top_k"], spec["hidden"], spec["intermediate"], spec["local_num_experts"], tokens
+        )
+        assert len({t[0] for t in valid}) > 1, f"{name}: one tile only, {valid}"
+        exp = None
+        worst = (0.0, 0.0)
+        differ = []
+        for tactic in valid:
+            y = runner.forward(inputs, list(tactic))[0]
+            if torch.equal(y, base):
+                continue
+            differ.append(tuple(tactic))
+            if exp is None:
+                exp = _ml4_reference(ref)
+                _compare(base, exp)
+            _compare(y, exp)
+            worst = tuple(max(a, b) for a, b in zip(worst, _dev(y, exp)))
+        summary.append(f"{name}: {len(valid)} valid, {len(differ)} differ")
+        if differ:
+            print(
+                f"  {name}: {len(differ)} of {len(valid)} tactics differ from the fallback, all "
+                f"inside the gate (worst {worst[0]:.2f} elt / {worst[1]:.3f} rms): {differ}"
+            )
+    print("  test_sw_tep8_every_valid_tactic_passes_the_gate OK (" + "; ".join(summary) + ")")
+
+
 # The shared layer each cell's (num_experts, hidden, intermediate) names.
 _GEOMETRIES = {(256, 7168, 2048): _dsr1, (512, 2560, 640): _many_experts}
 
@@ -2313,10 +4382,22 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     """
     certifying(moe)
     spec = cell.spec
+    if "layer" in spec:  # Mistral Large 4 tep4, dep4, tp4 and dep8: the checkpoint's magnitudes
+        seed = cell.seed_base() % 2**31
+        if "graph" in spec:
+            for tokens in spec["graph"]:
+                _ml4_replay(spec, tokens, seed + tokens)
+        elif "width_slices" in spec:
+            _ml4_width_slices(spec, seed)
+        elif "windows" in spec:
+            _ml4_windows(spec, seed)
+        else:
+            _ml4_sweep(spec, seed)
+        return
     args, ref = _GEOMETRIES[(spec["num_experts"], spec["hidden"], spec["intermediate"])]()
     off, n = spec["local_expert_offset"], spec["local_num_experts"]
     num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
-    gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    gen = torch.Generator(device=DEV).manual_seed(cell.seed_base() % 2**31)
     g1 = 137.0
 
     data, sf, x = _rand_activation(spec["tokens"], hidden, g1, gen)

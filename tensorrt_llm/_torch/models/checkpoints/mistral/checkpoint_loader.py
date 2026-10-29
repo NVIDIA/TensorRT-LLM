@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
@@ -91,3 +94,23 @@ class MistralLarge3CheckpointLoader(MistralCheckpointLoader):
             weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
         )
         self._checkpoint_format = "mistral_large_3"
+
+
+@register_checkpoint_loader("mistral_large_4")
+class MistralLarge4CheckpointLoader(HfCheckpointLoader):
+    """Load native metadata and preserve tensor names for the language-model weight table."""
+
+    def __init__(
+        self,
+        *,
+        weight_loader: BaseWeightLoader | None = None,
+        weight_mapper: BaseWeightMapper | None = None,
+        config_loader: BaseConfigLoader | None = None,
+    ):
+        super().__init__(
+            weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
+        )
+        self._checkpoint_format = "mistral_large_4"
+
+    def get_default_config_loader(self) -> MistralConfigLoader:
+        return MistralConfigLoader()

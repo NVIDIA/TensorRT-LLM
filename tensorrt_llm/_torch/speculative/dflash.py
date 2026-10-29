@@ -1456,7 +1456,7 @@ class DFlashWorker(SpecWorkerBase):
         and store them per-request so the draft model can use the full prompt
         as cross-attention context on subsequent gen steps.
         """
-        if not hasattr(draft_model, "fc") or not hasattr(draft_model, "hidden_norm"):
+        if not callable(getattr(draft_model, "project_target_hidden", None)):
             return
 
         num_ctx_tokens = attn_metadata.num_ctx_tokens
@@ -1738,7 +1738,13 @@ class DFlashWorker(SpecWorkerBase):
 
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                hidden_states_out = draft_model.dflash_forward(
+                block_forward = getattr(draft_model, "dflash_forward_with_metadata", None)
+                block_kwargs = {}
+                if block_forward is None:
+                    block_forward = draft_model.dflash_forward
+                else:
+                    block_kwargs["attn_metadata"] = attn_metadata
+                hidden_states_out = block_forward(
                     noise_embedding=inputs["noise_embedding"],
                     query_positions=inputs["query_positions"],
                     num_ctx_per_req=inputs["num_ctx_per_req"],
@@ -1747,6 +1753,7 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
                     ctx_kv_cache=inputs["ctx_kv_cache"],
                     ctx_page_table=inputs["ctx_page_table"],
+                    **block_kwargs,
                 )
 
                 # Gather K logits per gen request from the block outputs.
@@ -1769,7 +1776,11 @@ class DFlashWorker(SpecWorkerBase):
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
                 gen_logits = self._refine_block_logits(
-                    draft_model, gen_logits, inputs, spec_metadata
+                    draft_model,
+                    gen_logits,
+                    inputs,
+                    spec_metadata,
+                    gen_hidden_states.reshape(num_gens, K, -1),
                 )
 
                 # DFlash 2: replace the independent per-position picks with one
@@ -1894,6 +1905,7 @@ class DFlashWorker(SpecWorkerBase):
         gen_logits: torch.Tensor,
         inputs: dict,
         spec_metadata,
+        draft_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Refine the block logits between the draft forward and sampling.
 
@@ -2063,8 +2075,6 @@ class DFlashWorker(SpecWorkerBase):
                 )
         mask_token_id = self._resolved_mask_token_id
 
-        # Get the embed_tokens layer from the draft model
-        embed_tokens = draft_model.draft_model_full.model.embed_tokens
         hidden_dim = (
             spec_metadata.hidden_size if spec_metadata.hidden_size > 0 else hidden_states.shape[-1]
         )
@@ -2079,10 +2089,8 @@ class DFlashWorker(SpecWorkerBase):
 
             # Get captured multi-layer hidden states from spec_metadata
             captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
-            has_target_features = (
-                captured_hs is not None
-                and hasattr(draft_model, "fc")
-                and hasattr(draft_model, "hidden_norm")
+            has_target_features = captured_hs is not None and callable(
+                getattr(draft_model, "project_target_hidden", None)
             )
 
             # Use cached block_size (resolved once on first call)
@@ -2119,9 +2127,16 @@ class DFlashWorker(SpecWorkerBase):
                 if mask_token_id == getattr(draft_model, "mask_token_id", None)
                 else None
             )
-            noise_embed_2d = dflash_noise_block_embedding(
-                embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
-            )
+            embed_block = getattr(draft_model, "embed_draft_block", None)
+            if embed_block is not None:
+                # A learned position-specific mask is model math; the worker
+                # supplies the accepted anchor and the runtime block width.
+                noise_embed_2d = embed_block(bonus, query_tokens_per_req)
+            else:
+                embed_tokens = draft_model.draft_model_full.model.embed_tokens
+                noise_embed_2d = dflash_noise_block_embedding(
+                    embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+                )
 
             # Accumulate new accepted features into context buffers
             if has_target_features:

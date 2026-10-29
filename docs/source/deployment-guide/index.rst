@@ -39,3 +39,4 @@ The deployment guides below provide more detailed instructions for serving speci
    deployment-guide-for-glm-5-on-trtllm.md
    deployment-guide-for-glm-5.3-flash-on-trtllm.md
    deployment-guide-for-minimax-m3-on-trtllm.md
+   deployment-guide-for-mistral-large-4-on-trtllm.md

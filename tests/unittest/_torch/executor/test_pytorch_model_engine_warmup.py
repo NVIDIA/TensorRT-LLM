@@ -1286,6 +1286,28 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Expected exactly 2 empty_cache calls; got order={calls}",
         )
 
+    def test_guided_decoder_runs_the_context_warmup_before_the_autotuner(self):
+        """A capturable guided decoder rules out the general warmup's
+        generation requests, not its context requests: those still run, then
+        the release of the MoE workspaces and the cache, then the autotuner."""
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        model_engine._runner.guided_decoder = Mock()
+        tracker = _Tracker()
+        calls, _ = _run_warmup_tracked(model_engine, resource_manager, tracker=tracker)
+        (((_, configs), _),) = tracker.call_args["general_warmup"]
+        self.assertTrue(configs, "Expected context warmup requests")
+        self.assertTrue(
+            all(num_gen_tokens == 0 for _, num_gen_tokens in configs),
+            f"Expected context requests only; got {configs}",
+        )
+        self.assertIn((model_engine._runner._config.max_num_tokens, 0), configs)
+        general_idx = calls.index("general_warmup")
+        self.assertEqual(
+            calls[general_idx : general_idx + 5],
+            ["general_warmup", "moe_clear", "empty_cache", "autotuner", "empty_cache"],
+            f"Expected the context warmup and its release before the autotuner; got {calls}",
+        )
+
     def test_helix_cp_runs_only_the_generation_autotuner_warmup(self):
         """With Helix CP, can_run_general_warmup is False and the context
         warmups (general, Mamba hybrid) are skipped; the autotuner warmup still

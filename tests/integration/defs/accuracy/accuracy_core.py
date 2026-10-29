@@ -370,6 +370,10 @@ class AccuracyTask:
                                        self.HIGHER_IS_BETTER),
             threshold=entry.get("threshold"))
 
+    def evaluator_num_samples(self, num_samples: int) -> int:
+        """The evaluator's num_samples for a total sample count."""
+        return num_samples
+
     def evaluate(self,
                  llm: PyTorchLLM,
                  extra_acc_spec: Optional[str] = None,
@@ -424,9 +428,10 @@ class AccuracyTask:
             evaluator_kwargs.update(self.EVALUATOR_KWARGS)
         if extra_evaluator_kwargs is not None:
             evaluator_kwargs.update(extra_evaluator_kwargs)
-        evaluator = self.EVALUATOR_CLS(
-            num_samples=hypothesis_testing_params.num_samples,
-            **evaluator_kwargs)
+        num_samples = self.evaluator_num_samples(
+            hypothesis_testing_params.num_samples)
+        evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
+                                       **evaluator_kwargs)
         evaluate_kwargs = {}
         if hasattr(self, 'EVALUATE_KWARGS'):
             evaluate_kwargs.update(self.EVALUATE_KWARGS)
@@ -666,6 +671,17 @@ class MMMU(AccuracyTask):
                             apply_chat_template=True)
 
     EVALUATE_KWARGS = dict(model_type=None, is_force_single_image=False)
+
+    # mmmu_val groups 30 subjects and lm-eval applies the evaluator's
+    # num_samples to each of them; references count questions in total.
+    NUM_SUBJECTS = 30
+
+    def evaluator_num_samples(self, num_samples: int) -> int:
+        # INTEGRATION_TEST asks for one sample: one question per subject.
+        assert num_samples == 1 or num_samples % self.NUM_SUBJECTS == 0, (
+            f"MMMU num_samples={num_samples} must split evenly across "
+            f"{self.NUM_SUBJECTS} subjects")
+        return max(num_samples // self.NUM_SUBJECTS, 1)
 
 
 class PassKeyRetrieval64k(AccuracyTask):

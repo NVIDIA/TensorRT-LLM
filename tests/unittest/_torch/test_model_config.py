@@ -406,3 +406,575 @@ def test_validate_encoder_decoder_kv_cache_config_accepts_v2_enc_dec():
         model_config,
         _make_kv_cache_config(use_kv_cache_manager_v2=True, cross_kv_cache_fraction=0.5),
     )
+
+
+_MISTRAL_LARGE4_NUM_LAYERS = 72
+
+
+def _mistral_large4_expected_config(**overrides) -> dict:
+    """The language-model config adapted from the Mistral-Large-4-1T-A52B NVFP4 params.json."""
+    num_layers = _MISTRAL_LARGE4_NUM_LAYERS
+    nope_layer_flags = [layer % 4 == 3 for layer in range(num_layers)]
+    config = {
+        "_name_or_path": "",
+        "architectures": ["MistralLarge4ForCausalLM"],
+        "chunk_size_feed_forward": 0,
+        "dtype": "bfloat16",
+        "first_k_dense_replace": 1,
+        "fp8_kv_cache": True,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 6144,
+        "id2label": {"0": "LABEL_0", "1": "LABEL_1"},
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        # Layers 0-16 run their own indexer; from layer 17 on, two layers reuse
+        # the previous full layer's top-k, then two run their own.
+        "index_sharing": [
+            "full" if layer < 17 or (layer - 17) % 4 >= 2 else "shared"
+            for layer in range(num_layers)
+        ],
+        "index_topk": 2048,
+        "indexer_nope_layer_flags": list(nope_layer_flags),
+        "indexer_norm_eps": 1e-06,
+        "indexer_ssmax_scaling": True,
+        "intermediate_size": 24576,
+        "is_encoder_decoder": False,
+        "kv_lora_rank": 512,
+        # Every NoPE layer after layer 35 reads layer 35's latent KV.
+        "kv_source_layers": [
+            35 if layer > 35 and layer % 4 == 3 else layer for layer in range(num_layers)
+        ],
+        "label2id": {"LABEL_0": 0, "LABEL_1": 1},
+        "lerope": True,
+        "max_position_embeddings": 1048576,
+        "max_seq_len": 1048576,
+        "model_type": "mistral_large_4",
+        "moe": {"expert_model_parallel": 1, "expert_parallel": 1},
+        "moe_intermediate_size": 6144,
+        "moe_layer_freq": 1,
+        "n_group": 1,
+        "n_routed_experts": 128,
+        "n_shared_experts": 1,
+        "nope_layer_flags": list(nope_layer_flags),
+        "norm_topk_prob": True,
+        "num_attention_heads": 64,
+        "num_experts_per_tok": 4,
+        "num_hidden_layers": num_layers,
+        "num_key_value_heads": 64,
+        "output_attentions": False,
+        "output_hidden_states": False,
+        "problem_type": None,
+        "q_lora_rank": None,
+        "qk_nope_head_dim": 64,
+        "qk_rope_head_dim": 64,
+        "quantization_config": _mistral_large4_modelopt_quantization_config(),
+        "return_dict": True,
+        "rms_norm_eps": 1e-05,
+        "rope_parameters": {
+            "attention_factor": 1.0,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "factor": 2048.0,
+            "mscale_all_dim": 1,
+            "original_max_position_embeddings": 512,
+            "rope_theta": 10000.0,
+            "rope_type": "yarn",
+        },
+        "rope_theta": 10000.0,
+        "routed_scaling_factor": 1.0,
+        "scoring_func": "softmax",
+        "softmax_tanh_gating": 30.0,
+        "ssmax_scaling": True,
+        "tie_word_embeddings": False,
+        "topk_group": 1,
+        "topk_method": None,
+        "v_head_dim": 128,
+        "vocab_size": 204800,
+        "yarn": {},
+    }
+    config.update(overrides)
+    return config
+
+
+def _mistral_large4_model_config(checkpoint_dir: Path, fp8_kv_cache: bool = True) -> ModelConfig:
+    params = _mistral_large4_native_params()
+    params["dsa"]["fp8_kv_cache"] = fp8_kv_cache
+    (checkpoint_dir / "params.json").write_text(json.dumps(params))
+    # TEP4 with the serving limits passed the way the model loader passes them.
+    # moe_backend is explicit so that no GPU is needed to resolve AUTO.
+    return ModelConfig.from_pretrained(
+        str(checkpoint_dir),
+        checkpoint_format="mistral_large_4",
+        mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
+        max_seq_len=9216,
+        max_num_tokens=9216,
+        moe_backend="CUTLASS",
+    )
+
+
+def test_mistral_large4_native_pretrained_config(tmp_path):
+    from tensorrt_llm._torch.configs import MistralLarge4Config
+    from tensorrt_llm._torch.pyexecutor.config_utils import is_mla
+
+    expected = _mistral_large4_expected_config()
+    model_config = _mistral_large4_model_config(tmp_path)
+    pretrained_config = model_config.pretrained_config
+
+    assert isinstance(pretrained_config, MistralLarge4Config)
+    # Every key holds its expected value. transformers turns the dtype string
+    # into a torch.dtype and the id2label keys into ints, and the loader
+    # records the checkpoint directory as _name_or_path.
+    normalized = {"_name_or_path", "dtype", "id2label"}
+    for key, value in expected.items():
+        if key not in normalized:
+            assert getattr(pretrained_config, key) == value, key
+    assert pretrained_config.dtype == torch.bfloat16
+    assert pretrained_config.id2label == {0: "LABEL_0", 1: "LABEL_1"}
+    assert pretrained_config._name_or_path == str(tmp_path)
+    # Nothing else appears beside them (vision_config is covered by
+    # test_mistral_large4_native_checkpoint): no DeepSeek-V3 default (an MTP
+    # layer count, special-token ids), and the serving limits stay on
+    # ModelConfig.
+    public = {key for key in vars(pretrained_config) if not key.startswith("_")}
+    assert public - expected.keys() <= {"transformers_version", "vision_config"}
+    assert not hasattr(pretrained_config, "num_nextn_predict_layers")
+    assert pretrained_config.head_dim == 128
+    assert pretrained_config.max_seq_len == 1048576
+    assert model_config.max_seq_len == 9216
+    assert is_mla(pretrained_config)
+
+
+def test_mistral_large4_derives_dsa_with_shared_indexers(tmp_path):
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
+        derive_indexer_k_cache_layer_mask,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.mistral_large4.cache_manager import (
+        MistralLarge4CacheManager,
+    )
+    from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, KvCacheConfig
+
+    model_config = _mistral_large4_model_config(tmp_path)
+    pretrained_config = model_config.pretrained_config
+    sparse_config = model_config.sparse_attention_config
+
+    assert type(sparse_config) is DeepSeekSparseAttentionConfig
+    assert sparse_config.index_n_heads == 32
+    assert sparse_config.index_head_dim == 128
+    assert sparse_config.index_topk == 2048
+    assert sparse_config.indexer_k_dtype == "fp8"
+    assert sparse_config.indexer_rope_interleave is True
+
+    # Exactly the 'full' layers own an indexer-K cache; the 'shared' ones reuse
+    # the previous full layer's top-k.
+    index_sharing = pretrained_config.index_sharing
+    indexer_layers = derive_indexer_k_cache_layer_mask(
+        sparse_config, pretrained_config, _MISTRAL_LARGE4_NUM_LAYERS
+    )
+    assert indexer_layers == [role == "full" for role in index_sharing]
+    assert sum(indexer_layers) == 44
+
+    assert get_kv_cache_manager_cls(model_config, KvCacheConfig()) is MistralLarge4CacheManager
+    owners = sum(i == source for i, source in enumerate(pretrained_config.kv_source_layers))
+    bytes_per_token = MistralLarge4CacheManager.get_cache_size_per_token(
+        model_config, model_config.mapping
+    )
+    assert bytes_per_token == owners * 656 + 44 * 132
+
+
+def test_mistral_large4_quantization(tmp_path):
+    quant_config = _mistral_large4_model_config(tmp_path).quant_config
+
+    assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert quant_config.group_size == 16
+    assert quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+@pytest.mark.parametrize(
+    ("fp8_kv_cache", "kv_cache_dtype", "expected"),
+    [
+        pytest.param(True, "auto", QuantAlgo.FP8, id="checkpoint_fp8_auto"),
+        pytest.param(True, "nvfp4", QuantAlgo.NVFP4, id="checkpoint_fp8_explicit_nvfp4"),
+        pytest.param(False, "auto", None, id="checkpoint_bf16_auto"),
+        pytest.param(False, "fp8", QuantAlgo.FP8, id="checkpoint_bf16_explicit_fp8"),
+    ],
+)
+def test_mistral_large4_fp8_kv_cache_resolves_kv_cache_quant(
+    tmp_path, fp8_kv_cache, kv_cache_dtype, expected
+):
+    # `fp8_kv_cache` is the checkpoint's KV policy, as an hf_quant_config
+    # kv_cache_quant_algo would be: 'auto' keeps it, an explicit dtype wins.
+    model_config = _mistral_large4_model_config(tmp_path, fp8_kv_cache=fp8_kv_cache)
+    validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
+    assert model_config.quant_config.kv_cache_quant_algo == expected
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "expected"),
+    [
+        pytest.param("auto", QuantAlgo.FP8, id="auto"),
+        pytest.param("nvfp4", QuantAlgo.NVFP4, id="explicit_nvfp4"),
+    ],
+)
+def test_mistral_large4_fp8_kv_cache_reaches_llm_args(tmp_path, kv_cache_dtype, expected):
+    # llm.args.quant_config reports the same KV policy the engine runs with.
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    (tmp_path / "params.json").write_text(json.dumps(_mistral_large4_native_params()))
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        checkpoint_format="mistral_large_4",
+        kv_cache_config=KvCacheConfig(dtype=kv_cache_dtype),
+    )
+
+    assert ModelLoader(llm_args)._update_from_hf_quant_config() is True
+    assert llm_args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert llm_args.quant_config.kv_cache_quant_algo == expected
+
+
+def _mistral_large4_modelopt_quantization_config() -> dict:
+    """The inline ModelOpt config of the Mistral-Large-4-1T-A52B NVFP4 export, keyed by Mistral
+    module names: NVFP4 routed experts, FP8_PB_WO (block-128 FP8) linears, nothing else."""
+    fp8 = {"quant_algo": "FP8_PB_WO"}
+    layers = {
+        f"layers.{layer}.experts": {"quant_algo": "NVFP4", "group_size": 16}
+        for layer in range(1, _MISTRAL_LARGE4_NUM_LAYERS)
+    }
+    for layer in range(_MISTRAL_LARGE4_NUM_LAYERS):
+        layers[f"layers.{layer}.attention.wq"] = fp8
+        layers[f"layers.{layer}.attention.wo"] = fp8
+        if layer < 17 or layer % 4 in (0, 3):
+            layers[f"layers.{layer}.attention.indexer.wq_b"] = fp8
+        mlp = "feed_forward" if layer == 0 else "shared_experts"
+        for w in ("w1", "w2", "w3"):
+            layers[f"layers.{layer}.{mlp}.{w}"] = fp8
+    return {
+        "group_size": 16,
+        "ignore": [],
+        "quant_algo": "MIXED_PRECISION",
+        "quant_method": "modelopt",
+        "quantized_layers": layers,
+    }
+
+
+def test_mistral_large4_modelopt_mixed_precision_keeps_quantized_layers(tmp_path):
+    # The engine and the LLM API each normalise their own copy of the ModelOpt config; the
+    # config the modeling_v2 router reads keeps the map exactly as params.json states it.
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    quantization_config = _mistral_large4_modelopt_quantization_config()
+    (tmp_path / "params.json").write_text(json.dumps(_mistral_large4_native_params()))
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        checkpoint_format="mistral_large_4",
+        mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
+        max_seq_len=32768,
+        max_num_tokens=32768,
+        moe_backend="CUTLASS",
+    )
+    validate_and_set_kv_cache_quant(model_config, "fp8")
+
+    quant_config = model_config.quant_config
+    assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert quant_config.group_size == 16
+    layers = model_config.quant_config_dict
+    assert set(layers) == set(quantization_config["quantized_layers"])
+    algos = [(q.quant_algo, q.group_size) for q in layers.values()]
+    assert algos.count((QuantAlgo.NVFP4, 16)) == 71
+    assert algos.count((QuantAlgo.FP8_BLOCK_SCALES, None)) == 404
+    assert model_config.pretrained_config.quantization_config == quantization_config
+
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        checkpoint_format="mistral_large_4",
+        kv_cache_config=KvCacheConfig(dtype="fp8"),
+    )
+    assert ModelLoader(llm_args)._update_from_hf_quant_config() is True
+    assert llm_args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert llm_args.quant_config.group_size == 16
+
+
+def _mistral_large4_native_params() -> dict:
+    layers = _MISTRAL_LARGE4_NUM_LAYERS
+    params = {
+        "dim": 6144,
+        "n_layers": layers,
+        "n_heads": 64,
+        "n_kv_heads": 64,
+        "head_dim": 128,
+        "hidden_dim": 24576,
+        "norm_eps": 1e-5,
+        "vocab_size": 204800,
+        "tied_embeddings": False,
+        "max_position_embeddings": 1048576,
+        "q_lora_rank": None,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 64,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "nope": "rope,rope,rope,nope",
+        "ssmax_scaling": True,
+        "lerope": True,
+        "softmax_tanh_gating": 30.0,
+        "rope_theta": 10000.0,
+        "yarn": {
+            "original_max_position_embeddings": 512,
+            "factor": 2048,
+            "apply_scale": False,
+            "beta": 32,
+            "alpha": 1,
+        },
+        "moe": {
+            "expert_parallel": 1,
+            "expert_model_parallel": 1,
+            "route_every_n": 1,
+            "first_k_dense_replace": 1,
+            "num_experts": 128,
+            "num_experts_per_tok": 4,
+            "num_expert_groups": 1,
+            "num_expert_groups_per_tok": 1,
+            "routed_scale": 1.0,
+            "expert_hidden_dim": 6144,
+            "num_shared_experts": 1,
+        },
+        "dsa": {
+            "topk": 2048,
+            "n_heads": 32,
+            "head_dim": 128,
+            "match_nope": True,
+            "ssmax_scaling": True,
+            "norm_eps": 1e-6,
+            "sharing": ",".join(
+                "full" if i < 17 or i % 4 in (0, 3) else "shared" for i in range(layers)
+            ),
+            "fp8_kv_cache": True,
+        },
+        "kv_sharing": {
+            "source_layers_str": ",".join(
+                str(35 if i > 35 and i % 4 == 3 else i) for i in range(layers)
+            )
+        },
+        "vision_encoder": {"hidden_size": 2048},
+        "quantization_config": _mistral_large4_modelopt_quantization_config(),
+    }
+    return params
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_mistral_large4_native_checkpoint(tmp_path, kv_cache_dtype):
+    from tensorrt_llm._torch.configs import MistralLarge4Config
+    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import (
+        MistralConfigLoader,
+        adapt_config_dict,
+    )
+    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    params = _mistral_large4_native_params()
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    original = deepcopy(params)
+    config = adapt_config_dict(params)
+    assert params == original
+    expected = _mistral_large4_expected_config()
+    for field in (
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "intermediate_size",
+        "moe_intermediate_size",
+        "n_routed_experts",
+        "n_shared_experts",
+        "num_experts_per_tok",
+        "first_k_dense_replace",
+        "moe_layer_freq",
+        "scoring_func",
+        "nope_layer_flags",
+        "kv_source_layers",
+        "index_sharing",
+        "indexer_nope_layer_flags",
+        "indexer_norm_eps",
+        "indexer_ssmax_scaling",
+        "fp8_kv_cache",
+        "quantization_config",
+    ):
+        assert getattr(config, field) == expected[field], field
+    assert config.rope_parameters == expected["rope_parameters"]
+    assert config.index_topk_pattern.count("F") == 44
+    assert not hasattr(config, "vision_encoder")
+    assert config.vision_config.hidden_size == 2048
+    assert type(config).from_dict(config.to_dict()).vision_config.hidden_size == 2048
+    assert not hasattr(config, "num_nextn_predict_layers")
+    # Native parsing is selected explicitly in both the client and engine paths.
+    assert isinstance(
+        load_pretrained_config(str(tmp_path), checkpoint_format="mistral_large_4"),
+        MistralLarge4Config,
+    )
+    assert isinstance(
+        ModelLoader.load_hf_model_config(str(tmp_path), checkpoint_format="mistral_large_4"),
+        MistralLarge4Config,
+    )
+    from tensorrt_llm._torch.pyexecutor.model_loader import _construct_checkpoint_loader
+
+    checkpoint_loader = _construct_checkpoint_loader(None, "mistral_large_4")
+    assert checkpoint_loader.checkpoint_format == "mistral_large_4"
+    assert isinstance(checkpoint_loader.config_loader, MistralConfigLoader)
+    model_config = checkpoint_loader.load_config(
+        str(tmp_path),
+        mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
+        max_seq_len=32768,
+        max_num_tokens=32768,
+        moe_backend="CUTLASS",
+    )
+    assert model_config.pretrained_config.max_seq_len == 1048576
+    assert model_config.max_seq_len == 32768
+    assert model_config.sparse_attention_config.index_n_heads == 32
+    assert model_config.sparse_attention_config.index_topk == 2048
+    assert model_config.sparse_attention_config.indexer_rope_interleave is True
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert model_config.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert len(model_config.quant_config_dict) == len(
+        expected["quantization_config"]["quantized_layers"]
+    )
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        checkpoint_format="mistral_large_4",
+        kv_cache_config=KvCacheConfig(dtype=kv_cache_dtype),
+    )
+    assert ModelLoader(llm_args)._update_from_hf_quant_config() is True
+    assert llm_args.quant_config.quant_algo == model_config.quant_config.quant_algo
+    assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert json.loads((tmp_path / "params.json").read_text()) == original
+    assert not (tmp_path / "config.json").exists()
+
+
+@pytest.mark.parametrize("stale_config_json", [False, True], ids=["params_only", "stale_config"])
+def test_mistral_large4_requires_native_format(tmp_path, stale_config_json):
+    # A Mistral-Large-4 params.json loads only with checkpoint_format='mistral_large_4';
+    # any other format raises an error naming it, even beside a config.json that states
+    # model_type mistral_large_4.
+    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+
+    (tmp_path / "params.json").write_text(json.dumps(_mistral_large4_native_params()))
+    if stale_config_json:
+        (tmp_path / "config.json").write_text(
+            json.dumps(_mistral_large4_expected_config(hidden_size=128))
+        )
+    native_format = "checkpoint_format='mistral_large_4'"
+    for checkpoint_format in (None, "HF"):
+        with pytest.raises(ValueError, match=native_format):
+            load_pretrained_config(str(tmp_path), checkpoint_format=checkpoint_format)
+        with pytest.raises(ValueError, match=native_format):
+            ModelConfig.from_pretrained(str(tmp_path), checkpoint_format=checkpoint_format)
+    assert (
+        load_pretrained_config(str(tmp_path), checkpoint_format="mistral_large_4").hidden_size
+        == 6144
+    )
+
+
+@pytest.mark.parametrize("params", ["mistral", "mla_without_dsa", "invalid_json"])
+def test_hf_config_loads_beside_an_unrelated_params_json(tmp_path, params):
+    # Only a Mistral-Large-4 params.json requires the native format; the default (HF)
+    # format still loads config.json beside any other params.json.
+    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+
+    if params == "mistral":
+        native_params = {
+            "dim": 4096,
+            "n_layers": 32,
+            "head_dim": 128,
+            "hidden_dim": 14336,
+            "n_heads": 32,
+            "n_kv_heads": 8,
+            "norm_eps": 1e-5,
+            "vocab_size": 32768,
+            "rope_theta": 1000000.0,
+        }
+    elif params == "mla_without_dsa":
+        native_params = _mistral_large4_native_params()
+        del native_params["dsa"]
+    else:
+        native_params = None
+    (tmp_path / "params.json").write_text(
+        "invalid JSON" if native_params is None else json.dumps(native_params)
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["MistralForCausalLM"],
+                "model_type": "mistral",
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "num_hidden_layers": 2,
+                "vocab_size": 1000,
+            }
+        )
+    )
+    for checkpoint_format in (None, "HF"):
+        config = load_pretrained_config(str(tmp_path), checkpoint_format=checkpoint_format)
+        assert config.model_type == "mistral"
+        assert config.hidden_size == 128
+
+
+@pytest.mark.parametrize("field", ["nope", "kv_sharing", "dsa", "yarn"])
+def test_mistral_large4_invalid_native_patterns(field):
+    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import adapt_config_dict
+
+    params = _mistral_large4_native_params()
+    if field == "nope":
+        params["nope"] = "rope,unknown"
+    elif field == "kv_sharing":
+        params["kv_sharing"]["source_layers_str"] = "0,1"
+    elif field == "dsa":
+        params["dsa"]["sharing"] = "full,shared"
+    else:
+        params["yarn"]["apply_scale"] = True
+    with pytest.raises(ValueError):
+        adapt_config_dict(params)
+
+
+def test_deepseek_v32_dsa_derivation_ignores_mistral_large4_keys(tmp_path):
+    # The DeepSeek-V3.2 derivation is unchanged: every layer runs its own
+    # indexer, the indexer rope is NeoX, and only a quant config states a KV
+    # policy.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV32ForCausalLM"],
+                "model_type": "deepseek_v32",
+                "num_hidden_layers": 4,
+                "index_n_heads": 64,
+                "index_head_dim": 128,
+                "index_topk": 2048,
+                "fp8_kv_cache": True,
+                "index_sharing": ["full", "shared", "shared", "shared"],
+                "quantization_config": {
+                    "activation_scheme": "dynamic",
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    model_config = ModelConfig.from_pretrained(str(tmp_path), moe_backend="CUTLASS")
+    sparse_config = model_config.sparse_attention_config
+
+    assert sparse_config.algorithm == "dsa"
+    assert sparse_config.indexer_rope_interleave is False
+    assert all(
+        sparse_config.to_sparse_params(
+            pretrained_config=model_config.pretrained_config, layer_idx=layer
+        ).is_full_indexer_layer
+        for layer in range(4)
+    )
+    assert model_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert model_config.quant_config.kv_cache_quant_algo is None

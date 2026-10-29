@@ -195,6 +195,40 @@ class TestBuiltinExtensions:
         assert request.stream_options is not None
         assert request.stream_options.include_usage is True
 
+    @pytest.mark.parametrize("chat_template_kwargs", [None, {"reasoning_effort": "high"}])
+    def test_mistral_large_4_constrains_from_the_first_token(
+        self, clean_registry, chat_template_kwargs
+    ) -> None:
+        """``--reasoning_parser mistral_large_4`` resolves to the Mistral Large 4 extension.
+
+        Its structured outputs take the raw grammar: the parser has no generic reasoning
+        delimiters.
+        """
+        from tensorrt_llm.serve.openai_protocol import (
+            ResponseFormat,
+            _response_format_to_guided_decoding_params,
+        )
+
+        hook = structured_output_format_for("mistral_large_4")
+
+        from tensorrt_llm.serve.extensions.mistral_large_4 import MistralLarge4ServingExtension
+
+        assert isinstance(hook.__self__, MistralLarge4ServingExtension)
+        for response_format, field in (
+            (ResponseFormat(type="json_object"), "json_object"),
+            (
+                ResponseFormat(type="json_schema", json_schema={"schema": {"type": "object"}}),
+                "json",
+            ),
+        ):
+            params = _response_format_to_guided_decoding_params(
+                response_format,
+                reasoning_parser="mistral_large_4",
+                chat_template_kwargs=chat_template_kwargs,
+            )
+            assert params.structural_tag is None
+            assert getattr(params, field) in (True, {"type": "object"})
+
     def test_gpt_oss_structured_output_triggers_on_final_channel(self) -> None:
         import json
 
@@ -293,7 +327,7 @@ class TestOpenAIChatIntegration:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
-        from tensorrt_llm.serve import openai_server
+        from tensorrt_llm.inputs import utils as input_utils
         from tensorrt_llm.serve.openai_protocol import (
             ChatCompletionResponse,
             ChatCompletionResponseChoice,
@@ -315,7 +349,9 @@ class TestOpenAIChatIntegration:
             rendered.update(kwargs)
             return "rendered prompt"
 
-        monkeypatch.setattr(openai_server, "async_apply_chat_template", fake_apply_chat_template)
+        # openai_chat renders through async_apply_chat_template_with_mm, which
+        # calls this module-level function.
+        monkeypatch.setattr(input_utils, "async_apply_chat_template", fake_apply_chat_template)
 
         def generate_async(*, inputs, **kwargs):
             return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
@@ -359,7 +395,9 @@ class TestOpenAIChatIntegration:
         )
 
         app = FastAPI()
+        app.state.server = server
         app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+        app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
         return TestClient(app), events, rendered
 
     def test_extension_runs_before_prompt_rendering(self, chat_client) -> None:
@@ -381,3 +419,88 @@ class TestOpenAIChatIntegration:
         # The renderer saw the request the extension mutated, with the
         # client's own kwargs preserved.
         assert rendered["chat_template_kwargs"] == {"client_flag": 1, **self.MARKER}
+
+    @pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/messages"])
+    @pytest.mark.parametrize("name", ["basename", "path", "relative", "arbitrary"])
+    def test_local_checkpoint_client_names_remain_accepted(
+        self, chat_client, tmp_path, endpoint, name
+    ):
+        client, events, _ = chat_client
+        checkpoint = tmp_path / "Qwen3" / "Qwen3-0.6B"
+        checkpoint.mkdir(parents=True)
+        server = client.app.state.server
+        server.model = checkpoint.name
+        server.generator.args.model = str(checkpoint)
+        names = {
+            "basename": checkpoint.name,
+            "path": str(checkpoint),
+            "relative": "Qwen3/Qwen3-0.6B",
+            "arbitrary": "legacy-client-model-name",
+        }
+        response = client.post(
+            endpoint,
+            json={
+                "model": names[name],
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 4,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert events == ["extension", "render"]
+
+    @pytest.mark.parametrize("name", ["org/model", "model", "unknown"])
+    def test_hf_launch_keeps_permissive_request_model_names(self, chat_client, name):
+        client, _, _ = chat_client
+        server = client.app.state.server
+        server.model = "org/model"
+        server.generator.args.model = "org/model"
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": name, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 200, response.text
+
+    def test_prompt_and_output_budget_is_left_to_the_worker(self, chat_client):
+        """Forward combined budgets above the context limit for worker clamping."""
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import Mock
+
+        client, _, _ = chat_client
+        server = client.app.state.server
+        server.generator.args.max_seq_len = 64
+        server.generator.preprocess = Mock(return_value=SimpleNamespace(prompt_token_ids=[1] * 60))
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            server._input_proc_executor = executor
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 8,
+                },
+            )
+        server.generator.preprocess.assert_called_once()
+        assert response.status_code == 200, response.text
+
+    @pytest.mark.parametrize(
+        "choice", ["required", {"type": "function", "function": {"name": "get_weather"}}]
+    )
+    def test_native_forced_tools_require_llguidance(self, chat_client, choice):
+        client, _, _ = chat_client
+        server = client.app.state.server
+        server.model_config = type(
+            "NativeConfig", (), {"model_type": "mistral_large_4", "vocab_size": 1024}
+        )()
+        server.tool_parser = "mistral_large_4"
+        server.generator.args.guided_decoding_backend = "xgrammar"
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "tool_choice": choice,
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert "guided_decoding_backend='llguidance'" in response.json()["message"]

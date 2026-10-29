@@ -5400,6 +5400,64 @@ class TestForcedToolChoicePostprocessing:
         ]
         assert finish_reasons[-1] == "tool_calls"
 
+    @pytest.mark.parametrize("chunk_size", [1, 4, 1000])
+    def test_forced_mistral_stream_preserves_all_argument_deltas(
+            self, sample_tools, chunk_size):
+        args = self._make_args(sample_tools,
+                               tool_parser="mistral_large_4",
+                               forced_tool_name="get_weather",
+                               stream=True)
+        text = '[TOOL_CALLS]get_weather[ARGS]{"location": "Tokyo"}'
+        payloads = self._stream_deltas(
+            args,
+            [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)])
+        calls = [
+            call for payload in payloads for choice in payload["choices"]
+            for call in choice["delta"].get("tool_calls", [])
+        ]
+        assert sum("name" in call["function"] for call in calls) == 1
+        arguments = "".join(call["function"].get("arguments", "")
+                            for call in calls)
+        assert json.loads(arguments) == {"location": "Tokyo"}
+
+    @pytest.mark.parametrize("named", [False, True])
+    @pytest.mark.parametrize("chunk_size", [None, 1, 1000])
+    def test_native_mistral_postprocessing_call_count(self, sample_tools, named,
+                                                      chunk_size):
+        """Named choices return one call, so their grammar must enforce that."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(
+            sample_tools,
+            tool_parser="mistral_large_4",
+            forced_tool_name="get_weather" if named else None,
+            stream=chunk_size is not None)
+        if not named:
+            args.tool_choice = "required"
+        text = ('[TOOL_CALLS]get_weather[ARGS]{"location": "Paris"}'
+                '[TOOL_CALLS]get_weather[ARGS]{"location": "Berlin"}')
+        if chunk_size is None:
+            choice = chat_response_post_processor(self._fake_response(text),
+                                                  args).choices[0]
+            arguments = [
+                call.function.arguments for call in choice.message.tool_calls
+            ]
+        else:
+            payloads = self._stream_deltas(args, [
+                text[i:i + chunk_size] for i in range(0, len(text), chunk_size)
+            ])
+            fragments = {}
+            for payload in payloads:
+                for choice in payload["choices"]:
+                    for call in choice["delta"].get("tool_calls", []):
+                        index = call["index"]
+                        fragments[index] = fragments.get(
+                            index, "") + call["function"].get("arguments", "")
+            arguments = [fragments[index] for index in sorted(fragments)]
+        locations = [json.loads(argument)["location"] for argument in arguments]
+        assert locations == (["Paris"] if named else ["Paris", "Berlin"])
+
     def test_streaming_early_end_flushes_buffered_call(self, sample_tools):
         """Flush the buffered call when an auto-choice stream ends early.
 

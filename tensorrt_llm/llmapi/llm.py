@@ -56,6 +56,7 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
+from ..tokenizer import load_custom_tokenizer
 from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, ExecutorMemoryType,
@@ -340,6 +341,22 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
         disaggregated_params (dict): The disaggregated parameters of the LLM instance.
         startup_metrics (dict): The startup metrics reported by worker rank 0.
 """
+
+
+def _default_guided_decoding_backend(args: Any) -> Optional[str]:
+    """The guided decoding backend to serve with when the arguments set none.
+
+    Mistral Large 4 serves structured outputs (``response_format``) by default,
+    with xgrammar. A speculative decoding config keeps the given value: how it
+    combines with guided decoding is settled when the arguments are validated.
+    A multimodal-encoder-only instance generates nothing and keeps it too.
+    """
+    if (args.guided_decoding_backend is None
+            and getattr(args, "checkpoint_format", None) == "mistral_large_4"
+            and args.speculative_config is None
+            and not getattr(args, "mm_encoder_only", False)):
+        return "xgrammar"
+    return args.guided_decoding_backend
 
 
 @dataclass
@@ -1650,6 +1667,15 @@ class BaseLLM:
             assert isinstance(self.args.tokenizer, TokenizerBase)
             return self.args.tokenizer
 
+        # The native Mistral-Large-4 format tokenizes with mistral-common,
+        # whatever HF tokenizer files the checkpoint also ships.
+        if getattr(self.args, "checkpoint_format", None) == "mistral_large_4":
+            return load_custom_tokenizer(
+                "mistral_common",
+                self.args.model,
+                trust_remote_code=self.args.trust_remote_code,
+                use_fast=self.args.tokenizer_mode != 'slow')
+
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
         if (hasattr(self.args, "backend") and self.args.backend == "pytorch"
@@ -1690,18 +1716,31 @@ class BaseLLM:
 
     def _try_load_generation_config(
             self) -> Optional[transformers.GenerationConfig]:
+        # generation_config.json is an HF file; the native Mistral-Large-4
+        # format does not read it.
+        if getattr(self.args, "checkpoint_format", None) == "mistral_large_4":
+            return None
         return ModelLoader.load_hf_generation_config(self.args.model)
 
     def _try_load_generation_config_explicit_values(self) -> dict[str, Any]:
         if self.args.backend != "pytorch" or self.args.generation_config != "auto":
+            return {}
+        if getattr(self.args, "checkpoint_format", None) == "mistral_large_4":
             return {}
         model_dir = self._hf_model_dir or self.args.model
         return ModelLoader.load_hf_generation_config_dict(model_dir)
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
+        kwargs = {}
+        # The native Mistral-Large-4 format keeps its config in params.json;
+        # every other checkpoint format keeps the HF config lookup.
+        if getattr(self.args, "checkpoint_format", None) == "mistral_large_4":
+            kwargs["checkpoint_format"] = "mistral_large_4"
         return ModelLoader.load_hf_model_config(
-            self.args.model, trust_remote_code=self.args.trust_remote_code)
+            self.args.model,
+            trust_remote_code=self.args.trust_remote_code,
+            **kwargs)
 
     @set_api_status("prototype")
     def start_profile(self,
@@ -2151,6 +2190,20 @@ class _TorchLLM(BaseLLM):
                     "using LLM(model=..., encode_only=True) with "
                     "llm.encode() for optimized batch-forward inference that "
                     "bypasses the decoder scheduler.", architectures[0])
+
+        guided_decoding_backend = _default_guided_decoding_backend(self.args)
+        if guided_decoding_backend != self.args.guided_decoding_backend:
+            logger.info(
+                f"Guided decoding backend {guided_decoding_backend} enabled "
+                "for structured outputs.")
+            self.args.guided_decoding_backend = guided_decoding_backend
+        elif (checkpoint_format == "mistral_large_4"
+              and guided_decoding_backend is None
+              and self.args.speculative_config is not None):
+            logger.info(
+                "Guided decoding stays off with speculative decoding; set "
+                "guided_decoding_backend to 'xgrammar' to serve structured "
+                "outputs.")
 
         # Create the standard executor for generate()/generate_async()
         # TODO: revisit gather_context_logits

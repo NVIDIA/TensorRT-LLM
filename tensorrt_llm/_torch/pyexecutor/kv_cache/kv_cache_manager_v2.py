@@ -1781,11 +1781,13 @@ class KVCacheManagerV2(BaseResourceManager):
         # layout representative for each role from the public pool descriptors.
         self.num_pools = len(self.impl.layer_grouping)
         self._pool_layer_ids_by_role: Dict[Tuple[int, DataRole], LayerId] = {}
+        self._buffer_roles: set[tuple[int, DataRole]] = set()
         for pool_group in self.impl.pool_group_descs:
             for variant in pool_group.slot_desc.variants:
                 pool_id = int(variant.layer_group_id)
                 for coalesced in variant.coalesced_buffers:
                     for buffer_id in coalesced.buffer_ids:
+                        self._buffer_roles.add((int(buffer_id.layer_id), buffer_id.role))
                         self._pool_layer_ids_by_role.setdefault(
                             (pool_id, buffer_id.role), buffer_id.layer_id
                         )
@@ -2387,6 +2389,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 {
                     self.impl.get_page_stride(layer_id, self._get_pool_roles(pool_id)[0])
                     for layer_id in layer_ids
+                    if self.has_buffer(layer_id, self._get_pool_roles(pool_id)[0])
                 }
             )
             > 1
@@ -3194,8 +3197,14 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_cache_manager_py_config.layers[layer_offset], AttentionLayerConfig
         )
 
+    def has_buffer(self, local_layer_idx: int, role: DataRole) -> bool:
+        """Whether the local layer physically owns a buffer with this role."""
+        return (int(local_layer_idx), role) in self._buffer_roles
+
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
+        if not self.has_buffer(layer_offset, Role.KEY):
+            return None
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             addr_value = self.impl.get_mem_pool_base_address(
@@ -3405,6 +3414,7 @@ class KVCacheManagerV2(BaseResourceManager):
             [
                 self.impl.get_page_index_upper_bound(layer_id, Role.KEY)
                 for layer_id in typed_range(LayerId(self.num_local_layers))
+                if self.has_buffer(layer_id, Role.KEY)
             ]
         )
         # Subtract the pages the reserved sequences hold, not the count of
@@ -5710,7 +5720,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """Page-index scale of this layer's KV buffer. Layers in one pool can
         have different scales (e.g. different head_dim), so per-layer callers
         must not use the pool-level scale."""
-        return int(self.impl.get_page_index_scale(self.layer_offsets[layer_idx], Role.KEY))
+        local_layer_idx = self.layer_offsets[layer_idx]
+        if not self.has_buffer(local_layer_idx, Role.KEY):
+            raise ValueError(f"Layer {layer_idx} owns no KEY buffer")
+        return int(self.impl.get_page_index_scale(local_layer_idx, Role.KEY))
 
     def get_batch_cache_indices(
         self,

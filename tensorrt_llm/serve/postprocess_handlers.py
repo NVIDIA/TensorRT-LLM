@@ -541,15 +541,19 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                   finished=(output.finish_reason
                                                             is not None))
             if forced_tool and calls:
-                forced_name = _forced_call_name(calls,
-                                                forced_tool.function.name)
-                calls = calls[:1]
-                if calls[0].name:
-                    calls[0].name = forced_name
+                # One chunk can contain several argument deltas for the first
+                # call. Keep those together while dropping subsequent calls.
+                calls = [call for call in calls if call.tool_index == 0]
+                for call in calls:
+                    if call.name is not None:
+                        call.name = _forced_call_name([call],
+                                                      forced_tool.function.name)
             tool_calls = []
             for call_item in calls:
-                # Tool call ID should be generated only once per tool call
-                if call_item.name:
+                # Tool call ID should be generated only once per tool call. A
+                # call may be named "" (mistral_large_4 keeps unnamed calls), so
+                # only an absent name marks an argument delta.
+                if call_item.name is not None:
                     # First chunk: include ID and function name
                     tool_call_id = make_tool_call_id(
                         id_type=args.tool_call_id_type,
@@ -730,6 +734,12 @@ def chat_response_post_processor(
                                                arguments=call.parameters))
                 for call in calls
             ]
+            if args.tool_call_id_type == "mistral":
+                # The streaming path draws every id type from
+                # make_tool_call_id; here only the Mistral format replaces the
+                # default random id.
+                for tool_call in tool_calls:
+                    tool_call.id = make_tool_call_id(id_type="mistral")
             # Only the non-forced path builds ``message`` here; each forced
             # branch above builds its own. Keeping this outside the ``else``
             # would clobber those and read ``tool_calls`` unbound.

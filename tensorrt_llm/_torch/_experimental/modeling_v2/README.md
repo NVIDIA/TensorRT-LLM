@@ -132,7 +132,7 @@ tests/unittest/_torch/modeling_v2/
   _validating.py                 the fixtures that interpose is_valid and arm reference
   <category>/test_modeling_v2_<entry>.py                      shared entries
   models/<family>/<target>/<category>/test_modeling_v2_<entry>.py   owned entries
-  comm/_<entry>_op_matrix.py   the two collectives' 4-rank rank bodies
+  comm/_<entry>_op_matrix.py   the collectives' multi-rank rank bodies
   comm/_rank_job.py            starts one of those and asserts on its exit code
 ```
 
@@ -194,11 +194,12 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**Every entry is certified on sm_103, and both targets are gated there.**
+**Every entry is certified on sm_103, and every target is gated there.**
 
-The 19 entries -- 8 shared, 8 owned by deepseek, 3 by gpt-oss -- each drive
-their cells through `__call__` and `reference` in pre-merge CI, plus the two
-4-rank collective matrices. Certification is per architecture: `ARCHS` says
+Every entry, shared under `catalog/` or owned under a target's `ops/`, drives
+its cells through `__call__` and `reference` in CI: the single-GPU entries in
+pre-merge on B300, the collectives' multi-rank matrices in post-merge on GB300.
+Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,
 which is the honest state.
 
@@ -217,13 +218,18 @@ widening a tolerance, and each is written up in its own entry:
 * **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted
   by the op, not certified here).
 
-Both targets are gated by the accuracy suite's modeling_v2 files,
-`tests/integration/defs/accuracy/modeling_v2/test_{gpt_oss,deepseek_v3}.py`,
+The targets are gated by the accuracy suite's modeling_v2 files,
+`tests/integration/defs/accuracy/modeling_v2/test_<family>.py`,
 with `modeling_v2="require"` in force, which is what rules out the built-in
 implementation having been measured instead. gpt-oss-120b / sm_103 / tp1 runs
 gsm8k; deepseek-r1-0528-nvfp4 / sm_103 / dep4 runs gsm8k for the identity
 forward and the `mtp3` variant **paired in one session**, and the acceptance
-gate against stock modeling under the same `speculative_config`. The numbers
+gate against stock modeling under the same `speculative_config`.
+mistral-large-4-nvfp4 / sm_103 / tep4, dep4 and tp4 run gsm8k for the identity
+forward and the quick profile with the checkpoint's DSpark draft (RULER with
+its cache checks, the multimodal panel with MMMU, and GSM8K with its
+acceptance gate), and tp4 also runs the llguidance panel; tep8, dep8 and tp8
+run gsm8k and the quick profile over two nodes. The numbers
 live with those runs, not here: a number written into this file is one that
 drifts with nothing to notice.
 

@@ -30,6 +30,9 @@ l0_cpu:
   # catches a pruned reference before the post-merge canary does.
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
+  - unittest/test_ruler_accuracy.py
+  - unittest/test_mmmu_accuracy.py
+  - unittest/test_multimodal_accuracy.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
@@ -56,9 +59,14 @@ l0_cpu:
   - unittest/_torch/memory
   - unittest/_torch/modeling
   # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
-  # compute capability, no device. The rest of unittest/_torch/modeling_v2 needs a GPU.
+  # compute capability, no device.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
+  # mistral_large4 targets' cpu_only tests (weight manifests, engine configs, tiny-config
+  # slicing and loading). Run with -m cpu_only, this entry collects only the marked files; the
+  # rest of unittest/_torch/modeling_v2 needs a GPU. Cases that read the checkpoint skip when it
+  # is not under LLM_MODELS_ROOT.
+  - unittest/_torch/modeling_v2/models/mistral_large4
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
@@ -217,6 +225,7 @@ l0_cpu:
   - unittest/llmapi/test_session_prefetcher.py
   - unittest/llmapi/test_tokenizer_aliases.py
   - unittest/llmapi/test_tokenizer_decode.py
+  - unittest/llmapi/test_tokenizer_factory_mistral.py
   - unittest/llmapi/test_trtllm_serve_config_schemas.py
   - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_visual_gen_startup_shutdown.py
