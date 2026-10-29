@@ -126,13 +126,25 @@ def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
     """Install the engine's nvMatmulHeuristics policy on the process AutoTuner.
 
     Runs before model construction because CuTe DSL runners may enumerate
-    tactics while modules are built. Engines of one process (e.g. target and
-    draft) share the LLM args and therefore the policy.
+    tactics while modules are built. The policy is process-wide, so engines
+    that share a process should use the same config; target and draft engines
+    share the LLM args and therefore the policy.
     """
     # Partial test doubles of TorchLlmArgs may omit the field.
     config = getattr(llm_args, "autotuner_nvmmh_config", None)
-    AutoTuner.get().nvmmh_config = (None if config is None else NvMMHConfig(
-        max_tactics=config.max_tactics))
+    if config is not None:
+        from ..custom_ops import cutedsl_matmul_heuristics
+
+        if not cutedsl_matmul_heuristics.IS_NVMMH_AVAILABLE:
+            logger.warning_once(
+                "autotuner_nvmmh_config is set but nvMatmulHeuristics cannot "
+                "be imported; CuTe DSL GEMM/BMM runners tune their full "
+                "tactic space.",
+                key="autotuner_nvmmh_unavailable",
+            )
+    AutoTuner.get().nvmmh_config = (
+        None if config is None else NvMMHConfig(max_tactics=config.max_tactics)
+    )
 
 
 class ModelEngine:

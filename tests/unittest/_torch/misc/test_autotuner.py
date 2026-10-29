@@ -22,6 +22,7 @@ import re
 import statistics
 import sys
 import tempfile
+from types import SimpleNamespace
 from typing import Any, List
 
 import cloudpickle
@@ -1827,6 +1828,174 @@ def test_nvmmh_tactics_compute_the_product(case, monkeypatch):
         torch.cuda.synchronize()
         assert torch.isfinite(output).all(), tactic
         assert calc_diff(output, reference) < max_diff, tactic
+
+
+class _TacticSpaceRunner(TunableRunner):
+    """Runner whose tactic space key is set by the test."""
+
+    def __init__(self, space_key=None):
+        self.space_key = space_key
+
+    def unique_id(self):
+        return ()
+
+    def tactic_space_key(self):
+        return self.space_key
+
+    def get_valid_tactics(self, inputs: List[FakeTensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [0]
+
+    def forward(self,
+                /,
+                inputs: List[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        return inputs[0]
+
+
+_TACTIC_SPACE_SHAPES = (torch.Size([16, 64]), )
+
+
+def _tactic_space_cache_key(cache, runner):
+    return cache.get_cache_key("test_tactic_space", runner,
+                               _TACTIC_SPACE_SHAPES, TuningConfig())
+
+
+def test_tactic_space_key_extends_the_cache_key():
+    cache = autotuner.AutoTuner().profiling_cache
+    default = _tactic_space_cache_key(cache, _TacticSpaceRunner())
+    assert default == ("test_tactic_space", "_TacticSpaceRunner", "()",
+                       ((16, 64), ))
+    guided = _tactic_space_cache_key(cache, _TacticSpaceRunner(
+        ("nvmmh", "x", 3)))
+    assert guided == default + (("nvmmh", "x", 3), )
+    assert _tactic_space_cache_key(cache, _TacticSpaceRunner(
+        ("nvmmh", "x", 5))) != guided
+
+
+def test_search_cache_misses_across_tactic_spaces():
+    cache = autotuner.AutoTuner().profiling_cache
+    guided = _TacticSpaceRunner(("nvmmh", "x", 3))
+    cache.cache[_tactic_space_cache_key(cache, guided)] = (0, 7, 1.0)
+
+    def search(runner):
+        return cache.search_cache("test_tactic_space", [runner],
+                                  _TACTIC_SPACE_SHAPES, TuningConfig())
+
+    assert search(guided) == (True, 0, 7, 1.0)
+    assert not search(_TacticSpaceRunner())[0]
+    assert not search(_TacticSpaceRunner(("nvmmh", "x", 5)))[0]
+
+
+def test_tactic_space_key_survives_cache_save_and_load(tmp_path):
+    src = autotuner.AutoTuner().profiling_cache
+    key = _tactic_space_cache_key(src,
+                                  _TacticSpaceRunner(("nvmmh", "0.1.0.27", 3)))
+    src.cache[key] = (0, 7, 1.0)
+    path = str(tmp_path / "cache.json")
+    src.save_cache(path, rank=0)
+
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    assert dst.cache[key][1] == 7
+
+
+def test_nvmmh_tactic_space_key_follows_the_policy(monkeypatch):
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(ops.cutedsl_nvmmh, "IS_NVMMH_AVAILABLE", True)
+    monkeypatch.setattr(ops.cutedsl_nvmmh, "library_version", lambda: "x")
+    monkeypatch.setattr(tuner, "nvmmh_config", None)
+    assert ops._nvmmh_tactic_space_key() is None
+    monkeypatch.setattr(tuner, "nvmmh_config", NvMMHConfig(max_tactics=3))
+    assert ops._nvmmh_tactic_space_key() == ("nvmmh", "x", 3)
+    monkeypatch.setattr(ops.cutedsl_nvmmh, "IS_NVMMH_AVAILABLE", False)
+    assert ops._nvmmh_tactic_space_key() is None
+
+
+def test_nvfp4_unified_runner_keys_only_the_cutedsl_tactic_space(monkeypatch):
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops
+
+    monkeypatch.setattr(torch_custom_ops, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(torch_custom_ops,
+                        "_nvmmh_tactic_space_key",
+                        lambda: ("nvmmh", "x", 3),
+                        raising=False)
+    runner = torch_custom_ops.NVFP4GemmUnifiedRunner
+    assert runner(0, torch.bfloat16,
+                  ["cutlass", "cutedsl"]).tactic_space_key() == ("nvmmh", "x",
+                                                                 3)
+    assert runner(0, torch.bfloat16,
+                  ["cutlass", "cublaslt"]).tactic_space_key() is None
+
+
+def test_locality_domain_runner_forwards_the_tactic_space_key():
+    from tensorrt_llm._torch.locality_domain.autotune import \
+        LocalityDomainConcurrentTunableRunner
+
+    inner = _TacticSpaceRunner()
+    wrapper = LocalityDomainConcurrentTunableRunner(
+        inner, SimpleNamespace(num_partitions=2), 2, lambda *args: None)
+    assert wrapper.tactic_space_key() is None
+    inner.space_key = ("nvmmh", "x", 3)
+    assert wrapper.tactic_space_key() == ("nvmmh", "x", 3)
+
+
+def test_configure_autotuner_nvmmh_installs_the_engine_policy(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.model_engine import \
+        _configure_autotuner_nvmmh
+    from tensorrt_llm.llmapi.llm_args import AutoTunerNvMMHConfig
+
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(tuner, "nvmmh_config", None)
+    _configure_autotuner_nvmmh(
+        SimpleNamespace(autotuner_nvmmh_config=AutoTunerNvMMHConfig(
+            max_tactics=7)))
+    assert tuner.nvmmh_config == NvMMHConfig(max_tactics=7)
+    _configure_autotuner_nvmmh(SimpleNamespace(autotuner_nvmmh_config=None))
+    assert tuner.nvmmh_config is None
+
+
+def test_merge_nvmmh_rankings_picks_the_lowest_scoring_head():
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        _merge_nvmmh_rankings
+
+    def ranking(name, *scores):
+        return [(SimpleNamespace(score=score), f"{name}{i}")
+                for i, score in enumerate(scores)]
+
+    def merge(*rankings):
+        return [name for _, name in _merge_nvmmh_rankings(list(rankings))]
+
+    # Each ranking keeps its own order, even where it is not sorted by score.
+    assert merge(ranking("a", 1, 4, 2),
+                 ranking("b", 3, 5)) == ["a0", "b0", "a1", "a2", "b1"]
+    # Ties go to the earlier ranking.
+    assert merge(ranking("a", 1, 1), ranking("b", 1)) == ["a0", "a1", "b0"]
+    assert merge(ranking("a"), ranking("b", 2)) == ["b0"]
+    assert merge() == []
+
+
+def test_select_tactics_counts_configs_with_new_tactics():
+    from tensorrt_llm._torch.custom_ops.cutedsl_matmul_heuristics import \
+        select_tactics
+
+    ranked = [(None, ["a", "b"]), (None, ["b"]), (None, ["b", "c"]),
+              (None, ["d"])]
+    # The second config only repeats "b", so it is not counted.
+    assert select_tactics(ranked, 1) == ["a", "b"]
+    assert select_tactics(ranked, 2) == ["a", "b", "c"]
+    assert select_tactics(ranked, 10) == ["a", "b", "c", "d"]
+    assert select_tactics([], 3) == []
+
+
+@pytest.mark.parametrize("max_tactics", [True, 0, -1, "5", 2.0])
+def test_nvmmh_config_rejects_non_positive_integers(max_tactics):
+    with pytest.raises(ValueError, match="positive integer"):
+        NvMMHConfig(max_tactics=max_tactics)
 
 
 @pytest.mark.parametrize("distribution", ["random", "balanced"])

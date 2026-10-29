@@ -2011,12 +2011,15 @@ class AutoTunerNvMMHConfig(StrictBaseModel):
     nvMatmulHeuristics ranks highest for each problem shape, taking every
     field it models (CTA tile, cluster shape, split-K, rasterization order and
     swizzle) as returned, instead of profiling their full tactic space.
+    ``max_tactics`` counts kernel configurations, not profiled tactics.
     """
     max_tactics: PositiveInt = Field(
         default=5,
         description=
-        "Number of top-ranked nvMatmulHeuristics kernel configurations profiled per GEMM/BMM shape."
-    )
+        "Number of top-ranked nvMatmulHeuristics kernel configurations kept per GEMM/BMM shape. "
+        "Each configuration expands into one tactic per combination of the knobs nvMatmulHeuristics "
+        "does not model (e.g. SM107 prefetch, scheduler and mixed-cluster variants), so the number "
+        "of profiled tactics can be several times max_tactics.")
 
 
 class AttentionDpConfig(StrictBaseModel):

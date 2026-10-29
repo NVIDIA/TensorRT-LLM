@@ -722,6 +722,17 @@ def _merge_nvmmh_rankings(rankings: List[List[Tuple]]) -> List[Tuple]:
         heads[best] += 1
 
 
+def _log_nvmmh_fallback(runner: str, m: int, n: int, k: int,
+                        batch_size: int) -> None:
+    """Log a shape nvMMH gave no tactic for, so it runs the full sweep."""
+    logger.debug(f"CuteDSL: nvMMH returned no tactic for {runner} M={m}, "
+                 f"N={n}, K={k}, batch={batch_size}; using the full sweep.")
+    logger.info_once(
+        f"CuteDSL: nvMMH returned no tactic for some {runner} shapes, which "
+        "use the full tactic sweep; debug logging lists the shapes.",
+        key=f"nvmmh_fallback_{runner}")
+
+
 # The Blackwell block-scaled GEMM reduces split-K partials with TMA reduce-add
 # into the zeroed output and supports both rasters.
 _SM100_BLOCKSCALED_NVMMH_BACKEND = cutedsl_nvmmh.Backend(
@@ -1022,6 +1033,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                     nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, real_k, 1)
 
             # full shamoo
             mma_tiler_mn_candidates = [
@@ -5129,6 +5141,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     allow_split_k=True)
                 if nvmmh_tactics:
                     return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
 
             use_2cta_instrs_candi = [False, True]
             mma_tiler_mn_candi = _sm100_fp8_blockwise_mma_tiler_candidates(m)
@@ -5481,6 +5494,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     allow_split_k=inputs[4].shape[1] == m)
                 if nvmmh_tactics:
                     return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
 
             use_2cta_instrs_candi = [False, True]
             mma_tiler_mn_candi = _sm100_fp8_blockwise_mma_tiler_candidates(m)
@@ -9871,6 +9885,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     k, batch_size, None, 64, nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
 
             use_2cta_instrs_candi = [False, True]
             mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
@@ -10318,6 +10333,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     allow_split_k)
                 if nvmmh_tactics:
                     return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
 
             use_2cta_instrs_candi = [False, True]
             mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
@@ -10355,6 +10371,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     b_major,
                     c_major,
                 ) for split_k in split_k_candi
+                # Split-K serves grids of few output tiles, so only the
+                # smallest cluster M splits K.
+                if split_k == 1 or cluster_shape_mn[0] == (
+                    2 if use_2cta_instrs else 1)
             ]
 
         def forward(
@@ -10907,6 +10927,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, batch_size)
             return _sm107_bf16_valid_tactics(
                 m, n, k, batch_size, cutlass.BFloat16,
                 _SM107_BF16_MMA_TILER_MN_CANDIDATES, None)
@@ -11426,6 +11447,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     nvmmh_config.max_tactics)
                 if nvmmh_tactics:
                     return nvmmh_tactics
+                _log_nvmmh_fallback(type(self).__name__, m, n, k, 1)
 
             mma_tiler_mn_candi = list(_SM107_BF16_MMA_TILER_MN_CANDIDATES)
             # Skinny-M / small-N shapes under-use a 128x128 MMA tile (half the
@@ -13600,6 +13622,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cutlass.BFloat16, nvmmh_config.max_tactics)
                     if nvmmh_tactics:
                         return nvmmh_tactics
+                    _log_nvmmh_fallback(
+                        type(self).__name__, m, n, k, batch_size)
 
                 return [(use_2cta_instrs, mma_tiler, mma_inst_shape,
                          cluster_shape_mn) for use_2cta_instrs, mma_tiler,
@@ -13851,6 +13875,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         nvmmh_config.max_tactics, self.fp8_quantize_1x128)
                     if nvmmh_tactics:
                         return nvmmh_tactics
+                    _log_nvmmh_fallback(
+                        type(self).__name__, m, n, k, batch_size)
 
                 return [(use_2cta_instrs, mma_tiler, mma_inst_shape,
                          cluster_shape_mn) for use_2cta_instrs, mma_tiler,
@@ -14534,6 +14560,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         m, n, real_k, [False, True], nvmmh_config.max_tactics)
                     if nvmmh_tactics:
                         return nvmmh_tactics
+                    _log_nvmmh_fallback(type(self).__name__, m, n, real_k, 1)
 
                 # SM107 dense block-scaled tile sizes.
                 # b-reuse is enabled when mma_tiler_m = 2 * mma_inst_shape_m
