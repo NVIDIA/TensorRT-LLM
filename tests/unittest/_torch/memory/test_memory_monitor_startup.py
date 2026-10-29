@@ -287,3 +287,109 @@ class TestGroupMembers:
         )
         text = render(frame, _capability())
         assert "of which (GiB): Additional executor resources 1.00, Sampler 0.50" in text
+
+
+def _cuda_runtime():
+    import ctypes
+    import glob
+
+    for path in sorted(glob.glob("/usr/local/cuda/lib64/libcudart.so*")):
+        try:
+            return ctypes.CDLL(path)
+        except OSError:
+            continue
+    return None
+
+
+class TestResidualBreakdown:
+    """Splitting the overhead row by when, and where, it appeared."""
+
+    def test_parts_sum_to_the_residual(self):
+        startup._first = startup.Reading(process=10 * GIB, torch=3 * GIB, known=2 * GIB)
+        startup._stages.append(
+            startup.StageSample("model", "Model", 0, 0, process_taken=GIB, residual_taken=GIB)
+        )
+        startup._regions.append(
+            startup.RegionSample("custom allreduce workspace", "model", GIB // 2)
+        )
+        parts = dict(startup.residual_breakdown(8 * GIB))
+        assert sum(parts.values()) == 8 * GIB
+        assert parts["before the first startup step"] == 5 * GIB
+        # The region's share is taken out of the step it ran in.
+        assert parts["custom allreduce workspace"] == GIB // 2
+        assert parts["Model (other)"] == GIB // 2
+        assert parts["since startup"] == 2 * GIB
+
+    def test_freed_parts_show_as_negative_remainder(self):
+        startup._first = startup.Reading(process=10 * GIB, torch=0, known=0)
+        parts = dict(startup.residual_breakdown(9 * GIB))
+        assert parts["released since startup"] == -GIB
+
+    def test_nothing_recorded_nothing_shown(self):
+        assert startup.residual_breakdown(GIB) == []
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="measures a real allocation")
+    def test_region_names_memory_allocated_outside_torch(self):
+        # A library calling cudaMalloc itself: invisible to torch, visible to
+        # NVML, and therefore exactly what a region should catch.
+        import ctypes
+
+        # The context must exist first: NVML lists only processes that have
+        # one, so checking before creating it skips the test spuriously.
+        torch.empty(1, device="cuda")
+        if startup._process_used() is None:
+            pytest.skip("NVML cannot report this process here")
+        cudart = _cuda_runtime()
+        if cudart is None:
+            pytest.skip("no CUDA runtime library to call directly")
+        pointer = ctypes.c_void_p()
+        with startup.region("fake library"):
+            assert cudart.cudaMalloc(ctypes.byref(pointer), ctypes.c_size_t(256 << 20)) == 0
+        try:
+            sample = startup._regions[-1]
+            assert sample.name == "fake library"
+            assert sample.residual_taken >= 256 << 20
+        finally:
+            cudart.cudaFree(pointer)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="measures a real allocation")
+    def test_region_does_not_claim_torch_memory(self):
+        torch.empty(1, device="cuda")
+        if startup._process_used() is None:
+            pytest.skip("NVML cannot report this process here")
+        with startup.region("torch only"):
+            held = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+        try:
+            # Already counted under PyTorch; claiming it here would double count.
+            assert abs(startup._regions[-1].residual_taken) < 64 << 20
+        finally:
+            del held
+
+    def test_region_is_a_noop_when_off(self, monkeypatch):
+        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+        with startup.region("anything"):
+            pass
+        assert startup._regions == []
+
+    def test_overhead_row_lists_the_parts(self):
+        startup._first = startup.Reading(process=10 * GIB, torch=0, known=0)
+        startup._regions.append(startup.RegionSample("custom allreduce workspace", None, 2 * GIB))
+        frame = build_frame(
+            DeviceReading(total=180 * GIB, free=150 * GIB, process_used=30 * GIB),
+            TorchReading(reserved=0, live=0),
+            [],
+        )
+        text = render(frame, _capability())
+        assert "before the first startup step 10.00" in text
+        assert "custom allreduce workspace 2.00" in text
+
+    def test_no_breakdown_without_a_per_process_reading(self):
+        # Startup parts are per process; they would not reconcile with a
+        # device-wide upper bound.
+        startup._first = startup.Reading(process=10 * GIB, torch=0, known=0)
+        frame = build_frame(
+            DeviceReading(total=180 * GIB, free=150 * GIB, process_used=None),
+            TorchReading(reserved=0, live=0),
+            [],
+        )
+        assert "before the first startup step" not in render(frame, _capability())

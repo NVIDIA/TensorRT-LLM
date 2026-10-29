@@ -146,12 +146,25 @@ def group_totals(frame: Frame) -> GroupTotals:
             by_owner = members.setdefault(group, {})
             by_owner[name] = by_owner.get(name, 0) + free
 
+    # The overhead row is a residual, so it has no owners of its own; split
+    # it instead by when each part appeared. Only with a per-process reading:
+    # the startup measurements are per process and would not reconcile with
+    # a device-wide figure.
+    if not frame.device.process_used_is_upper_bound:
+        from .startup import residual_breakdown
+
+        parts = residual_breakdown(frame.nontorch_residual)
+        if parts:
+            members[Group.OVERHEAD] = dict(parts)
+
     return GroupTotals(
         sizes=sizes,
         unmeasured=tuple(unmeasured),
         process_total=frame.device.effective_process_used,
         process_total_is_upper_bound=frame.device.process_used_is_upper_bound,
-        members={g: sorted(owners.items(), key=lambda kv: -kv[1]) for g, owners in members.items()},
+        members={
+            g: sorted(owners.items(), key=lambda kv: -abs(kv[1])) for g, owners in members.items()
+        },
     )
 
 
@@ -230,10 +243,10 @@ def render_summary(
         if group is Group.OVERHEAD and frame.residual_is_negative:
             note = "NEGATIVE: readings disagree; see details"
         out.append(f"{line}   {note}")
-        parts = [(n, b) for n, b in (totals.members or {}).get(group, []) if b >= _SHOWN]
+        parts = [(n, b) for n, b in (totals.members or {}).get(group, []) if abs(b) >= _SHOWN]
         if len(parts) > 1:
-            listed = ", ".join(f"{n} {b / _GIB:.2f}" for n, b in parts[:4])
-            more = f", +{len(parts) - 4} more" if len(parts) > 4 else ""
+            listed = ", ".join(f"{n} {b / _GIB:.2f}" for n, b in parts[:5])
+            more = f", +{len(parts) - 5} more" if len(parts) > 5 else ""
             out.append(f"  {'':<28s}  of which (GiB): {listed}{more}")
 
     out.append("")
