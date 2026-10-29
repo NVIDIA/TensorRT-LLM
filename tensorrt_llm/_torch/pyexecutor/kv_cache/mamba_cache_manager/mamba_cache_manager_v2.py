@@ -99,6 +99,27 @@ if TYPE_CHECKING:
 GB = 1 << 30
 
 
+def _mamba_retained_turn_snapshots(
+    kv_cache_config: KvCacheConfig,
+    max_seq_len: Optional[int],
+) -> int:
+    """Return the snapshots that the earlier turns of one conversation keep.
+
+    Under ``per_conversation``, a conversation keeps the stable-boundary states
+    of up to ``max_num_turns`` completed turns. A from-end boundary moves with
+    the prompt, so each earlier turn keeps its own snapshot of it; the turns
+    share their from-start boundaries and their attention pages.
+    """
+    if not kv_cache_config.enable_block_reuse:
+        return 0
+    block_reuse_config = kv_cache_config.block_reuse_config
+    if BlockReusePolicy(block_reuse_config.policy) != BlockReusePolicy.PER_CONVERSATION:
+        return 0
+    offsets = set(kv_cache_config.mamba_state_config.additional_snapshot_offsets_from_end)
+    from_end_rules = sum(1 for offset in offsets if max_seq_len is None or offset < max_seq_len)
+    return (block_reuse_config.max_num_turns - 1) * from_end_rules
+
+
 class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
@@ -476,6 +497,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         Data-dependent divergence points are not modeled, only the branch prompt-end fallback.
 
+        Under ``per_conversation``, each earlier turn of a conversation that the cache retains
+        also keeps its own snapshot of every from-end boundary.
+
         Args:
             capacity: Estimated total sequence length of one typical request, in tokens (prompt plus
                 output). Serves as the estimated prompt length for snapshot placement.
@@ -516,7 +540,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
         if kv_cache_config.block_reuse_config.enable_branch_snapshot and num_snapshots == 0:
             num_snapshots = 1
-        return 1 + num_snapshots
+        retained = _mamba_retained_turn_snapshots(kv_cache_config, self.max_seq_len)
+        return 1 + num_snapshots + retained
 
     def _typical_request_descs(
         self,

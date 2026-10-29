@@ -2113,6 +2113,22 @@ class AttentionDpConfig(StrictBaseModel):
             "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_strict_conversation_affinity: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Keep a request of a pinned conversation in the waiting queue while "
+        "its rank is full, instead of placing it on another rank where its "
+        "KV-cache prefix is not cached. Requests without a pin are admitted "
+        "as before. Only used when kv_cache_routing_conversation_affinity is "
+        "True.")
+    kv_cache_routing_strict_affinity_max_wait_iters: PositiveInt = Field(
+        default=2000,
+        status="prototype",
+        description=
+        "Number of admission passes that may defer a request under strict "
+        "conversation affinity before it may be placed on any rank. Only used "
+        "when kv_cache_routing_strict_conversation_affinity is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':

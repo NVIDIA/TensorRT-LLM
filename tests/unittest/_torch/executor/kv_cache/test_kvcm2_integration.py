@@ -1343,6 +1343,40 @@ def test_avg_seq_len_updates_typical_step() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "policy, max_num_turns, windows, extra_turns",
+    [
+        ("per_conversation", 3, [None, 200], 2),
+        ("per_conversation", 1, [None, 200], 0),
+        ("per_request", 3, [None, 200], 0),
+        ("per_conversation", 3, [None, None], 0),
+    ],
+)
+def test_typical_step_counts_retained_conversation_turns(
+    policy: str, max_num_turns: int, windows: list[int | None], extra_turns: int
+) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(
+            avg_seq_len=256,
+            enable_block_reuse=True,
+            block_reuse_config=BlockReuseConfig(policy=policy, max_num_turns=max_num_turns),
+        ),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        max_draft_len=2,
+        max_attention_window_vec=windows,
+    )
+
+    # Each earlier turn of a typical request keeps one window: the widest window
+    # (200) rounded up to whole blocks plus a block, ending mid-block.
+    assert config.typical_step == BatchDesc(
+        [KVCacheDesc(capacity=2048, history_length=0)]
+        + [KVCacheDesc(capacity=256, history_length=253)] * 2
+        + [KVCacheDesc(capacity=384, history_length=319)] * (extra_turns * 2)
+    )
+
+
 def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
     with pytest.raises(ValueError, match="avg_seq_len"):
         _make_cache_config_for_test(

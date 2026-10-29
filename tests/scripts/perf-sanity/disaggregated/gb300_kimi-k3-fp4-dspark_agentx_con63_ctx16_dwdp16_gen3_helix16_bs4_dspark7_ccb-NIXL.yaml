@@ -111,6 +111,7 @@ worker_config:
   ctx:
     attention_dp_config:
       kv_cache_routing_conversation_affinity: true
+      kv_cache_routing_strict_conversation_affinity: true
       kv_cache_routing_new_conv_placement: least_queued
     cache_transceiver_config:
       backend: NIXL

@@ -946,6 +946,7 @@ class TestBenchmarkFillAdmissionFlowControl:
 
         ex.dist = Mock()
         ex.dist.tp_size = tp_size
+        ex.adp_router = Mock(admission_rank=Mock(return_value=None))
         return ex
 
     @staticmethod
@@ -1689,6 +1690,7 @@ class TestFillPhaseEndToEnd:
         ex.kv_connector_manager = None
         ex.enable_partial_reuse_for_disagg = False
         ex.active_requests = []
+        ex.adp_router = Mock(admission_rank=Mock(return_value=None))
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         _stub_transfer_entry_points(ex)

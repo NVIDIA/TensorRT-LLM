@@ -19,6 +19,7 @@ from tensorrt_llm._torch.host_staging import copy_host_to_device
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     GPU_LEVEL,
+    BlockReusePolicy,
     KVCacheManagerV2,
     Role,
     _estimate_full_attn_size_per_token,
@@ -153,6 +154,9 @@ class CSA2CacheManager(KVCacheManagerV2):
     Logical buffer identities include model layer, compression ratio and role.
     SWA belongs to the uncompressed family regardless of the layer's GLOBAL ratio.
     """
+
+    # Prompt-tail tokens a next turn may rewrite and still reuse the committed Encoder window.
+    _REWRITE_TOLERANCE = 512
 
     def __init__(
         self,
@@ -321,6 +325,32 @@ class CSA2CacheManager(KVCacheManagerV2):
             limit = max(0, req.prompt_len - self._decoder_replay_window)
             reuse_limit = limit if reuse_limit is None else min(limit, reuse_limit)
         return super()._context_reuse_tokens(req, reuse_limit)
+
+    def _context_end_checkpoint(self, req: LlmRequest, kv_cache) -> int | None:
+        """Commit the Encoder window that ends well before the prompt end, too.
+
+        ``_context_reuse_tokens`` stops reuse ``_decoder_replay_window`` tokens
+        before the end of the next prompt, while the per_request and
+        per_conversation policies commit only the window at the prompt end. A
+        next turn that resends this prompt, rewrites its last
+        ``_REWRITE_TOLERANCE`` tokens, or adds fewer than
+        ``_decoder_replay_window`` tokens can then reuse up to this point.
+        """
+        if (
+            not self._decoder_replay_window
+            or self._encoder_replay_enabled
+            or self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+        ):
+            return None
+        tokens_per_block = self.tokens_per_block
+        point = (
+            (req.prompt_len - self._decoder_replay_window - self._REWRITE_TOLERANCE)
+            // tokens_per_block
+            * tokens_per_block
+        )
+        if point <= kv_cache.num_committed_tokens or point < kv_cache.history_length:
+            return None
+        return point
 
     def _resume_context_cache(self, req: LlmRequest, cache) -> bool:
         """Select Encoder reuse before the normal context-cache activation."""
