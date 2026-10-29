@@ -234,6 +234,8 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     out.hostSparsePoolQuota = config.hostSparsePoolQuota;
     out.hostMemBacking = config.hostMemBacking;
     out.expansion = expansionMap;
+    out.gpuArena = config.poolRebalance.copyBasedRebalancing;
+    out.dropUnreferencedOnRebalance = config.poolRebalance.dropUnreferencedOnRebalance;
 
     for (auto& [key, variants] : poolGroups)
     {
