@@ -183,7 +183,7 @@ are not supported. See the
   role `reference`. Audio requires an image or video reference. See the
   [Ref2VA example](../../../examples/visual_gen/README.md#minimax-h3-reference-to-video-and-audio)
   for input limits, ordering, and media dependencies.
-- MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
+- MiniMax-H3 currently restricts TRTLLM attention to SM100, SM103 or SM107. This is a
   model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
