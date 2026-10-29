@@ -103,6 +103,10 @@ public:
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
         HostMemBackingOptions const& options = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
+    //! A level whose storage was built by the caller (the copy-based rebalancing arena).
+    CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
+        std::unique_ptr<CacheLevelStorage> storage);
+
     CacheLevel cacheLevel;
     CacheTier cacheTier;
     std::unique_ptr<CacheLevelStorage> storage;
@@ -192,6 +196,25 @@ public:
     void shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots,
         std::vector<SharedPtr<Page>> const& persistentPages);
     void expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots);
+
+    //! Shrink a pool group to `target`, a window inside its current one, at either or both ends.
+    //! Pages outside the target are dropped (copy-based rebalancing with the drop flag, droppable
+    //! pages only), evicted, or copied into free slots inside it, and their slot ids change.
+    void shrinkPoolGroupToWindow(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target,
+        std::vector<SharedPtr<Page>> const& persistentPages);
+
+    //! Whether the GPU level is a copy-based rebalancing arena.
+    [[nodiscard]] bool isGpuArena() const noexcept
+    {
+        return mGpuArena;
+    }
+
+    //! Exclusive bound on the hot-level slot ids pool group pgIdx can ever use; kernel views over
+    //! the pool must extend this far. For an arena that is the arena end, in this group's slots.
+    [[nodiscard]] SlotCount slotIdUpperBound(PoolGroupIndex pgIdx) const;
+
+    //! Current hot-level window of each pool group.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> hotWindows() const;
 
     // ---- Migration ---------------------------------------------------------
 
@@ -465,6 +488,17 @@ private:
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 
+    //! Copy-based rebalancing of the GPU arena: move the window boundaries to `ratioList`.
+    void adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList,
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages);
+    //! Move one arena pool group from `from` to `to`: grow over any space gained, then shrink off
+    //! any space lost. Space gained must already have been vacated by its previous owner.
+    void moveArenaWindow(PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to,
+        std::vector<SharedPtr<Page>> const& persistentPages);
+    //! Drop the droppable (unreferenced) pages of a pool group whose slots lie outside `target`.
+    //! Returns how many were dropped.
+    SlotCount dropUnreferencedPagesOutside(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target);
+
     LifeCyclePoolGroupMapping const& poolGroupMapping(CacheLevel level) const
     {
         TLLM_CHECK(level >= CacheLevel{0} && level < mSlotDescLists.size());
@@ -526,6 +560,9 @@ private:
     //! still satisfied.
     size_t mHostSparsePoolQuota = 0;
 
+    // Copy-based rebalancing (StorageConfig::gpuArena / dropUnreferencedOnRebalance).
+    bool mGpuArena = false;
+    bool mDropUnreferencedOnRebalance = false;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     RetentionExpiryQueue mRetentionExpiries;

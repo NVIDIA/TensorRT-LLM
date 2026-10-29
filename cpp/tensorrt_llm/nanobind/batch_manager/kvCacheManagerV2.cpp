@@ -1907,7 +1907,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "__init__",
             [](kv::PoolRebalanceConfig* cfg, int minSampledKvCaches, double cooldownSecs, int targetRatioUpdateInterval,
-                float ratioTolerance, double movingAverageDecay)
+                float ratioTolerance, double movingAverageDecay, bool copyBasedRebalancing,
+                bool dropUnreferencedOnRebalance)
             {
                 new (cfg) kv::PoolRebalanceConfig();
                 cfg->minSampledKvCaches = minSampledKvCaches;
@@ -1915,16 +1916,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->targetRatioUpdateInterval = targetRatioUpdateInterval;
                 cfg->ratioTolerance = ratioTolerance;
                 cfg->movingAverageDecay = movingAverageDecay;
+                cfg->copyBasedRebalancing = copyBasedRebalancing;
+                cfg->dropUnreferencedOnRebalance = dropUnreferencedOnRebalance;
                 cfg->validate();
             },
             nb::arg("min_sampled_kv_caches") = 2000, nb::arg("cooldown_secs") = 120.0,
             nb::arg("target_ratio_update_interval") = 100, nb::arg("ratio_tolerance") = 0.25f,
-            nb::arg("moving_average_decay") = 0.9999)
+            nb::arg("moving_average_decay") = 0.9999, nb::arg("copy_based_rebalancing") = false,
+            nb::arg("drop_unreferenced_on_rebalance") = false)
         .def_rw("min_sampled_kv_caches", &kv::PoolRebalanceConfig::minSampledKvCaches)
         .def_rw("cooldown_secs", &kv::PoolRebalanceConfig::cooldownSecs)
         .def_rw("target_ratio_update_interval", &kv::PoolRebalanceConfig::targetRatioUpdateInterval)
         .def_rw("ratio_tolerance", &kv::PoolRebalanceConfig::ratioTolerance)
         .def_rw("moving_average_decay", &kv::PoolRebalanceConfig::movingAverageDecay)
+        .def_rw("copy_based_rebalancing", &kv::PoolRebalanceConfig::copyBasedRebalancing)
+        .def_rw("drop_unreferenced_on_rebalance", &kv::PoolRebalanceConfig::dropUnreferencedOnRebalance)
         .def("validate", &kv::PoolRebalanceConfig::validate) DEF_COPY(kv::PoolRebalanceConfig);
 
     nb::class_<kv::KVCacheManagerConfig>(m, "KVCacheManagerConfig")
@@ -2673,6 +2679,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 manager, kv::TypedVec<kv::PoolGroupIndex, float>{std::move(ratios)});
         },
         nb::arg("manager"), nb::arg("ratios"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "gpu_slot_windows", [](kv::KvCacheManager& manager) { return kv::KvCacheIntrospection::gpuSlotWindows(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     // White-box reuse-tree introspection: mirror the Python manager's _life_cycles
     // and _radix_tree attributes so shared tests can inspect reuse state.
     mIntrospection.def(

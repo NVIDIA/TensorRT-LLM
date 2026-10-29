@@ -477,6 +477,8 @@ class PoolRebalanceConfig:
     target_ratio_update_interval: int = 100
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
+    copy_based_rebalancing: bool = False
+    drop_unreferenced_on_rebalance: bool = False
 
 @dataclass(slots=True)
 class KVCacheManagerConfig:

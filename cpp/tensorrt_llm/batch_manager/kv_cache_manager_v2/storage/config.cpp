@@ -205,6 +205,8 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.hostSparsePoolQuota = config.hostSparsePoolQuota;
     out.expansion = expansionMap;
+    out.gpuArena = config.poolRebalance.copyBasedRebalancing;
+    out.dropUnreferencedOnRebalance = config.poolRebalance.dropUnreferencedOnRebalance;
 
     for (auto& [key, variants] : poolGroups)
     {

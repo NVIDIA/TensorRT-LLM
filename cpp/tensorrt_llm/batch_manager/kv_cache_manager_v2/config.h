@@ -497,8 +497,24 @@ struct PoolRebalanceConfig
     // length) used to compute target pool ratios. Higher values react more slowly to change.
     double movingAverageDecay = 0.9999;
 
+    // Copy-based rebalancing (CoReba). The GPU tier becomes one arena mapped once at startup; every
+    // pool group addresses it from the same base pointer and owns a window of arena-relative block
+    // indices. A rebalance moves the window boundaries in proportion to the new ratios and copies the
+    // blocks in the parts that change owner into free space in their own pool; it never remaps memory
+    // and the GPU quota cannot change afterwards. Requires one pool per pool group.
+    bool copyBasedRebalancing = false;
+
+    // With copy-based rebalancing: drop, rather than copy, blocks that must move and that no request
+    // references (cached reusable blocks). Set once for the server.
+    bool dropUnreferencedOnRebalance = false;
+
     void validate() const
     {
+        if (dropUnreferencedOnRebalance && !copyBasedRebalancing)
+        {
+            throw std::invalid_argument(
+                "PoolRebalanceConfig: drop_unreferenced_on_rebalance requires copy_based_rebalancing");
+        }
         if (minSampledKvCaches < 0)
         {
             throw std::invalid_argument("PoolRebalanceConfig: min_sampled_kv_caches must be non-negative");

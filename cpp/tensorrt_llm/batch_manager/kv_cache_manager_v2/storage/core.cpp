@@ -24,6 +24,7 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -66,12 +67,20 @@ size_t tierAllocationGranularity(CacheTier tier, size_t quota)
 // ---------------------------------------------------------------------------
 
 SlotAllocator::SlotAllocator(SlotCount capacity)
-    : mCapacity(capacity)
-    , mTargetCapacity(capacity)
-    , mNumActiveSlots(0)
-    , mNumReadyRecycledSlots(0)
-    , mOccupiedMask(slotCountToSizeT(capacity))
+    : SlotAllocator(SlotWindow{SlotId{0}, SlotId{capacity}}, Growth::kAscending)
 {
+}
+
+SlotAllocator::SlotAllocator(SlotWindow window, Growth growth)
+    : mWindow(window)
+    , mTarget(window)
+    , mIssued{window.begin, window.begin}
+    , mGrowth(growth)
+    , mNumReadyRecycledSlots(0)
+    , mOccupiedMask(slotCountToSizeT(window.end.value()))
+{
+    TLLM_CHECK_WITH_INFO(window.begin >= SlotCount{0} && !(window.end < window.begin),
+        "SlotAllocator: window must be a non-negative, non-inverted range");
 }
 
 SlotAllocator::~SlotAllocator()
@@ -81,11 +90,11 @@ SlotAllocator::~SlotAllocator()
     {
         KVCM2_CHECK_FATAL_WITH_INFO(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size(),
             "SlotAllocator destroyed with unfinished events — did you call synchronize()?");
-        KVCM2_CHECK_FATAL_WITH_INFO(mTargetCapacity == mCapacity && mOverflowSlots.empty(),
+        KVCM2_CHECK_FATAL_WITH_INFO(!shrinkInProgress() && mOverflowSlots.empty(),
             "SlotAllocator destroyed while resize is in progress");
         KVCM2_CHECK_FATAL_WITH_INFO(
             mOccupiedMask.numSetBits() == 0, "SlotAllocator destroyed with occupied slots still in use");
-        KVCM2_CHECK_FATAL_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots),
+        KVCM2_CHECK_FATAL_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(numActiveSlots()),
             "SlotAllocator destroyed with some slots not recycled");
     }
 
@@ -104,8 +113,34 @@ SlotAllocator::~SlotAllocator()
 
 SlotCount SlotAllocator::numFreeSlots() const noexcept
 {
-    SlotCount const inactiveSlots = mTargetCapacity > mNumActiveSlots ? mTargetCapacity - mNumActiveSlots : 0;
-    return slotCountValueFromSize(mRecycledSlots.size()) + inactiveSlots;
+    // mIssued lies inside the target, so the rest of the target has never been handed out.
+    SlotCount const neverIssued = mTarget.size() - mIssued.size();
+    return slotCountValueFromSize(mRecycledSlots.size()) + neverIssued;
+}
+
+SlotCount SlotAllocator::numIssuedOutside(SlotWindow target) const noexcept
+{
+    // Issued ids are mIssued plus, during a shrink, the ones already counted outside mTarget.
+    return mNumIssuedOutsideTarget + mIssued.size() - mIssued.intersect(target).size();
+}
+
+SlotId SlotAllocator::issueFreshId()
+{
+    TLLM_CHECK_DEBUG(mIssued.size() < mTarget.size());
+    if (mIssued.empty())
+    {
+        // Start the run at the end of the target that fresh ids should come from.
+        SlotId const anchor = mGrowth == Growth::kAscending ? mTarget.begin : mTarget.end;
+        mIssued = SlotWindow{anchor, anchor};
+    }
+    bool const canGrowUp = mIssued.end < mTarget.end;
+    bool const canGrowDown = mTarget.begin < mIssued.begin;
+    bool const growUp = mGrowth == Growth::kAscending ? canGrowUp : !canGrowDown;
+    if (growUp)
+    {
+        return mIssued.end++;
+    }
+    return --mIssued.begin;
 }
 
 SlotCount SlotAllocator::numOccupiedSlots() const noexcept
@@ -131,9 +166,9 @@ Slot SlotAllocator::allocate()
         --mNumReadyRecycledSlots;
         TLLM_CHECK_DEBUG_WITH_INFO(slot.readyEvent.isClosed(), "ready recycled slot has non-null event");
     }
-    else if (mNumActiveSlots < std::min(mCapacity, mTargetCapacity))
+    else if (mIssued.size() < mTarget.size())
     {
-        slot.setSlotId(SlotId{mNumActiveSlots++});
+        slot.setSlotId(issueFreshId());
     }
     else
     {
@@ -179,7 +214,7 @@ void SlotAllocator::release(Slot slot)
         throw LogicError("SlotAllocator::release: slot is not occupied");
     }
     mOccupiedMask.clear(toSizeT(slotId));
-    if (slotId < mTargetCapacity)
+    if (mTarget.contains(slotId))
     {
         mRecycledSlots.push_back(std::move(slot));
     }
@@ -193,27 +228,44 @@ void SlotAllocator::release(Slot slot)
 
 void SlotAllocator::expand(SlotCount newNumSlots)
 {
+    TLLM_CHECK_DEBUG(newNumSlots > numSlots());
+    expandWindow(SlotWindow{mWindow.begin, mWindow.begin + newNumSlots});
+}
+
+void SlotAllocator::expandWindow(SlotWindow window)
+{
     TLLM_CHECK_DEBUG(check());
-    TLLM_CHECK_DEBUG(mTargetCapacity == mCapacity);
-    TLLM_CHECK_DEBUG(newNumSlots > mCapacity);
-    mOccupiedMask.resize(slotCountToSizeT(newNumSlots));
-    mCapacity = newNumSlots;
-    mTargetCapacity = newNumSlots;
+    TLLM_CHECK_DEBUG(!shrinkInProgress());
+    TLLM_CHECK_WITH_INFO(window.contains(mWindow) && window != mWindow && window.begin >= SlotCount{0},
+        "SlotAllocator::expandWindow: the new window must strictly contain the current one");
+    if (toSizeT(window.end) > mOccupiedMask.size())
+    {
+        mOccupiedMask.resize(toSizeT(window.end));
+    }
+    mWindow = window;
+    mTarget = window;
     TLLM_CHECK_DEBUG(check());
 }
 
 void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
 {
+    TLLM_CHECK_DEBUG(newNumSlots < numSlots());
+    prepareForShrinkWindow(SlotWindow{mWindow.begin, mWindow.begin + newNumSlots});
+}
+
+void SlotAllocator::prepareForShrinkWindow(SlotWindow target)
+{
     TLLM_CHECK_DEBUG(check());
-    TLLM_CHECK_DEBUG(mTargetCapacity == mCapacity);
-    TLLM_CHECK_DEBUG(newNumSlots < mCapacity);
+    TLLM_CHECK_DEBUG(!shrinkInProgress());
+    TLLM_CHECK_WITH_INFO(mWindow.contains(target) && target != mWindow,
+        "SlotAllocator::prepareForShrinkWindow: the target must lie strictly inside the current window");
     std::deque<Slot> newRecycled;
     SlotCount newNumReady = 0;
     SlotCount const oldNumReady = mNumReadyRecycledSlots;
     SlotCount idx = 0;
     for (auto& s : mRecycledSlots)
     {
-        if (s.slotId() < newNumSlots)
+        if (target.contains(s.slotId()))
         {
             if (idx < oldNumReady)
                 ++newNumReady;
@@ -227,17 +279,24 @@ void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
     }
     mRecycledSlots = std::move(newRecycled);
     mNumReadyRecycledSlots = newNumReady;
-    mTargetCapacity = newNumSlots;
+    // Issued ids outside the target become overflow; the run inside it stays contiguous.
+    mNumIssuedOutsideTarget = numIssuedOutside(target);
+    mIssued = mIssued.intersect(target);
+    if (mIssued.empty())
+    {
+        // Disjoint: keep the (empty) run inside the target. issueFreshId() re-anchors it anyway.
+        mIssued = SlotWindow{target.begin, target.begin};
+    }
+    mTarget = target;
     TLLM_CHECK_DEBUG(check());
 }
 
 bool SlotAllocator::finishShrink()
 {
     TLLM_CHECK_DEBUG(check());
-    // Overflow-range IDs that were ever issued are exactly
-    // max(0, _num_active_slots - _target_capacity); the underused case
-    // (_num_active_slots <= _target_capacity) collapses to zero.
-    SlotCount const expectedOverflow = std::max(SlotCount{0}, mNumActiveSlots - mTargetCapacity);
+    // Every issued id outside the target has to come back before the window can shrink. An
+    // underused pool (nothing issued outside the target) needs nothing back.
+    SlotCount const expectedOverflow = mNumIssuedOutsideTarget;
     if (shrinkInProgress() && slotCountValueFromSize(mOverflowSlots.size()) == expectedOverflow)
     {
         // Validate uniqueness of slot IDs in overflow (debug only).
@@ -258,8 +317,8 @@ bool SlotAllocator::finishShrink()
         for (auto& s : mOverflowSlots)
             s.resetSlot();
         mOverflowSlots.clear();
-        mCapacity = mTargetCapacity;
-        mNumActiveSlots = std::min(mNumActiveSlots, mCapacity);
+        mWindow = mTarget;
+        mNumIssuedOutsideTarget = 0;
         scrubEvents();
         TLLM_CHECK_DEBUG(check());
         return true;
@@ -270,10 +329,10 @@ bool SlotAllocator::finishShrink()
 std::vector<SlotId> SlotAllocator::getSlotsBlockingShrink() const
 {
     std::vector<SlotId> result;
-    for (SlotCount id = mTargetCapacity; id < mCapacity; ++id)
+    for (SlotId id = mWindow.begin; id < mWindow.end; ++id)
     {
-        if (mOccupiedMask.get(slotCountToSizeT(id)))
-            result.push_back(SlotId{id});
+        if (!mTarget.contains(id) && mOccupiedMask.get(toSizeT(id)))
+            result.push_back(id);
     }
     return result;
 }
@@ -288,24 +347,24 @@ void SlotAllocator::synchronize()
 
 bool SlotAllocator::check() const noexcept
 {
-    // Mirrors Python SlotAllocator._check().
-    if (mNumActiveSlots > mCapacity)
+    // Mirrors Python SlotAllocator._check(), generalized to windows.
+    if (!mWindow.contains(mTarget) || !mTarget.contains(mIssued))
         return false;
-    if (mTargetCapacity > mCapacity)
+    if (!shrinkInProgress() && (!mOverflowSlots.empty() || mNumIssuedOutsideTarget != 0))
         return false;
-    if (!shrinkInProgress() && !mOverflowSlots.empty())
+    if (mNumIssuedOutsideTarget > mWindow.size() - mTarget.size())
         return false;
     for (auto const& slot : mOverflowSlots)
     {
         if (!slot.hasValidSlot())
             return false;
-        SlotCount id = slot.slotId().value();
-        if (id < mTargetCapacity || id >= mCapacity)
+        SlotId const id = slot.slotId();
+        if (mTarget.contains(id) || !mWindow.contains(id))
             return false;
     }
     SlotCount const accountedSlots = slotCountValueFromSize(mRecycledSlots.size())
         + slotCountValueFromSize(mOverflowSlots.size()) + numOccupiedSlots();
-    if (accountedSlots != mNumActiveSlots)
+    if (accountedSlots != numActiveSlots())
         return false;
     return true;
 }
@@ -369,6 +428,52 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 {
     TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "GpuSlotPool::slotAddress: slot index out of bounds");
     return MemAddress(mVirtMem.address() + mSlotSize * toSizeT(slot));
+}
+
+// ---------------------------------------------------------------------------
+// ArenaGpuSlotPool
+// ---------------------------------------------------------------------------
+
+ArenaGpuSlotPool::ArenaGpuSlotPool(
+    size_t slotSize, MemAddress arenaBase, size_t arenaBytes, SlotWindow window, size_t granularity)
+    : SlotPoolBase(slotSize)
+    , mArenaBase(arenaBase)
+    , mArenaBytes(arenaBytes)
+    , mGranularity(granularity)
+{
+    setWindow(window);
+}
+
+void ArenaGpuSlotPool::destroy()
+{
+    // The memory belongs to the arena, which outlives every pool in it.
+    mWindow = SlotWindow{mWindow.begin, mWindow.begin};
+}
+
+void ArenaGpuSlotPool::resize(SlotCount newNumSlots)
+{
+    setWindow(SlotWindow{mWindow.begin, mWindow.begin + newNumSlots});
+}
+
+void ArenaGpuSlotPool::setWindow(SlotWindow window)
+{
+    TLLM_CHECK_WITH_INFO(window.begin >= SlotCount{0} && !(window.end < window.begin)
+            && toSizeT(window.end) <= mArenaBytes / mSlotSize,
+        "ArenaGpuSlotPool::setWindow: window [%ld, %ld) does not fit an arena of %zu slots of %zu bytes",
+        static_cast<long>(window.begin.value()), static_cast<long>(window.end.value()), mArenaBytes / mSlotSize,
+        mSlotSize);
+    mWindow = window;
+}
+
+Address ArenaGpuSlotPool::slotAddress(SlotId slot) const
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "ArenaGpuSlotPool::slotAddress: slot outside the pool's window");
+    return MemAddress(mArenaBase + mSlotSize * toSizeT(slot));
+}
+
+Address ArenaGpuSlotPool::baseAddress() const
+{
+    return mArenaBase;
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +604,11 @@ PoolGroupBase::PoolGroupBase(SlotCount numSlots)
 {
 }
 
+PoolGroupBase::PoolGroupBase(SlotWindow window, SlotAllocator::Growth growth)
+    : mSlotAllocator(window, growth)
+{
+}
+
 SlotCount PoolGroupBase::getNumSlotsFromPools() const noexcept
 {
     if (mPools.empty())
@@ -593,6 +703,24 @@ void PoolGroupBase::resizePools(std::optional<SlotCount> newNumSlots)
         "After resizePools: allocator capacity exceeds pool capacity");
 }
 
+void PoolGroupBase::setPoolWindows(SlotWindow window)
+{
+    for (auto& p : mPools)
+        p->setWindow(window);
+}
+
+SlotCount PoolGroupBase::slotIdUpperBound() const noexcept
+{
+    if (mPools.empty())
+        return 0;
+    SlotCount bound = mPools.front()->slotIdUpperBound();
+    for (PoolIndex poolIdx{1}; poolIdx < mPools.size(); ++poolIdx)
+    {
+        bound = std::min(bound, mPools[poolIdx]->slotIdUpperBound());
+    }
+    return bound;
+}
+
 TypedVec<PoolIndex, Address> PoolGroupBase::slotAddress(SlotId slotId) const
 {
     TypedVec<PoolIndex, Address> addrs;
@@ -673,6 +801,19 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
         }
         mPools.push_back(std::make_unique<GpuSlotPool>(sz, vmSize, physMemAllocator, numSlots));
     }
+}
+
+GpuPoolGroup::GpuPoolGroup(SlotWindow window, SlotAllocator::Growth growth,
+    TypedVec<PoolIndex, size_t> const& slotSizeList, MemAddress arenaBase, size_t arenaBytes, size_t arenaGranularity)
+    : PoolGroupBase(window, growth)
+{
+    // A group's pools share slot ids, but in an arena each pool needs its own region that moves
+    // with the others; that layout is not implemented, so the arena takes one pool per group.
+    TLLM_CHECK_WITH_INFO(slotSizeList.size() == PoolIndex{1},
+        "Copy-based rebalancing supports exactly one pool per pool group (this group has %d)",
+        slotSizeList.size().value());
+    mPools.push_back(std::make_unique<ArenaGpuSlotPool>(
+        slotSizeList[PoolIndex{0}], arenaBase, arenaBytes, window, arenaGranularity));
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +903,197 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
         mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
             slotCountList[pgIdx], sizes, mPhysMemAllocator, std::move(sparsity), hostOptions, sparseReservation));
     }
+}
+
+// ---------------------------------------------------------------------------
+// ArenaGpuCacheLevelStorage
+// ---------------------------------------------------------------------------
+
+namespace
+{
+TypedVec<PoolGroupIndex, size_t> singlePoolSlotSizes(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList)
+{
+    TypedVec<PoolGroupIndex, size_t> sizes;
+    sizes.reserve(slotDescList.size());
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    {
+        auto const sizeList = slotDescList[pgIdx].slotSizeList();
+        TLLM_CHECK_WITH_INFO(sizeList.size() == PoolIndex{1},
+            "Copy-based rebalancing supports exactly one pool per pool group (pool group %d has %d)", pgIdx.value(),
+            sizeList.size().value());
+        sizes.push_back(sizeList[PoolIndex{0}]);
+    }
+    return sizes;
+}
+} // namespace
+
+ArenaGpuCacheLevelStorage::ArenaGpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    size_t arenaBytes, TypedVec<PoolGroupIndex, float> const& ratioList,
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, PooledPhysMemAllocator& physMemAllocator)
+    : mArenaBytes(arenaBytes)
+    // Mapped in full now and never remapped: rebalancing only moves windows.
+    , mArena(arenaBytes, physMemAllocator, arenaBytes / physMemAllocator.physMemSize())
+{
+    TLLM_CHECK_WITH_INFO(arenaBytes > 0 && arenaBytes % physMemAllocator.physMemSize() == 0,
+        "GPU arena size %zu must be a positive multiple of %zu", arenaBytes, physMemAllocator.physMemSize());
+    // Sparse pools (host memory, device-mapped; DeepSeek-V4 KV cache offload) live outside device
+    // memory and so outside any device arena. The arena has no layout for them.
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    {
+        for (PoolIndex p{0}; p < slotDescList[pgIdx].slotSizeList().size(); ++p)
+        {
+            TLLM_CHECK_WITH_INFO(!slotDescList[pgIdx].isSparse(p),
+                "Copy-based rebalancing does not support sparse (host-backed) pools; pool group %d pool %d is sparse",
+                pgIdx.value(), p.value());
+        }
+    }
+    auto const sizes = singlePoolSlotSizes(slotDescList);
+    auto const windows = computeArenaWindows(arenaBytes, sizes, ratioList, minSlots);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    {
+        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(windows[pgIdx], growthFor(pgIdx, slotDescList.size()),
+            slotDescList[pgIdx].slotSizeList(), arenaBase(), arenaBytes, physMemAllocator.physMemSize()));
+    }
+}
+
+ArenaGpuCacheLevelStorage::~ArenaGpuCacheLevelStorage()
+{
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
+}
+
+void ArenaGpuCacheLevelStorage::destroy()
+{
+    CacheLevelStorage::destroy();
+    mArena.destroy();
+}
+
+TypedVec<PoolGroupIndex, size_t> ArenaGpuCacheLevelStorage::slotSizes() const
+{
+    TypedVec<PoolGroupIndex, size_t> sizes;
+    sizes.reserve(mPoolGroups.size());
+    for (auto const& pg : mPoolGroups)
+        sizes.push_back(pg->slotSize()[PoolIndex{0}]);
+    return sizes;
+}
+
+TypedVec<PoolGroupIndex, SlotWindow> ArenaGpuCacheLevelStorage::windows() const
+{
+    TypedVec<PoolGroupIndex, SlotWindow> result;
+    result.reserve(mPoolGroups.size());
+    for (auto const& pg : mPoolGroups)
+        result.push_back(pg->slotAllocator().window());
+    return result;
+}
+
+TypedVec<PoolGroupIndex, SlotWindow> ArenaGpuCacheLevelStorage::computeWindows(
+    TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+{
+    return computeArenaWindows(mArenaBytes, slotSizes(), ratioList, minSlots);
+}
+
+SlotAllocator::Growth ArenaGpuCacheLevelStorage::growthFor(PoolGroupIndex pgIdx, PoolGroupIndex numPoolGroups) noexcept
+{
+    // The last group's only moving edge is its begin; every other group's end can move.
+    bool const isLast = numPoolGroups > PoolGroupIndex{1} && pgIdx == numPoolGroups - 1;
+    return isLast ? SlotAllocator::Growth::kDescending : SlotAllocator::Growth::kAscending;
+}
+
+TypedVec<PoolGroupIndex, SlotWindow> ArenaGpuCacheLevelStorage::computeArenaWindows(size_t arenaBytes,
+    TypedVec<PoolGroupIndex, size_t> const& slotSizes, TypedVec<PoolGroupIndex, float> const& ratioList,
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
+{
+    PoolGroupIndex const numPg = slotSizes.size();
+    TLLM_CHECK_WITH_INFO(numPg > PoolGroupIndex{0} && ratioList.size() == numPg && minSlots.size() == numPg,
+        "computeArenaWindows: slot sizes, ratios and min slots must have one entry per pool group");
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        TLLM_CHECK_WITH_INFO(slotSizes[pgIdx] > 0 && ratioList[pgIdx] > 0.f,
+            "computeArenaWindows: slot sizes and ratios must be positive");
+    }
+    auto minSlotsOf = [&](PoolGroupIndex pgIdx) { return std::max(minSlots[pgIdx], SlotCount{1}); };
+    // Smallest share that still yields minSlots after step 2: each boundary snaps by up to half the
+    // larger neighbouring slot size (a full one is reserved), and rounding to whole blocks at the two
+    // ends loses under one block each.
+    auto floorBytesOf = [&](PoolGroupIndex pgIdx)
+    {
+        size_t const s = slotSizes[pgIdx];
+        size_t margin = 2 * s;
+        if (pgIdx > PoolGroupIndex{0})
+            margin += std::max(s, slotSizes[pgIdx - 1]);
+        if (pgIdx + 1 < numPg)
+            margin += std::max(s, slotSizes[pgIdx + 1]);
+        return static_cast<double>(slotCountToSizeT(minSlotsOf(pgIdx)) * s + margin);
+    };
+
+    // 1. Byte share per group. A group whose share would not hold its minimum is pinned to its floor
+    //    and the rest is shared out again, as in ratioToSlotCountList.
+    TypedVec<PoolGroupIndex, double> share(numPg, 0.0);
+    TypedVec<PoolGroupIndex, std::uint8_t> pinned(numPg, 0); // not bool: TypedVec wraps std::vector
+    double budget = static_cast<double>(arenaBytes);
+    while (true)
+    {
+        double ratioSum = 0.0;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+        {
+            if (!pinned[pgIdx])
+                ratioSum += static_cast<double>(ratioList[pgIdx]);
+        }
+        if (ratioSum == 0.0)
+            break; // every group is pinned
+        bool newlyPinned = false;
+        double pinnedBytes = 0.0;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+        {
+            if (pinned[pgIdx])
+                continue;
+            share[pgIdx] = budget * static_cast<double>(ratioList[pgIdx]) / ratioSum;
+            double const floorBytes = floorBytesOf(pgIdx);
+            if (share[pgIdx] < floorBytes)
+            {
+                share[pgIdx] = floorBytes;
+                pinned[pgIdx] = 1;
+                pinnedBytes += floorBytes;
+                newlyPinned = true;
+            }
+        }
+        budget -= pinnedBytes;
+        if (budget < 0.0)
+        {
+            throw std::invalid_argument("GPU arena of " + std::to_string(arenaBytes)
+                + " bytes is too small for the pool groups' min_slots constraints");
+        }
+        if (!newlyPinned)
+            break;
+    }
+
+    // 2. Boundaries between neighbours, snapped to whole blocks of the larger neighbour.
+    TypedVec<PoolGroupIndex, size_t> begins(numPg, 0);
+    double cumulative = 0.0;
+    for (PoolGroupIndex pgIdx{1}; pgIdx < numPg; ++pgIdx)
+    {
+        cumulative += share[pgIdx - 1];
+        size_t const grid = std::max(slotSizes[pgIdx - 1], slotSizes[pgIdx]);
+        auto const snapped = static_cast<size_t>(std::llround(cumulative / static_cast<double>(grid))) * grid;
+        begins[pgIdx] = std::clamp(snapped, begins[pgIdx - 1], arenaBytes);
+    }
+
+    // 3. Each group takes the whole blocks between its boundaries.
+    TypedVec<PoolGroupIndex, SlotWindow> windows(numPg);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        size_t const slotSize = slotSizes[pgIdx];
+        size_t const endBytes = pgIdx + 1 < numPg ? begins[pgIdx + 1] : arenaBytes;
+        SlotId const begin{slotCountValueFromSize(divUp(begins[pgIdx], slotSize))};
+        SlotId const end{std::max(begin.value(), slotCountValueFromSize(endBytes / slotSize))};
+        windows[pgIdx] = SlotWindow{begin, end};
+        if (windows[pgIdx].size() < minSlotsOf(pgIdx))
+        {
+            throw std::invalid_argument("GPU arena of " + std::to_string(arenaBytes) + " bytes leaves pool group "
+                + std::to_string(pgIdx.value()) + " " + std::to_string(windows[pgIdx].size())
+                + " slots, below its minimum of " + std::to_string(minSlotsOf(pgIdx)));
+        }
+    }
+    return windows;
 }
 
 // ---------------------------------------------------------------------------

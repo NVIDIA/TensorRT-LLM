@@ -32,6 +32,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -113,6 +115,15 @@ CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     storage = createCacheLevelStorage(
         tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options, sparseReservation);
+}
+
+CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
+    std::unique_ptr<CacheLevelStorage> levelStorage)
+    : cacheLevel(cl)
+    , cacheTier(levelStorage->cacheTier())
+    , storage(std::move(levelStorage))
+    , controller(lifeCycleGrouping, cl)
+{
 }
 
 // ---------------------------------------------------------------------------
@@ -386,10 +397,23 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mHostSparsePoolQuota = config.hostSparsePoolQuota.has_value() ? *config.hostSparsePoolQuota
                                                                   : defaultHostSparsePoolQuota(config.cacheTiers);
     // From the descriptors: the level's storage does not exist yet.
-    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
-        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota));
-    mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{}, mHostSparsePoolQuota);
+    mGpuArena = config.gpuArena;
+    mDropUnreferencedOnRebalance = config.dropUnreferencedOnRebalance;
+    if (mGpuArena)
+    {
+        // The whole GPU quota becomes one arena, rounded down to whole physical chunks.
+        size_t const arenaBytes = roundDown(gpuQuota, gpuGranularity);
+        mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel,
+            std::make_unique<ArenaGpuCacheLevelStorage>(
+                slotDescList(kHotLevel), arenaBytes, hotRatio, mHotMinSlots, *mGpuPhysMemAllocator));
+    }
+    else
+    {
+        auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
+            gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota));
+        mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
+            gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{}, mHostSparsePoolQuota);
+    }
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -1709,11 +1733,20 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
 void StorageManager::shrinkPoolGroup(
     CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
 {
+    auto const window = poolGroup(level, pgIdx).slotAllocator().window();
+    TLLM_CHECK_DEBUG(newNumSlots < window.size());
+    shrinkPoolGroupToWindow(level, pgIdx, SlotWindow{window.begin, window.begin + newNumSlots}, persistentPages);
+}
+
+void StorageManager::shrinkPoolGroupToWindow(
+    CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target, std::vector<SharedPtr<Page>> const& persistentPages)
+{
     refreshRetention();
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator();
     auto& ctrl = mLevels.at(level).controller;
-    TLLM_CHECK_DEBUG(newNumSlots < pg.numSlots());
+    TLLM_CHECK_DEBUG(allocator.window().contains(target) && allocator.window() != target);
+    SlotCount const newNumSlots = target.size();
 
     // A16: persistent_pages preconditions.
     TLLM_CHECK_DEBUG_WITH_INFO(
@@ -1723,25 +1756,31 @@ void StorageManager::shrinkPoolGroup(
                              { return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx; }),
         "Persistent page cache level or pool group mismatch");
 
-    // Fast path: when no slot id has ever been issued in the to-be-removed
-    // range [newNumSlots, capacity), there is nothing to migrate.
-    // numActiveSlots() is a monotone high-water mark of issued ids.
-    if (allocator.numActiveSlots() <= newNumSlots)
+    // Fast path: when no slot id has ever been issued in the part of the window being given up,
+    // there is nothing to migrate.
+    if (allocator.numIssuedOutside(target) == 0)
     {
-        allocator.prepareForShrink(newNumSlots);
+        allocator.prepareForShrinkWindow(target);
         allocator.finishShrink();
-        pg.resizePools(newNumSlots);
+        pg.setPoolWindows(target);
         return;
     }
 
-    // Find overflow pages: scheduled pages with slot_id >= newNumSlots.
+    // Copy-based rebalancing, step 7: pages that would have to move and that nothing references
+    // can be dropped instead, when the server is configured to.
+    if (mGpuArena && mDropUnreferencedOnRebalance && level == kHotLevel)
+    {
+        dropUnreferencedPagesOutside(level, pgIdx, target);
+    }
+
+    // Find overflow pages: scheduled pages whose slot lies outside the target.
     auto gen = ctrl.pageGenerator(pgIdx);
     std::deque<std::pair<SlotCount, SharedPtr<Page>>> overflowSlots;
     {
         SlotCount idx = 0;
         while (auto const* page = gen())
         {
-            if ((*page)->slotId() >= newNumSlots)
+            if (!target.contains((*page)->slotId()))
                 overflowSlots.emplace_back(idx, *page);
             ++idx;
         }
@@ -1751,7 +1790,7 @@ void StorageManager::shrinkPoolGroup(
     std::vector<SharedPtr<Page>> overflowPersistent;
     for (auto const& p : persistentPages)
     {
-        if (p->slotId() >= newNumSlots)
+        if (!target.contains(p->slotId()))
             overflowPersistent.push_back(p);
     }
     SlotCount numOverflowPersistent = slotCountValueFromSize(overflowPersistent.size());
@@ -1763,7 +1802,7 @@ void StorageManager::shrinkPoolGroup(
     }
 
     // Mark the allocator for shrink.
-    allocator.prepareForShrink(newNumSlots);
+    allocator.prepareForShrinkWindow(target);
 
     // Calculate minimum number of lowest-priority pages to evict.
     // Need numEvictedOverflowSlots because evicted overflow pages won't become free,
@@ -1807,12 +1846,144 @@ void StorageManager::shrinkPoolGroup(
     _batchedMigrate(level, level, overflowPages, /*updateSrc=*/true, MigrationRecorder{}, /*defrag=*/true);
 
     // A18: post-defrag overflow assertion — overflow slot count matches expectations.
-    TLLM_CHECK_DEBUG_WITH_INFO(allocator.numOverflowSlots() == allocator.numActiveSlots() - allocator.targetCapacity(),
+    TLLM_CHECK_DEBUG_WITH_INFO(allocator.numOverflowSlots() == allocator.numIssuedOutsideTarget(),
         "Post-defrag overflow slot count mismatch");
 
     // Finalize shrink and resize pools.
     allocator.finishShrink();
-    pg.resizePools(newNumSlots);
+    pg.setPoolWindows(target);
+}
+
+SlotCount StorageManager::dropUnreferencedPagesOutside(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target)
+{
+    auto& ctrl = mLevels.at(level).controller;
+    // Collect first: removing a page from its eviction queue invalidates the generator.
+    std::vector<SharedPtr<Page>> victims;
+    auto gen = ctrl.pageGenerator(pgIdx);
+    while (auto const* page = gen())
+    {
+        if (!target.contains((*page)->slotId()) && (*page)->status() == PageStatus::DROPPABLE)
+            victims.push_back(*page);
+    }
+    for (auto const& page : victims)
+    {
+        excludeFromEviction(*page);
+    }
+    auto const numDropped = slotCountValueFromSize(victims.size());
+    // The eviction queue was these pages' only owner, so releasing the last references here
+    // unlinks them from the radix tree and returns their slots (~CommittedPage, ~Page).
+    victims.clear();
+    return numDropped;
+}
+
+void StorageManager::moveArenaWindow(
+    PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to, std::vector<SharedPtr<Page>> const& persistentPages)
+{
+    auto& pg = poolGroup(kHotLevel, pgIdx);
+    TLLM_CHECK_DEBUG(pg.slotAllocator().window() == from);
+    // Growing first lets the blocks this group gives up be copied into the space it gains.
+    SlotWindow const hull = from.hull(to);
+    if (hull != from)
+    {
+        pg.setPoolWindows(hull);
+        pg.slotAllocator().expandWindow(hull);
+    }
+    if (hull != to)
+    {
+        shrinkPoolGroupToWindow(kHotLevel, pgIdx, to, persistentPages);
+    }
+}
+
+void StorageManager::adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList,
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
+{
+    auto& arena = static_cast<ArenaGpuCacheLevelStorage&>(*mLevels.at(kHotLevel).storage);
+    size_t const arenaQuota = arena.roundedNumBytes(CacheTier::GPU_MEM);
+    if (newQuota.has_value() && roundUp(*newQuota, arena.poolSizeGranularity(CacheTier::GPU_MEM)) != arenaQuota)
+    {
+        throw std::invalid_argument("Copy-based rebalancing uses a fixed GPU arena of "
+            + std::to_string(arenaQuota) + " bytes; the GPU quota cannot be changed to "
+            + std::to_string(*newQuota));
+    }
+    auto const oldWindows = arena.windows();
+    // Target clamping: a group cannot shrink below the pages it is unable to give up (occupied but
+    // not evictable, i.e. held by requests when this is the last level), scaled by 1/maxUtilForResume
+    // so that KvCache::resume does not then refuse every suspended request. Computing every window
+    // before touching any keeps an impossible target from leaving the arena half-adjusted.
+    auto minSlots = mHotMinSlots;
+    auto const& ctrl = mLevels.at(kHotLevel).controller;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < minSlots.size(); ++pgIdx)
+    {
+        SlotCount const unevictable
+            = arena.poolGroup(pgIdx).slotAllocator().numOccupiedSlots() - ctrl.numEvictablePages(pgIdx);
+        auto const resumable = static_cast<SlotCount>(
+            std::ceil(static_cast<double>(unevictable) / static_cast<double>(mMaxUtilForResume)));
+        minSlots[pgIdx] = std::max(minSlots[pgIdx], resumable);
+    }
+    auto const newWindows = arena.computeWindows(ratioList, minSlots);
+    PoolGroupIndex const numPg = oldWindows.size();
+    auto byteRange = [this](PoolGroupIndex pgIdx, SlotWindow w)
+    {
+        size_t const s = slotSize(kHotLevel, pgIdx)[PoolIndex{0}];
+        return std::make_pair(toSizeT(w.begin) * s, toSizeT(w.end) * s);
+    };
+    // Group a gains from group b if a's new range overlaps b's old range. Such space must be vacated
+    // by b before a may use it, so b moves first. Along a line of groups this order always exists:
+    // a gaining from b means a's new range reaches past the boundary between them, so b cannot also
+    // gain from a.
+    auto gainsFrom = [&](PoolGroupIndex a, PoolGroupIndex b)
+    {
+        auto const [aBegin, aEnd] = byteRange(a, newWindows[a]);
+        auto const [bBegin, bEnd] = byteRange(b, oldWindows[b]);
+        return a != b && aBegin < bEnd && bBegin < aEnd;
+    };
+    enum class State : std::uint8_t
+    {
+        kPending,
+        kMoving,
+        kDone
+    };
+    TypedVec<PoolGroupIndex, State> state(numPg, State::kPending);
+    std::function<void(PoolGroupIndex)> move = [&](PoolGroupIndex pgIdx)
+    {
+        if (state[pgIdx] == State::kDone)
+            return;
+        TLLM_CHECK_WITH_INFO(state[pgIdx] == State::kPending, "Cyclic arena window dependency");
+        state[pgIdx] = State::kMoving;
+        for (PoolGroupIndex other{0}; other < numPg; ++other)
+        {
+            if (gainsFrom(pgIdx, other))
+                move(other);
+        }
+        if (newWindows[pgIdx] != oldWindows[pgIdx])
+        {
+            static std::vector<SharedPtr<Page>> const kNoPages;
+            moveArenaWindow(pgIdx, oldWindows[pgIdx], newWindows[pgIdx],
+                persistentPages ? (*persistentPages)[pgIdx] : kNoPages);
+        }
+        state[pgIdx] = State::kDone;
+    };
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        move(pgIdx);
+    }
+}
+
+SlotCount StorageManager::slotIdUpperBound(PoolGroupIndex pgIdx) const
+{
+    return mLevels.at(kHotLevel).storage->poolGroup(pgIdx).slotIdUpperBound();
+}
+
+TypedVec<PoolGroupIndex, SlotWindow> StorageManager::hotWindows() const
+{
+    auto const& storage = *mLevels.at(kHotLevel).storage;
+    TypedVec<PoolGroupIndex, SlotWindow> result;
+    result.reserve(storage.numPoolGroups());
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storage.numPoolGroups(); ++pgIdx)
+    {
+        result.push_back(storage.poolGroup(pgIdx).slotAllocator().window());
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +1994,11 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     TypedVec<PoolGroupIndex, float> const& ratioList,
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
 {
+    if (level == kHotLevel && mGpuArena)
+    {
+        adjustArenaLevel(newQuota, ratioList, persistentPages);
+        return;
+    }
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
     size_t quota = newQuota.has_value()
