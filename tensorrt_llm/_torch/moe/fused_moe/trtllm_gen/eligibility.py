@@ -102,13 +102,11 @@ def check_flashinfer_shard_alignment(
     d: MoEDeployment,
     *,
     weight_alignment: int,
-    input_hidden_alignment: int | None = None,
 ) -> MoEEligibility | None:
-    """Per-rank shard alignment the FlashInfer bf16 kernels need, or ``None``.
+    """Per-rank intermediate-shard alignment the FlashInfer bf16 kernels need.
 
-    Two distinct spellings of "does not apply": an absent shape on ``p`` means
-    the caller did not say, so abstain; an ``input_hidden_alignment`` of
-    ``None`` means the kernels constrain the hidden dimension not at all.
+    ``None`` admits. An absent ``intermediate_size`` on ``p`` means the caller
+    did not say, so the gate abstains rather than rejects.
     """
     if p.intermediate_size is not None:
         inter = p.intermediate_size
@@ -126,17 +124,6 @@ def check_flashinfer_shard_alignment(
                 f"{cls.__name__} requires intermediate_size_per_partition "
                 f"({inter}) to be a multiple of {weight_alignment}",
             )
-
-    if (
-        input_hidden_alignment is not None
-        and p.hidden_size is not None
-        and p.hidden_size % input_hidden_alignment != 0
-    ):
-        return _reject(
-            MoERejectReason.SHAPE_UNALIGNED,
-            f"{cls.__name__} requires hidden_size ({p.hidden_size}) to be a "
-            f"multiple of {input_hidden_alignment}",
-        )
 
     return None
 

@@ -1225,15 +1225,9 @@ def create_test_backend(
     activation_type: ActivationType = ActivationType.Swiglu,
     locality_domain_policy: Optional[LocalityDomainPolicy] = None,
     n_shared_experts: int = 0,
-    moe_cls: Optional[type] = None,
 ) -> MoE:
-    """Create a MoE backend for testing.
-
-    ``moe_cls`` pins the leaf class directly, for the providers the default
-    lookup never selects (resolution prefers the native TRTLLM-Gen leaf
-    whenever one exists for the format).
-    """
-    backend_cls = moe_cls or get_backend_class(
+    """Create a MoE backend for testing."""
+    backend_cls = get_backend_class(
         backend_type, None if quant_config is None else quant_config.quant_algo
     )
     if locality_domain_policy is None:
