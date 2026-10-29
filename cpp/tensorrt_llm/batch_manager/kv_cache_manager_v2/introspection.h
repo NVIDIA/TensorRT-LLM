@@ -173,6 +173,10 @@ public:
     //! rebalancing; [0, numSlots) otherwise.
     static std::vector<std::pair<SlotCount, SlotCount>> gpuSlotWindows(KvCacheManager& manager);
 
+    //! GPU window [begin, end) of every pool of every pool group, in the pool's own ids (bound pools
+    //! of a copy-based rebalancing arena have their own; every other pool's is its group's).
+    static std::vector<std::vector<std::pair<SlotCount, SlotCount>>> gpuPoolWindows(KvCacheManager& manager);
+
     //! Allocates `size` bytes of host-tier memory the way the host tier would
     //! and reports where its pages landed.
     //!

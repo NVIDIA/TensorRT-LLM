@@ -234,6 +234,14 @@ public:
     // Scale factor: base_page_index * scale → kernel page index.
     int getPageIndexScale(LayerId layerId, DataRole role) const;
 
+    // Copy-based rebalancing with several pools in a pool group: the buffer's pool has its own slot
+    // ids, and its kernel page index is bindings[base_page_index] * scale (+ the converter's layer
+    // offset), where bindings is this table, indexed by base page index. std::nullopt when the
+    // buffer's pool uses the base page indices directly. The table changes when a rebalance moves
+    // the pool; getPageIndexBindingVersion() changes with it.
+    std::optional<std::vector<int32_t>> getPageIndexBindings(LayerId layerId, DataRole role) const;
+    uint64_t getPageIndexBindingVersion() const;
+
     // Composite converter (scale + expansion).
     PageIndexConverter getPageIndexConverter(LayerId layerId, DataRole role) const;
 

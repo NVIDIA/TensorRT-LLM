@@ -5126,7 +5126,8 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "startup; every pool group addresses it from the same base pointer with block indices "
         "relative to the arena. A rebalance moves the pool boundaries in proportion to the new "
         "ratios and copies blocks out of the parts that change owner, instead of remapping memory. "
-        "Requires one pool per pool group; the GPU quota is fixed afterwards.")
+        "A pool group with several pools gives each pool its own window and block ids; it does not "
+        "support host or disk cache tiers yet. The GPU quota is fixed afterwards.")
 
     drop_unreferenced_on_rebalance: bool = Field(
         default=False,
