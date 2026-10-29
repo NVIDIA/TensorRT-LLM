@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseBackendForwardArgs,
@@ -405,6 +406,8 @@ def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool) -> None:
     assert torch.count_nonzero(actual[~mask]) == 0
     with pytest.raises(ValueError, match="discarded padded queries"):
         attention.forward(q, k, v, batch_size=2, seq_len=8, key_padding_mask=mask)
+    with pytest.raises(ValueError, match="discarded padded queries"):
+        attention.forward(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL, **kwargs)
     mask[0, 1] = False
     with pytest.raises(ValueError, match="trailing padding"):
         attention.forward(q, k, v, **kwargs)
