@@ -129,6 +129,8 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_projection_quantization_follows_checkpoint_entries
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_expands_to_mixed_precision
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_honors_ignored_layers
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_a_quantized_head
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_partly_excluded_fused_projections
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_rejects_unsupported_expert_recipes
   - unittest/_torch/models/test_minimax_m3.py::test_uniform_mxfp8_and_bf16_configs_are_unchanged
   - unittest/_torch/models/test_minimax_m3.py::test_modelopt_mixed_precision_map_is_normalized_as_before

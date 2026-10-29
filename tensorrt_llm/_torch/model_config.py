@@ -22,8 +22,8 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import (TYPE_CHECKING, Any, Dict, Generic, Iterator, List, Optional,
-                    Sequence, Tuple, TypeVar)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, Iterator, List,
+                    Optional, Sequence, Tuple, TypeVar)
 
 import filelock
 import torch
@@ -1086,6 +1086,14 @@ class ModelConfig(Generic[TConfig]):
             kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
             group_size=quant_config.group_size)
         experts_quant_config.kv_cache_quant_algo = quant_config.kv_cache_quant_algo
+        excluded = mixed_quant_config.is_module_excluded_from_quantization
+        # The per-layer map covers only the decoder layers, so an untied head
+        # must be excluded: a quantized head would load without its scales.
+        if not getattr(text_config, "tie_word_embeddings",
+                       False) and not excluded("lm_head"):
+            raise ValueError(
+                "The MiniMax M3 NVFP4 routed-expert packaging must exclude "
+                "lm_head from quantization (list it in ignored_layers).")
 
         layer_quant_config = {}
         for layer_idx in range(num_layers):
@@ -1113,7 +1121,19 @@ class ModelConfig(Generic[TConfig]):
                     f"{prefix}.mlp.{proj}": base_quant_config
                     for proj in ("gate_proj", "up_proj", "down_proj")
                 })
-            excluded = mixed_quant_config.is_module_excluded_from_quantization
+            # Fused projections load as one module, so their members must
+            # agree on whether they are quantized.
+            ModelConfig._check_fused_exclusions([
+                f"{prefix}.self_attn.{proj}"
+                for proj in ("q_proj", "k_proj", "v_proj")
+            ], excluded)
+            for parent in ("block_sparse_moe.shared_experts", "mlp"):
+                names = [
+                    f"{prefix}.{parent}.{proj}"
+                    for proj in ("gate_proj", "up_proj")
+                ]
+                if names[0] in entries:
+                    ModelConfig._check_fused_exclusions(names, excluded)
             layer_quant_config.update({
                 name: config
                 for name, config in entries.items() if not excluded(name)
@@ -1124,6 +1144,16 @@ class ModelConfig(Generic[TConfig]):
             "MXFP8 base linears with NVFP4 routed experts "
             f"({len(layer_quant_config)} per-layer quant entries).")
         return mixed_quant_config, layer_quant_config
+
+    @staticmethod
+    def _check_fused_exclusions(names: List[str],
+                                excluded: Callable[[str], bool]) -> None:
+        """Reject an ignore list that excludes only part of a fused module."""
+        flags = [excluded(name) for name in names]
+        if any(flags) and not all(flags):
+            raise ValueError(
+                "The MiniMax M3 NVFP4 routed-expert packaging must exclude all "
+                f"or none of the fused projections {names}.")
 
     @staticmethod
     def _set_minimax_m3_layer_quant_config(

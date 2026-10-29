@@ -1398,6 +1398,7 @@ def _expand_packaged_quant_config(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("text_config_as_dict", [False, True])
 def test_packaged_moe_config_expands_to_mixed_precision(text_config_as_dict: bool) -> None:
     quant_config, layer_quant_config = _expand_packaged_quant_config(
@@ -1428,6 +1429,7 @@ def test_packaged_moe_config_expands_to_mixed_precision(text_config_as_dict: boo
     assert {k: (v.quant_algo, v.group_size) for k, v in layer_quant_config.items()} == expected
 
 
+@pytest.mark.cpu_only
 def test_packaged_moe_config_honors_ignored_layers() -> None:
     cfg = _packaged_vl_config()
     cfg.quantization_config["ignored_layers"].append(
@@ -1439,6 +1441,7 @@ def test_packaged_moe_config_honors_ignored_layers() -> None:
     assert "model.layers.5.self_attn.o_proj" in layer_quant_config
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -1450,11 +1453,37 @@ def test_packaged_moe_config_honors_ignored_layers() -> None:
         {"moe_quant_algo": None},
     ],
 )
-def test_packaged_moe_config_rejects_unsupported_expert_recipes(overrides) -> None:
+def test_packaged_moe_config_rejects_unsupported_expert_recipes(
+    overrides: dict[str, str | int | None],
+) -> None:
     with pytest.raises(ValueError, match="routed-expert packaging"):
         _expand_packaged_quant_config(_packaged_vl_config(**overrides))
 
 
+@pytest.mark.cpu_only
+def test_packaged_moe_config_rejects_a_quantized_head() -> None:
+    cfg = _packaged_vl_config()
+    cfg.quantization_config["ignored_layers"].remove("lm_head")
+    with pytest.raises(ValueError, match="must exclude lm_head"):
+        _expand_packaged_quant_config(cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "module",
+    ["self_attn.q_proj", "mlp.gate_proj", "block_sparse_moe.shared_experts.up_proj"],
+)
+def test_packaged_moe_config_rejects_partly_excluded_fused_projections(module: str) -> None:
+    layer = 1 if module.startswith("mlp.") else 4
+    cfg = _packaged_vl_config()
+    cfg.quantization_config["ignored_layers"].append(
+        f"language_model.model.layers.{layer}.{module}"
+    )
+    with pytest.raises(ValueError, match="all or none of the fused projections"):
+        _expand_packaged_quant_config(cfg)
+
+
+@pytest.mark.cpu_only
 def test_uniform_mxfp8_and_bf16_configs_are_unchanged() -> None:
     cfg = _packaged_vl_config()
     for key in ("moe_quant_algo", "moe_quant_format", "group_size"):
@@ -1468,6 +1497,7 @@ def test_uniform_mxfp8_and_bf16_configs_are_unchanged() -> None:
     assert result[0] is no_quant and result[1] is None
 
 
+@pytest.mark.cpu_only
 def test_modelopt_mixed_precision_map_is_normalized_as_before() -> None:
     base_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     expert_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
@@ -1491,6 +1521,7 @@ def test_modelopt_mixed_precision_map_is_normalized_as_before() -> None:
             assert key not in out
 
 
+@pytest.mark.cpu_only
 def test_index_projection_quant_config_follows_declared_entries() -> None:
     _, layer_quant_config = _expand_packaged_quant_config(_packaged_vl_config())
     declared = _get_index_projection_quant_config(
