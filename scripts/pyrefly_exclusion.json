@@ -5,7 +5,8 @@
     "tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/",
     "tensorrt_llm/_torch/moe/kernels/",
     "tensorrt_llm/_torch/attention/kernels/",
-    "tensorrt_llm/_torch/attention/backends/prims_ts/kernels/"
+    "tensorrt_llm/_torch/attention/backends/prims_ts/kernels/",
+    "tensorrt_llm/_torch/_experimental/"
   ],
   "symbols": [
     "etcd3.MultiEndpointEtcd3Client",
@@ -13,6 +14,17 @@
     "tl.*",
     "opentelemetry.exporter.otlp.proto.grpc.trace_exporter",
     "line_profiler",
+    "PreTrainedConfig",
+    "CSA2TrtllmMetadata",
+    "MoEImplBase",
+    "ir.*",
+    "BaseResourceManager",
+    "TrtllmAttentionMetadata",
+    "BaseWeightMapper",
+    "BaseMoeRoutingMethod",
+    "SpecMetadata",
+    "ParakeetEncoderConfig",
+    "AttentionMetadata",
     "ctm.Constexpr",
     "ctm.GridConstant",
     "cutlass.Constexpr",
