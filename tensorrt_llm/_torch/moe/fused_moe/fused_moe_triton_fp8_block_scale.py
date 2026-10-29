@@ -655,14 +655,21 @@ def _per_token_group_quant_fp8_kernel(
     GROUP: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    """Quantize one 1 x GROUP slice of a row to FP8 with its own scale."""
+    """Quantize one 1 x GROUP slice of a row to FP8 with its own scale.
+
+    Same arithmetic as the CUTLASS MoE's fused 1 x 128 quantization: multiply
+    by FP8_MAX / amax and store the reciprocal as the scale, with both
+    divisions correctly rounded. BF16 inputs often land exactly on an FP8
+    rounding midpoint, where the default approximate division can round the
+    other way.
+    """
     row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
     offs = group * GROUP + tl.arange(0, GROUP)
     x = tl.load(x_ptr + row * stride_xm + offs).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(x)), 1e-10) / FP8_MAX
-    tl.store(q_ptr + row * stride_qm + offs, (x / scale).to(tl.float8e4nv))
-    tl.store(s_ptr + row * stride_sm + group, scale)
+    quant_scale = tl.math.div_rn(FP8_MAX, tl.maximum(tl.max(tl.abs(x)), 1e-10))
+    tl.store(q_ptr + row * stride_qm + offs, (x * quant_scale).to(tl.float8e4nv))
+    tl.store(s_ptr + row * stride_sm + group, tl.math.div_rn(1.0, quant_scale))
 
 
 @triton.jit
@@ -684,7 +691,8 @@ def _swiglu_quant_fp8_kernel(
 
     With a limit, ``up`` is clamped to [-limit, limit] and ``gate`` to at most
     ``limit`` before SiLU (or the SiLU output, with CLAMP_AFTER_SILU), as the
-    CUTLASS MoE activation does.
+    CUTLASS MoE activation does. Like its epilogue, the result is rounded to
+    BF16 and then quantized as in :func:`_per_token_group_quant_fp8_kernel`.
     """
     row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
@@ -700,10 +708,10 @@ def _swiglu_quant_fp8_kernel(
             act = gate * tl.sigmoid(gate)
     else:
         act = gate * tl.sigmoid(gate)
-    y = act * up
-    scale = tl.maximum(tl.max(tl.abs(y)), 1e-10) / FP8_MAX
-    tl.store(q_ptr + row * stride_qm + offs, (y / scale).to(tl.float8e4nv))
-    tl.store(s_ptr + row * stride_sm + group, scale)
+    y = (act * up).to(tl.bfloat16).to(tl.float32)
+    quant_scale = tl.math.div_rn(FP8_MAX, tl.maximum(tl.max(tl.abs(y)), 1e-10))
+    tl.store(q_ptr + row * stride_qm + offs, (y * quant_scale).to(tl.float8e4nv))
+    tl.store(s_ptr + row * stride_sm + group, tl.math.div_rn(1.0, quant_scale))
 
 
 @triton.jit
@@ -713,7 +721,6 @@ def _fused_moe_fp8act_fp8w_kernel(
     b_ptr,
     b_scale_ptr,
     c_ptr,
-    topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
@@ -738,7 +745,6 @@ def _fused_moe_fp8act_fp8w_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     top_k: tl.constexpr,
-    MUL_ROUTED_WEIGHT: tl.constexpr,
 ):
     """Fused MoE GEMM with FP8 activations (1 x 128 scales) and FP8 weights (128 x 128 scales).
 
@@ -778,10 +784,6 @@ def _fused_moe_fp8act_fp8w_kernel(
         accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
-        accumulator *= moe_weight[:, None]
 
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
@@ -868,20 +870,25 @@ def _moe_align_small(
 @triton.jit
 def _moe_topk_sum_kernel(
     in_ptr,
+    weights_ptr,
     out_ptr,
     hidden,
     TOP_K: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    """out[t, :] = sum_k in[t * TOP_K + k, :] in FP32."""
+    """out[t, :] = sum_k weights[t, k] * in[t * TOP_K + k, :] in FP32.
+
+    As in the CUTLASS MoE finalize, the routing weights scale the BF16 expert
+    outputs rather than the FC2 accumulators.
+    """
     t = tl.program_id(0).to(tl.int64)
     offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs < hidden
     acc = tl.zeros([BLOCK_H], dtype=tl.float32)
     for k in tl.static_range(TOP_K):
-        acc += tl.load(in_ptr + (t * TOP_K + k) * hidden + offs, mask=mask, other=0.0).to(
-            tl.float32
-        )
+        weight = tl.load(weights_ptr + t * TOP_K + k).to(tl.float32)
+        row = tl.load(in_ptr + (t * TOP_K + k) * hidden + offs, mask=mask, other=0.0)
+        acc += weight * row.to(tl.float32)
     tl.store(out_ptr + t * hidden + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
@@ -911,7 +918,6 @@ def _invoke_fp8act_fp8w_moe_kernel(
     b: torch.Tensor,
     b_scale: torch.Tensor,
     c: torch.Tensor,
-    topk_weights: torch.Tensor | None,
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -937,7 +943,6 @@ def _invoke_fp8act_fp8w_moe_kernel(
         b,
         b_scale,
         c,
-        topk_weights,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -962,7 +967,6 @@ def _invoke_fp8act_fp8w_moe_kernel(
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_K=_BLOCK_SHAPE[0],
         top_k=top_k,
-        MUL_ROUTED_WEIGHT=topk_weights is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -986,7 +990,10 @@ def run_triton_fp8_block_scale_moe_fp8_act(
     (DeepSeekFP8BlockScalesFusedMoEMethod without E8M0 resmoothing). Activations
     are quantized per 1 x 128 group, and each GEMM launches only as many expert
     blocks as the batch can occupy, so the cost follows the routed experts
-    rather than the expert count.
+    rather than the expert count. The rounding steps follow the CUTLASS MoE
+    path (BF16 FC1 and FC2 outputs, BF16 activation before its quantization,
+    routing weights applied in FP32 to the BF16 expert outputs), so batches on
+    either side of the dispatch threshold get the same numerics.
 
     Args:
         x: (T, H) BF16 input activations.
@@ -1029,7 +1036,6 @@ def run_triton_fp8_block_scale_moe_fp8_act(
         w3_w1,
         w3_w1_scales,
         ic1,
-        None,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -1066,7 +1072,6 @@ def run_triton_fp8_block_scale_moe_fp8_act(
         w2,
         w2_scales,
         ic2,
-        token_final_scales.contiguous(),
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -1078,6 +1083,6 @@ def run_triton_fp8_block_scale_moe_fp8_act(
     if num_tokens > 0:
         block_h = 1024
         _moe_topk_sum_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
-            ic2, output, hidden, TOP_K=top_k, BLOCK_H=block_h
+            ic2, token_final_scales.contiguous(), output, hidden, TOP_K=top_k, BLOCK_H=block_h
         )
     return output

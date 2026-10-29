@@ -297,10 +297,11 @@ def _dequant_blocks(w_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 
 
 def _fake_quant_1x128(v: torch.Tensor) -> torch.Tensor:
-    """Round a 1-D FP32 vector through FP8 with one scale per 128 elements."""
+    """Round a 1-D FP32 vector through FP8 with one scale per 128 elements, using the
+    CUTLASS MoE arithmetic (multiply by 448 / amax, dequantize by its reciprocal)."""
     groups = v.view(-1, 128)
-    scale = groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-10) / 448.0
-    return ((groups / scale).to(torch.float8_e4m3fn).float() * scale).view(-1)
+    quant_scale = 448.0 / groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-10)
+    return ((groups * quant_scale).to(torch.float8_e4m3fn).float() * (1.0 / quant_scale)).view(-1)
 
 
 def _run_moe_fp8_act_reference(
@@ -315,7 +316,7 @@ def _run_moe_fp8_act_reference(
     swiglu_clamp_after_silu,
 ) -> torch.Tensor:
     """FP32 reference over dequantized weights and 1 x 128 FP8-rounded activations,
-    with the CUTLASS SwiGLU clamp."""
+    with the CUTLASS SwiGLU clamp and BF16 rounding steps."""
     intermediate = w3_w1.shape[1] // 2
     w31 = _dequant_blocks(w3_w1, w3_w1_scales)
     w2f = _dequant_blocks(w2, w2_scales)
@@ -334,9 +335,8 @@ def _run_moe_fp8_act_reference(
                     act = F.silu(gate.clamp(max=swiglu_limit))
             else:
                 act = F.silu(gate)
-            out[t] += (w2f[e] @ _fake_quant_1x128(act * up)).bfloat16().float() * float(
-                token_final_scales[t, k]
-            )
+            act_q = _fake_quant_1x128((act * up).bfloat16().float())
+            out[t] += (w2f[e] @ act_q).bfloat16().float() * float(token_final_scales[t, k])
     return out.bfloat16()
 
 
@@ -377,15 +377,13 @@ def test_fp8_act_matches_reference(num_tokens, swiglu_limit, swiglu_clamp_after_
     shape = MoeShape(
         "decode", num_tokens=num_tokens, hidden=512, intermediate=256, num_experts=72, top_k=8
     )
-    inputs = _make_inputs(shape, seed=num_tokens)
+    inputs = _make_inputs(shape, seed=num_tokens, swiglu_limit=swiglu_limit)
     del inputs["activation_type"]
 
     out = run_triton_fp8_block_scale_moe_fp8_act(
-        **inputs, swiglu_limit=swiglu_limit, swiglu_clamp_after_silu=swiglu_clamp_after_silu
+        **inputs, swiglu_clamp_after_silu=swiglu_clamp_after_silu
     )
-    ref = _run_moe_fp8_act_reference(
-        **inputs, swiglu_limit=swiglu_limit, swiglu_clamp_after_silu=swiglu_clamp_after_silu
-    )
+    ref = _run_moe_fp8_act_reference(**inputs, swiglu_clamp_after_silu=swiglu_clamp_after_silu)
 
     assert out.shape == ref.shape == (num_tokens, shape.hidden)
     assert out.dtype == torch.bfloat16
