@@ -98,14 +98,20 @@ class TorchReading:
     """Caching-allocator readings.
 
     ``reserved`` and ``live`` come from ``memory_reserved()`` and
-    ``memory_stats()["allocated_bytes.all.current"]``.
+    ``memory_stats()["allocated_bytes.all.current"]``. ``reserved`` is
+    ``None`` when the allocator does not report it.
     """
 
-    reserved: int
+    reserved: int | None
     live: int
 
     @property
-    def reserved_unallocated(self) -> int:
+    def footprint(self) -> int:
+        """What torch holds from the driver, or ``live`` as a lower bound."""
+        return self.live if self.reserved is None else self.reserved
+
+    @property
+    def reserved_unallocated(self) -> int | None:
         """Reserved but not handed out.
 
         Deliberately *not* named "fragmentation". Besides genuinely
@@ -115,6 +121,8 @@ class TorchReading:
         Calling the whole gap fragmentation would suggest it is immediately
         reusable.
         """
+        if self.reserved is None:
+            return None
         return max(self.reserved - self.live, 0)
 
 
@@ -143,6 +151,11 @@ class Frame:
     @property
     def residual_is_negative(self) -> bool:
         return self.nontorch_residual < 0
+
+    @property
+    def residual_is_upper_bound(self) -> bool:
+        """The residual also holds torch's pool slack, which went unreported."""
+        return self.torch.reserved is None
 
 
 def build_frame(
@@ -175,7 +188,9 @@ def build_frame(
     frame.unattributed_live = max(torch.live - frame.tagged_total, 0)
 
     # Subtraction (2): held by this process, explained by nobody.
-    frame.nontorch_residual = device.effective_process_used - torch.reserved - frame.nontorch_known
+    # With reserved unreported, live stands in for torch's footprint, so the
+    # residual also absorbs the pool's slack and is only an upper bound.
+    frame.nontorch_residual = device.effective_process_used - torch.footprint - frame.nontorch_known
 
     return frame
 
@@ -204,6 +219,8 @@ def derived_entries(frame: Frame) -> list[Entry]:
                 "NEGATIVE: readings disagree (vantage point, sampling skew, "
                 "or another process released memory mid-measurement)"
                 if frame.residual_is_negative
+                else "UPPER BOUND: also holds torch pool slack the allocator did not report"
+                if frame.residual_is_upper_bound
                 else "CUDA context, NCCL internals, cuBLAS, lazy module loading"
             ),
         ),

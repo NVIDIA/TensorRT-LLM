@@ -31,7 +31,7 @@ warn.
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -56,14 +56,6 @@ class Capability:
     oom_observer_present: bool
     nvml_available: bool
 
-    #: ``memory_stats`` keys that exist but are not meaningful on this
-    #: backend. Consumers must render these as ``unsupported``, never as 0.
-    unsupported_stats: tuple[str, ...] = field(default_factory=tuple)
-
-    @property
-    def stats_trustworthy(self) -> bool:
-        return self.allocator_backend == "native"
-
     def describe(self) -> str:
         parts = [
             f"backend={self.allocator_backend}",
@@ -85,11 +77,26 @@ def _alloc_conf() -> tuple[str, str | None]:
 
 
 def _nvml_available() -> bool:
+    """Whether NVML can actually be queried here.
+
+    Checks that the library initialises and reports at least one device,
+    rather than only that a helper is importable -- the helper always is,
+    which made this report ``nvml=yes`` on hosts where every query failed.
+    """
     try:
+        import pynvml
+
         from tensorrt_llm import profiler
     except ImportError:
         return False
-    return bool(getattr(profiler, "pynvml_context", None))
+    context = getattr(profiler, "pynvml_context", None)
+    if context is None:
+        return False
+    try:
+        with context():
+            return pynvml.nvmlDeviceGetCount() > 0
+    except Exception:  # noqa: BLE001 - NVML raises many unrelated types
+        return False
 
 
 def probe_capability() -> Capability:
@@ -113,15 +120,6 @@ def probe_capability() -> Capability:
             # raising rather than returning False.
             metadata_supported = False
 
-    # Under cudaMallocAsync torch keeps these keys but never populates them.
-    unsupported: tuple[str, ...] = ()
-    if backend != "native":
-        unsupported = (
-            "reserved_bytes.all.current",
-            "inactive_split_bytes.all.current",
-            "active_bytes.all.current",
-        )
-
     return Capability(
         allocator_backend=backend,
         alloc_conf=conf,
@@ -132,5 +130,4 @@ def probe_capability() -> Capability:
         snapshot_api_present=hasattr(memory, "_snapshot"),
         oom_observer_present=hasattr(torch._C, "_cuda_attach_out_of_memory_observer"),
         nvml_available=_nvml_available(),
-        unsupported_stats=unsupported,
     )

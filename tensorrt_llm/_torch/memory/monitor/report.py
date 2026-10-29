@@ -24,9 +24,14 @@ reports mislead in practice:
 * A negative residual is printed with its sign and flagged, not clamped.
 """
 
+from typing import TYPE_CHECKING
+
 from .capability import Capability
 from .frame import Frame, derived_entries
 from .schema import Category, Entry, Placement
+
+if TYPE_CHECKING:
+    from .checks import CheckResult
 
 __all__ = ["UNAVAILABLE", "UNSUPPORTED", "render"]
 
@@ -55,7 +60,7 @@ def _entry_line(entry: Entry) -> str:
     owner = f" [{entry.owner}]" if entry.owner else ""
     note = f"  ({entry.note})" if entry.note else ""
     return (
-        f"  {str(entry.category):<22s}{str(entry.source):<9s}"
+        f"  {str(entry.category):<22s}{str(entry.source):<11s}"
         f"{str(entry.basis):<21s}{size}{owner}{note}"
     )
 
@@ -69,6 +74,7 @@ def render(
     pid: int | None = None,
     rank: int | None = None,
     device_index: int | None = None,
+    checks: "list[CheckResult] | None" = None,
 ) -> str:
     """Render a human-readable report."""
     device, torch_r = frame.device, frame.torch
@@ -92,12 +98,6 @@ def render(
     if ident:
         add("  " + " ".join(ident))
     add(f"  capability: {capability.describe()}")
-    if capability.unsupported_stats:
-        add(
-            f"  NOTE: backend {capability.allocator_backend!r} leaves "
-            f"{len(capability.unsupported_stats)} stats meaningless; "
-            "they render as unsupported, not as zero."
-        )
 
     add("")
     add("[device]")
@@ -118,19 +118,30 @@ def render(
 
     add("")
     add("[this process]")
-    add(_line("torch reserved", torch_r.reserved))
-    add(_line("  of which handed out", torch_r.live))
-    add(
-        _line(
-            "  reserved, not handed out",
-            torch_r.reserved_unallocated,
-            "   <- incl. blocks awaiting release on other streams",
+    if torch_r.reserved is None:
+        add(
+            f"  {'torch reserved':<26s}{UNKNOWN}   <- not reported by the "
+            f"{capability.allocator_backend!r} allocator"
         )
-    )
+    else:
+        add(_line("torch reserved", torch_r.reserved))
+    add(_line("  of which handed out", torch_r.live))
+    if torch_r.reserved_unallocated is None:
+        add(f"  {'  reserved, not handed out':<26s}{UNKNOWN}")
+    else:
+        add(
+            _line(
+                "  reserved, not handed out",
+                torch_r.reserved_unallocated,
+                "   <- incl. blocks awaiting release on other streams",
+            )
+        )
     add(_line("component counters", frame.nontorch_known))
     residual_suffix = ""
     if frame.residual_is_negative:
         residual_suffix = "   <- NEGATIVE, see below"
+    elif frame.residual_is_upper_bound:
+        residual_suffix = "   <- UPPER BOUND: includes unreported torch pool slack"
     add(_line("unexplained", frame.nontorch_residual, residual_suffix))
 
     torch_entries = [
@@ -139,7 +150,7 @@ def render(
     derived = derived_entries(frame)
     add("")
     add("[torch-visible, by category]")
-    add(f"  {'category':<22s}{'source':<9s}{'basis':<21s}{'bytes':>14s}")
+    add(f"  {'category':<22s}{'source':<11s}{'basis':<21s}{'bytes':>14s}")
     for entry in sorted(torch_entries, key=lambda e: -(e.size_bytes or 0)):
         add(_entry_line(entry))
     add(_entry_line(derived[0]))
@@ -180,6 +191,15 @@ def render(
             "with its sign rather than clamped, because clamping hides"
         )
         add("          precisely the case worth investigating.")
+
+    if checks:
+        failed = [c for c in checks if not c.passed]
+        add("")
+        add(f"[checks] {len(checks) - len(failed)} passed, {len(failed)} FAILED")
+        # Failures first: a check that fails means two independent readings
+        # disagree, which is the most important line in the report.
+        for check in failed + [c for c in checks if c.passed]:
+            add(f"  {'FAILED' if not check.passed else 'ok':<7s}{check.name:<28s}{check.detail}")
 
     return "\n".join(out)
 

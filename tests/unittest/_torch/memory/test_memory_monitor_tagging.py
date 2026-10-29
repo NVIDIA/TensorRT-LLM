@@ -45,13 +45,19 @@ MB = 1 << 20
 
 
 @pytest.fixture
-def window():
-    """A tagging window that is always closed again."""
+def window(monkeypatch):
+    """A tagging window, with the monitor on, that is always closed again."""
+    from tensorrt_llm._torch.memory.monitor.tagging import clear_claims, set_frozen_map
+
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+    clear_claims()
     started = start_tagging_window()
     try:
         yield started
     finally:
         stop_tagging_window()
+        clear_claims()
+        set_frozen_map(TagSnapshot(supported=False))
 
 
 class TestAttribution:
@@ -212,7 +218,7 @@ class TestCheckB:
 
 
 class TestClaimModuleMemory:
-    """Re-attribution from a module's final parameters."""
+    """Weights are attributed by walking the live module at report time."""
 
     def test_claims_parameters_and_buffers(self, window):
         from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory
@@ -220,10 +226,8 @@ class TestClaimModuleMemory:
         module = torch.nn.Linear(512, 512).cuda()
         module.register_buffer("scratch", torch.empty(1024, 1024, device="cuda"))
         try:
-            claimed = claim_module_memory(module, "WEIGHTS")
-            assert claimed > 0
-
-            by_tag = live_bytes_by_tag(freeze_tag_map())
+            assert claim_module_memory(module, "WEIGHTS") is True
+            by_tag = live_bytes_by_tag(TagSnapshot(supported=False))
             # The buffer alone is 4 MiB; weight and bias add to that.
             assert by_tag.get("WEIGHTS", 0) >= 4 * MB
         finally:
@@ -245,31 +249,101 @@ class TestClaimModuleMemory:
 
         module = Tied(shared)
         try:
-            claimed = claim_module_memory(module, "WEIGHTS")
-            assert claimed == 8 * MB, f"shared storage must be claimed once, got {claimed}"
+            claim_module_memory(module, "WEIGHTS")
+            by_tag = live_bytes_by_tag(TagSnapshot(supported=False))
+            assert by_tag.get("WEIGHTS", 0) == 8 * MB
         finally:
             del module, shared
 
     def test_survives_the_window_freeze(self, window):
-        # The closing freeze rebuilds the trace-derived map wholesale;
-        # claims are kept apart so they are not discarded by it.
+        # The closing freeze rebuilds the trace-derived map wholesale; claims
+        # live elsewhere so they are not discarded by it.
         from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory, set_frozen_map
 
         module = torch.nn.Linear(1024, 1024).cuda()
         try:
             claim_module_memory(module, "WEIGHTS")
-            set_frozen_map(freeze_tag_map())  # what startup_window does
-            by_tag = live_bytes_by_tag(freeze_tag_map())
-            assert by_tag.get("WEIGHTS", 0) > 0, (
-                "a freeze must not discard claims made during loading"
-            )
+            set_frozen_map(freeze_tag_map())
+            assert live_bytes_by_tag(freeze_tag_map()).get("WEIGHTS", 0) > 0
         finally:
             del module
 
-    def test_cpu_module_claims_nothing(self):
+    def test_freed_weights_do_not_label_their_successor(self, window):
+        # An address recorded at load time keeps its label after the block
+        # is freed and reused. Walking the module sees only what it holds
+        # now, so a replaced weight's old block, reused by an activation, is
+        # not counted as weights.
         from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory
 
-        assert claim_module_memory(torch.nn.Linear(8, 8), "WEIGHTS") == 0
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(
+            torch.empty(16 * MB, dtype=torch.uint8, device="cuda"), requires_grad=False
+        )
+        claim_module_memory(module, "WEIGHTS")
+        before = live_bytes_by_tag(TagSnapshot(supported=False)).get("WEIGHTS", 0)
+        assert before == 16 * MB
+
+        # Replace the weight (a smaller one, as quantisation would), free the
+        # old block, and let an unrelated allocation take its place.
+        module.weight = torch.nn.Parameter(
+            torch.empty(4 * MB, dtype=torch.uint8, device="cuda"), requires_grad=False
+        )
+        torch.cuda.synchronize()
+        activation = torch.empty(16 * MB, dtype=torch.uint8, device="cuda")
+        try:
+            after = live_bytes_by_tag(TagSnapshot(supported=False)).get("WEIGHTS", 0)
+            assert after == 4 * MB, f"expected only the new weight, got {after / MB} MiB"
+        finally:
+            del activation, module
+
+    def test_released_module_is_forgotten(self, window):
+        import gc
+
+        from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory
+
+        module = torch.nn.Linear(256, 256).cuda()
+        claim_module_memory(module, "WEIGHTS")
+        del module
+        gc.collect()
+        # A claim must not keep the model alive, nor survive it.
+        assert "WEIGHTS" not in live_bytes_by_tag(TagSnapshot(supported=False))
+
+    def test_cpu_module_claims_nothing(self, window):
+        from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory
+
+        module = torch.nn.Linear(8, 8)
+        claim_module_memory(module, "WEIGHTS")
+        assert "WEIGHTS" not in live_bytes_by_tag(TagSnapshot(supported=False))
+
+
+class TestNothingHappensWhenOff:
+    """The monitor is off by default; loading a model must cost nothing."""
+
+    def test_claim_is_a_noop(self, monkeypatch):
+        from tensorrt_llm._torch.memory.monitor import tagging
+
+        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+        tagging.clear_claims()
+        snapshots = []
+        monkeypatch.setattr(
+            torch.cuda.memory, "_snapshot", lambda *a, **k: snapshots.append(1) or {"segments": []}
+        )
+
+        assert tagging.claim_module_memory(torch.nn.Linear(4, 4), "WEIGHTS") is False
+        assert snapshots == [], "a disabled monitor must not take an allocator snapshot"
+        assert tagging._claimed_modules == []
+
+    def test_tag_does_not_touch_allocator_metadata(self, monkeypatch):
+        from tensorrt_llm._torch.memory.monitor import tagging
+
+        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+        calls = []
+        monkeypatch.setattr(
+            torch.cuda.memory, "_set_memory_metadata", lambda *a: calls.append(a), raising=False
+        )
+        with tagging.tag("SAMPLER"):
+            pass
+        assert calls == []
 
 
 class TestCaptureBuildsTagEntries:
@@ -321,3 +395,46 @@ class TestCaptureBuildsTagEntries:
         finally:
             set_frozen_map(TagSnapshot(supported=False))
             del weights
+
+
+class TestStartupWindow:
+    def test_reports_even_when_tagging_is_unsupported(self, monkeypatch):
+        # On cudaMallocAsync tags cannot work, but the KV cache and every
+        # other component still belong in the startup breakdown.
+        from tensorrt_llm._torch.memory.monitor import tagging, triggers
+
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+        monkeypatch.setattr(tagging, "tagging_supported", lambda: False)
+        reports = []
+        monkeypatch.setattr(triggers, "report_now", lambda **kw: reports.append(kw) or "r")
+
+        with tagging.startup_window() as recording:
+            assert recording is False
+        assert len(reports) == 1 and reports[0]["tag"] == "startup_complete"
+
+    def test_records_without_stacks(self, monkeypatch):
+        # Stacks make each snapshot cost seconds; the tag survives without them.
+        from tensorrt_llm._torch.memory.monitor import tagging
+
+        calls = []
+        monkeypatch.setattr(tagging, "tagging_supported", lambda: True)
+        monkeypatch.setattr(
+            torch.cuda.memory, "_record_memory_history", lambda *a, **k: calls.append((a, k))
+        )
+        assert tagging.start_tagging_window()
+        assert calls[0][1].get("context", "all") is None
+
+    def test_recording_stops_before_the_report_is_built(self, monkeypatch):
+        from tensorrt_llm._torch.memory.monitor import tagging, triggers
+
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+        order = []
+        monkeypatch.setattr(tagging, "start_tagging_window", lambda: True)
+        monkeypatch.setattr(tagging, "freeze_tag_map", lambda: TagSnapshot(supported=True))
+        monkeypatch.setattr(tagging, "stop_tagging_window", lambda: order.append("stop"))
+        monkeypatch.setattr(tagging, "live_bytes_by_tag", lambda s: order.append("read") or {})
+        monkeypatch.setattr(triggers, "report_now", lambda **kw: order.append("report"))
+
+        with tagging.startup_window():
+            pass
+        assert order.index("stop") < order.index("read") < order.index("report")

@@ -24,7 +24,9 @@ CPU only: the statistics objects are fakes shaped like the real binding.
 
 import types
 
-from tensorrt_llm._torch.memory.monitor.checks import check_kv_pool_conservation, check_kv_quota
+import pytest
+
+from tensorrt_llm._torch.memory.monitor.checks import check_kv_pool_conservation
 from tensorrt_llm._torch.memory.monitor.providers.kv_cache import (
     KvCacheProvider,
     kv_pool_group_stats,
@@ -101,37 +103,6 @@ class TestCheckCIsNotVacuous:
         assert [r.passed for r in results] == [True, False]
 
 
-class TestCheckD:
-    def test_rounding_above_quota_is_fine(self):
-        rows = kv_pool_group_stats(_manager(_stats(102, 0, 0)))
-        result = check_kv_quota(rows, quota_bytes=100 * MB)
-        assert result.passed
-
-    def test_capacity_below_quota_fails(self):
-        # Pools round up, so landing under the quota means the sizing and
-        # the allocation disagree.
-        rows = kv_pool_group_stats(_manager(_stats(90, 0, 0)))
-        assert not check_kv_quota(rows, quota_bytes=100 * MB).passed
-
-    def test_slightly_below_quota_still_fails(self):
-        # Within the tolerance in absolute terms, so a symmetric band would
-        # wave it through. Rounding can only add, which makes any shortfall
-        # a real disagreement however small.
-        rows = kv_pool_group_stats(_manager(_stats(97, 0, 0)))
-        result = check_kv_quota(rows, quota_bytes=100 * MB)
-        assert not result.passed, (
-            "the tolerance is one-sided: capacity under quota is never explained by rounding"
-        )
-
-    def test_far_above_quota_fails(self):
-        rows = kv_pool_group_stats(_manager(_stats(200, 0, 0)))
-        assert not check_kv_quota(rows, quota_bytes=100 * MB).passed
-
-    def test_absent_quota_is_not_a_failure(self):
-        rows = kv_pool_group_stats(_manager(_stats(100, 0, 0)))
-        assert check_kv_quota(rows, quota_bytes=0).passed
-
-
 class TestSlotsToBytes:
     def test_every_pool_in_the_group_contributes_a_slot(self):
         rows = kv_pool_group_stats(_manager(_stats(10, 2, 3, slot_sizes=(MB, 2 * MB))))
@@ -187,11 +158,19 @@ class TestProviderAvailability:
         assert provider.available() is False
         assert provider.collect() == []
 
-    def test_unavailable_on_a_manager_without_the_accessor(self):
-        # A v1 manager, say: reporting 0 would claim the cache is empty.
-        provider = KvCacheProvider(types.SimpleNamespace())
-        assert provider.available() is False
-        assert provider.collect() == []
+    def test_manager_without_statistics_yields_an_unknown_row(self):
+        # KV cache manager V1 has no storage statistics. Omitting it would
+        # let the pool fall into the unexplained residual with nothing to
+        # say it is missing; reporting 0 would claim the cache is empty.
+        class _V1Manager:
+            pass
+
+        manager = _V1Manager()
+        entries = KvCacheProvider(manager).collect()
+        assert len(entries) == 1
+        assert entries[0].size_bytes is None
+        assert entries[0].basis is Basis.PHYSICAL_BACKING
+        assert "_V1Manager" in entries[0].owner
 
     def test_not_in_the_default_set(self):
         from tensorrt_llm._torch.memory.monitor.providers import default_providers
@@ -200,3 +179,109 @@ class TestProviderAvailability:
             "the manager has no process-wide accessor, so it must be "
             "passed in rather than discovered"
         )
+
+
+class TestInconsistentPoolKeepsCapacity:
+    """free + evictable > total is what check C exists to catch."""
+
+    def test_capacity_row_survives(self):
+        manager = _manager(_stats(100, 70, 50))
+        entries = KvCacheProvider(manager).collect()
+        physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
+        # Raising on the negative split used to drop the whole pool from the
+        # report, at the one moment its accounting was worth looking at.
+        assert physical and physical[0].size_bytes == 100 * MB
+        assert "withheld" in physical[0].note
+
+    def test_split_is_unknown_not_negative(self):
+        manager = _manager(_stats(100, 70, 50))
+        logical = [e for e in KvCacheProvider(manager).collect() if e.basis is Basis.LOGICAL]
+        assert logical[0].size_bytes is None
+
+    def test_check_c_still_flags_it(self):
+        manager = _manager(_stats(100, 70, 50))
+        assert not check_kv_pool_conservation(kv_pool_group_stats(manager))[0].passed
+
+
+class TestPoolRoles:
+    def test_roles_have_distinct_names(self):
+        a, b = _manager(_stats(10, 0, 0)), _manager(_stats(20, 0, 0))
+        assert KvCacheProvider(a, "main").name != KvCacheProvider(b, "draft").name
+
+    def test_main_draft_and_cross_are_all_registered(self, monkeypatch):
+        from tensorrt_llm._torch.memory.monitor import providers as reg
+        from tensorrt_llm._torch.pyexecutor._util import _register_kv_cache_monitor_providers
+
+        reg.clear_registered_providers()
+        try:
+            main, draft, cross = (_manager(_stats(n, 0, 0)) for n in (100, 20, 5))
+            _register_kv_cache_monitor_providers(main, draft, cross)
+            physical = sorted(
+                e.size_bytes
+                for e in reg.collect_all()
+                if e.category is Category.KV_CACHE_POOL and e.basis is Basis.PHYSICAL_BACKING
+            )
+            # A shared fixed name would have let the registry keep only one.
+            assert physical == [5 * MB, 20 * MB, 100 * MB]
+        finally:
+            reg.clear_registered_providers()
+
+    def test_shared_draft_manager_is_counted_once(self):
+        from tensorrt_llm._torch.memory.monitor import providers as reg
+        from tensorrt_llm._torch.pyexecutor._util import _register_kv_cache_monitor_providers
+
+        reg.clear_registered_providers()
+        try:
+            main = _manager(_stats(100, 0, 0))
+            _register_kv_cache_monitor_providers(main, main, None)
+            physical = [
+                e
+                for e in reg.collect_all()
+                if e.category is Category.KV_CACHE_POOL and e.basis is Basis.PHYSICAL_BACKING
+            ]
+            assert len(physical) == 1
+        finally:
+            reg.clear_registered_providers()
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="capture reads the device")
+class TestChecksRunInRealReports:
+    """The checks used to be called only from tests, so no report ran them."""
+
+    @pytest.fixture(autouse=True)
+    def _monitor_on(self, monkeypatch):
+        from tensorrt_llm._torch.memory.monitor import providers as reg
+
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+        reg.clear_registered_providers()
+        yield
+        reg.clear_registered_providers()
+
+    def test_inconsistent_pool_fails_check_c_in_the_report(self):
+        from tensorrt_llm._torch.memory.monitor import capture, render_capture
+        from tensorrt_llm._torch.memory.monitor.providers import register_provider
+
+        manager = _manager(_stats(100, 70, 50))
+        register_provider(KvCacheProvider(manager, "main"))
+        snapshot = capture(tag="unit")
+
+        failed = [c for c in snapshot.checks if not c.passed]
+        assert any(c.name.startswith("C:kv_cache.main") for c in failed)
+        text = render_capture(snapshot)
+        assert "FAILED" in text and "[checks]" in text
+
+    def test_consistent_pool_passes(self):
+        from tensorrt_llm._torch.memory.monitor import capture
+        from tensorrt_llm._torch.memory.monitor.providers import register_provider
+
+        manager = _manager(_stats(100, 30, 20))
+        register_provider(KvCacheProvider(manager, "main"))
+        snapshot = capture(tag="unit")
+        kv = [c for c in snapshot.checks if c.name.startswith("C:")]
+        assert kv and all(c.passed for c in kv)
+
+    def test_check_b_is_always_present(self):
+        from tensorrt_llm._torch.memory.monitor import capture
+
+        snapshot = capture(tag="unit")
+        assert any(c.name.startswith("B:") for c in snapshot.checks)

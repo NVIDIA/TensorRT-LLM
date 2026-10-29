@@ -1340,10 +1340,9 @@ def create_py_executor(
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
     try:
-        monitor_install_oom_reporter()
         with monitor_startup_window(), monitor_executor_initialization(
         ), _StartupTimer("executor_creation") as startup_timer:
-            return _create_py_executor_impl(
+            py_executor = _create_py_executor_impl(
                 _startup_timer=startup_timer,
                 llm_args=llm_args,
                 checkpoint_dir=checkpoint_dir,
@@ -1362,3 +1361,8 @@ def create_py_executor(
                     "Failed to roll back DWDP after PyExecutor construction error\n"
                     f"{traceback.format_exc()}")
         raise
+    # Armed only once startup is over: KV sizing, warmup and graph capture
+    # run allocations into the wall on purpose and catch the error, and the
+    # observer fires before anyone catches.
+    monitor_install_oom_reporter()
+    return py_executor

@@ -46,7 +46,6 @@ from ...llmapi.llm_args import LoadFormat
 from .._experimental.modeling_v2 import modeling_v2_resolve
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..memory.monitor.tagging import claim_module_memory as monitor_claim_memory
-from ..memory.monitor.tagging import tag as monitor_tag
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -1150,78 +1149,71 @@ class ModelLoader:
 
             memo: dict[torch.Tensor, torch.Tensor] = {}
 
-            # One tag around every branch below. Each materializes the
-            # parameters differently -- a dedicated virtual memory scope,
-            # a meta-tensor init, or the plain `.to("cuda")` fallback --
-            # but all of them allocate the same bytes, so tagging per
-            # branch would attribute weights only on whichever path a
-            # given run happened to take.
-            with monitor_tag("WEIGHTS"):
-                if (self.model_weights_memory_tag is not None
-                        and load_format != LoadFormat.GMS):
-                    # Allocate buffers to the outer virtual_memory_scope,
-                    # but parameters (weights) to the dedicated inner virtual_memory_scope.
+            if (self.model_weights_memory_tag is not None
+                    and load_format != LoadFormat.GMS):
+                # Allocate buffers to the outer virtual_memory_scope,
+                # but parameters (weights) to the dedicated inner virtual_memory_scope.
 
-                    def allocate_buffer_on_cuda(t: torch.Tensor):
-                        if t not in memo:
-                            if t.device == torch.device('meta'):
-                                cuda_t = torch.empty_like(t, device='cuda')
-                            else:
-                                cuda_t = t.cuda()
-                            memo[t] = cuda_t
-                            memo[cuda_t] = cuda_t
-                        return memo[t]
-
-                    _apply_to_buffers_only(model, allocate_buffer_on_cuda)
-
-                    need_initialized_weights = load_format not in (
-                        LoadFormat.AUTO, LoadFormat.DUMMY)
-
-                    def allocate_weights_on_cuda(t: torch.Tensor):
-                        if t not in memo:
+                def allocate_buffer_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        if t.device == torch.device('meta'):
                             cuda_t = torch.empty_like(t, device='cuda')
-                            if t.device != torch.device('meta') and (
-                                    need_initialized_weights or is_meta_init):
-                                if t.is_cuda:
-                                    memory_type_map = {
-                                        ExecutorMemoryType.MODEL_WEIGHTS_MAIN:
-                                        ExecutorMemoryType.MODEL_ENGINE_MAIN,
-                                        ExecutorMemoryType.MODEL_WEIGHTS_DRAFT:
-                                        ExecutorMemoryType.MODEL_ENGINE_DRAFT,
-                                    }
+                        else:
+                            cuda_t = t.cuda()
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
 
-                                    warnings.warn(
-                                        f"A weight tensor of shape {t.shape} is already allocated on CUDA device before "
-                                        f"the weight allocation stage. This will cause extra CUDA memory usage in the "
-                                        f"'{memory_type_map[self.model_weights_memory_tag]}' scope."
-                                    )
-                                cuda_t.copy_(t)
-                            memo[t] = cuda_t
-                            memo[cuda_t] = cuda_t
-                        return memo[t]
+                _apply_to_buffers_only(model, allocate_buffer_on_cuda)
 
-                    with virtual_memory_scope(
-                            self.model_weights_memory_tag,
-                            self.model_weights_restore_mode) as pool:
-                        model._apply(allocate_weights_on_cuda)
-                    self._weight_pool_proxy = pool
-                elif is_meta_init and load_format != LoadFormat.GMS:
+                need_initialized_weights = load_format not in (LoadFormat.AUTO,
+                                                               LoadFormat.DUMMY)
 
-                    def init_meta_tensor(t: torch.Tensor):
-                        if t.device != torch.device('meta'):
-                            return t
+                def allocate_weights_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        cuda_t = torch.empty_like(t, device='cuda')
+                        if t.device != torch.device('meta') and (
+                                need_initialized_weights or is_meta_init):
+                            if t.is_cuda:
+                                memory_type_map = {
+                                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN:
+                                    ExecutorMemoryType.MODEL_ENGINE_MAIN,
+                                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT:
+                                    ExecutorMemoryType.MODEL_ENGINE_DRAFT,
+                                }
 
-                        if t not in memo:
-                            memo[t] = torch.empty_like(t, device='cuda')
-                        return memo[t]
+                                warnings.warn(
+                                    f"A weight tensor of shape {t.shape} is already allocated on CUDA device before "
+                                    f"the weight allocation stage. This will cause extra CUDA memory usage in the "
+                                    f"'{memory_type_map[self.model_weights_memory_tag]}' scope."
+                                )
+                            cuda_t.copy_(t)
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
 
-                    model._apply(init_meta_tensor)
+                with virtual_memory_scope(
+                        self.model_weights_memory_tag,
+                        self.model_weights_restore_mode) as pool:
+                    model._apply(allocate_weights_on_cuda)
+                self._weight_pool_proxy = pool
+            elif is_meta_init and load_format != LoadFormat.GMS:
 
-                # Ensure everything is at least on CUDA
-                # No-op if worked as expected
-                if load_format != LoadFormat.GMS:
-                    model.to("cuda")
-                memo.clear()
+                def init_meta_tensor(t: torch.Tensor):
+                    if t.device != torch.device('meta'):
+                        return t
+
+                    if t not in memo:
+                        memo[t] = torch.empty_like(t, device='cuda')
+                    return memo[t]
+
+                model._apply(init_meta_tensor)
+
+            # Ensure everything is at least on CUDA
+            # No-op if worked as expected
+            if load_format != LoadFormat.GMS:
+                model.to("cuda")
+            memo.clear()
 
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
@@ -1610,11 +1602,8 @@ class ModelLoader:
             f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
         if LOW_M_GEMM_ACTIVE:
             prepare_low_m_gemm(model)
-        # Re-attribute from the parameters the model actually ended up with.
-        # The tag around the allocation region above misses anything the
-        # loader replaced -- fusing and quantising free the tagged blocks and
-        # allocate untagged ones -- so reading the final state is what makes
-        # the weights figure match the model.
+        # Attribute the parameters the model ended up with, whichever load
+        # path produced them. A no-op unless TLLM_MEM_MONITOR is set.
         monitor_claim_memory(model, "WEIGHTS")
         return model, moe_load_balancer
 

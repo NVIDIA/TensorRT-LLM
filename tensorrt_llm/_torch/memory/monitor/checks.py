@@ -28,7 +28,6 @@ from dataclasses import dataclass
 __all__ = [
     "CheckResult",
     "check_kv_pool_conservation",
-    "check_kv_quota",
     "check_tag_coverage",
 ]
 
@@ -73,36 +72,6 @@ def check_kv_pool_conservation(rows: list[dict]) -> list[CheckResult]:
             )
         )
     return results
-
-
-def check_kv_quota(rows: list[dict], quota_bytes: int, tolerance: float = 0.05) -> CheckResult:
-    """Check D: pool capacity against the quota it was sized from.
-
-    The two are expected to differ: pools round up to an allocation
-    granularity, so capacity lands at or slightly above quota. A capacity
-    *below* quota, or far above it, means the sizing and the allocation
-    disagree.
-
-    Tolerance is one-sided on purpose -- rounding can only add.
-    """
-    capacity = sum(row["capacity_bytes"] for row in rows)
-    if quota_bytes <= 0:
-        return CheckResult(
-            name="D:kv_quota",
-            passed=True,
-            detail=f"no quota to compare against (quota={quota_bytes})",
-        )
-
-    ratio = capacity / quota_bytes
-    passed = 1.0 <= ratio <= 1.0 + tolerance
-    return CheckResult(
-        name="D:kv_quota",
-        passed=passed,
-        detail=(
-            f"capacity={capacity} quota={quota_bytes} ratio={ratio:.4f} "
-            f"(expected 1.0..{1.0 + tolerance:.2f}; rounding only adds)"
-        ),
-    )
 
 
 def check_tag_coverage(by_tag: dict[str, int], torch_live_bytes: int) -> list[CheckResult]:

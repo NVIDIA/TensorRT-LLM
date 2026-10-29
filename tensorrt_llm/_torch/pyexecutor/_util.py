@@ -122,6 +122,22 @@ def _has_variable_kv_cache_geometry(model_config: ModelConfig) -> bool:
                                       for spec in layer_specs}) > 1
 
 
+def _register_kv_cache_monitor_providers(main, draft, cross) -> None:
+    """Hand each distinct KV cache pool to the memory monitor."""
+    seen = []
+    for role, manager in (("main", main), ("draft", draft), ("cross", cross)):
+        if manager is None or any(manager is other for other in seen):
+            continue
+        seen.append(manager)
+        try:
+            _monitor_register_provider(_MonitorKvCacheProvider(manager, role))
+        except Exception as exc:  # noqa: BLE001
+            # A diagnostic must never be the reason an executor fails to
+            # come up.
+            logger.debug(f"memory monitor: could not register the {role} KV "
+                         f"cache provider ({type(exc).__name__}: {exc})")
+
+
 def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,
                                      kv_cache_config: KvCacheConfig):
     # Variable per-layer geometry requires V2's per-layer buffer sizes.
@@ -3144,19 +3160,15 @@ class KvCacheCreator:
                 cross_kv_cache_config, estimating_kv_cache,
                 original_max_seq_len)
 
-        # The pool is usually the largest single allocation in the process,
-        # and nothing outside this function has a handle on its manager, so
-        # register it here rather than leaving it to be rediscovered. The
-        # provider holds the manager weakly.
-        if kv_cache_manager is not None:
-            try:
-                _monitor_register_provider(
-                    _MonitorKvCacheProvider(kv_cache_manager))
-            except Exception as exc:  # noqa: BLE001
-                # A diagnostic must never be the reason an executor fails
-                # to come up.
-                logger.debug(f"memory monitor: could not register the KV "
-                             f"cache provider ({type(exc).__name__}: {exc})")
+        # Each pool is a separate allocation, usually the largest in the
+        # process, and nothing outside this function has a handle on its
+        # manager, so register them here rather than leaving them to be
+        # rediscovered. A draft model that shares the target's manager is
+        # skipped so the pool is not counted twice. Providers hold the
+        # managers weakly.
+        _register_kv_cache_monitor_providers(kv_cache_manager,
+                                             draft_kv_cache_manager,
+                                             cross_kv_cache_manager)
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
