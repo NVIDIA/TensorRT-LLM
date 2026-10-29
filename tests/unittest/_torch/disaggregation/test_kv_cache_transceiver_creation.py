@@ -21,6 +21,7 @@ only when no preference was expressed). Everything else must fail loudly at
 transceiver creation — these tests pin those creation-time errors.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -65,6 +66,28 @@ def test_python_runtime_rejects_non_helix_cp_at_creation() -> None:
         transceiver_module.create_kv_cache_transceiver(
             mapping, Mock(), Mock(spec=KVCacheManagerV2), Mock(), config
         )
+
+
+def test_python_runtime_refuses_a_partial_transfer_under_helix() -> None:
+    """Under Helix a transfer moves each rank's whole slice of the prompt, which stands for the
+    whole prompt; a manager that may move part of it is refused at creation, not per request."""
+
+    class MovesPart(KVCacheManagerV2):
+        def disagg_transfer_length(self, request):
+            return 1
+
+    # What the constructor reads before its compatibility check.
+    config = SimpleNamespace(
+        kv_transfer_timeout_ms=1000,
+        kv_transfer_poll_interval_ms=10,
+        kv_transfer_sender_future_timeout_ms=None,
+    )
+    mapping = Mock()
+    mapping.cp_size = 2
+    mapping.has_cp_helix.return_value = True
+
+    with pytest.raises(ValueError, match="may transfer part of a prompt"):
+        KvCacheTransceiverV2(mapping, Mock(), object.__new__(MovesPart), config)
 
 
 @pytest.mark.parametrize(

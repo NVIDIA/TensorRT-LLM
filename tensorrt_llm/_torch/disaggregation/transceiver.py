@@ -1577,6 +1577,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"(cp_size={self._mapping.cp_size}, cp_type={self._mapping.cp_config.get('cp_type')}); "
                 f"only cp_size == 1 or helix CP is supported"
             )
+        # Under Helix only a rank's whole slice of the prompt stands for the whole prompt, so a
+        # manager that may move a part of it names no history the receiver could record.
+        transfer_length = getattr(type(self._kv_cache_manager), "disagg_transfer_length", None)
+        if (
+            self._mapping.cp_size != 1
+            and self._mapping.has_cp_helix()
+            and transfer_length is not None
+            and transfer_length is not KVCacheManagerV2.disagg_transfer_length
+        ):
+            raise ValueError(
+                "KvCacheTransceiverV2: _check_compatible: "
+                f"{type(self._kv_cache_manager).__name__} may transfer part of a prompt "
+                "(disagg_transfer_length), which Helix context parallelism does not support"
+            )
 
     def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:
         """Return whether this rank supports pipelined KV transfer."""
