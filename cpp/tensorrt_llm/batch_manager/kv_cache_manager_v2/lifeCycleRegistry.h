@@ -40,7 +40,6 @@ struct AttnLifeCycle
 {
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
-    bool isSparse = false;
     AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
 
     bool isPrivate() const noexcept
@@ -62,8 +61,7 @@ struct AttnLifeCycle
     {
         int numBlocks = divUp(historyLength, tokensPerBlock);
         BlockOrdinal start{std::min(numBlocks, numSinkBlocks)};
-        // Sparse selection may revisit any history block, including outside the sliding window.
-        if (isSparse || !windowSize.has_value())
+        if (!windowSize.has_value())
             return {start, start};
         // `+ 1` is intentional: attention always runs for >= 1 in-flight input
         // token at position `historyLength`, so the live window is
@@ -74,8 +72,7 @@ struct AttnLifeCycle
 
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
-        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && isSparse == o.isSparse
-            && reusePolicy == o.reusePolicy;
+        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && reusePolicy == o.reusePolicy;
     }
 
     bool operator<(AttnLifeCycle const& o) const noexcept
@@ -88,22 +85,18 @@ struct AttnLifeCycle
         {
             return numSinkBlocks < o.numSinkBlocks;
         }
-        if (isSparse != o.isSparse)
-        {
-            return isSparse < o.isSparse;
-        }
         return reusePolicy < o.reusePolicy;
     }
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock,
-        bool isSparse = false, AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED)
+        AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED)
     {
         TLLM_CHECK_DEBUG(tokensPerBlock > 0);
         TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
         TLLM_CHECK_DEBUG(!numSinkTokens.has_value() || *numSinkTokens >= 0);
         TLLM_CHECK_DEBUG((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
-        return AttnLifeCycle{ws, sinkBlocks, isSparse, reusePolicy};
+        return AttnLifeCycle{ws, sinkBlocks, reusePolicy};
     }
 };
 
@@ -199,7 +192,11 @@ public:
     LifeCycleId getId(LifeCycle const& lc) const;
 
     // Number of unique life cycles.
-    LifeCycleId size() const noexcept;
+    [[nodiscard]] LifeCycleId size() const noexcept
+    {
+        check();
+        return mLifeCycleList.size();
+    }
 
     // Iteration over LifeCycles in registration order.
     TypedVec<LifeCycleId, LifeCycle> const& getAll() const noexcept
@@ -283,7 +280,16 @@ public:
     }
 
 private:
-    void check() const;
+    //! Gated on the package's cached gDebug: TLLM_CHECK_DEBUG_WITH_INFO's own gate is an
+    //! out-of-line call into another TU, which would undo size() being inline.
+    void check() const
+    {
+        if (TLLM_UNLIKELY(gDebug))
+        {
+            TLLM_CHECK_WITH_INFO(
+                toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size(), "corrupted life cycle registry");
+        }
+    }
 
     TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;

@@ -43,7 +43,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
-from .._experimental.modeling_v2 import modeling_v2_resolve
+from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
@@ -1476,9 +1476,9 @@ class ModelLoader:
                         #      compatibility check (GMS has no disk fallback).
                         #   4. `materialize_module`: zero-copy bind GMS
                         #      pool storage onto the model parameters.
-                        #   5. Per-module `cache_derived_state`: recompute
-                        #      Python-side state from real, materialized
-                        #      tensors without re-running one-shot transforms.
+                        #   5. Mark materialized weights as transformed, then
+                        #      recompute Python-side derived state without
+                        #      re-running one-shot transforms.
                         #   6. `post_load_publish`: apply the format-specific
                         #      receiver publication policy.
                         with timing_metric(
@@ -1496,6 +1496,7 @@ class ModelLoader:
                             self._check_gms_source_identity(gms_backend)
 
                             gms_backend.materialize_module(model)
+                            self._mark_weights_transformed(model)
                             self._walk_cache_state(model)
 
                             self._post_load_publish(
@@ -2096,7 +2097,7 @@ class ModelLoader:
         # modeling_v2 target reads the arguments as the engine will run with
         # them and never overrides those defaults.
         config = replace(config,
-                         modeling_v2_target=modeling_v2_resolve(
+                         modeling_v2_target=modeling_v2_resolve_on_all_ranks(
                              config, self.llm_args))
 
         if uses_mtp_head_checkpoint(self.spec_config):

@@ -488,6 +488,99 @@ def test_kda_mixer_empty_prefill_preserves_initial_conv_state():
 
 
 @torch.no_grad()
+@pytest.mark.parametrize(
+    ("state_dtype", "mode"),
+    [(torch.bfloat16, "small-bh"), (torch.float32, "auto")],
+    ids=["bf16-small-bh", "fp32-auto"],
+)
+@pytest.mark.parametrize(
+    "sequence_lengths",
+    [[640, 100, 1000, 37], [1024]],
+    ids=["varlen", "single"],
+)
+def test_kda_prefill_op_sm_reserve_keeps_results(sequence_lengths, state_dtype, mode) -> None:
+    """Persistent grids of every size compute bitwise the same output and states.
+
+    ``sm_reserve`` only shrinks the Small-BH persistent grid, so each work
+    unit is computed the same way by another block.
+    """
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops  # noqa: F401
+
+    heads = 8
+    tokens = sum(sequence_lengths)
+    rows = len(sequence_lengths)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    shape = (1, tokens, heads, HEAD_DIM)
+
+    def bf16(scale: float = 1.0) -> torch.Tensor:
+        return (torch.randn(*shape, generator=gen, device="cuda") * scale).to(torch.bfloat16)
+
+    inputs = dict(
+        q=bf16(),
+        k=bf16(),
+        v=bf16(0.5),
+        g=bf16(),
+        beta=torch.randn(1, tokens, heads, generator=gen, device="cuda").to(torch.bfloat16),
+    )
+    state_seed = (
+        torch.randn(rows + 1, heads, HEAD_DIM, HEAD_DIM, generator=gen, device="cuda") * 0.1
+    ).to(state_dtype)
+    state_indices = torch.arange(1, rows + 1, dtype=torch.int32, device="cuda")
+
+    def call(sm_reserve: int) -> tuple[torch.Tensor, torch.Tensor]:
+        state_pool = state_seed.clone()
+        output = torch.ops.trtllm.kda_prefill(
+            **inputs,
+            state_pool=state_pool,
+            state_indices=state_indices,
+            cu_seqlens=cu_seqlens,
+            A_log=torch.zeros(heads, device="cuda"),
+            dt_bias=torch.zeros(heads * HEAD_DIM, device="cuda"),
+            scale=HEAD_DIM**-0.5,
+            lower_bound=-5.0,
+            mode=mode,
+            sm_reserve=sm_reserve,
+        )
+        return output, state_pool
+
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    expected = call(0)
+    for sm_reserve in (1, num_sms // 2, num_sms - 3):
+        for got, want in zip(call(sm_reserve), expected, strict=True):
+            assert torch.equal(got, want), f"sm_reserve={sm_reserve}"
+    with pytest.raises(ValueError, match="sm_reserve"):
+        call(num_sms)
+
+
+@torch.no_grad()
+def test_kda_mixer_prefill_passes_the_reserve_set_before_construction() -> None:
+    """The mixer passes the SM reserve that was set before it was built to the prefill."""
+    from tensorrt_llm._torch.cute_dsl_utils import set_sm_reserve
+
+    set_sm_reserve(16)
+    try:
+        kda = _make_kda(num_heads=2)
+    finally:
+        set_sm_reserve(0)
+    reserves = []
+    prefill_chunk_kda = kda._dispatch.prefill_chunk_kda
+
+    def spy(**kwargs):
+        reserves.append(kwargs["sm_reserve"])
+        return prefill_chunk_kda(**kwargs)
+
+    kda._dispatch.prefill_chunk_kda = spy
+    hidden_states = torch.randn(1, 64, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
+    _run_production_prefill(kda, hidden_states)
+    assert reserves == [16]
+
+
+@torch.no_grad()
 def test_kda_prefill_op_partial_final_chunk_large_batch():
     """Large packed batches with short final sequences match the FLA reference.
 
