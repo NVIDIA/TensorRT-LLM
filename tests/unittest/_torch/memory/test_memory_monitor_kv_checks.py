@@ -285,3 +285,23 @@ class TestChecksRunInRealReports:
 
         snapshot = capture(tag="unit")
         assert any(c.name.startswith("B:") for c in snapshot.checks)
+
+
+class TestKvCacheManagerV1:
+    def test_reads_the_managers_allocated_bytes(self):
+        class _V1:
+            def get_kv_cache_stats(self):
+                return types.SimpleNamespace(allocated_bytes=12 * MB)
+
+        manager = _V1()
+        entries = KvCacheProvider(manager).collect()
+        assert entries[0].size_bytes == 12 * MB
+        assert entries[0].basis is Basis.PHYSICAL_BACKING
+
+    def test_a_failing_accessor_is_unknown_not_zero(self):
+        class _Broken:
+            def get_kv_cache_stats(self):
+                raise RuntimeError("not ready")
+
+        manager = _Broken()
+        assert KvCacheProvider(manager).collect()[0].size_bytes is None

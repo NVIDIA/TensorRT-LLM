@@ -252,16 +252,17 @@ def _live_blocks() -> list[tuple[int, int, bool, list]] | None:
 
     ``frames`` is the allocating stack when stack recording is on, else empty.
     """
-    from .pools import classify
+    from .pools import classify_all
 
     try:
         segments = torch.cuda.memory._snapshot()["segments"]
     except Exception:  # noqa: BLE001
         logger.debug("memory monitor: snapshot failed while reading tags")
         return None
+    kinds = classify_all(segment.get("segment_pool_id", (0, 0)) for segment in segments)
     blocks = []
     for segment in segments:
-        in_graph = classify(segment.get("segment_pool_id", (0, 0)))[0] == "graph"
+        in_graph = kinds[tuple(segment.get("segment_pool_id", (0, 0)))][0] == "graph"
         for block in segment["blocks"]:
             if block["state"] == "active_allocated":
                 blocks.append(

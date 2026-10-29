@@ -110,9 +110,18 @@ class TorchReading:
     pools: tuple | None = None
 
     @property
+    def released(self) -> int:
+        """Reserved bytes of sleep-mode pools whose memory is released."""
+        return sum(p.reserved for p in self.pools or () if p.released)
+
+    @property
     def footprint(self) -> int:
-        """What torch holds from the driver, or ``live`` as a lower bound."""
-        return self.live if self.reserved is None else self.reserved
+        """What torch holds from the driver, or ``live`` as a lower bound.
+
+        Released sleep-mode pools are left out: torch still counts them,
+        the driver no longer backs them.
+        """
+        return (self.live if self.reserved is None else self.reserved) - self.released
 
     @property
     def reserved_unallocated(self) -> int | None:
@@ -200,8 +209,20 @@ def build_frame(
 
 
 def derived_entries(frame: Frame) -> list[Entry]:
-    """The two subtraction results, as monitor entries."""
-    return [
+    """The subtraction results, as monitor entries."""
+    released = []
+    if frame.torch.released:
+        released.append(
+            Entry(
+                category=Category.SLEEP_RELEASED,
+                size_bytes=-frame.torch.released,
+                source=Source.DERIVED,
+                placement=Placement.TORCH_DEFAULT,
+                basis=Basis.PHYSICAL_BACKING,
+                note="counted by torch, physically released by sleep mode",
+            )
+        )
+    return released + [
         Entry(
             category=Category.UNATTRIBUTED_LIVE,
             size_bytes=frame.unattributed_live,
