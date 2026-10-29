@@ -1253,7 +1253,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
     # Provide a mamba layer group so _create_chunk places the slot ID
-    mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
+    mamba_lg = SimpleNamespace(kind=CacheKind.STATE, pool_views=[object()])
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
@@ -4081,6 +4081,71 @@ def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
             mgr.kv_cache_map[123].get_aggregated_page_indices(1, valid_only=True)
         )
         assert attention_blocks
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_private_ssm_buffer_uses_buffer_group_lookups():
+    """A recurrent buffer with its own reuse policy splits each Mamba layer across two layer groups. The manager
+    resolves the recurrent-state group through the SSM_STATE buffer, describes the private group by its own role, and
+    leaves the private group out of the disaggregated transfer."""
+    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
+
+    private_role = DataRole("private_scratch")
+
+    class PrivateBufferManager(NemotronHybridCacheManager):
+        def _get_recurrent_buffer_configs(self, global_layer_id):
+            return [
+                *super()._get_recurrent_buffer_configs(global_layer_id),
+                BufferConfig(role=private_role, size=256, reuse_policy=ReusePolicy.PRIVATE),
+            ]
+
+        def get_disagg_ignored_roles(self):
+            return super().get_disagg_ignored_roles() | {private_role}
+
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2, model_manager_cls=PrivateBufferManager
+    )
+    try:
+        required = int(mgr.impl.get_buffer_group_id(LayerId(0), MambaRole.SSM_STATE))
+        private = int(mgr.impl.get_buffer_group_id(LayerId(0), private_role))
+        attention = int(mgr.impl.get_layer_group_id(LayerId(2)))
+        assert len({required, private, attention}) == 3
+        assert mgr.ssm_layer_group_id == required
+        assert int(mgr.impl.get_buffer_group_id(LayerId(1), MambaRole.CONV_STATE)) == required
+        with pytest.raises(ValueError):
+            mgr.impl.get_layer_group_id(LayerId(0))
+        assert mgr.num_pools == len(mgr.impl.buffer_grouping)
+        assert sorted(mgr._layer_ids_by_group[private]) == [0, 1]
+        assert mgr._get_pool_roles(required) == (MambaRole.SSM_STATE, None)
+        assert mgr._get_pool_roles(private) == (private_role, None)
+        assert [mgr._get_layer_execution_group(layer) for layer in range(3)] == [
+            required,
+            required,
+            attention,
+        ]
+
+        mgr.add_dummy_requests([123], token_nums=[8], is_gen=False)
+        kv_cache = mgr.kv_cache_map[123]
+        assert mgr.get_state_indices([123], [False]) == [
+            kv_cache.get_ssm_block_base_index(required)
+        ]
+        assert kv_cache.get_ssm_block_base_index(private) >= 0
+        private_view = mgr._get_state_buffer(0, private_role, torch.uint8, [256])
+        num_private_pages = mgr.impl.get_page_index_upper_bound(LayerId(0), private_role)
+        assert private_view.shape[0] == num_private_pages // mgr.impl.get_page_index_scale(
+            LayerId(0), private_role
+        )
+        mgr._get_state_buffer(1, private_role, torch.uint8, [256])
+        assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
+
+        page_table = build_page_table_from_manager(mgr)
+        assert len(page_table.layer_groups) == len(mgr.impl.buffer_grouping)
+        assert not page_table.layer_groups[private].pool_views
+        assert not page_table.layer_groups[private].local_layers
+        assert MambaPolicy._find_mamba_layer_group(page_table) is page_table.layer_groups[required]
     finally:
         mgr.shutdown()
 

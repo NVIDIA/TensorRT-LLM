@@ -675,7 +675,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kinds = [lg.kind for lg in layer_groups]
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
-                slot = self._get_mamba_slot_for_request(req)
+                slot = self._get_mamba_slot_for_request(req) if lg.pool_views else None
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
                 # Block lists carry beam 0 only (beam-search attention reads

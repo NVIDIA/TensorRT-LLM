@@ -478,10 +478,15 @@ class MambaPolicy:
     ) -> Optional[MambaLayerGroup]:
         if page_table is None:
             return None
-        return next(
-            (lg for lg in page_table.layer_groups if lg.kind == CacheKind.STATE),
-            None,
-        )
+        groups = [
+            lg for lg in page_table.layer_groups if lg.kind == CacheKind.STATE and lg.pool_views
+        ]
+        if len(groups) > 1:
+            raise ValueError(
+                "Mamba transfer requires one recurrent-state lifecycle; "
+                "multiple transferable state groups need separate slot indices"
+            )
+        return groups[0] if groups else None
 
     @staticmethod
     def validate_peer_compatible(
