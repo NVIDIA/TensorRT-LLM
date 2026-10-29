@@ -172,7 +172,14 @@ class Coordinator:
 
     async def _shutdown_group(self) -> None:
         try:
-            await asyncio.gather(*(peer.request({"operation": "shutdown"}) for peer in self._peers))
+            results = await asyncio.gather(
+                *(peer.request({"operation": "shutdown"}) for peer in self._peers),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    self._fail(f"Frontend shutdown publication failed: {result}")
+                    raise result
         finally:
             self._request_shutdown()
 
@@ -207,6 +214,8 @@ class Coordinator:
                 "instance_id": self.instance_id,
                 "count": len(self._requests),
                 "stopping": self.stopping,
+                "shutdown_pending": self._shutdown_task is not None
+                and not self._shutdown_task.done(),
             }
         if operation == "failure":
             self.ready = False

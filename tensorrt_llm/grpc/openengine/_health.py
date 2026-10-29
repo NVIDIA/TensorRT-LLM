@@ -51,7 +51,12 @@ class OpenEngineHealthServicer(health_pb2_grpc.HealthServicer):
 
     async def set(self, service: str, status: int) -> None:
         async with self._changed:
-            if self._shutting_down or self._statuses.get(service) == status:
+            fatal_liveness = (
+                service == "liveness" and status == health_pb2.HealthCheckResponse.NOT_SERVING
+            )
+            if (self._shutting_down and not fatal_liveness) or self._statuses.get(
+                service
+            ) == status:
                 return
             self._statuses[service] = status
             if service == "readiness":

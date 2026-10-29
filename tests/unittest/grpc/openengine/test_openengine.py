@@ -64,6 +64,7 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> 
         server._health = SimpleNamespace(enter_graceful_shutdown=AsyncMock(), set=AsyncMock())
         server._health_task = None
         server._shutdown_health_task = None
+        server._fatal_health_task = None
         server._fatal_engine_failure = False
         server._input_executor = ThreadPoolExecutor(max_workers=1)
         server._media_executor = ThreadPoolExecutor(max_workers=1)
@@ -83,6 +84,84 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> 
                 pool.submit(lambda: None)
 
     asyncio.run(exercise_stop())
+
+
+def test_fatal_failure_during_drain_updates_liveness() -> None:
+    async def exercise():
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            llm_id="test-instance",
+            tokenizer=None,
+            _check_health=lambda: True,
+        )
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test")
+        await server.start()
+        original = server._server
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def stop(grace):
+            entered.set()
+            await release.wait()
+            await original.stop(grace)
+
+        server._server = SimpleNamespace(stop=stop)
+        task = asyncio.create_task(server.stop(grace=0))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            server._fatal_engine_failure = True
+            server.begin_shutdown()
+            await server._fatal_health_task
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                request = health_pb2.HealthCheckRequest(service="liveness")
+                assert (
+                    await health.Check(request, timeout=3)
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                watch = health.Watch(request, timeout=3)
+                assert (await watch.read()).status == health_pb2.HealthCheckResponse.NOT_SERVING
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(exercise())
+
+
+def test_fatal_failure_during_start_does_not_restore_liveness() -> None:
+    async def exercise():
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            llm_id="test-instance",
+            tokenizer=None,
+            _check_health=lambda: True,
+        )
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test")
+        original = server._server
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def start():
+            entered.set()
+            await release.wait()
+            await original.start()
+
+        server._server = SimpleNamespace(start=start, stop=original.stop)
+        task = asyncio.create_task(server.start())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            server._fatal_engine_failure = True
+            server.begin_shutdown()
+            await server._fatal_health_task
+            release.set()
+            await task
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                response = await health_pb2_grpc.HealthStub(channel).Check(
+                    health_pb2.HealthCheckRequest(service="liveness"), timeout=3
+                )
+                assert response.status == health_pb2.HealthCheckResponse.NOT_SERVING
+        finally:
+            release.set()
+            await server.stop(grace=0)
+
+    asyncio.run(exercise())
 
 
 def test_openengine_server_serves_the_control_contract() -> None:
@@ -700,6 +779,15 @@ def test_shutdown_rpc_closes_admission_and_preserves_health(fatal, pending_probe
             assert (
                 await health.Check(health_pb2.HealthCheckRequest(service="readiness"))
             ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+            if not fatal and not pending_probe:
+                # A fatal error during an orderly shutdown must become visible
+                # even while owner cleanup is still held.
+                server._fatal_engine_failure = True
+                server.begin_shutdown()
+                await asyncio.wait_for(server._fatal_health_task, 3)
+                assert (
+                    await health.Check(health_pb2.HealthCheckRequest(service="liveness"))
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
         finally:
             probe_release.set()
             accepted.set()

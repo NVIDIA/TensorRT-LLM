@@ -485,6 +485,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 stopping = stopping or (await self._frontend.request("status"))["stopping"]
             except CoordinationError:
                 stopping = True
+        stopping = stopping or self._inference.stopping
         if stopping:
             checks.append(
                 lifecycle_pb2.HealthCheck(

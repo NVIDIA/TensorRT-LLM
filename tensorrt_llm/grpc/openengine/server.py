@@ -125,6 +125,7 @@ class OpenEngineServer:
         self._stopping = False
         self._health_task: asyncio.Task | None = None
         self._shutdown_health_task: asyncio.Task[None] | None = None
+        self._fatal_health_task: asyncio.Task[None] | None = None
         self._engine_health_task: asyncio.Task[bool] | None = None
         self._health_refresh_lock = asyncio.Lock()
         self._inference_serving = False
@@ -197,7 +198,8 @@ class OpenEngineServer:
                     "set kv_cache_config.use_kv_cache_manager_v2: true and use a supported model"
                 )
         await self._server.start()
-        await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
+        if not self._fatal_engine_failure:
+            await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
         await self._refresh_inference_health()
         self._health_task = asyncio.create_task(self._monitor_inference_health())
         address = _format_bind_address(self.host, self.port)
@@ -234,6 +236,10 @@ class OpenEngineServer:
         if self._shutdown_health_task is None:
             self._shutdown_health_task = asyncio.create_task(
                 self._health.set("readiness", health_pb2.HealthCheckResponse.NOT_SERVING)
+            )
+        if self._fatal_engine_failure and self._fatal_health_task is None:
+            self._fatal_health_task = asyncio.create_task(
+                self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
             )
         return self._shutdown_health_task
 
@@ -313,8 +319,8 @@ class OpenEngineServer:
         """
         try:
             await asyncio.shield(self.begin_shutdown())
-            if self._fatal_engine_failure:
-                await self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
+            if self._fatal_health_task is not None:
+                await asyncio.shield(self._fatal_health_task)
             await self._health.enter_graceful_shutdown()
             if self._health_task is not None:
                 self._health_task.cancel()
@@ -365,6 +371,9 @@ def launch_server(
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
     _warn_if_python_protobuf()
+
+    class StartupStopped(Exception):
+        """Leave startup through the common cleanup and failure check."""
 
     async def serve() -> None:
         logger.info("Initializing TensorRT-LLM OpenEngine server...")
@@ -479,7 +488,7 @@ def launch_server(
                         status = await frontend.request("heartbeat", frontend=frontend.frontend_id)
                     except CoordinationError:
                         return
-                    if status["stopping"]:
+                    if status["stopping"] and not status["shutdown_pending"]:
                         request_stop()
                         return
                 try:
@@ -504,7 +513,7 @@ def launch_server(
             if stop_event.is_set():
                 if failure is not None:
                     raise RuntimeError(failure)
-                return
+                raise StartupStopped
             logger.info("Model loaded successfully")
             instance_id = llm_args["_openengine_discovery"]["engine_id"]
             if mode.is_launcher:
@@ -552,14 +561,15 @@ def launch_server(
                         cancelled=startup_cancelled,
                         report_failure=report_failure,
                     )
-                except FrontendStartupCancelled:
+                except FrontendStartupCancelled as error:
                     # The spawn helper has already reaped its children. The
                     # stop check below distinguishes SIGTERM from engine failure.
-                    pass
+                    for pid, code in error.failures:
+                        fail(f"OpenEngine frontend {pid} exited with code {code} during startup")
             if stop_event.is_set():
                 if failure is not None:
                     raise RuntimeError(failure)
-                return
+                raise StartupStopped
             server = OpenEngineServer(
                 host=host,
                 port=port,
@@ -579,6 +589,8 @@ def launch_server(
                 coordinator.ready = True
                 await server._refresh_inference_health()
             await stop_event.wait()
+        except StartupStopped:
+            pass
         finally:
             startup_cancelled.set()
             await report_frontend_exit()
@@ -594,16 +606,16 @@ def launch_server(
             finally:
                 try:
                     if children:
-                        await asyncio.to_thread(_terminate_attached_frontends, children)
+                        child_failures = await asyncio.to_thread(
+                            _terminate_attached_frontends, children
+                        )
                         # Cleanup after closing the private channel can still
                         # fail. Preserve those failures in the group result,
                         # while allowing the termination helper's grace policy.
-                        for child in children:
-                            if child.returncode not in (0, -signal.SIGTERM, -signal.SIGKILL):
-                                fail(
-                                    f"OpenEngine frontend {child.pid} exited with code "
-                                    f"{child.returncode} during shutdown"
-                                )
+                        for pid, code in child_failures:
+                            fail(
+                                f"OpenEngine frontend {pid} exited with code {code} during shutdown"
+                            )
                     if frontend is not None:
                         await report_frontend_exit()
                         await frontend.close()
@@ -614,6 +626,7 @@ def launch_server(
                         if llm is not None:
                             record_terminal_engine_failure()
                             await asyncio.to_thread(llm.shutdown)
+                            record_terminal_engine_failure()
                     finally:
                         if directory is not None:
                             directory.cleanup()

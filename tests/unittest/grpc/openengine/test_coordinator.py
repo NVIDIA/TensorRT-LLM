@@ -78,6 +78,7 @@ async def test_cross_frontend_ownership_load_and_abort():
             "ready": True,
             "instance_id": "shared-engine",
             "stopping": False,
+            "shutdown_pending": False,
         }
         assert await second.request("abort", request_id="request") == {
             "aborted": 1,
@@ -202,7 +203,8 @@ async def test_cancelled_shutdown_keeps_launcher_commit():
 
 
 @pytest.mark.asyncio
-async def test_cancelled_shutdown_finishes_group_publication():
+@pytest.mark.parametrize("peer_failure", [False, True])
+async def test_cancelled_shutdown_finishes_group_publication(peer_failure):
     """A cancelled reply cannot strand a committed shutdown during fanout."""
     async with group() as (coordinator, (first, _), failures):
         entered, release, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -211,6 +213,8 @@ async def test_cancelled_shutdown_finishes_group_publication():
         async def delayed(message):
             entered.set()
             await release.wait()
+            if peer_failure:
+                raise RuntimeError("injected peer publication failure")
             return await original(message)
 
         coordinator._peers[0].request = delayed
@@ -223,15 +227,69 @@ async def test_cancelled_shutdown_finishes_group_publication():
         task = asyncio.create_task(first.request("shutdown", expected_instance_id="shared-engine"))
         try:
             await asyncio.wait_for(entered.wait(), 2)
+            heartbeat = await first.request("heartbeat", frontend=first.frontend_id)
+            assert heartbeat["stopping"] and heartbeat["shutdown_pending"]
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
             release.set()
             await asyncio.wait_for(stopped.wait(), 2)
+            await asyncio.gather(coordinator._shutdown_task, return_exceptions=True)
             assert coordinator.stopping
-            assert not failures
+            assert bool(failures) == peer_failure
         finally:
             release.set()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_wins_over_stale_probe_status():
+    """A delayed healthy coordinator response cannot resurrect local readiness."""
+    from conftest import FakeServicerContext
+
+    from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer
+    from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    stopping = False
+
+    class Frontend:
+        calls = 0
+
+        async def request(self, operation):
+            self.calls += 1
+            if self.calls == 2:
+                entered.set()
+                await release.wait()
+            return {"ready": True, "stopping": False}
+
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        tokenizer=None,
+        _check_health=lambda: True,
+    )
+    inference = OpenEngineInferenceServicer(llm, "test", is_stopping=lambda: stopping)
+    control = OpenEngineControlServicer(llm, "test", inference, frontend=Frontend())
+
+    async def probe(model):
+        return lifecycle_pb2.HealthCheck(state=lifecycle_pb2.HEALTH_STATE_READY)
+
+    control._inference_probe = probe
+    task = asyncio.create_task(
+        control.Health(
+            lifecycle_pb2.HealthRequest(include_inference_probe=True), FakeServicerContext()
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        stopping = True
+        release.set()
+        assert (await asyncio.wait_for(task, 2)).state == lifecycle_pb2.HEALTH_STATE_NOT_READY
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 @pytest.mark.asyncio

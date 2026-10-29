@@ -26,6 +26,15 @@ from tensorrt_llm.grpc.openengine.bindings import server_pb2 as server_info  # n
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 
+def test_cleanup_reports_a_frontend_killed_before_termination():
+    from tensorrt_llm.serve._frontend_processes import _terminate_attached_frontends
+
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    process.kill()
+    process.wait(timeout=5)
+    assert _terminate_attached_frontends([process]) == [(process.pid, -signal.SIGKILL)]
+
+
 def test_second_frontend_group_rejects_occupied_port_before_model_load(monkeypatch):
     monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
     model_loaded = Mock(side_effect=AssertionError("model loaded before port check"))
@@ -141,6 +150,7 @@ def test_ready_child_death_fails_startup(monkeypatch, last_child_ready):
 # Replace only the GPU engine boundary. The real launcher, readiness pipes,
 # signals, gRPC servers, coordinator, and subprocess cleanup remain in use.
 _LAUNCHER = """
+import asyncio
 import os
 from pathlib import Path
 import signal
@@ -157,8 +167,10 @@ frontend = int(os.environ.get("TLLM_EXECUTOR_FRONTEND_ID", "0"))
 
 class Engine:
     def __init__(self, **kwargs):
-        if sys.argv[3] == "startup-signal" or (
-            frontend and sys.argv[3] in ("child-startup-signal", "child-startup-engine-failure")
+        if sys.argv[3] in ("startup-signal", "startup-signal-fatal") or (
+            frontend and sys.argv[3] in (
+                "child-startup-signal", "child-startup-signal-fatal", "child-startup-engine-failure"
+            )
         ):
             if frontend:
                 previous = signal.getsignal(signal.SIGTERM)
@@ -184,6 +196,8 @@ class Engine:
         self.tokenizer = None
         self._executor = Mock(spec=GenerationExecutorProxy)
         self._executor.multi_frontend_attach_info.return_value = {"mode": "classic"}
+        if sys.argv[3] == "startup-signal-fatal":
+            self._executor._fatal_error = RuntimeError("injected fatal startup failure")
     def _check_health(self):
         return not (
             frontend == 0 and sys.argv[3] == "child-startup-engine-failure"
@@ -192,10 +206,19 @@ class Engine:
     def shutdown(self):
         with (root / f"shutdown-{frontend}").open("a") as marker:
             marker.write("shutdown\\n")
-        if frontend and sys.argv[3] == "rpc-close-fatal-attached":
+        if frontend and sys.argv[3] in ("rpc-close-fatal-attached", "child-startup-signal-fatal"):
             raise RuntimeError("injected failure after coordinator close")
+        if not frontend and sys.argv[3] == "rpc-close-fatal-owner":
+            self._executor._engine_dead = True
 
 server.PyTorchLLM = Engine
+if frontend and sys.argv[3] == "rpc-delayed-peer":
+    original_dispatch = server.FrontendClient._dispatch
+    async def delayed_dispatch(self, message, context):
+        if message.get("operation") == "shutdown":
+            await asyncio.sleep(1.5)
+        return await original_dispatch(self, message, context)
+    server.FrontendClient._dispatch = delayed_dispatch
 if sys.argv[3].startswith("rpc-"):
     original_info = server.OpenEngineControlServicer.GetServerInfo
     async def info(self, request, context):
@@ -236,14 +259,18 @@ def _wait_until(predicate, timeout=90):
         "launcher-death",
         "shutdown",
         "startup-signal",
+        "startup-signal-fatal",
         "child-startup-signal",
+        "child-startup-signal-fatal",
         "child-startup-engine-failure",
         "rpc-single",
         "rpc-launcher",
         "rpc-attached",
+        "rpc-delayed-peer",
         "rpc-fatal",
         "rpc-fatal-attached",
         "rpc-close-fatal-attached",
+        "rpc-close-fatal-owner",
         "rpc-signal",
     ],
 )
@@ -264,15 +291,19 @@ def test_frontend_group_cleanup(tmp_path, failure):
             env={**os.environ, "TLLM_FRONTEND_READY_TIMEOUT": "45"},
         )
     try:
-        if failure == "startup-signal":
+        if failure in ("startup-signal", "startup-signal-fatal"):
             _wait_until(lambda: (tmp_path / "initializing").exists())
             process.terminate()
             (tmp_path / "continue-initialization").touch()
-            assert process.wait(timeout=20) == 0
+            assert (process.wait(timeout=20) == 0) == (failure == "startup-signal")
             assert (tmp_path / "shutdown-0").exists()
-        elif failure in ("child-startup-signal", "child-startup-engine-failure"):
+        elif failure in (
+            "child-startup-signal",
+            "child-startup-signal-fatal",
+            "child-startup-engine-failure",
+        ):
             _wait_until(lambda: (tmp_path / "initializing").exists())
-            if failure == "child-startup-signal":
+            if failure in ("child-startup-signal", "child-startup-signal-fatal"):
                 process.terminate()
             # Resume only after the launcher starts terminating its child:
             # otherwise READY could race cancellation and bypass the wait path.
