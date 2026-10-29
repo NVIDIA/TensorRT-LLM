@@ -59,6 +59,7 @@ class _StubWorkerServer:
         self.fail = fail
         self.get_count = 0
         self.posted_offsets: list[float] = []
+        self.paths: list[str] = []
         self._server = None
         self.url = None
 
@@ -80,6 +81,7 @@ class _StubWorkerServer:
                 except (asyncio.IncompleteReadError, ConnectionResetError):
                     return
                 method = header.split(b" ", 1)[0]
+                self.paths.append(header.split(b" ", 2)[1].decode())
                 if method == b"POST":
                     length = 0
                     for line in header.split(b"\r\n"):
@@ -200,3 +202,19 @@ async def test_unreachable_server_is_skipped_quietly():
     # Stub is now closed; the port should refuse connections.
     fake_self = SimpleNamespace(_req_timeout_secs=5)
     await OpenAIDisaggServer._sync_server_clock(fake_self, dead_url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scheme,suffix",
+    [("", ""), ("http://", ""), ("http://", "/")],
+    ids=["bare", "http_scheme", "http_scheme_trailing_slash"],
+)
+async def test_server_entry_forms_reach_the_endpoint(scheme, suffix):
+    """A server entry with or without a scheme or trailing slash is dialed as is."""
+    async with _StubWorkerServer() as stub:
+        fake_self = SimpleNamespace(_req_timeout_secs=30)
+        await OpenAIDisaggServer._sync_server_clock(fake_self, f"{scheme}{stub.url}{suffix}")
+
+    assert len(stub.posted_offsets) == 1
+    assert set(stub.paths) == {"/steady_clock_offset"}
