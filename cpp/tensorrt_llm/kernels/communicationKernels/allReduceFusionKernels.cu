@@ -135,11 +135,16 @@ public:
         {
             m_flag_value = next_flag(m_flag_value);
             // To avoid the ABA problem, we need to synchronize the correct flag value to all barrier_flags, even if the
-            // corresponding CTA has not been launched.
-            for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
+            // corresponding CTA has not been launched. The slot of this block is written last: the peer only waits on
+            // that slot, so its release store must order the stores to the slots of CTAs that are not launched now.
+            // Otherwise a later launch with a larger grid can see a slot still holding the flag from two barriers
+            // ago, which also differs from prev_flag, and pass early. The one release store orders all of them, so
+            // the others can be relaxed.
+            for (int flag_idx = blockIdx.x + gridDim.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
             {
-                st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
+                st_flag_relaxed(m_target_flag + flag_idx * NRanks, m_flag_value);
             }
+            st_flag(m_target_flag + blockIdx.x * NRanks, m_flag_value);
 
             while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
             {
@@ -152,6 +157,11 @@ protected:
     __device__ __forceinline__ void st_flag(int* addr, int flag)
     {
         asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
+    }
+
+    __device__ __forceinline__ void st_flag_relaxed(int* addr, int flag)
+    {
+        asm volatile("st.global.relaxed.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
     }
 
     __device__ __forceinline__ int ld_flag(int* addr)
