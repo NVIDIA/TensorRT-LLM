@@ -936,7 +936,8 @@ def read_allowed_local_media(url: str) -> bytes:
     directory, the reference resolves (symlinks and ``..`` included) to a path
     inside it, and that path is a regular file within the media size limit. A
     reference refused for its location gets the same message whether or not it
-    exists.
+    exists, and so does one refused because the variable does not name a
+    directory; that misconfiguration is logged on the server.
 
     The file is opened once, without following a symlink in its final
     component, and the regular-file and size checks run on the open descriptor.
@@ -957,7 +958,13 @@ def read_allowed_local_media(url: str) -> bytes:
         raise refused
     root = os.path.realpath(allowed_root)
     if not os.path.isdir(root):
-        raise ValueError(f"{_ALLOWED_LOCAL_MEDIA_PATH_ENV} is not a directory: {allowed_root!r}")
+        # Operator configuration: report it in the server log, not to the client.
+        logger.warning(
+            "%s=%r is not a directory; refusing the local media reference.",
+            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            allowed_root,
+        )
+        raise refused
     resolved = os.path.realpath(_normalize_file_uri(url))
     if os.path.commonpath([root, resolved]) != root:
         raise refused
