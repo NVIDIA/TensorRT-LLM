@@ -1,0 +1,293 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# One JSON diagnostic per line: path, line, column, code, and message.
+{"code": "call-arg", "column": 20, "line": 123, "message": "Unexpected keyword argument \"tensor_initializers\" for \"DynamicTensorSpec\"", "path": "tensorrt_llm/_torch/attention/backends/fmha/flashinfer_trtllm_gen.py"}
+{"code": "call-arg", "column": 24, "line": 310, "message": "Missing named argument \"max_seq_len\" for \"CSA2TrtllmMetadata\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/csa2/metadata.py"}
+{"code": "call-arg", "column": 24, "line": 310, "message": "Missing named argument \"num_contexts\" for \"CSA2TrtllmMetadata\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/csa2/metadata.py"}
+{"code": "call-arg", "column": 24, "line": 310, "message": "Missing named argument \"seq_lens\" for \"CSA2TrtllmMetadata\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/csa2/metadata.py"}
+{"code": "call-arg", "column": 24, "line": 310, "message": "Missing named argument \"seq_lens_kv\" for \"CSA2TrtllmMetadata\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/csa2/metadata.py"}
+{"code": "call-arg", "column": 16, "line": 1211, "message": "Missing named argument \"head_dim\" for \"get_index_k_buffer\" of \"KVCacheManagerV2\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/minimax_m3/msa_backend.py"}
+{"code": "call-arg", "column": 23, "line": 312, "message": "Missing named argument \"head_dim\" for \"get_index_k_buffer\" of \"KVCacheManagerV2\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/qsa/indexer.py"}
+{"code": "call-arg", "column": 23, "line": 383, "message": "Missing named argument \"head_dim\" for \"get_index_k_buffer\" of \"KVCacheManagerV2\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/qsa/indexer.py"}
+{"code": "call-arg", "column": 27, "line": 633, "message": "Missing named argument \"head_dim\" for \"get_index_k_buffer\" of \"KVCacheManagerV2\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/qsa/module.py"}
+{"code": "call-arg", "column": 23, "line": 695, "message": "Missing named argument \"head_dim\" for \"get_index_k_buffer\" of \"KVCacheManagerV2\"", "path": "tensorrt_llm/_torch/attention/backends/sparse/qsa/module.py"}
+{"code": "call-arg", "column": 9, "line": 97, "message": "Unexpected keyword argument \"bos_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseek_v3.py"}
+{"code": "call-arg", "column": 9, "line": 97, "message": "Unexpected keyword argument \"eos_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseek_v3.py"}
+{"code": "call-arg", "column": 9, "line": 97, "message": "Unexpected keyword argument \"pad_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseek_v3.py"}
+{"code": "call-arg", "column": 9, "line": 97, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseek_v3.py"}
+{"code": "call-arg", "column": 9, "line": 964, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseek_v41.py"}
+{"code": "call-arg", "column": 9, "line": 172, "message": "Unexpected keyword argument \"bos_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseekv4.py"}
+{"code": "call-arg", "column": 9, "line": 172, "message": "Unexpected keyword argument \"eos_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseekv4.py"}
+{"code": "call-arg", "column": 9, "line": 172, "message": "Unexpected keyword argument \"pad_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseekv4.py"}
+{"code": "call-arg", "column": 9, "line": 172, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/deepseekv4.py"}
+{"code": "call-arg", "column": 27, "line": 41, "message": "Unexpected keyword argument \"enable_moe_block\" for \"Gemma4TextConfig\"", "path": "tensorrt_llm/_torch/configs/gemma4.py"}
+{"code": "call-arg", "column": 27, "line": 41, "message": "Unexpected keyword argument \"hidden_size_per_layer_input\" for \"Gemma4TextConfig\"", "path": "tensorrt_llm/_torch/configs/gemma4.py"}
+{"code": "call-arg", "column": 27, "line": 41, "message": "Unexpected keyword argument \"num_hidden_layers\" for \"Gemma4TextConfig\"", "path": "tensorrt_llm/_torch/configs/gemma4.py"}
+{"code": "call-arg", "column": 27, "line": 41, "message": "Unexpected keyword argument \"num_kv_shared_layers\" for \"Gemma4TextConfig\"", "path": "tensorrt_llm/_torch/configs/gemma4.py"}
+{"code": "call-arg", "column": 27, "line": 41, "message": "Unexpected keyword argument \"use_double_wide_mlp\" for \"Gemma4TextConfig\"", "path": "tensorrt_llm/_torch/configs/gemma4.py"}
+{"code": "call-arg", "column": 27, "line": 41, "message": "Unexpected keyword argument \"vocab_size_per_layer_input\" for \"Gemma4TextConfig\"", "path": "tensorrt_llm/_torch/configs/gemma4.py"}
+{"code": "call-arg", "column": 9, "line": 184, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/gemma4.py"}
+{"code": "call-arg", "column": 9, "line": 107, "message": "Unexpected keyword argument \"pad_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/kimi_k3.py"}
+{"code": "call-arg", "column": 9, "line": 144, "message": "Unexpected keyword argument \"pad_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/kimi_k3.py"}
+{"code": "call-arg", "column": 9, "line": 129, "message": "Unexpected keyword argument \"bos_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/kimi_linear.py"}
+{"code": "call-arg", "column": 9, "line": 129, "message": "Unexpected keyword argument \"eos_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/kimi_linear.py"}
+{"code": "call-arg", "column": 9, "line": 129, "message": "Unexpected keyword argument \"pad_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/kimi_linear.py"}
+{"code": "call-arg", "column": 9, "line": 129, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/kimi_linear.py"}
+{"code": "call-arg", "column": 9, "line": 123, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/minicpmv4_6.py"}
+{"code": "call-arg", "column": 9, "line": 201, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/configs/qwen4_exp.py"}
+{"code": "name-defined", "column": 39, "line": 174, "message": "Name \"dist.DeviceMesh\" is not defined", "path": "tensorrt_llm/_torch/device_mesh.py"}
+{"code": "name-defined", "column": 52, "line": 53, "message": "Name \"self.RequestTransferMetadata\" is not defined", "path": "tensorrt_llm/_torch/disaggregation/orchestration/transfer_manager.py"}
+{"code": "name-defined", "column": 57, "line": 9, "message": "Name \"BaseWeightMapper\" is not defined", "path": "tensorrt_llm/_torch/models/checkpoints/auto_mapper.py"}
+{"code": "call-arg", "column": 9, "line": 48, "message": "Unexpected keyword argument \"max_position_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 9, "line": 48, "message": "Unexpected keyword argument \"rope_parameters\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 9, "line": 48, "message": "Unexpected keyword argument \"rope_scaling\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"d_model\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"downsample_factor\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"encoder_attention_heads\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"encoder_ffn_dim\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"encoder_layers\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"hop_length\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"max_source_positions\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"num_mel_bins\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"sampling_rate\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"vocab_size\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 25, "line": 222, "message": "Unexpected keyword argument \"window_size\" for \"WhisperConfig\"", "path": "tensorrt_llm/_torch/models/checkpoints/mistral/config_loader.py"}
+{"code": "call-arg", "column": 21, "line": 78, "message": "Missing named argument \"config\" for \"DecoderModelForCausalLM\"", "path": "tensorrt_llm/_torch/models/modeling_auto.py"}
+{"code": "call-arg", "column": 21, "line": 78, "message": "Missing named argument \"hidden_size\" for \"DecoderModelForCausalLM\"", "path": "tensorrt_llm/_torch/models/modeling_auto.py"}
+{"code": "call-arg", "column": 21, "line": 78, "message": "Missing named argument \"vocab_size\" for \"DecoderModelForCausalLM\"", "path": "tensorrt_llm/_torch/models/modeling_auto.py"}
+{"code": "call-arg", "column": 13, "line": 2560, "message": "Unexpected keyword argument \"padded_num_tokens\" for \"_compute_engram_hashes\" of \"DeepseekV4Model\"", "path": "tensorrt_llm/_torch/models/modeling_deepseekv41.py"}
+{"code": "call-arg", "column": 13, "line": 2560, "message": "Unexpected keyword argument \"refresh\" for \"_compute_engram_hashes\" of \"DeepseekV4Model\"", "path": "tensorrt_llm/_torch/models/modeling_deepseekv41.py"}
+{"code": "call-arg", "column": 13, "line": 108, "message": "Unexpected keyword argument \"text_config\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_exaone4_5.py"}
+{"code": "call-arg", "column": 13, "line": 108, "message": "Unexpected keyword argument \"vision_config\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_exaone4_5.py"}
+{"code": "call-arg", "column": 13, "line": 1527, "message": "Missing positional argument \"residual\" in call to \"maybe_capture_hidden_states\" of \"SpecMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_gemma4.py"}
+{"code": "call-arg", "column": 30, "line": 538, "message": "Missing named argument \"num_contexts\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_glm5_next_vision.py"}
+{"code": "call-arg", "column": 30, "line": 538, "message": "Missing named argument \"seq_lens\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_glm5_next_vision.py"}
+{"code": "call-arg", "column": 30, "line": 538, "message": "Missing named argument \"seq_lens_kv\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_glm5_next_vision.py"}
+{"code": "call-arg", "column": 20, "line": 642, "message": "Missing named argument \"num_contexts\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_glm5_next_vision.py"}
+{"code": "call-arg", "column": 20, "line": 642, "message": "Missing named argument \"seq_lens\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_glm5_next_vision.py"}
+{"code": "call-arg", "column": 20, "line": 642, "message": "Missing named argument \"seq_lens_kv\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_glm5_next_vision.py"}
+{"code": "call-arg", "column": 9, "line": 329, "message": "Unexpected keyword argument \"bos_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_hunyuan_dense.py"}
+{"code": "call-arg", "column": 9, "line": 329, "message": "Unexpected keyword argument \"eos_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_hunyuan_dense.py"}
+{"code": "call-arg", "column": 9, "line": 329, "message": "Unexpected keyword argument \"pad_token_id\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_hunyuan_dense.py"}
+{"code": "call-arg", "column": 9, "line": 329, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"__init__\" of \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_hunyuan_dense.py"}
+{"code": "call-arg", "column": 23, "line": 870, "message": "Unexpected keyword argument \"num_attention_heads\" for \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_kimi_k25.py"}
+{"code": "call-arg", "column": 23, "line": 870, "message": "Unexpected keyword argument \"num_key_value_heads\" for \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_kimi_k25.py"}
+{"code": "call-arg", "column": 23, "line": 870, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_kimi_k25.py"}
+{"code": "call-arg", "column": 23, "line": 387, "message": "Unexpected keyword argument \"num_attention_heads\" for \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_kimi_k3_vl.py"}
+{"code": "call-arg", "column": 23, "line": 387, "message": "Unexpected keyword argument \"num_key_value_heads\" for \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_kimi_k3_vl.py"}
+{"code": "call-arg", "column": 23, "line": 387, "message": "Unexpected keyword argument \"tie_word_embeddings\" for \"PreTrainedConfig\"", "path": "tensorrt_llm/_torch/models/modeling_kimi_k3_vl.py"}
+{"code": "call-arg", "column": 21, "line": 3276, "message": "Too many arguments for \"load_expert\"", "path": "tensorrt_llm/_torch/models/modeling_kimi_linear.py"}
+{"code": "call-arg", "column": 16, "line": 552, "message": "Missing named argument \"max_seq_len\" for \"_prepare_qwen_vl_vision_attn_metadata\"", "path": "tensorrt_llm/_torch/models/modeling_minicpmv4_6.py"}
+{"code": "call-arg", "column": 30, "line": 82, "message": "Missing named argument \"num_contexts\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_multimodal_encoder.py"}
+{"code": "call-arg", "column": 30, "line": 82, "message": "Missing named argument \"seq_lens\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_multimodal_encoder.py"}
+{"code": "call-arg", "column": 30, "line": 82, "message": "Missing named argument \"seq_lens_kv\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_multimodal_encoder.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"attention_bias\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"conv_kernel_size\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"convolution_bias\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"hidden_size\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"intermediate_size\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"max_position_embeddings\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"num_attention_heads\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"num_hidden_layers\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"num_mel_bins\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"scale_input\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"subsampling_conv_channels\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"subsampling_conv_kernel_size\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"subsampling_conv_stride\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 12, "line": 331, "message": "Unexpected keyword argument \"subsampling_factor\" for \"ParakeetEncoderConfig\"", "path": "tensorrt_llm/_torch/models/modeling_parakeet.py"}
+{"code": "call-arg", "column": 23, "line": 1178, "message": "Unexpected keyword argument \"allow_partial_loading\" for \"preprocess_weights\" of \"BaseWeightMapper\"", "path": "tensorrt_llm/_torch/models/modeling_qwen3_next.py"}
+{"code": "call-arg", "column": 30, "line": 898, "message": "Missing named argument \"num_contexts\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_qwen3vl.py"}
+{"code": "call-arg", "column": 30, "line": 898, "message": "Missing named argument \"seq_lens\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_qwen3vl.py"}
+{"code": "call-arg", "column": 30, "line": 898, "message": "Missing named argument \"seq_lens_kv\" for \"AttentionMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_qwen3vl.py"}
+{"code": "call-arg", "column": 23, "line": 1213, "message": "Unexpected keyword argument \"allow_partial_loading\" for \"preprocess_weights\" of \"BaseWeightMapper\"", "path": "tensorrt_llm/_torch/models/modeling_qwen4_exp.py"}
+{"code": "call-arg", "column": 13, "line": 1891, "message": "Missing positional argument \"residual\" in call to \"maybe_capture_hidden_states\" of \"SpecMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_speculative.py"}
+{"code": "call-arg", "column": 34, "line": 934, "message": "Missing positional argument \"_input_ids\" in call to \"apply\" of \"BaseMoeRoutingMethod\"", "path": "tensorrt_llm/_torch/models/modeling_step3p7.py"}
+{"code": "call-arg", "column": 13, "line": 1583, "message": "Missing positional argument \"residual\" in call to \"maybe_capture_hidden_states\" of \"SpecMetadata\"", "path": "tensorrt_llm/_torch/models/modeling_step3p7.py"}
+{"code": "name-defined", "column": 43, "line": 674, "message": "Name \"TorchLlmArgs\" is not defined", "path": "tensorrt_llm/_torch/models/modeling_utils.py"}
+{"code": "name-defined", "column": 46, "line": 849, "message": "Name \"BaseWeightMapper\" is not defined", "path": "tensorrt_llm/_torch/models/modeling_utils.py"}
+{"code": "name-defined", "column": 53, "line": 1362, "message": "Name \"BaseWeightLoader\" is not defined", "path": "tensorrt_llm/_torch/models/modeling_utils.py"}
+{"code": "name-defined", "column": 42, "line": 1368, "message": "Name \"BaseConfigLoader\" is not defined", "path": "tensorrt_llm/_torch/models/modeling_utils.py"}
+{"code": "name-defined", "column": 42, "line": 1720, "message": "Name \"BaseWeightMapper\" is not defined", "path": "tensorrt_llm/_torch/models/modeling_utils.py"}
+{"code": "call-arg", "column": 9, "line": 928, "message": "Missing positional argument \"self\" in call to \"__call__\" of \"_Wrapped\"", "path": "tensorrt_llm/_torch/models/modeling_vila.py"}
+{"code": "name-defined", "column": 34, "line": 370, "message": "Name \"PageAlignedLayout\" is not defined", "path": "tensorrt_llm/_torch/modules/dwdp/page_pool.py"}
+{"code": "call-arg", "column": 24, "line": 77, "message": "Unexpected keyword argument \"axis\" for \"cat\"", "path": "tensorrt_llm/_torch/modules/triton_linear.py"}
+{"code": "call-arg", "column": 24, "line": 87, "message": "Unexpected keyword argument \"axis\" for \"cat\"", "path": "tensorrt_llm/_torch/modules/triton_linear.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"activation\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"apply_router_weight_on_input\" for \"MoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"apply_router_weight_on_input\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"aux_stream_dict\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"aux_stream_dict\" for \"VanillaMoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"bias\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"bias\" for \"VanillaMoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"dtype\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"hidden_size\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"init_load_balancer\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"init_load_balancer\" for \"VanillaMoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"intermediate_size\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"layer_idx\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"model_config\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"num_experts\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"reduce_results\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"routing_method\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 152, "message": "Unexpected keyword argument \"weight_loading_mode\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"activation\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"apply_router_weight_on_input\" for \"MoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"apply_router_weight_on_input\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"dtype\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"hidden_size\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"intermediate_size\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"layer_idx\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"model_config\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"num_experts\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"reduce_results\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"routing_method\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 169, "message": "Unexpected keyword argument \"weight_loading_mode\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"activation\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"apply_router_weight_on_input\" for \"MoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"apply_router_weight_on_input\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"aux_stream_dict\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"aux_stream_dict\" for \"VanillaMoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"dtype\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"hidden_size\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"init_load_balancer\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"init_load_balancer\" for \"VanillaMoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"intermediate_size\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"layer_idx\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"model_config\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"num_experts\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"reduce_results\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"routing_method\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 187, "message": "Unexpected keyword argument \"weight_loading_mode\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"activation\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"bias\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"bias\" for \"VanillaMoE\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"dtype\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"hidden_size\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"intermediate_size\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"layer_idx\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"model_config\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"num_experts\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"reduce_results\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"routing_method\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "call-arg", "column": 16, "line": 219, "message": "Unexpected keyword argument \"weight_loading_mode\" for \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/create_moe.py"}
+{"code": "name-defined", "column": 23, "line": 240, "message": "Name \"Map\" is not defined", "path": "tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py"}
+{"code": "name-defined", "column": 35, "line": 242, "message": "Name \"Map\" is not defined", "path": "tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py"}
+{"code": "call-arg", "column": 31, "line": 659, "message": "Unexpected keyword argument \"workspace\" for \"run_moe\" of \"MoEImplBase\"", "path": "tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py"}
+{"code": "name-defined", "column": 33, "line": 81, "message": "Name \"self.LoraLayerKey\" is not defined", "path": "tensorrt_llm/_torch/peft/lora/cuda_graph_lora_params.py"}
+{"code": "call-arg", "column": 25, "line": 1095, "message": "Unexpected keyword argument \"draft_kv_cache_manager\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 25, "line": 1095, "message": "Unexpected keyword argument \"encoder_output_lens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 25, "line": 1095, "message": "Unexpected keyword argument \"is_gen\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 25, "line": 1095, "message": "Unexpected keyword argument \"max_beam_width\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 25, "line": 1095, "message": "Unexpected keyword argument \"max_num_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 25, "line": 1095, "message": "Unexpected keyword argument \"token_nums\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 25, "line": 1095, "message": "Unexpected keyword argument \"use_mrope\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 32, "line": 1244, "message": "Unexpected keyword argument \"encoder_output_lens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 32, "line": 1244, "message": "Unexpected keyword argument \"is_gen\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 32, "line": 1244, "message": "Unexpected keyword argument \"max_beam_width\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 32, "line": 1244, "message": "Unexpected keyword argument \"token_nums\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py"}
+{"code": "call-arg", "column": 28, "line": 230, "message": "Unexpected keyword argument \"draft_kv_cache_manager\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 230, "message": "Unexpected keyword argument \"is_gen\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 230, "message": "Unexpected keyword argument \"kv_reserve_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 230, "message": "Unexpected keyword argument \"max_num_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 230, "message": "Unexpected keyword argument \"token_nums\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 230, "message": "Unexpected keyword argument \"use_mrope\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 247, "message": "Unexpected keyword argument \"draft_kv_cache_manager\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 247, "message": "Unexpected keyword argument \"is_gen\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 247, "message": "Unexpected keyword argument \"kv_reserve_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 247, "message": "Unexpected keyword argument \"max_beam_width\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 247, "message": "Unexpected keyword argument \"max_num_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 247, "message": "Unexpected keyword argument \"token_nums\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 28, "line": 247, "message": "Unexpected keyword argument \"use_mrope\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 32, "line": 323, "message": "Unexpected keyword argument \"draft_kv_cache_manager\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 32, "line": 323, "message": "Unexpected keyword argument \"is_gen\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 32, "line": 323, "message": "Unexpected keyword argument \"kv_reserve_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 32, "line": 323, "message": "Unexpected keyword argument \"max_beam_width\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 32, "line": 323, "message": "Unexpected keyword argument \"max_num_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 32, "line": 323, "message": "Unexpected keyword argument \"token_nums\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 32, "line": 323, "message": "Unexpected keyword argument \"use_mrope\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 20, "line": 339, "message": "Unexpected keyword argument \"capture_sampling_params\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 20, "line": 339, "message": "Unexpected keyword argument \"draft_kv_cache_manager\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 20, "line": 339, "message": "Unexpected keyword argument \"is_gen\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 20, "line": 339, "message": "Unexpected keyword argument \"kv_reserve_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 20, "line": 339, "message": "Unexpected keyword argument \"max_beam_width\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 20, "line": 339, "message": "Unexpected keyword argument \"max_num_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 20, "line": 339, "message": "Unexpected keyword argument \"token_nums\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 20, "line": 339, "message": "Unexpected keyword argument \"use_mrope\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 31, "line": 449, "message": "Unexpected keyword argument \"capture_sampling_params\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 31, "line": 449, "message": "Unexpected keyword argument \"draft_kv_cache_manager\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 31, "line": 449, "message": "Unexpected keyword argument \"is_gen\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 31, "line": 449, "message": "Unexpected keyword argument \"kv_reserve_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 31, "line": 449, "message": "Unexpected keyword argument \"max_beam_width\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 31, "line": 449, "message": "Unexpected keyword argument \"max_num_draft_tokens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 31, "line": 449, "message": "Unexpected keyword argument \"token_nums\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 31, "line": 449, "message": "Unexpected keyword argument \"use_mrope\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/dummy_requests.py"}
+{"code": "call-arg", "column": 16, "line": 190, "message": "Unexpected keyword argument \"attention_backend\" for \"EncoderConfigMixin\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder.py"}
+{"code": "call-arg", "column": 16, "line": 190, "message": "Unexpected keyword argument \"attention_runtime_features\" for \"EncoderConfigMixin\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder.py"}
+{"code": "call-arg", "column": 16, "line": 190, "message": "Unexpected keyword argument \"max_batch_size\" for \"EncoderConfigMixin\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder.py"}
+{"code": "call-arg", "column": 16, "line": 190, "message": "Unexpected keyword argument \"max_beam_width\" for \"EncoderConfigMixin\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder.py"}
+{"code": "call-arg", "column": 16, "line": 190, "message": "Unexpected keyword argument \"max_num_tokens\" for \"EncoderConfigMixin\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder.py"}
+{"code": "call-arg", "column": 16, "line": 190, "message": "Unexpected keyword argument \"max_seq_len\" for \"EncoderConfigMixin\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder.py"}
+{"code": "call-arg", "column": 16, "line": 190, "message": "Unexpected keyword argument \"without_logits\" for \"EncoderConfigMixin\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder.py"}
+{"code": "call-arg", "column": 32, "line": 1257, "message": "Unexpected keyword argument \"encoder_output_lens\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder_decoder.py"}
+{"code": "call-arg", "column": 32, "line": 1257, "message": "Unexpected keyword argument \"is_gen\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder_decoder.py"}
+{"code": "call-arg", "column": 32, "line": 1257, "message": "Unexpected keyword argument \"max_beam_width\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder_decoder.py"}
+{"code": "call-arg", "column": 32, "line": 1257, "message": "Unexpected keyword argument \"token_nums\" for \"add_dummy_requests\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/engine/runners/encoder_decoder.py"}
+{"code": "name-defined", "column": 34, "line": 116, "message": "Name \"PyExecutor\" is not defined", "path": "tensorrt_llm/_torch/pyexecutor/profiling.py"}
+{"code": "name-defined", "column": 28, "line": 122, "message": "Name \"PyExecutor\" is not defined", "path": "tensorrt_llm/_torch/pyexecutor/profiling.py"}
+{"code": "call-arg", "column": 21, "line": 3223, "message": "Too many arguments for \"update_resources\" of \"BaseResourceManager\"", "path": "tensorrt_llm/_torch/pyexecutor/resource_manager.py"}
+{"code": "import-not-found", "column": 1, "line": 90, "message": "Cannot find implementation or library stub for module named \"tensorrt_llm._torch.speculative.dspark_confidence\"", "path": "tensorrt_llm/_torch/speculative/accept_stats.py"}
+{"code": "name-defined", "column": 49, "line": 1, "message": "Name \"DecodingBaseConfig\" is not defined", "path": "tensorrt_llm/_torch/speculative/auto_heuristic.py"}
+{"code": "call-arg", "column": 21, "line": 165, "message": "Too many arguments for \"pop\" of \"MutableSet\"", "path": "tensorrt_llm/_torch/speculative/save_hidden_state.py"}
+{"code": "call-arg", "column": 26, "line": 121, "message": "Missing named argument \"max_seq_len\" for \"TrtllmAttentionMetadata\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py"}
+{"code": "call-arg", "column": 26, "line": 121, "message": "Missing named argument \"num_contexts\" for \"TrtllmAttentionMetadata\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py"}
+{"code": "call-arg", "column": 26, "line": 121, "message": "Missing named argument \"seq_lens\" for \"TrtllmAttentionMetadata\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py"}
+{"code": "call-arg", "column": 26, "line": 121, "message": "Missing named argument \"seq_lens_kv\" for \"TrtllmAttentionMetadata\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/trtllm.py"}
+{"code": "call-arg", "column": 12, "line": 191, "message": "Unexpected keyword argument \"dtype\" for \"AttentionBackend\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/utils.py"}
+{"code": "call-arg", "column": 12, "line": 191, "message": "Unexpected keyword argument \"head_dim\" for \"AttentionBackend\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/utils.py"}
+{"code": "call-arg", "column": 12, "line": 191, "message": "Unexpected keyword argument \"layer_idx\" for \"AttentionBackend\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/utils.py"}
+{"code": "call-arg", "column": 12, "line": 191, "message": "Unexpected keyword argument \"max_batch_size\" for \"AttentionBackend\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/utils.py"}
+{"code": "call-arg", "column": 12, "line": 191, "message": "Unexpected keyword argument \"max_seq_len\" for \"AttentionBackend\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/utils.py"}
+{"code": "call-arg", "column": 12, "line": 191, "message": "Unexpected keyword argument \"num_heads\" for \"AttentionBackend\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/utils.py"}
+{"code": "call-arg", "column": 12, "line": 191, "message": "Unexpected keyword argument \"num_kv_heads\" for \"AttentionBackend\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/utils.py"}
+{"code": "call-arg", "column": 12, "line": 191, "message": "Unexpected keyword argument \"quant_config\" for \"AttentionBackend\"", "path": "tensorrt_llm/_torch/visual_gen/attention/backends/utils.py"}
+{"code": "name-defined", "column": 12, "line": 290, "message": "Name \"_binding_dtype_size\" is not defined", "path": "tensorrt_llm/_utils.py"}
+{"code": "name-defined", "column": 9, "line": 1256, "message": "Name \"prometheus_multiproc_dir\" is not defined", "path": "tensorrt_llm/_utils.py"}
+{"code": "name-defined", "column": 9, "line": 1259, "message": "Name \"prometheus_multiproc_dir\" is not defined", "path": "tensorrt_llm/_utils.py"}
+{"code": "name-defined", "column": 50, "line": 1260, "message": "Name \"prometheus_multiproc_dir\" is not defined", "path": "tensorrt_llm/_utils.py"}
+{"code": "call-arg", "column": 19, "line": 221, "message": "Too few arguments", "path": "tensorrt_llm/commands/serve.py"}
+{"code": "call-arg", "column": 21, "line": 1092, "message": "Missing positional argument \"task_name\" in call to \"LmEvalEvaluator\"", "path": "tensorrt_llm/evaluate/lm_eval.py"}
+{"code": "call-arg", "column": 17, "line": 735, "message": "Too many arguments for \"pop\" of \"MutableSet\"", "path": "tensorrt_llm/executor/executor.py"}
+{"code": "name-defined", "column": 9, "line": 68, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 32, "line": 85, "message": "Name \"torch.distributed.TCPStore\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 9, "line": 111, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "call-arg", "column": 23, "line": 115, "message": "Unexpected keyword argument \"device_id\" for \"BaseWorker\"", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 13, "line": 278, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 9, "line": 316, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 13, "line": 332, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 9, "line": 354, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 13, "line": 366, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 9, "line": 384, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 13, "line": 393, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 17, "line": 399, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "name-defined", "column": 9, "line": 417, "message": "Name \"logger\" is not defined", "path": "tensorrt_llm/executor/ray/gpu_worker.py"}
+{"code": "call-arg", "column": 21, "line": 840, "message": "Unexpected keyword argument \"exc_info\" for \"debug\"", "path": "tensorrt_llm/executor/result.py"}
+{"code": "call-arg", "column": 21, "line": 868, "message": "Unexpected keyword argument \"exc_info\" for \"debug\"", "path": "tensorrt_llm/executor/result.py"}
+{"code": "name-defined", "column": 2, "line": 1005, "message": "Name \"GenerationExecutor.Response\" is not defined", "path": "tensorrt_llm/executor/result.py"}
+{"code": "call-arg", "column": 29, "line": 394, "message": "Unexpected keyword argument \"exc_info\" for \"error\"", "path": "tensorrt_llm/executor/rpc/rpc_client.py"}
+{"code": "call-arg", "column": 24, "line": 1179, "message": "Too many arguments for \"InputProcessor\"", "path": "tensorrt_llm/inputs/registry.py"}
+{"code": "call-arg", "column": 24, "line": 1179, "message": "Unexpected keyword argument \"trust_remote_code\" for \"InputProcessor\"", "path": "tensorrt_llm/inputs/registry.py"}
+{"code": "name-defined", "column": 60, "line": 541, "message": "Name \"fp8_per_channel_quant_weight_gpu\" is not defined", "path": "tensorrt_llm/models/convert_utils.py"}
+{"code": "name-defined", "column": 63, "line": 58, "message": "Name \"Logprob\" is not defined", "path": "tensorrt_llm/scaffolding/contrib/DeepConf/deep_conf_utils.py"}
+{"code": "name-defined", "column": 60, "line": 44, "message": "Name \"openai.Completion\" is not defined", "path": "tensorrt_llm/scaffolding/contrib/mcp/chat_handler.py"}
+{"code": "name-defined", "column": 2, "line": 16, "message": "Name \"Controller\" is not defined", "path": "tensorrt_llm/scaffolding/contrib/mcp/mcp_task.py"}
+{"code": "name-defined", "column": 2, "line": 36, "message": "Name \"Controller\" is not defined", "path": "tensorrt_llm/scaffolding/contrib/mcp/mcp_task.py"}
+{"code": "name-defined", "column": 62, "line": 42, "message": "Name \"TaskCollection\" is not defined", "path": "tensorrt_llm/scaffolding/result.py"}
+{"code": "name-defined", "column": 2, "line": 101, "message": "Name \"Controller\" is not defined", "path": "tensorrt_llm/scaffolding/task.py"}
+{"code": "call-arg", "column": 28, "line": 379, "message": "Too many arguments", "path": "tensorrt_llm/serve/openai_disagg_service.py"}
+{"code": "call-arg", "column": 28, "line": 382, "message": "Too many arguments", "path": "tensorrt_llm/serve/openai_disagg_service.py"}
+{"code": "call-arg", "column": 21, "line": 1912, "message": "Unexpected keyword argument \"exc_info\" for \"error\"", "path": "tensorrt_llm/serve/openai_server.py"}
+{"code": "call-arg", "column": 26, "line": 3958, "message": "Unexpected keyword argument \"params\" for \"generate\" of \"BaseLLM\"", "path": "tensorrt_llm/serve/openai_server.py"}
+{"code": "call-arg", "column": 26, "line": 3958, "message": "Unexpected keyword argument \"params\" for \"generate\" of \"MultimodalEncoder\"", "path": "tensorrt_llm/serve/openai_server.py"}
+{"code": "call-arg", "column": 15, "line": 462, "message": "Unexpected keyword argument \"client_ver\" for \"GxtPayload\"; did you mean \"clientVer\"?", "path": "tensorrt_llm/usage/schema.py"}
+{"code": "call-arg", "column": 15, "line": 462, "message": "Unexpected keyword argument \"sent_ts\" for \"GxtPayload\"; did you mean \"sentTs\"?", "path": "tensorrt_llm/usage/schema.py"}
+{"code": "call-arg", "column": 15, "line": 462, "message": "Unexpected keyword argument \"session_id\" for \"GxtPayload\"; did you mean \"sessionId\"?", "path": "tensorrt_llm/usage/schema.py"}
