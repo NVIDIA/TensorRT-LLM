@@ -23,6 +23,10 @@
 // individual writes (complete / stall / fail): those use a FakeXferAgent (a NixlTransferAgent subclass
 // overriding postXferRequest), because real NIXL cannot be made to do that.
 //
+// The last section checks the FAILURE contract around the failed-request core (bounceFailedRequestTest):
+// which chunks a failure records, which messages answer them, and that dst is not written after the
+// status completes.
+//
 // The happy-path / concurrency / bidirectional / multi-agent coverage lives in bounceAgentE2ETest,
 // which drives the SAME pipeline through the production entry point (NixlTransferAgent::
 // submitTransferRequests) with one-directional AgentDesc bootstrap, so it is not duplicated here.
@@ -38,6 +42,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <future>
 #include <memory>
@@ -243,29 +248,91 @@ bool waitGrant(b::ZmqControlChannel& ch, std::uint64_t rid, std::chrono::millise
         });
 }
 
-// Wait up to `budget` for a NACK for `rid`.
-bool waitNack(b::ZmqControlChannel& ch, std::uint64_t rid, std::chrono::milliseconds budget)
+// Wait up to 5 s for a NACK naming (rid, chunkIdx, regionHandle).
+bool waitChunkNack(b::ZmqControlChannel& ch, std::uint64_t rid, std::uint32_t chunkIdx, std::uint64_t regionHandle)
 {
-    return pumpChannel(ch, budget,
-        [&](b::BounceMsgHeader const& h, std::string const&)
-        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kNACK && h.requestId == rid; });
-}
-
-// Count ACKs for `rid` over the FULL `budget` window (a negative-assertion helper: always runs to
-// the deadline so extra/duplicate ACKs have time to show up).
-int countAcks(b::ZmqControlChannel& ch, std::chrono::milliseconds budget, std::uint64_t rid)
-{
-    int n = 0;
-    pumpChannel(ch, budget,
+    return pumpChannel(ch, std::chrono::seconds(5),
         [&](b::BounceMsgHeader const& h, std::string const&)
         {
-            if (static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kACK && h.requestId == rid)
+            return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kNACK && h.requestId == rid
+                && h.chunkIdx == chunkIdx && h.regionHandle == regionHandle;
+        });
+}
+
+// The ACKs and NACKs seen for one rid.
+struct AnswerCounts
+{
+    std::uint64_t rid{};
+    int acks{0};
+    int nacks{0};
+
+    void add(b::BounceMsgHeader const& h)
+    {
+        if (h.requestId != rid)
+        {
+            return;
+        }
+        auto const type = static_cast<b::BounceMsgType>(h.msgType);
+        acks += type == b::BounceMsgType::kACK ? 1 : 0;
+        nacks += type == b::BounceMsgType::kNACK ? 1 : 0;
+    }
+};
+
+// FIFO barrier against `node`'s reactor. It NACKs a WANT for a zero-byte chunk while dispatching it and reads
+// one peer's messages in order, so once that NACK arrives it has dispatched everything `ch` sent before; and
+// it sends `ch` everything on one DEALER, so `onEarlier` sees each message it sent `ch` before the NACK.
+template <typename Fn>
+bool reactorBarrier(b::ZmqControlChannel& ch, std::string const& node, Fn&& onEarlier)
+{
+    static std::atomic<std::uint64_t> nextRid{std::uint64_t{1} << 40}; // never one of a test's own rids
+    auto const rid = nextRid.fetch_add(1);
+    ch.sendTo(node, b::encodeWant(rid, {0}, ch.localEndpoint()));
+    return pumpChannel(ch, std::chrono::seconds(5),
+        [&](b::BounceMsgHeader const& h, std::string const& blob)
+        {
+            if (static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kNACK && h.requestId == rid)
             {
-                ++n;
+                return true;
             }
+            onEarlier(h, blob);
             return false;
         });
-    return n;
+}
+
+bool reactorBarrier(b::ZmqControlChannel& ch, std::string const& node)
+{
+    return reactorBarrier(ch, node, [](b::BounceMsgHeader const&, std::string const&) {});
+}
+
+// A DATA whose header claims one run more than its payload holds: it passes the header check but not
+// decodeScatter.
+std::string undecodableData(std::uint64_t rid, std::uint32_t chunkIdx, std::uint32_t numChunks, std::uint64_t region,
+    b::BounceScatterRun const& run)
+{
+    auto blob = b::encodeData(rid, chunkIdx, numChunks, region, {run});
+    b::BounceMsgHeader header{};
+    EXPECT_TRUE(b::decodeHeader(blob, header));
+    header.count += 1;
+    std::memcpy(blob.data(), &header, sizeof(header));
+    return blob;
+}
+
+// Count answers until the first ACK for `counts.rid` arrives (up to 5 s: it follows a scatter, whose first
+// launch also loads the kernel module), then for one more second, so an extra answer has time to show up.
+void countAnswersPastFirstAck(b::ZmqControlChannel& ch, AnswerCounts& counts)
+{
+    pumpChannel(ch, std::chrono::seconds(5),
+        [&](b::BounceMsgHeader const& h, std::string const&)
+        {
+            counts.add(h);
+            return counts.acks > 0;
+        });
+    pumpChannel(ch, std::chrono::seconds(1),
+        [&](b::BounceMsgHeader const& h, std::string const&)
+        {
+            counts.add(h);
+            return false;
+        });
 }
 
 // ---- Helpers for the FAILURE-contract tests (last section) ----
@@ -285,6 +352,12 @@ bool waitUntil(Pred&& done, std::chrono::milliseconds budget = std::chrono::seco
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return true;
+}
+
+// Wait until the fake agent has had `n` writes posted.
+bool waitPosts(XferControls const& ctl, std::uint64_t n)
+{
+    return waitUntil([&] { return ctl.postCount.load(std::memory_order_acquire) == n; });
 }
 
 // Takes exec contexts away from a node's reactor and gives them back on destruction, so a failed
@@ -318,17 +391,17 @@ public:
     ExecHold& operator=(ExecHold const&) = delete;
 
     // Whether it holds every context but the `leaveFree` it was asked to leave (i.e. the pool was idle).
-    [[nodiscard]] bool complete() const
+    [[nodiscard]] bool acquiredAll() const
     {
         return mHeld.size() + mLeaveFree == mPool.size();
     }
 
-    [[nodiscard]] b::ExecCtx* front() const
+    [[nodiscard]] b::ExecCtx* first() const
     {
         return mHeld.front();
     }
 
-    void releaseFront()
+    void releaseFirst()
     {
         mPool.release(mHeld.front());
         mHeld.erase(mHeld.begin());
@@ -465,6 +538,71 @@ constexpr unsigned char kArenaFill = 0xA5;
 // What the caller writes into dst once the request has resolved.
 constexpr unsigned char kReusedFill = 0x3C;
 
+// Reuse dst, then shut the receiver down (joins its scatter workers, syncs the device): nothing may write
+// dst again.
+void expectDstUntouchedAfterReuse(bounce_test::Node& receiver, OwnedXferBufs const& bufs)
+{
+    ASSERT_EQ(cudaMemset(bufs.dst, kReusedFill, bufs.total), cudaSuccess);
+    receiver.tx->shutdown();
+    EXPECT_TRUE(deviceBytesEqual(bufs.dst, 0, bufs.total, kReusedFill)) << "dst was written after it was reused";
+}
+
+// A FakeXferAgent sender and a real receiver whose scatters write dst, for `chunks` one-chunk descriptors
+// (chunk i is descriptor i).
+struct GatedScatterPair
+{
+    GatedScatterPair(std::string const& name, b::BounceConfig const& c, std::uint32_t chunks, std::uint32_t seed)
+        : bufs(chunks, static_cast<std::uint32_t>(c.maxChunkSizeBytes), seed)
+        , sender(makeFakeNode(name + "Sender", c, ctl))
+        , receiver(bounce_test::makeNode(name + "Receiver", c, 1024))
+    {
+    }
+
+    // False when the NIXL agent/backend is unavailable (the caller GTEST_SKIPs).
+    [[nodiscard]] bool available() const
+    {
+        return sender != nullptr && receiver != nullptr;
+    }
+
+    // Wire the peers and prefill the receiver arena with kArenaFill. Leave the sender one exec context, so
+    // its gathers and writes post in chunk order, and hold every receiver context, so no scatter starts
+    // until the test lets one.
+    [[nodiscard]] bool arm()
+    {
+        if (!sender->tx->addPeer(receiver->name, receiver->ch->localEndpoint())
+            || !receiver->tx->addPeer(sender->name, sender->ch->localEndpoint())
+            || cudaMemset(receiver->arena->base(), kArenaFill, receiver->arena->bytes()) != cudaSuccess)
+        {
+            return false;
+        }
+        senderGathers.emplace(*sender->exec, /*leaveFree=*/1);
+        receiverScatters.emplace(*receiver->exec, /*leaveFree=*/0);
+        return senderGathers->acquiredAll() && receiverScatters->acquiredAll();
+    }
+
+    // Give the receiver's scatter worker only a context behind a closed StreamGate: the first scatter waits
+    // there until gate->open().
+    [[nodiscard]] bool gateFirstScatter()
+    {
+        gate.emplace(receiverScatters->first()->stream);
+        if (!gate->installed())
+        {
+            return false;
+        }
+        receiverScatters->releaseFirst();
+        return true;
+    }
+
+    OwnedXferBufs bufs; // first, so it is freed after the nodes shut down
+    std::shared_ptr<XferControls> ctl{std::make_shared<XferControls>()};
+    std::unique_ptr<bounce_test::Node> sender;
+    std::unique_ptr<bounce_test::Node> receiver;
+    // Last, so they let go of the exec contexts (and open the gate) before the nodes go away.
+    std::optional<ExecHold> senderGathers;
+    std::optional<ExecHold> receiverScatters;
+    std::optional<StreamGate> gate;
+};
+
 // Wait for the sender's (non-cancel) WANT and store its rid in `rid`.
 bool waitWant(b::ZmqControlChannel& ch, std::uint64_t& rid, std::chrono::milliseconds budget = std::chrono::seconds(5))
 {
@@ -499,17 +637,20 @@ bool waitData(b::ZmqControlChannel& ch, std::uint64_t rid, std::size_t chunks,
         });
 }
 
-// Wait for the sender's cancel (an empty WANT) for `rid`, i.e. proof that it failed the request.
+// Whether a message is the sender's cancel (an empty WANT) for `rid`.
+bool isCancelFor(b::BounceMsgHeader const& h, std::string const& blob, std::uint64_t rid)
+{
+    std::vector<std::uint32_t> chunkBytes;
+    std::string endpoint;
+    return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kWANT && h.requestId == rid
+        && b::decodeWant(blob, h, chunkBytes, endpoint) && b::isCancelWant(chunkBytes);
+}
+
+// Wait for the sender's cancel for `rid`, i.e. proof that it failed the request.
 bool waitCancel(b::ZmqControlChannel& ch, std::uint64_t rid, std::chrono::milliseconds budget = std::chrono::seconds(5))
 {
-    return pumpChannel(ch, budget,
-        [&](b::BounceMsgHeader const& h, std::string const& blob)
-        {
-            std::vector<std::uint32_t> chunkBytes;
-            std::string endpoint;
-            return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kWANT && h.requestId == rid
-                && b::decodeWant(blob, h, chunkBytes, endpoint) && b::isCancelWant(chunkBytes);
-        });
+    return pumpChannel(
+        ch, budget, [&](b::BounceMsgHeader const& h, std::string const& blob) { return isCancelFor(h, blob, rid); });
 }
 
 // The region handle a scripted receiver grants to chunk `chunkIdx`.
@@ -522,14 +663,18 @@ std::uint64_t fakeRegion(std::uint32_t chunkIdx)
 // plays the receiver by hand. Writes are fake, so the credits carry fake addresses.
 struct ScriptedPeers
 {
-    // Declared first, so destroyed last: freed only after the sender has shut down.
+    ~ScriptedPeers()
+    {
+        sender.reset(); // shut down before the channel and the request buffers go away
+    }
+
     std::deque<OwnedXferBufs> requestBufs;
     std::shared_ptr<XferControls> ctl{std::make_shared<XferControls>()};
     std::string senderName;
     std::string receiverName;
     std::uint32_t chunkBytes{};
     std::unique_ptr<b::ZmqControlChannel> receiver;
-    std::unique_ptr<bounce_test::Node> sender; // declared last: shut down before the channel goes away
+    std::unique_ptr<bounce_test::Node> sender;
 
     // GRANT chunks [firstChunk, endChunk) of `rid` in one message; chunk i gets fakeRegion(i).
     void grant(std::uint64_t rid, std::uint32_t firstChunk, std::uint32_t endChunk) const
@@ -537,7 +682,7 @@ struct ScriptedPeers
         std::vector<b::BounceCreditEntry> credits;
         for (std::uint32_t i = firstChunk; i < endChunk; ++i)
         {
-            credits.push_back({/*addr=*/0, chunkBytes, /*devId=*/0, fakeRegion(i)});
+            credits.push_back({.addr = 0, .len = chunkBytes, .devId = 0, .regionHandle = fakeRegion(i)});
         }
         receiver->sendTo(senderName, b::encodeGrant(rid, credits));
     }
@@ -589,7 +734,7 @@ struct ScriptedRequest
 };
 
 // Learn `req`'s rid from its WANT, grant all its chunks at once and wait until every one is Sent.
-bool grantUntilAllSent(ScriptedPeers& peers, ScriptedRequest& req)
+bool grantAllAndWaitSent(ScriptedPeers& peers, ScriptedRequest& req)
 {
     if (!waitWant(*peers.receiver, req.rid))
     {
@@ -599,27 +744,6 @@ bool grantUntilAllSent(ScriptedPeers& peers, ScriptedRequest& req)
     return waitData(*peers.receiver, req.rid, req.chunks);
 }
 
-// FIFO barrier: once this returns true, the sender's reactor has dispatched every message the scripted
-// receiver sent before it. A never-granted sentinel request is NACKed and must resolve; the reactor reads
-// one peer's messages in order.
-bool syncSender(ScriptedPeers& peers)
-{
-    ScriptedRequest sentinel(peers, /*chunks=*/1, /*seed=*/0);
-    if (!waitWant(*peers.receiver, sentinel.rid))
-    {
-        return false;
-    }
-    peers.nack(sentinel.rid, 0);
-    return sentinel.fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
-}
-
-// A status over a future already resolved with `result`.
-b::BounceTransferStatus resolvedStatus(b::BounceResult const& result)
-{
-    std::promise<b::BounceResult> promise;
-    promise.set_value(result);
-    return b::BounceTransferStatus{promise.get_future().share()};
-}
 } // namespace
 
 // A peer that never GRANTs must fail the request on requestTimeoutMs, not hang. The WANT is
@@ -643,7 +767,6 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "request hung with no grant";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kNoProgressTimeout);
-    EXPECT_TRUE(fut.get().quiesced) << "nothing was sent, so nothing can write dst";
 
     t->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
@@ -654,7 +777,9 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
 TEST(BounceTransportFailure, WriteFailureFailsRequest)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/5000);
     capRegions(c, c.maxInflightChunksPerRequest);
     auto ctl = std::make_shared<XferControls>();
@@ -662,7 +787,9 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     auto A = makeFakeNode("feA", c, ctl);
     auto B = bounce_test::makeNode("feB", c, 1024);
     if (!A || !B)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     A->tx->addPeer("feB", B->ch->localEndpoint());
     B->tx->addPeer("feA", A->ch->localEndpoint());
 
@@ -671,7 +798,7 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "write failure hung";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kWriteFailed);
-    EXPECT_TRUE(fut.get().quiesced) << "no write completed, so no DATA was sent";
+    EXPECT_TRUE(fut.get().destinationQuiesced()) << "no write completed, so no DATA was sent";
     EXPECT_GE(ctl->postCount.load(std::memory_order_acquire), 1u);
 
     A->tx->shutdown();
@@ -689,7 +816,9 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
 TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     constexpr int kTimeoutMs = 20000; // generous: the NACK bound below is timeout/2, the hang guard is 10 s
     auto senderCfg = cfg(kTimeoutMs);
     senderCfg.maxChunkSizeBytes = 8192;
@@ -697,7 +826,9 @@ TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
     auto A = bounce_test::makeNode("nackA", senderCfg, 1024);
     auto B = bounce_test::makeNode("nackB", receiverCfg, 1024);
     if (!A || !B)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     bounce_test::wirePair(*A, *B);
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/8192, /*seed=*/12);
@@ -709,7 +840,6 @@ TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
     auto const elapsed = std::chrono::steady_clock::now() - start;
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kPeerNack);
-    EXPECT_TRUE(fut.get().quiesced) << "the WANT was rejected, so no DATA was sent";
     EXPECT_LT(elapsed, std::chrono::milliseconds(kTimeoutMs / 2)) << "NACK did not short-circuit the timeout";
 
     // The eager gather of the failed chunk holds an ExecCtx + staging region until failRequest (or,
@@ -717,8 +847,8 @@ TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
     // ctx assertion is a leak guard, not parked-branch coverage: it cannot tell the parked
     // (Gathering) branch from the immediate (Gathered) one — an 8 KiB eager gather finishes before
     // the ZMQ round trip, and if the NACK wins the race nothing was posted at all — so the
-    // parked-gather branch is not deterministically exercised here (it would need a gather-stall
-    // hook).
+    // parked-gather branch is not exercised here; StatusCompletesOnlyOnceOrphanedGatherFinishes holds a
+    // gather behind a StreamGate to cover it.
     auto const releaseDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (A->exec->freeCount() != execBaseline && std::chrono::steady_clock::now() < releaseDeadline)
     {
@@ -733,26 +863,27 @@ TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
 
 // DATA has no retransmission path in this protocol. Receiving it twice for one granted region must
 // therefore produce one scatter and one ACK, rather than adding replay state for an impossible
-// normal-flow event.
+// normal-flow event. The duplicate gets no NACK either: it would answer a chunk whose first copy's
+// scatter may still be writing dst.
 TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/5000);
     capRegions(c, c.maxInflightChunksPerRequest);
     b::ZmqControlChannel sender("dupDataSender");
     auto receiver = bounce_test::makeNode("dupDataReceiver", c, 1024); // receiver posts no writes
     if (!receiver)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     ASSERT_TRUE(sender.addPeer("dupDataReceiver", receiver->ch->localEndpoint()));
 
     // Hold every context so both DATA messages reach the reactor before the first scatter can finish.
-    std::vector<b::ExecCtx*> heldExecContexts;
-    while (auto* ctx = receiver->exec->tryAcquire())
-    {
-        heldExecContexts.push_back(ctx);
-    }
-    ASSERT_EQ(heldExecContexts.size(), receiver->exec->size());
+    ExecHold receiverScatters(*receiver->exec, /*leaveFree=*/0);
+    ASSERT_TRUE(receiverScatters.acquiredAll());
 
     constexpr std::uint64_t rid = 17;
     sender.sendTo("dupDataReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
@@ -767,20 +898,115 @@ TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
     auto const data = b::encodeData(rid, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, {run});
     sender.sendTo("dupDataReceiver", data);
     sender.sendTo("dupDataReceiver", data);
-    // FIFO sentinel instead of a sleep: the reactor is a single FIFO consumer, so a GRANT for a
-    // fresh rid sent after both DATA messages proves it already consumed them (the second region is
-    // free under capRegions(2), so the sentinel WANT is grantable while rid=17 holds its region).
-    constexpr std::uint64_t sentinelRid = 18;
-    sender.sendTo("dupDataReceiver", b::encodeWant(sentinelRid, {256}, sender.localEndpoint()));
-    std::vector<b::BounceCreditEntry> sentinelCredits;
-    ASSERT_TRUE(waitGrant(sender, sentinelRid, std::chrono::seconds(5), sentinelCredits))
-        << "sentinel WANT never granted; DATA messages may not have reached the reactor";
-    for (auto* ctx : heldExecContexts)
-    {
-        receiver->exec->release(ctx);
-    }
+    AnswerCounts answers{.rid = rid};
+    ASSERT_TRUE(reactorBarrier(
+        sender, "dupDataReceiver", [&](b::BounceMsgHeader const& h, std::string const&) { answers.add(h); }))
+        << "the DATA messages never reached the reactor";
+    receiverScatters.releaseAll();
 
-    EXPECT_EQ(countAcks(sender, std::chrono::seconds(2), rid), 1);
+    countAnswersPastFirstAck(sender, answers);
+    EXPECT_EQ(answers.acks, 1);
+    EXPECT_EQ(answers.nacks, 0);
+
+    receiver->tx->shutdown();
+    EXPECT_EQ(cudaFree(dst), cudaSuccess);
+}
+
+// A DATA the receiver will not scatter is NACKed, naming that DATA's chunk and region, so its sender stops
+// waiting for the chunk instead of reporting it in-doubt: first one that does not decode, then one whose
+// flow was cancelled, so its region is no longer the flow's.
+TEST(BounceTransportFailure, RefusedDataIsNacked)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    auto c = cfg(/*timeoutMs=*/5000);
+    capRegions(c, c.maxInflightChunksPerRequest);
+    b::ZmqControlChannel sender("refusedDataSender");
+    auto receiver = bounce_test::makeNode("refusedDataReceiver", c, 1024);
+    if (!receiver)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    ASSERT_TRUE(sender.addPeer("refusedDataReceiver", receiver->ch->localEndpoint()));
+
+    constexpr std::uint64_t rid = 19;
+    sender.sendTo("refusedDataReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    ASSERT_TRUE(waitGrant(sender, rid, std::chrono::seconds(5), credits));
+    ASSERT_EQ(credits.size(), 1);
+    auto const region = credits.front().regionHandle;
+
+    void* dst = nullptr;
+    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
+    b::BounceScatterRun const run{.bounceOffset = 0,
+        .dstAddr = reinterpret_cast<std::uintptr_t>(dst),
+        .dstStride = 0,
+        .bounceStride = 0,
+        .pieceSize = 256,
+        .count = 1};
+    sender.sendTo("refusedDataReceiver", undecodableData(rid, /*chunkIdx=*/0, /*numChunks=*/2, region, run));
+    EXPECT_TRUE(waitChunkNack(sender, rid, /*chunkIdx=*/0, region)) << "the undecodable DATA was not NACKed";
+
+    sender.sendTo("refusedDataReceiver", b::encodeCancel(rid, sender.localEndpoint()));
+    sender.sendTo("refusedDataReceiver", b::encodeData(rid, /*chunkIdx=*/1, /*numChunks=*/2, region, {run}));
+    EXPECT_TRUE(waitChunkNack(sender, rid, /*chunkIdx=*/1, region)) << "the DATA after the cancel was not NACKed";
+
+    receiver->tx->shutdown();
+    EXPECT_EQ(cudaFree(dst), cudaSuccess);
+}
+
+// A DATA refused while a scatter still holds its region gets no NACK: that scatter may be writing this very
+// chunk. Here the flow is cancelled while the first copy's scatter waits in the queue, so a second copy, and
+// an undecodable one, find the region no longer the flow's but still scattering. The first copy still runs
+// and answers.
+TEST(BounceTransportFailure, RefusedDataGetsNoNackWhileItsRegionScatters)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    auto c = cfg(/*timeoutMs=*/5000);
+    capRegions(c, c.maxInflightChunksPerRequest);
+    b::ZmqControlChannel sender("scatteringRefusedSender");
+    auto receiver = bounce_test::makeNode("scatteringRefusedReceiver", c, 1024);
+    if (!receiver)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    ASSERT_TRUE(sender.addPeer("scatteringRefusedReceiver", receiver->ch->localEndpoint()));
+    ExecHold receiverScatters(*receiver->exec, /*leaveFree=*/0);
+    ASSERT_TRUE(receiverScatters.acquiredAll());
+
+    constexpr std::uint64_t rid = 23;
+    sender.sendTo("scatteringRefusedReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    ASSERT_TRUE(waitGrant(sender, rid, std::chrono::seconds(5), credits));
+    ASSERT_EQ(credits.size(), 1);
+
+    void* dst = nullptr;
+    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
+    b::BounceScatterRun const run{.bounceOffset = 0,
+        .dstAddr = reinterpret_cast<std::uintptr_t>(dst),
+        .dstStride = 0,
+        .bounceStride = 0,
+        .pieceSize = 256,
+        .count = 1};
+    auto const data = b::encodeData(rid, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, {run});
+    sender.sendTo("scatteringRefusedReceiver", data);
+    sender.sendTo("scatteringRefusedReceiver", b::encodeCancel(rid, sender.localEndpoint()));
+    sender.sendTo("scatteringRefusedReceiver", data);
+    sender.sendTo("scatteringRefusedReceiver",
+        undecodableData(rid, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, run));
+    AnswerCounts answers{.rid = rid};
+    ASSERT_TRUE(reactorBarrier(
+        sender, "scatteringRefusedReceiver", [&](b::BounceMsgHeader const& h, std::string const&) { answers.add(h); }));
+    receiverScatters.releaseAll();
+
+    countAnswersPastFirstAck(sender, answers);
+    EXPECT_EQ(answers.acks, 1) << "the first copy's scatter did not answer";
+    EXPECT_EQ(answers.nacks, 0) << "the refused copy was NACKed while its region still scattered";
 
     receiver->tx->shutdown();
     EXPECT_EQ(cudaFree(dst), cudaSuccess);
@@ -980,8 +1206,8 @@ TEST(BounceTransportFailure, GrantLeaseExpiryReclaimsSilentSendersRegion)
     ASSERT_EQ(credit2.size(), 1u);
     EXPECT_EQ(credit2.front().regionHandle, credit1.front().regionHandle); // the one region, recycled
 
-    // Late DATA for the EXPIRED grant must be dropped (flow reclaimed -> heldByFlow false): exactly
-    // one ACK total, and it belongs to rid=2's legitimate DATA.
+    // Late DATA for the EXPIRED grant must not be scattered (flow reclaimed -> heldByFlow false; the
+    // receiver NACKs it): exactly one ACK total, and it belongs to rid=2's legitimate DATA.
     void* dst = nullptr;
     ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
     b::BounceScatterRun run{0, reinterpret_cast<std::uintptr_t>(dst), 0, 0, 256, 1};
@@ -1097,7 +1323,6 @@ TEST(BounceTransportFailure, CreditMispairAbandonIsTerminalAndIgnoresLaterGrants
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "abandoned flow never resolved";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kProtocolError);
-    EXPECT_TRUE(fut.get().quiesced) << "no write was posted, so no DATA was sent";
     // The later valid GRANT must not have resurrected the abandoned flow into posting a write.
     EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 0u) << "abandoned flow posted an RDMA write";
 
@@ -1109,20 +1334,23 @@ TEST(BounceTransportFailure, CreditMispairAbandonIsTerminalAndIgnoresLaterGrants
 TEST(BounceTransportFailure, ShutdownFailsInflight)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/0); // timeout disabled -> only shutdown can resolve it
+    }
+    auto c = cfg(/*timeoutMs=*/600000); // never fires here: only shutdown can resolve it
     auto t = bounce_test::makeNode("sdSolo", c, 1024);
     if (!t)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "nobody"); // stuck (no grant, no timeout)
+    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "nobody");                     // stuck: never granted
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
     t->tx->shutdown();
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "shutdown left request hanging";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
-    EXPECT_TRUE(fut.get().quiesced) << "never granted, so no DATA was sent";
 
     bounce_test::freeXferBufs(bufs);
 }
@@ -1133,8 +1361,10 @@ TEST(BounceTransportFailure, ShutdownFailsInflight)
 TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/0);
+    }
+    auto c = cfg(/*timeoutMs=*/600000); // never fires here: only shutdown can resolve it
     capRegions(c, c.maxInflightChunksPerRequest);
     b::ZmqControlChannel peer("shutdownReleasePeer");
     auto ctl = std::make_shared<XferControls>();
@@ -1142,7 +1372,9 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
     ctl->releaseSucceeds.store(false, std::memory_order_release);
     auto sender = makeFakeNode("shutdownReleaseSender", c, ctl);
     if (!sender)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     ASSERT_TRUE(sender->tx->addPeer("shutdownReleasePeer", peer.localEndpoint()));
     ASSERT_TRUE(peer.addPeer("shutdownReleaseSender", sender->ch->localEndpoint()));
 
@@ -1166,22 +1398,26 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
-    EXPECT_TRUE(fut.get().quiesced) << "the write never completed, so no DATA was sent";
+    EXPECT_TRUE(fut.get().destinationQuiesced()) << "the write never completed, so no DATA was sent";
     // failAll attempts the failed release exactly twice (initial + bounded retry), never spins.
     EXPECT_EQ(ctl->releaseCount.load(std::memory_order_acquire), 2u);
     bounce_test::freeXferBufs(bufs);
 }
 
-// forgetPeer() (the invalidateRemoteAgent path) must fail any in-flight request to the gone peer,
-// even with the request timeout disabled, modeling a peer that drops out mid-transfer.
+// forgetPeer() (the invalidateRemoteAgent path) must fail any in-flight request to the gone peer
+// well before the request timeout, modeling a peer that drops out mid-transfer.
 TEST(BounceTransportFailure, ForgetPeerFailsInflightRequest)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/0); // timeout disabled -> only forgetPeer can resolve it
+    }
+    auto c = cfg(/*timeoutMs=*/600000); // never fires here: only forgetPeer can resolve it
     auto t = bounce_test::makeNode("fpSolo", c, 1024);
     if (!t)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
     auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "gonePeer");                   // stuck: never granted
@@ -1263,7 +1499,9 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
 TEST(BounceTransportFailure, ForgetPeerFreesOrphanedRegionsToOtherPeersOnly)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/30000);
     c.scatterWorkerCount = 1;                     // exactly one job can be dequeued; the other must stay in mJobs
     c.quarantineMs = 30000;                       // the old-order symptom: the mis-granted region is parked this long
@@ -1272,16 +1510,11 @@ TEST(BounceTransportFailure, ForgetPeerFreesOrphanedRegionsToOtherPeersOnly)
     b::ZmqControlChannel other("fgOther");
     auto receiver = bounce_test::makeNode("fgReceiver", c, 1024); // receiver posts no writes
     if (!receiver)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     ASSERT_TRUE(gone.addPeer("fgReceiver", receiver->ch->localEndpoint()));
     ASSERT_TRUE(other.addPeer("fgReceiver", receiver->ch->localEndpoint()));
-    // A zero-size WANT is NACKed inline by dispatch(); on the same DEALER it proves every earlier
-    // message was processed, and the tick that dispatched it runs drainForgets() before recv()ing again.
-    auto syncReactor = [&](std::uint64_t rid)
-    {
-        gone.sendTo("fgReceiver", b::encodeWant(rid, {0}, gone.localEndpoint()));
-        return waitNack(gone, rid, std::chrono::seconds(5));
-    };
 
     std::vector<b::ExecCtx*> heldExecContexts;
     while (auto* ctx = receiver->exec->tryAcquire())
@@ -1310,10 +1543,12 @@ TEST(BounceTransportFailure, ForgetPeerFreesOrphanedRegionsToOtherPeersOnly)
     }
     gone.sendTo("fgReceiver", b::encodeWant(/*rid=*/1, {}, gone.localEndpoint()));             // cancel -> orphans
     gone.sendTo("fgReceiver", b::encodeWant(/*rid=*/2, {chunk, chunk}, gone.localEndpoint())); // pending: arena full
-    ASSERT_TRUE(syncReactor(/*rid=*/3)) << "cancel / pending WANT not processed";
+    ASSERT_TRUE(reactorBarrier(gone, "fgReceiver")) << "cancel / pending WANT not processed";
 
     receiver->tx->forgetPeer("fgGone");
-    ASSERT_TRUE(syncReactor(/*rid=*/4)) << "forget not applied"; // also re-adds fgGone's DEALER: a mis-grant is visible
+    // The tick that dispatches this barrier runs drainForgets() before it recv()s again; the barrier also
+    // re-adds fgGone's DEALER, so a mis-grant would be visible.
+    ASSERT_TRUE(reactorBarrier(gone, "fgReceiver")) << "forget not applied";
 
     other.sendTo("fgReceiver", b::encodeWant(/*rid=*/10, {chunk}, other.localEndpoint()));
     std::vector<b::BounceCreditEntry> otherCredits;
@@ -1447,63 +1682,58 @@ TEST(BounceTransportFailure, ConcurrentMultiThreadedSubmit)
 // ============================================================================
 // A FAILURE resolves only after the receiver has answered every chunk whose DATA was sent
 // ----------------------------------------------------------------------------
-// Only the receiver's scatter of a received DATA writes dst, and the receiver answers (ACK or NACK)
-// after that scatter's last write. So a failed request waits for those answers before it resolves
-// kFAILURE with quiesced == true; a receiver that sends no answer for requestTimeoutMs is assumed dead
-// and the request resolves in-doubt (quiesced == false). These tests order events with exec-context
-// holds, a stream gate, scripted writes and FIFO barriers, not by sleeping.
+// The answer-wait rules themselves are checked over every event order in bounceFailedRequestTest. These
+// tests check the reactor around them: which chunks a failure records, which messages answer them, and
+// that nothing writes dst once the status completes. They order events with exec-context holds, a stream
+// gate, scripted writes and FIFO barriers, and sleep only where elapsed time is what they measure.
 // ============================================================================
 
-// The status contract the agent hands out (pure: hand-built futures, no NIXL). isCompleted() is true
-// exactly when the request is over AND nothing will write the destination again.
-TEST(BounceTransferStatus, CompletedOnlyOnceTheDestinationIsQuiesced)
-{
-    std::promise<b::BounceResult> pending;
-    b::BounceTransferStatus const inFlight{pending.get_future().share()};
-    EXPECT_FALSE(inFlight.isCompleted());
-    EXPECT_EQ(inFlight.wait(0), kvc::TransferState::kIN_PROGRESS);
-    EXPECT_EQ(inFlight.getLastStatusStr(), "");
-
-    auto const success = resolvedStatus({kvc::TransferState::kSUCCESS, b::BounceFailReason::kNone, /*quiesced=*/true});
-    EXPECT_TRUE(success.isCompleted());
-    EXPECT_EQ(success.wait(0), kvc::TransferState::kSUCCESS);
-    EXPECT_EQ(success.getLastStatusStr(), "");
-
-    auto const quiescedFailure
-        = resolvedStatus({kvc::TransferState::kFAILURE, b::BounceFailReason::kWriteFailed, /*quiesced=*/true});
-    EXPECT_TRUE(quiescedFailure.isCompleted()) << "a destination proven quiescent may be reused";
-    EXPECT_EQ(quiescedFailure.wait(0), kvc::TransferState::kFAILURE);
-    EXPECT_EQ(quiescedFailure.getLastStatusStr(), b::toString(b::BounceFailReason::kWriteFailed));
-
-    auto const inDoubt
-        = resolvedStatus({kvc::TransferState::kFAILURE, b::BounceFailReason::kNoProgressTimeout, /*quiesced=*/false});
-    EXPECT_FALSE(inDoubt.isCompleted()) << "the receiver may still write the destination";
-    EXPECT_EQ(inDoubt.wait(0), kvc::TransferState::kFAILURE);
-    EXPECT_EQ(inDoubt.getLastStatusStr(),
-        std::string(b::toString(b::BounceFailReason::kNoProgressTimeout)) + "; destination not proven quiescent");
-
-    pending.set_value({kvc::TransferState::kSUCCESS, b::BounceFailReason::kNone, /*quiesced=*/true});
-    EXPECT_TRUE(inFlight.isCompleted());
-}
-
-// A request rejected at plan time never sent anything, so its FAILURE is quiesced.
-TEST(BounceTransportFailure, PlanRejectionIsQuiesced)
+// A request fails before any DATA was sent while its eager gather is still running. Nothing can write
+// dst, so the result is quiesced at once, but the gather still reads the source, so the status completes
+// only once that gather finishes. The gather is held by a stream gate on the only free exec context.
+TEST(BounceTransportFailure, StatusCompletesOnlyOnceOrphanedGatherFinishes)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/5000);
-    // One descriptor larger than maxChunkSizeBytes: BounceTransferPlan::build rejects it.
-    OwnedXferBufs bufs(/*nDescs=*/1, /*descBytes=*/2 * static_cast<std::uint32_t>(c.maxChunkSizeBytes), /*seed=*/81);
-    auto t = bounce_test::makeNode("prSolo", c, 1024);
+    }
+    auto c = cfg(/*timeoutMs=*/30000); // the timeout never fires here: forgetPeer fails the request
+    // One chunk. Declared before the node, so it is freed after the node shuts down.
+    OwnedXferBufs bufs(/*nDescs=*/1, static_cast<std::uint32_t>(c.maxChunkSizeBytes), /*seed=*/94);
+    auto t = bounce_test::makeNode("orphanGatherSolo", c, 1024);
     if (!t)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    // A bound ROUTER that no transport ever recv()s on: the WANT is delivered but never granted.
+    b::ZmqControlChannel ghost("ghostPeer");
+    t->tx->addPeer("ghostPeer", ghost.localEndpoint());
 
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "nobody");
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready)
-        << "plan rejection resolves in submit()";
+    ExecHold senderGathers(*t->exec, /*leaveFree=*/0);
+    ASSERT_TRUE(senderGathers.acquiredAll());
+    StreamGate gate(senderGathers.first()->stream);
+    ASSERT_TRUE(gate.installed());
+    senderGathers.releaseFirst(); // the eager gather can get only the gated context
+
+    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "ghostPeer");
+    b::BounceTransferStatus const status{fut};
+    ASSERT_TRUE(waitUntil([&] { return t->exec->freeCount() == 0; })) << "the eager gather never started";
+    t->tx->forgetPeer("ghostPeer");
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+        << "forgetPeer did not fail the request";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kPlanRejected);
-    EXPECT_TRUE(fut.get().quiesced);
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kPeerDropped);
+    EXPECT_TRUE(fut.get().destinationQuiesced()) << "nothing was sent, so nothing can write dst";
+    // Watched for a while, not once: an orphan drain that ended the read on an early poll shows up here.
+    auto const gatherHeldUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (std::chrono::steady_clock::now() < gatherHeldUntil)
+    {
+        ASSERT_FALSE(status.isCompleted()) << "completed while the orphaned gather could still read the source";
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    gate.open();
+    EXPECT_TRUE(waitUntil([&] { return status.isCompleted(); })) << "the finished gather was never observed";
     t->tx->shutdown();
 }
 
@@ -1514,59 +1744,88 @@ TEST(BounceTransportFailure, PlanRejectionIsQuiesced)
 TEST(BounceTransportFailure, FailureWaitsForRunningScatter)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     // The timeout never fires here: only the receiver's answers may resolve the failed request.
     auto c = cfg(/*timeoutMs=*/30000);
     c.scatterWorkerCount = 1;
     capRegions(c, c.maxInflightChunksPerRequest); // two chunks, both granted at once
-    // Chunk i is descriptor i. Declared before the nodes, so it is freed after they shut down.
-    OwnedXferBufs bufs(/*nDescs=*/2, static_cast<std::uint32_t>(c.maxChunkSizeBytes), /*seed=*/91);
-    auto ctl = std::make_shared<XferControls>();
-    auto sender = makeFakeNode("runScatterSender", c, ctl);
-    auto receiver = bounce_test::makeNode("runScatterReceiver", c, 1024);
-    if (!sender || !receiver)
+    GatedScatterPair pair("runScatter", c, /*chunks=*/2, /*seed=*/91);
+    if (!pair.available())
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender->tx->addPeer(receiver->name, receiver->ch->localEndpoint()));
-    ASSERT_TRUE(receiver->tx->addPeer(sender->name, sender->ch->localEndpoint()));
-    ASSERT_EQ(cudaMemset(receiver->arena->base(), kArenaFill, receiver->arena->bytes()), cudaSuccess);
+    }
+    ASSERT_TRUE(pair.arm());
+    ASSERT_TRUE(pair.gateFirstScatter());
+    pair.ctl->scriptWrite(0, WriteScript::kComplete);
+    pair.ctl->scriptWrite(1, WriteScript::kStall);
 
-    ExecHold senderGathers(*sender->exec, /*leaveFree=*/1); // post index == chunk index
-    ExecHold receiverScatters(*receiver->exec, /*leaveFree=*/0);
-    ASSERT_TRUE(senderGathers.complete());
-    ASSERT_TRUE(receiverScatters.complete());
-    StreamGate gate(receiverScatters.front()->stream);
-    ASSERT_TRUE(gate.installed());
-    receiverScatters.releaseFront(); // the worker can get only the gated context
-    ctl->scriptWrite(0, WriteScript::kComplete);
-    ctl->scriptWrite(1, WriteScript::kStall);
-
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, receiver->name);
+    auto fut = pair.sender->tx->submit(pair.bufs.srcDescs, pair.bufs.dstDescs, pair.receiver->name);
     // The worker took the gated context: chunk 0 is Sent and its scatter waits behind the gate.
-    ASSERT_TRUE(waitUntil([&] { return receiver->exec->freeCount() == 0; })) << "chunk 0 never reached the scatter";
-    ASSERT_TRUE(waitUntil([&] { return ctl->postCount.load(std::memory_order_acquire) == 2; }));
-    ctl->scriptWrite(1, WriteScript::kFail);
+    ASSERT_TRUE(waitUntil([&] { return pair.receiver->exec->freeCount() == 0; }))
+        << "chunk 0 never reached the scatter";
+    ASSERT_TRUE(waitPosts(*pair.ctl, 2));
+    pair.ctl->scriptWrite(1, WriteScript::kFail);
     // Write 0's handle was released when its DATA went out; write 1's is released by the orphan
     // drain that runs only after failRequest.
-    ASSERT_TRUE(waitUntil([&] { return ctl->releaseCount.load(std::memory_order_acquire) == 2; }))
+    ASSERT_TRUE(waitUntil([&] { return pair.ctl->releaseCount.load(std::memory_order_acquire) == 2; }))
         << "the failed write was never handled";
-    EXPECT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout)
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout)
         << "FAILURE reported while chunk 0's scatter could still write dst";
 
-    gate.open();
+    pair.gate->open();
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "the scatter's ACK was not awaited";
     auto const result = fut.get();
     EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(result.reason, b::BounceFailReason::kWriteFailed);
-    EXPECT_TRUE(result.quiesced);
-    EXPECT_TRUE(deviceBytesEqual(bufs.dst, bufs.off[0], bufs.descBytes, kArenaFill))
+    EXPECT_TRUE(result.destinationQuiesced());
+    EXPECT_TRUE(deviceBytesEqual(pair.bufs.dst, pair.bufs.off[0], pair.bufs.descBytes, kArenaFill))
         << "chunk 0's scatter had not finished when the FAILURE resolved";
-    EXPECT_TRUE(deviceBytesEqual(bufs.dst, bufs.off[1], bufs.descBytes, 0)) << "chunk 1 was never sent";
-    // Reuse dst, then shut the receiver down (joins its scatter workers, syncs the device): nothing may
-    // write it again.
-    ASSERT_EQ(cudaMemset(bufs.dst, kReusedFill, bufs.total), cudaSuccess);
-    receiver->tx->shutdown();
-    EXPECT_TRUE(deviceBytesEqual(bufs.dst, 0, bufs.total, kReusedFill)) << "dst was written after it was reused";
-    sender->tx->shutdown();
+    EXPECT_TRUE(deviceBytesEqual(pair.bufs.dst, pair.bufs.off[1], pair.bufs.descBytes, 0)) << "chunk 1 was never sent";
+    expectDstUntouchedAfterReuse(*pair.receiver, pair.bufs);
+    pair.sender->tx->shutdown();
+}
+
+// End to end on a real receiver: a failure resolved in-doubt while chunk 0's scatter is held completes once
+// that scatter runs and answers, and nothing writes dst after the status says so.
+TEST(BounceTransportFailure, LateAnswerCompletesAnInDoubtFailureAfterItsLastWrite)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    constexpr auto kTimeout = std::chrono::milliseconds(2000);
+    auto c = cfg(static_cast<int>(kTimeout.count()));
+    c.scatterWorkerCount = 1;
+    capRegions(c, c.maxInflightChunksPerRequest);
+    GatedScatterPair pair("lateAnswer", c, /*chunks=*/2, /*seed=*/113);
+    if (!pair.available())
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    ASSERT_TRUE(pair.arm());
+    ASSERT_TRUE(pair.gateFirstScatter());
+    pair.ctl->scriptWrite(0, WriteScript::kComplete);
+    pair.ctl->scriptWrite(1, WriteScript::kStall);
+
+    auto fut = pair.sender->tx->submit(pair.bufs.srcDescs, pair.bufs.dstDescs, pair.receiver->name);
+    b::BounceTransferStatus const status{fut};
+    ASSERT_TRUE(waitUntil([&] { return pair.receiver->exec->freeCount() == 0; }))
+        << "chunk 0 never reached the scatter";
+    ASSERT_TRUE(waitPosts(*pair.ctl, 2));
+    pair.ctl->scriptWrite(1, WriteScript::kFail);
+    ASSERT_EQ(fut.wait_for(kTimeout + std::chrono::seconds(5)), std::future_status::ready)
+        << "the answer wait did not end";
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kWriteFailed);
+    EXPECT_FALSE(status.isCompleted()) << "completed while chunk 0's scatter could still write dst";
+
+    pair.gate->open();
+    ASSERT_TRUE(waitUntil([&] { return status.isCompleted(); })) << "chunk 0's late ACK did not complete it";
+    EXPECT_TRUE(deviceBytesEqual(pair.bufs.dst, pair.bufs.off[0], pair.bufs.descBytes, kArenaFill))
+        << "completed before chunk 0's scatter finished";
+    expectDstUntouchedAfterReuse(*pair.receiver, pair.bufs);
+    pair.sender->tx->shutdown();
 }
 
 // Same as above, but the sent chunks are still QUEUED on the receiver: chunk 0 waits for an exec
@@ -1575,75 +1834,69 @@ TEST(BounceTransportFailure, FailureWaitsForRunningScatter)
 TEST(BounceTransportFailure, FailureWaitsForQueuedScatters)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     // The timeout never fires here: only the receiver's answers may resolve the failed request.
     auto c = cfg(/*timeoutMs=*/30000);
     c.scatterWorkerCount = 1;
     c.maxInflightChunksPerRequest = 3;
     capRegions(c, c.maxInflightChunksPerRequest); // three chunks, all granted at once
-    // Chunk i is descriptor i. Declared before the nodes, so it is freed after they shut down.
-    OwnedXferBufs bufs(/*nDescs=*/3, static_cast<std::uint32_t>(c.maxChunkSizeBytes), /*seed=*/92);
-    auto ctl = std::make_shared<XferControls>();
-    auto sender = makeFakeNode("queuedScatterSender", c, ctl);
-    auto receiver = bounce_test::makeNode("queuedScatterReceiver", c, 1024);
-    if (!sender || !receiver)
+    GatedScatterPair pair("queuedScatter", c, /*chunks=*/3, /*seed=*/92);
+    if (!pair.available())
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender->tx->addPeer(receiver->name, receiver->ch->localEndpoint()));
-    ASSERT_TRUE(receiver->tx->addPeer(sender->name, sender->ch->localEndpoint()));
-    ASSERT_EQ(cudaMemset(receiver->arena->base(), kArenaFill, receiver->arena->bytes()), cudaSuccess);
-
-    ExecHold senderGathers(*sender->exec, /*leaveFree=*/1); // post index == chunk index
-    ExecHold receiverScatters(*receiver->exec, /*leaveFree=*/0);
-    ASSERT_TRUE(senderGathers.complete());
-    ASSERT_TRUE(receiverScatters.complete());
-    ctl->scriptWrite(0, WriteScript::kComplete);
-    ctl->scriptWrite(1, WriteScript::kComplete);
+    }
+    ASSERT_TRUE(pair.arm());
+    pair.ctl->scriptWrite(0, WriteScript::kComplete);
+    pair.ctl->scriptWrite(1, WriteScript::kComplete);
     // Polled in chunk order, writes 0 and 1 are Sent (DATA out) before write 2's failure is seen.
-    ctl->scriptWrite(2, WriteScript::kFail);
+    pair.ctl->scriptWrite(2, WriteScript::kFail);
 
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, receiver->name);
+    auto fut = pair.sender->tx->submit(pair.bufs.srcDescs, pair.bufs.dstDescs, pair.receiver->name);
     // Writes 0 and 1 were released when their DATA went out; write 2 after failRequest.
-    ASSERT_TRUE(waitUntil([&] { return ctl->releaseCount.load(std::memory_order_acquire) == 3; }))
+    ASSERT_TRUE(waitUntil([&] { return pair.ctl->releaseCount.load(std::memory_order_acquire) == 3; }))
         << "the failed write was never handled";
-    EXPECT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout)
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout)
         << "FAILURE reported while chunks 0 and 1 could still be scattered into dst";
 
-    receiverScatters.releaseAll();
+    pair.receiverScatters->releaseAll();
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready)
         << "the scatters' ACKs were not awaited";
     auto const result = fut.get();
     EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(result.reason, b::BounceFailReason::kWriteFailed);
-    EXPECT_TRUE(result.quiesced);
+    EXPECT_TRUE(result.destinationQuiesced());
     for (std::uint32_t chunk = 0; chunk < 2; ++chunk)
     {
-        EXPECT_TRUE(deviceBytesEqual(bufs.dst, bufs.off[chunk], bufs.descBytes, kArenaFill))
+        EXPECT_TRUE(deviceBytesEqual(pair.bufs.dst, pair.bufs.off[chunk], pair.bufs.descBytes, kArenaFill))
             << "chunk " << chunk << " was not scattered before the FAILURE resolved";
     }
-    EXPECT_TRUE(deviceBytesEqual(bufs.dst, bufs.off[2], bufs.descBytes, 0)) << "chunk 2 was never sent";
-    // Reuse dst, then shut the receiver down (joins its scatter workers, syncs the device): nothing may
-    // write it again.
-    ASSERT_EQ(cudaMemset(bufs.dst, kReusedFill, bufs.total), cudaSuccess);
-    receiver->tx->shutdown();
-    EXPECT_TRUE(deviceBytesEqual(bufs.dst, 0, bufs.total, kReusedFill)) << "dst was written after it was reused";
-    sender->tx->shutdown();
+    EXPECT_TRUE(deviceBytesEqual(pair.bufs.dst, pair.bufs.off[2], pair.bufs.descBytes, 0)) << "chunk 2 was never sent";
+    expectDstUntouchedAfterReuse(*pair.receiver, pair.bufs);
+    pair.sender->tx->shutdown();
 }
 
 // A NACK fails the request but answers only its own chunk: the request waits for the other Sent
 // chunk's answer, and not for a chunk whose write is still in flight (its DATA was never sent, so the
-// receiver will never scatter or answer it).
-TEST(BounceTransportFailure, NackWaitsOnlyForOtherSentChunks)
+// receiver will never scatter or answer it). The cancel waits for that write: sent earlier, it would let
+// the receiver re-grant a region the write still lands in.
+TEST(BounceTransportFailure, NackWaitsOnlyForOtherSentChunksAndDefersCancelUntilWriteEnds)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/30000); // waiting for chunk 2 would show up as a missed 5 s bound
     c.maxInflightChunksPerRequest = 3;
     capRegions(c, c.maxInflightChunksPerRequest);
     auto peers = makeScriptedPeers("nackWait", c);
     if (!peers)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     ExecHold senderGathers(*peers->sender->exec, /*leaveFree=*/1); // post index == chunk index
-    ASSERT_TRUE(senderGathers.complete());
+    ASSERT_TRUE(senderGathers.acquiredAll());
     peers->ctl->scriptWrite(0, WriteScript::kComplete);
     peers->ctl->scriptWrite(1, WriteScript::kComplete);
     peers->ctl->scriptWrite(2, WriteScript::kStall);
@@ -1652,11 +1905,13 @@ TEST(BounceTransportFailure, NackWaitsOnlyForOtherSentChunks)
     ASSERT_TRUE(waitWant(*peers->receiver, req.rid));
     peers->grant(req.rid, /*firstChunk=*/0, /*endChunk=*/3);
     ASSERT_TRUE(waitData(*peers->receiver, req.rid, 2)) << "chunks 0 and 1 never reached Sent";
-    ASSERT_TRUE(waitUntil([&] { return peers->ctl->postCount.load(std::memory_order_acquire) == 3; }))
-        << "chunk 2's write was never posted";
+    ASSERT_TRUE(waitPosts(*peers->ctl, 3)) << "chunk 2's write was never posted";
 
+    bool cancelled = false;
+    auto const noteCancel = [&](b::BounceMsgHeader const& h, std::string const& blob)
+    { cancelled = cancelled || isCancelFor(h, blob, req.rid); };
     peers->nack(req.rid, 1);
-    ASSERT_TRUE(syncSender(*peers));
+    ASSERT_TRUE(reactorBarrier(*peers->receiver, peers->senderName, noteCancel));
     EXPECT_EQ(req.fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout)
         << "resolved before chunk 0 was answered";
     peers->ack(req.rid, 0);
@@ -1665,65 +1920,51 @@ TEST(BounceTransportFailure, NackWaitsOnlyForOtherSentChunks)
     auto const result = req.fut.get();
     EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(result.reason, b::BounceFailReason::kPeerNack);
-    EXPECT_TRUE(result.quiesced);
+    EXPECT_TRUE(result.destinationQuiesced());
     EXPECT_EQ(peers->ctl->releaseCount.load(std::memory_order_acquire), 2u)
         << "chunk 2's write must still be in flight";
+    ASSERT_TRUE(reactorBarrier(*peers->receiver, peers->senderName, noteCancel));
+    EXPECT_FALSE(cancelled) << "the cancel went out while chunk 2's write could still land in its region";
 
-    // End the orphaned write so shutdown skips its 5 s write drain; its deferred cancel follows.
     peers->ctl->scriptWrite(2, WriteScript::kComplete);
-    EXPECT_TRUE(waitCancel(*peers->receiver, req.rid));
+    EXPECT_TRUE(waitCancel(*peers->receiver, req.rid)) << "the deferred cancel never followed the write";
 }
 
-// NACKs are answers too: a failed request whose remaining chunks are all NACKed (e.g. a receiver with a
-// CUDA fault NACKs every queued scatter) resolves quiesced at once, not in-doubt at requestTimeoutMs.
-TEST(BounceTransportFailure, NackAnswersEndTheWait)
-{
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/30000); // ignoring the NACKs would show up as a missed 5 s bound
-    c.maxInflightChunksPerRequest = 3;
-    capRegions(c, c.maxInflightChunksPerRequest);
-    auto peers = makeScriptedPeers("nackAnswers", c);
-    if (!peers)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-
-    ScriptedRequest req(*peers, /*chunks=*/3, /*seed=*/106);
-    ASSERT_TRUE(grantUntilAllSent(*peers, req));
-    peers->nack(req.rid, 2); // fails the request: chunks 0 and 1 are awaited
-    ASSERT_TRUE(waitCancel(*peers->receiver, req.rid));
-    peers->nack(req.rid, 0);
-    peers->nack(req.rid, 1);
-    ASSERT_EQ(req.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready)
-        << "NACKs to a failed request were not taken as answers";
-    auto const result = req.fut.get();
-    EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(result.reason, b::BounceFailReason::kPeerNack);
-    EXPECT_TRUE(result.quiesced);
-}
-
-// Only an answer for an awaited chunk (same chunk index AND region) ends a failed request's wait. A
-// duplicate, an answer for a chunk that is not awaited and a wrong-region answer are all ignored.
+// Only an answer for an awaited chunk (same chunk index AND region, from the request's peer) ends a failed
+// request's wait, and a NACK answers like an ACK. A duplicate, an answer for a chunk that is not awaited, a
+// wrong-region answer and an answer from another peer are all ignored.
 TEST(BounceTransportFailure, OnlyMatchingAnswersEndTheWait)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/30000);
     c.maxInflightChunksPerRequest = 3;
     capRegions(c, c.maxInflightChunksPerRequest);
     auto peers = makeScriptedPeers("matchAnswers", c);
     if (!peers)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
 
     ScriptedRequest req(*peers, /*chunks=*/3, /*seed=*/102);
-    ASSERT_TRUE(grantUntilAllSent(*peers, req));
+    ASSERT_TRUE(grantAllAndWaitSent(*peers, req));
     peers->nack(req.rid, 2); // fails the request: chunks 0 and 1 are awaited
     ASSERT_TRUE(waitCancel(*peers->receiver, req.rid));
 
-    peers->ack(req.rid, 1); // a real answer: only chunk 0 is awaited now
-    peers->ack(req.rid, 1); // duplicate
-    peers->ack(req.rid, 2); // chunk 2 is not awaited: its NACK already answered it
-    peers->receiver->sendTo(peers->senderName, b::encodeAck(req.rid, 0, fakeRegion(0) + 1)); // wrong region
-    ASSERT_TRUE(syncSender(*peers));
+    peers->nack(req.rid, 1); // a real answer: only chunk 0 is awaited now
+    peers->nack(req.rid, 1); // duplicate
+    peers->ack(req.rid, 2);  // chunk 2 is not awaited: its NACK already answered it
+    auto const ungrantedRegion = fakeRegion(req.chunks);
+    peers->receiver->sendTo(peers->senderName, b::encodeAck(req.rid, 0, ungrantedRegion));
+    peers->receiver->sendTo(peers->senderName, b::encodeAck(req.rid, /*chunkIdx=*/1, fakeRegion(0))); // crossed
+    b::ZmqControlChannel intruder("matchAnswersIntruder");
+    ASSERT_TRUE(intruder.addPeer(peers->senderName, peers->sender->ch->localEndpoint()));
+    intruder.sendTo(peers->senderName, b::encodeAck(req.rid, 0, fakeRegion(0)));
+    // Each channel needs its own barrier: the reactor orders messages per peer only.
+    ASSERT_TRUE(reactorBarrier(intruder, peers->senderName));
+    ASSERT_TRUE(reactorBarrier(*peers->receiver, peers->senderName));
     EXPECT_EQ(req.fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout)
         << "an answer that matches no awaited chunk ended the wait";
 
@@ -1732,7 +1973,8 @@ TEST(BounceTransportFailure, OnlyMatchingAnswersEndTheWait)
     auto const result = req.fut.get();
     EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(result.reason, b::BounceFailReason::kPeerNack);
-    EXPECT_TRUE(result.quiesced);
+    EXPECT_TRUE(result.destinationQuiesced());
+    EXPECT_EQ(peers->sender->tx->failedRequestCount(), 0u) << "kept a failed request whose chunks are all answered";
 }
 
 // A failed request that still has unposted chunks (more chunks than maxInflightChunksPerRequest, the
@@ -1741,14 +1983,18 @@ TEST(BounceTransportFailure, OnlyMatchingAnswersEndTheWait)
 TEST(BounceTransportFailure, FailedRequestWithUnpostedChunksStaysInert)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/30000);            // maxInflightChunksPerRequest = 2
     capRegions(c, c.maxInflightChunksPerRequest); // the sender's staging holds exactly two chunks
     auto peers = makeScriptedPeers("unpostedChunks", c);
     if (!peers)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     ExecHold senderGathers(*peers->sender->exec, /*leaveFree=*/1); // post index == chunk index
-    ASSERT_TRUE(senderGathers.complete());
+    ASSERT_TRUE(senderGathers.acquiredAll());
     peers->ctl->scriptWrite(0, WriteScript::kComplete);
     peers->ctl->scriptWrite(1, WriteScript::kStall);
 
@@ -1756,48 +2002,80 @@ TEST(BounceTransportFailure, FailedRequestWithUnpostedChunksStaysInert)
     ASSERT_TRUE(waitWant(*peers->receiver, req.rid));
     peers->grant(req.rid, /*firstChunk=*/0, /*endChunk=*/2);
     ASSERT_TRUE(waitData(*peers->receiver, req.rid, 1));
-    ASSERT_TRUE(waitUntil([&] { return peers->ctl->postCount.load(std::memory_order_acquire) == 2; }));
+    ASSERT_TRUE(waitPosts(*peers->ctl, 2));
     peers->ctl->scriptWrite(1, WriteScript::kFail);
     // Failed: chunk 0 is awaited, and chunks 2 and 3 were never posted.
     ASSERT_TRUE(waitCancel(*peers->receiver, req.rid));
 
     peers->grant(req.rid, /*firstChunk=*/2, /*endChunk=*/4);
-    ASSERT_TRUE(syncSender(*peers));
-    EXPECT_EQ(peers->ctl->postCount.load(std::memory_order_acquire), 2u) << "the failed request posted a write";
+    ASSERT_TRUE(reactorBarrier(*peers->receiver, peers->senderName));
     EXPECT_EQ(req.fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
     peers->ack(req.rid, 0);
     ASSERT_EQ(req.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto const result = req.fut.get();
     EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(result.reason, b::BounceFailReason::kWriteFailed);
-    EXPECT_TRUE(result.quiesced);
+    EXPECT_TRUE(result.destinationQuiesced());
 
     // No staging may stay held: a fresh 2-chunk request needs both regions to get both chunks Sent.
     ScriptedRequest next(*peers, /*chunks=*/2, /*seed=*/108);
-    ASSERT_TRUE(grantUntilAllSent(*peers, next)) << "the failed request leaked a staging region";
+    ASSERT_TRUE(grantAllAndWaitSent(*peers, next)) << "the failed request leaked a staging region";
     EXPECT_EQ(peers->ctl->postCount.load(std::memory_order_acquire), 4u)
         << "the failed request posted a write (only the fresh request's two may follow its own two)";
 }
 
+// A request that fails while its eagerly gathered chunk still waits for its credit returns that chunk's
+// staging region: a fresh request that needs all of the sender's staging still gets every chunk Sent.
+TEST(BounceTransportFailure, FailureRecyclesAGatheredChunkStillWaitingForItsCredit)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    auto c = cfg(/*timeoutMs=*/30000);
+    capRegions(c, c.maxInflightChunksPerRequest); // the sender's staging holds exactly two chunks
+    auto peers = makeScriptedPeers("gatheredRecycle", c);
+    if (!peers)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+
+    // submit() launches the eager gather; its exec context comes back once the reactor saw it finish.
+    ScriptedRequest gathered(*peers, /*chunks=*/1, /*seed=*/115);
+    ASSERT_TRUE(waitWant(*peers->receiver, gathered.rid));
+    ASSERT_TRUE(waitUntil([&] { return peers->sender->exec->freeCount() == peers->sender->exec->size(); }))
+        << "the eager gather never finished";
+    peers->nack(gathered.rid, 0);
+    ASSERT_EQ(gathered.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+
+    ScriptedRequest next(*peers, /*chunks=*/2, /*seed=*/116);
+    ASSERT_TRUE(grantAllAndWaitSent(*peers, next)) << "the failed request kept its gathered chunk's staging";
+}
+
 // A receiver that stops answering is assumed dead requestTimeoutMs after its LAST answer: the request
-// then resolves in-doubt. Each answer restarts that bound. Bounds are measured from the test's own
-// send times, so they hold however the threads are scheduled.
+// then resolves in-doubt. Each answer restarts that bound, and an answer after it still ends its chunk's
+// write. Bounds are measured from the test's own send times, so they hold however the threads are scheduled.
 TEST(BounceTransportFailure, SilentReceiverResolvesInDoubtAfterTimeoutSinceLastAnswer)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     constexpr auto kTimeout = std::chrono::milliseconds(2000);
-    // Room for thread scheduling on top of the bound; far below a second kTimeout.
-    constexpr auto kSchedulingSlack = std::chrono::seconds(3);
+    // Room for thread scheduling on top of the bound; less than a second kTimeout, so a wait that ran
+    // twice still fails EXPECT_LT below.
+    constexpr auto kSchedulingSlack = kTimeout * 9 / 10;
     auto c = cfg(static_cast<int>(kTimeout.count()));
     c.maxInflightChunksPerRequest = 3;
     capRegions(c, c.maxInflightChunksPerRequest);
     auto peers = makeScriptedPeers("silentReceiver", c);
     if (!peers)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
 
     ScriptedRequest req(*peers, /*chunks=*/3, /*seed=*/94);
-    ASSERT_TRUE(grantUntilAllSent(*peers, req));
+    ASSERT_TRUE(grantAllAndWaitSent(*peers, req));
 
     // Fails the request; chunks 0 and 1 still owe an answer.
     peers->nack(req.rid, 2);
@@ -1807,7 +2085,7 @@ TEST(BounceTransportFailure, SilentReceiverResolvesInDoubtAfterTimeoutSinceLastA
     ASSERT_EQ(req.fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout)
         << "resolved before requestTimeoutMs passed since the failure";
     auto const lastAnswerSent = std::chrono::steady_clock::now();
-    peers->ack(req.rid, 0); // the last answer: chunk 1 never gets one
+    peers->ack(req.rid, 0); // the last answer within the wait
 
     ASSERT_EQ(req.fut.wait_for(kTimeout + kSchedulingSlack), std::future_status::ready)
         << "an unanswered chunk held the request past its bound";
@@ -1815,9 +2093,13 @@ TEST(BounceTransportFailure, SilentReceiverResolvesInDoubtAfterTimeoutSinceLastA
     auto const result = req.fut.get();
     EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(result.reason, b::BounceFailReason::kPeerNack);
-    EXPECT_FALSE(result.quiesced) << "chunk 1 was never answered";
+    EXPECT_FALSE(result.destinationQuiesced()) << "chunk 1 was not answered within the wait";
     EXPECT_GE(waited, kTimeout) << "the last answer did not restart the requestTimeoutMs bound";
     EXPECT_LT(waited, kTimeout + kSchedulingSlack);
+
+    b::BounceTransferStatus const status{req.fut};
+    peers->ack(req.rid, 1);
+    EXPECT_TRUE(waitUntil([&] { return status.isCompleted(); })) << "the late answer was dropped";
 }
 
 // The answer wait also restarts at the failure itself, however long the failing write took: the
@@ -1825,15 +2107,19 @@ TEST(BounceTransportFailure, SilentReceiverResolvesInDoubtAfterTimeoutSinceLastA
 TEST(BounceTransportFailure, AnswerWaitStartsAtTheFailure)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
-    constexpr auto kTimeout = std::chrono::milliseconds(1500);
+    }
+    constexpr auto kTimeout = std::chrono::milliseconds(5000);
     auto c = cfg(static_cast<int>(kTimeout.count()));
     capRegions(c, c.maxInflightChunksPerRequest);
     auto peers = makeScriptedPeers("answerWaitStart", c);
     if (!peers)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
     ExecHold senderGathers(*peers->sender->exec, /*leaveFree=*/1); // post index == chunk index
-    ASSERT_TRUE(senderGathers.complete());
+    ASSERT_TRUE(senderGathers.acquiredAll());
     peers->ctl->scriptWrite(0, WriteScript::kComplete);
     peers->ctl->scriptWrite(1, WriteScript::kStall);
 
@@ -1841,7 +2127,7 @@ TEST(BounceTransportFailure, AnswerWaitStartsAtTheFailure)
     ASSERT_TRUE(waitWant(*peers->receiver, req.rid));
     peers->grant(req.rid, /*firstChunk=*/0, /*endChunk=*/2);
     ASSERT_TRUE(waitData(*peers->receiver, req.rid, 1));
-    ASSERT_TRUE(waitUntil([&] { return peers->ctl->postCount.load(std::memory_order_acquire) == 2; }));
+    ASSERT_TRUE(waitPosts(*peers->ctl, 2));
     // Write 1 stalls for most of requestTimeoutMs (its post was the request's last progress), then fails.
     std::this_thread::sleep_for(kTimeout * 6 / 10);
     peers->ctl->scriptWrite(1, WriteScript::kFail);
@@ -1855,51 +2141,27 @@ TEST(BounceTransportFailure, AnswerWaitStartsAtTheFailure)
     auto const result = req.fut.get();
     EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(result.reason, b::BounceFailReason::kWriteFailed);
-    EXPECT_TRUE(result.quiesced);
-}
-
-// A kNoProgressTimeout means no progress for requestTimeoutMs, so a request with a sent chunk still
-// unanswered resolves in-doubt at once instead of waiting another requestTimeoutMs.
-TEST(BounceTransportFailure, NoProgressTimeoutWithUnansweredChunkResolvesInDoubtAtOnce)
-{
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    constexpr auto kTimeout = std::chrono::milliseconds(2000);
-    auto c = cfg(static_cast<int>(kTimeout.count()));
-    capRegions(c, c.maxInflightChunksPerRequest);
-    auto peers = makeScriptedPeers("noProgress", c);
-    if (!peers)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-
-    ScriptedRequest req(*peers, /*chunks=*/2, /*seed=*/95);
-    ASSERT_TRUE(grantUntilAllSent(*peers, req));
-    auto const lastAnswerSent = std::chrono::steady_clock::now();
-    peers->ack(req.rid, 0); // the request's last progress; chunk 1 stays unanswered
-
-    ASSERT_EQ(req.fut.wait_for(2 * kTimeout), std::future_status::ready)
-        << "the no-progress timeout waited another requestTimeoutMs for answers";
-    auto const waited = std::chrono::steady_clock::now() - lastAnswerSent;
-    auto const result = req.fut.get();
-    EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(result.reason, b::BounceFailReason::kNoProgressTimeout);
-    EXPECT_FALSE(result.quiesced) << "chunk 1 was never answered";
-    EXPECT_GE(waited, kTimeout);
-    EXPECT_LT(waited, 2 * kTimeout);
+    EXPECT_TRUE(result.destinationQuiesced());
 }
 
 // An abandoned flow (GRANT mispair) dies through checkTimeouts' kNoProgressTimeout. With a Sent chunk
 // unanswered it resolves in-doubt within one requestTimeoutMs of its last progress, reporting the
-// abandon cause; it must not wait another requestTimeoutMs for answers.
+// abandon cause; it must not wait another requestTimeoutMs for answers. The sender keeps it for late
+// answers only while someone holds its result.
 TEST(BounceTransportFailure, AbandonWithSentChunkResolvesInDoubtWithinOneTimeout)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
-    constexpr auto kTimeout = std::chrono::milliseconds(1500);
+    }
+    constexpr auto kTimeout = std::chrono::milliseconds(3000);
     auto c = cfg(static_cast<int>(kTimeout.count()));
     capRegions(c, c.maxInflightChunksPerRequest);
     auto peers = makeScriptedPeers("abandonSent", c);
     if (!peers)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
 
     ScriptedRequest req(*peers, /*chunks=*/2, /*seed=*/110);
     ASSERT_TRUE(waitWant(*peers->receiver, req.rid));
@@ -1907,138 +2169,112 @@ TEST(BounceTransportFailure, AbandonWithSentChunkResolvesInDoubtWithinOneTimeout
     ASSERT_TRUE(waitData(*peers->receiver, req.rid, 1));
     auto const chunk0Sent = std::chrono::steady_clock::now(); // after the request's last progress
     // Chunk 1's credit is half the chunk: a mispair, so the flow is abandoned.
-    std::vector<b::BounceCreditEntry> const undersized{{/*addr=*/0, peers->chunkBytes / 2, /*devId=*/0, fakeRegion(1)}};
+    std::vector<b::BounceCreditEntry> const undersized{
+        {.addr = 0, .len = peers->chunkBytes / 2, .devId = 0, .regionHandle = fakeRegion(1)}};
     peers->receiver->sendTo(peers->senderName, b::encodeGrant(req.rid, undersized));
 
     ASSERT_EQ(req.fut.wait_for(kTimeout + kTimeout / 2), std::future_status::ready)
         << "the abandoned flow waited another requestTimeoutMs for answers";
     EXPECT_LT(std::chrono::steady_clock::now() - chunk0Sent, kTimeout + kTimeout / 2);
-    auto const result = req.fut.get();
-    EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(result.reason, b::BounceFailReason::kProtocolError);
-    EXPECT_FALSE(result.quiesced) << "chunk 0 was never answered";
-}
-
-// A kNoProgressTimeout with every chunk Sent and none answered resolves in-doubt. ACKs arriving
-// afterwards, enough to count every chunk, hit an erased request: the reactor drops them and keeps
-// serving (the FIFO barrier below).
-TEST(BounceTransportFailure, LateAcksAfterNoProgressTimeoutChangeNothing)
-{
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    constexpr auto kTimeout = std::chrono::milliseconds(1000);
-    auto c = cfg(static_cast<int>(kTimeout.count()));
-    capRegions(c, c.maxInflightChunksPerRequest);
-    auto peers = makeScriptedPeers("lateAcks", c);
-    if (!peers)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-
-    ScriptedRequest req(*peers, /*chunks=*/2, /*seed=*/96);
-    ASSERT_TRUE(grantUntilAllSent(*peers, req));
-    ASSERT_EQ(req.fut.wait_for(kTimeout + std::chrono::seconds(5)), std::future_status::ready);
     EXPECT_EQ(req.fut.get().state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(req.fut.get().reason, b::BounceFailReason::kNoProgressTimeout);
-    EXPECT_FALSE(req.fut.get().quiesced);
+    EXPECT_EQ(req.fut.get().reason, b::BounceFailReason::kProtocolError);
+    EXPECT_FALSE(req.fut.get().destinationQuiesced()) << "chunk 0 was never answered";
 
-    peers->ack(req.rid, 0);
-    peers->ack(req.rid, 1);
-    EXPECT_TRUE(syncSender(*peers)) << "the reactor stopped after the late ACKs";
+    EXPECT_EQ(peers->sender->tx->failedRequestCount(), 1u) << "dropped an in-doubt request whose result is held";
+    req.fut = {};
+    EXPECT_TRUE(waitUntil([&] { return peers->sender->tx->failedRequestCount() == 0; }))
+        << "kept an in-doubt request whose result nobody holds";
 }
 
-// forgetPeer while a failed request awaits answers must not fail it again: it keeps its first reason
-// and keeps waiting, and a later answer resolves it with that ORIGINAL reason.
-TEST(BounceTransportFailure, ForgetPeerWhileAwaitingAnswersKeepsWaiting)
+// forgetPeer fails only active requests. One that already failed keeps its reason and its answer wait; a
+// fully sent active one fails with kPeerDropped and then waits for its chunks' answers, which still reach
+// the sender's ROUTER. Both resolve FAILURE once answered, never SUCCESS, though every chunk ends up ACKed.
+TEST(BounceTransportFailure, ForgetPeerFailsOnlyActiveRequestsAndLaterAnswersStillCount)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/30000);
     capRegions(c, c.maxInflightChunksPerRequest);
-    auto peers = makeScriptedPeers("forgetAwaiting", c);
+    auto peers = makeScriptedPeers("forgetPeer", c);
     if (!peers)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
 
-    ScriptedRequest req(*peers, /*chunks=*/2, /*seed=*/98);
-    ASSERT_TRUE(grantUntilAllSent(*peers, req));
+    ScriptedRequest failed(*peers, /*chunks=*/2, /*seed=*/98);
+    ASSERT_TRUE(grantAllAndWaitSent(*peers, failed));
+    peers->nack(failed.rid, 1); // fails it: chunk 0 is awaited
+    ASSERT_TRUE(waitCancel(*peers->receiver, failed.rid));
+    ScriptedRequest active(*peers, /*chunks=*/2, /*seed=*/100);
+    ASSERT_TRUE(grantAllAndWaitSent(*peers, active));
     // Never granted: forgetPeer fails it, which proves the forget was applied.
     ScriptedRequest sentinel(*peers, /*chunks=*/1, /*seed=*/99);
 
-    peers->nack(req.rid, 1);
-    // No write was in flight, so the cancel went out at once: the NACK failed the request.
-    ASSERT_TRUE(waitCancel(*peers->receiver, req.rid));
     peers->sender->tx->forgetPeer(peers->receiverName);
     ASSERT_EQ(sentinel.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "forgetPeer not applied";
     EXPECT_EQ(sentinel.fut.get().reason, b::BounceFailReason::kPeerDropped);
-    EXPECT_EQ(req.fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout)
-        << "forgetPeer resolved a request that still awaits an answer";
-
-    peers->ack(req.rid, 0); // answers still reach the sender's ROUTER after forgetPeer
-    ASSERT_EQ(req.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    auto const result = req.fut.get();
-    EXPECT_EQ(result.state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(result.reason, b::BounceFailReason::kPeerNack) << "forgetPeer failed the request a second time";
-    EXPECT_TRUE(result.quiesced);
-}
-
-// forgetPeer fails a request whose chunks were all Sent; it then waits for their answers. ACKs for
-// every chunk must resolve it FAILURE (kPeerDropped, quiesced), never SUCCESS, even though the ACK
-// count reaches numChunks.
-TEST(BounceTransportFailure, AnswersAfterForgetPeerResolveFailureNotSuccess)
-{
-    if (!bounce_test::hasCuda())
-        GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/30000);
-    capRegions(c, c.maxInflightChunksPerRequest);
-    auto peers = makeScriptedPeers("forgetAllSent", c);
-    if (!peers)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-
-    ScriptedRequest req(*peers, /*chunks=*/2, /*seed=*/100);
-    ASSERT_TRUE(grantUntilAllSent(*peers, req));
-    // Never granted: forgetPeer fails it in the same pass, which proves the forget was applied.
-    ScriptedRequest sentinel(*peers, /*chunks=*/1, /*seed=*/101);
-
-    peers->sender->tx->forgetPeer(peers->receiverName);
-    ASSERT_EQ(sentinel.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "forgetPeer not applied";
-    EXPECT_EQ(req.fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout)
+    EXPECT_EQ(failed.fut.wait_for(std::chrono::seconds(0)), std::future_status::timeout)
+        << "forgetPeer resolved a failed request that still awaits an answer";
+    EXPECT_EQ(active.fut.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout)
         << "forgetPeer resolved a request whose sent chunks were unanswered";
 
-    peers->ack(req.rid, 0);
-    peers->ack(req.rid, 1);
-    ASSERT_EQ(req.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    auto const result = req.fut.get();
-    EXPECT_EQ(result.state, kvc::TransferState::kFAILURE) << "a failed request resolved SUCCESS";
-    EXPECT_EQ(result.reason, b::BounceFailReason::kPeerDropped);
-    EXPECT_TRUE(result.quiesced);
+    peers->ack(failed.rid, 0);
+    peers->ack(active.rid, 0);
+    peers->ack(active.rid, 1);
+    ASSERT_EQ(failed.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    ASSERT_EQ(active.fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(failed.fut.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(failed.fut.get().reason, b::BounceFailReason::kPeerNack) << "forgetPeer failed the request a second time";
+    EXPECT_TRUE(failed.fut.get().destinationQuiesced());
+    EXPECT_EQ(active.fut.get().state, kvc::TransferState::kFAILURE) << "a failed request resolved SUCCESS";
+    EXPECT_EQ(active.fut.get().reason, b::BounceFailReason::kPeerDropped);
+    EXPECT_TRUE(active.fut.get().destinationQuiesced());
 }
 
-// Shutdown resolves every pending request. One already awaiting answers keeps its own reason, and any
-// request with a sent chunk unanswered is in-doubt: the receiver may still scatter into its dst.
+// Shutdown resolves every pending request. One already awaiting answers keeps its own reason, an abandoned
+// one keeps its abandon cause, and any request with a sent chunk unanswered is in-doubt: the receiver may
+// still scatter into its dst.
 TEST(BounceTransportFailure, ShutdownResolvesUnansweredRequestsInDoubtWithTheirOwnReason)
 {
     if (!bounce_test::hasCuda())
+    {
         GTEST_SKIP() << "no CUDA device";
+    }
     auto c = cfg(/*timeoutMs=*/30000);
     c.maxInflightChunksPerRequest = 3;
     capRegions(c, c.maxInflightChunksPerRequest);
     auto peers = makeScriptedPeers("shutdownAwaiting", c);
     if (!peers)
+    {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
 
     ScriptedRequest failed(*peers, /*chunks=*/2, /*seed=*/104);
-    ASSERT_TRUE(grantUntilAllSent(*peers, failed));
+    ASSERT_TRUE(grantAllAndWaitSent(*peers, failed));
     peers->nack(failed.rid, 1); // fails it: chunk 0 is awaited
     ASSERT_TRUE(waitCancel(*peers->receiver, failed.rid));
     // Still live: its only chunk is Sent and unanswered.
     ScriptedRequest live(*peers, /*chunks=*/1, /*seed=*/105);
-    ASSERT_TRUE(grantUntilAllSent(*peers, live));
+    ASSERT_TRUE(grantAllAndWaitSent(*peers, live));
+    // Abandoned, not yet failed: its credit is half its chunk.
+    ScriptedRequest abandoned(*peers, /*chunks=*/1, /*seed=*/114);
+    ASSERT_TRUE(waitWant(*peers->receiver, abandoned.rid));
+    std::vector<b::BounceCreditEntry> const undersized{
+        {.addr = 0, .len = peers->chunkBytes / 2, .devId = 0, .regionHandle = fakeRegion(0)}};
+    peers->receiver->sendTo(peers->senderName, b::encodeGrant(abandoned.rid, undersized));
+    ASSERT_TRUE(reactorBarrier(*peers->receiver, peers->senderName));
 
     peers->sender->tx->shutdown();
     ASSERT_EQ(failed.fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
     EXPECT_EQ(failed.fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(failed.fut.get().reason, b::BounceFailReason::kPeerNack) << "shutdown replaced the original reason";
-    EXPECT_FALSE(failed.fut.get().quiesced) << "chunk 0 was never answered";
+    EXPECT_FALSE(failed.fut.get().destinationQuiesced()) << "chunk 0 was never answered";
     ASSERT_EQ(live.fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
     EXPECT_EQ(live.fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(live.fut.get().reason, b::BounceFailReason::kShutdown);
-    EXPECT_FALSE(live.fut.get().quiesced) << "its sent chunk was never answered";
+    EXPECT_FALSE(live.fut.get().destinationQuiesced()) << "its sent chunk was never answered";
+    ASSERT_EQ(abandoned.fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    EXPECT_EQ(abandoned.fut.get().reason, b::BounceFailReason::kProtocolError) << "shutdown replaced the abandon cause";
 }

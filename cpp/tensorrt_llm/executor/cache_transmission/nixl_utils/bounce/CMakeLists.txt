@@ -16,7 +16,7 @@
 add_library(
   tllm_executor_bounce_core STATIC EXCLUDE_FROM_ALL
   BuddyAllocator.cpp CreditScheduler.cpp BounceTransferPlan.cpp
-  BounceMessage.cpp)
+  BounceMessage.cpp BounceResult.cpp)
 add_library(tllm::executor_bounce_core ALIAS tllm_executor_bounce_core)
 target_link_libraries(tllm_executor_bounce_core PUBLIC tllm::common_logging
                                                        Threads::Threads)

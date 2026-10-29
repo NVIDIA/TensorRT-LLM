@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceResult.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #include <chrono>
@@ -39,18 +39,11 @@ public:
     {
     }
 
+    /// The TransferStatus contract; see FailedRequest for when a failure gets there.
     [[nodiscard]] bool isCompleted() const override
     {
-        // Terminal AND the destination is quiesced (BounceResult::quiesced): kSUCCESS, or a kFAILURE the
-        // receiver has fully answered; an in-doubt kFAILURE stays false. Callers read the outcome from
-        // wait()/getLastStatusStr. get() cannot throw: every erase/shutdown path resolves the promise
-        // with set_value first, so broken_promise is unreachable.
-        if (!isReady())
-        {
-            return false;
-        }
-        auto const& result = mFut.get();
-        return result.state == TransferState::kSUCCESS || result.quiesced;
+        // Readiness first: the sender records every outstanding access before it sets the result.
+        return isReady() && mFut.get().quiesced();
     }
 
     [[nodiscard]] TransferState wait(int64_t timeoutMs) const override
@@ -84,7 +77,7 @@ public:
             return {};
         }
         std::string detail = toString(result.reason);
-        if (!result.quiesced)
+        if (!result.destinationQuiesced())
         {
             detail += "; destination not proven quiescent";
         }
