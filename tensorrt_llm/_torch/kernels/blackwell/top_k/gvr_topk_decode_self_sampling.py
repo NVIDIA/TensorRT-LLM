@@ -10894,6 +10894,13 @@ class GvrRegClusKernel:
         # regress the exact-rescue path. Static K only controls slot unrolling.
         K = cutlass.const_expr(self.top_k)
         HINT_SLOTS = cutlass.const_expr((K + self.blk - 1) // self.blk)
+        # Suffix guard (hint-free builds): threads without a prefix value sample the end of the row
+        # and raise the bracket maximum only; the bin grid stays the prefix sample's.
+        SFX = cutlass.const_expr(2 * K == self.blk)
+        SFXL = cutlass.const_expr(64)  # suffix lanes (threads K .. K+SFXL-1)
+        # Parallel exact rescue only in the two-slot K=2048 build; K <= BLK keeps the pre-#20998
+        # unconditional histogram, CS*CMPC degeneracy limit and rank-0 fallback.
+        rescue_on = self.hint_free and self.top_k == 2048
 
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()  # knob default off
@@ -11046,24 +11053,16 @@ class GvrRegClusKernel:
             # One coalesced word per thread per slot, NO cluster barrier —
             # GMIN/GMAX identical everywhere by construction.
             if cutlass.const_expr(self.hint_free):
-                # Exactly K distinct values in endpoint-inclusive uniform blocks.
+                # Prefix sample: the first K row values set GMIN (the bin grid) and GMAX as before #20998.
                 if tid < k:
                     pv0 = tid
                 if cutlass.const_expr(HINT_SLOTS == 2):
                     if tid + cutlass.Int32(self.blk) < k:
                         pv1 = tid + cutlass.Int32(self.blk)
-                if k == cutlass.Int32(512) or k == cutlass.Int32(1024) or k == cutlass.Int32(2048):
-                    sample_blocks = k // cutlass.Int32(64)
-                    if tid < k:
-                        pv0 = ((tid // cutlass.Int32(64)) * (n - cutlass.Int32(64))) // (
-                            sample_blocks - cutlass.Int32(1)
-                        ) + tid % cutlass.Int32(64)
-                    if cutlass.const_expr(HINT_SLOTS == 2):
-                        sample_id = tid + cutlass.Int32(self.blk)
-                        if sample_id < k:
-                            pv1 = ((sample_id // cutlass.Int32(64)) * (n - cutlass.Int32(64))) // (
-                                sample_blocks - cutlass.Int32(1)
-                            ) + sample_id % cutlass.Int32(64)
+                if cutlass.const_expr(SFX):
+                    # Suffix sample on SFXL otherwise idle threads: the last SFXL valid positions.
+                    if tid >= k and tid < k + cutlass.Int32(SFXL):
+                        pv0 = n - cutlass.Int32(1) - (tid - k)
             else:
                 if tid < k:
                     pv0 = ld_g_i32(p_addr, tid)
@@ -11102,7 +11101,11 @@ class GvrRegClusKernel:
             lmax = cutlass.Uint32(0)
             if cutlass.Uint32(pv0) < cutlass.Uint32(n):
                 uk = fkey(ldg_f32(x_addr, pv0))  # __ldg(X+pv0)
-                lmin = uk
+                if cutlass.const_expr(self.hint_free and SFX):
+                    if tid < k:  # suffix values raise the maximum only
+                        lmin = uk
+                else:
+                    lmin = uk
                 lmax = uk
             if cutlass.const_expr(HINT_SLOTS == 2):
                 if cutlass.Uint32(pv1) < cutlass.Uint32(n):
@@ -11150,7 +11153,7 @@ class GvrRegClusKernel:
             CQ0 = cutlass.Float32(1.0) - Tv * SC
             CQ = CQ0 + cutlass.Float32(1e-6) * (_fabsf__regclus(CQ0) + cutlass.Float32(1.0))
 
-            if okc != cutlass.Int32(0) or cutlass.const_expr(not self.hint_free):
+            if okc != cutlass.Int32(0) or cutlass.const_expr(not rescue_on):
                 # ---- P4: histogram; tval add UNCONDITIONAL (trash bin swallows
                 # -INFINITY via the saturating cvt).
                 for s in cutlass.range_constexpr(S):
@@ -11200,7 +11203,7 @@ class GvrRegClusKernel:
                 whole = cutlass.Int32(1)
             degen = cutlass.Int32(0)
             rescue_limit = cutlass.Int32(CS * CMPC)
-            if cutlass.const_expr(self.hint_free):
+            if cutlass.const_expr(rescue_on):
                 # Serial refinement becomes expensive before the candidate buffer fills.
                 # Cap work independently of K so K=2048 also takes the parallel escape.
                 rescue_limit = min(rescue_limit, cutlass.Int32(32) * k)
@@ -11497,7 +11500,7 @@ class GvrRegClusKernel:
             cute.arch.barrier()
             _cluster_sync_aligned()
 
-            if cutlass.const_expr(self.hint_free):
+            if cutlass.const_expr(rescue_on):
                 # All cluster CTAs retain their register fragments for exact rescue.
                 # Only complete float4 loads are resident; rank 0 owns the scalar tail.
                 if degen != cutlass.Int32(0):
@@ -11806,7 +11809,7 @@ class GvrRegClusKernel:
 
             # ---- P9: rank-0 selection
             if rank == cutlass.Int32(0) and (
-                degen == cutlass.Int32(0) or cutlass.const_expr(not self.hint_free)
+                degen == cutlass.Int32(0) or cutlass.const_expr(not rescue_on)
             ):
                 if whole == cutlass.Int32(0):
                     mc = m
