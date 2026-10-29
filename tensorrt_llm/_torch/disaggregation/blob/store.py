@@ -91,9 +91,9 @@ class RowStatus(enum.Enum):
 
     DECLINED = "declined"
     """For a put: the store would not take the row, for space or policy, and said so; or the
-    driver will not write the key again because an earlier put of its own left the key unresolved
-    in the store, and that put concluded FAULT. Nothing was published; the other rows of the
-    operation go on. A refusal the driver cannot place is FAULT."""
+    driver will not write the key again, as an earlier put of its own may still hold the key or
+    act on a new write of it. Nothing was published; the other rows of the operation go on. A
+    refusal the driver cannot place is FAULT."""
 
     CANCELLED = "cancelled"
     """Never started, because of a cancel or a drain; no byte moved and the row's memory was not
