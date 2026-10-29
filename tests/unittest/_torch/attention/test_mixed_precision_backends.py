@@ -267,9 +267,7 @@ def test_optimized_two_pool_prefill_and_decode(
                     cache = manager.kv_cache_map[request_id]
                     assert cache.resize(None, begin)
                     cache.suspend()
-                    assert cache.resume(
-                        torch.cuda.current_stream().cuda_stream, is_decoding=not context
-                    )
+                    assert cache.resume(torch.cuda.current_stream().cuda_stream)
                     assert cache.resize(end)
                     manager._restore_page_index_bufs(request_id, cache)
             history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
@@ -468,9 +466,7 @@ def test_mla_cached_context_and_decode(backend):
                 cache = manager.kv_cache_map[0]
                 assert cache.resize(None, begin)
                 cache.suspend()
-                assert cache.resume(
-                    torch.cuda.current_stream().cuda_stream, is_decoding=not context
-                )
+                assert cache.resume(torch.cuda.current_stream().cuda_stream)
                 assert cache.resize(end)
                 manager._restore_page_index_bufs(0, cache)
             metadata = backend.Metadata(
