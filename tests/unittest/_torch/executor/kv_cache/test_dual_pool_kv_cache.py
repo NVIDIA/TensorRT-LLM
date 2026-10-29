@@ -122,11 +122,12 @@ def _make_model_config(
     return ModelConfig(pretrained_config=PretrainedConfig(**pretrained_kwargs))
 
 
-def _make_mock_model_engine(model_config):
+def _make_mock_model_engine(model_config: ModelConfig) -> Mock:
     """Mock ModelEngine shell; a real engine needs GPU + loaded weights."""
     engine = Mock()
     engine.model.model_config = model_config
-    engine.model.config.torch_dtype = torch.bfloat16
+    engine.model.config.torch_dtype = model_config.torch_dtype
+    engine.dtype = model_config.torch_dtype
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     engine.cuda_graph_batch_sizes = []
     engine.cuda_graph_padding_enabled = False
@@ -535,7 +536,6 @@ class TestCrossKvCacheConstruction:
             model_config=model_config,
             manager_cls=KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager,
         )
-        creator._model_engine.dtype = model_dtype
         creator._skip_est = False
         manager_cls = creator._kv_cache_manager_cls
 
