@@ -49,6 +49,7 @@ from tensorrt_llm.visual_gen.args import VisualGenArgs
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
+from .models.ltx23.checkpoint import resolve_ltx23_checkpoint
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
@@ -91,11 +92,11 @@ class PipelineLoader:
         self.device = torch.device(device)
 
     def _resolve_checkpoint_dir(self, checkpoint_dir: str) -> str:
-        """Resolve checkpoint_dir to a local directory path.
+        """Resolve checkpoint_dir to a local checkpoint path.
 
-        If checkpoint_dir is an existing local path, returns it unchanged.
-        Otherwise, attempts to download from HuggingFace Hub using the
-        file-lock-protected download utility. Pipelines may register an
+        LTX-2.3 directories and Hub IDs select one workflow-specific file.
+        Other existing local paths are returned unchanged. Hub downloads use
+        the file-lock-protected download utility. Pipelines may register an
         allow-list so repositories with multiple checkpoint variants only
         fetch the components supported by TRT-LLM.
 
@@ -103,13 +104,27 @@ class PipelineLoader:
             checkpoint_dir: Local path or HuggingFace Hub model ID.
 
         Returns:
-            Path to local directory containing the model.
+            Local checkpoint file or directory containing the model.
 
         Raises:
             ValueError: If the path cannot be resolved (invalid repo ID,
                 authentication failure, offline with no cache, etc.)
         """
         if os.path.exists(checkpoint_dir):
+            if os.path.isdir(checkpoint_dir):
+                try:
+                    class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+                except ValueError:
+                    return checkpoint_dir
+                if class_name in ("LTX23Pipeline", "LTX23RetakePipeline"):
+                    default_workflow = (
+                        "retake" if class_name == "LTX23RetakePipeline" else "generation"
+                    )
+                    return resolve_ltx23_checkpoint(
+                        checkpoint_dir,
+                        workflow=self.args.pipeline_config.get("workflow", default_workflow),
+                        revision=self.args.revision,
+                    )
             return checkpoint_dir
 
         revision = self.args.revision
@@ -126,6 +141,17 @@ class PipelineLoader:
                 ),
                 None,
             )
+            if entry is not None and entry.pipeline_cls.__name__ in (
+                "LTX23Pipeline",
+                "LTX23RetakePipeline",
+            ):
+                return resolve_ltx23_checkpoint(
+                    checkpoint_dir,
+                    workflow=self.args.pipeline_config.get(
+                        "workflow", entry.defaults.get("workflow", "generation")
+                    ),
+                    revision=revision,
+                )
             if entry is not None and entry.download_patterns:
                 local_dir = download_hf_partial(
                     checkpoint_dir,

@@ -342,7 +342,7 @@ l0_b200:
   # One-model speculative decoding step-copy kernels and the engine's decode
   # step that runs them (SM 100; they skip on other GPUs).
   - unittest/_torch/kernels/test_spec_step_copies.py
-  - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/executor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
   # Kimi K3 DSpark drafter attention (CuTe DSL, SM 100) and its modeling_v2 catalog entries, plus the sm_100 cells of
   # fused_qk_norm_rope, which the drafter calls.
   - unittest/_torch/kernels/kimi_k3/test_k3_drafter_attn.py
@@ -454,6 +454,11 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_cudnn.py
+  - unittest/_torch/visual_gen/test_block_causal_attention.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_block_causal_layout.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_copy_kv_slots.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_rotate_rows.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_scatter_kv_slots.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
@@ -661,6 +666,12 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-nvfp4]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-cuda-graph]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[bf16]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[fp8]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[bf16]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[fp8]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[nvfp4]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_lpips_matches_eager
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden

@@ -257,12 +257,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         nodeLabelPrefix = "cpu"
         break
     }
-    // Temporarily avoid an arm64 builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-    def blockedNodeAffinity = arch == "arm64" ? '''
-                              - key: "kubernetes.io/hostname"
-                                operator: NotIn
-                                values:
-                                - "rl300-0021.ipp2a1.colossus"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -299,7 +293,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 values:
                                 - "core"
                                 - "qa_only"
-${blockedNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
