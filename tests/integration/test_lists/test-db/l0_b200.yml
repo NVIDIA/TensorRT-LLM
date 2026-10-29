@@ -147,6 +147,8 @@ l0_b200:
   - unittest/_torch/modules/test_engram_history_uploads.py
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
+  # trtllm-gen non-causal windowed DSpark block attention; skips off SM100/SM103.
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_noncausal_window.py
   - unittest/disaggregated/test_csa2_kv_transfer.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
