@@ -65,6 +65,7 @@ from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -3548,6 +3549,25 @@ def test_update_request_states_uses_common_dummy_cleanup():
     PyExecutor._update_request_states_tp(stub, scheduled_requests)
 
     stub._terminate_attention_dp_dummy_requests.assert_called_once_with()
+
+
+@pytest.mark.parametrize("cp_type", [CpType.ULYSSES, CpType.RING, CpType.HELIX])
+def test_update_request_states_single_cp_rank_takes_tp_path(cp_type):
+    stub = Mock(dist=Mock(cp_config={"cp_type": cp_type}, cp_size=1))
+    scheduled_requests = Mock(context_requests=[])
+
+    PyExecutor._update_request_states(stub, scheduled_requests)
+
+    stub._update_request_states_tp.assert_called_once_with(scheduled_requests)
+
+
+def test_update_request_states_rejects_unsupported_cp_type_with_context_parallelism():
+    stub = Mock(dist=Mock(cp_config={"cp_type": CpType.ULYSSES}, cp_size=2))
+
+    with pytest.raises(NotImplementedError, match="Unsupported cp type ULYSSES"):
+        PyExecutor._update_request_states(stub, Mock(context_requests=[]))
+
+    stub._update_request_states_tp.assert_not_called()
 
 
 def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():

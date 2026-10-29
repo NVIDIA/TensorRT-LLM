@@ -44,6 +44,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemMetadata,
     MultimodalItemPartition,
 )
+from tensorrt_llm.llmapi.llm_args import CpConfig
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.sampling_params import LogprobMode
 
@@ -1394,6 +1395,59 @@ def test_merge_requests_agg_helix_keeps_full_prompt():
         assert llm_request.get_tokens(0) == input_tokens
         assert llm_request.prompt_len == len(input_tokens)
         assert llm_request.total_input_len_cp == len(input_tokens)
+
+
+@pytest.mark.parametrize("is_disagg", [False, True], ids=["agg", "disagg"])
+@pytest.mark.parametrize(
+    "cp_config",
+    [
+        CpConfig().model_dump(exclude_none=True),
+        {"cp_type": CpType.ULYSSES},
+        {"cp_type": CpType.RING},
+    ],
+    ids=["default", "ulysses", "ring"],
+)
+def test_merge_requests_single_cp_rank_merges_as_without_cp(cp_config, is_disagg):
+    """With one CP rank, a cp_type other than HELIX merges like no cp_config."""
+    input_tokens = [1, 2, 3, 4, 5, 6, 7]
+
+    def merged(config):
+        executor_request = trtllm.Request(
+            input_token_ids=input_tokens,
+            max_tokens=5,
+            streaming=False,
+            sampling_config=trtllm.SamplingConfig(),
+            output_config=trtllm.OutputConfig(),
+        )
+        return merge_requests(
+            [RequestQueueItem(id=1, request=executor_request)],
+            cp_config=config,
+            cp_rank=0,
+            cp_size=1,
+            exclude_last_generation_logits=False,
+            is_disagg=is_disagg,
+        )
+
+    result = merged(cp_config)
+    expected = merged({})
+
+    assert len(result) == len(expected) == 1
+    assert result[0].request_id == expected[0].request_id == 1
+    assert result[0].get_tokens(0) == expected[0].get_tokens(0) == input_tokens
+    assert result[0].prompt_len == expected[0].prompt_len == len(input_tokens)
+
+
+@pytest.mark.parametrize("cp_type", [CpType.ULYSSES, CpType.RING])
+def test_merge_requests_rejects_unsupported_cp_type_with_context_parallelism(cp_type):
+    with pytest.raises(NotImplementedError, match=f"Unsupported cp type {cp_type.name}"):
+        merge_requests(
+            [RequestQueueItem(1, Mock())],
+            cp_config={"cp_type": cp_type},
+            cp_rank=0,
+            cp_size=2,
+            exclude_last_generation_logits=False,
+            is_disagg=False,
+        )
 
 
 def test_get_from_waiting_queue():
