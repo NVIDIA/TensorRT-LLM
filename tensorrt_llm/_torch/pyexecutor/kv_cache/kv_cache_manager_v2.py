@@ -8282,12 +8282,14 @@ class KVCacheManagerV2(BaseResourceManager):
         return success
 
     def reset_reuse_state(self):
-        self.impl.clear_reusable_blocks()
-        if self.conversation_manager is not None:
-            self.conversation_manager.clear()
-        if self._sharing is not None:
-            self._sharing._on_reset()
-        # A reset can run while inference is paused or idle, with no next iteration.
-        # Buffered attention-DP events gather here: every rank must reset in the
-        # same order, including ranks with an empty cache.
-        self.flush_iteration_events()
+        try:
+            self.impl.clear_reusable_blocks()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
+            if self._sharing is not None:
+                self._sharing._on_reset()
+        finally:
+            # A reset can run while inference is paused or idle, with no next iteration.
+            # Buffered attention-DP flushing gathers across ranks. Every rank must
+            # participate in the same order, even if its reset failed or cache is empty.
+            self.flush_iteration_events()

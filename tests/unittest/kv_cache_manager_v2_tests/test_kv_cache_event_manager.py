@@ -23,6 +23,7 @@ import uuid
 from importlib.util import find_spec
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
+from unittest.mock import Mock
 
 import msgspec
 import pytest
@@ -347,6 +348,38 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory, lora_i
         assert published[-1].events[0].lora_id == lora_id
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear", "sharing_reset"])
+def test_cache_reset_failure_still_participates_in_buffered_gather(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    gather = Mock(return_value=[[], []])
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.event_manager = KVCacheEventManager(
+        max_kv_event_entries=128,
+        window_size=128,
+        attention_dp_rank=1,
+        attention_dp_gather=gather,
+    )
+    wrapper.impl = SimpleNamespace(clear_reusable_blocks=Mock())
+    wrapper.conversation_manager = SimpleNamespace(clear=Mock())
+    wrapper._sharing = SimpleNamespace(_on_reset=Mock())
+    stages = {
+        "native_clear": wrapper.impl.clear_reusable_blocks,
+        "conversation_clear": wrapper.conversation_manager.clear,
+        "sharing_reset": wrapper._sharing._on_reset,
+    }
+    error = RuntimeError("reset failed on this rank")
+    stages[failure_stage].side_effect = error
+
+    with pytest.raises(RuntimeError) as exc_info:
+        wrapper.reset_reuse_state()
+
+    assert exc_info.value is error
+    # Even a failed rank with no events must enter the native gather callback.
+    gather.assert_called_once_with([])
+    assert wrapper.event_manager.get_latest_events(0) == []
 
 
 @pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
