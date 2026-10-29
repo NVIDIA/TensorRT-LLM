@@ -60,6 +60,9 @@ CP = 4
     [
         # split-KV decode: one KV head, up to four requests
         (4, 1, [1, 1, 1], [300, 7000, 65], "GqaSplitKvFmha"),
+        # ~40K-token contexts: more than two tiles per CTA, so the K / V ring phases wrap
+        (4, 1, [1, 1], [40000, 38500], "GqaSplitKvFmha"),
+        (4, 1, [1, 1, 1, 1], [41000, 300, 40000, 39000], "GqaSplitKvFmha"),
         # segmented: two KV heads, up to two requests
         (32, 2, [1, 1], [5000, 130], "GqaSegmentedFmha"),
         # neither: trtllm-gen
@@ -115,7 +118,7 @@ def _qwen3_next_attention(use_gqa_decode_fmha: bool) -> Qwen3Attention:
         num_key_value_heads=1,
         head_dim=HEAD_DIM,
         partial_rotary_factor=0.25,
-        max_position_embeddings=16384,
+        max_position_embeddings=65536,
         torch_dtype=torch.bfloat16,
     )
     config.partial_rotary_factor = 0.25
@@ -202,6 +205,9 @@ def _generation_step(use_gqa_decode_fmha: bool, cached: list, q_len: int):
         # up to four requests without a KV-replica group: the split-KV decode kernel runs the prologue (fold)
         ([5000], 7, None, "fold"),
         ([300, 7000, 65], 1, None, "fold"),
+        # ~40K-token contexts: more than two tiles per CTA, so the K / V ring phases wrap
+        ([40000, 38500], 7, None, "fold"),
+        ([41000, 300, 40000, 39000], 7, None, "fold"),
         # a deferred prologue reaching another GQA decode library: it runs the prologue kernel itself
         ([5000], 7, "-gqa_split_kv", "append"),
         # more: the module's prologue appends the FP8 K / V, trtllm-gen decodes
