@@ -1074,7 +1074,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         for key, value in weights.items():
             if ".ff.net.0.proj." in key:
                 prefix, suffix = key.split("net.0.proj.", maxsplit=1)
-                if suffix in cls._FEED_FORWARD_ROW_SPLIT_SUFFIXES and value.dim() > 0:
+                if (
+                    suffix in cls._FEED_FORWARD_ROW_SPLIT_SUFFIXES
+                    and value.dim() > 0
+                    and value.shape[0] > 1
+                ):
                     # Diffusers' SwiGLU stores ``[up, gate]`` while TRT-LLM's
                     # fused GatedMLP consumes ``[gate, up]``.
                     up, gate = value.chunk(2, dim=0)
