@@ -1530,6 +1530,15 @@ def test_a_buffer_with_its_own_tokens_per_block_is_expanded():
 
 
 @pytest.mark.cpu_only
+def test_a_buffer_of_several_sub_pages_split_over_ranks_is_refused():
+    """A buffer's tensors describe one page: split over ranks, the pieces of several sub-pages
+    would pair bytes of different sub-pages, so such a buffer is refused; replicated, it moves
+    whole."""
+    with pytest.raises(ValueError, match=r"\(0, index_key\): 2 sub-pages per block"):
+        derive_layout(Manager([kv_group(extra=[("index_key", 64, 2)])]))
+
+
+@pytest.mark.cpu_only
 def test_the_manager_layout_holds_per_group_and_per_pool_group_facts():
     """Two attention groups share pool group 3, each with its own window and sinks; a state group
     has pool group 1 and neither window nor sinks."""

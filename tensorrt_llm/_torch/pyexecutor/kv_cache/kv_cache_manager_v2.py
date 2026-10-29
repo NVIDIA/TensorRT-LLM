@@ -3576,6 +3576,13 @@ class KVCacheManagerV2(BaseResourceManager):
                                 f"buffer ({lid}, {role}): its tensors hold {declared} bytes on "
                                 f"this rank, not the {size} bytes of its slot"
                             )
+                        if expansion != 1 and any(t.split for t in tensors):
+                            # Its tensors describe one page; ranks holding parts of several
+                            # sub-pages would pair bytes of different sub-pages.
+                            raise ValueError(
+                                f"buffer ({lid}, {role}): {expansion} sub-pages per block are "
+                                "declarable only alike on every rank (replicated)"
+                            )
                         owner = named.setdefault((global_of.get(lid, lid), role), lid)
                         if owner != lid:
                             raise ValueError(
