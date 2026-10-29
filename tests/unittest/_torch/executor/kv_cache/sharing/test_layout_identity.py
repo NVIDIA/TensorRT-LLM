@@ -483,16 +483,18 @@ class Manager:
 
     def _page_buffer_tensors(self, layer_id, role, size, tokens, state):
         """Each role spread as ``mappers`` names it ("all" for the roles it does not list):
-        "replicated", "sectioned" by ``layouts``' ``section_bytes``, or split by head,
-        "head_major" or "token_major", ``layouts``' ``bytes_per_head`` or the layer's KV heads
-        apart."""
+        "replicated", "owned" by each rank, "sectioned" by ``layouts``' ``section_bytes``, or
+        split by head, "head_major" or "token_major", ``layouts``' ``bytes_per_head`` or the
+        layer's KV heads apart."""
         kind = self.mappers.get(role, self.mappers["all"])
         layout = self.layouts.get(role, {})
         if kind == "replicated":
             return replicated(size)
+        split = self._page_state_split() if state else ("tp",)
+        ranks, _ = page_layout.grid_place(page_table.rank_topology(self.mapping), split)
+        if kind == "owned":
+            return page_layout.owned(size, ranks, split)
         if kind == "sectioned":
-            split = self._page_state_split() if state else ("tp",)
-            ranks, _ = page_layout.grid_place(page_table.rank_topology(self.mapping), split)
             return sectioned(layout["section_bytes"], ranks, split)
         return self._page_head_split(
             layer_id,
@@ -1573,6 +1575,9 @@ def test_a_buffer_of_several_sub_pages_split_over_ranks_is_refused():
     whole."""
     with pytest.raises(ValueError, match=r"\(0, index_key\): 2 sub-pages per block"):
         derive_layout(Manager([kv_group(extra=[("index_key", 64, 2)])]))
+    # Buffers that never move, or move only to the same rank, need no sub-page structure.
+    derive_layout(Manager([kv_group(extra=[("index_key", 64, 2)])], ignored={"index_key"}))
+    derive_layout(Manager([kv_group(extra=[("index_key", 64, 2)])], mappers={"index_key": "owned"}))
 
 
 @pytest.mark.cpu_only

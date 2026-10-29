@@ -3576,9 +3576,15 @@ class KVCacheManagerV2(BaseResourceManager):
                                 f"buffer ({lid}, {role}): its tensors hold {declared} bytes on "
                                 f"this rank, not the {size} bytes of its slot"
                             )
-                        if expansion != 1 and any(t.split for t in tensors):
+                        if (
+                            expansion != 1
+                            and transfer
+                            and role not in derived
+                            and any(t.split and t.name != "own" for t in tensors)
+                        ):
                             # Its tensors describe one page; ranks holding parts of several
-                            # sub-pages would pair bytes of different sub-pages.
+                            # sub-pages would pair bytes of different sub-pages. A rank's own
+                            # share pairs only with the same rank's, whole.
                             raise ValueError(
                                 f"buffer ({lid}, {role}): {expansion} sub-pages per block are "
                                 "declarable only alike on every rank (replicated)"
