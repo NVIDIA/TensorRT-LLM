@@ -100,9 +100,12 @@ def test_matching_draft_layout_unifies(is_disagg):
 
 
 @pytest.mark.parametrize("is_disagg", [False, True])
-@pytest.mark.parametrize("tokens_per_block", [8, 16, 32, 64, 128])
+@pytest.mark.parametrize(
+    ("tokens_per_block", "draft_tokens_per_block"),
+    [(8, 32), (16, 32), (32, 32), (64, 64), (128, 32)],
+)
 def test_unification_requires_supported_draft_page_size(
-    is_disagg: bool, tokens_per_block: int
+    is_disagg: bool, tokens_per_block: int, draft_tokens_per_block: int
 ) -> None:
     creator = _creator(
         is_disagg=is_disagg,
@@ -112,7 +115,7 @@ def test_unification_requires_supported_draft_page_size(
     creator._tokens_per_block = tokens_per_block
 
     assert creator._should_unify_dflash_kv_cache() is (tokens_per_block in (16, 32, 64))
-    assert creator._get_draft_tokens_per_block() == 32
+    assert creator._get_draft_tokens_per_block() == draft_tokens_per_block
 
 
 def test_mismatched_draft_kv_heads_unify_only_in_aggregated_serving() -> None:

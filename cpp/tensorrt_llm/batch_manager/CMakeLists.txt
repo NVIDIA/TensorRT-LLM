@@ -34,7 +34,7 @@ set(SRCS
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
-     "${xgrammar_source_dir}/cpp/nanobind/.*\\.cc")
+     "${xgrammar_source_dir}/cpp/tvm_ffi/.*\\.cc")
 
 add_library(tensorrt_llm_xgrammar_static STATIC ${XGRAMMAR_SRCS})
 set_target_properties(
@@ -86,8 +86,10 @@ add_library(tllm::kv_cache ALIAS tllm_kv_cache)
 target_include_directories(
   tllm_kv_cache PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR} ${SHA256_DIR})
 target_link_libraries(
-  tllm_kv_cache PUBLIC tllm::kv_cache_host_memory tllm::common_cuda
-                       tllm::executor_types CUDA::cuda_driver)
+  tllm_kv_cache
+  PUBLIC tllm::kv_cache_host_memory tllm::common_cuda tllm::executor_types
+         CUDA::cuda_driver
+  PRIVATE tllm::common_environment)
 
 add_library(
   tllm_kv_cache_legacy STATIC

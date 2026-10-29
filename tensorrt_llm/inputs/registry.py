@@ -34,6 +34,7 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
+from .model_config import resolve_top_level_model_type
 # yapf: disable
 from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          MultimodalItemMetadata, _as_cpu_tensor,
@@ -499,6 +500,16 @@ class BaseMultimodalInputProcessor(ABC):
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
             "Please override this method to provide the vocabulary size. ")
         return None
+
+    def requires_input_placeholders(self, *, tokenized: bool = False) -> bool:
+        """Whether the selected input path needs caller-supplied media markers."""
+        if tokenized and self.supports_token_id_mm_expansion:
+            return True
+        model_type = getattr(type(self), "_registered_model_type", None)
+        if model_type is None:
+            model_type = resolve_top_level_model_type(self.config)
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+            model_type) != ContentFormat.PASSTHROUGH
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
         """Token IDs for a logical multimodal unit; include framing tokens for one contiguous span per unit.
@@ -1072,8 +1083,10 @@ def create_input_processor(
     Args:
         model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
         tokenizer: Tokenizer instance.
-        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
-            config loading; any other value skips HF config loading. Default is "HF".
+        checkpoint_format: Checkpoint format identifier. "HF" and "MX" use Hugging
+            Face-style config loading, because MX loads Hugging Face-format
+            checkpoints; "mistral" and "mistral_large_3" use the native Mistral
+            config; any other value skips HF config loading. Default is "HF".
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
         enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
@@ -1092,7 +1105,7 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format == "HF":
+    if checkpoint_format in ("HF", "MX"):
         try:
             model_config = ModelConfig.from_pretrained(
                 model_path_or_dir, trust_remote_code=trust_remote_code)
