@@ -35,7 +35,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
     is_qwen4_exp, load_pretrained_config)
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -591,7 +591,7 @@ class ModelConfig(Generic[TConfig]):
             # CuteDslB12xW4a16Nvfp4FusedMoE on SM120/121 (reached through the
             # CUTEDSL family), MarlinFusedMoE on Hopper. Any
             # other SM falls through to CUTLASS, which dequantizes on the fly.
-            if sm_version in (120, 121):
+            if is_sm_120f(sm_version):
                 return "CUTEDSL"
             if 90 <= sm_version < 100:
                 return "MARLIN"

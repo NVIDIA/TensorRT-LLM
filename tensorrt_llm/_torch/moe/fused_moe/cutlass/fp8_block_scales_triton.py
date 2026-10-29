@@ -38,19 +38,19 @@ from .identity import TECHNIQUE_TRITON, cutlass_descriptor
 class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
     """``trtllm.triton.grouped_gemm.fp8_block_scales``.
 
-    FP8 block scales on SM120, where CUTLASS TMA fails for large token counts
+    FP8 block scales on SM120/121, where CUTLASS TMA fails for large token counts
     (``cuTensorMapEncodeTiled`` limitations). The whole MoE runs in
     ``run_triton_fp8_block_scale_moe``, which never enters C++.
     """
 
     descriptor = cutlass_descriptor(
         "fp8_block_scales",
-        "Internal Triton FP8 block-scale grouped GEMM, SM120.",
+        "Internal Triton FP8 block-scale grouped GEMM, SM120/121.",
         technique=TECHNIQUE_TRITON,
         # run_triton_fp8_block_scale_moe takes no bias operands.
         supports_expert_bias=False,
     )
-    sm_support = SmSupport(allowed=frozenset({120}))
+    sm_support = SmSupport(allowed=frozenset({120, 121}))
     #: The Triton kernel is instantiated for BF16 activations only.
     supported_dtypes = BF16_ONLY
     # Only these two gated kinds, and of the three ABI registers only the clamp:
