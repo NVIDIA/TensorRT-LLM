@@ -1202,6 +1202,11 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
                 )
             return await self._run_in_executor(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
+            # No path policy here: this branch serves the offline API, which
+            # reads the caller's own files. A URL taken from a server request
+            # must go through `async_load_allowed_local_file` instead, which
+            # confines it to TRTLLM_MEDIA_ALLOWED_LOCAL_PATH and never reopens
+            # a path.
             return await self._run_in_executor(self.load_file, url)
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
