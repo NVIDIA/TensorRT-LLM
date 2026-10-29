@@ -190,6 +190,13 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+Run changed-file Python static checks with `scripts/run_mypy.sh`, or pass
+`--full-project` to scan all product Python files. The `[tool.mypy]` section in
+`pyproject.toml` defines the product and test roots and the diagnostic allowlist.
+Keep its enabled/disabled code lists aligned with the pinned mypy version in
+`requirements-dev.txt`. Missing imports are reported except for PyTorch and the
+generated `tensorrt_llm.bindings` modules, which may be absent on development hosts.
+
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
 for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
