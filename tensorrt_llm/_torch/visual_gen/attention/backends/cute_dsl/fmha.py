@@ -21,7 +21,7 @@ sparse backend uses `VSACuTeDSLAttention` in `attention.backends.sparse.vsa` ins
 """
 
 import math
-from typing import Any, NamedTuple, Tuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -32,6 +32,9 @@ from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from .....attention.backends.interface import PredefinedAttentionMask
 from ..interface import AttentionBackend, AttentionTensorLayout
+
+if TYPE_CHECKING:
+    from ....cache import CausalKVCacheManager
 
 _cute_dsl_import_error: BaseException | None = None
 try:
@@ -204,9 +207,13 @@ class _CacheKey(NamedTuple):
     enable_ex2_emulation: bool
     enable_skip_correction: bool
     gpu_arch_str: str
+    # 0: contiguous K/V. Otherwise tokens per page of a combined-HND paged pool, which is
+    # only used with the prefix window (see ``cute_dsl_paged_window_fmha_fwd``).
+    page_size: int = 0
 
 
 _COMPILE_CACHE: dict = {}
+_UNIFORM_CU_SEQLEN_CACHE: dict = {}
 
 
 def clear_cute_dsl_fmha_cache() -> None:
@@ -244,17 +251,29 @@ def _get_or_compile(key: _CacheKey, compile_args: tuple):
             key.enable_ex2_emulation,
             key.enable_skip_correction,
             use_tma_store=key.use_tma_store,
+            page_size=key.page_size or None,
+            paged_kv_layout="combined_hnd" if key.page_size else "separate_nhd",
         )
     logger.info(
         f"Compiling CuTe DSL FMHA kernel for {key.qk_cutlass_dtype.__name__}/"
         f"{key.pv_cutlass_dtype.__name__} head_dim={key.head_dim} "
         f"mask={key.mask_type.name} persistent={key.is_persistent} "
         f"lse={key.with_lse} on {key.gpu_arch_str} ..."
-        f"qk_sf_vec={key.qk_sf_vec} "
+        f"qk_sf_vec={key.qk_sf_vec} page_size={key.page_size} "
     )
     compiled = cute.compile(fmha, *compile_args)
     _COMPILE_CACHE[key] = compiled
     return compiled
+
+
+def _uniform_cu_seqlen(num_blocks: int, block_size: int, device: torch.device) -> torch.Tensor:
+    """``[0, block_size, 2 * block_size, ...]`` int32 on ``device``, shared by every call."""
+    key = (num_blocks, block_size, device)
+    cu = _UNIFORM_CU_SEQLEN_CACHE.get(key)
+    if cu is None:
+        cu = torch.arange(num_blocks + 1, dtype=torch.int32, device=device) * block_size
+        _UNIFORM_CU_SEQLEN_CACHE[key] = cu
+    return cu
 
 
 @torch.compiler.disable
@@ -527,11 +546,8 @@ def cute_dsl_fmha_fwd(
             lse_cute,
             None,  # sink
             cute_typing.Float32(scale_softmax_log2_value),
-            scale_softmax_log2_tensor_cute,
             cute_typing.Float32(scale_softmax_value),
-            scale_softmax_tensor_cute,
             cute_typing.Float32(scale_output_value),
-            scale_output_tensor_cute,
             skip_threshold_log2,
             ws_left,
             ws_right,
@@ -539,8 +555,149 @@ def cute_dsl_fmha_fwd(
             None,  # total_softmax_count
             stream,
             False,  # use_pdl
+            None,  # page_table
+            None,  # o_sf_tensor
+            None,  # o_sf_scale
+            None,  # o_sf_start_index
+            None,  # dynamic_work_counter
+            scale_softmax_log2_tensor_cute,
+            scale_softmax_tensor_cute,
+            scale_output_tensor_cute,
         )
 
+    compiled = _get_or_compile(key, launch_args)
+    compiled(*launch_args)
+
+
+@torch.compiler.disable
+def cute_dsl_paged_window_fmha_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    page_table: torch.Tensor,
+    cum_seqlen_k: torch.Tensor,
+    kv_len: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    prefix_tokens: int,
+    block_size: int,
+    sm_scale: float,
+) -> None:
+    """Fixed window attention with a prefix sequence over a paged K/V cache.
+
+    The ``T`` query tokens are ``T // block_size`` sequences of ``block_size`` tokens. Sequence
+    ``i`` attends, in full, to the logical key positions ``[0, prefix_tokens)`` and
+    ``[cum_seqlen_k[i], cum_seqlen_k[i] + kv_len[i])``: the starts are positions in one shared
+    address space and need not be a prefix sum of the lengths.
+
+    Args:
+        q: ``[T, H_q, D]``, ``T`` a multiple of ``block_size``.
+        kv: one layer's pool view ``[num_pool_pages, 2, H_kv, page_size, D]``
+            (plane 0 K, plane 1 V), as ``CausalKVCacheManager.kv_buffer`` returns it.
+        page_table: ``[max_pages]`` int32, logical page (position // page_size) to the index of
+            its pool page in ``kv``. Only entries of pages holding a visible position are read.
+        cum_seqlen_k, kv_len: ``[T // block_size]`` int32 device tensors.
+        out: ``[T, H_q, D]``, written.
+        prefix_tokens: leading positions every sequence attends to.
+    """
+    _check_cute_runtime_available()
+    num_tokens, num_heads_q, head_dim = q.shape
+    num_pool_pages, planes, num_heads_kv, page_size, kv_head_dim = kv.shape
+    if planes != 2 or kv_head_dim != head_dim or num_tokens % block_size:
+        raise ValueError(
+            f"q {tuple(q.shape)} and kv {tuple(kv.shape)} do not form {block_size}-token "
+            "sequences over a [pages, 2, H_kv, page_size, D] pool"
+        )
+    if q.dtype != kv.dtype or out.dtype != q.dtype:
+        raise ValueError(f"q, kv and out dtypes differ: {q.dtype}, {kv.dtype}, {out.dtype}")
+    if not q.is_contiguous():
+        q = q.contiguous()
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous (written in place).")
+    num_blocks = num_tokens // block_size
+    device = q.device
+    gpu_arch_str = _get_gpu_arch(device)
+    enable_ex2_emulation = gpu_arch_str == "sm_100a"
+    dtype = _torch_to_cutlass_dtype(q.dtype)
+
+    k_cute = from_dlpack(kv[:, 0], assumed_align=32).mark_layout_dynamic(leading_dim=3)
+    v_cute = from_dlpack(kv[:, 1], assumed_align=32).mark_layout_dynamic(leading_dim=3)
+    q_cute = _to_cute_tensor(q, leading_dim=2)
+    o_cute = _to_cute_tensor(out, leading_dim=2)
+    page_table_cute = from_dlpack(page_table.view(1, -1), assumed_align=16).mark_layout_dynamic(
+        leading_dim=1
+    )
+    cum_q_cute = _to_cute_tensor(_uniform_cu_seqlen(num_blocks, block_size, device), 0)
+    cum_k_cute = _to_cute_tensor(cum_seqlen_k, 0)
+    kv_len_cute = _to_cute_tensor(kv_len, 0)
+
+    problem_size = (
+        num_blocks,
+        block_size,
+        num_tokens,
+        page_table.shape[0] * page_size,
+        num_heads_q,
+        num_heads_kv,
+        head_dim,
+        head_dim,
+    )
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    launch_args = (
+        q_cute,
+        k_cute,
+        v_cute,
+        o_cute,
+        problem_size,
+        cum_q_cute,
+        cum_k_cute,
+        None,  # lse
+        None,  # sink
+        cute_typing.Float32(sm_scale * math.log2(math.exp(1.0))),
+        cute_typing.Float32(sm_scale),
+        cute_typing.Float32(1.0),  # scale_output
+        None,  # skip_softmax_threshold_log2
+        None,  # window_size_left
+        None,  # window_size_right
+        None,  # skip_softmax_count
+        None,  # total_softmax_count
+        stream,
+        False,  # use_pdl
+        page_table_cute,
+        None,  # o_sf_tensor
+        None,  # o_sf_scale
+        None,  # o_sf_start_index
+        None,  # dynamic_work_counter
+        None,  # scale_softmax_log2_tensor
+        None,  # scale_softmax_tensor
+        None,  # scale_output_tensor
+        kv_len_cute,
+        cute_typing.Int32(prefix_tokens),
+    )
+    key = _CacheKey(
+        qk_cutlass_dtype=dtype,
+        pv_cutlass_dtype=dtype,
+        out_cutlass_dtype=dtype,
+        qk_acc_dtype=cutlass.Float32,
+        pv_acc_dtype=cutlass.Float32,
+        head_dim=head_dim,
+        head_dim_v=head_dim,
+        mma_tiler_mn=(128, 128),
+        qk_sf_vec=0,
+        is_persistent=True,
+        mask_type=fmha_utils.MaskEnum.RESIDUAL_MASK,
+        with_lse=False,
+        with_sink=False,
+        with_scale_softmax_tensor=False,
+        with_scale_output_tensor=False,
+        with_scale_v_channels=False,
+        has_window=False,
+        has_skip_softmax=False,
+        # Variable-length Q is stored by the correction warps directly, not through TMA.
+        use_tma_store=False,
+        enable_ex2_emulation=enable_ex2_emulation,
+        enable_skip_correction=True,
+        gpu_arch_str=gpu_arch_str,
+        page_size=page_size,
+    )
     compiled = _get_or_compile(key, launch_args)
     compiled(*launch_args)
 
@@ -856,6 +1013,60 @@ class CuTeDSLAttention(AttentionBackend):
         )
         return out, lse
 
+    def _forward_with_kv_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: "CausalKVCacheManager",
+        seq_len: Optional[int],
+        causal_block_size: Optional[int],
+        attention_mask: PredefinedAttentionMask,
+    ) -> torch.Tensor:
+        """Stage ``k``/``v`` in ``kv_cache`` and attend over it. ``q``, ``k``, ``v`` are
+        ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video. The first ``seq_len`` rows are
+        real (``None``: all of them); rows past that are padding, neither written nor
+        attended, and their output rows are zero."""
+        if attention_mask != PredefinedAttentionMask.FULL:
+            raise NotImplementedError("K/V cache attention is full attention over the cache.")
+        if self.quant_attention_config is not None or self.sparse_params is not None:
+            raise NotImplementedError(
+                "K/V cache attention does not combine with quantized or sparse attention."
+            )
+        batch, num_rows, num_heads, head_dim = q.shape
+        if batch != 1 or k.shape[1] != num_rows or v.shape != k.shape:
+            raise ValueError(
+                "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
+            )
+        if k.shape[2] != kv_cache.num_kv_heads:
+            raise ValueError(
+                f"k has {k.shape[2]} heads but the cache holds {kv_cache.num_kv_heads} per rank."
+            )
+        num_tokens = num_rows if seq_len is None else seq_len
+        if not 0 < num_tokens <= num_rows:
+            raise ValueError(
+                f"seq_len {seq_len} outside (0, {num_rows}]: it counts the real tokens; "
+                "rows past it are padding."
+            )
+        block_size, num_blocks = kv_cache.causal_blocks(num_tokens, causal_block_size)
+        q, k, v = q[0, :num_tokens], k[0, :num_tokens], v[0, :num_tokens]
+        kv_cache.write_staged(self.layer_idx, k, v)
+        cum_seqlen_k, kv_len = kv_cache.kv_ranges(num_blocks, block_size)
+        out = torch.empty(num_rows, num_heads, head_dim, dtype=q.dtype, device=q.device)
+        out[num_tokens:].zero_()
+        cute_dsl_paged_window_fmha_fwd(
+            q,
+            kv_cache.kv_buffer(self.layer_idx),
+            kv_cache.page_table,
+            cum_seqlen_k,
+            kv_len,
+            out[:num_tokens],
+            prefix_tokens=kv_cache.fixed_tokens,
+            block_size=block_size,
+            sm_scale=self.scale,
+        )
+        return out.unsqueeze(0)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -863,6 +1074,7 @@ class CuTeDSLAttention(AttentionBackend):
         v: torch.Tensor,
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        kv_cache: Optional["CausalKVCacheManager"] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -875,10 +1087,30 @@ class CuTeDSLAttention(AttentionBackend):
             k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             attention_mask: Attention mask type (CAUSAL or FULL)
+            kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
+                tokens only: they are written at ``staging_offset`` and each causal block
+                attends to the cache's fixed region, the ``window_tokens`` before the
+                block, and the new tokens up to the block's end. ``batch_size`` must be 1.
+            seq_len: Number of real tokens when ``kv_cache`` is given; all rows are real
+                if it is ``None``. Rows past it are padding added so the sequence splits
+                evenly across ranks; they are neither written to the cache nor attended,
+                and their output rows are zero.
+            causal_block_size: Requires ``kv_cache``. Cuts the real tokens into
+                consecutive causal blocks: full attention within a block, causal across
+                blocks. Absent: one block.
 
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]
         """
+        causal_block_size = kwargs.pop("causal_block_size", None)
+        if kv_cache is not None:
+            return self._forward_with_kv_cache(
+                q, k, v, kv_cache, kwargs.get("seq_len"), causal_block_size, attention_mask
+            )
+        if causal_block_size is not None:
+            raise NotImplementedError(
+                "causal_block_size is only implemented over a K/V cache; pass kv_cache."
+            )
         output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
         return output
 
@@ -899,6 +1131,8 @@ class CuTeDSLAttention(AttentionBackend):
                     always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
+        if kwargs.get("kv_cache") is not None:
+            raise NotImplementedError("forward_with_lse does not support a K/V cache.")
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
         output, lse = self._fwd(q, k, v, is_causal, **kwargs)
         if output.dtype != origin_dtype:
@@ -907,6 +1141,9 @@ class CuTeDSLAttention(AttentionBackend):
 
     @classmethod
     def support_lse(cls) -> bool:
+        return True
+
+    def support_kv_cache(self) -> bool:
         return True
 
     @property
