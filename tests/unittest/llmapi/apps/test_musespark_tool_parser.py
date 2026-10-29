@@ -78,7 +78,7 @@ def musespark_calls_as_dicts(calls):
 
 
 def musespark_stream_chunks(musespark_parser, tools, text, chunks):
-    """Feed ``text`` in chunks; return (normal_text, [(idx, name, args_json)])."""
+    """Feed `text` in chunks; return (normal_text, [(idx, name, args_json)])."""
     text_parts = []
     names, args = {}, {}
     pos = 0
@@ -164,7 +164,7 @@ def test_musespark_parameter_value_not_trimmed(musespark_parser):
 def test_musespark_block_in_private_reasoning_is_not_a_call(
     musespark_parser, musespark_sample_tools
 ):
-    """A block written inside a ``to=self`` message is planning, not a call."""
+    """A block written inside a `to=self` message is planning, not a call."""
     text = f" to=self{MS_M}Plan: {MS_WEATHER}{MS_EOM}{MS_S}assistant to=user{MS_M}Done.{MS_EOT}"
     r = musespark_parser.detect_and_parse(text, musespark_sample_tools)
     assert r.calls == []
@@ -504,7 +504,7 @@ def test_musespark_one_delta_matches_detect_and_parse(text, musespark_sample_too
 
     A larger stream interval, or speculative decoding accepting many tokens at
     once, coalesces messages into one delta; every header in it, including a
-    later `` to=self``, is still stripped.
+    later ` to=self`, is still stripped.
     """
     expected = MuseSparkToolParser().detect_and_parse(text, musespark_sample_tools)
     normal, calls = musespark_stream_chunks(

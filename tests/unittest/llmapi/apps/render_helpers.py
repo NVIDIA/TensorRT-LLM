@@ -18,7 +18,7 @@ The tests use the tokenizers of real models from ``llm_models_root()``; a test w
 not there is skipped. ``real_tokenizer`` returns a shared object: do not change it.
 ``make_tokenizer`` returns a shallow copy, which may get another chat template or attribute
 (the encoding stays the real one); ``copy_of`` returns a deep copy for the tests that change
-the encoding itself. ``byte_level_tokenizer`` needs no model files, for the tests that only
+the encoding itself. `byte_level_tokenizer` needs no model files, for the tests that only
 read the prompt back.
 """
 
@@ -83,7 +83,7 @@ def copy_of(name: str = QWEN3):
 
 
 def byte_level_tokenizer(chat_template: str):
-    """A Hugging Face tokenizer built in memory, with ``chat_template`` as its template.
+    """A Hugging Face tokenizer built in memory, with `chat_template` as its template.
 
     Every byte is one token, so decoding the ids gives back the exact prompt.
     """
@@ -167,7 +167,7 @@ def resources(tokenizer, **overrides) -> RenderResources:
 
 
 async def responses_prompt(request, tokenizer, *, model_type: str) -> str:
-    """The prompt the Responses route renders for a text-only ``request``, read back from its ids."""
+    """The prompt the Responses route renders for a text-only `request`, read back from its ids."""
     from tensorrt_llm.serve.responses_utils import _create_input_tokens
 
     token_ids = await _create_input_tokens(

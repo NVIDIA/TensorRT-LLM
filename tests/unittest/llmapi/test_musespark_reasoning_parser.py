@@ -42,7 +42,7 @@ def musespark_make_parser():
 
 
 def musespark_stream_chunks(parser, text, chunks):
-    """Feed ``text`` in the given chunk sizes; return (content, reasoning)."""
+    """Feed `text` in the given chunk sizes; return (content, reasoning)."""
     content, reasoning = [], []
     pos = 0
     for n in chunks:
@@ -263,9 +263,9 @@ def test_musespark_finish_flushes_truncated_content():
 def test_musespark_headerless_body_survives_end_marker():
     """A forced tool call's arguments are the whole response.
 
-    ``tool_choice={"type":"function",...}`` constrains generation to the
+    `tool_choice={"type":"function",...}` constrains generation to the
     arguments value, so nothing that looks like a routing header is ever
-    emitted and the body runs straight into ``<|end_of_text|>``. The header
+    emitted and the body runs straight into `<|end_of_text|>`. The header
     state must not clear its buffer on that marker, or the arguments are lost:
     the caller would see HTTP 200, an empty message and no tool call.
 
@@ -286,7 +286,7 @@ def test_musespark_headerless_body_survives_end_marker():
 def test_musespark_end_marker_still_ends_a_completed_turn():
     """Keeping a headerless body must not resurrect text the parser drops.
 
-    After a closed message the header state sees ``<|start|>assistant`` (or a
+    After a closed message the header state sees `<|start|>assistant` (or a
     fragment of it) followed by the end marker; that is a header remnant, not a
     body, and it stays dropped.
     """
@@ -324,7 +324,7 @@ class _CountingMuseSparkParser(MuseSparkReasoningParser):
     The bug these tests pin wedged a live server: the header and body states
     handed the same buffer back and forth, `_feed`'s loop never ended, and
     because that loop runs in the server's event loop the whole frontend
-    stopped answering, including ``/health``. A plain assertion on the parsed
+    stopped answering, including `/health`. A plain assertion on the parsed
     text would reproduce it as a test run that never finishes, which is a much
     worse signal than a failed assertion.
     """
@@ -355,13 +355,13 @@ class _CountingMuseSparkParser(MuseSparkReasoningParser):
     ],
 )
 def test_musespark_stray_start_marker_terminates(text, content, reasoning):
-    """``<|start|>`` that is not followed by a header must still be consumed.
+    """`<|start|>` that is not followed by a header must still be consumed.
 
-    The body state leaves ``<|start|>`` in the buffer so the header regexes see
-    the canonical ``<|start|>assistant to=`` form. When the header state then
+    The body state leaves `<|start|>` in the buffer so the header regexes see
+    the canonical `<|start|>assistant to=` form. When the header state then
     ruled the text out as a header it handed the buffer back unchanged, the
     body state found the marker at index 0, emitted nothing and handed it back
-    again. Under concurrent load with ``--ignore-eos`` the model emits exactly
+    again. Under concurrent load with `--ignore-eos` the model emits exactly
     this, and the server stopped serving.
     """
     p = _CountingMuseSparkParser()
@@ -385,7 +385,7 @@ def test_musespark_stray_start_marker_terminates_streamed():
 def test_musespark_feed_is_bounded_even_if_a_step_stops_consuming():
     """The backstop, independent of the specific cycle above.
 
-    ``_feed`` runs in the server's event loop, so a step sequence that stops
+    `_feed` runs in the server's event loop, so a step sequence that stops
     consuming must degrade to a bad parse, never to a spin.
     """
 

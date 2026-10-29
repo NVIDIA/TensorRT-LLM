@@ -4,9 +4,9 @@
 
 A kwarg the template never reads is accepted and does nothing, so two
 different efforts must render differently, and the request-level
-``reasoning_effort`` must reach the template the same way an explicit kwarg
+`reasoning_effort` must reach the template the same way an explicit kwarg
 does. Runs against the checkpoint's own tokenizer and chat template under
-``LLM_MODELS_ROOT``; skips when the checkpoint is absent.
+`LLM_MODELS_ROOT`; skips when the checkpoint is absent.
 """
 
 import json

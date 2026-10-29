@@ -1430,10 +1430,10 @@ def _get_chat_completion_function_tools(
 def _template_supports_deferred_tools(template_source: Optional[str]) -> bool:
     """Whether the active template renders namespace/deferred tools natively.
 
-    Keyed on the template reading ``deferred_render_mode``: the template
+    Keyed on the template reading `deferred_render_mode`: the template
     revision that introduced that variable is the one that renders
-    ``{"type": "namespace"}`` tools and ``defer_loading`` flags itself.
-    ``None`` (a renderer with no analyzable Jinja source) and templates the
+    `{"type": "namespace"}` tools and `defer_loading` flags itself.
+    `None` (a renderer with no analyzable Jinja source) and templates the
     reference analysis cannot see into stay on the flattened rendering,
     which every template understands.
     """
@@ -1444,13 +1444,13 @@ def _template_supports_deferred_tools(template_source: Optional[str]) -> bool:
 
 
 def _explicit_defer_flag(tool) -> Optional[bool]:
-    """The tool's ``defer_loading`` only when the client set it.
+    """The tool's `defer_loading` only when the client set it.
 
     Tri-state matters: the template reads an absent flag on a namespace
     member as "inherit the namespace's deferral", while explicit flags can
-    carve members out (a member set ``false`` renders eagerly when other
-    members are explicitly ``true``). A pydantic default of ``None`` must
-    therefore not be serialized as ``false``.
+    carve members out (a member set `false` renders eagerly when other
+    members are explicitly `true`). A pydantic default of `None` must
+    therefore not be serialized as `false`.
     """
     flag = getattr(tool, "defer_loading", None)
     return flag if isinstance(flag, bool) else None
@@ -1487,9 +1487,9 @@ def _native_tools_for_chat_template(tools: list[Tool]) -> list[dict[str, Any]]:
 
     Function and custom tools keep the chat-completions wrapping (with the
     same freeform schema a flattened custom tool gets); a namespace passes
-    through as ``{"type": "namespace", ...}`` with flat member entries, so
+    through as `{"type": "namespace", ...}` with flat member entries, so
     the template itself qualifies the names, writes the namespace metadata
-    line and recipient pattern, and applies ``defer_loading``. Tools the
+    line and recipient pattern, and applies `defer_loading`. Tools the
     template cannot describe (web_search and unknown types) are dropped
     exactly as the flattened conversion drops them; the flattened pass over
     the same request already warned about them.
@@ -1551,10 +1551,10 @@ def _native_tools_for_chat_template(tools: list[Tool]) -> list[dict[str, Any]]:
 def _tools_for_chat_template(
         tools: Optional[list[Tool]], flat_tool_dicts: list[dict[str, Any]],
         template_source: Optional[str]) -> list[dict[str, Any]]:
-    """The tool dicts handed to ``apply_chat_template``.
+    """The tool dicts handed to `apply_chat_template`.
 
     Default is the flattened function-tool view every template understands.
-    A request carrying namespace tools or explicit ``defer_loading`` flags
+    A request carrying namespace tools or explicit `defer_loading` flags
     switches to the native structures when the active template renders them
     (see _template_supports_deferred_tools): the model was trained on the
     native rendering, and flattening erases the deferral, so every tool
@@ -1804,8 +1804,8 @@ def reasoning_chat_template_kwargs(request,
     parser and the reasoning, plus its closing tag, stays in the visible
     answer. Deriving both from one place keeps them from drifting apart.
 
-    ``template_source`` (the Jinja source about to be rendered, from
-    ``rendered_hf_chat_template_source``) makes the injection template-aware:
+    `template_source` (the Jinja source about to be rendered, from
+    `rendered_hf_chat_template_source`) makes the injection template-aware:
     templates differ in which reasoning kwargs they implement, so injected
     keys the template never reads are dropped instead of being handed to it.
     Only injected keys are filtered: kwargs the client sent are returned
@@ -1813,9 +1813,9 @@ def reasoning_chat_template_kwargs(request,
     template to render (the reasoning-parser sites, custom non-Jinja
     tokenizers) pass no source and get the full injection.
 
-    ``model_type`` selects the model's effort normalizer (see
-    ``ServingExtension.normalize_reasoning_effort``) for an effort derived
-    from ``reasoning.effort``; without it the effort is forwarded unchanged.
+    `model_type` selects the model's effort normalizer (see
+    `ServingExtension.normalize_reasoning_effort`) for an effort derived
+    from `reasoning.effort`; without it the effort is forwarded unchanged.
     """
     # Check the type rather than the truthiness of each attribute. A caller
     # that passes a stand-in object - a Mock in a unit test, say - hands back a

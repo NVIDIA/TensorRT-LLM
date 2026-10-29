@@ -122,7 +122,7 @@ def unreferenced_chat_template_kwargs(
     template_source: str | None,
     keys: Iterable[str],
 ) -> frozenset[str]:
-    """Subset of ``keys`` the active template never reads.
+    """Subset of `keys` the active template never reads.
 
     The same reference analysis the validator runs, exposed as a query so
     that code which *constructs* template kwargs (rather than forwarding a
@@ -133,7 +133,7 @@ def unreferenced_chat_template_kwargs(
     surface is flagged: constructing code can safely omit an unverifiable
     key and leave the template its own default, whereas the validator (which
     faces caller-supplied kwargs it cannot remove) skips instead. A
-    non-string ``template_source`` flags nothing, matching the validator's
+    non-string `template_source` flags nothing, matching the validator's
     skip.
     """
     if not isinstance(template_source, str):

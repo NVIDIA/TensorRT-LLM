@@ -12,18 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Serving extension for Muse Spark checkpoints (``model_type == "muse_spark"``).
+"""Serving extension for Muse Spark checkpoints (`model_type == "muse_spark"`).
 
-Routes a request-level ``reasoning_effort`` to the MuseSpark chat template and
+Routes a request-level `reasoning_effort` to the MuseSpark chat template and
 normalizes every serve-derived effort onto the levels the template accepts.
 
 Structured output takes the generic reasoning-parser placement. This extension
-is registered by model type only, so no hook is keyed by the ``musespark``
-reasoning parser, and ``_response_format_to_guided_decoding_params`` wraps the
+is registered by model type only, so no hook is keyed by the `musespark`
+reasoning parser, and `_response_format_to_guided_decoding_params` wraps the
 constraint in a structural tag: a forced private reasoning message, opened by
-``MuseSparkReasoningParser.reasoning_start`` and closed by ``reasoning_end``,
+`MuseSparkReasoningParser.reasoning_start` and closed by `reasoning_end`,
 then the constraint on the answer message. Reasoning tokens therefore count
-toward ``max_tokens`` before any constrained output.
+toward `max_tokens` before any constrained output.
 """
 
 from typing import Optional
@@ -71,19 +71,19 @@ class MuseSparkServingExtension(ServingExtension):
         return normalize_musespark_effort(effort)
 
     def apply_chat_extensions(self, request: ChatCompletionRequest) -> None:
-        """Route a request-level ``reasoning_effort`` to the template kwargs.
+        """Route a request-level `reasoning_effort` to the template kwargs.
 
         The Muse Spark chat template renders its reasoning-strength control
         line from chat-template kwargs only, so a top-level
-        ``reasoning_effort`` (the field OpenAI-compatible clients send) has
+        `reasoning_effort` (the field OpenAI-compatible clients send) has
         to be derived into them. An explicit client-supplied
-        ``chat_template_kwargs.reasoning_effort`` wins over the derived
+        `chat_template_kwargs.reasoning_effort` wins over the derived
         value, and the pydantic default (the field defaults to LOW) is never
         derived: only an effort the client explicitly set.
 
-        A ``reasoning_effort`` kwarg the serve itself injected (the Anthropic
-        adapter forwards ``output_config.effort`` this way and lists it in
-        ``injected_chat_template_kwargs``) is normalized in place; a kwarg
+        A `reasoning_effort` kwarg the serve itself injected (the Anthropic
+        adapter forwards `output_config.effort` this way and lists it in
+        `injected_chat_template_kwargs`) is normalized in place; a kwarg
         the client wrote is forwarded untouched.
         """
         kwargs = request.chat_template_kwargs

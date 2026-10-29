@@ -683,7 +683,7 @@ NATIVE_RENDER_TEMPLATE = (
 async def test_responses_prompt_renders_the_namespace_deferral():
     """Both deferral forms reach the prompt the Responses route renders.
 
-    ``send`` inherits the namespace's deferral and ``read`` opts out explicitly; the
+    `send` inherits the namespace's deferral and `read` opts out explicitly; the
     flattened view would render both eagerly.
     """
     request = ResponsesRequest(

@@ -114,9 +114,9 @@ class ServingExtension:
         """Map a protocol-level effort onto what this model's template accepts.
 
         Applied to efforts the serve itself derives from API fields (a
-        top-level ``reasoning_effort``, Anthropic ``output_config.effort``,
-        Responses ``reasoning.effort``), never to a ``chat_template_kwargs``
-        value the client wrote. Returning ``None`` drops the kwarg so the
+        top-level `reasoning_effort`, Anthropic `output_config.effort`,
+        Responses `reasoning.effort`), never to a `chat_template_kwargs`
+        value the client wrote. Returning `None` drops the kwarg so the
         template default applies. The default forwards the value unchanged.
         """
         return effort
@@ -201,7 +201,7 @@ def apply_model_chat_extensions(request, model_type: Optional[str]) -> None:
 
 
 def normalize_reasoning_effort(effort: str, model_type: Optional[str]) -> Optional[str]:
-    """Run the effort normalizer registered for ``model_type``; identity if none."""
+    """Run the effort normalizer registered for `model_type`; identity if none."""
     _load_builtin_extensions()
     extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
     return effort if extension is None else extension.normalize_reasoning_effort(effort)

@@ -15,5 +15,5 @@
 """Model-specific reasoning parser implementations.
 
 Each module defines a parser registered with
-``tensorrt_llm.llmapi.reasoning_parser.register_reasoning_parser``.
+`tensorrt_llm.llmapi.reasoning_parser.register_reasoning_parser`.
 """

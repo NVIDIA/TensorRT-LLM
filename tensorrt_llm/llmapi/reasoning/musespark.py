@@ -35,34 +35,34 @@ class MuseSparkReasoningParser(BaseReasoningParser):
         <|start|>assistant to=RECIPIENT<|message|>BODY<|eom|>   (more follows)
         <|start|>assistant to=RECIPIENT<|message|>BODY<|eot|>   (end of turn)
 
-    The generation prompt ends with ``<|start|>assistant``, so the first
-    message starts at `` to=RECIPIENT<|message|>`` (leading space included).
+    The generation prompt ends with `<|start|>assistant`, so the first
+    message starts at ` to=RECIPIENT<|message|>` (leading space included).
 
     Recipient routing:
 
     ==================  ==================================================
-    ``to=self``         ``reasoning_content`` (private CoT)
-    bare ``<|message|>`` ``reasoning_content`` (public CoT, no recipient)
-    ``to=user``         ``content`` (final answer)
-    ``to=commentary``   ``content`` (interim user-visible text)
-    ``to=developer``,
-    ``to=assistant``    dropped
-    anything else       tool call: header + ``<|message|>`` + body are passed
-                        through verbatim into ``content`` for the
-                        ``musespark`` tool parser; end markers are dropped
+    `to=self`         `reasoning_content` (private CoT)
+    bare `<|message|>` `reasoning_content` (public CoT, no recipient)
+    `to=user`         `content` (final answer)
+    `to=commentary`   `content` (interim user-visible text)
+    `to=developer`,
+    `to=assistant`    dropped
+    anything else       tool call: header + `<|message|>` + body are passed
+                        through verbatim into `content` for the
+                        `musespark` tool parser; end markers are dropped
     ==================  ==================================================
 
-    Streaming: header text is buffered until ``<|message|>`` resolves the
-    recipient, so no fragment of `` to=self`` ever reaches ``content``. Text
-    that cannot be a header (does not start with `` to=``/``<|start|>``/
-    ``<|message|>``) is streamed as content, matching the reference default.
+    Streaming: header text is buffered until `<|message|>` resolves the
+    recipient, so no fragment of ` to=self` ever reaches `content`. Text
+    that cannot be a header (does not start with ` to=`/`<|start|>`/
+    `<|message|>`) is streamed as content, matching the reference default.
 
-    ``needs_raw_special_tokens`` makes the serving layer decode with
-    ``skip_special_tokens=False``. If the parser is nevertheless fed text
-    with the special tokens stripped (`` to=selfTHOUGHTassistant to=userANSWER``),
-    no ``<|message|>`` ever arrives; the parser buffers until ``finish()``
-    and splits on the bare recipient headers (``_parse_stripped``), never
-    returning a ``to=self`` span as content.
+    `needs_raw_special_tokens` makes the serving layer decode with
+    `skip_special_tokens=False`. If the parser is nevertheless fed text
+    with the special tokens stripped (` to=selfTHOUGHTassistant to=userANSWER`),
+    no `<|message|>` ever arrives; the parser buffers until `finish()`
+    and splits on the bare recipient headers (`_parse_stripped`), never
+    returning a `to=self` span as content.
     """
 
     needs_raw_special_tokens = True
@@ -71,7 +71,7 @@ class MuseSparkReasoningParser(BaseReasoningParser):
     # lets the model think freely and then constrains the answer, and it does
     # that from these two markers (openai_protocol.py, the "force thinking and
     # then trigger user constraint" branch). This model does not wrap its
-    # reasoning in a symmetric tag pair like ``<think>``/``</think>``: it
+    # reasoning in a symmetric tag pair like `<think>`/`</think>`: it
     # emits a private-recipient header, the thought, an end-of-message marker,
     # and then a *new* header addressed to the user before the answer. So the
     # opening marker is the private-recipient header and the closing marker
@@ -81,7 +81,7 @@ class MuseSparkReasoningParser(BaseReasoningParser):
     # Without these, a json_schema request with a reasoning parser configured
     # fails at the server with AttributeError and the client sees HTTP 400.
     # With reasoning off the model writes no thought, but the generation prompt
-    # still stops at ``<|start|>assistant``, so it writes this header before the
+    # still stops at `<|start|>assistant`, so it writes this header before the
     # answer body. Structured output has to trigger on it rather than applying
     # the schema from the first generated token, which would forbid the very
     # header the model has to write next.
@@ -105,13 +105,13 @@ class MuseSparkReasoningParser(BaseReasoningParser):
     _DROP_RECIPIENTS = frozenset({"developer", "assistant"})
     _NAME_CHARS = r"[A-Za-z0-9_.\-]"
 
-    # Header text between the message boundary and ``<|message|>``.
+    # Header text between the message boundary and `<|message|>`.
     _RECIPIENT_RE = re.compile(r"(?:^|\s)to=(" + _NAME_CHARS + r"+)\s*$")
     # A buffer that may still grow into a header (kept-token case).
     _HEADER_PARTIAL_RE = re.compile(
         r"^(?:<\|start\|>assistant)?(?:\s*(?:t|to|to=" + _NAME_CHARS + r"*)?)$"
     )
-    # A buffer that looks like a header whose ``<|message|>`` was stripped.
+    # A buffer that looks like a header whose `<|message|>` was stripped.
     _HEADER_STRIPPED_RE = re.compile(
         r"^(?:<\|start\|>assistant|assistant)?\s+to=" + _NAME_CHARS + r"+"
     )
@@ -141,7 +141,7 @@ class MuseSparkReasoningParser(BaseReasoningParser):
     # ------------------------------------------------------------------ utils
     @staticmethod
     def _partial_suffix_len(text: str, markers: tuple[str, ...]) -> int:
-        """Longest suffix of ``text`` that is a proper prefix of any marker."""
+        """Longest suffix of `text` that is a proper prefix of any marker."""
         best = 0
         for marker in markers:
             for length in range(min(len(text), len(marker) - 1), best, -1):
@@ -167,10 +167,10 @@ class MuseSparkReasoningParser(BaseReasoningParser):
 
     @classmethod
     def _could_be_header(cls, buf: str) -> bool:
-        """Whether ``buf`` is still a proper prefix of some header form.
+        """Whether `buf` is still a proper prefix of some header form.
 
-        The forms are ``[<|start|>assistant] to=NAME<|message|>`` and a bare
-        ``<|message|>``.
+        The forms are `[<|start|>assistant] to=NAME<|message|>` and a bare
+        `<|message|>`.
         """
         hold = cls._partial_suffix_len(buf, (cls.MESSAGE,))
         core = buf[: len(buf) - hold]
@@ -187,25 +187,25 @@ class MuseSparkReasoningParser(BaseReasoningParser):
             content.append(text)
 
     def _drop_ruled_out_start(self) -> None:
-        """Consume a leading ``<|start|>`` the header state has just ruled out.
+        """Consume a leading `<|start|>` the header state has just ruled out.
 
-        The body state deliberately leaves ``<|start|>`` in the buffer when it
+        The body state deliberately leaves `<|start|>` in the buffer when it
         hands control back to the header state, so the header regexes see the
-        canonical ``<|start|>assistant to=`` form. If the header state then
+        canonical `<|start|>assistant to=` form. If the header state then
         decides the text is not a header, leaving the marker in place sends the
         identical buffer back to the body state, which finds the marker at
         index 0, emits nothing and hands it straight back. The two states pass
-        the same buffer to each other with nothing consumed, so ``_feed``'s
+        the same buffer to each other with nothing consumed, so `_feed`'s
         loop never ends.
 
         That is not a theoretical case: it is what wedged the server under
         concurrent load. The spin runs in the frontend's event loop and holds
-        the GIL, so ``/health`` stops answering and no new request reaches the
+        the GIL, so `/health` stops answering and no new request reaches the
         engine; rank 0 then blocks on an empty request queue while the other
         ranks sit in the per-iteration request-count broadcast, with the GPUs
         idle. Consuming the marker here is what makes every step consume
         something. It is a special token, so it is dropped rather than emitted:
-        the alternative leaks ``<|start|>`` into user-visible content.
+        the alternative leaks `<|start|>` into user-visible content.
         """
         if self._buffer.startswith(self.START):
             self._buffer = self._buffer[len(self.START) :]
@@ -225,7 +225,7 @@ class MuseSparkReasoningParser(BaseReasoningParser):
                 if self._could_be_header(buf):
                     return False  # still a plausible header prefix
                 if not self._saw_message_marker and self._HEADER_STRIPPED_RE.match(buf):
-                    # `` to=self`` followed by body text with no <|message|>:
+                    # ` to=self` followed by body text with no <|message|>:
                     # special tokens were stripped. Hold everything for the
                     # finish() fallback rather than leak the private channel.
                     self._state = "stripped"
@@ -246,10 +246,10 @@ class MuseSparkReasoningParser(BaseReasoningParser):
                     # A body that never had a header. Guided decoding pins the
                     # whole generation to one value -- a forced tool call's
                     # arguments, a constrained answer -- so the model writes no
-                    # `` to=RECIPIENT<|message|>``, and this state waits for one
+                    # ` to=RECIPIENT<|message|>`, and this state waits for one
                     # that cannot arrive. Clearing the buffer here discards the
                     # whole response: a forced tool_choice decoded
-                    # ``{"a": 2, "b": 3}<|end_of_text|>`` and the caller got an
+                    # `{"a": 2, "b": 3}<|end_of_text|>` and the caller got an
                     # empty message and no tool call. Route it the way the
                     # no-terminator branch above routes unheadered text and let
                     # the body branch consume the end marker.
@@ -287,7 +287,7 @@ class MuseSparkReasoningParser(BaseReasoningParser):
             self._state = "done"
             self._buffer = ""
             return False
-        # <|eom|>: the next header follows as ``<|start|>assistant to=...``.
+        # <|eom|>: the next header follows as `<|start|>assistant to=...`.
         # A bare <|start|> (model skipped <|eom|>) is kept so the header
         # regexes see the canonical form.
         self._buffer = buf[idx + (len(marker) if marker == self.EOM else 0) :]
@@ -327,10 +327,10 @@ class MuseSparkReasoningParser(BaseReasoningParser):
     def _parse_stripped(cls, text: str) -> ReasoningParserResult:
         """Split on bare recipient headers when special tokens were removed.
 
-        As in the reference implementation, a `` to=self`` span is never
+        As in the reference implementation, a ` to=self` span is never
         returned as content; with no recipient header at all the text is
         ordinary content. Bodies end at the next literal
-        ``assistant to=`` (what ``<|start|>assistant to=`` reduces to).
+        `assistant to=` (what `<|start|>assistant to=` reduces to).
         """
         first = cls._STRIPPED_HEADER_RE.search(text)
         if first is None:

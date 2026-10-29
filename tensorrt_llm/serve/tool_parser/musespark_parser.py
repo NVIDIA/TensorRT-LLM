@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tool parser for the MuseSpark ``<atem:function_calls>`` format.
+"""Tool parser for the MuseSpark `<atem:function_calls>` format.
 
 Behavior follows the reference implementation's tool parser; each
 deliberate deviation from it has a case in
-``tests/unittest/llmapi/apps/test_musespark_tool_parser.py``.
+`tests/unittest/llmapi/apps/test_musespark_tool_parser.py`.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ _NAME = r"[A-Za-z0-9_.\-]+"
 
 
 def _declared_type(param_name: str, func_name: str, tools: List[Tool]) -> Optional[str]:
-    """JSON-schema type declared for ``param_name`` of ``func_name``, if any."""
+    """JSON-schema type declared for `param_name` of `func_name`, if any."""
     for tool in tools or ():
         if tool.function.name != func_name:
             continue
@@ -44,11 +44,11 @@ def _declared_type(param_name: str, func_name: str, tools: List[Tool]) -> Option
 def _parse_param_value(raw: str, declared: Optional[str]) -> Any:
     """Type a parameter value the way the reference does.
 
-    ``json.loads`` on the raw text, else keep the raw string (no trimming).
+    `json.loads` on the raw text, else keep the raw string (no trimming).
 
-    One addition: a parameter the tool schema declares as ``string`` is kept
-    raw even when its text happens to be valid JSON (``"quoted"``, ``1e3``,
-    ``true``), so the model's string is not re-typed.
+    One addition: a parameter the tool schema declares as `string` is kept
+    raw even when its text happens to be valid JSON (`"quoted"`, `1e3`,
+    `true`), so the model's string is not re-typed.
     """
     if declared == "string":
         return raw
@@ -69,25 +69,25 @@ class MuseSparkToolParser(BaseToolParser):
         </atem:invoke>
         </atem:function_calls><|eom|>            (<|eot|> on the last one)
 
-    The function name is read from ``<atem:invoke name=...>``, not from the
-    header. A block may hold several ``<atem:invoke>`` elements and a
+    The function name is read from `<atem:invoke name=...>`, not from the
+    header. A block may hold several `<atem:invoke>` elements and a
     response may hold several blocks (parallel calls); tool indices run
     consecutively across all of them.
 
-    Text reaching this parser is either the ``musespark`` reasoning parser's
-    ``content`` (headers of tool messages replayed, end markers removed) or,
+    Text reaching this parser is either the `musespark` reasoning parser's
+    `content` (headers of tool messages replayed, end markers removed) or,
     with no reasoning parser configured, the raw decoded stream. Both are
-    handled: routing headers (``<|start|>assistant to=X<|message|>`` or
-    `` to=X<|message|>``) and the structural tokens ``<|start|>``,
-    ``<|message|>``, ``<|eom|>``, ``<|eot|>``, ``<|end_of_text|>`` are never
-    emitted as content, and a `` to=self<|message|>`` span is suppressed up to
-    its ``<|eom|>``/``<|eot|>``.
+    handled: routing headers (`<|start|>assistant to=X<|message|>` or
+    ` to=X<|message|>`) and the structural tokens `<|start|>`,
+    `<|message|>`, `<|eom|>`, `<|eot|>`, `<|end_of_text|>` are never
+    emitted as content, and a ` to=self<|message|>` span is suppressed up to
+    its `<|eom|>`/`<|eot|>`.
 
     Streaming: the name of each invoke is emitted as soon as its opening tag
-    is seen (``ToolCallItem(name=..., parameters="")``), then argument deltas
+    is seen (`ToolCallItem(name=..., parameters="")`), then argument deltas
     follow as the parameters close. Intermediate JSON strings drop the
-    trailing ``}`` so every emitted string is a prefix of the next; the final
-    delta closes the object (``"{}"`` for a closed invoke with no params).
+    trailing `}` so every emitted string is a prefix of the next; the final
+    delta closes the object (`"{}"` for a closed invoke with no params).
     """
 
     needs_raw_special_tokens = True
@@ -177,7 +177,7 @@ class MuseSparkToolParser(BaseToolParser):
         """Parse XML parameters, or a bare JSON object.
 
         The bare-JSON form is what structural-tag guided decoding produces
-        between ``structure_info`` begin/end.
+        between `structure_info` begin/end.
         """
         stripped = invoke_content.strip()
         if stripped.startswith("{") and stripped.endswith("}"):
@@ -190,21 +190,21 @@ class MuseSparkToolParser(BaseToolParser):
         return self._parse_params(invoke_content, func_name, tools)
 
     def _iter_invokes(self, body: str) -> List[Tuple[str, str]]:
-        """Every ``<atem:invoke>`` in a block body, terminated or not.
+        """Every `<atem:invoke>` in a block body, terminated or not.
 
         Anchoring on the opening tag rather than on a matched open/close pair
         is what lets a truncated generation still yield the call it had begun.
-        A generation cut off mid-invoke never emits ``</atem:invoke>``, and a
+        A generation cut off mid-invoke never emits `</atem:invoke>`, and a
         pattern that requires the closer simply finds nothing -- the model
         asked for a tool and the caller is told no tool was requested.
 
-        The streaming path already behaves this way: ``finish()`` passes
-        ``block_complete=True`` and ``_update_tool_deltas`` parses the
+        The streaming path already behaves this way: `finish()` passes
+        `block_complete=True` and `_update_tool_deltas` parses the
         unterminated tail. Matching that here is what makes the two paths
         agree, which is the contract the serving smoke checks.
 
         An unterminated invoke runs to the start of the next invoke, or to the
-        end of the body. ``_parse_invoke_content`` keeps only the parameters
+        end of the body. `_parse_invoke_content` keeps only the parameters
         that did close, so a half-written one is dropped rather than guessed.
         """
         out: List[Tuple[str, str]] = []
@@ -226,9 +226,9 @@ class MuseSparkToolParser(BaseToolParser):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse a complete message in one shot.
 
-        ``normal_text`` is everything outside the tool blocks, with headers,
-        ``to=self`` spans and structural tokens removed, so commentary prose
-        before a call is kept. A block inside a ``to=self`` span is private
+        `normal_text` is everything outside the tool blocks, with headers,
+        `to=self` spans and structural tokens removed, so commentary prose
+        before a call is kept. A block inside a `to=self` span is private
         reasoning, not a call.
         """
         text = self._drop_self_spans(text)
@@ -267,10 +267,10 @@ class MuseSparkToolParser(BaseToolParser):
         return StreamingParseResult(normal_text=normal_text.strip(), calls=calls)
 
     def _self_spans(self, text: str) -> List[Tuple[re.Match, int, bool]]:
-        """Each `` to=self`` message in ``text``: ``(header, end, closed)``.
+        """Each ` to=self` message in `text`: `(header, end, closed)`.
 
-        A message runs from its header through ``<|eom|>``/``<|eot|>``; one
-        that has not ended yet runs to the end of ``text`` and is not closed.
+        A message runs from its header through `<|eom|>`/`<|eot|>`; one
+        that has not ended yet runs to the end of `text` and is not closed.
         Both parse paths skip these spans before they look for a tool block.
         """
         spans: List[Tuple[re.Match, int, bool]] = []
@@ -385,20 +385,20 @@ class MuseSparkToolParser(BaseToolParser):
             return StreamingParseResult()
 
     def _strip_header(self, safe: str) -> Tuple[List[str], int, bool]:
-        """Split the front of ``safe`` into content, through its first routing header.
+        """Split the front of `safe` into content, through its first routing header.
 
-        Returns ``(parts, consumed, entered_reasoning)``; ``consumed`` is how
+        Returns `(parts, consumed, entered_reasoning)`; `consumed` is how
         much of the buffer front is settled (0 = hold everything). At most one
         header is consumed per call and the caller rescans what follows it: a
         delta can hold several messages, and every header in it, including a
-        later `` to=self``, must be stripped.
+        later ` to=self`, must be stripped.
         """
         parts: List[str] = []
         start_pos = safe.find(self.START)
         m = self._HEADER_RE.search(safe)
         if m is not None and (start_pos < 0 or m.start() <= start_pos):
             # The first message after the generation prompt has no <|start|>
-            # (`` to=X<|message|>``); a later one includes it in the match.
+            # (` to=X<|message|>`); a later one includes it in the match.
             if m.start() > 0:
                 parts.append(safe[: m.start()])
             return parts, m.end(), m.group(2) == "self"
@@ -424,7 +424,7 @@ class MuseSparkToolParser(BaseToolParser):
             parts.append(safe[:emit_len])
         return parts, emit_len, False
 
-    # Header still growing: ``[<|start|>assistant][ to=NAME][<|mess``.
+    # Header still growing: `[<|start|>assistant][ to=NAME][<|mess`.
     _HEADER_PREFIX_RE = re.compile(
         r"^(?:<\|start\|>assistant)?(?:\s*(?:t|to|to=[A-Za-z0-9_.\-]*)?)$"
     )
@@ -433,10 +433,10 @@ class MuseSparkToolParser(BaseToolParser):
     def _header_hold_len(cls, safe: str) -> int:
         """Number of trailing characters to hold back rather than emit.
 
-        The longest suffix of ``safe`` that could still grow into a routing
+        The longest suffix of `safe` that could still grow into a routing
         header or a structural token. Unlike the reference, which holds
-        `` to=`` partials only from 3 chars, every prefix is held; the cost
-        is a one-chunk delay on text ending in whitespace or `` t``.
+        ` to=` partials only from 3 chars, every prefix is held; the cost
+        is a one-chunk delay on text ending in whitespace or ` t`.
         """
         hold = max(cls._partial_suffix_len(safe, tok) for tok in cls.STRUCTURAL_TOKENS)
         for n in range(len(safe), hold, -1):
@@ -497,7 +497,7 @@ class MuseSparkToolParser(BaseToolParser):
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """Flush at end of stream.
 
-        Closes an unterminated block (a truncated ``</atem:function_calls>``)
+        Closes an unterminated block (a truncated `</atem:function_calls>`)
         and releases held-back plain text.
         """
         calls: List[ToolCallItem] = []
@@ -522,7 +522,7 @@ class MuseSparkToolParser(BaseToolParser):
 
     def structure_info(self) -> _GetInfoFunc:
         # Guided decoding fills a JSON object between begin and end;
-        # ``_parse_invoke_content`` accepts that bare-JSON form.
+        # `_parse_invoke_content` accepts that bare-JSON form.
         return lambda name: StructureInfo(
             begin=f'<atem:function_calls>\n<atem:invoke name="{name}">\n',
             end="\n</atem:invoke>\n</atem:function_calls>",

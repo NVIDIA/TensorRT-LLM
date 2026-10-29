@@ -660,13 +660,13 @@ def resolve_hf_chat_template(
 
 
 class _RenderDispatch(NamedTuple):
-    """The renderer ``apply_chat_template`` uses for a set of inputs.
+    """The renderer `apply_chat_template` uses for a set of inputs.
 
-    ``kind`` is ``"deepseek_v41"``, ``"deepseek"`` (the other DeepSeek
-    tokenizers), ``"passthrough"`` (the model skips chat templates),
-    ``"native"`` (a tokenizer-native python template) or ``"jinja"``.
-    ``tokenizer`` is the object that renderer is called on, and ``template``
-    is the resolved source for ``"jinja"`` (None when no template resolves).
+    `kind` is `"deepseek_v41"`, `"deepseek"` (the other DeepSeek
+    tokenizers), `"passthrough"` (the model skips chat templates),
+    `"native"` (a tokenizer-native python template) or `"jinja"`.
+    `tokenizer` is the object that renderer is called on, and `template`
+    is the resolved source for `"jinja"` (None when no template resolves).
     """
     kind: str
     tokenizer: Any
@@ -681,7 +681,7 @@ def _resolve_render_dispatch(
     chat_template: Optional[str],
     tools: Optional[list[dict[str, Any]]],
 ) -> _RenderDispatch:
-    """Pick the renderer, in the order ``apply_chat_template`` checks them."""
+    """Pick the renderer, in the order `apply_chat_template` checks them."""
     if isinstance(tokenizer, DeepseekV41Tokenizer):
         return _RenderDispatch("deepseek_v41", tokenizer)
     if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
@@ -712,9 +712,9 @@ def rendered_hf_chat_template_source(
     tools: Optional[list[dict[str, Any]]] = None,
     model_type: Optional[str] = None,
 ) -> Optional[str]:
-    """The Jinja source ``apply_chat_template`` will render for these inputs.
+    """The Jinja source `apply_chat_template` will render for these inputs.
 
-    Returns ``None`` when ``apply_chat_template`` dispatches to a renderer
+    Returns `None` when `apply_chat_template` dispatches to a renderer
     with no Jinja source to analyze (the DeepSeek custom tokenizers, a model
     that skips chat templates, a tokenizer-native python template) or when no
     template resolves. Callers that construct chat_template_kwargs use this
