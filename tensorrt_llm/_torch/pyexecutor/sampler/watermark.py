@@ -46,6 +46,7 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.watermark.prf import PAD_TOKEN, context_seeds_torch, secondary_key
 from tensorrt_llm.watermark.state_kernels import commit_windows, plan_windows
+from tensorrt_llm.watermark.step_kernel import StepScratch, watermark_step
 
 from ..llm_request import LlmRequest
 
@@ -79,6 +80,37 @@ def _owner_ref(request: LlmRequest) -> Callable[[], Optional[LlmRequest]]:
         return weakref.ref(request)
     except TypeError:
         return lambda: request
+
+
+class PinnedStager:
+    """Copies small host lists to a device buffer without allocating pinned memory per step.
+
+    Allocating pinned host memory synchronizes with the device, which can deadlock a tensor
+    parallel step whose ranks are inside a collective. The staging buffers are allocated once
+    and reused round-robin; a buffer is rewritten only after its previous copy has finished.
+    """
+
+    def __init__(self, capacity: int, dtype: torch.dtype, depth: int = 4):
+        self._dtype = dtype
+        self._buffers = [
+            torch.empty(capacity, dtype=dtype, pin_memory=prefer_pinned()) for _ in range(depth)
+        ]
+        self._events: list[Optional[torch.cuda.Event]] = [None] * depth
+        self._next = 0
+
+    def copy_to(self, values: list, dest: torch.Tensor) -> None:
+        """Write ``values`` to the leading entries of ``dest`` (device) and zero-fill nothing else."""
+        index = self._next
+        self._next = (index + 1) % len(self._buffers)
+        event = self._events[index]
+        if event is not None:
+            event.synchronize()
+        count = len(values)
+        buffer = self._buffers[index]
+        buffer[:count] = torch.tensor(values, dtype=self._dtype)
+        dest[:count].copy_(buffer[:count], non_blocking=True)
+        event = self._events[index] = torch.cuda.Event()
+        event.record()
 
 
 @dataclass
@@ -120,7 +152,8 @@ class WatermarkHandler:
             dtype=torch.int64,
             device=device,
         )
-        self._ones: dict[int, torch.Tensor] = {}
+        self._ones = torch.ones(max_num_sequences + 1, dtype=torch.int64, device=device)
+        self._step_scratch = StepScratch(num_rows, self._device)
         self._begin_cache: Optional[tuple] = None
         self._tail = torch.full((num_rows, width), PAD_TOKEN, dtype=torch.int64, device=device)
         self._dedupe = config.deduplicate_contexts == "single_turn"
@@ -138,12 +171,18 @@ class WatermarkHandler:
         # warmup dummy requests reuse the ids that real requests are given later.
         self._slot_owner: list[Optional[Callable[[], Optional[LlmRequest]]]] = [None] * num_rows
         self._slot_enabled: list[bool] = [False] * num_rows
+        # Whether the slot's sampling params filter nothing but the temperature (no top-k, top-p
+        # or min-p), so its keyed draw can run on the logits without forming probabilities.
+        self._slot_neutral: list[bool] = [False] * num_rows
 
     def requested(self, request: LlmRequest) -> bool:
         return request_wants_watermark(self.config, request)
 
     def observe(
-        self, requests: list[LlmRequest], is_sampling: Callable[[LlmRequest], bool]
+        self,
+        requests: list[LlmRequest],
+        is_sampling: Callable[[LlmRequest], bool],
+        is_neutral: Optional[Callable[[LlmRequest], bool]] = None,
     ) -> None:
         """Reset the state of every slot whose occupant changed.
 
@@ -166,6 +205,7 @@ class WatermarkHandler:
             self._slot_owner[slot] = _owner_ref(request)
             enabled = self.requested(request) and is_sampling(request)
             self._slot_enabled[slot] = enabled
+            self._slot_neutral[slot] = enabled and is_neutral is not None and is_neutral(request)
             if not enabled:
                 continue
             tokens = request.get_tokens(0)[-width:]
@@ -320,11 +360,7 @@ class WatermarkHandler:
             accepted_tokens = accepted_tokens.unsqueeze(1)
         batch = rows.seeds.shape[0]
         if num_accepted is None:
-            num_accepted = self._ones.get(batch)
-            if num_accepted is None:
-                num_accepted = self._ones[batch] = torch.ones(
-                    batch, dtype=torch.int64, device=self._device
-                )
+            num_accepted = self._ones[:batch]
         commit_windows(
             rows.slots,
             rows.enabled,
@@ -394,3 +430,62 @@ class WatermarkHandler:
             )
             self._begin_cache = (key, slots, enabled)
         return self.plan(slots, enabled)
+
+    def step_inputs(self, slots_per_row: list[int]) -> Optional[tuple]:
+        """Host entry for the fused decode step: ``(slots, enabled, all_enabled, all_neutral)``.
+
+        ``slots`` and ``enabled`` are device tensors (reused while the batch repeats);
+        ``all_enabled`` and ``all_neutral`` say whether every row carries a watermark and
+        whether every such row filters nothing but its temperature. None when no row carries
+        a watermark.
+        """
+        flags = tuple(self._slot_enabled[slot] for slot in slots_per_row)
+        if not any(flags):
+            return None
+        key = (tuple(slots_per_row), flags)
+        if self._begin_cache is not None and self._begin_cache[0] == key:
+            slots, enabled = self._begin_cache[1], self._begin_cache[2]
+        else:
+            pin = prefer_pinned()
+            slots = torch.tensor(slots_per_row, dtype=torch.int64, pin_memory=pin).to(
+                self._device, non_blocking=True
+            )
+            enabled = torch.tensor(flags, dtype=torch.bool, pin_memory=pin).to(
+                self._device, non_blocking=True
+            )
+            self._begin_cache = (key, slots, enabled)
+        all_neutral = all(
+            self._slot_neutral[slot] for slot, flag in zip(slots_per_row, flags) if flag
+        )
+        return slots, enabled, all(flags), all_neutral
+
+    @property
+    def needs_fallback_token(self) -> bool:
+        """Whether a watermarked row can fall back to the ordinary sampler's token."""
+        return self._dedupe
+
+    def sample_step(
+        self,
+        values: torch.Tensor,
+        temperature: Optional[torch.Tensor],
+        slots: torch.Tensor,
+        enabled: torch.Tensor,
+        fallback: Optional[torch.Tensor],
+        *,
+        from_probs: bool,
+    ) -> torch.Tensor:
+        """Plan, draw and commit one plain decode step in a single launch. Device-only."""
+        return watermark_step(
+            values,
+            temperature,
+            slots,
+            enabled,
+            fallback,
+            self._tail,
+            self._count,
+            self._ring if self._dedupe else None,
+            self._ring_size,
+            self._keys,
+            self._step_scratch,
+            from_probs=from_probs,
+        )
