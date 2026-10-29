@@ -258,6 +258,9 @@ def generate_rerun_tests_list(outdir,
     # Get tests that terminated unexpectedly from unfinished_test_filename.
     # e.g. unfinished_test_line: "stage_name/test_name1"
     # unfinished_tests: ["test_name1", "test_name2", "test_name3"]
+    # A unittest entry is recorded as its wrapper,
+    # "stage_name/test_unittests.py::test_unittests_v2[unittest/...]", and is
+    # named "unittest/..." in the test list, as parse_name names it.
     unfinished_tests = []
     if unfinished_test_filename and os.path.exists(unfinished_test_filename):
         with open(unfinished_test_filename, 'r') as f:
@@ -266,6 +269,8 @@ def generate_rerun_tests_list(outdir,
                 if not line:
                     continue
                 test_name = line.split('/', 1)[1] if '/' in line else line
+                if test_name.startswith("test_unittests.py::"):
+                    test_name = parse_name("", test_name, "test_unittests.py")
                 unfinished_tests.append(test_name)
 
     twice_max = policy["rerun_twice_max_duration_s"]
