@@ -1855,13 +1855,14 @@ def _export_style_checkpoint(
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
 def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
     """A ModelOpt-style export goes through ``load_weights`` and one forward on the static path."""
-    reference = h3.MiniMaxH3Transformer3DModel(_make_model_config(**_NVFP4_SHAPES))
+    layers = {"num_layers": 1, "num_refiner_layers": 1}
+    reference = h3.MiniMaxH3Transformer3DModel(_make_model_config(**(_NVFP4_SHAPES | layers)))
     reference_state = {k: v.detach().cpu() for k, v in reference.state_dict().items()}
     del reference
 
     quant_config = QuantConfig(quant_algo=quant_algo, exclude_modules=list(_H3_MEDIA_PROJECTIONS))
     model = h3.MiniMaxH3Transformer3DModel(
-        _make_prequantized_nvfp4_model_config(quant_config=quant_config)
+        _make_prequantized_nvfp4_model_config(quant_config=quant_config, **layers)
     ).to("cuda")
     assert not model.model_config.dynamic_weight_quant
     checkpoint = _export_style_checkpoint(reference_state, model, quant_algo)
