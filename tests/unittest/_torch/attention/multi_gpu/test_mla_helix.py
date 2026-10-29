@@ -389,6 +389,10 @@ def _run_mla_distributed(
     # This decode fixture populates each rank's cache from a different token
     # chunk. Complete, replicated-input prefill outputs are checked separately.
     activate_all_ranks_for_context(attn_metadata, position_ids_ctx_rank)
+    # This disaggregated decode fixture already supplies rank-local token
+    # shards. Populate them directly; applying the aggregated owner plan
+    # again would shard the fixture's history twice.
+    attn_metadata.helix_context_local_slots = None
     ctx_output = input_ctx_rank.new_empty(
         [input_ctx_rank.shape[0], mla.mha.num_heads * mla.v_head_dim], dtype=input_ctx_rank.dtype
     )

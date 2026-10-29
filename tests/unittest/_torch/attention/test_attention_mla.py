@@ -420,7 +420,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
             return False
 
     class FakeMetadata:
-        pass
+        helix_context_local_slots = None
 
     class FakeAttention:
 
