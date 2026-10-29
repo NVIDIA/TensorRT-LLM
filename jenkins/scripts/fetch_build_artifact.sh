@@ -16,8 +16,9 @@
 
 # Reads one file under llm-artifacts/ from the primary Artifactory location, and from the secondary
 # location only when the primary does not have it. CI reads a build's build_info.txt, packaged
-# builds, and waive_list/ with it, and it reads any other file there the same way. Run it with
-# --help for the interface and the exit codes.
+# builds, and waive_list/ with it, and it reads any other file there the same way. With --list, it
+# prints the files in one folder there on both locations, which is how CI finds a run's test
+# results. Run it with --help for the interface and the exit codes.
 #
 # Credentials go to the aws location only, through curl's --netrc-file; urm is read anonymously.
 # The script turns off xtrace that a caller passes on, because a trace would show response URLs,
@@ -44,34 +45,46 @@ readonly FETCH_USAGE=64
 usage() {
     cat <<'EOF'
 Usage: fetch_build_artifact.sh [--properties | --exists] <artifact-path> [<dest-file>]
+       fetch_build_artifact.sh --list <directory-path>
 
 Reads a build artifact from the primary Artifactory location, and from the secondary location
 only when the primary does not have it. A rejected request, a server or connection error, or a
-checksum mismatch never falls back.
+checksum mismatch never falls back. --list lists a folder on both locations instead.
 
 Arguments:
   <artifact-path>  A legacy path (sw-tensorrt-generic/llm-artifacts/... or
                    sw-tensorrt-generic-local/llm-artifacts/...) or a layout path
                    (llm-artifacts/...).
   <dest-file>      Output file, written as <dest-file>.part and renamed when complete.
-                   Required unless --exists is given.
+                   Required unless --exists is given; not allowed with --list.
   --properties     Write the artifact's properties (storage API JSON) instead of the file.
   --exists         Write no file; print "<url> <sha1>" for the location that holds the artifact.
+  --list           Print "<location> <name>" for each file directly in the folder
+                   <directory-path>, a legacy or layout path that may end in "/": the
+                   primary's files, then the secondary's, so a name on both appears twice.
+                   The secondary is not asked when the primary rejects the request.
 
 Environment:
   LLM_ARTIFACTS_PRIMARY      aws (the default) or urm; the other location is the secondary.
   ARTIFACTORY_NETRC          netrc file holding an Artifactory access token for
-                             artifactory.nvidia.com; required whenever aws is contacted.
+                             artifactory.nvidia.com; required whenever aws is contacted, and
+                             always with --list.
   ARTIFACTORY_CREDENTIAL_ID  Name of the CI credential behind ARTIFACTORY_NETRC, for messages.
   LLM_ARTIFACTS_AWS_URL, LLM_ARTIFACTS_URM_URL
                              Replace a location's base URL, <root>/<repository>.
 
 Exit codes:
   0   Success; stderr gets "fetch_build_artifact: served-by=<aws|urm> path=<layout path>".
-  2   Neither location has the artifact (with --properties: has properties for it).
+      With --list, both locations answered and at least one has the folder; stderr ends with
+      "fetch_build_artifact: listed <n> on <primary>, <m> on <secondary> path=<layout path>",
+      as it does when --list exits 2 or 4.
+  2   Neither location has the artifact (with --properties: has properties for it; with
+      --list: has the folder).
   3   The primary rejected the request; the secondary was not contacted.
   4   The transfer failed after retries: a connection or server error, a persistent CDN
       rejection, a checksum mismatch, or a failure other than "absent" on the secondary.
+      With --list, a listing failed after retries or the secondary rejected the request; the
+      files listed on the other location are still printed.
   64  Usage error, unmappable path, bad LLM_ARTIFACTS_PRIMARY, missing ARTIFACTORY_NETRC,
       or a missing tool.
 EOF
@@ -189,6 +202,34 @@ extract_sha1() {
         | tr 'A-F' 'a-f'
 }
 
+# Prints the names of the files directly in a folder, one per line, from the storage API's answer
+# for the folder: the "uri" of each child whose "folder" is false, without its leading "/", as the
+# JSON text writes it. Fails unless the answer holds a complete "children" array. grep splits the
+# JSON into tokens, one per line, and awk walks them, so whitespace and the order of a child's
+# keys do not matter and a name keeps any character it holds. A JSON string holds no raw line
+# break, so joining the lines first changes no name.
+extract_file_names() {
+    tr -d '\r\n' <"$1" \
+        | grep -oE '"([^"\\]|\\.)*"|[][{}:,]|[^][{}:,"[:space:]]+' \
+        | awk '
+            $0 == ":" { key = prev }
+            $0 == "[" && depth == 1 && prev == ":" && key == "\"children\"" { children = 1 }
+            $0 == "{" || $0 == "[" {
+                depth++
+                if (children && depth == 3) { uri = ""; folder = "" }
+            }
+            children && depth == 3 && prev == ":" && key == "\"uri\"" { uri = $0 }
+            children && depth == 3 && prev == ":" && key == "\"folder\"" { folder = $0 }
+            $0 == "}" && children && depth == 3 && folder == "false" && uri ~ /^"\/./ {
+                print substr(uri, 3, length(uri) - 3)
+            }
+            $0 == "]" && children && depth == 2 { children = 0; complete = 1 }
+            $0 == "}" || $0 == "]" { depth-- }
+            { prev = $0 }
+            END { exit !complete }
+        '
+}
+
 # Steps make one attempt each and return 0 (done), 1 (transient failure, reason in FAILURE),
 # FETCH_ABSENT, or FETCH_REJECTED (status in REJECTED_STATUS).
 
@@ -291,6 +332,32 @@ properties_step() {
     return 1
 }
 
+# Writes the names of the files directly in the folder to WORK_DIR/files.
+list_step() {
+    local rc
+    http_get "$WORK_DIR/folder.json" "$(storage_url)"
+    rc=$?
+    if (( rc != 0 )); then
+        FAILURE="the folder listing failed (curl exit $rc)"
+        return 1
+    fi
+    case "$HTTP_STATUS" in
+        200)
+            if extract_file_names "$WORK_DIR/folder.json" >"$WORK_DIR/files"; then
+                return 0
+            fi
+            FAILURE="the folder listing answered without a complete children array"
+            ;;
+        404) return "$FETCH_ABSENT" ;;
+        401 | 403)
+            REJECTED_STATUS="$HTTP_STATUS"
+            return "$FETCH_REJECTED"
+            ;;
+        *) FAILURE="the folder listing answered HTTP $HTTP_STATUS" ;;
+    esac
+    return 1
+}
+
 # with_retries <step>: repeats a step while it fails transiently, at most MAX_ATTEMPTS times in
 # total, sleeping 2 s and then 4 s in between. Returns the step's result, or
 # FETCH_TRANSFER_FAILED when its last attempt failed transiently.
@@ -336,6 +403,24 @@ read_from() {
     with_retries download_step
 }
 
+# list_on <aws|urm>: lists the folder on one location and, once the listing is complete, prints
+# "<location> <name>" for each file directly in it. Sets LISTED to the number of files printed.
+# Returns 0, FETCH_ABSENT, FETCH_REJECTED, or FETCH_TRANSFER_FAILED (failed after retries).
+list_on() {
+    local rc name
+    use_location "$1"
+    LISTED=0
+    with_retries list_step
+    rc=$?
+    if (( rc == 0 )); then
+        while IFS= read -r name; do
+            printf '%s %s\n' "$LOC" "$name"
+            LISTED=$(( LISTED + 1 ))
+        done <"$WORK_DIR/files"
+    fi
+    return "$rc"
+}
+
 # The message names both causes for a 401 and a 403 alike, so that a missing permission is never
 # taken for an expired token.
 report_rejection() {
@@ -358,6 +443,37 @@ served() {
     exit 0
 }
 
+# Lists the folder on the primary and, unless the primary rejects the request, on the secondary.
+# Exits as usage() describes for --list.
+list_folder() {
+    local primary_rc primary_listed secondary_rc status=0
+    # Every listing asks aws unless urm, as the primary, rejects the request, so the netrc is
+    # checked before the first request.
+    require_netrc
+    list_on "$PRIMARY"
+    primary_rc=$?
+    if (( primary_rc == FETCH_REJECTED )); then
+        report_rejection
+        exit "$FETCH_REJECTED"
+    fi
+    primary_listed="$LISTED"
+    list_on "$SECONDARY"
+    secondary_rc=$?
+    if (( secondary_rc == FETCH_REJECTED )); then
+        # A rejection by the secondary is reported like any other failure there.
+        report_rejection
+        secondary_rc="$FETCH_TRANSFER_FAILED"
+    fi
+    if (( primary_rc == FETCH_TRANSFER_FAILED || secondary_rc == FETCH_TRANSFER_FAILED )); then
+        status="$FETCH_TRANSFER_FAILED"
+    elif (( primary_rc == FETCH_ABSENT && secondary_rc == FETCH_ABSENT )); then
+        status="$FETCH_ABSENT"
+        log "neither $PRIMARY nor $SECONDARY has $LAYOUT_PATH."
+    fi
+    log "listed $primary_listed on $PRIMARY, $LISTED on $SECONDARY path=$LAYOUT_PATH"
+    exit "$status"
+}
+
 cleanup() {
     rm -rf -- "$WORK_DIR"
     if [[ -n "$PART" ]]; then
@@ -373,9 +489,9 @@ while (( $# > 0 )); do
             usage
             exit 0
             ;;
-        --properties | --exists)
+        --properties | --exists | --list)
             if [[ "$MODE" != download && "$MODE" != "${1#--}" ]]; then
-                usage_error "--properties and --exists cannot be combined."
+                usage_error "--$MODE and $1 cannot be combined."
             fi
             MODE="${1#--}"
             ;;
@@ -391,18 +507,24 @@ while (( $# > 0 )); do
 done
 
 case "$MODE:${#ARGS[@]}" in
-    download:2 | properties:2 | exists:1 | exists:2) ;;
+    download:2 | properties:2 | exists:1 | exists:2 | list:1) ;;
+    list:2) usage_error "--list takes no <dest-file>." ;;
     *) usage_error "wrong number of arguments." ;;
 esac
 
-if ! LAYOUT_PATH="$(map_path "${ARGS[0]}")"; then
+if [[ "$MODE" == list ]]; then
+    # A directory path may end in one "/".
+    if ! LAYOUT_PATH="$(map_path "${ARGS[0]%/}")"; then
+        usage_error "not a directory path under llm-artifacts/: '${ARGS[0]}'"
+    fi
+elif ! LAYOUT_PATH="$(map_path "${ARGS[0]}")"; then
     usage_error "not a file path under llm-artifacts/: '${ARGS[0]}'"
 fi
 
-# --exists writes no file, so it ignores <dest-file>.
+# --exists and --list write no file, and --exists ignores <dest-file>.
 DEST=""
 PART=""
-if [[ "$MODE" != exists ]]; then
+if [[ "$MODE" == download || "$MODE" == properties ]]; then
     DEST="${ARGS[1]}"
     if [[ -z "$DEST" || "$DEST" == */ || -d "$DEST" ]]; then
         fail "$FETCH_USAGE" "<dest-file> must name a file: '$DEST'"
@@ -444,11 +566,16 @@ FAILURE=""
 REJECTED_STATUS=""
 HTTP_STATUS=""
 FINAL_HOST=""
+LISTED=0
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fetch_build_artifact.XXXXXX")" \
     || fail "$FETCH_USAGE" "cannot create a temporary directory."
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if [[ "$MODE" == list ]]; then
+    list_folder
+fi
 
 read_from "$PRIMARY"
 case $? in

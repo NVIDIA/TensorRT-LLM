@@ -750,6 +750,31 @@ def test_l0_reads_build_artifacts_and_pulls_images_with_separate_credential_sett
     assert _groovy_string("\n".join(lines), "ARTIFACTORY_CREDENTIALS_ID") != publishing
 
 
+def test_l0_deletes_checkpoints_with_each_locations_publishing_credential() -> None:
+    lines = _l0_test_code_lines()
+    code = "\n".join(lines)
+
+    # Each entry of the delete's netrc names its location's host and holds the identity that
+    # publishes to that location. A netrc "default" entry would send a token to every host.
+    entry_writer = _groovy_function_body(lines, "addArtifactoryNetrcEntry")
+    assert "credentialsId: LLM_ARTIFACTS_LOCATIONS[location].credential," in entry_writer
+    assert '"ARTIFACTORY_HOST=${llmArtifactsHost(location)}"' in entry_writer
+    assert "printf 'machine %s login %s password %s\\\\n' \"$ARTIFACTORY_HOST\"" in entry_writer
+    assert not re.search(r"\bdefault\b", entry_writer)
+    build = _groovy_code(BUILD_GROOVY)
+    for location in ("aws", "urm"):
+        assert _artifact_location_field(code, location, "credential") == _artifact_location_field(
+            build, location, "credential"
+        )
+
+    # The delete sends the credentials only through that netrc, never on a command line.
+    delete = _groovy_function_body(lines, "deleteProgressArtifact")
+    assert "addArtifactoryNetrcEntry(pipeline, netrcPath, location)" in delete
+    request = _groovy_function_body(lines, "artifactoryRequestStatus")
+    assert '--netrc-file "$ARTIFACTORY_REQUEST_NETRC"' in request
+    assert not re.search(r"(?:^|\s)(?:-u|--user)\s", request)
+
+
 # A netrc entry that a pipeline writes with printf, which keeps the secret off the command line.
 # The two arguments after the format are the login and password variables.
 _NETRC_ENTRY = re.compile(r"printf 'machine (?P<host>\S+) login %s password %s")
