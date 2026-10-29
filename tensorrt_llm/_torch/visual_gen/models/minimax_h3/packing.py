@@ -386,7 +386,10 @@ def pad_packed_sequence(layout: MiniMaxH3PackedSequence, multiple: int) -> MiniM
     return MiniMaxH3PackedSequence(
         sequence_length=layout.sequence_length + pad,
         position_ids=torch.cat(
-            (layout.position_ids, layout.position_ids.new_zeros((pad, layout.position_ids.shape[1])))
+            (
+                layout.position_ids,
+                layout.position_ids.new_zeros((pad, layout.position_ids.shape[1])),
+            )
         ),
         token_tags=torch.cat((layout.token_tags, layout.token_tags.new_full((pad,), -1))),
         video_indices=layout.video_indices,

@@ -63,9 +63,9 @@ from .packing import (
     align_num_frames,
     audio_latent_num_frames,
     build_packed_sequence,
-    pad_packed_sequence,
     build_row_timesteps,
     keyframe_condition_noise,
+    pad_packed_sequence,
     patchify_video_latents,
     prepare_keyframe_image,
     resolve_canvas_size,
@@ -210,9 +210,7 @@ class _MiniMaxH3CUDAGraphRunner(CUDAGraphRunner):
 
     @staticmethod
     def _copy_input(static, value):
-        if isinstance(value, MiniMaxH3StaticContext) and isinstance(
-            static, MiniMaxH3StaticContext
-        ):
+        if isinstance(value, MiniMaxH3StaticContext) and isinstance(static, MiniMaxH3StaticContext):
             static.text_embeds.copy_(value.text_embeds)
             static.rotary_emb[0].copy_(value.rotary_emb[0])
             static.rotary_emb[1].copy_(value.rotary_emb[1])

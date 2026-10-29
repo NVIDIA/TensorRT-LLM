@@ -640,7 +640,9 @@ def test_minimax_h3_cuda_graph_matches_eager(_full_cuda_memory_budget) -> None:
     expected = eager_video.permute(0, 1, 4, 2, 3).float().div(255.0)
     lpips_distance = _mean_lpips_distance(graph_video, expected)
     audio_distance = _multi_resolution_log_stft_distance(graph_audio, eager_audio)
-    print(f"MiniMax-H3 CUDA graph vs eager: LPIPS {lpips_distance:.4f}, audio log-STFT {audio_distance:.4f}")
+    print(
+        f"MiniMax-H3 CUDA graph vs eager: LPIPS {lpips_distance:.4f}, audio log-STFT {audio_distance:.4f}"
+    )
     assert lpips_distance < MINIMAX_H3_CUDA_GRAPH_LPIPS_THRESHOLD, (
         f"CUDA-graph clip drifted from eager: LPIPS {lpips_distance:.4f} >= {MINIMAX_H3_CUDA_GRAPH_LPIPS_THRESHOLD}"
     )

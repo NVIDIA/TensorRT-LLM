@@ -1733,9 +1733,14 @@ def test_cuda_graph_layout_key_resolves_padding_outside_capture() -> None:
 def test_cuda_graph_layout_key_is_registered_with_the_runner() -> None:
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config())
     registered: dict[str, object] = {}
-    runner = SimpleNamespace(register_extra_key_fn=lambda name, fn: registered.__setitem__(name, fn))
+    runner = SimpleNamespace(
+        register_extra_key_fn=lambda name, fn: registered.__setitem__(name, fn)
+    )
     model.register_cuda_graph_extra_key_fns(runner)
-    assert registered[h3.MiniMaxH3Transformer3DModel.CUDA_GRAPH_LAYOUT_KEY] == model._cuda_graph_layout_key
+    assert (
+        registered[h3.MiniMaxH3Transformer3DModel.CUDA_GRAPH_LAYOUT_KEY]
+        == model._cuda_graph_layout_key
+    )
 
 
 @requires_cuda
@@ -1750,7 +1755,9 @@ def test_forward_with_resolved_layout_matches_eager() -> None:
     with torch.inference_mode():
         eager = model(**inputs)
         flags = model._cuda_graph_layout_key(**inputs)
-        with resolved_extra_keys_scope({h3.MiniMaxH3Transformer3DModel.CUDA_GRAPH_LAYOUT_KEY: flags}):
+        with resolved_extra_keys_scope(
+            {h3.MiniMaxH3Transformer3DModel.CUDA_GRAPH_LAYOUT_KEY: flags}
+        ):
             resolved = model(**inputs)
     torch.testing.assert_close(resolved[0], eager[0], rtol=0, atol=0)
     torch.testing.assert_close(resolved[1], eager[1], rtol=0, atol=0)
