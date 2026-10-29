@@ -1723,8 +1723,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         fast paths (``spec_decode_fast_paths``): greedy and temperature-only
         tokens of vocabulary-sharded logits through the TP key exchange, the
         temperature-only CUDA graph variant, the overlap loop on the execution
-        stream and the hoisted position ids. A model enables them where they
-        are validated."""
+        stream, the hoisted position ids and the MTP-Eagle draft loop's step-0
+        epilogue. A model enables them where they are validated."""
         return False
 
     def __init__(self,
@@ -1856,7 +1856,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 model_config,
                 model_config.mapping.mapping_for_full_rows(),
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
-                key_exchange=key_exchange)
+                key_exchange=key_exchange,
+                spec_decode_fast_paths=self.spec_decode_fast_paths)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing

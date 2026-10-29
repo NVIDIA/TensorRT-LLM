@@ -461,9 +461,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                  mapping: Optional[Mapping] = None,
                  model_config: Optional[ModelConfig] = None,
                  use_separate_draft_kv_cache: bool = False,
-                 key_exchange=None):
+                 key_exchange=None,
+                 spec_decode_fast_paths: bool = False):
         super().__init__(use_separate_draft_kv_cache, key_exchange)
         self.spec_config = spec_config
+        # The model takes the one-engine speculative fast paths
+        # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths).
+        self.spec_decode_fast_paths = spec_decode_fast_paths
         self.mapping = mapping
         # model_config is required for MTP Eagle TP / ADP / Mamba support; the
         # Eagle3 path can leave it as None.
@@ -848,6 +852,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # step-0 -> 1 metadata update in one launch (the step-0 epilogue). It
         # reads the pre-loop sequence lengths, since it writes the live ones.
         use_epilogue = (pre_draft_seq_lens is not None and self.is_mtp_eagle
+                        and self.spec_decode_fast_paths
                         and self.guided_decoder is None
                         and hasattr(attn_metadata, "kv_lens_cuda"))
         step0 = None
@@ -1471,10 +1476,12 @@ class MTPEagleWorker(Eagle3OneModelWorker):
                  use_separate_draft_kv_cache: bool = False,
                  *,
                  mapping: Optional[Mapping] = None,
-                 key_exchange=None):
+                 key_exchange=None,
+                 spec_decode_fast_paths: bool = False):
         super().__init__(
             spec_config,
             mapping=mapping,
             model_config=model_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache,
-            key_exchange=key_exchange)
+            key_exchange=key_exchange,
+            spec_decode_fast_paths=spec_decode_fast_paths)
