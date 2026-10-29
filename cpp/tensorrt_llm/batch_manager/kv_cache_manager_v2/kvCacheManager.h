@@ -147,7 +147,14 @@ public:
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
-        bool enableRequestStats = false);
+        bool enableRequestStats = false,
+        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt);
+
+    //! Restore expired, unreferenced pages to the default retention priority.
+    void refreshRetention();
+
+    // Move reuse-matched pages without claiming or extending their request retention policy.
+    bool prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens, CacheLevel target, bool knownNoDigest);
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     // Defaults false (safe: the scanning path is taken).

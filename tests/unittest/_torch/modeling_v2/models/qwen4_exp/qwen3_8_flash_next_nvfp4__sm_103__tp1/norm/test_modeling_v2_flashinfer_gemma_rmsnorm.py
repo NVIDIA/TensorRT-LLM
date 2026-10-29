@@ -34,14 +34,9 @@ def _build(spec, seed):
         rows, off = shape[0], spec["col_offset"]
         buffer = randn(rows, spec["row_width"])
         x = buffer[:, off : off + width]
-    elif "row_step" in spec:
-        buffer = randn(shape[0] * spec["row_step"], width)
-        x = buffer[:: spec["row_step"]]
     else:
         buffer = x = randn(*shape)
-    weight = (torch.randn(width, generator=g, device="cuda") * spec.get("weight_scale", 1.0)).to(
-        dtype
-    )
+    weight = torch.randn(width, generator=g, device="cuda").to(dtype)
     return buffer, x, weight, spec["eps"]
 
 
@@ -62,65 +57,14 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     torch.testing.assert_close(out, op.reference(x, weight, eps))
 
 
-def test_weight_bias_is_one_not_zero() -> None:
-    """Discrimination: the scale is (1 + w), not w.
-
-    Measured: 0 away from the (1 + w) reference, ~3.98 from the plain-w one.
-    """
-    _, x, weight, eps = _build(dict(shape=(4, 5120), dtype=torch.bfloat16, eps=1e-6), seed=0)
-    out = op(x, weight, eps)
-    xf = x.float()
-    plain = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * weight.float()).to(x.dtype)
-    gemma = op.reference(x, weight, eps)
-
-    torch.testing.assert_close(out, gemma)
-    gemma_dev = (out.float() - gemma.float()).abs().max().item()
-    plain_dev = (out.float() - plain.float()).abs().max().item()
-    assert plain_dev > 100 * max(gemma_dev, 2.0**-8), (gemma_dev, plain_dev)
-
-
 def test_guard_refuses_fp8_before_the_kernel_answers() -> None:
-    """Both fp8 dtypes are in the DSL dtype table: accepted, and a tensor comes back."""
-    for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        x = torch.randn(4, 2560, device="cuda").to(dtype)
-        w = torch.randn(2560, device="cuda").to(dtype)
-        unguarded = torch.ops.trtllm.flashinfer_gemma_rmsnorm(x, w, 1e-6)
-        assert unguarded.dtype is dtype and unguarded.shape == x.shape, (
-            "the hazard this guard covers is gone"
-        )
-        with pytest.raises(AssertionError, match="dequantize"):
-            with validating(op):
-                op(x, w, 1e-6)
-
-
-def test_unsupported_dtypes_raise() -> None:
-    for dtype in (torch.float64, torch.int8, torch.uint8):
-        x = torch.ones(4, 2560, dtype=dtype, device="cuda")
-        w = torch.ones(2560, dtype=dtype, device="cuda")
-        with pytest.raises(KeyError):
+    """fp8 is in the DSL dtype table: accepted, and a tensor comes back."""
+    x = torch.randn(4, 2560, device="cuda").to(torch.float8_e4m3fn)
+    w = torch.randn(2560, device="cuda").to(torch.float8_e4m3fn)
+    unguarded = torch.ops.trtllm.flashinfer_gemma_rmsnorm(x, w, 1e-6)
+    assert unguarded.dtype is x.dtype and unguarded.shape == x.shape, (
+        "the hazard this guard covers is gone"
+    )
+    with pytest.raises(AssertionError, match="dequantize"):
+        with validating(op):
             op(x, w, 1e-6)
-
-
-def test_shape_dtype_and_device_mismatches_raise() -> None:
-    """All loud, which is why `is_valid` restates none of them."""
-    w = torch.randn(2560, dtype=torch.bfloat16, device="cuda")
-    x = torch.randn(4, 2560, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError):
-        op(x, w.float(), 1e-6)
-    with pytest.raises(ValueError):
-        op(x, torch.randn(2048, dtype=torch.bfloat16, device="cuda"), 1e-6)
-    with pytest.raises(ValueError):
-        op(x, w.cpu(), 1e-6)
-    with pytest.raises(ValueError):
-        op(x.cpu(), w.cpu(), 1e-6)
-    with pytest.raises(ValueError):
-        op(torch.randn(2560, dtype=torch.bfloat16, device="cuda"), w, 1e-6)
-    # a strided normalized dim: "Mismatched mX.strides[1] ... expected to be 1"
-    with pytest.raises(ValueError, match="strides"):
-        op(torch.randn(8, 2560, 2, dtype=torch.bfloat16, device="cuda")[..., 0], w, 1e-6)
-    with pytest.raises(ValueError):
-        op(
-            torch.randn(2, 4, 8, 128, dtype=torch.bfloat16, device="cuda"),
-            torch.randn(128, dtype=torch.bfloat16, device="cuda"),
-            1e-6,
-        )

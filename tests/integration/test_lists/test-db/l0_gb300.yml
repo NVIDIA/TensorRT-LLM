@@ -19,6 +19,8 @@ l0_gb300:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  # MLA context head slices, including FP8 scale-block boundaries.
+  - unittest/_torch/modules/test_linear_output_slice.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
@@ -41,8 +43,20 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
-  - unittest/_torch/thop/parallel
+  - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
+  # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
+  - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py
+  - unittest/_torch/modules/kimi_kda/test_kda_fused_prefill_conv.py
+  - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
+  - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_decode_state_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/visual_gen/kernels/parallel
 - condition:
     ranges:

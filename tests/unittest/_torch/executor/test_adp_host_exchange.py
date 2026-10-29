@@ -207,13 +207,34 @@ def test_lockstep_fake_fails_fast_when_a_rank_skips_a_collective():
 
 
 def test_can_queue_gathers_only_the_batch_size():
+    """Votes on the batch size alone, over TP x CP; one empty rank vetoes the forward."""
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = True
-    executor.dist = SimpleNamespace(tp_allgather_int64=Mock(return_value=np.array([[2], [0]])))
+    executor.dist = SimpleNamespace(
+        cp_size=1, tp_rank=0, tp_cp_allgather_int64=Mock(return_value=np.array([[2], [0]]))
+    )
 
     can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
 
-    executor.dist.tp_allgather_int64.assert_called_once_with([2])
+    executor.dist.tp_cp_allgather_int64.assert_called_once_with([2])
+    assert can_queue is False and this_rank is True
+
+
+@pytest.mark.parametrize("batch_size", [1, 0], ids=["padded_cp_rank", "empty_cp_rank"])
+def test_can_queue_this_rank_is_shared_by_the_cp_peers_of_a_dp_rank(batch_size):
+    """Under helix one CP rank can pad a dummy its peer could not allocate. The
+    vote fails for both, and both defer the previous batch together."""
+    executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = True
+    # tp1 x cp2: rows are this DP rank's two CP ranks.
+    executor.dist = SimpleNamespace(
+        cp_size=2, tp_rank=0, tp_cp_allgather_int64=Mock(return_value=np.array([[1], [0]]))
+    )
+
+    can_queue, this_rank = PyExecutor._can_queue(
+        executor, types.SimpleNamespace(batch_size=batch_size)
+    )
+
     assert can_queue is False and this_rank is True
 
 
@@ -234,7 +255,7 @@ class _ObjectPathDist(Distributed):
     def tp_barrier(self):
         pass
 
-    def broadcast(self, obj, root=0):
+    def broadcast(self, obj, root=0, **kwargs):
         return obj
 
     def allgather(self, obj, root=0):

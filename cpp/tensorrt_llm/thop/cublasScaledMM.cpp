@@ -77,9 +77,8 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
         && compType == CUBLAS_COMPUTE_32F)
     {
         // TODO: remove this after cublas fix the heuristic for Spark
-        algo_list = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 121
-            ? &cublas_lut::spark_bf16_algo_list
-            : &cublas_lut::bf16_algo_list;
+        algo_list = tensorrt_llm::common::getSMVersion() == 121 ? &cublas_lut::spark_bf16_algo_list
+                                                                : &cublas_lut::bf16_algo_list;
     }
     else if (aType == CUDA_R_8F_E4M3 && compType == CUBLAS_COMPUTE_32F)
     {
@@ -209,9 +208,8 @@ bool useBF16Tactics(torch::Tensor const& out, torch::Tensor const& a, torch::Ten
 {
     auto const aligned = [](torch::Tensor const& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 256 == 0; };
     return a.scalar_type() == at::kBFloat16 && b.scalar_type() == at::kBFloat16 && out.scalar_type() == at::kBFloat16
-        && !use_scale && a.size(0) <= 16 && tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 121
-        && a.stride(0) == a.size(1) && b.stride(1) == b.size(0) && out.stride(0) == out.size(1) && aligned(a)
-        && aligned(b) && aligned(out);
+        && !use_scale && a.size(0) <= 16 && tensorrt_llm::common::getSMVersion() == 121 && a.stride(0) == a.size(1)
+        && b.stride(1) == b.size(0) && out.stride(0) == out.size(1) && aligned(a) && aligned(b) && aligned(out);
 }
 
 // Tactic 0 is today's choice, the rest are cuBLASLt's distinct heuristic answers that fit the workspace.

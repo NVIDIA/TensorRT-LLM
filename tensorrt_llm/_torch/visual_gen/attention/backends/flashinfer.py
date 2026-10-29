@@ -405,11 +405,7 @@ class FlashInferAttention(AttentionBackend):
                 qk_mode=qk_dtype,
                 is_causal=is_causal,
             )
-        if (
-            capability in ((12, 0), (12, 1))
-            and qk_dtype == "nvfp4"
-            and quant_config.v_dtype == "nvfp4"
-        ):
+        if capability[0] == 12 and qk_dtype == "nvfp4" and quant_config.v_dtype == "nvfp4":
             return self._run_nvfp4_sm12x(q, k, v, is_causal=is_causal)
         raise RuntimeError(
             "Unsupported FlashInfer quantized attention recipe for "

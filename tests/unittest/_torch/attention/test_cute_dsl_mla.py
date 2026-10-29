@@ -123,7 +123,14 @@ class _TrtllmGenStub:
 
 
 def _select_mla_generation_fmha(
-    monkeypatch, *, sm: int, num_heads: int, seq_len_q: int, fp8_kv: bool, helix: bool
+    monkeypatch,
+    *,
+    sm: int,
+    num_heads: int,
+    seq_len_q: int,
+    fp8_kv: bool,
+    helix: bool,
+    batch_size: int,
 ):
     """Run FmhaManager._select_mla over [CuteDslMlaFmha, TRTLLM-Gen stub] on CPU."""
     from tensorrt_llm._torch.attention.backends.fmha import cute_dsl_mla
@@ -145,7 +152,6 @@ def _select_mla_generation_fmha(
         CuteDslMlaFmha, "_kernel_can_implement", staticmethod(lambda *args, **kwargs: (True, ""))
     )
 
-    batch_size = 4
     num_tokens = batch_size * seq_len_q
     attn = SimpleNamespace(
         num_heads=num_heads,
@@ -210,6 +216,10 @@ def _select_mla_generation_fmha(
 def test_mla_generation_routes_wide_head_fp8_verify_away_from_trtllm_gen(
     monkeypatch, sm, num_heads, seq_len_q, fp8_kv, helix, expected
 ) -> None:
+    # The perf gate admits single-token H=96 FP8 decode only from batch_size 8.
+    # The multi-token routes must not depend on the batch size, so they stay
+    # below that floor.
+    batch_size = 8 if seq_len_q == 1 else 4
     assert (
         _select_mla_generation_fmha(
             monkeypatch,
@@ -218,6 +228,26 @@ def test_mla_generation_routes_wide_head_fp8_verify_away_from_trtllm_gen(
             seq_len_q=seq_len_q,
             fp8_kv=fp8_kv,
             helix=helix,
+            batch_size=batch_size,
         )
         == expected
+    )
+
+
+def test_mla_generation_single_token_wide_head_fp8_below_perf_floor_falls_through(
+    monkeypatch,
+) -> None:
+    """Below its measured batch floor, single-token H=96 FP8 decode is not a
+    CuTe DSL perf win, so selection falls through to the next MLA library."""
+    assert (
+        _select_mla_generation_fmha(
+            monkeypatch,
+            sm=103,
+            num_heads=96,
+            seq_len_q=1,
+            fp8_kv=True,
+            helix=False,
+            batch_size=4,
+        )
+        == "trtllm_gen"
     )

@@ -16,14 +16,17 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
+  # Covers the GPU cases of tests/unittest/_torch/attention/ on H100; its cpu_only cases
+  # run on CPU (l0_cpu). kernels/ has no entry of its own on any list, so this entry is
+  # what runs it here. multi_gpu/ cases need >= 2 GPUs and most also need Blackwell, so
+  # they skip here and run on Blackwell multi-GPU stages: l0_gb300_multi_gpus (post_merge)
+  # and l0_dgx_b300, which runs test_helix_zero_kv.py in its pre_merge block and the rest
+  # in post_merge. Collecting them still runs their helix files' import-time rebinding of
+  # mpi4py's serializer, which applies to the whole pytest process.
+  # The GPU cases of kernels/parallel_hw_agnostic/ run here; l0_b200 and l0_b300 ignore
+  # that directory, so on Blackwell only GB300 (l0_gb300_multi_gpus, post_merge) runs them.
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
@@ -41,6 +44,7 @@ l0_h100:
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   - unittest/_torch/modules/test_w4a16_nvfp4_linear.py
+  - unittest/_torch/modules/test_lm_head_output_dtype.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
@@ -76,14 +80,14 @@ l0_h100:
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/speculative/test_capture_buffer_cuda.py
   - unittest/_torch/speculative/test_capture_sampling_params.py
-  - unittest/_torch/thop/parallel
+  - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
-  - unittest/_torch/thop/serial
+  - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
   # Only key models in H100: llama/gemma/gpt-oss
   - unittest/_torch/modeling -k "modeling_llama"
@@ -100,6 +104,7 @@ l0_h100:
   # Breakable prefill CUDA graphs (BCG) on the hybrid Mamba path; mpi_ray_parity (Ray id runs in the ray stage below).
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph[tp1] TIMEOUT (90)
   - unittest/_torch/modeling/test_multimodal_encoder_graph.py
+  - unittest/_torch/modeling/test_modeling_qwen3vl.py::test_qwen3_vision_cuda_graph_replay_matches_eager
   # Register the full EXAONE suite on Hopper to include the SM90-only
   # chunked-prefill and KV-cache-reuse scenarios.
   - unittest/_torch/modeling/test_modeling_exaone4_5.py
@@ -124,8 +129,6 @@ l0_h100:
   - unittest/disaggregated/test_minimax_m3_kv_transfer.py
   # Split the large cache transceiver parametrization into readable chunks.
   # Main transfer matrix.
-  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v1 and no_window"
-  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v1 and uniform_window"
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and no_window"
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and uniform_window"
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and vswa"
@@ -134,24 +137,16 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "uniform_window"
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "v2 and vswa"
   # Boundary request lengths.
-  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v1"
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v2"
-  # DSA indexer-K side cache (V1, REPLICATED).
-  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_dsa_indexer
-  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp
   # Python transceiver with the C++ NIXL agent's bounce v2 enabled.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
   # Helix CP
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_helix_cp
-  # V1 host offload: the send path must address primary slots, not block IDs.
-  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_sends_primary_slots_under_host_offload
-  # Real scheduler/resource lifecycle: pending pins, capacity recovery and host-prefix replay.
-  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_host_offload_scheduler_lifecycle
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_kv_cache_manager_v2_accepts_attention_dp_with_helix_cp
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_kv_cache_manager_v2_rejects_attention_dp_with_helix_cp_under_pp
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py
-  - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
-  - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_kv_cache_events.py::test_kv_cache_event_data_serialization
   - unittest/llmapi/test_llm_kv_cache_events.py::test_mm_keys_in_stored_events
@@ -162,6 +157,7 @@ l0_h100:
   - unittest/llmapi/test_llm_kv_cache_events.py::test_kv_cache_event_async_api
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_kv_events_api
   - unittest/llmapi/test_return_routed_experts.py
+  - unittest/llmapi/test_lm_head_dtype.py
   - unittest/scaffolding
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
