@@ -622,6 +622,11 @@ def _estimate_mamba_hybrid_cache_cost(
     state_bytes_per_rank = local_mamba_layers * params.get_states_bytes_per_layer(mapping)
     state_bytes_per_rank += extra_state_bytes_per_rank
     max_resident_sequences = max_batch_size * mapping.pp_size
+    if not mapping.has_pp():
+        # Paused GEN requests (MambaHybridCacheManagerV2._max_resident_sequences).
+        from ...scheduler.gen_preemption import resident_headroom
+
+        max_resident_sequences += resident_headroom()
 
     if include_explicit_snapshots:
         fixed_rules, unaligned_fixed_rules = _mamba_snapshot_rule_counts(

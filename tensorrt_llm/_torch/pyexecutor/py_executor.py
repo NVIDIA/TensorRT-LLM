@@ -129,8 +129,11 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         create_waiting_queue)
 from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
                                    count_retiring_requests)
-from .scheduler.gen_admission_queue import (GenAdmissionConfig,
+from .scheduler.gen_admission_queue import (STATS_LOG_PERIOD_S,
+                                            GenAdmissionConfig,
                                             GenAdmissionWaitingQueue)
+from .scheduler.gen_preemption import (GenPreemption, GenPreemptionConfig,
+                                       log_gen_preemption_config)
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -1210,6 +1213,9 @@ class PyExecutor:
         if self.dist.rank == 0 and isinstance(self.waiting_queue,
                                               GenAdmissionWaitingQueue):
             self._first_token_timer = self.waiting_queue.enable_rank0()
+        # GEN slot preemption (TLLM_GEN_PREEMPT_POLICY).
+        self._gen_preemption = self._create_gen_preemption()
+        self._gen_preemption_last_log = 0.0
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -7199,6 +7205,98 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
+    def _gen_preemption_disabled_reason(
+            self, config: GenPreemptionConfig) -> Optional[str]:
+        """Why GEN slot preemption cannot run here, or None."""
+        if config.disabled_reason is not None:
+            return config.disabled_reason
+        if not isinstance(self.scheduler, KVCacheV2Scheduler):
+            return "needs the KV cache manager V2 scheduler"
+        if not self._gen_admission.needs_clock:
+            return ("needs the auto GEN admission policy "
+                    "(0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99)")
+        if self.enable_attention_dp or self.dist.has_pp:
+            return "not supported with attention DP or pipeline parallelism"
+        # Every pool with one entry per resident request must hold the paused
+        # requests too (gen_preemption.resident_headroom).
+        resident = self.max_num_active_requests + config.max_paused
+        seq_slots = self.resource_manager.resource_managers.get(
+            ResourceManagerType.SEQ_SLOT_MANAGER)
+        pools = [("sequence slot pool", seq_slots.get_max_resource_count()
+                  if seq_slots is not None else None)]
+        for manager in (self.kv_cache_manager, self.draft_kv_cache_manager):
+            if manager is None:
+                continue
+            name = type(manager).__name__
+            pools.append((f"{name} index pool",
+                          getattr(manager, "max_admissible_sequences", None)))
+            if hasattr(manager, "_max_resident_sequences"):
+                pools.append((f"{name} recurrent state pool",
+                              manager._max_resident_sequences()))
+        for name, size in pools:
+            if isinstance(size, int) and size < resident:
+                return (f"the {name} holds {size} requests, fewer than "
+                        f"max_num_active_requests + "
+                        f"TLLM_GEN_PREEMPT_MAX_PAUSED = {resident}")
+        return None
+
+    def _create_gen_preemption(self) -> Optional[GenPreemption]:
+        config = GenPreemptionConfig.from_env()
+        if config.policy == "off":
+            return None
+        reason = self._gen_preemption_disabled_reason(config)
+        if self.dist.rank == 0:
+            log_gen_preemption_config(config, reason)
+        if reason is not None:
+            return None
+        return GenPreemption(config)
+
+    def _run_gen_preemption(self, waiting_queue: WaitingQueue,
+                            active_requests: List[LlmRequest],
+                            num_active_requests: int) -> int:
+        """Resume lane, then pausing; returns the admission count.
+
+        Paused requests stay resident in ``active_requests`` but hold no
+        admission slot and are not scheduled. Free slots go to them, oldest
+        pause first, before any new admission; one paused for
+        TLLM_GEN_PREEMPT_MAX_PAUSE_S resumes regardless. With no slot left and
+        the next waiting request at risk of missing the TTFT target, the
+        policy's victims are paused to free slots for it. Every input is
+        identical on all ranks, so every rank decides the same.
+        """
+        preemption = self._gen_preemption
+        preemption.observe(active_requests, self.request_broadcaster.rank0_now)
+        num_active_requests -= preemption.num_paused
+        free_slots = self._get_request_admission_capacity(
+        ) - num_active_requests
+
+        for req in preemption.resume_candidates(free_slots):
+            preemption.on_resumed(req)
+            num_active_requests += 1
+            free_slots -= 1
+
+        if (free_slots <= 0 and waiting_queue
+                and isinstance(waiting_queue, GenAdmissionWaitingQueue)):
+            num_at_risk = waiting_queue.num_at_risk(preemption.config.slack_s)
+            for req in preemption.select_victims(active_requests, num_at_risk):
+                preemption.on_paused(req)
+                num_active_requests -= 1
+
+        self.scheduler.set_gen_paused_ids(preemption.paused_ids)
+        self._log_gen_preemption()
+        return num_active_requests
+
+    def _log_gen_preemption(self) -> None:
+        """Rank-0 GEN preemption stat line every STATS_LOG_PERIOD_S."""
+        if self.dist.rank != 0:
+            return
+        now = time.monotonic()
+        if now - self._gen_preemption_last_log < STATS_LOG_PERIOD_S:
+            return
+        self._gen_preemption_last_log = now
+        if self._gen_preemption.has_activity:
+            logger.info(self._gen_preemption.stats_line())
+
     def _get_request_admission_capacity(self) -> int:
         """Return the maximum number of distinct requests admitted at once."""
         if self.enable_attention_dp:
@@ -7457,6 +7555,12 @@ class PyExecutor:
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
+
+        # 2b. GEN slot preemption: resume lane, then pause running requests
+        # for at-risk waiting requests (non-attention-DP only).
+        if getattr(self, "_gen_preemption", None) is not None:
+            total_num_active_requests = self._run_gen_preemption(
+                waiting_queue, active_requests, total_num_active_requests)
 
         # 3. Pop requests from waiting queue
         new_requests, placement = self._pop_from_waiting_queue(
@@ -7991,6 +8095,8 @@ class PyExecutor:
         scheduled_requests.scheduled_mm_encoder_items = (
             scheduler_output.scheduled_mm_encoder_items)
         scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
+        if getattr(self, "_gen_preemption", None) is not None:
+            scheduled_requests.paused_in_place_ids = self._gen_preemption.paused_ids
 
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)
