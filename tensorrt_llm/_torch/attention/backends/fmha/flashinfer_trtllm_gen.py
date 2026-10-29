@@ -420,6 +420,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True
 
+    @staticmethod
+    def prewarm() -> None:
+        """Build flashinfer's TRTLLM-Gen FMHA module now instead of on first use.
+
+        On first use flashinfer downloads the module's kernel metadata and
+        compiles its launcher with nvcc; later calls only load the built module.
+        """
+        flashinfer.decode.get_trtllm_gen_fmha_module()
+        flashinfer.prefill.get_trtllm_gen_fmha_module()
+
     @classmethod
     def serves_only_extra_page_sizes(cls) -> bool:
         """Whether this device uses the library only for a KV cache manager's extra page sizes."""
