@@ -65,12 +65,13 @@ routed expert projection as `weight_packed`, `weight_scale`,
 FP4 bytes and E4M3 block scales as stored and converts the global scales at
 load time: the stored `2688 / amax` multipliers become the reciprocal
 `weight_scale_2` and `input_scale` divisors of the NVFP4 MoE weight contract.
-A global scale that is zero, negative or not finite, or an expert whose `w1`
-and `w3` weight global scales differ, fails the load with an error naming the
-checkpoint tensors. The routed experts then run the standard static NVFP4 MoE
-recipe (static input scale, BF16 rounding after FC1, routing weights applied
-in the finalize) on any NVFP4-capable MoE backend; `moe_config.backend:
-CUTLASS` and `TRTLLM` are both qualified on this packaging.
+A global scale that cannot be inverted (zero, as stored for an expert without
+calibration data, or negative or not finite) is set to 0 with a warning; a
+weight global scale of 0 zeroes that expert's output. The routed experts then
+run the standard static NVFP4 MoE recipe (static input scale, BF16 rounding
+after FC1, routing weights applied in the finalize) on any NVFP4-capable MoE
+backend; `moe_config.backend: CUTLASS` and `TRTLLM` are both qualified on this
+packaging.
 
 Use the checkpoint's chat template (`chat_template.jinja`) when launching the
 server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).

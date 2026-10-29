@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
+from typing import Any, Callable, Optional, Tuple
 from unittest.mock import Mock, create_autospec
 
 import pytest
@@ -62,6 +63,9 @@ from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mut
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MiniMaxM3HfWeightMapper,
+)
+from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import (
+    convert_compressed_tensors_nvfp4_weights,
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
@@ -1347,7 +1351,7 @@ def test_get_moe_layer_ids_length_mismatch_raises():
 # ---------------------------------------------------------------------------
 
 
-def _make_packaged_text_config():
+def _make_packaged_text_config() -> SimpleNamespace:
     """The trimmed text config as the compressed-tensors package declares it.
 
     Every attention layer is sparse and K-only while layers 0-2 keep a dense
@@ -1363,7 +1367,9 @@ def _make_packaged_text_config():
     return cfg
 
 
-def _packaged_vl_config(text_config_as_dict: bool = False, **quant_overrides):
+def _packaged_vl_config(
+    text_config_as_dict: bool = False, **quant_overrides: Any
+) -> SimpleNamespace:
     quantization_config = {
         "quant_method": "mxfp8",
         "activation_scheme": "dynamic",
@@ -1391,7 +1397,9 @@ def _packaged_vl_config(text_config_as_dict: bool = False, **quant_overrides):
     return cfg
 
 
-def _expand_packaged_quant_config(pretrained_config):
+def _expand_packaged_quant_config(
+    pretrained_config: SimpleNamespace,
+) -> Tuple[QuantConfig, Optional[dict[str, QuantConfig]]]:
     """Parse the inline config as from_pretrained does, then apply the M3 hook."""
     quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
         pretrained_config.quantization_config, "CUTLASS"
@@ -3228,7 +3236,9 @@ def _cosine(out: torch.Tensor, ref: torch.Tensor) -> float:
     )
 
 
-def _graph_replay(fn, *inputs: torch.Tensor):
+def _graph_replay(
+    fn: Callable[..., torch.Tensor], *inputs: torch.Tensor
+) -> Callable[..., torch.Tensor]:
     """Capture ``fn(*inputs)`` in a CUDA graph; return a replay(new_inputs) helper."""
     static_inputs = [t.clone() for t in inputs]
     stream = torch.cuda.Stream()
@@ -3439,8 +3449,8 @@ def test_packaged_nvfp4_experts_load_and_run_on_cutlass(use_cuda_graph: bool, tu
         allow_backend_degradation=False,
     )
     backend = moe.backend
-    assert type(backend).__name__ == "CutlassFusedMoE"
-    translated = MiniMaxM3HfWeightMapper().preprocess_weights(dict(checkpoint))
+    assert type(backend).__name__ == "TrtllmCutlassNvfp4Impl"
+    translated = convert_compressed_tensors_nvfp4_weights(dict(checkpoint))
     module_weights = {
         key[len(prefix) + 1 :]: value
         for key, value in translated.items()
@@ -3561,11 +3571,11 @@ def test_packaged_nvfp4_experts_load_and_run_on_cutlass(use_cuda_graph: bool, tu
 
 
 @pytest.mark.cpu_only
-def test_minimax_m3_fold_gemma_boundary_weights_accepts_partial_lazy_load():
+def test_minimax_m3_fold_gemma_boundary_weights_accepts_partial_lazy_load() -> None:
     stored = torch.tensor([0.25, -0.25], dtype=torch.bfloat16)
 
     class LazyWeight:
-        def __getitem__(self, index):
+        def __getitem__(self, index: slice) -> torch.Tensor:
             assert index == slice(None)
             return stored
 
@@ -3582,10 +3592,12 @@ def test_minimax_m3_fold_gemma_boundary_weights_accepts_partial_lazy_load():
     assert result["model.layers.2.self_attn.q_norm.weight"] is untouched
 
 
-def _stub_minimax_m3_attention_construction(monkeypatch, *, is_neox=True):
+def _stub_minimax_m3_attention_construction(
+    monkeypatch: pytest.MonkeyPatch, *, is_neox: bool = True
+) -> Mock:
     """Keep the M3 constructor real while removing generic GPU setup and projection allocation."""
 
-    def initialize_attention(self, **kwargs):
+    def initialize_attention(self: nn.Module, **kwargs: Any) -> None:
         nn.Module.__init__(self)
         config = kwargs["config"]
         self.pos_embd_params = SimpleNamespace(rope=kwargs["pos_embd_params"].rope, is_neox=is_neox)
@@ -3594,7 +3606,7 @@ def _stub_minimax_m3_attention_construction(monkeypatch, *, is_neox=True):
         self.qkv_proj = nn.Module()
         self.qkv_proj.mapping = config.mapping
 
-    def make_linear(*args, **kwargs):
+    def make_linear(*args: Any, **kwargs: Any) -> nn.Module:
         projection = nn.Module()
         projection.quant_config = kwargs["quant_config"]
         return projection
@@ -3610,7 +3622,9 @@ def _stub_minimax_m3_attention_construction(monkeypatch, *, is_neox=True):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("entries", ["matching", "absent", "mismatched", "missing_k"])
-def test_minimax_m3_index_projection_quantization_follows_checkpoint_entries(monkeypatch, entries):
+def test_minimax_m3_index_projection_quantization_follows_checkpoint_entries(
+    monkeypatch: pytest.MonkeyPatch, entries: str
+) -> None:
     """index_qk_proj is quantized exactly when the checkpoint declares matching per-layer entries."""
     _, model_config = _make_fused_qk_norm_rope_test_config()
     # Other-layer entries must not affect the projection being constructed.

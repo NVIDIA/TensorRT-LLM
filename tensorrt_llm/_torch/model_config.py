@@ -1024,8 +1024,9 @@ class ModelConfig(Generic[TConfig]):
                            group_size=NVFP4_SF_VEC_SIZE)
 
     @staticmethod
-    def _build_minimax_m3_mxfp8_moe_quant_config(pretrained_config,
-                                                 quant_config):
+    def _build_minimax_m3_mxfp8_moe_quant_config(
+        pretrained_config: Any, quant_config: QuantConfig
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
         """Expand MXFP8 base + NVFP4 routed experts into MIXED_PRECISION.
 
         Used for the compressed-tensors NVFP4 MoE packaging, which has no
@@ -1125,8 +1126,10 @@ class ModelConfig(Generic[TConfig]):
         return mixed_quant_config, layer_quant_config
 
     @staticmethod
-    def _set_minimax_m3_layer_quant_config(pretrained_config, quant_config,
-                                           layer_quant_config):
+    def _set_minimax_m3_layer_quant_config(
+        pretrained_config: Any, quant_config: QuantConfig,
+        layer_quant_config: Optional[Dict[str, QuantConfig]]
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
         """Normalize the Minimax M3 MIXED_PRECISION quant configs.
 
         Returns ``(quant_config, layer_quant_config)``. A checkpoint without a

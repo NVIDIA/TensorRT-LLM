@@ -849,7 +849,9 @@ _M3_LAYER_BYTES_PER_TOKEN = {
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("main_dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize("index_dtype", ["bf16", "fp8"])
-def test_m3_budget_estimate_covers_actual_paged_buffers(main_dtype, index_dtype):
+def test_m3_budget_estimate_covers_actual_paged_buffers(
+    main_dtype: DataType, index_dtype: str
+) -> None:
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     manager.dtype = main_dtype
     manager.kv_cache_type = CacheType.SELF
@@ -883,6 +885,7 @@ def test_m3_budget_estimate_covers_actual_paged_buffers(main_dtype, index_dtype)
     manager.reuse_match_backoff = 0
     manager.enable_stats = False
     manager._has_cp_helix = False
+    manager.layer_specs = None
 
     config = manager._build_base_config(
         KvCacheConfig(

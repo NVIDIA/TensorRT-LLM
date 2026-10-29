@@ -78,11 +78,7 @@ from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cu
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
-from .checkpoints.hf.minimaxm3_weight_mapper import (
-    MINIMAX_M3_PARAMS_MAP,
-    MiniMaxM3HfWeightMapper,
-    translate_packed_nvfp4_experts,
-)
+from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .checkpoints.hf.weight_mapper import convert_compressed_tensors_nvfp4_weights
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
@@ -3218,8 +3214,6 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
         # set of unknown top-level keys it surfaces as errors.
         from .modeling_minimaxm3_vl import load_minimax_m3_vl_state_dict, split_multimodal_weights
 
-        # Rewrite before the prefix strip so errors name the checkpoint tensor.
-        weights = translate_packed_nvfp4_experts(weights)
         text_or_other_weights, vision_weights = split_multimodal_weights(weights)
 
         text_weights, ignored = _strip_language_model_prefix(text_or_other_weights)
@@ -3231,12 +3225,6 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             )
             self.last_loaded_vision_keys = loaded
             self.last_missing_vision_keys = missing
-        logger.info(
-            f"MiniMax-M3 VL weights: {len(self.last_loaded_vision_keys)} vision tensors "
-            f"loaded, {len(self.last_missing_vision_keys)} vision parameters missing, "
-            f"{len(ignored)} checkpoint tensors skipped "
-            f"({sorted(set(ignored.values()))})."
-        )
 
         super().load_weights(
             weights=text_weights,
