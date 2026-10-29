@@ -46,16 +46,17 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
                                  local_mpi_comm, local_mpi_rank, local_mpi_size,
                                  mpi_comm, mpi_disabled)
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
-_AUTO_IO_POLICY = "auto"
-_NATIVE_IO_POLICY = "native"
-_RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
-_SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
-_SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
+_SUPPORTED_IO_POLICIES = (CheckpointIOPolicy.NATIVE,
+                          CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD)
+_SUPPORTED_REQUESTED_IO_POLICIES = (
+    CheckpointIOPolicy.AUTO, ) + _SUPPORTED_IO_POLICIES
 # Model families whose checkpoints are too large to materialize in host RAM;
 # their models stream rank-local slices out of the lazy mmapped handles.
 _LAZY_SAFETENSORS_MODEL_TYPES = ("kimi_k3", "kimi_linear", "glm5_next",
@@ -95,17 +96,25 @@ class _LazySafetensorsWeights(ConsumableWeightsDict):
 
 @dataclass
 class _CheckpointIOStatus:
-    requested: str
-    selected: str
+    requested: CheckpointIOPolicy
+    selected: CheckpointIOPolicy
     activated: bool = False
     effective: str = "none"
     fallback_reason: str | None = None
+    # Time `open_weight_session` took to hand out the weights: policy checks
+    # across ranks, file mapping and starting the background readers, or the
+    # native fallback load.
+    preparation_seconds: float = 0.0
+    # Time `open_weight_session` took to close: waiting for every rank and
+    # stopping the background readers. Always 0 without an active
+    # read-ahead session.
+    finalization_seconds: float = 0.0
 
 
-@register_checkpoint_weight_loader("MX")
-@register_checkpoint_weight_loader("mistral")
-@register_checkpoint_weight_loader("mistral_large_3")
-@register_checkpoint_weight_loader("HF")
+@register_checkpoint_weight_loader(CheckpointFormat.MX)
+@register_checkpoint_weight_loader(CheckpointFormat.MISTRAL)
+@register_checkpoint_weight_loader(CheckpointFormat.MISTRAL_LARGE_3)
+@register_checkpoint_weight_loader(CheckpointFormat.HF)
 class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
@@ -113,19 +122,21 @@ class HfWeightLoader(BaseWeightLoader):
 
     # Compatibility defaults for subclasses written before this class gained
     # checkpoint I/O state. Their constructors may not call super().__init__().
-    _checkpoint_io_policy = _NATIVE_IO_POLICY
-    _requested_checkpoint_io_policy = _NATIVE_IO_POLICY
+    _checkpoint_io_policy = CheckpointIOPolicy.NATIVE
+    _requested_checkpoint_io_policy = CheckpointIOPolicy.NATIVE
     _selection_fallback_reason: str | None = None
     _partial_model_loading = False
     _last_checkpoint_io_status = _CheckpointIOStatus(
-        requested=_NATIVE_IO_POLICY,
-        selected=_NATIVE_IO_POLICY,
+        requested=CheckpointIOPolicy.NATIVE,
+        selected=CheckpointIOPolicy.NATIVE,
     )
 
     def __init__(self,
-                 checkpoint_io_policy: str = _NATIVE_IO_POLICY,
+                 checkpoint_io_policy: CheckpointIOPolicy
+                 | str = CheckpointIOPolicy.NATIVE,
                  *,
-                 requested_checkpoint_io_policy: str | None = None,
+                 requested_checkpoint_io_policy: CheckpointIOPolicy | str
+                 | None = None,
                  selection_fallback_reason: str | None = None,
                  partial_model_loading: bool = False) -> None:
         self._partial_model_loading = partial_model_loading
@@ -137,22 +148,25 @@ class HfWeightLoader(BaseWeightLoader):
 
     def _configure_checkpoint_io_policy(
         self,
-        checkpoint_io_policy: str,
+        checkpoint_io_policy: CheckpointIOPolicy | str,
         *,
-        requested_checkpoint_io_policy: str | None = None,
+        requested_checkpoint_io_policy: CheckpointIOPolicy | str | None = None,
         selection_fallback_reason: str | None = None,
     ) -> None:
         """Apply a pre-materialization policy selection."""
+        checkpoint_io_policy = CheckpointIOPolicy(checkpoint_io_policy)
         if checkpoint_io_policy not in _SUPPORTED_IO_POLICIES:
+            supported = tuple(policy.value for policy in _SUPPORTED_IO_POLICIES)
             raise ValueError("checkpoint_io_policy must be one of "
-                             f"{_SUPPORTED_IO_POLICIES}, got "
-                             f"{checkpoint_io_policy!r}")
-        requested_checkpoint_io_policy = (requested_checkpoint_io_policy
-                                          or checkpoint_io_policy)
+                             f"{supported}, got {checkpoint_io_policy.value!r}")
+        requested_checkpoint_io_policy = CheckpointIOPolicy(
+            requested_checkpoint_io_policy or checkpoint_io_policy)
         if requested_checkpoint_io_policy not in _SUPPORTED_REQUESTED_IO_POLICIES:
+            supported = tuple(policy.value
+                              for policy in _SUPPORTED_REQUESTED_IO_POLICIES)
             raise ValueError("requested_checkpoint_io_policy must be one of "
-                             f"{_SUPPORTED_REQUESTED_IO_POLICIES}, got "
-                             f"{requested_checkpoint_io_policy!r}")
+                             f"{supported}, got "
+                             f"{requested_checkpoint_io_policy.value!r}")
         self._checkpoint_io_policy = checkpoint_io_policy
         self._requested_checkpoint_io_policy = requested_checkpoint_io_policy
         self._selection_fallback_reason = selection_fallback_reason
@@ -162,7 +176,7 @@ class HfWeightLoader(BaseWeightLoader):
             fallback_reason=selection_fallback_reason)
 
     @property
-    def checkpoint_io_policy(self) -> str:
+    def checkpoint_io_policy(self) -> CheckpointIOPolicy:
         return self._checkpoint_io_policy
 
     @property
@@ -436,9 +450,9 @@ class HfWeightLoader(BaseWeightLoader):
                      **kwargs) -> dict[str, Any]:
         """Load synchronously without activating session-scoped read-ahead."""
         self._reset_checkpoint_io_status()
-        if self._checkpoint_io_policy != _NATIVE_IO_POLICY:
+        if self._checkpoint_io_policy != CheckpointIOPolicy.NATIVE:
             status = self._last_checkpoint_io_status
-            status.selected = _NATIVE_IO_POLICY
+            status.selected = CheckpointIOPolicy.NATIVE
             status.fallback_reason = (
                 "rank-striped read-ahead requires open_weight_session() to "
                 "overlap I/O with model materialization")
@@ -449,7 +463,7 @@ class HfWeightLoader(BaseWeightLoader):
             logger.info(message)
         weights = self._load_weights_native(checkpoint_dir, mapping,
                                             use_consolidated, **kwargs)
-        self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+        self._last_checkpoint_io_status.effective = CheckpointIOPolicy.NATIVE
         self._log_checkpoint_io_status()
         return weights
 
@@ -459,70 +473,75 @@ class HfWeightLoader(BaseWeightLoader):
                             mapping: Mapping,
                             use_consolidated: bool = False,
                             **kwargs) -> Iterator[dict[str, Any]]:
-        """Keep opt-in read-ahead alive through model materialization."""
+        """Keep opt-in read-ahead alive through model materialization.
+
+        Copy the yielded weights into the model inside the ``with`` block.
+        Every rank must enter and leave the block, because starting and
+        finishing read-ahead are collective. Afterwards,
+        `last_checkpoint_io_status` reports the policy that took effect and
+        how long the session took to start and to finish.
+        """
+        preparation_started = time.perf_counter()
         self._reset_checkpoint_io_status()
-        if self._checkpoint_io_policy == _NATIVE_IO_POLICY:
+        status = self._last_checkpoint_io_status
+
+        # prepare the weights: native load, native fallback or read-ahead
+        session: RankStripedReadAheadSession | None = None
+        if self._checkpoint_io_policy == CheckpointIOPolicy.NATIVE:
             weights = self._load_weights_native(checkpoint_dir, mapping,
                                                 use_consolidated, **kwargs)
-            self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+            status.effective = CheckpointIOPolicy.NATIVE
             self._log_checkpoint_io_status()
-            yield weights
-            return
-
-        active_communicator = self._active_communicator()
-        mapping_error = None
-        communicator_size = (None if active_communicator is None else
-                             active_communicator.Get_size())
-        if (communicator_size is not None
-                and mapping.world_size != communicator_size):
-            mapping_error = RuntimeError(
-                "Rank-striped read-ahead requires mapping.world_size to "
-                "match the active MPI communicator size "
-                f"({communicator_size}); received {mapping.world_size}.")
-        coordinated_mapping_error = coordinate_error(
-            active_communicator,
-            "rank-striped mapping validation",
-            mapping_error,
-        )
-        if coordinated_mapping_error is not None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
-            weights = self._fallback_to_native(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                str(coordinated_mapping_error),
-                active_communicator=active_communicator,
-                allow_native_prefetch=False,
-                **kwargs,
+        else:
+            active_communicator = self._active_communicator()
+            mapping_error = None
+            communicator_size = (None if active_communicator is None else
+                                 active_communicator.Get_size())
+            if (communicator_size is not None
+                    and mapping.world_size != communicator_size):
+                mapping_error = RuntimeError(
+                    "Rank-striped read-ahead requires mapping.world_size to "
+                    "match the active MPI communicator size "
+                    f"({communicator_size}); received {mapping.world_size}.")
+            coordinated_mapping_error = coordinate_error(
+                active_communicator,
+                "rank-striped mapping validation",
+                mapping_error,
             )
-            yield weights
-            return
-        if mapping.world_size > 1 and active_communicator is None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
-            weights = self._fallback_to_native(
-                checkpoint_dir,
-                mapping,
-                use_consolidated,
-                "distributed rank-striped read-ahead requires an active MPI communicator",
-                # Ray workers intentionally disable MPI. Preserve the native
-                # path's per-process read-ahead in that supported mode.
-                allow_native_prefetch=mpi_disabled(),
-                **kwargs,
-            )
-            yield weights
-            return
+            if coordinated_mapping_error is not None:
+                status.selected = CheckpointIOPolicy.NATIVE
+                weights = self._fallback_to_native(
+                    checkpoint_dir,
+                    mapping,
+                    use_consolidated,
+                    str(coordinated_mapping_error),
+                    active_communicator=active_communicator,
+                    allow_native_prefetch=False,
+                    **kwargs,
+                )
+            elif mapping.world_size > 1 and active_communicator is None:
+                status.selected = CheckpointIOPolicy.NATIVE
+                weights = self._fallback_to_native(
+                    checkpoint_dir,
+                    mapping,
+                    use_consolidated,
+                    "distributed rank-striped read-ahead requires an active MPI communicator",
+                    # Ray workers intentionally disable MPI. Preserve the native
+                    # path's per-process read-ahead in that supported mode.
+                    allow_native_prefetch=mpi_disabled(),
+                    **kwargs,
+                )
+            else:
+                weights, session = self._start_rank_striped_read_ahead(
+                    checkpoint_dir,
+                    mapping,
+                    use_consolidated,
+                    active_communicator,
+                    **kwargs,
+                )
+        status.preparation_seconds = time.perf_counter() - preparation_started
 
-        weights, session = self._start_rank_striped_read_ahead(
-            checkpoint_dir,
-            mapping,
-            use_consolidated,
-            active_communicator,
-            **kwargs,
-        )
-        if session is None:
-            yield weights
-            return
-
+        # hand the weights to the caller's with-block, then finish read-ahead
         body_error = None
         try:
             yield weights
@@ -530,39 +549,56 @@ class HfWeightLoader(BaseWeightLoader):
             body_error = error
             raise
         finally:
-            try:
-                read_error = session.finish(body_error)
-            except Exception as error:
-                status = self._last_checkpoint_io_status
-                status.effective = "none"
-                if body_error is None:
-                    status.fallback_reason = str(error)
-                    self._log_checkpoint_io_status()
-                    raise
-                status.fallback_reason = (
-                    "model materialization failed: "
-                    f"{type(body_error).__name__}: {body_error}")
+            if session is not None:
+                finalization_started = time.perf_counter()
+                try:
+                    self._finish_read_ahead_session(session, body_error)
+                finally:
+                    status.finalization_seconds = (time.perf_counter() -
+                                                   finalization_started)
+
+    def _finish_read_ahead_session(self, session: RankStripedReadAheadSession,
+                                   body_error: BaseException | None) -> None:
+        """Finish read-ahead after the caller's with-block and record the outcome.
+
+        Called by `open_weight_session` when its with-block ends.
+
+        Raises:
+            - Exception: finishing failed and the with-block itself did not
+              fail. When the with-block failed, its error is kept instead.
+        """
+        status = self._last_checkpoint_io_status
+        try:
+            read_error = session.finish(body_error)
+        except Exception as error:
+            status.effective = "none"
+            if body_error is None:
+                status.fallback_reason = str(error)
                 self._log_checkpoint_io_status()
-                # Preserve the specific local error (for example, CUDA OOM) instead
-                # of finish()'s rank-coordinated wrapper.
-                logger.error(
-                    "Rank-striped model materialization failed; preserving "
-                    "the original exception. Coordinated session result: "
-                    f"{type(error).__name__}: {error}")
-            else:
-                status = self._last_checkpoint_io_status
-                if read_error is None:
-                    status.effective = _RANK_STRIPED_IO_POLICY
-                else:
-                    # Read-ahead is advisory. The native mmap/materialization
-                    # path succeeded, so never retry a partially mutated model.
-                    status.effective = _NATIVE_IO_POLICY
-                    status.fallback_reason = str(read_error)
-                    logger.warning(
-                        "Rank-striped read-ahead degraded after activation; "
-                        "keeping the successfully materialized model: "
-                        f"{read_error}")
-                self._log_checkpoint_io_status()
+                raise
+            status.fallback_reason = (
+                "model materialization failed: "
+                f"{type(body_error).__name__}: {body_error}")
+            self._log_checkpoint_io_status()
+            # Preserve the specific local error (for example, CUDA OOM) instead
+            # of finish()'s rank-coordinated wrapper.
+            logger.error(
+                "Rank-striped model materialization failed; preserving "
+                "the original exception. Coordinated session result: "
+                f"{type(error).__name__}: {error}")
+            return
+
+        if read_error is None:
+            status.effective = CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD
+        else:
+            # Read-ahead is advisory. The native mmap/materialization
+            # path succeeded, so never retry a partially mutated model.
+            status.effective = CheckpointIOPolicy.NATIVE
+            status.fallback_reason = str(read_error)
+            logger.warning("Rank-striped read-ahead degraded after activation; "
+                           "keeping the successfully materialized model: "
+                           f"{read_error}")
+        self._log_checkpoint_io_status()
 
     @staticmethod
     def _active_communicator():
@@ -637,7 +673,7 @@ class HfWeightLoader(BaseWeightLoader):
         message = ("Checkpoint I/O policy is falling back before model "
                    f"materialization: requested={status.requested}, "
                    f"selected={status.selected}, reason={reason}.")
-        if status.requested == _RANK_STRIPED_IO_POLICY:
+        if status.requested == CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD:
             logger.warning(message)
         else:
             logger.info(message)
@@ -713,7 +749,7 @@ class HfWeightLoader(BaseWeightLoader):
             self._log_checkpoint_io_status()
             raise coordinated_close_error
         assert weights is not None
-        status.effective = _NATIVE_IO_POLICY
+        status.effective = CheckpointIOPolicy.NATIVE
         self._log_checkpoint_io_status()
         return weights
 
@@ -742,7 +778,7 @@ class HfWeightLoader(BaseWeightLoader):
             self._close_unactivated_session(
                 None, node_communicator, active_communicator,
                 "rank-striped node communicator cleanup")
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_split_error),
@@ -776,7 +812,7 @@ class HfWeightLoader(BaseWeightLoader):
         coordinated_preflight_error = coordinate_error(
             active_communicator, "rank-striped preflight", preflight_error)
         if coordinated_preflight_error is not None:
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_preflight_error),
@@ -810,7 +846,7 @@ class HfWeightLoader(BaseWeightLoader):
             self._close_unactivated_session(
                 None, node_communicator, active_communicator,
                 "rank-striped node preflight cleanup")
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             str(coordinated_node_error),
@@ -845,14 +881,14 @@ class HfWeightLoader(BaseWeightLoader):
                             if selection[1] is not None]
         if fallback_reasons:
             rank, reason = fallback_reasons[0]
-            self._last_checkpoint_io_status.selected = _NATIVE_IO_POLICY
+            self._last_checkpoint_io_status.selected = CheckpointIOPolicy.NATIVE
             return self._fallback_to_native(checkpoint_dir, mapping,
                                             use_consolidated,
                                             f"rank {rank}: {reason}",
                                             active_communicator,
                                             node_communicator, **kwargs), None
 
-        self._last_checkpoint_io_status.selected = _RANK_STRIPED_IO_POLICY
+        self._last_checkpoint_io_status.selected = CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD
         session = None
         setup_error = None
         try:

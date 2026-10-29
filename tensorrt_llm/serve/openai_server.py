@@ -39,6 +39,7 @@ from transformers import AutoProcessor
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -970,7 +971,8 @@ class OpenAIServer(_VideoRoutesMixin):
         trust_remote_code = self.generator.args.trust_remote_code
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
-        if checkpoint_format in ("mistral", "mistral_large_3"):
+        if checkpoint_format in (CheckpointFormat.MISTRAL,
+                                 CheckpointFormat.MISTRAL_LARGE_3):
             # Do not load HF processor for mistral native checkpoints
             # even if it is available
             self.processor = None
