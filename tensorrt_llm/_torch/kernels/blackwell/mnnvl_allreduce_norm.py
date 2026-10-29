@@ -533,6 +533,16 @@ def _st_dsmem_f32(addr: Int32, cta_rank: Int32, value: Float32, *, loc=None, ip=
 
 
 @dsl_user_op
+def _cluster_arrive_relaxed(*, loc=None, ip=None) -> None:
+    _asm(None, [], "barrier.cluster.arrive.relaxed.aligned;", "~{memory}", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _cluster_wait(*, loc=None, ip=None) -> None:
+    _asm(None, [], "barrier.cluster.wait.acquire.aligned;", "~{memory}", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _cluster_sync(*, loc=None, ip=None) -> None:
     _asm(
         None,
@@ -710,6 +720,10 @@ class MnnvlAllReduceNormKernel:
         fl = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
         red_addr = _smem_addr(red.iterator)
         csum_addr = _smem_addr(csum.iterator)
+        if const_expr(ctas > 1):
+            # Every CTA of the cluster must have started before another CTA writes its shared memory (the
+            # cluster sum below waits on this arrival).
+            _cluster_arrive_relaxed()
 
         # ---- before the dependency wait: only host-written addresses and the norm weight ----
         tbl = gWs.iterator.toint()
@@ -924,6 +938,7 @@ class MnnvlAllReduceNormKernel:
         total = bsum
         if const_expr(ctas > 1):
             # Every CTA of the cluster gets every CTA's sum at its own index, then sums in CTA order.
+            _cluster_wait()
             if tidx < ctas:
                 _st_dsmem_f32(csum_addr + Int32(4) * part, Int32(tidx), bsum)
             _cluster_sync()
