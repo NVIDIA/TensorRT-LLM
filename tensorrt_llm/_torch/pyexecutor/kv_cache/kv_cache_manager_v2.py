@@ -6764,25 +6764,37 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
+        """Pool-0 block IDs per request as a zero-padded CPU int32 tensor.
+
+        Rows are copied from each request's page-index buffer and transformed
+        in one vectorized pass. ``BAD_PAGE_INDEX`` entries read as 0.
+        """
         if self.layer_specs is not None:
-            block_ids_per_seq = self.get_batch_cache_indices(request_ids, raw_indices=True)
-            div_factor = 1
+            index_scale, page_stride, layer_div = 1, 1, 1
         else:
-            block_ids_per_seq = self.get_batch_cache_indices(request_ids)
-            div_factor = self.num_local_layers
-            if self.kv_factor > 1 and self._index_scale_ints[0] % self.kv_factor != 0:
-                div_factor = 1
-        block_ids_per_seq_tensors = [
-            torch.tensor(
-                [i // div_factor if i != BAD_PAGE_INDEX else 0 for i in sublist],
-                dtype=torch.int,
-            )
-            for sublist in block_ids_per_seq
-        ]
-        padded_tensor = torch.nn.utils.rnn.pad_sequence(
-            block_ids_per_seq_tensors, batch_first=True, padding_value=0
+            index_scale = self._index_scale_ints[0]
+            page_stride = self._get_cache_view_page_stride(index_scale, self.kv_factor)
+            layer_div = self.num_local_layers
+            if self.kv_factor > 1 and index_scale % self.kv_factor != 0:
+                layer_div = 1
+        kv_caches = [self.kv_cache_map[req_id] for req_id in request_ids]
+        num_blocks = [kv_cache.num_blocks for kv_cache in kv_caches]
+        block_ids_tensor = torch.zeros(
+            (len(kv_caches), max(num_blocks, default=0)), dtype=torch.int32
         )
-        return padded_tensor
+        block_ids = block_ids_tensor.numpy()
+        for row, (kv_cache, n) in enumerate(zip(kv_caches, num_blocks)):
+            block_ids[row, :n] = np.frombuffer(
+                kv_cache.get_base_page_indices(0), dtype=np.int32, count=n
+            )
+        valid = block_ids != BAD_PAGE_INDEX
+        np.copyto(
+            block_ids,
+            block_ids.astype(np.int64) * index_scale // page_stride // layer_div,
+            where=valid,
+        )
+        block_ids[~valid] = 0
+        return block_ids_tensor
 
     def add_dummy_requests(
         self,

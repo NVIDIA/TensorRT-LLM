@@ -765,6 +765,53 @@ def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layo
         manager.shutdown()
 
 
+@pytest.mark.parametrize("kv_cache_type", [CacheType.SELF, CacheType.SELFKONLY])
+def test_block_ids_per_seq_matches_batch_cache_indices(kv_cache_type: CacheType) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    num_layers = 2
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        kv_cache_type,
+        num_layers=num_layers,
+        num_kv_heads=2,
+        head_dim=8,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=3,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+    )
+    try:
+        request_ids = [3, 5, 9]
+        for request_id, num_blocks in zip(request_ids, (1, 4, 3)):
+            cache = manager._create_kv_cache(request_id, None, None)
+            assert cache.resume(manager._stream.cuda_stream)
+            assert cache.resize(num_blocks * TOKENS_PER_BLOCK, 0)
+
+        layer_div = num_layers
+        if manager.kv_factor > 1 and manager._index_scale_ints[0] % manager.kv_factor != 0:
+            layer_div = 1
+        rows = manager.get_batch_cache_indices(request_ids)
+        expected = torch.zeros((len(rows), max(len(row) for row in rows)), dtype=torch.int32)
+        for row_id, row in enumerate(rows):
+            expected[row_id, : len(row)] = torch.tensor(
+                [i // layer_div if i != BAD_PAGE_INDEX else 0 for i in row], dtype=torch.int32
+            )
+
+        block_ids = manager.get_block_ids_per_seq(request_ids)
+        assert block_ids.dtype == torch.int32
+        assert torch.equal(block_ids, expected)
+    finally:
+        manager.shutdown()
+
+
 def test_nvfp4_scale_indices_with_mixed_bf16_storage() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
