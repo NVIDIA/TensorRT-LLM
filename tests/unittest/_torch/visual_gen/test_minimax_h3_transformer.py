@@ -1733,7 +1733,9 @@ def test_fa4_2cta_request_reaches_transformer_block_backends(
     )
 
     monkeypatch.setattr(h3, "fa4_use_2cta_default", lambda attn_backend: True)
-    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(attention_backend="FA4"))
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(attention_backend="FA4", num_layers=1, num_refiner_layers=1)
+    )
 
     assert model.fa4_use_2cta is True
     expected = True if fa4_2cta_requestable() else None
@@ -1749,5 +1751,7 @@ def test_fa4_2cta_request_reaches_transformer_block_backends(
 def test_fa4_2cta_request_is_not_sent_to_other_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     """A VANILLA backend never sees FA4's keyword, even when the default would request it."""
     monkeypatch.setattr(h3, "fa4_use_2cta_default", lambda attn_backend: True)
-    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(attention_backend="VANILLA"))
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(attention_backend="VANILLA", num_layers=1, num_refiner_layers=1)
+    )
     assert not hasattr(model.transformer_blocks[0].attn.attn, "use_2cta")
