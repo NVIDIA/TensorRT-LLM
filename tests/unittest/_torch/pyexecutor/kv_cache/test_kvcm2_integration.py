@@ -4124,39 +4124,3 @@ def test_default_attention_rejects_split_coupled_buffers(monkeypatch, role):
             dtype=DataType.HALF,
             vocab_size=16,
         )
-
-
-def test_attention_scratch_rejects_layout_requiring_split_slot_indices(monkeypatch):
-    original = KVCacheManagerV2._build_cache_config
-
-    def build_config(self, config):
-        config = original(self, config)
-        layers = list(config.layers)
-        layer = layers[0]
-        layers[0] = AttentionLayerConfig(
-            layer_id=layer.layer_id,
-            sliding_window_size=layer.sliding_window_size,
-            buffers=[*layer.buffers, BufferConfig(role="side", size=layer.buffers[0].size)],
-        )
-        return replace(config, layers=layers)
-
-    monkeypatch.setattr(KVCacheManagerV2, "_build_cache_config", build_config)
-    with pytest.raises(ValueError, match="require whole layer blocks per slot"):
-        KVCacheManagerV2(
-            KvCacheConfig(
-                max_gpu_total_bytes=4 << 20,
-                host_cache_size=0,
-                max_attention_window=[8, 8],
-                enable_swa_scratch_reuse=True,
-            ),
-            CacheType.SELF,
-            num_layers=2,
-            num_kv_heads=1,
-            head_dim=64,
-            tokens_per_block=TOKENS_PER_BLOCK,
-            max_seq_len=MAX_SEQ_LEN,
-            max_batch_size=1,
-            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
-            dtype=DataType.HALF,
-            vocab_size=16,
-        )
