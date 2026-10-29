@@ -159,6 +159,7 @@ def build_mla_decode_task_manager(
     acc_output=None,
     lse=None,
     acc_lse=None,
+    softmax_stats=None,
     # Domain (k_tile_count)
     domain=4,
     # Persistent loop support
@@ -441,6 +442,7 @@ def build_mla_decode_task_manager(
 
     tmem_s = TmemSResource(
         page_offsets=page_offsets,
+        store_softmax_stats=softmax_stats is not None,
         smem_q_latent=smem_q_latent_arr,
         smem_q_rope=smem_q_rope_arr,
         smem_p=smem_p_arr,
@@ -491,6 +493,7 @@ def build_mla_decode_task_manager(
         partial_output=acc_output,
         lse=lse,
         partial_lse=acc_lse,
+        softmax_stats=softmax_stats,
         tmem_o_ref=tmem_o,
         tmem_corr_ref=tmem_corr,
         atten_sinks=atten_sinks,
@@ -1112,6 +1115,7 @@ class MlaDecodeTs:
         output_scale: cutlass.Float32,
         stream: object,
         output_quant_args=None,
+        softmax_stats: cute.Tensor | None = None,
     ):
         """Execute the MLA decode TS kernel."""
         if cutlass.const_expr(self.fuse_sparse_reduction):
@@ -1400,6 +1404,7 @@ class MlaDecodeTs:
             )
 
         softmax_scale_log2 = softmax_scale * LOG2_E
+        softmax_stats_scale = softmax_scale if softmax_stats is not None else None
 
         kernel_split_kv = (
             Int32(self.static_split_kv)
@@ -1473,6 +1478,8 @@ class MlaDecodeTs:
             clc_tile_sched_params,
             output_quant_args,
             tma_desc_o,
+            softmax_stats,
+            softmax_stats_scale,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1498,6 +1505,8 @@ class MlaDecodeTs:
                     cu_seqlens_q,
                     block_split_kvs,
                     output_quant_args,
+                    softmax_stats,
+                    softmax_stats_scale,
                 ).launch(
                     grid=(
                         (
@@ -1528,6 +1537,8 @@ class MlaDecodeTs:
                     cache_seqs,
                     cu_seqlens_q,
                     block_split_kvs,
+                    softmax_stats,
+                    softmax_stats_scale,
                 ).launch(
                     grid=(
                         ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1571,6 +1582,8 @@ class MlaDecodeTs:
         clc_tile_sched_params: object,
         output_quant_args=None,
         tma_desc_o: cutlass.GridConstant[cuda.TensorMap] = None,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         if cutlass.const_expr(self.direct_sparse):
@@ -2005,6 +2018,7 @@ class MlaDecodeTs:
                 acc_output=acc_o,
                 lse=lse,
                 acc_lse=acc_lse,
+                softmax_stats=softmax_stats,
                 domain=Int32(1),  # dummy; MlaTask recomputes per-task to avoid spills
                 work_queue=mla_work_queue,
                 cache_seqs=cache_seqs,
@@ -2077,6 +2091,7 @@ class MlaDecodeTs:
             # Set runtime params on GmemO (epilogue)
             named_res["gmem_o"].output_scale = output_scale
             named_res["gmem_o"].softmax_scale_log2 = softmax_scale_log2
+            named_res["gmem_o"].softmax_stats_scale = softmax_stats_scale
             named_res["gmem_o"].smem_exchange = epilogue_exchange_arr.data_ptr().toint(
                 Int32
             )
@@ -2157,6 +2172,8 @@ class MlaDecodeTs:
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: cute.Tensor,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
     ):
         """Dispatch the throughput 2CTA split-KV reduction body."""
         cfg = make_mla_decode_config(
@@ -2183,6 +2200,8 @@ class MlaDecodeTs:
             cfg,
             self.reduction_split_capacity,
             REDUCTION_ROWS_PER_CTA,
+            softmax_stats,
+            softmax_stats_scale,
         )
 
     @cute.kernel
@@ -2197,6 +2216,8 @@ class MlaDecodeTs:
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
         output_quant_args=None,
+        softmax_stats: cute.Tensor | None = None,
+        softmax_stats_scale=None,
     ):
         """Dispatch the high-split fixed-D512 cluster reducer."""
 
@@ -2236,4 +2257,6 @@ class MlaDecodeTs:
             self.fuse_sparse_reduction,
             self.output_quant,
             output_quant_args,
+            softmax_stats,
+            softmax_stats_scale,
         )

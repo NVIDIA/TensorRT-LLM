@@ -21,3 +21,5 @@ l0_gb300_multi_nodes_node4_gpu16:
   - accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[baseline] TIMEOUT (90)
   - accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[sa] TIMEOUT (90)
   - test_e2e.py::test_multi_nodes_eval[MiniMax-M3-tp16-mmlu]
+  - accuracy/test_kimi3.py::TestKimiK3::test_prims_ts[bf16-kv] TIMEOUT (90)
+  - accuracy/test_kimi3.py::TestKimiK3::test_prims_ts[fp8-kv] TIMEOUT (90)

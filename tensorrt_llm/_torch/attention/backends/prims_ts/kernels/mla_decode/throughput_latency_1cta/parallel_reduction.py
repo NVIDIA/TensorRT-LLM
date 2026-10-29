@@ -32,6 +32,7 @@ from ..helpers.ops import (
     warp_reduce_sum_f32,
 )
 from ..helpers.query import flat_query_row_state, public_query_flat_row
+from ..helpers.softmax_stats import store_reduced_softmax_stats
 from ..parallel_reduction_topology import ParallelReductionTopology
 from .config import MlaConfig
 
@@ -205,6 +206,8 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
 ):
     """Reduce G1 partials with the compact row-shared schedule."""
 
@@ -304,6 +307,14 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                 )
                 (lse.iterator.raw_ptr() + stats_output_query_row).store(
                     global_lse * Float32(LN_2) if finalize_attention else global_lse
+                )
+                store_reduced_softmax_stats(
+                    softmax_stats,
+                    stats_output_query_row,
+                    acc_lse,
+                    row_lse,
+                    cfg.num_ctas_per_seq_kv,
+                    softmax_stats_scale,
                 )
 
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
@@ -427,6 +438,8 @@ def _run_parallel_gmem_reduction_shared_stats(
     slots_per_rank: cutlass.Constexpr[int],
     actual_splits: cutlass.Constexpr[int],
     elements_per_slice: cutlass.Constexpr[int],
+    softmax_stats=None,
+    softmax_stats_scale=None,
 ):
     """Reduce split-KV with one cooperative statistics warp per output row.
 
@@ -763,6 +776,14 @@ def _run_parallel_gmem_reduction_shared_stats(
                 (lse.iterator.raw_ptr() + output_query_row).store(
                     smem_global_lse[row_in_slice]
                 )
+                store_reduced_softmax_stats(
+                    softmax_stats,
+                    output_query_row,
+                    acc_lse,
+                    acc_lse[head_idx, None, q_idx, batch_idx],
+                    cfg.num_ctas_per_seq_kv,
+                    softmax_stats_scale,
+                )
             out_elem_offset = _output_element_offset(cfg, output_query_row, dim_idx)
             if cutlass.const_expr(output_elements_per_thread == 1):
                 (output.iterator.raw_ptr() + out_elem_offset).store(
@@ -806,6 +827,8 @@ def run_parallel_gmem_reduction_kernel(
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
 ):
     """Reduce split-KV partials with row-shared local and peer statistics."""
 
@@ -827,6 +850,8 @@ def run_parallel_gmem_reduction_kernel(
             finalize_attention,
             output_quant,
             output_quant_args,
+            softmax_stats,
+            softmax_stats_scale,
         )
         return
 
@@ -842,4 +867,6 @@ def run_parallel_gmem_reduction_kernel(
         slots_per_rank,
         actual_splits,
         elements_per_slice,
+        softmax_stats,
+        softmax_stats_scale,
     )
