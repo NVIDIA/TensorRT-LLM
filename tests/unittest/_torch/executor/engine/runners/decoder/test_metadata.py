@@ -98,7 +98,9 @@ def test_set_spec_metadata_all_rank_counts_for_one_model() -> None:
 
 @pytest.mark.parametrize("dspark", [False, True])
 @pytest.mark.parametrize("gather_context_logits", [False, True])
-def test_forward_selects_current_speculative_rows(dspark, gather_context_logits) -> None:
+def test_forward_selects_current_speculative_rows(
+    dspark: bool, gather_context_logits: bool
+) -> None:
     logits = torch.arange(24).reshape(6, 4)
     metadata = object.__new__(DSparkSpecMetadata) if dspark else SimpleNamespace()
     runner = object.__new__(DecoderRunner)
@@ -106,7 +108,12 @@ def test_forward_selects_current_speculative_rows(dspark, gather_context_logits)
     runner._inputs = SimpleNamespace(preprocess_inputs=lambda inputs, **kwargs: inputs)
     runner.sample_in_graph_callable = None
 
-    def forward(*, return_context_logits, spec_metadata=None, **kwargs):
+    def forward(
+        *,
+        return_context_logits: bool,
+        spec_metadata: SimpleNamespace | DSparkSpecMetadata | None = None,
+        **kwargs: object,
+    ) -> dict[str, torch.Tensor]:
         assert return_context_logits is (spec_metadata is not None or gather_context_logits)
         if dspark and spec_metadata is not None:
             assert spec_metadata._requires_all_context_logits is gather_context_logits
