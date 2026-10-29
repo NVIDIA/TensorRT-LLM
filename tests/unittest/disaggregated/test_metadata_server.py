@@ -131,7 +131,16 @@ async def test_router_lists_only_signed_records():
 @pytest.mark.parametrize(
     "signature",
     [None, 7, "", "x", "sha256=", "sha256=zz", "\ud800", "sha256=\ud800"],
-    ids=["none", "int", "empty", "no_prefix", "prefix_only", "non_hex", "surrogate", "prefix_surrogate"],
+    ids=[
+        "none",
+        "int",
+        "empty",
+        "no_prefix",
+        "prefix_only",
+        "non_hex",
+        "surrogate",
+        "prefix_surrogate",
+    ],
 )
 def test_malformed_signature_is_ignored(signature):
     raw = InMemoryDictionary()

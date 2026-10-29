@@ -82,8 +82,8 @@ def _is_well_formed_signature(value: Any) -> bool:
     if not isinstance(value, str) or not value.startswith(_SIGNATURE_PREFIX):
         return False
     digest = value[len(_SIGNATURE_PREFIX):]
-    return len(digest) == _SIGNATURE_HEX_LENGTH and all(
-        c in "0123456789abcdef" for c in digest)
+    return len(digest) == _SIGNATURE_HEX_LENGTH and all(c in "0123456789abcdef"
+                                                        for c in digest)
 
 
 def _sign_record(record_auth_key: str, key: str, value: dict) -> str:
