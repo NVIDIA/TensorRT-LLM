@@ -868,17 +868,21 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # LLM in a reused worker pool would get the previous port. The bcast
         # is unconditional and also carries rank 0's failure, so every rank
         # raises together instead of waiting for a store that never came up.
+        comm = mpi_comm()
         store = None
         payload = None
         if rank == 0:
+            loopback = False
             try:
                 try:
                     addr = socket.gethostbyname(socket.gethostname())
                 except OSError:
                     # Unresolvable hostname (minimal containers / broken
-                    # DNS): this bootstrap is documented single-node, so
-                    # loopback works.
+                    # DNS). Loopback reaches rank 0 only from its own host;
+                    # that is checked below on every rank, after the bcast,
+                    # so no rank skips a collective its peers wait in.
                     addr = "127.0.0.1"
+                    loopback = True
                 store = dist.TCPStore(
                     addr,
                     0,
@@ -887,15 +891,28 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     timeout=default_pg_timeout,
                     wait_for_workers=False,
                 )
-                payload = (addr, store.port, None)
+                payload = (addr, store.port, loopback, None)
             except RuntimeError as e:
-                payload = (None, None, repr(e))
-        host, port, error = mpi_comm().bcast(payload, root=0)
+                payload = (None, None, False, repr(e))
+        host, port, loopback, error = comm.bcast(payload, root=0)
         if error is not None:
             raise RuntimeError(
                 f"[MegaMoECuteDsl] rank 0 could not host the torch.distributed "
                 f"rendezvous store: {error}"
             )
+        if loopback:
+            # Every rank received the same flag, so all of them enter this
+            # allgather. A rank on another host would dial its own loopback
+            # and time out alone; instead all ranks raise together here.
+            hostnames = comm.allgather(socket.gethostname())
+            if any(h != hostnames[0] for h in hostnames):
+                raise RuntimeError(
+                    f"[MegaMoECuteDsl] rank 0 could not resolve its hostname "
+                    f"{hostnames[0]!r}, so it can only serve the "
+                    f"torch.distributed rendezvous on loopback, but the MPI "
+                    f"ranks span several hosts ({sorted(set(hostnames))}). "
+                    f"Fix hostname resolution on rank 0's host."
+                )
         if store is None:
             store = dist.TCPStore(host, port, world, is_master=False, timeout=default_pg_timeout)
         # The executor already bound this rank's device before the model was
