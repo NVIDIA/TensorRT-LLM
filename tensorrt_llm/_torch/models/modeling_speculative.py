@@ -59,13 +59,21 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
 
 
 def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
-                                   target_config: ModelConfig) -> None:
+                                   target_config: ModelConfig,
+                                   *,
+                                   is_mtp: bool = False) -> None:
     """Inherit the target KV dtype unless the model requests a draft override."""
     algo = target_config.quant_config.kv_cache_quant_algo
     override = target_config.extra_attrs.get(
         "draft_kv_cache_quant_algo_override")
+    if override is None and not is_mtp:
+        # Mixed-precision KV on a sparse model: a drafter with its own architecture
+        # keeps a plain cache; MTP heads keep the target's dtype and go mixed.
+        override = target_config.extra_attrs.get(
+            "mixed_precision_draft_kv_cache_quant_algo")
     if override is not None:
-        algo = QuantAlgo(override)
+        # NO_QUANT: the draft cache stays in the model dtype.
+        algo = None if override == QuantAlgo.NO_QUANT else QuantAlgo(override)
     draft_config.quant_config.kv_cache_quant_algo = algo
     if override is not None and draft_config.quant_config_dict is not None:
         for layer_quant_config in draft_config.quant_config_dict.values():
@@ -117,7 +125,7 @@ def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
                            quant_config_dict=layer_configs,
                            skip_create_weights_in_init=True)
     draft_config.extra_attrs = model_config.extra_attrs
-    _set_draft_kv_cache_quant_algo(draft_config, model_config)
+    _set_draft_kv_cache_quant_algo(draft_config, model_config, is_mtp=True)
     for config in (draft_config.quant_config_dict or {}).values():
         config.kv_cache_quant_algo = draft_config.quant_config.kv_cache_quant_algo
     return draft_config

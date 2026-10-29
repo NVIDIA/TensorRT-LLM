@@ -747,23 +747,28 @@ def test_mixed_precision_llm_args_allow_speculative_decoding(speculative_config)
     assert args.speculative_config is not None
 
 
-@pytest.mark.parametrize("high,expected", [("fp8", "fp8"), ("bfloat16", "auto")])
+@pytest.mark.parametrize("is_mtp", [True, False])
 @pytest.mark.cpu_only
-def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
-    """The separate draft manager stores its layers in the retained dtype only."""
+def test_one_model_draft_kv_cache_dtype(is_mtp):
+    """A separate MTP draft manager goes mixed like the target; another drafter keeps a plain cache."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 
     target = KvCacheConfig(
-        dtype=f"mixed_nvfp4_{high}",
+        dtype="mixed_nvfp4_fp8",
         mixed_precision_first_n=16,
         mixed_precision_last_n=64,
         pool_ratio=[0.9, 0.1],
     )
-    draft = KvCacheCreator._get_one_model_draft_kv_cache_config(
-        SimpleNamespace(), target, 1024, estimating_kv_cache=True
+    creator = SimpleNamespace(
+        _speculative_config=SimpleNamespace(
+            spec_dec_mode=SimpleNamespace(is_mtp_one_model=lambda: is_mtp)
+        )
     )
-    assert draft.dtype == expected
-    assert draft.mixed_precision_kv is None
+    draft = KvCacheCreator._get_one_model_draft_kv_cache_config(
+        creator, target, 1024, estimating_kv_cache=True
+    )
+    assert draft.dtype == ("mixed_nvfp4_fp8" if is_mtp else "auto")
+    assert (draft.mixed_precision_kv is not None) == is_mtp
     assert draft.max_attention_window is None
     assert target.mixed_precision_kv is not None
 
@@ -771,7 +776,7 @@ def test_one_model_draft_kv_cache_keeps_plain_dtype(high, expected):
 @pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
 @pytest.mark.cpu_only
 def test_draft_forward_hides_retained_rows(backend):
-    """A draft forward runs on a manager without twin layers, so the retained-row hooks stay off."""
+    """A draft forward on a manager without twin layers turns the retained-row hooks off."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
         DeepseekV4TrtllmAttentionMetadata,
     )
@@ -785,6 +790,7 @@ def test_draft_forward_hides_retained_rows(backend):
     meta = Mock()
     meta.kv_cache_manager = Mock(name="draft_kv_cache_manager")
     meta.draft_sliding_block_tables = None
+    meta.draft_retained_block_table = None
     meta.draft_replay_swapped_attrs = {}
     for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
         setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
@@ -796,6 +802,45 @@ def test_draft_forward_hides_retained_rows(backend):
     meta.restore_draft_swaps()
     assert meta.retained_block_table is table
     assert cls.has_mixed_precision_retained_rows.fget(meta) is True
+
+
+@pytest.mark.cpu_only
+def test_dsa_draft_forward_uses_draft_twin_table():
+    """MTP layers on a mixed DSA draft manager read its own twin table during the draft forward."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+        DSAtrtllmAttentionMetadata,
+    )
+
+    meta = Mock()
+    meta.kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    meta.draft_replay_swapped_attrs = {}
+    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+        setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
+    target, draft = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
+    meta.retained_block_table = target
+    meta.draft_retained_block_table = draft
+
+    DSAtrtllmAttentionMetadata.prepare_for_draft_forward(meta)
+    assert meta.retained_block_table is draft
+    meta.restore_draft_swaps()
+    assert meta.retained_block_table is target
+
+
+@pytest.mark.cpu_only
+def test_draft_forward_swaps_in_draft_staging():
+    """A mixed MTP draft manager's layers run on its own staging copy during the draft forward."""
+    meta = Mock()
+    meta.draft_replay_swapped_attrs = {}
+    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+        setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
+    target, draft = Mock(name="target_staging"), Mock(name="draft_staging")
+    meta.mixed_precision_staging = target
+    meta.draft_mixed_precision_staging = draft
+
+    TrtllmAttentionMetadata.prepare_for_draft_forward(meta)
+    assert meta.mixed_precision_staging is draft
+    meta.restore_draft_swaps()
+    assert meta.mixed_precision_staging is target
 
 
 @pytest.mark.cpu_only
@@ -855,6 +900,7 @@ def test_mixed_precision_retained_dtype_must_match_model_dtype():
         sparse_attention_config=SimpleNamespace(algorithm="dsa"),
         pretrained_config=SimpleNamespace(),
         attn_backend="TRTLLM",
+        extra_attrs={},
     )
     with pytest.raises(ValueError, match="model dtype"):
         validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_float16")

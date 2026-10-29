@@ -94,7 +94,7 @@ def test_draft_kv_cache_quant_algo_inheritance_preserves_layer_settings(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("override", [None, QuantAlgo.FP8])
+@pytest.mark.parametrize("override", [None, QuantAlgo.FP8, QuantAlgo.NO_QUANT])
 def test_draft_kv_cache_quant_algo_without_layer_settings(override: QuantAlgo | None) -> None:
     """Global inheritance and overrides also support uniform checkpoints."""
     target = SimpleNamespace(
@@ -108,10 +108,36 @@ def test_draft_kv_cache_quant_algo_without_layer_settings(override: QuantAlgo | 
 
     _set_draft_kv_cache_quant_algo(draft, target)
 
-    expected_algo = QuantAlgo.NVFP4 if override is None else override
+    expected_algo = {None: QuantAlgo.NVFP4, QuantAlgo.NO_QUANT: None}.get(override, override)
     assert draft.quant_config.kv_cache_quant_algo == expected_algo
     assert draft.quant_config_dict is None
     assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_override", [None, QuantAlgo.FP8])
+@pytest.mark.parametrize("is_mtp", [False, True])
+def test_draft_kv_cache_quant_algo_mixed_precision_default(model_override, is_mtp) -> None:
+    """The model's own draft override always wins; the mixed-precision default skips MTP heads."""
+    extra_attrs = {"mixed_precision_draft_kv_cache_quant_algo": QuantAlgo.NO_QUANT}
+    if model_override is not None:
+        extra_attrs["draft_kv_cache_quant_algo_override"] = model_override
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs=extra_attrs,
+    )
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        quant_config_dict=None,
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target, is_mtp=is_mtp)
+
+    if model_override is not None:
+        expected = model_override
+    else:
+        expected = QuantAlgo.NVFP4 if is_mtp else None
+    assert draft.quant_config.kv_cache_quant_algo == expected
 
 
 class _FakeDraftModel(nn.Module):

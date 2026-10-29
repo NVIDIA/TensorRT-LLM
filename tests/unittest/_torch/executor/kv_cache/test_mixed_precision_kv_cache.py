@@ -311,16 +311,135 @@ def test_mixed_precision_rejects_custom_managers():
     assert native.high_precision_dtype == DataType.BF16
 
 
-def test_appended_draft_layers_stay_native(make_manager):
-    """One-model draft layers appended to the target manager keep a plain cache."""
+@pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
+def test_appended_draft_layers(make_manager, drafter):
+    """MTP layers appended to the target manager go mixed; an Eagle3 draft layer keeps a plain cache."""
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+
+    spec_config = (
+        MTPDecodingConfig(num_nextn_predict_layers=1)
+        if drafter == "mtp"
+        else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
+    )
+    manager = make_manager(
+        config=mixed_config(pool_ratio=None), num_layers=2, spec_config=spec_config
+    )
+    assert manager.pp_layers == [0, 1, 2]
+    if drafter == "mtp":
+        assert manager.high_layers == {0: 3, 1: 4, 2: 5}
+    else:
+        assert manager.high_layers == {0: 3, 1: 4}
+        assert manager.get_buffers(2).dtype == torch.bfloat16
+
+
+def test_separate_mtp_draft_manager_goes_mixed(make_manager):
+    """A separate one-model MTP draft manager builds twins for its own layers, like the target."""
+    from types import SimpleNamespace
+
     from tensorrt_llm.llmapi import MTPDecodingConfig
 
     manager = make_manager(
         config=mixed_config(pool_ratio=None),
-        num_layers=2,
+        num_layers=1,
+        layer_mask=[False, False, True],
         spec_config=MTPDecodingConfig(num_nextn_predict_layers=1),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+        is_draft=True,
     )
-    assert manager.pp_layers == [0, 1, 2]
-    assert manager.high_layers == {0: 3, 1: 4}
-    assert not manager._is_mixed_precision_layer(2)
-    assert manager.get_buffers(2).dtype == torch.bfloat16
+    assert manager.pp_layers == [2]
+    assert manager.high_layers == {0: 1}
+
+
+def test_mixed_precision_page_tables_match_base_page_indices(make_manager):
+    """The batched page-table gather equals reading each request's base page indices."""
+    import numpy as np
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+    manager = make_manager(config=mixed_config(pool_ratio=None, enable_block_reuse=False))
+    request_ids = [11, 12, 13]
+    manager.add_dummy_requests(request_ids, token_nums=[100, 300, 700], is_gen=False)
+    width = manager.max_blocks_per_seq
+    out = np.full((2, len(request_ids), width), -7, dtype=np.int32)
+    manager.fill_mixed_precision_page_tables(request_ids, 0, out)
+    for role, layer in enumerate((0, manager.high_layers[0])):
+        pool = int(manager.impl.get_layer_group_id(layer))
+        scale = int(manager.impl.get_page_index_converter(layer, Role.KEY).scale)
+        for row, request_id in enumerate(request_ids):
+            kv_cache = manager.kv_cache_map[request_id]
+            count = kv_cache.num_blocks
+            base = np.asarray(kv_cache.get_base_page_indices(pool)[:count])
+            expected = np.where(
+                base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // manager.kv_factor
+            )
+            np.testing.assert_array_equal(out[role, row, :count], expected)
+            assert (out[role, row, count:] == -7).all()
+
+
+def test_dsa_mtp_layer_goes_mixed():
+    """A DSA MTP layer appended to the target manager gets a twin like the target layers."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    manager = DSACacheManagerV2(
+        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=64,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.NVFP4,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
+        spec_config=MTPDecodingConfig(num_nextn_predict_layers=1),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    try:
+        assert manager.pp_layers == [0, 1, 2]
+        assert sorted(manager.high_layers) == [0, 1, 2]
+    finally:
+        manager.shutdown()
+
+
+def test_deepseek_v4_mtp_layer_stays_native():
+    """DeepSeek-V4's MTP layer has only a sliding window, so it gets no twin."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+    from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+
+    ratios = [1, 4, 128, 4, 1]
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=4,
+        num_kv_heads=1,
+        head_dim=512,
+        tokens_per_block=128,
+        max_seq_len=4096,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.NVFP4,
+        vocab_size=1000,
+        max_input_len=4096,
+        max_num_tokens=8192,
+        sparse_attn_config=DeepSeekV4SparseAttentionConfig(
+            index_head_dim=128, window_size=128, compress_ratios=ratios
+        ),
+        spec_config=MTPDecodingConfig(num_nextn_predict_layers=1),
+        pretrained_config=SimpleNamespace(num_hidden_layers=4),
+    )
+    try:
+        assert manager.pp_layers == [0, 1, 2, 3, 4]
+        # Only the compressed layers (ratio 4 or 128) get a twin; the MTP layer 4 does not.
+        assert sorted(manager.high_layers) == [1, 2, 3]
+    finally:
+        manager.shutdown()

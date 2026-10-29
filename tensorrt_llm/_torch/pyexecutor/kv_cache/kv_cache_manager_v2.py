@@ -1882,9 +1882,14 @@ class KVCacheManagerV2(BaseResourceManager):
             if len(set(self.pp_layers)) != len(self.pp_layers):
                 raise ValueError(f"layer-spec global layer ids must be unique: {self.pp_layers}")
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
-        # Appended draft layers keep a plain cache.
+        # MTP layers are target attention layers and go mixed like them; the layers of
+        # a drafter with its own architecture (Eagle3, DFlash, ...) keep a plain cache.
         self._first_spec_layer_id: Optional[int] = None
-        if spec_config is not None and self.low_precision_dtype is not None:
+        if (
+            spec_config is not None
+            and self.low_precision_dtype is not None
+            and not spec_config.spec_dec_mode.is_mtp_one_model()
+        ):
             from tensorrt_llm._torch.speculative import get_num_spec_layers
 
             if get_num_spec_layers(spec_config) > 0:
@@ -4055,8 +4060,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 AttentionLayerConfig(
                     layer_id=LayerId(len(layers)),
                     buffers=[BufferConfig(role=role, size=page_bytes) for role in roles],
-                    # Native SWA includes the next query's write position.
-                    sliding_window_size=self.last_n + 1,
+                    # Native SWA includes the next query's write position, plus the draft tokens.
+                    sliding_window_size=self.last_n + 1 + self.max_draft_len,
                     num_sink_tokens=self.first_n,
                     reuse_policy=AttentionReusePolicy.REQUIRED,
                 )
@@ -4114,8 +4119,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Write the low (``out[0]``) and high (``out[1]``) page tables of a mixed-precision layer.
 
         ``out`` is ``(2, batch, pages)`` int32; entries past a request's blocks are left as they
-        are. The page indices are read as whole arrays from the cache's zero-copy buffers, so
-        this costs a few vector operations per request instead of one Python operation per page.
+        are. Each table is one gather from the zero-copy host page-index table.
         """
         local = self.layer_offsets[layer_idx]
         for role, layer in enumerate((local, self.high_layers[local])):
@@ -4125,14 +4129,24 @@ class KVCacheManagerV2(BaseResourceManager):
         """Write the ``(batch, pages)`` page table of one manager layer into ``out``."""
         pool_id = int(self.impl.get_layer_group_id(layer))
         scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
-        for row, req_id in enumerate(request_ids):
-            kv_cache = self.kv_cache_map[req_id]
-            count = min(kv_cache.num_blocks, out.shape[1])
-            base = kv_cache.get_base_page_indices(pool_id)[:count]
-            np.copyto(
-                out[row, :count],
-                np.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor),
-            )
+        # The core keeps every pool's base page indices in this zero-copy host table;
+        # gather the batch's rows at once (mixed precision runs at beam width 1).
+        # Not get_copy_index: its buffer is shared with in-flight block-offset copies.
+        rows = np.fromiter(
+            (self.index_mapper.get_index(req_id) * self.max_beam_width for req_id in request_ids),
+            dtype=np.int64,
+            count=len(request_ids),
+        )
+        width = min(out.shape[1], self.host_kv_cache_block_offsets.shape[-1])
+        base = self.host_kv_cache_block_offsets[pool_id, :, 0, :width].numpy()[rows]
+        counts = np.fromiter(
+            (self.kv_cache_map[req_id].num_blocks for req_id in request_ids),
+            dtype=np.int64,
+            count=len(request_ids),
+        )
+        pages = np.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor)
+        # Entries past a request's blocks are left as they are.
+        np.copyto(out[:, :width], pages, where=np.arange(width) < counts[:, None])
 
     def fill_high_precision_page_table(
         self, request_ids: List[int], layer_idx: int, out: np.ndarray

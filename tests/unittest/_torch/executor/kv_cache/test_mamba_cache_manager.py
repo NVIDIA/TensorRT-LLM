@@ -3102,8 +3102,8 @@ def test_v2_hybrid_mixed_precision_appends_retained_group():
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="Mixed-precision NVFP4 KV requires Blackwell",
 )
-def test_v2_hybrid_mixed_precision_skips_appended_draft_layer():
-    """A draft layer appended to the hybrid manager's mask keeps a plain cache."""
+def test_v2_hybrid_mixed_precision_mixes_appended_mtp_layer():
+    """An MTP layer appended to the hybrid manager's mask goes mixed like the target layers."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         dtype=DataType.HALF,
         kv_cache_config=_mixed_precision_kv_cache_config(),
@@ -3112,10 +3112,9 @@ def test_v2_hybrid_mixed_precision_skips_appended_draft_layer():
         pretrained_config=SimpleNamespace(num_hidden_layers=2),
     )
     try:
-        # Layers 0 (recurrent), 1 (attention), 2 (draft): only layer 1 gets a twin, at 3.
-        assert mgr._first_spec_layer_id == 2
-        assert mgr.high_layers == {1: 3}
-        assert mgr.get_buffers(2).dtype == torch.float16
+        # Layers 0 (recurrent), 1 (attention), 2 (MTP): both attention layers get a twin.
+        assert mgr._first_spec_layer_id is None
+        assert mgr.high_layers == {1: 3, 2: 4}
     finally:
         mgr.shutdown()
 

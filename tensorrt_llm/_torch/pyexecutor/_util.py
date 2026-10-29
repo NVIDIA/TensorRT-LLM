@@ -2339,10 +2339,11 @@ class KvCacheCreator:
                                 self._get_draft_max_attention_window(
                                     max_seq_len, kv_cache_config))
         update = {"max_attention_window": max_attention_window}
-        mixed = kv_cache_config.mixed_precision_kv
-        if mixed is not None:
-            # Draft layers keep a plain cache in the retained dtype.
-            update["dtype"] = "fp8" if mixed.high == "fp8" else "auto"
+        if (kv_cache_config.mixed_precision_kv is not None and
+                not self._speculative_config.spec_dec_mode.is_mtp_one_model()):
+            # A drafter with its own architecture keeps a plain cache; MTP layers go
+            # mixed like the target. The pool dtype follows the model's KV quant algo.
+            update["dtype"] = "auto"
         return kv_cache_config.model_copy(update=update)
 
     def _create_one_model_draft_kv_cache_manager(
