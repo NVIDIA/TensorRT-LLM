@@ -115,6 +115,10 @@ class SeaCacheController:
         self.cached_steps = []
         self.total_steps = 0
 
+    def release(self) -> None:
+        """Drop the generation's tensors (residual history, last indicator); keep its statistics."""
+        self._state = _TrajectoryState()
+
     def _should_compute(self, step: int, indicator: torch.Tensor) -> bool:
         state = self._state
         if state.last_step is not None and step != state.last_step + 1:

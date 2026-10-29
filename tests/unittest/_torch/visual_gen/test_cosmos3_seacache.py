@@ -88,6 +88,18 @@ def _cached_steps(pipeline) -> list[int]:
     return pipeline.cache_accelerator.get_stats()["cached_step_indices"]
 
 
+def _assert_video(video: torch.Tensor, num_frames: int = NUM_FRAMES) -> None:
+    assert video.dtype == torch.uint8
+    assert video.shape == (1, num_frames, HEIGHT, WIDTH, 3)
+    assert video.float().std() > 0
+
+
+def _assert_tensors_released(pipeline) -> None:
+    state = pipeline.cache_accelerator._controller._state
+    assert state.history == []
+    assert state.previous_indicator is None
+
+
 def test_requests_are_isolated(seacache_pipeline) -> None:
     """Each request starts from a clean cache: a T2V request repeated after an I2V
     request and an uncached single-frame request reproduces the first one exactly
@@ -95,12 +107,15 @@ def test_requests_are_isolated(seacache_pipeline) -> None:
     first = _generate(seacache_pipeline)
     first_cached = _cached_steps(seacache_pipeline)
     image = PIL.Image.new("RGB", (WIDTH, HEIGHT), color=(64, 128, 192))
-    _generate(seacache_pipeline, image=image)
+    i2v = _generate(seacache_pipeline, image=image)
     i2v_cached = _cached_steps(seacache_pipeline)
     single_frame = _generate(seacache_pipeline, num_frames=1)
     single_frame_cached = _cached_steps(seacache_pipeline)
     again = _generate(seacache_pipeline)
 
+    _assert_video(first.video)
+    _assert_video(i2v.video)
+    _assert_tensors_released(seacache_pipeline)
     assert first_cached == EXPECTED_CACHED_STEPS
     assert i2v_cached == EXPECTED_CACHED_STEPS
     assert single_frame.video.shape[1] == 1
@@ -133,6 +148,7 @@ def test_failed_request_does_not_leak_state(seacache_pipeline, monkeypatch) -> N
     assert accelerator._step is None
     assert accelerator._last_run_step is None
     assert accelerator._call_latents is None
+    _assert_tensors_released(seacache_pipeline)
 
     after = _generate(seacache_pipeline)
     assert _cached_steps(seacache_pipeline) == EXPECTED_CACHED_STEPS

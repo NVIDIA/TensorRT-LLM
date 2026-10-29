@@ -279,6 +279,29 @@ def test_accelerator_reads_sigma_of_the_current_step(monkeypatch):
     assert observed == pytest.approx(pipeline.scheduler.sigmas[:8].tolist())
 
 
+@pytest.mark.parametrize("fail_at_step", [None, 3])
+def test_accelerator_releases_tensors_when_denoising_ends(fail_at_step):
+    """The residual history is dropped when the loop ends, also on failure; stats survive."""
+    pipeline = _fake_pipeline()
+    accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())
+    accelerator.wrap()
+
+    def latents(step):
+        if step == fail_at_step:
+            raise RuntimeError("injected failure")
+        return _slow_latents(step)
+
+    if fail_at_step is None:
+        _denoise(pipeline, accelerator, 8, latents_fn=latents)
+    else:
+        with pytest.raises(RuntimeError, match="injected failure"):
+            _denoise(pipeline, accelerator, 8, latents_fn=latents)
+    state = accelerator._controller._state
+    assert state.history == [] and state.previous_indicator is None
+    expected = [1, 2, 4, 5] if fail_at_step is None else [1, 2]
+    assert accelerator.get_stats()["cached_step_indices"] == expected
+
+
 def test_accelerator_forwards_step_hooks():
     pipeline = _fake_pipeline()
     accelerator = SeaCacheAccelerator(pipeline, SeaCacheConfig())

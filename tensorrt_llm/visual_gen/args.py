@@ -612,7 +612,9 @@ class SeaCacheConfig(BaseCacheConfig):
     The first and last denoising steps are always computed.
     """
 
-    cache_backend: Literal["seacache"] = "seacache"
+    cache_backend: Literal["seacache"] = Field(
+        "seacache", description="Selects the SeaCache backend in `cache_config`."
+    )
     threshold: float = Field(
         0.25,
         gt=0.0,

@@ -101,6 +101,7 @@ class SeaCacheAccelerator(CacheAccelerator):
         def reset_denoising_step() -> None:
             self._step = None
             self._last_run_step = None
+            self._controller.release()
             original_reset_step()
 
         self._hook_handles = [
@@ -124,6 +125,7 @@ class SeaCacheAccelerator(CacheAccelerator):
         self._call_latents = None
         self._step = None
         self._last_run_step = None
+        self._controller.release()
 
     def refresh(self, num_inference_steps: int) -> None:
         self._controller.reset(num_inference_steps)

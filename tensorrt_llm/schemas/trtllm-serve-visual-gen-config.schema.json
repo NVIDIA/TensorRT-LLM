@@ -739,6 +739,7 @@
         "cache_backend": {
           "const": "seacache",
           "default": "seacache",
+          "description": "Selects the SeaCache backend in `cache_config`.",
           "title": "Cache Backend",
           "type": "string"
         },
