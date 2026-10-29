@@ -22,3 +22,5 @@ jupyter_server>=2.21.0
 notebook>=7.6.3
 # WAR against https://github.com/advisories/GHSA-vxq7-64xx-v4gw
 urllib3>=2.8.0
+# WAR against https://github.com/advisories/GHSA-6q48-6c7w-9gw2
+certifi>=2026.10.19
