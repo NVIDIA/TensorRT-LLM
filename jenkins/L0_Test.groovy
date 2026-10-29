@@ -2879,7 +2879,7 @@ def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFi
                (needsSanity && key =~ /PackageSanityCheck/) ||
                (needsPerfSanity && key =~ /PerfSanity/)
     }
-    // Coverage omits multi-GPU stages; preserve those forced by auto-trigger in the baseline set.
+    // Preserve baseline auto-triggered stages when coverage replaces the selected stage set.
     if (cbts.scope == "coverage") {
         def autoTriggerTags = testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []
         filtered += parallelJobsFiltered.findAll { key, _ ->
