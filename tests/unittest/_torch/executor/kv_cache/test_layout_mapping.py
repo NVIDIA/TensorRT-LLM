@@ -389,6 +389,21 @@ def test_the_oracle_refuses_runs_into_bytes_no_transferred_tensor_holds(monkeypa
         oracle.assert_layouts_reshard([page], [page])
 
 
+def test_the_oracle_gives_layer_groups_sharing_a_pool_group_slots_of_their_own():
+    """Two layer groups drawing from one pool group, as windowed and full layers of equal slot
+    sizes do, lay their buffers at the same offsets of slots of their own; the oracle keeps them
+    apart rather than counting both writes in one slot."""
+    topology = Instance().ranks(0)[0]
+    size = 4 * HEAD
+    buffers = tuple(BufferDesc(layer, "key", 0, 0, 0, size, kv(4)(topology)) for layer in (0, 1))
+    groups = (
+        LayerGroupDesc("attention", None, 0, 0, (0,)),
+        LayerGroupDesc("attention", 64, 0, 0, (1,)),
+    )
+    page = PageLayout(TOKENS, {0: (size,)}, groups, buffers, topology)
+    assert_layouts_reshard([page], [page])
+
+
 def _with_group(page: PageLayout, **changes) -> PageLayout:
     """``page`` with its first layer group's fields changed."""
     first, *rest = page.layer_groups

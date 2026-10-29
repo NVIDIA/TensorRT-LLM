@@ -30,7 +30,7 @@ from typing import Dict, Sequence, Tuple
 
 import numpy as np
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import fan, map_buffers
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import fan, layer_group_of, map_buffers
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     GRID_DIMENSIONS,
     BufferDesc,
@@ -41,7 +41,21 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     held,
 )
 
-Pool = Tuple[int, int]  # (pool group, pool index)
+# (pool group, pool index, layer group): layer groups sharing a pool group draw slots of their
+# own, so one page of each holds that group's buffers alone.
+Slot = Tuple[int, int, int]
+
+
+def _slot(groups: Dict[Tuple[int, int], int], buffer: BufferDesc) -> Slot:
+    return buffer.pool_group, buffer.pool_index, groups[buffer.pool_group, buffer.layer]
+
+
+def _slots(page: PageLayout, groups: Dict[Tuple[int, int], int]) -> Dict[Slot, np.ndarray]:
+    """An empty slot of each pool for each layer group drawing from it, -1 at every byte."""
+    return {
+        _slot(groups, b): np.full(page.pool_slot_bytes[b.pool_group][b.pool_index], -1, np.int64)
+        for b in page.buffers
+    }
 
 
 class Elements:
@@ -75,17 +89,17 @@ class Elements:
             ids = (ids[:, None] * axis.extent + (h.start + h.step * local)[None, :]).ravel()
         return offsets, ids + self._base(buffer, tensor)
 
-    def memory(self, page: PageLayout) -> Dict[Pool, np.ndarray]:
-        """One pool slot of each pool, each byte holding its element id (-1 where none lies)."""
-        mem = {
-            (g, i): np.full(width, -1, dtype=np.int64)
-            for g, widths in page.pool_slot_bytes.items()
-            for i, width in enumerate(widths)
-        }
+    def memory(self, page: PageLayout) -> Dict[Slot, np.ndarray]:
+        """One slot of each pool per layer group drawing from it, holding element ids.
+
+        Each byte holds the id of the element there, -1 where none lies.
+        """
+        groups = layer_group_of(page)
+        mem = _slots(page, groups)
         for buffer in page.buffers:
             for tensor in buffer.tensors:
                 offsets, ids = self.of(page, buffer, tensor)
-                mem[buffer.pool_group, buffer.pool_index][offsets] = ids
+                mem[_slot(groups, buffer)][offsets] = ids
         return mem
 
 
@@ -111,21 +125,19 @@ def assert_layouts_reshard(
     """
     elements = Elements()
     source_memory = [elements.memory(page) for page in sources]
+    source_groups = [layer_group_of(page) for page in sources]
     sent = {(b.layer, b.role) for page in sources for b in page.buffers if b.transferred}
     for dst in destinations:
-        got = {
-            (g, i): np.full(width, -1, dtype=np.int64)
-            for g, widths in dst.pool_slot_bytes.items()
-            for i, width in enumerate(widths)
-        }
+        dst_groups = layer_group_of(dst)
+        got = _slots(dst, dst_groups)
         writes = {pool: np.zeros(arr.size, dtype=np.int64) for pool, arr in got.items()}
-        for src, memory in zip(sources, source_memory):
+        for src, memory, groups in zip(sources, source_memory, source_groups):
             maps = map_buffers(src, dst)
             if maps:
                 assert paired(src.topology, dst.topology), (src.topology, dst.topology)
             for runs in maps:
-                src_pool = (runs.src.pool_group, runs.src.pool_index)
-                dst_pool = (runs.dst.pool_group, runs.dst.pool_index)
+                src_pool = _slot(groups, runs.src)
+                dst_pool = _slot(dst_groups, runs.dst)
                 for s, d, n in zip(runs.src_offsets, runs.dst_offsets, runs.sizes):
                     assert n > 0 and 0 <= s and s + n <= memory[src_pool].size, (src_pool, s, n)
                     assert 0 <= d and d + n <= got[dst_pool].size, (dst.topology, dst_pool, d, n)
@@ -135,7 +147,7 @@ def assert_layouts_reshard(
         for buffer in dst.buffers:
             if not buffer.transferred or (buffer.layer, buffer.role) not in sent:
                 continue
-            pool = (buffer.pool_group, buffer.pool_index)
+            pool = _slot(dst_groups, buffer)
             for tensor in buffer.tensors:
                 offsets, ids = elements.of(dst, buffer, tensor)
                 expected[pool][offsets] = True
