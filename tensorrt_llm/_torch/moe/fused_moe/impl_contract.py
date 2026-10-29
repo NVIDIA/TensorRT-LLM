@@ -79,6 +79,13 @@ class MoEInputRequirement:
     # Overrides the NVLink one-sided combine payload dtype; None means the
     # buffer follows the model output dtype.
     onesided_workspace_dtype: Optional[torch.dtype] = None
+    # ``run_moe`` works in buffers the backend keeps across calls: the tensor it
+    # returns may be a view of one, overwritten by the next call, and two calls
+    # in flight on different streams would share the same scratch. A multi-chunk
+    # forward therefore runs every chunk on one stream and copies each chunk's
+    # output before the next chunk runs. ``FusedCommMoEScheduler`` copies no
+    # chunk output, so it refuses a backend that declares this.
+    run_moe_reuses_buffers: bool = False
 
     # No sentinel for invalid_token_expert_id: every Communication uses -1.
 
@@ -327,6 +334,11 @@ class MoERejectReason(str, Enum):
     # EPLB is registered for this layer and the impl cannot lay out slots for
     # it. Distinct from TOPOLOGY_UNSUPPORTED: the parallel sizes are fine.
     EPLB_UNSUPPORTED = "eplb_unsupported"
+    # The deployment forces per-call activation scales
+    # (``force_dynamic_quantization``) and the impl quantizes against scales
+    # fixed at load time. Distinct from QUANT_UNSUPPORTED: the impl serves the
+    # format, so the report must name this rejection as the degradation cause.
+    DYNAMIC_QUANT_UNSUPPORTED = "dynamic_quant_unsupported"
     # The impl only has a fused-finalize FC2 epilogue, and the caller disabled
     # finalize fusion (explicitly, or implicitly by configuring LoRA).
     FINALIZE_FUSION_REQUIRED = "finalize_fusion_required"
@@ -399,6 +411,30 @@ def check_quant_matches_identity(cls: type, p: "MoEProblem") -> Optional[MoEElig
             f"{cls.__name__} implements quant={expected}, got {actual}",
         )
     return None
+
+
+def activation_rejection_detail(cls: type, p: "MoEProblem") -> Optional[str]:
+    """Why ``cls.activation_support`` cannot carry ``p``'s activation, or ``None``."""
+    support = getattr(cls, "activation_support", None)
+    if support is None:
+        return None
+    return support.rejection_detail(
+        cls.__name__,
+        p.activation_type,
+        clamp_after_silu=p.clamp_after_silu,
+        constants=p.activation_constants,
+    )
+
+
+def check_activation_support(cls: type, p: "MoEProblem") -> Optional[MoEEligibility]:
+    """Reject an activation ``cls.activation_support`` does not cover.
+
+    Resolution runs the same check; this one answers a direct ``can_implement`` call.
+    """
+    detail = activation_rejection_detail(cls, p)
+    if detail is None:
+        return None
+    return MoEEligibility.no(MoERejectReason.ACTIVATION_UNSUPPORTED, detail)
 
 
 def require_layer_quant_format(impl: "MoEImplBase", expected: str) -> None:

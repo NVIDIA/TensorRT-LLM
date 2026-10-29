@@ -121,12 +121,13 @@ def _make_model_config(
 
 
 def _make_mock_model_engine(model_config):
-    """Mock PyTorchModelEngine shell; a real engine needs GPU + loaded weights."""
+    """Mock ModelEngine shell; a real engine needs GPU + loaded weights."""
     engine = Mock()
     engine.model.model_config = model_config
-    engine.dtype = torch.bfloat16
-    engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine.model.config.torch_dtype = torch.bfloat16
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
+    engine.cuda_graph_batch_sizes = []
+    engine.cuda_graph_padding_enabled = False
     return engine
 
 
@@ -443,8 +444,7 @@ class TestCrossKvCacheConstruction:
         )
         creator._skip_est = False
         creator._execution_stream = _FakeCudaStream()
-        creator._model_engine.is_multimodal = False
-        creator._model_engine._max_cuda_graph_batch_size = None
+        creator._model_engine.max_cuda_graph_batch_size = None
 
         distributed = Mock()
         distributed.allreduce.side_effect = lambda value, op: value
@@ -770,9 +770,10 @@ class TestKVCacheV2SchedulerCrossParam:
         mgr._has_cp_helix = False
         mgr.enable_joint_kv_cache_reuse = False
         # Instance attributes of the real manager, so a spec'd Mock does not
-        # auto-create them; the scheduler reads both in __init__.
+        # auto-create them; the scheduler reads them in __init__.
         mgr.enable_block_reuse = False
         mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
+        mgr.can_share_inflight_prefix = False
         return mgr
 
     def test_default_cross_is_none(self):
@@ -833,6 +834,7 @@ class TestKVCacheV2SchedulerCrossParam:
         model_engine = SimpleNamespace(
             spec_config=None,
             model=SimpleNamespace(model_config=_make_model_config()),
+            mm_encoder_item_scheduling_enabled=False,
         )
         llm_args = TorchLlmArgs(
             model=_DUMMY_MODEL,

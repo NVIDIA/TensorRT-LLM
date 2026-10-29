@@ -1538,6 +1538,46 @@ BOUNDARY_CONFIGS = [
 ]
 
 
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
+def test_kv_cache_manager_v2_accepts_attention_dp_with_helix_cp(is_mla):
+    """KVCacheManagerV2 builds a helix-CP generation instance with attention-DP at pp_size=1.
+
+    The Python transceiver runs its gen-side completion consensus across the CP
+    ranks of a DP group, and the pp=1 executor loops align gen-init admission
+    across them.
+    """
+    managers = _create_managers_for_instance(
+        tp=2,
+        pp=1,
+        enable_dp=True,
+        is_mla=is_mla,
+        use_v2=True,
+        cp_size=2,
+    )
+    assert len(managers) == 4
+    assert all(isinstance(m, KVCacheManagerV2) for m in managers)
+    for m in managers:
+        m.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_kv_cache_manager_v2_rejects_attention_dp_with_helix_cp_under_pp():
+    """KVCacheManagerV2 rejects attention-DP with helix CP when pp_size > 1.
+
+    Only the pp=1 executor loops align gen-init admission across helix CP ranks.
+    """
+    with pytest.raises(ValueError, match=r"pp_size > 1"):
+        _create_managers_for_instance(
+            tp=2,
+            pp=2,
+            enable_dp=True,
+            is_mla=False,
+            use_v2=True,
+            cp_size=2,
+        )
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,is_mla",

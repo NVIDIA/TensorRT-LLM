@@ -31,7 +31,7 @@ conversation (the chat route overlaps media loading with rendering).
 from __future__ import annotations
 
 import asyncio
-import os
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -45,31 +45,18 @@ from tensorrt_llm.inputs.utils import (
 )
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.serving_extensions import ServingExtension
 
-from .prompt_types import RenderedPrompt, UnsupportedRenderError
+from .prompt_types import (
+    HarmonyConversionError,
+    RenderedPrompt,
+    UnrenderableMessagesError,
+    UnsupportedRenderError,
+)
 from .resources import RenderResources
 
 if TYPE_CHECKING:
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
-
-_LEGACY_ENV = "TRTLLM_RENDER_LEGACY"
-
-
-def legacy_render_enabled() -> bool:
-    """Whether callers run in the pre-merge compatibility mode.
-
-    ``TRTLLM_RENDER_LEGACY=1`` is a compatibility mode, not a bit-for-bit rollback.
-    What it restores exactly: the router and ``count_tokens`` run their previous
-    implementations, and the router writes ids back without checking the fingerprint.
-    What it only approximates: the governor, Responses and multimodal-encoder routes
-    render without the server-level chat template and the model extension's rules (as
-    before) but still go through the shared render-then-tokenize pipeline, not the
-    previous helper. For a tokenizer whose two pipelines disagreed (one that renders text
-    itself, where the previous governor returned the text's characters as ids) the previous
-    output is not restored. The recorded pre-merge outputs and every intended difference
-    are in ``tests/unittest/llmapi/apps/test_render_golden.py``.
-    """
-    return os.getenv(_LEGACY_ENV, "0") == "1"
 
 
 @dataclass
@@ -95,9 +82,7 @@ def prepare_chat_request(request: "ChatCompletionRequest", res: RenderResources)
     if request.tool_choice == "required" and extension.required_tool_choice_mode() is None:
         # Schema-accepting "required" everywhere but enforcing it only for models
         # whose extension allows it would silently degrade to "auto" elsewhere;
-        # reject loudly for models that cannot honor it. Still a ValueError for the
-        # routes (a 400); a router or counter that only needs an estimate catches
-        # UnsupportedRenderError and leaves the rejection to the worker.
+        # reject loudly for models that cannot honor it (a 400 on the routes).
         raise UnsupportedRenderError("tool_choice='required' is not supported for this model.")
     tool_dicts = (
         None
@@ -330,7 +315,7 @@ def _parse_text_conversation(
         )
     except ValidationError as error:
         if raw_messages is None:
-            raise UnsupportedRenderError(
+            raise UnrenderableMessagesError(
                 "The messages carry fields the request model rejects; they can only be "
                 "rendered from the raw request body."
             ) from error
@@ -342,6 +327,27 @@ def _parse_text_conversation(
             model_type_override=res.model_type,
             resolve_media=False,
         )
+
+
+def _without_media(messages: Any) -> List[Any]:
+    """The messages with every non-text content part left out."""
+    result = []
+    for original in messages:
+        message = dict(original)
+        tool_calls = message.get("tool_calls")
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            # Written back too: the router forwards this request, and the drained iterator
+            # would leave it without its tool calls.
+            message["tool_calls"] = list(tool_calls)
+            if isinstance(original, dict):
+                original["tool_calls"] = message["tool_calls"]
+        content = message.get("content")
+        if isinstance(content, list):
+            message["content"] = [
+                part for part in content if isinstance(part, dict) and part.get("type") == "text"
+            ]
+        result.append(message)
+    return result
 
 
 def render_chat(
@@ -416,6 +422,65 @@ def render_chat(
     )
     result.context = preparation_context(request, res, result)
     return result
+
+
+class _LengthExtension(ServingExtension):
+    """No extension hooks, but the model's tool serialization (kimi_k3 drops null defaults)."""
+
+    def __init__(self, model_extension: ServingExtension):
+        self._model_extension = model_extension
+
+    def serialize_tool(self, tool: Any) -> Dict[str, Any]:
+        return self._model_extension.serialize_tool(tool)
+
+
+def render_chat_for_length(
+    request: "ChatCompletionRequest",
+    res: RenderResources,
+    *,
+    encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
+) -> RenderedPrompt:
+    """Render a request ``render_chat`` refuses, for a caller that only needs its length.
+
+    Renders a copy that ``render_chat`` accepts: media left out, a forcing ``tool_choice``
+    (``required`` or a named function) cleared, and the model treated as a plain text model
+    (no extension hooks, no own input processor). System blocks, tools and the chat template
+    stay in the length; the media's own tokens do not. Harmony falls back to the tokenizer's
+    template for messages it cannot convert.
+
+    The result is not an executable prompt and must never be forwarded to a worker. Messages
+    the request model rejects raise :class:`UnrenderableMessagesError`.
+    """
+    try:
+        messages = _without_media(request.messages)
+    except ValidationError as error:
+        raise UnrenderableMessagesError(
+            "The messages carry fields the request model rejects; they can only be "
+            "rendered from the raw request body."
+        ) from error
+    update: Dict[str, Any] = {"messages": messages}
+    if request.tool_choice == "required" or getattr(request.tool_choice, "function", None):
+        # "none" and "auto" change which tools are rendered; keep them.
+        update["tool_choice"] = None
+    text_only = request.model_copy(update=update)
+    if res.use_harmony:
+        try:
+            token_ids = res.extension.render_prompt(text_only, res)
+        except HarmonyConversionError:
+            if res.tokenizer is None:
+                raise
+        else:
+            if token_ids is not None:
+                return RenderedPrompt(token_ids=list(token_ids))
+    plain = dataclasses.replace(
+        res,
+        model_type="" if _is_passthrough_model(res) else res.model_type,
+        hf_config=None,
+        input_processor=None,
+        extension=_LengthExtension(res.extension),
+        use_harmony=False,
+    )
+    return render_chat(text_only, plain, encode_rendered=encode_rendered)
 
 
 def preparation_context(

@@ -16,7 +16,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, Trtll
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import EncoderCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners import encoder as encoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
-    EncoderConfigMixin,
+    EncoderConfig,
     EncoderPreparedInputs,
     EncoderRunner,
     EncoderRunnerConfig,
@@ -37,7 +37,7 @@ def _encoder_config(
     declares_feature_spec: bool,
     tp_size: int = 1,
     encoder_decoder: bool = False,
-) -> tuple[EncoderConfigMixin, tuple[tuple[int, ...], torch.dtype, int]]:
+) -> tuple[EncoderConfig, tuple[tuple[int, ...], torch.dtype, int]]:
     feature_spec = ((480_000,), torch.float32, 1_500)
 
     class _Model:
@@ -61,7 +61,6 @@ def _encoder_config(
         max_beam_width=1,
         without_logits=False,
         attention_backend=TrtllmAttention,
-        attention_runtime_features=AttentionRuntimeFeatures(),
         enable_autotuner=False,
     )
     if encoder_decoder:
@@ -150,8 +149,8 @@ def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None
         max_num_tokens=16,
         max_beam_width=2,
         attention_backend=TrtllmAttention,
-        attention_runtime_features=AttentionRuntimeFeatures(),
     )
+    runner._attention_runtime_features = AttentionRuntimeFeatures()
     runner._mapping = object()
     runner._buffers = SimpleNamespace(cache_indirection=cache_indirection)
     runner._attn_metadata = None
@@ -182,8 +181,8 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
         max_num_tokens=16,
         max_beam_width=2,
         attention_backend=TrtllmAttention,
-        attention_runtime_features=AttentionRuntimeFeatures(),
     )
+    runner._attention_runtime_features = AttentionRuntimeFeatures()
     runner._mapping = object()
     runner._encoder_config = SimpleNamespace(is_encoder_decoder=True)
 
@@ -245,7 +244,7 @@ def test_packed_inputs_reject_inconsistent_request_boundaries(
     runner = object.__new__(EncoderRunner)
 
     with pytest.raises(ValueError, match=message):
-        runner.prepare_inputs(PackedInputs(input_ids, sequence_lengths, multi_item_part_lens))
+        runner._prepare_inputs(PackedInputs(input_ids, sequence_lengths, multi_item_part_lens))
 
 
 @pytest.mark.parametrize(
@@ -263,7 +262,7 @@ def test_encoder_runner_rejects_model_inputs_owned_by_the_runner(reserved_name: 
     runner._encoder_cuda_graph_runner = SimpleNamespace(enabled=False)
 
     with pytest.raises(ValueError, match=reserved_name):
-        runner.prepare_inputs(PackedInputs([11, 12], [2], model_inputs={reserved_name: object()}))
+        runner._prepare_inputs(PackedInputs([11, 12], [2], model_inputs={reserved_name: object()}))
 
 
 def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
@@ -273,7 +272,7 @@ def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
     runner._prepare_encoder_batch = Mock(return_value=expected)
     token_type_ids = torch.tensor([0, 1])
 
-    actual = runner.prepare_inputs(
+    actual = runner._prepare_inputs(
         PackedInputs([11, 12], [2], model_inputs={"token_type_ids": token_type_ids})
     )
 
@@ -306,7 +305,7 @@ def test_encoder_runner_rejects_undeclared_tensor_input_when_graph_is_usable() -
     runner = _graph_enabled_runner()
 
     with pytest.raises(ValueError, match="not declared"):
-        runner.prepare_inputs(
+        runner._prepare_inputs(
             PackedInputs([11, 12], [2], model_inputs={"token_type_ids": torch.tensor([0, 1])})
         )
 
@@ -316,7 +315,7 @@ def test_multi_item_batch_skips_extra_input_validation() -> None:
     runner = _graph_enabled_runner()
     token_type_ids = torch.tensor([0, 1])
 
-    runner.prepare_inputs(
+    runner._prepare_inputs(
         PackedInputs([11, 12], [2], [[1, 1]], model_inputs={"token_type_ids": token_type_ids})
     )
 
@@ -327,7 +326,7 @@ def test_unsupported_attention_backend_skips_extra_input_validation() -> None:
     """A backend that cannot replay encoder graphs keeps every call eager."""
     runner = _graph_enabled_runner(attention_backend=SimpleNamespace(Metadata=AttentionMetadata))
 
-    runner.prepare_inputs(
+    runner._prepare_inputs(
         PackedInputs([11, 12], [2], model_inputs={"token_type_ids": torch.tensor([0, 1])})
     )
 
@@ -358,11 +357,10 @@ def test_encoder_runner_forwards_eager_model_inputs_and_gathers_logits() -> None
 
     outputs = runner._forward_step(
         inputs,
-        gather_ids=torch.tensor([2, 0]),
-        gather_context_logits=False,
+        gather_context_logits=True,
     )
 
-    torch.testing.assert_close(outputs["logits"], torch.tensor([[8, 9, 10, 11], [0, 1, 2, 3]]))
+    torch.testing.assert_close(outputs["logits"], torch.arange(12).reshape(3, 4))
     metadata.on_update_kv_lens.assert_called_once_with()
     model_forward.assert_called_once_with(**inputs, return_context_logits=True)
 

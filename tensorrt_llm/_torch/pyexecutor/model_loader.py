@@ -43,7 +43,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
-from .._experimental.modeling_v2 import modeling_v2_resolve
+from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
@@ -2097,7 +2097,7 @@ class ModelLoader:
         # modeling_v2 target reads the arguments as the engine will run with
         # them and never overrides those defaults.
         config = replace(config,
-                         modeling_v2_target=modeling_v2_resolve(
+                         modeling_v2_target=modeling_v2_resolve_on_all_ranks(
                              config, self.llm_args))
 
         if uses_mtp_head_checkpoint(self.spec_config):

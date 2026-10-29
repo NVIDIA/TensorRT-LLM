@@ -19,6 +19,7 @@ from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  MultimodalData, MultimodalDataTracker,
                                  load_base64_image_embeds)
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, BaseMediaIO
+from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import apply_mm_placeholders
@@ -431,18 +432,6 @@ def _parse_tool_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     if "tool_call_id" in message:
         result["tool_call_id"] = message["tool_call_id"]
     return result
-
-
-def resolve_top_level_model_type(model_config: AutoConfig) -> str:
-    """Return the top-level HF model_type for a loaded config.
-
-    Newer composite configs (e.g. Qwen2_5_VLConfig) delegate the instance
-    attribute to `text_config`, returning e.g. "qwen2_5_vl_text" instead of the
-    top-level "qwen2_5_vl" used as the AutoConfig/registry key. The class-level
-    attribute is unaffected by this delegation, so prefer it.
-    """
-    return getattr(type(model_config), "model_type", None) or getattr(
-        model_config, "model_type", "")
 
 
 def parse_chat_messages_coroutines(

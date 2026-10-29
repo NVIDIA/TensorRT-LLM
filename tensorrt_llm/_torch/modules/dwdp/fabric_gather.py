@@ -97,26 +97,45 @@ def blocks_per_row(rows: int) -> int:
     return max(1, total_blocks() // max(rows, 1))
 
 
-#: Compute-side knobs the SM gather sets for itself unless the user pinned them.
+#: SMs the persistent grids leave to the gather (``resident_sms``), if the user pins the count.
 _SM_RESERVE_ENV = "TRTLLM_CUTEDSL_SM_RESERVE"
+#: Compute-side knobs the SM gather sets for itself unless the user pinned them.
 _DENSE_GEMM_SCHEDULER_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
 _ROUTING_NO_COOP_ENV = "TLLM_ROUTING_DISABLE_COOP_LAUNCH"
 
 
-def apply_compute_side_defaults() -> None:
-    """Tune the CuTeDSL persistent kernels for a resident gather; call before any kernel compiles.
+def available() -> bool:
+    """True if the gather transport is requested and its op is registered."""
+    return is_enabled() and gather_op() is not None
 
-    Reserves the gather's block count of SMs (``TRTLLM_CUTEDSL_SM_RESERVE``) and pins the SM107
-    dense GEMM to the CLC dynamic scheduler (``TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER``) so static
-    persistent grids do not run a second wave on the occupied SMs.  Also turns off the
-    grid-cooperative MoE routing kernel (``TLLM_ROUTING_DISABLE_COOP_LAUNCH=1``), which needs every
-    SM co-resident and so would wait behind the gather.  The routing code reads that knob once, at
-    its first launch, so this must run before the first forward.  An explicit user setting wins.
+
+def resident_sms() -> int:
+    """SMs the persistent compute grids leave to the gather; read once, by ``DwdpManager``.
+
+    ``TRTLLM_CUTEDSL_SM_RESERVE`` pins the count.  Otherwise it is the gather's block count where
+    the gather is the transport and one block of ``THREADS >= 512`` fills an SM; smaller blocks
+    share SMs with the compute kernels and reserve none.
     """
-    reserve = str(total_blocks() if THREADS >= 512 else 0)
+    pinned = _int_env(_SM_RESERVE_ENV, -1)
+    if pinned >= 0:
+        return pinned
+    if not available() or THREADS < 512:
+        return 0
+    return total_blocks()
+
+
+def apply_compute_side_defaults() -> None:
+    """Tune the compute kernels for a resident gather; call before the first forward.
+
+    Pins the SM107 dense GEMM to the CLC dynamic scheduler
+    (``TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER``) so static persistent grids do not run a second wave
+    on the SMs the gather holds (the persistent grids themselves leave :func:`resident_sms` SMs
+    out, see ``DwdpManager``).  Also turns off the grid-cooperative MoE routing kernel
+    (``TLLM_ROUTING_DISABLE_COOP_LAUNCH=1``), which needs every SM co-resident and so would wait
+    behind the gather.  The routing code reads that knob once, at its first launch, so this must
+    run before the first forward.  An explicit user setting wins.
+    """
     applied = []
-    if os.environ.setdefault(_SM_RESERVE_ENV, reserve) == reserve:
-        applied.append(f"{_SM_RESERVE_ENV}={reserve}")
     if os.environ.setdefault(_DENSE_GEMM_SCHEDULER_ENV, "clc_dynamic") == "clc_dynamic":
         applied.append(f"{_DENSE_GEMM_SCHEDULER_ENV}=clc_dynamic")
     if os.environ.setdefault(_ROUTING_NO_COOP_ENV, "1") == "1":

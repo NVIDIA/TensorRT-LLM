@@ -605,6 +605,14 @@ class MLA(nn.Module):
                 ),
                 requires_grad=False,
             )
+        # Helix CP only: the BF16 V up-projection weight of every tp-local head,
+        # [num_heads_tp, v_head_dim, kv_lora_rank], built from kv_b_proj in
+        # transform_weights. With it, generation applies the V up-projection to
+        # this rank's partial outputs before the CP all-to-all (see
+        # _helix_project_v_partials), so the exchange and the combine carry
+        # v_head_dim instead of kv_lora_rank values per head.
+        self.register_buffer("helix_v_b_proj_full", None, persistent=False)
+        self._helix_v_up_before_exchange = False
 
         self.mqa = create_attention(
             config.attn_backend,
@@ -838,8 +846,15 @@ class MLA(nn.Module):
         v: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        helix_v_up: bool = False,
         **kwargs,
     ):
+        """Run absorbed attention; under Helix CP also exchange and combine the partials.
+
+        With ``helix_v_up`` the V up-projection is applied to this rank's
+        partial outputs before the all-to-all, so the result holds
+        ``num_heads_tp_cp * v_head_dim`` values per token instead of latents.
+        """
         if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
@@ -881,12 +896,16 @@ class MLA(nn.Module):
                     seq_start=attn_metadata.num_contexts,
                     num_seqs=attn_metadata.num_generations,
                 )
+            value_dim = kv_lora_rank
+            if helix_v_up:
+                partial_o = self._helix_project_v_partials(partial_o)
+                value_dim = self.v_head_dim
             return _helix_post_process(
                 partial_o,
                 softmax_stats,
                 self.mapping,
                 self.num_heads_tp_cp,
-                kv_lora_rank,
+                value_dim,
                 self.aux_stream,
                 self.ln_events,
                 zero_kv_mask=zero_kv_mask,
@@ -1667,6 +1686,80 @@ class MLA(nn.Module):
                 a = a.contiguous()
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
+    def _bind_helix_v_up_weight(self, weight: torch.Tensor) -> None:
+        """Apply the V up-projection with ``weight`` before the Helix CP all-to-all.
+
+        ``weight`` is the BF16 V weight of every tp-local head,
+        ``[num_heads_tp, v_head_dim, kv_lora_rank]``.
+        """
+        assert self.mapping.has_cp_helix()
+        assert weight.dtype == torch.bfloat16
+        assert tuple(weight.shape) == (self.num_heads_tp, self.v_head_dim, self.kv_lora_rank)
+        self.helix_v_b_proj_full = weight
+        self._helix_v_up_before_exchange = True
+
+    def _build_helix_v_up_weight(self) -> None:
+        """Under Helix CP, build every tp-local head's BF16 V weight from ``kv_b_proj``.
+
+        ``kv_b_proj.weight`` rows are ``[H * qk_nope_head_dim | H * v_head_dim]``.
+        Runs before ``kv_b_proj`` transforms its own weights (the transform walk
+        visits this module first), so the weight is the loaded BF16 tensor or
+        the loaded FP8 codes with their 128x128 FP32 block scales. Any other
+        layout keeps the V up-projection after the exchange.
+        """
+        if not self.mapping.has_cp_helix() or self.dtype != torch.bfloat16:
+            return
+        weight = self.kv_b_proj.weight
+        nope_rows = self.num_heads_tp * self.qk_nope_head_dim
+        v_shape = (self.num_heads_tp, self.v_head_dim, self.kv_lora_rank)
+        num_rows = nope_rows + self.num_heads_tp * self.v_head_dim
+        if weight.is_meta or tuple(weight.shape) != (num_rows, self.kv_lora_rank):
+            return
+        if weight.dtype == torch.bfloat16:
+            v_weight = weight[nope_rows:].view(v_shape)
+            plan = self.kv_b_proj.partition_plan
+            if plan.enabled and plan.op_kind == "bf16_linear":
+                # kv_b_proj releases its full weight once it is localized.
+                v_weight = v_weight.clone(memory_format=torch.contiguous_format)
+        elif weight.dtype == torch.float8_e4m3fn:
+            block = 128
+            scale = self.kv_b_proj.weight_scale
+            if scale.dtype != torch.float32 or tuple(scale.shape) != (
+                math.ceil(num_rows / block),
+                math.ceil(self.kv_lora_rank / block),
+            ):
+                return
+            row_blocks = torch.arange(nope_rows, num_rows, device=weight.device) // block
+            v_scale = scale[row_blocks].repeat_interleave(block, dim=1)[:, : self.kv_lora_rank]
+            v_weight = (weight[nope_rows:].float() * v_scale).to(self.dtype).view(v_shape)
+            if self.v_b_proj_dequant is not None:
+                # This rank's dequantized V chunk holds the same values.
+                start = self.mapping.cp_rank * self.num_heads_tp_cp
+                self.v_b_proj_dequant = nn.Parameter(
+                    v_weight[start : start + self.num_heads_tp_cp], requires_grad=False
+                )
+        else:
+            return
+        self._bind_helix_v_up_weight(v_weight)
+
+    def _helix_project_v_partials(self, partial_o: torch.Tensor) -> torch.Tensor:
+        """Apply every tp-local head's V up-projection to this CP rank's partial outputs.
+
+        The CP combine is a per-head weighted sum of the ranks' partial
+        outputs, so it commutes with the per-head linear V projection.
+        ``partial_o`` is ``[num_tokens, num_heads_tp * kv_lora_rank]``; the
+        result is ``[num_tokens, num_heads_tp * v_head_dim]``.
+        """
+        num_tokens = partial_o.shape[0]
+        partial_v = partial_o.new_empty((num_tokens, self.num_heads_tp, self.v_head_dim))
+        self._bmm_bf16_out(
+            partial_o.view(num_tokens, self.num_heads_tp, self.kv_lora_rank).transpose(0, 1),
+            self.helix_v_b_proj_full,
+            self.helix_v_b_proj_full.transpose(1, 2),
+            partial_v.transpose(0, 1),
+        )
+        return partial_v.view(num_tokens, self.num_heads_tp * self.v_head_dim)
+
     def forward_absorption_generation(
         self,
         q: torch.Tensor,
@@ -1837,6 +1930,7 @@ class MLA(nn.Module):
         else:
             raise RuntimeError("MLA absorption requires k_b_proj_trans")
 
+        helix_v_up = self._helix_v_up_before_exchange
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
             fused_q,
@@ -1854,9 +1948,16 @@ class MLA(nn.Module):
             mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
+            helix_v_up=helix_v_up,
             **kwargs,
         )
         fused_q = None
+
+        if helix_v_up:
+            # The V up-projection ran before the all-to-all; the combine already
+            # produced the [num_tokens, num_heads_tp_cp * v_head_dim] output.
+            output.view(attn_out_latent.shape).copy_(attn_out_latent)
+            return output
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (
@@ -2285,6 +2386,7 @@ class MLA(nn.Module):
             self.v_b_proj, self.v_b_proj_scale = self.resmooth_parameters(
                 self.v_b_proj, self.v_b_proj_scale, recipe=(1, 128, 128)
             )
+        self._build_helix_v_up_weight()
         self._rebuild_locality_domain_bf16_bmm_weight_shards()
         self._weights_transformed = True
 

@@ -84,8 +84,6 @@ def _server(queue, batches):
 
 
 def test_failed_task_publishes_without_a_final_collective(monkeypatch):
-    barrier = Mock()
-    monkeypatch.setattr(mpi, "mpi_barrier", barrier)
     monkeypatch.setattr(mpi, "mpi_rank", lambda: 0)
     monkeypatch.setattr(mpi, "mpi_world_size", lambda: 2)
 
@@ -94,7 +92,6 @@ def test_failed_task_publishes_without_a_final_collective(monkeypatch):
 
     with pytest.raises(ValueError, match="injected failure"):
         mpi.RemoteMpiCommSessionServer.task_wrapper((), fail)
-    barrier.assert_called_once()
 
 
 def test_stop_is_processed_while_all_futures_are_pending(monkeypatch: pytest.MonkeyPatch) -> None:

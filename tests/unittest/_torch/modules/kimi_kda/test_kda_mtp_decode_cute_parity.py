@@ -1321,6 +1321,216 @@ def test_commit_pending_drafts_replays_the_per_token_records():
     assert not conv_pool[others].any()
 
 
+def _packed_fused_norm_inputs(B, H, num_spec, state_dtype):
+    """Runtime-contract inputs for the packed / fused-norm path: section-strided q / k / v /
+    output-gate views of one fused projection, the bf16 beta tail of [f_a | beta], replay caches
+    and bf16 conv windows chained from a CPU-golden round 1, mixed acceptance 0..num_spec and
+    non-identity state slots."""
+    data, _ = _round2_inputs(B, H, num_spec)
+    for name in ("cs_q", "cs_k", "cs_v"):
+        # The runtime's conv caches are bf16; round 1 wrote bf16 values into them.
+        src = data[name]
+        dst = torch.empty(
+            src.shape[0], src.shape[2], src.shape[1], dtype=torch.bfloat16, device=src.device
+        ).transpose(1, 2)
+        dst.copy_(src)
+        data[name] = dst
+    packed, _ = _pack_new_token_projection_views(data)
+    slots = torch.arange(B - 1, -1, -1, dtype=torch.int32, device="cuda")
+    packed["ssm_state_indices"] = slots
+    for name in (
+        "initial_state_cute",
+        "k_cache",
+        "g_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        slot_order = torch.empty_like(packed[name])
+        slot_order[slots.long()] = packed[name]
+        packed[name] = slot_order
+    pool_accepted = torch.zeros(B, dtype=torch.int32, device="cuda")
+    pool_accepted[slots.long()] = data["num_accepted_tokens"]
+    packed["num_accepted_tokens"] = pool_accepted
+    packed["initial_state_cute"] = packed["initial_state_cute"].to(state_dtype)
+    packed["onorm_weight"] = torch.linspace(
+        0.75, 1.25, data["V"], dtype=torch.float32, device="cuda"
+    )
+    packed["onorm_eps"] = 1e-5
+    return packed
+
+
+_VERIFY_RESULTS = (
+    "out",
+    "state_v_first",
+    "k_cache",
+    "g_cache",
+    "v_cache",
+    "beta_cache",
+    "cs_q",
+    "cs_k",
+    "cs_v",
+)
+
+
+def _run_with_verify_kernel(monkeypatch, kernel, run, expected_selection=None):
+    """``run()`` with the verify kernel forced to ``kernel``; with ``expected_selection``, also
+    asserts the kernel ``_select_verify_kernel`` picks for the call on its own."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops as mtp_ops
+
+    select = mtp_ops._select_verify_kernel
+    selected = []
+
+    def forced(**kwargs):
+        selected.append(select(**kwargs))
+        return kernel
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mtp_ops, "_select_verify_kernel", forced)
+        result = run()
+    assert selected, "the call did not reach the verify kernel selection"
+    if expected_selection is not None:
+        assert selected == [expected_selection], f"selection picked {selected}"
+    return result
+
+
+def _multi_wave(B, H):
+    return B * H > torch.cuda.get_device_properties(0).multi_processor_count
+
+
+@pytest.mark.parametrize(
+    "B,H,num_spec",
+    [(1, 6, 6), (4, 6, 7), (16, 6, 6), (32, 6, 7), (128, 6, 6), (8, 12, 7)],
+    ids=lambda v: str(v),
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("strided_state", [False, True], ids=["pool", "strided"])
+def test_v2_kernel_matches_v1_bitwise(B, H, num_spec, state_dtype, strided_state, monkeypatch):
+    """The latency-scheduled verify kernel (packed rows + fused gated RMSNorm) performs the same
+    arithmetic as ``kda_decode_mtp_kernel`` in the same order: the outputs, committed state,
+    conv pools and replay caches must match bit for bit. Covers the cluster-pair
+    (HV * B <= 64) and single-CTA grids, fp32 / bf16 state pools and a state that is a strided
+    slice of a larger buffer (non-flat TMA view)."""
+    packed = _packed_fused_norm_inputs(B, H, num_spec, state_dtype)
+
+    def run():
+        override = None
+        if strided_state:
+            shape = tuple(packed["initial_state_cute"].shape)
+            big = torch.zeros((shape[0], 3) + shape[1:], dtype=state_dtype, device="cuda")
+            override = big[:, 1]
+        return cute_run(
+            packed, packed_token_layout=True, fuse_output_norm=True, state_override=override
+        )
+
+    ref = _run_with_verify_kernel(monkeypatch, "v1", run)
+    expected = "two_cta" if _multi_wave(B, H) else "v2"
+    new = _run_with_verify_kernel(monkeypatch, "v2", run, expected_selection=expected)
+    for name in _VERIFY_RESULTS:
+        assert torch.equal(new[name], ref[name]), f"{name}: v2 differs from v1"
+
+
+@pytest.mark.parametrize(
+    "B,H,num_spec",
+    [(26, 6, 2), (32, 6, 6), (32, 6, 7), (64, 6, 5), (128, 6, 6), (4, 6, 7), (8, 96, 7)],
+    ids=lambda v: str(v),
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_two_cta_kernel_matches_v1_bitwise(B, H, num_spec, state_dtype, monkeypatch):
+    """The two-CTAs-per-SM verify kernel performs v2's arithmetic in v2's order: outputs,
+    committed state, conv windows and replay caches match ``kda_decode_mtp_kernel`` bit for bit,
+    for single- and multi-wave grids (selected for multi-wave grids only)."""
+    packed = _packed_fused_norm_inputs(B, H, num_spec, state_dtype)
+
+    def run():
+        return cute_run(packed, packed_token_layout=True, fuse_output_norm=True)
+
+    ref = _run_with_verify_kernel(monkeypatch, "v1", run)
+    expected = "two_cta" if _multi_wave(B, H) else "v2"
+    new = _run_with_verify_kernel(monkeypatch, "two_cta", run, expected_selection=expected)
+    for name in _VERIFY_RESULTS:
+        assert torch.equal(new[name], ref[name]), f"{name}: two-CTA kernel differs from v1"
+
+
+def _valid_mxfp8_scales(output_scale, rows, heads):
+    """The R128c4 UE8M0 scale bytes of the ``rows`` output rows (four copies per (row, head));
+    the padding rows of the layout are not written."""
+    r = torch.arange(rows, device=output_scale.device)
+    h = torch.arange(heads, device=output_scale.device)
+    base = (
+        (r // 128)[:, None] * heads * 512
+        + h[None, :] * 512
+        + ((r % 32) * 16 + ((r % 128) // 32) * 4)[:, None]
+    )
+    return output_scale[base[..., None] + torch.arange(4, device=output_scale.device)]
+
+
+@pytest.mark.parametrize(
+    "B,H,num_spec",
+    [(1, 96, 7), (8, 96, 7), (16, 96, 5), (8, 12, 7), (32, 12, 5), (8, 6, 7), (4, 96, 3)],
+    ids=lambda v: str(v),
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_two_cta_mxfp8_output_matches_v1_bitwise(B, H, num_spec, state_dtype, monkeypatch):
+    """MXFP8-output verify calls run the two-CTA kernel at every grid size, with the E4M3 values,
+    valid-row scales, committed state, conv windows and replay caches of
+    ``kda_decode_mtp_kernel``'s quantization epilogue bit for bit (helix and dep16 head counts)."""
+    packed = _packed_fused_norm_inputs(B, H, num_spec, state_dtype)
+
+    def run():
+        return cute_run(packed, packed_token_layout=True, quantize_output=True)
+
+    ref = _run_with_verify_kernel(monkeypatch, "v1", run)
+    new = _run_with_verify_kernel(monkeypatch, "two_cta", run, expected_selection="two_cta")
+    rows = B * (num_spec + 1)
+    assert new["out"].dtype == torch.float8_e4m3fn
+    assert torch.equal(new["out"].view(torch.uint8), ref["out"].view(torch.uint8))
+    assert torch.equal(
+        _valid_mxfp8_scales(new["output_scale"], rows, H),
+        _valid_mxfp8_scales(ref["output_scale"], rows, H),
+    )
+    for name in _VERIFY_RESULTS[1:]:
+        assert torch.equal(new[name], ref[name]), f"{name}: two-CTA kernel differs from v1"
+
+
+def test_verify_kernel_selection():
+    """v2 and the two-CTA kernel serve only the runtime verify contract, the two-CTA kernel
+    for MXFP8 output and for grids of more tiles than SMs; the contract requires its operands;
+    every other variant stays on v1."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import _select_verify_kernel
+
+    contract = dict(
+        packed_token_layout=True,
+        fuse_output_norm=True,
+        quantize_output=False,
+        bf16_math=False,
+        replay_only=False,
+        num_spec=7,
+        num_tiles=148,
+        num_sms=148,
+        operands_ok=lambda: True,
+    )
+    assert _select_verify_kernel(**contract) == "v2"
+    assert _select_verify_kernel(**{**contract, "num_tiles": 149}) == "two_cta"
+    # MXFP8 output: the two-CTA kernel at every grid size
+    assert _select_verify_kernel(**{**contract, "quantize_output": True}) == "two_cta"
+    for quantize_output in (False, True):
+        with pytest.raises(ValueError, match="packed, fused-norm verify"):
+            _select_verify_kernel(
+                **{**contract, "quantize_output": quantize_output, "operands_ok": lambda: False}
+            )
+    for name, value in (
+        ("packed_token_layout", False),
+        ("fuse_output_norm", False),
+        ("bf16_math", True),
+        ("replay_only", True),
+        ("num_spec", 8),
+    ):
+        assert _select_verify_kernel(**{**contract, name: value, "operands_ok": None}) == "v1", name
+
+
 if __name__ == "__main__":
     import sys
 

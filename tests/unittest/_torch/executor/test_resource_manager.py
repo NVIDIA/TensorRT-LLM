@@ -26,7 +26,8 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
     _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
-    _warn_if_unsupported_v1_kv_cache_event_hash_algo)
+    _warn_if_unsupported_v1_kv_cache_event_hash_algo,
+    scan_kv_buffer_for_invalid_values)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_str_dtype
 from tensorrt_llm.bindings import LayerType
@@ -1257,6 +1258,39 @@ class TestResourceManager(unittest.TestCase):
         # The PeftCacheManager should be created successfully with the provided stream
         self.assertTrue(peft_cache_manager.impl.enabled)
 
+    def _reload_ckpt_source(self, server_ckpt_source, request_ckpt_source):
+        """Return the ckpt_source add_request_peft reloads an adapter with."""
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=self.create_peft_cache_config(),
+            lora_config=LoraConfig(lora_ckpt_source=server_ckpt_source),
+            model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
+        )
+        peft_cache_manager.impl = MagicMock()
+        peft_cache_manager.impl.is_task_cached.return_value = False
+        lora_manager = MagicMock()
+        lora_manager.cpp_lora_weights = {7: torch.zeros(1)}
+        lora_manager.cpp_lora_config = {7: torch.zeros(1)}
+        peft_cache_manager._lora_manager = lora_manager
+
+        request = self._create_request(request_id=0, task_id=7)
+        request.py_lora_path = "/path/to/adapter"
+        request.py_lora_ckpt_source = request_ckpt_source
+        peft_cache_manager.add_request_peft(request)
+
+        lora_manager.load_from_ckpt.assert_called_once()
+        return lora_manager.load_from_ckpt.call_args.kwargs["ckpt_source"]
+
+    def test_add_request_peft_reloads_with_request_ckpt_source(self):
+        """The engine-side reload uses the format the request was admitted with."""
+        self.assertEqual(self._reload_ckpt_source("nemo", "hf"), "hf")
+        self.assertEqual(self._reload_ckpt_source("hf", "nemo"), "nemo")
+
+    def test_add_request_peft_reload_defaults_to_config_ckpt_source(self):
+        """Without a per-request format, the reload uses the LoRA config's."""
+        self.assertEqual(self._reload_ckpt_source("nemo", None), "nemo")
+        self.assertEqual(self._reload_ckpt_source("hf", None), "hf")
+
 
 @pytest.mark.cpu_only
 class TestKVCacheManagerConnectorReporting(unittest.TestCase):
@@ -1751,6 +1785,49 @@ class TestRequestBudget(unittest.TestCase):
                    ) as mock_logger:
             executor._warn_if_kv_block_budget_unchecked()
         mock_logger.warning_once.assert_not_called()
+
+
+def _scan(buffer: torch.Tensor) -> Tuple[bool, bool]:
+    has_invalid_values = torch.tensor([False],
+                                      dtype=torch.bool,
+                                      device=buffer.device)
+    skipped = scan_kv_buffer_for_invalid_values(buffer, has_invalid_values)
+    return bool(has_invalid_values), skipped
+
+
+@pytest.mark.parametrize("dtype",
+                         [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_scan_kv_buffer_finds_invalid_value_in_any_slice(
+        monkeypatch, dtype, value):
+    # Three rows per slice, so the buffer spans several slices and a short
+    # last one.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.resource_manager."
+        "_INVALID_VALUE_SCAN_ELEMS", 3 * 4 * 8)
+    pool = torch.zeros(10, 2, 4, 8, dtype=dtype, device="cuda")
+    assert _scan(pool) == (False, False)
+    for row in (0, 5, 9):
+        pool.zero_()
+        pool[row, 1, 3, 7] = value
+        # A per-layer view of a shared pool is strided along dim 0.
+        assert _scan(pool[:, 1]) == (True, False), f"row {row}"
+        assert _scan(pool[:, 0]) == (False, False), f"row {row}"
+
+
+def test_scan_kv_buffer_keeps_checking_after_unsupported_check(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.resource_manager."
+        "_INVALID_VALUE_SCAN_ELEMS", 2 * 16)
+    # isinf is not implemented for float8_e4m3fn, isnan is.
+    buffer = torch.zeros(9, 16, dtype=torch.float8_e4m3fn, device="cuda")
+    assert _scan(buffer) == (False, True)
+    buffer[8, 15] = float("nan")
+    assert _scan(buffer) == (True, True)
+
+
+def test_scan_kv_buffer_accepts_empty_buffer():
+    assert _scan(torch.zeros(0, 8, device="cuda")) == (False, False)
 
 
 if __name__ == "__main__":
