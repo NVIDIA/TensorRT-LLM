@@ -855,20 +855,22 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 1,
                 (self.max_blocks_per_seq * max_scratch_pages + min_scale - 1) // min_scale,
             )
+            # Rows as in _device_kv_cache_block_offsets_input: pool groups, then bound pools.
+            num_scratch_rows = self.num_pools + len(self._bound_pools)
             scratch_slots_shape = (
-                self.num_pools,
+                num_scratch_rows,
                 staging_capacity,
                 self._max_scratch_slots,
             )
             self._host_scratch_begs_staging = torch.empty(
-                self.num_pools,
+                num_scratch_rows,
                 staging_capacity,
                 dtype=torch.int32,
                 pin_memory=prefer_pinned(),
                 device="cpu",
             )
             self._host_scratch_ends_staging = torch.empty(
-                self.num_pools,
+                num_scratch_rows,
                 staging_capacity,
                 dtype=torch.int32,
                 pin_memory=prefer_pinned(),
@@ -881,13 +883,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 device="cpu",
             )
             self._device_scratch_begs_staging = torch.empty(
-                self.num_pools,
+                num_scratch_rows,
                 staging_capacity,
                 dtype=torch.int32,
                 device=device,
             )
             self._device_scratch_ends_staging = torch.empty(
-                self.num_pools,
+                num_scratch_rows,
                 staging_capacity,
                 dtype=torch.int32,
                 device=device,
@@ -1655,6 +1657,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 host_ends[pool_idx, context_idx] = int(desc.range.end)
                 for slot_idx, slot_id in enumerate(slot_ids):
                     host_slots[pool_idx, context_idx, slot_idx] = int(slot_id)
+        # Bound pools: the pool group's scratch ranges, slot ids translated to the pool's own ids.
+        for row, (pool_id, binding_key) in enumerate(self._bound_pools, start=self.num_pools):
+            host_begs[row] = host_begs[pool_id]
+            host_ends[row] = host_ends[pool_id]
+            host_slots[row] = _translate_page_indices(
+                host_slots[pool_id], self._host_bindings[binding_key]
+            )
 
         self._device_scratch_begs_staging.copy_(host_begs_staging, non_blocking=True)
         self._device_scratch_ends_staging.copy_(host_ends_staging, non_blocking=True)
