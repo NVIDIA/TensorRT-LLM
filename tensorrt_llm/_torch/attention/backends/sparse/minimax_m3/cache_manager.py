@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
@@ -64,37 +65,6 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
-
-
-class _UnchangedCopy:
-    """Remembers the inputs of the last decode-only block-table copy into one destination.
-
-    In steady decode the block tables change only when a request grows into a
-    new page, so a copy whose destination, batch order, decode-only shape and
-    host block-offset table equal the previous copy's can be skipped.
-    """
-
-    def __init__(self) -> None:
-        self._key: Optional[tuple] = None
-        self._host: Optional[torch.Tensor] = None
-
-    def skip(self, dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks, host) -> bool:
-        if num_contexts != 0:
-            self._key = None
-            return False
-        key = (dst.data_ptr(), tuple(request_ids), beam_width, num_seqs, max_blocks)
-        return key == self._key and self._host is not None and torch.equal(host, self._host)
-
-    def record(
-        self, dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks, host
-    ) -> None:
-        if num_contexts != 0:
-            return
-        self._key = (dst.data_ptr(), tuple(request_ids), beam_width, num_seqs, max_blocks)
-        if self._host is None or self._host.shape != host.shape:
-            self._host = host.clone()
-        else:
-            self._host.copy_(host)
 
 
 class MiniMaxM3SparseIndexCache:
@@ -439,7 +409,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
         super().__init__(*args, **kwargs)
-        self._unchanged_copies: Dict[int, _UnchangedCopy] = {}
+        self._unchanged_copies: Dict[int, DeviceCopyBuffer] = {}
         self._pool_views: Dict[tuple, torch.Tensor] = {}
 
         if self.dtype == DataType.NVFP4:
@@ -735,20 +705,29 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     ) -> None:
         if self.num_attention_op_pools == 0:
             return
+        guard = None
+        key = (
+            dst_tensor.dtype,
+            dst_tensor.storage_offset(),
+            tuple(dst_tensor.shape),
+            tuple(dst_tensor.stride()),
+            tuple(request_ids),
+            beam_width,
+            num_seqs,
+            max_blocks,
+        )
         if self.skip_unchanged_block_offsets:
-            guard = self._unchanged_copies.setdefault(dst_tensor.data_ptr(), _UnchangedCopy())
-            args = (
-                dst_tensor,
-                request_ids,
-                beam_width,
-                num_contexts,
-                num_seqs,
-                max_blocks,
-                self.host_kv_cache_block_offsets,
-            )
-            if guard.skip(*args):
+            address = dst_tensor.untyped_storage().data_ptr()
+            guard = self._unchanged_copies.setdefault(address, DeviceCopyBuffer(dst_tensor))
+            if num_contexts != 0 or (
+                dst_tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+            ):
+                guard.invalidate()
+                guard = None
+            elif guard.matches(self.host_kv_cache_block_offsets, key=key, exact=True):
                 return
-            guard.record(*args)
+            else:
+                guard.invalidate()
         # The base materializer owns only the storage-pool output rows; virtual
         # draft pools are filled below with their own conversion metadata.
         base_dst = dst_tensor[: self.num_pools] if self._draft_op_pools else dst_tensor
@@ -756,6 +735,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             base_dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
         )
         if not self._draft_op_pools:
+            if guard is not None:
+                guard.record(self.host_kv_cache_block_offsets, key=key)
             return
         # Fill each virtual pool from its source pool's slot ids with the draft
         # layer's scale.
@@ -774,6 +755,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 self._draft_kv_offsets[i : i + 1],
                 self._stream.cuda_stream,
             )
+
+        if guard is not None:
+            guard.record(self.host_kv_cache_block_offsets, key=key)
 
     def update_resources(self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None):
         # Only tree acceptance relocates draft KV, which M3's pool layout cannot do.
@@ -1255,7 +1239,7 @@ class MiniMaxM3DraftKVCacheView:
         if manager.tokens_per_block in self.trtllm_gen_extra_tokens_per_block:
             _require_trtllm_gen_extra_page_route(manager.tokens_per_block)
         self._manager = manager
-        self._unchanged_copy = _UnchangedCopy()
+        self._unchanged_copies: Dict[int, DeviceCopyBuffer] = {}
         layer_id = draft_layer_ids[0]
         local = int(manager.layer_offsets[layer_id])
         self._local_layer_idx = local
@@ -1326,32 +1310,44 @@ class MiniMaxM3DraftKVCacheView:
         """
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
         manager = self._manager
+        guard = None
+        key = (
+            dst_tensor.dtype,
+            dst_tensor.storage_offset(),
+            tuple(dst_tensor.shape),
+            tuple(dst_tensor.stride()),
+            tuple(request_ids),
+            beam_width,
+            num_seqs,
+            max_blocks,
+        )
         if manager.skip_unchanged_block_offsets:
-            args = (
-                dst_tensor,
-                request_ids,
-                beam_width,
-                num_contexts,
-                num_seqs,
-                max_blocks,
-                self.host_kv_cache_block_offsets,
-            )
-            if self._unchanged_copy.skip(*args):
+            address = dst_tensor.untyped_storage().data_ptr()
+            guard = self._unchanged_copies.setdefault(address, DeviceCopyBuffer(dst_tensor))
+            if num_contexts != 0 or (
+                dst_tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+            ):
+                guard.invalidate()
+                guard = None
+            elif guard.matches(self.host_kv_cache_block_offsets, key=key, exact=True):
                 return
-            self._unchanged_copy.record(*args)
+            else:
+                guard.invalidate()
         copy_idx = manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
         if self._page_table_materializer.uses_device_expansion:
             self._page_table_materializer.copy_block_offsets_to(dst_tensor, copy_idx)
-            return
-        copy_batch_block_offsets_to_device(
-            self.host_kv_cache_block_offsets,
-            dst_tensor,
-            copy_idx,
-            self.index_scales,
-            self.kv_offset,
-            manager._stream.cuda_stream,
-        )
+        else:
+            copy_batch_block_offsets_to_device(
+                self.host_kv_cache_block_offsets,
+                dst_tensor,
+                copy_idx,
+                self.index_scales,
+                self.kv_offset,
+                manager._stream.cuda_stream,
+            )
+        if guard is not None:
+            guard.record(self.host_kv_cache_block_offsets, key=key)
 
 
 def get_minimax_m3_kv_cache_manager_cls():

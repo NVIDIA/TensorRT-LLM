@@ -314,3 +314,20 @@ def test_a_tail_record_keeps_its_storage_so_a_new_buffer_cannot_inherit_it(cache
     assert fresh.data_ptr() != address
     fill_tail_if_changed(fresh, 3, -1)
     assert fresh[3:].eq(-1).all()
+
+
+def test_failed_copy_through_another_view_invalidates_the_old_record(cache, monkeypatch):
+    dst = _device_zeros(4)
+    host = _host([1, 2, 3, 4])
+    assert cache.copy(dst, host, pack=False)
+
+    def partial_copy_then_fail(target, source):
+        target.copy_(source, non_blocking=True)
+        raise RuntimeError("copy submission failed")
+
+    monkeypatch.setattr(h2d_cache.step_inputs, "copy_", partial_copy_then_fail)
+    with pytest.raises(RuntimeError, match="copy submission failed"):
+        cache.copy(dst[1:], _host([9, 9, 9]), pack=True)
+    assert cache.copy(dst, host, pack=False)
+    torch.cuda.synchronize()
+    assert dst.tolist() == host.tolist()

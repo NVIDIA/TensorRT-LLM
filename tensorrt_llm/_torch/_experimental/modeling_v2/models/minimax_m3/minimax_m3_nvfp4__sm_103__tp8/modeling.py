@@ -62,7 +62,6 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import (
     Any,
     Callable,
@@ -156,7 +155,6 @@ from .ops import m3_sampled_accept as m3_sampled_accept_kernel
 from .ops import m3_shard_accept as m3_shard_accept_kernel
 from .ops import msa_kv_update as _msa_kv_update_kernel
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
-from .ops.attention.m3_dense_decode import m3_dense_decode
 from .ops.attention.m3_draft_attention import m3_draft_attention
 from .ops.attention.m3_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
 from .ops.attention.m3_fused_score_select import (
@@ -233,16 +231,6 @@ DECODE_PLANS = (
     DecodePlan("small", 16, attn_mc_ar=True, moe_mc_ar=True, qkv_prequant=True),
     DecodePlan("verify", DECODE_MAX_TOKENS, attn_mc_ar=True, moe_mc_ar=True, qkv_prequant=True),
 )
-
-# The dense layers' decode attention (trtllm-gen, msa_decode.dense_decode_max_seq_len): the max_seq_len it is handed
-# per request count. It only sizes the multi-CTA KV split (every CTA still covers its share of the actual length; the
-# result changes only by the split-merge order), and the model maximum over-splits AgentX-length caches at one
-# request. Two requests are neutral (the grid is unchanged) and keep the step's bound.
-DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH: Mapping[int, int] = MappingProxyType({1: 16384})
-# The same cap on the Eagle3 drafter layer's trtllm-gen decode (8 query heads over one KV head per rank): GB300, one
-# request, 63.7K cached tokens: 22.5 -> 11.7 us at one query row, 24.3 -> 12.5 us at four; 188K tokens: 28.2 -> 20.2 us.
-# Two requests are flat and keep the step's bound.
-DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH: Mapping[int, int] = MappingProxyType({1: 16384})
 
 # The sparse layers' NVFP4 QKV + indexer producer (ops/attention/m3_producer, every step its geometry fits) triggers its
 # dependent kernel on entry, so the kernel after it launches and stages its pre-wait loads while the producer runs.
@@ -496,14 +484,6 @@ SHARD_ACCEPT = RowRange(
     lambda spec: ((spec["draft_len"], spec["nreq"]),),
 )
 
-# Requests of a decode step whose dense-layer attention runs at a capped KV split.
-DENSE_DECODE_SPLIT = RowRange(
-    "m3_dense_decode",
-    frozenset(DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH),
-    m3_dense_decode,
-    lambda spec: (len(spec["kv_lens"]),) if spec["capped"] else (),
-)
-
 # (draft length, requests) of a fused draft loop, and the rows of its passes' draft input: the first pass's
 # requests x (draft length + 1), one per request on the later passes.
 DRAFT_STEP = RowRange(
@@ -525,7 +505,6 @@ DRAFT_INPUT = RowRange(
 
 FAST_PATHS: Tuple[RowRange, ...] = (
     EMBED_FIRSTNORM,
-    DENSE_DECODE_SPLIT,
     SPARSE_DECODE_PRODUCER,
     SPARSE_DECODE_LC8,
     PRODUCER,
@@ -1535,9 +1514,6 @@ class MiniMaxM3Tp8ModelingV2(DecoderModel):
                 raise ValueError(
                     f"layer {i}: expected the MiniMax-M3 MSA backend, got {type(backend).__name__}"
                 )
-            if i not in self.sparse_layers:
-                # The KV split trtllm-gen dense decode runs at, per request count.
-                backend.dense_decode_max_seq_len_by_batch = DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH
             self.attn.append(backend)
 
         # Built once the weights are real (``post_load_weights``): the KV (Q, K, V) scales, the MoE scalars, the
@@ -3916,12 +3892,10 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         return True
 
     def prebuild_drafter_linears(self, draft_model: Optional[M3Eagle3Draft]) -> int:
-        """Compile every drafter linear call ``DRAFT_LOWM`` covers, and cap the drafter attention's trtllm-gen KV
-        split per request count (``DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH``). Called before the executor's warmup, on every
+        """Compile every drafter linear call ``DRAFT_LOWM`` covers before the executor's warmup, on every
         rank. Returns the number of low-M calls compiled."""
         if draft_model is None:
             return 0
-        draft_model.attn.dense_decode_max_seq_len_by_batch = DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH
         return _prebuild_draft_lowm(draft_model)
 
     def _m3_drafter_supported(self, draft_model: M3Eagle3Draft) -> bool:

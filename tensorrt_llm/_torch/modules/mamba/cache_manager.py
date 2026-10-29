@@ -460,7 +460,7 @@ def select_mamba2_state(
     if spec_config is not None and (getattr(spec_config, "use_dynamic_tree", False)):
         logger.info("Replay kernel incompatible with tree attention; using legacy MTP path")
         use_replay = False
-    if stochastic_rounding and ssm_cache_dtype == torch.float16 and (sm < 100 or sm in (120, 121)):
+    if stochastic_rounding and ssm_cache_dtype == torch.float16 and not (100 <= sm < 120):
         logger.info(
             "Replay kernel Philox requires 100 <= sm < 120; "
             "using legacy MTP path for stochastic rounding support"

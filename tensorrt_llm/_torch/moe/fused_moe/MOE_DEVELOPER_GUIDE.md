@@ -274,7 +274,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
 | `none` | `TrtllmCutlassUnquantizedImpl` | `trtllm.cutlass.grouped_gemm.none` | Fuses routed-expert LoRA |
 | `fp8` | `TrtllmCutlassFp8Impl` | `trtllm.cutlass.grouped_gemm.fp8` | Static per-tensor e4m3 input; fuses routed-expert LoRA |
 | `fp8_block_scales` | `DeepgemmCudaHopperFp8BlockScalesImpl` | `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | SM90; `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM |
-| `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120, BF16 activations; a Triton grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build gate); runs SwiGLU/GeGLU only, takes no expert bias and no activation constant but a uniform pre-SiLU SwiGLU clamp |
+| `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120/121, BF16 activations; a Triton grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build gate); runs SwiGLU/GeGLU only, takes no expert bias and no activation constant but a uniform pre-SiLU SwiGLU clamp |
 | `nvfp4` | `TrtllmCutlassNvfp4Impl` | `trtllm.cutlass.grouped_gemm.nvfp4` | Quantizes activations to NVFP4 itself |
 | `w4a16_nvfp4` | `TrtllmCutlassW4a16Nvfp4Impl` | `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | Dequantizes the weights every forward, then runs unquantized |
 | `mxfp8` | `TrtllmCutlassMxfp8Impl` | `trtllm.cutlass.grouped_gemm.mxfp8` | Dynamic MXFP8 input |
@@ -292,7 +292,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
   on `quant_config`.
 - **FP8 block scales splits by SM.** Its two leaves carry the providers and
   techniques of the kernels they run (DeepGEMM, Triton), yet stay in the family
-  because the `CUTLASS` literal serves FP8 block scales on SM90 and SM120.
+  because the `CUTLASS` literal serves FP8 block scales on SM90 and SM120/121.
   `find_cutlass_leaf(quant_algo, *, sm=None)` (and `cutlass_leaf`, which
   raises instead of returning `None`) is a lookup, not an eligibility check, and
   reads the SM only to choose between those two.
@@ -702,7 +702,7 @@ or with float16 activations, or any SM outside Marlin's 89-99 and B12x's
 120/121.
 
 ‡ No CuteDSL leaf publishes `fp8_block_scales`; the DeepGEMM and TRTLLM-Gen
-leaves own the format on SM100/103/107 and Cutlass on SM90/SM120. Because a
+leaves own the format on SM100/103/107 and Cutlass on SM90/SM120/SM121. Because a
 `CUTEDSL` request considers only the CuteDSL family plus the Cutlass fallback,
 an explicit `moe_backend="CUTEDSL"` on an FP8-block checkpoint at SM100 fails
 resolution; request `DEEPGEMM` or `TRTLLM` for that checkpoint instead.

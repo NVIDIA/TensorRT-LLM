@@ -15,7 +15,7 @@ own deployment; none is a general default.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 if TYPE_CHECKING:
     import torch
@@ -146,6 +146,34 @@ class MsaRuntimePolicy:
     reuse_pool_views: bool = False
 
 
+class DecodePrologue(Protocol):
+    """Replaces the decode step's input prologue with one launch.
+
+    Called first in the step's input preprocessing, inside CUDA graph capture
+    as well. It decides on the host before any device work; returning False
+    keeps the native prologue, and returning True means every engine-visible
+    tensor the native prologue writes holds the value it would have written.
+    """
+
+    def __call__(
+        self, preparer: Any, inputs: Any, *, enable_spec_decode: bool, runtime_draft_len: int
+    ) -> bool:
+        """``preparer`` is the ``DecoderInputPreparer`` running the step's preprocessing."""
+
+
+class ExecutorEvents(Protocol):
+    """Points in the executor's life a model may act at."""
+
+    def after_warmup(self) -> None:
+        """After warmup and CUDA graph capture, before the first request is served."""
+
+    def before_overlap_loop(self) -> None:
+        """Right before the overlap executor loop starts, on every rank; must not raise."""
+
+    def at_shutdown(self) -> None:
+        """When the executor loop has completed, during cleanup; must not raise."""
+
+
 @dataclass(frozen=True)
 class RuntimeHooks:
     """The step-loop hooks a model opts into. All off by default."""
@@ -153,6 +181,8 @@ class RuntimeHooks:
     # Pack a decode step's small host-to-device input copies into one upload and
     # one scatter launch, issued just before the CUDA graph replay.
     pack_step_inputs: bool = False
+    decode_prologue: Optional[DecodePrologue] = None
+    executor_events: Optional[ExecutorEvents] = None
     # Skip host-to-device metadata copies whose values the destination already holds.
     skip_unchanged_h2d: bool = False
     # Run the overlap executor loop with the execution stream current, so the

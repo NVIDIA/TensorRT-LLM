@@ -60,7 +60,6 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import (
     Any,
     Callable,
@@ -159,7 +158,6 @@ from .ops import msa_kv_update as _msa_kv_update_kernel
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_attn_c1 import m3_attn_c1
 from .ops.attention.m3_attn_mega import m3_attn_mega
-from .ops.attention.m3_dense_decode import m3_dense_decode
 from .ops.attention.m3_draft_attention import m3_draft_attention
 from .ops.attention.m3_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
 from .ops.attention.m3_fused_decode_attn import m3_fused_decode_attn
@@ -245,13 +243,6 @@ DECODE_PLANS = (
     DecodePlan("small", 16, attn_mc_ar=True, moe_mc_ar=True, qkv_prequant=True),
     DecodePlan("verify", DECODE_MAX_TOKENS, attn_mc_ar=True, moe_mc_ar=True, qkv_prequant=True),
 )
-
-# The dense layers' decode attention (trtllm-gen, msa_decode.dense_decode_max_seq_len): the max_seq_len it is handed
-# per request count. It only sizes the multi-CTA KV split (every CTA still covers its share of the actual length; the
-# result changes only by the split-merge order), and the model maximum over-splits AgentX-length caches at one
-# request: GB300 TP4, 16 heads, FP8 KV, 64K context: 15.1 us at 16K vs 28.6 us at 1M. Two requests are neutral (the
-# grid is unchanged) and keep the step's bound.
-DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH: Mapping[int, int] = MappingProxyType({1: 16384})
 
 # The sparse layers' NVFP4 QKV + indexer producer (ops/attention/m3_producer, every step its geometry fits) triggers its
 # dependent kernel on entry, so the index scorer launches and stages its pre-wait loads while the producer runs (its
@@ -535,14 +526,6 @@ SHARD_ACCEPT = RowRange(
     lambda spec: ((spec["draft_len"], spec["nreq"]),),
 )
 
-# Requests of a decode step whose dense-layer attention runs at a capped KV split.
-DENSE_DECODE_SPLIT = RowRange(
-    "m3_dense_decode",
-    frozenset(DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH),
-    m3_dense_decode,
-    lambda spec: (len(spec["kv_lens"]),) if spec["capped"] else (),
-)
-
 # Verify rows of a fused-verify step whose target logits come from the coded head.
 TARGET_HEAD = RowRange(
     "m3_target_head",
@@ -575,7 +558,6 @@ FAST_PATHS: Tuple[RowRange, ...] = (
     ATTN_MEGA,
     ATTN_C1,
     FUSED_DECODE_ATTN,
-    DENSE_DECODE_SPLIT,
     SPARSE_DECODE_PRODUCER,
     PRODUCER,
     INDEX_SCORE,
@@ -1781,9 +1763,6 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
                 raise ValueError(
                     f"layer {i}: expected the MiniMax-M3 MSA backend, got {type(backend).__name__}"
                 )
-            if i not in self.sparse_layers:
-                # The KV split trtllm-gen dense decode runs at, per request count.
-                backend.dense_decode_max_seq_len_by_batch = DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH
             self.attn.append(backend)
 
         # Built once the weights are real (``post_load_weights``): the KV (Q, K, V) scales, the MoE scalars, the

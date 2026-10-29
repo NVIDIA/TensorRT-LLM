@@ -28,6 +28,8 @@ from typing import Iterator, Optional
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
+
 from . import step_inputs
 
 
@@ -38,7 +40,7 @@ class H2DSkipCache:
         # Device storage address -> (the storage, kept alive so the address is not reused; the view key; the host
         # values). Keyed by storage rather than by view base: tensors made under inference mode do not record their
         # base.
-        self._shadow: dict[int, tuple[object, tuple, torch.Tensor]] = {}
+        self._shadow: dict[int, tuple[object, tuple, DeviceCopyBuffer]] = {}
         # Device storage address -> (the storage, kept alive as above; the view key; (first row, value) of the view's
         # last tail fill).
         self._tails: dict[int, tuple[object, tuple, tuple[int, int]]] = {}
@@ -57,19 +59,17 @@ class H2DSkipCache:
             return True
         key = (dst.storage_offset(), tuple(dst.shape), tuple(dst.stride()), dst.dtype)
         entry = self._shadow.get(addr)
-        if (
-            entry is not None
-            and entry[1] == key
-            and entry[2].dtype == src.dtype
-            and entry[2].shape == src.shape
-            and torch.equal(entry[2], src)
-        ):
+        if entry is not None and entry[1] == key and entry[2].matches(src, exact=True):
             return False
+        buffer = entry[2] if entry is not None and entry[1] == key else DeviceCopyBuffer(dst)
+        buffer.invalidate()
+        self._shadow.pop(addr, None)
         if pack:
             step_inputs.copy_(dst, src)
         else:
             dst.copy_(src, non_blocking=True)
-        self._shadow[addr] = (storage, key, src.clone())
+        buffer.record(src)
+        self._shadow[addr] = (storage, key, buffer)
         return True
 
     def fill_tail(self, buf: torch.Tensor, start: int, value: int) -> None:

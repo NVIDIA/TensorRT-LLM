@@ -200,8 +200,6 @@ def test_the_thresholds_are_the_kernels() -> None:
     assert dispatch.INDEX_SCORE_EARLY_MAX_REQUESTS == 0
     assert dispatch.FC_EARLY_MAX_ROWS == 0
     assert dispatch.LC8_PREWAIT_MAX_ROWS == 8
-    assert dict(dispatch.DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH) == {1: 16384}
-    assert dict(dispatch.DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH) == {1: 16384}
 
 
 def test_no_fast_path_quantizes_a_bf16_head_or_the_drafter() -> None:
@@ -318,11 +316,6 @@ def test_the_index_scorer_runs_its_prefetching_schedule_only() -> None:
     for cell in dispatch.INDEX_SCORE.entry.CELLS:
         assert not cell.spec["early"]
         assert len(cell.spec["seq_lens"]) > dispatch.FUSED_SCORE_SELECT_MAX_REQUESTS
-
-
-def test_the_drafter_decode_split_is_capped_at_one_request() -> None:
-    assert dispatch.DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH[1] == 16384
-    assert 2 not in dispatch.DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH
 
 
 # ------------------------------------------------------------------ the long-context sparse decode (lc8)
@@ -725,9 +718,8 @@ def test_draft_linear_on_a_batched_activation_is_uncovered(monkeypatch, log) -> 
     assert len(log.info) == 1 and not log.warning
 
 
-def test_prebuild_drafter_linears_caps_the_drafter_attention(monkeypatch) -> None:
-    """The drafter attention gets ``DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH`` and every covered drafter linear call is
-    compiled before warmup; without a drafter nothing is built."""
+def test_prebuild_drafter_linears(monkeypatch) -> None:
+    """Covered drafter linear calls compile before warmup; without a drafter nothing is built."""
     built = []
     monkeypatch.setattr(dispatch, "_prebuild_draft_lowm", lambda dm: built.append(dm) or 17)
     worker = dispatch.M3Eagle3Worker.__new__(dispatch.M3Eagle3Worker)
@@ -736,7 +728,6 @@ def test_prebuild_drafter_linears_caps_the_drafter_attention(monkeypatch) -> Non
     drafter = SimpleNamespace(attn=attn)
     assert worker.prebuild_drafter_linears(drafter) == 17
     assert built == [drafter]
-    assert attn.dense_decode_max_seq_len_by_batch is dispatch.DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH
 
 
 # ------------------------------------------------------------------ the fused draft loop's preconditions

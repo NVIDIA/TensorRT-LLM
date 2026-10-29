@@ -33,7 +33,8 @@ if TYPE_CHECKING:
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .sparse.dsa.metadata import TokenMajorGenView
 
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
+                                 maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
@@ -1699,16 +1700,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             runtime_draft_len + 1)
 
     def is_sm_version_trtllm_gen_kernel(self, sm):
-        return not (sm < 100 or sm in [120, 121])
+        return is_sm_100f(sm)
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
+    # FMHA library classes this instance tries before the registry's libraries.
+    prepended_fmha_lib_classes: tuple = ()
 
     @staticmethod
     def is_sm_version_trtllm_gen_kernel(sm):
-        return not (sm < 100 or sm in [120, 121])
+        return is_sm_100f(sm)
 
     def __init__(
         self,
@@ -1758,8 +1761,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.is_mla_enable = mla_params is not None
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
-                and get_sm_version() in (120, 121)
-                and self.kv_cache_dtype != "fp8_ds_mla"):
+                and is_sm_120f() and self.kv_cache_dtype != "fp8_ds_mla"):
             raise ValueError(
                 "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
                 "kv_cache_config.dtype='fp8_ds_mla'.")
@@ -1907,9 +1909,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return CSA2TrtllmAttention.runtime_workspace_bytes_per_token(
                 model_config, mapping)
 
+        sm_version = get_sm_version()
         fp8_context_mla = (quant_config is not None
                            and quant_config.quant_mode.has_fp8_kv_cache()
-                           and get_sm_version() in (90, 100, 103, 107, 120))
+                           and (sm_version == 90 or is_sm_100f(sm_version)
+                                or is_sm_120f(sm_version)))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
@@ -1921,12 +1925,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
         #     so those layers still run dense MLA. The workspace is shared, so one dense layer forces the
         #     reserve.
-        #   * SM 100 / 103 / 107 -- mUseTllmGen is `sm >= 100 && sm != 120 && sm != 121`.
+        #   * SM 100 family -- where mUseTllmGen is true.
         #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
         # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
-                      and get_sm_version() in (100, 103, 107))
+                      and is_sm_100f())
         short_seq_mha_enabled = int(
             os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled

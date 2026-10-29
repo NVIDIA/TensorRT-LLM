@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The dense layers' decode attention (trtllm-gen over the full page table) with the KV split this target sizes per
-request count (``dispatch.DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH``)."""
+"""The dense layers' decode attention over the full page table with valid sequence-length bounds."""
 
 from __future__ import annotations
 
@@ -23,9 +22,8 @@ __all__ = ["m3_dense_decode"]
 HEADS = 16
 KV_HEADS = 1
 HEAD_DIM = 128
-#: The split this target hands trtllm-gen at one request (dispatch.DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH), and a model
-#: maximum the in-tree step passes otherwise.
-CAPPED = 16384
+#: Valid upper bounds used to compare short-context and model-maximum dispatch.
+SHORT_BOUND = 16384
 MODEL_MAX = 1 << 20
 
 
@@ -82,39 +80,35 @@ def gather_paged_kv(
 
 
 class M3DenseDecode(OpWrapper):
-    """``minimax_m3_trtllm_gen_dense_decode`` as ``MsaDecodeFmha`` calls it for a dense layer, with the max_seq_len
-    ``msa_decode.dense_decode_max_seq_len`` resolves: this target's per-request-count cap, else the step's bound.
+    """Decode over each request's full causal context in the paged FP8 pool.
 
-    Decode attention of every query row over its request's full causal context in the paged FP8 pool, written into
-    ``output`` (BF16 [T, heads, head_dim]) in place. ``max_seq_len`` only sizes trtllm-gen's multi-CTA KV split:
-    every CTA still covers its share of each request's actual length, which may exceed it.
+    The sequence-length bound covers every request and the BF16 output is written in place.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="one request verifying 1 + 3 rows over a 20000-token context, the split sized for 16384",
-            spec=dict(kv_lens=(20000,), qlen=4, max_seq_len=CAPPED, capped=True),
+            why="one request verifying 1 + 3 rows over a 20000-token context, its full sequence-length bound",
+            spec=dict(kv_lens=(20000,), qlen=4, max_seq_len=20000, tight_bound=True),
         ),
         Cell(
-            why="one request, one row, over a 65536-token context (an AgentX-length cache) at the capped split",
-            spec=dict(kv_lens=(65536,), qlen=1, max_seq_len=CAPPED, capped=True),
+            why="one request, one row, over a 65536-token context with its full sequence-length bound",
+            spec=dict(kv_lens=(65536,), qlen=1, max_seq_len=65536, tight_bound=True),
         ),
         Cell(
-            why="one request verifying 1 + 3 rows over a 3000-token context: the cap above the length",
-            spec=dict(kv_lens=(3000,), qlen=4, max_seq_len=CAPPED, capped=True),
+            why="one request verifying 1 + 3 rows over a 3000-token context: an upper bound above the length",
+            spec=dict(kv_lens=(3000,), qlen=4, max_seq_len=SHORT_BOUND, tight_bound=True),
         ),
         Cell(
-            why="two requests keep the model maximum (no cap at two requests)",
-            spec=dict(kv_lens=(20000, 5000), qlen=4, max_seq_len=MODEL_MAX, capped=False),
+            why="two requests with the model maximum as the upper bound",
+            spec=dict(kv_lens=(20000, 5000), qlen=4, max_seq_len=MODEL_MAX, tight_bound=False),
         ),
     )
 
     note = """
-    The split only reorders the merge of the CTAs' partial softmax sums, so the capped split's output is the uncapped
-    one's to a few BF16 ulps (the test holds it there), and both are held to the fp32 reference within the FP8-KV
-    band of the in-tree dense decode test.
+    Outputs at two valid sequence-length bounds agree to a few BF16 ulps and both match the fp32
+    reference within the FP8-KV tolerance of the in-tree dense decode test.
     """
 
     def __call__(
@@ -180,6 +174,7 @@ class M3DenseDecode(OpWrapper):
     ) -> None:
         # The multi-CTA KV counters are sized for max_num_requests: more requests overrun them.
         assert seq_lens.shape[0] <= max_num_requests, "more requests than the counters cover"
+        assert bool((seq_lens <= max_seq_len).all()), "sequence length exceeds its bound"
         # Each verify row attends a causal prefix of at least one key.
         assert bool((seq_lens >= decode_query_len).all()), "a request shorter than its query rows"
 

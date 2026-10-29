@@ -243,7 +243,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
         xqaParams.kv_cache_data_type = xqaParams.data_type;
     }
     if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && (mSM < kSM_90 || mSM > kSM_120)))
+        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
     {
         xqaParams.multi_block_mode = false;
     }
@@ -2958,22 +2958,22 @@ int AttentionOp::initialize() noexcept
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || tc::isSM100Family(mSM) || mSM == 120 || mSM == 121,
-            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100f, sm_120 or sm_121.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || tc::isSM100Family(mSM) || tc::isSM120Family(mSM),
+            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100f or sm_120f.");
     }
 
     // Pre-Check of FP8 Generation MLA.
     if (mFP8GenerationMLA)
     {
         TLLM_CHECK_WITH_INFO(mIsMLAEnabled, "FP8 Generation MLA cannot be enabled because MLA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || tc::isSM100Family(mSM) || mSM == 120 || mSM == 121,
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || tc::isSM100Family(mSM) || tc::isSM120Family(mSM),
             "FP8 Generation MLA is supported on Ada, Hopper or Blackwell architecture.");
     }
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || tc::isSM100Family(mSM) || mSM == 120 || mSM == 121,
-        "fuse_fp4_quant only supports SM100f or SM120 or SM121 devices.");
+    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || tc::isSM100Family(mSM) || tc::isSM120Family(mSM),
+        "fuse_fp4_quant only supports SM100f or SM120f devices.");
 
     // Check requirements for FP4 KV cache.
     TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA || mUseNvfp4MlaKvCache,
@@ -3189,7 +3189,7 @@ int AttentionOp::initialize() noexcept
         // Deepseek-V2 Generation needs a differ fmha with different argumments
         if (mIsMLAEnabled)
         {
-            mEnableXQA = (mSM == kSM_120) && mIsGenerationMLA;
+            mEnableXQA = tc::isSM120Family(mSM) && mIsGenerationMLA;
             if (mUseTllmGen)
             {
                 Data_type qDataType = DATA_TYPE_FP32;

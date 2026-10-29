@@ -275,6 +275,30 @@ def test_a_step_with_contexts_always_copies_and_resets_the_record(manager, base_
     assert base_copy.call_count == 4
 
 
+def test_a_failed_block_copy_does_not_leave_a_valid_record(manager, base_copy):
+    host = _block_table_host(manager)
+    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    dst = torch.zeros_like(host)
+    _decode_copy(manager, dst)
+    base_copy.side_effect = RuntimeError("copy failed")
+    with pytest.raises(RuntimeError, match="copy failed"):
+        _decode_copy(manager, dst, request_ids=(1, 0))
+    base_copy.side_effect = None
+    _decode_copy(manager, dst)
+    assert base_copy.call_count == 3
+
+
+def test_a_different_destination_view_requires_a_new_copy(manager, base_copy):
+    host = _block_table_host(manager)
+    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=True, reuse_pool_views=False)
+    storage = torch.zeros(2 * host.numel(), dtype=host.dtype)
+    first = storage[: host.numel()].view_as(host)
+    second = storage[host.numel() :].view_as(host)
+    for dst in (first, second, first):
+        _decode_copy(manager, dst)
+    assert base_copy.call_count == 3
+
+
 # ---------------------------------------------------------------------------
 # Pool-view shortcut
 # ---------------------------------------------------------------------------

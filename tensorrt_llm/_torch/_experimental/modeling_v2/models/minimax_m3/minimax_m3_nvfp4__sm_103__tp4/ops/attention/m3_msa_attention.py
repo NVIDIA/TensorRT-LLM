@@ -27,7 +27,7 @@ class M3MsaAttention(OpWrapper):
       top-k blocks; the FMHA attends those blocks. Otherwise the FMHA attends the whole page table.
 
     The FMHA dispatches on the step's metadata (context rows: the MSA prefill FMHA; generation rows: the MSA decode
-    FMHA, the dense layers' trtllm-gen decode at their capped KV split). ``backend`` and ``metadata`` are the runtime's
+    FMHA, the dense layers' trtllm-gen decode over their full context). ``backend`` and ``metadata`` are the runtime's
     objects for this layer and step.
     """
 

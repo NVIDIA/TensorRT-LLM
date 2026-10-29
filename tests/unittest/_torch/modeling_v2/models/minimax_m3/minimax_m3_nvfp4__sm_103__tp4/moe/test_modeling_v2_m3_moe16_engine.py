@@ -11,7 +11,9 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.moe.m3_moe16_engine import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.m3_moe.op16 import (  # noqa: E501
+    M16_NUM_CTAS,
+    SHARED_CTAS,
     M3Moe16State,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.moe.m3_moe16_engine import (  # noqa: E501
@@ -32,6 +34,9 @@ _STATES = {}
 
 
 def _state(m: int) -> M3Moe16State:
+    sms = torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
+    if sms < M16_NUM_CTAS + SHARED_CTAS:
+        pytest.skip(f"m3_moe16 needs {M16_NUM_CTAS + SHARED_CTAS} resident SMs; device has {sms}")
     if m not in _STATES:
         _STATES[m] = M3Moe16State(torch.device("cuda"), num_tokens=m)
     return _STATES[m]
@@ -56,3 +61,11 @@ def test_certified_cells(cell, case) -> None:
 @pytest.mark.parametrize("m", (9, 13))
 def test_routed_part_is_trtllm_gen_bit_for_bit(m) -> None:
     check_routed_part(op, _state(m), m, seed=100 + m)
+
+
+def test_insufficient_sm_budget_is_rejected() -> None:
+    device = torch.device("cuda")
+    if torch.cuda.get_device_properties(device).multi_processor_count >= M16_NUM_CTAS + SHARED_CTAS:
+        pytest.skip("device has enough SMs for the MoE16 schedule")
+    with pytest.raises(ValueError, match="routed CTAs"):
+        M3Moe16State(device, num_tokens=9)

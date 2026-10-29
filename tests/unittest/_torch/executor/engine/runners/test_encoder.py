@@ -1,8 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import pytest
@@ -27,6 +31,11 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, EncodeExtraInputSpec
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from tensorrt_llm._torch.attention.backends.interface import AttentionBackend
 
 pytestmark = pytest.mark.cpu_only
 
@@ -203,7 +212,7 @@ def test_multi_item_batch_stays_eager_even_when_a_graph_is_available() -> None:
     runner = object.__new__(EncoderRunner)
 
     @contextmanager
-    def pad_batch(inputs, batch_size):
+    def pad_batch(inputs: dict[str, object], batch_size: int) -> Iterator[dict[str, object]]:
         yield dict(inputs)
 
     graph_runner = SimpleNamespace(
@@ -286,7 +295,9 @@ def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
     )
 
 
-def _graph_enabled_runner(*, attention_backend=TrtllmAttention) -> EncoderRunner:
+def _graph_enabled_runner(
+    *, attention_backend: type[AttentionBackend] = TrtllmAttention
+) -> EncoderRunner:
     """An EncoderRunner whose graph runner is enabled but has no declared extra inputs."""
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = SimpleNamespace(
@@ -369,7 +380,7 @@ def test_encoder_capture_runs_warmup_then_capture_and_restores_phase() -> None:
     events: list[bool] = []
 
     @contextmanager
-    def allow_capture():
+    def allow_capture() -> Iterator[None]:
         yield
 
     runner = object.__new__(EncoderRunner)
@@ -394,7 +405,7 @@ def test_token_graph_capture_and_replay_enter_moe_iteration_context() -> None:
     capture_forward_calls: list[dict[str, object]] = []
 
     @contextmanager
-    def moe_context(balance: object | None):
+    def moe_context(balance: object | None) -> Iterator[None]:
         context_balancers.append(balance)
         yield
 
@@ -407,12 +418,16 @@ def test_token_graph_capture_and_replay_enter_moe_iteration_context() -> None:
             return True
 
         @staticmethod
-        def capture(key, forward, inputs):
+        def capture(
+            key: tuple[int, int, int],
+            forward: Callable[[dict[str, object]], dict[str, torch.Tensor]],
+            inputs: dict[str, object],
+        ) -> dict[str, torch.Tensor]:
             capture_forward_calls.append(inputs)
             return forward(inputs)
 
         @staticmethod
-        def replay(key, inputs):
+        def replay(key: tuple[int, int, int], inputs: dict[str, object]) -> dict[str, torch.Tensor]:
             return {"logits": torch.tensor([[2.0]])}
 
     runner = object.__new__(EncoderRunner)

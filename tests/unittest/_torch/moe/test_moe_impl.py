@@ -1198,7 +1198,7 @@ _CUTLASS_DECLARATIONS = (
     ),
     pytest.param(
         TrtllmTritonFp8BlockScalesImpl,
-        {120},
+        {120, 121},
         {torch.bfloat16},
         (False, False),
         (False, False),
