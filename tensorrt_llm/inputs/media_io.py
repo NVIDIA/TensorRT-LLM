@@ -1002,6 +1002,31 @@ def read_allowed_local_media(url: str) -> bytes:
     return data
 
 
+def log_allowed_local_media_path() -> None:
+    """Log the local media policy once, at server start.
+
+    Unset ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` is the default and is not
+    logged. A value that is not a directory is reported here, since every
+    request naming a local file would otherwise fail with a generic error
+    while the operator sees nothing at startup.
+    """
+    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    if not allowed_root:
+        return
+    if os.path.isdir(os.path.realpath(allowed_root)):
+        logger.info(
+            "Request media may name local files under %r (%s).",
+            allowed_root,
+            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+        )
+    else:
+        logger.warning(
+            "%s=%r is not a directory; every request naming a local media file will be refused.",
+            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            allowed_root,
+        )
+
+
 def _check_media_size(size: int, max_bytes: int) -> None:
     if size > max_bytes:
         raise ValueError(f"Media input exceeds maximum allowed size of {max_bytes} bytes.")
