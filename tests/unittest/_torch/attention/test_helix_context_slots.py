@@ -83,3 +83,51 @@ def test_helix_context_slots_reset(phase: str) -> None:
         metadata.kv_cache_manager.mapping = Mapping()
     TrtllmAttentionMetadata._prepare_helix_context_slots(metadata, cached)
     assert metadata.helix_context_local_slots is None
+
+
+@pytest.mark.parametrize("phase", ["decode", "no_cp"])
+def test_helix_context_slots_metadata_reuse(phase: str) -> None:
+    """The host planner clears and recomputes slots on the same metadata object."""
+    cp_size, rank, page = 2, 1, 16
+    metadata = _metadata(cp_size, rank, page)
+    mapping = metadata.kv_cache_manager.mapping
+    positions = metadata.helix_position_offsets.clone()
+    inactive = metadata.helix_is_inactive_rank.clone()
+
+    def check_slots(cached: torch.Tensor) -> None:
+        TrtllmAttentionMetadata._prepare_helix_context_slots(metadata, cached)
+        expected = []
+        for prefix, length in zip(
+            cached[: metadata.num_contexts].tolist(),
+            metadata.seq_lens[: metadata.num_contexts].tolist(),
+        ):
+            owned = [g for g in range(prefix + length) if (g // page) % cp_size == rank]
+            local = {position: slot for slot, position in enumerate(owned)}
+            expected.extend(local.get(g, -1) for g in range(prefix, prefix + length))
+        torch.testing.assert_close(
+            metadata.helix_context_local_slots, torch.tensor(expected, dtype=torch.int32)
+        )
+        torch.testing.assert_close(metadata.helix_position_offsets, positions)
+        torch.testing.assert_close(metadata.helix_is_inactive_rank, inactive)
+
+    cached = torch.tensor([0] * metadata.num_contexts + [5, 7], dtype=torch.int32)
+    check_slots(cached)
+
+    if phase == "decode":
+        metadata.num_contexts = 0
+        metadata.num_ctx_tokens = 0
+        metadata.seq_lens = torch.tensor([1, 2], dtype=torch.int32)
+        cached = cached[-2:]
+    else:
+        metadata.kv_cache_manager.mapping = Mapping()
+    TrtllmAttentionMetadata._prepare_helix_context_slots(metadata, cached)
+    assert metadata.helix_context_local_slots is None
+    torch.testing.assert_close(metadata.helix_position_offsets, positions)
+    torch.testing.assert_close(metadata.helix_is_inactive_rank, inactive)
+
+    lengths = [3, 0, 19]
+    metadata.num_contexts = len(lengths)
+    metadata.num_ctx_tokens = sum(lengths)
+    metadata.seq_lens = torch.tensor(lengths + [1, 2], dtype=torch.int32)
+    metadata.kv_cache_manager.mapping = mapping
+    check_slots(torch.tensor([15, 16, 33, 5, 7], dtype=torch.int32))

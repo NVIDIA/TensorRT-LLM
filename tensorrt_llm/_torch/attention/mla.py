@@ -1223,6 +1223,10 @@ class MLA(nn.Module):
         )
         if append_owned_kv:
             assert isinstance(self.mha, TrtllmAttention)
+            if self.mha.uses_fp4_mla_attention:
+                raise NotImplementedError(
+                    "Owner-only Helix prefill does not support dense FP4 MLA KV cache"
+                )
             assert latent_cache is not None
             self.mha.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
             k_pe = latent_cache[:, self.kv_lora_rank :]
