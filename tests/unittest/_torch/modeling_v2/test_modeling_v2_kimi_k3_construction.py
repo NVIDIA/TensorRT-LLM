@@ -3,6 +3,7 @@
 """The Kimi K3 targets' construction checks, host-side: each target requires its own parallel layout, and
 ``tp16_moetp16ep1`` also an explicit expert split and no speculative decoding."""
 
+import inspect
 import types
 
 import pytest
@@ -21,6 +22,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
     spec_worker as spec_b,
 )
 from tensorrt_llm._torch.models import modeling_kimi_linear as shared
+from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -89,23 +91,26 @@ def test_expert_ckpt_spec_meets_the_shared_loader_contract(target):
 
 
 @pytest.mark.parametrize("target", [spec_a, spec_b], ids=["tp16_moetp4ep4", "tp16_moetp16ep1"])
-def test_dspark_refine_block_logits_passes_spec_metadata(target, monkeypatch):
+def test_dspark_markov_bias_meets_the_shared_worker_contract(target, monkeypatch):
+    worker_cls = target.KimiK3DSparkWorker
+    assert inspect.signature(worker_cls._apply_dspark_markov_bias) == inspect.signature(
+        DSparkWorker._apply_dspark_markov_bias
+    )
     calls = []
     monkeypatch.setattr(
-        target.KimiK3DSparkWorker,
+        DSparkWorker,
         "_apply_dspark_markov_bias",
-        lambda self, *args: calls.append(args) or "biased",
+        lambda self, *args: calls.append(args) or "shared",
     )
-    worker = target.KimiK3DSparkWorker.__new__(target.KimiK3DSparkWorker)
-    draft_model = types.SimpleNamespace(has_markov_head=True)
-    spec_metadata = object()
-    out = worker._refine_block_logits(
-        draft_model, "logits", {"first_prev_tokens": "prev"}, spec_metadata
+    worker = worker_cls.__new__(worker_cls)
+    worker._k3_sharded_block_logits = False
+    draft_model = types.SimpleNamespace(has_markov_head=True, markov_w2=torch.empty(8, 2))
+    logits = torch.zeros(1, 2, 8)
+    prev = torch.zeros(1, dtype=torch.long)
+    assert worker._refine_block_logits(draft_model, logits, {"first_prev_tokens": prev}, None) == (
+        "shared"
     )
-    assert out == "biased"
-    assert calls == [(draft_model, "logits", "prev", spec_metadata)]
-    no_head = types.SimpleNamespace(has_markov_head=False)
-    assert worker._refine_block_logits(no_head, "logits", {}, spec_metadata) == "logits"
+    assert calls == [(draft_model, logits, prev)]
 
 
 def test_tp16_moetp16ep1_requires_the_split_set_explicitly():
