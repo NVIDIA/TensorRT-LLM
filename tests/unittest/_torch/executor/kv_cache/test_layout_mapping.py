@@ -466,11 +466,38 @@ def test_model_layers_named_by_other_layers_are_refused():
     doubled = _with_group(
         layout(topology, (8, 10), [("key", kv(4), "attention")]), model_layers=(4, 5)
     )
-    with pytest.raises(ValueError, match=r"model layer 4 named \[8\] against \[4\]"):
+    with pytest.raises(
+        ValueError, match=r"model layer 4's key buffers in layers \[8\] against \[4\]"
+    ):
         check_compatible(doubled, plain)
-    with pytest.raises(ValueError, match=r"model layer 5 named \[5\] against \[10\]"):
+    with pytest.raises(
+        ValueError, match=r"model layer 5's key buffers in layers \[5\] against \[10\]"
+    ):
         check_compatible(plain, doubled)
     check_compatible(doubled, doubled)
+
+
+def test_a_role_one_side_alone_transfers_leaves_the_model_layer_s_others_paired():
+    """A CSA2 context-only worker keeps no sliding cache past its split: its boundary layer 20
+    holds only the global cache, layer 61, where the generation worker holds both, 60 and 61, and
+    rebuilds the sliding one. The global cache pairs; the sliding one is the receiver's own."""
+    topology = Instance().ranks(0)[0]
+    both = layout(topology, (60, 61), [("swa", kv(4), "attention"), ("global", kv(4), "attention")])
+    full = _with_group(
+        dataclasses.replace(
+            both,
+            buffers=tuple(
+                b for b in both.buffers if (b.layer, b.role) in {(60, "swa"), (61, "global")}
+            ),
+        ),
+        model_layers=(20, 20),
+    )
+    context_only = _with_group(
+        layout(topology, (61,), [("global", kv(4), "attention")]), model_layers=(20,)
+    )
+    check_compatible(context_only, full)
+    check_compatible(full, context_only)
+    assert {(r.dst.layer, r.dst.role) for r in map_buffers(context_only, full)} == {(61, "global")}
 
 
 def test_layer_groups_keeping_other_windows_correspond():

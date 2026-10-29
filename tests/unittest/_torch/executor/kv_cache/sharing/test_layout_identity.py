@@ -1312,7 +1312,9 @@ def test_mixed_precision_names_a_model_layer_alike_on_every_pipeline_stage():
         check_compatible(pages["whole"], plain)
     # A plain stage sharing no layer id with the mixed one it pairs with.
     plain_last = mixed_precision_stage([2, 3], mixed=False).get_page_table().page_layout
-    with pytest.raises(ValueError, match=r"model layer 2 named \[4\] against \[2\]"):
+    with pytest.raises(
+        ValueError, match=r"model layer 2's key buffers in layers \[4\] against \[2\]"
+    ):
         check_compatible(pages["last"], plain_last)
 
 
