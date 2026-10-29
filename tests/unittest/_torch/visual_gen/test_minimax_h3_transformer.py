@@ -1749,7 +1749,11 @@ def test_forward_with_resolved_layout_matches_eager() -> None:
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
 
     torch.manual_seed(0)
-    model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config())
+    # TRT-LLM Linears allocate their parameters uninitialised; an exact comparison needs
+    # defined weights (NaN never compares equal).
+    _initialize_diffusers_golden_weights(model)
+    model = model.to("cuda")
     inputs = _layout_key_inputs(torch.tensor([1, 1, 0, 0, 2]), device="cuda")
     inputs["encoder_hidden_states"] = torch.randn(1, 2, _TINY_CONFIG["text_dim"], device="cuda")
     with torch.inference_mode():
