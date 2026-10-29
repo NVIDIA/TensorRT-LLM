@@ -71,6 +71,8 @@ struct LamportComm
     {
         counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
         flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
+        // Bytes the previous Lamport kernel wrote to its sub-buffer. Every Lamport kernel on this workspace reads and
+        // writes it, whatever its dtype, so it stays in bytes.
         clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
         flag_value = *flag_ptr;
         auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
@@ -465,7 +467,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
     }
 #endif
     LamportComm<NRanks> comm(params.workspace, params.rank);
-    int clear_access = comm.clear_size / kElemsPerAccess<DType>;
+    int clear_access = static_cast<int>(comm.clear_size / sizeof(float4));
 
     for (int idx = access_id; idx < tot_access; idx += access_stride)
     {
@@ -514,7 +516,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
         fused_op(sum_val, tidx);
     }
 
-    comm.update(params.size * NRanks);
+    comm.update(params.size * NRanks * sizeof(DType));
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (TriggerCompletionAtEnd)
