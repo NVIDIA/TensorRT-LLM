@@ -324,8 +324,9 @@ class PrimsTSFmha(PhasedFmha):
             return False, "sparse attention metadata is not supported."
         if meta.num_sparse_topk > 0:
             return False, "sparse attention metadata is not supported."
+        is_mla = attn.is_mla_enable
         is_mla_generation = (
-            attn.is_mla_enable and fwd.attention_input_type == AttentionInputType.generation_only
+            is_mla and fwd.attention_input_type == AttentionInputType.generation_only
         )
         feature_reason = get_attention_feature_unsupported_reason(
             meta, fwd, allow_helix=is_mla_generation
@@ -347,11 +348,15 @@ class PrimsTSFmha(PhasedFmha):
         if mask_type not in (AttentionMaskType.causal, AttentionMaskType.padding):
             return False, f"attention mask type {mask_type} is not supported."
         policy_reason = get_paged_kv_policy_unsupported_reason(
-            attn, meta, allow_fp8_kv_cache=True, allow_linear_mla=is_mla_generation
+            attn,
+            meta,
+            allow_fp8_kv_cache=True,
+            allow_linear_mla=is_mla
+            and fwd.attention_input_type
+            in (AttentionInputType.context_only, AttentionInputType.generation_only),
         )
         if policy_reason is not None:
             return False, policy_reason
-        is_mla = attn.is_mla_enable
         is_fp8_kv = QuantMode(attn.quant_mode).has_fp8_kv_cache()
         is_fp8_mla = is_mla and is_fp8_kv
 

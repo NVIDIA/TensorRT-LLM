@@ -335,6 +335,95 @@ def test_supports_mla_context(num_heads: int, fp8: bool) -> None:
     assert supported, reason
 
 
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("spec_flags", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    "mask,store_stats,kv_len",
+    [
+        (PredefinedAttentionMask.CAUSAL, False, 4),
+        (PredefinedAttentionMask.CAUSAL, True, 4),
+        (PredefinedAttentionMask.FULL, True, 4),
+        (PredefinedAttentionMask.FULL, True, 0),
+    ],
+    ids=["fresh", "final-chunk", "cached-chunk", "empty-cached-chunk"],
+)
+def test_supports_linear_mla_context(
+    fp8: bool,
+    spec_flags: tuple[bool, bool],
+    mask: PredefinedAttentionMask,
+    store_stats: bool,
+    kv_len: int,
+) -> None:
+    supported, reason = _support_result(
+        attention_input_type=AttentionInputType.context_only,
+        head_dim=192,
+        is_mla=True,
+        num_heads=96,
+        num_kv_heads=96,
+        has_separate_kv=True,
+        tokens_per_block=128,
+        kv_dtype=DataType.FP8 if fp8 else DataType.BF16,
+        quant_mode=QuantMode.from_description(use_fp8_kv_cache=fp8),
+        metadata_overrides={
+            "is_spec_decoding_enabled": spec_flags[0],
+            "use_spec_decoding": spec_flags[1],
+        },
+        forward_overrides={
+            "attention_mask": mask,
+            "softmax_stats_tensor": _TensorSpec((4, 96, 2), torch.float32) if store_stats else None,
+        },
+        kv_lens_override=[kv_len],
+    )
+    assert supported, reason
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_reason",
+    [
+        ({"is_spec_dec_tree": True}, "tree speculative"),
+        ({"metadata_overrides": {"is_spec_dec_dynamic_tree": True}}, "tree speculative"),
+        ({"forward_overrides": {"attention_mask_data": torch.empty(1)}}, "custom attention"),
+        ({"helix": True}, "Helix parallelism"),
+        ({"attention_input_type": AttentionInputType.mixed}, "speculative decoding"),
+        (
+            {
+                "is_mla": False,
+                "head_dim": 128,
+                "num_kv_heads": 96,
+                "is_fused_qkv": True,
+                "has_separate_kv": False,
+            },
+            "speculative decoding",
+        ),
+        (
+            {
+                "kv_lens_override": [0],
+                "forward_overrides": {
+                    "attention_mask": PredefinedAttentionMask.FULL,
+                    "softmax_stats_tensor": None,
+                },
+            },
+            "at least one KV",
+        ),
+    ],
+)
+def test_rejects_unsupported_linear_mla_context(overrides: dict, expected_reason: str) -> None:
+    args = dict(
+        attention_input_type=AttentionInputType.context_only,
+        head_dim=192,
+        is_mla=True,
+        num_heads=96,
+        num_kv_heads=96,
+        has_separate_kv=True,
+        tokens_per_block=128,
+        use_spec_decoding=True,
+    )
+    args.update(overrides)
+    supported, reason = _support_result(**args)
+    assert not supported
+    assert expected_reason in reason
+
+
 @pytest.mark.parametrize("query_width", [1, 6, 8])
 @pytest.mark.parametrize("helix", [False, True])
 @pytest.mark.parametrize("page_size", [32, 128])
@@ -1084,34 +1173,44 @@ def test_sequence_lengths_are_live_source_view() -> None:
     torch.testing.assert_close(actual, torch.tensor([33, 65], dtype=torch.int32))
 
 
+@pytest.mark.parametrize("num_heads", [6, 96])
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("mask", [PredefinedAttentionMask.CAUSAL, PredefinedAttentionMask.FULL])
 def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     monkeypatch: pytest.MonkeyPatch,
+    num_heads: int,
+    fp8: bool,
+    mask: PredefinedAttentionMask,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    attn = _Attention(head_dim=192, is_mla=True, num_heads=6, num_kv_heads=6)
+    attn = _Attention(head_dim=192, is_mla=True, num_heads=num_heads, num_kv_heads=num_heads)
+    attn.quant_mode = QuantMode.from_description(use_fp8_kv_cache=fp8)
     attn._ensure_rope_table_size = Mock()
     attn.get_local_layer_idx = lambda _meta: 0
     attn.rotary_cos_sin = torch.empty(1)
     fmha = PrimsTSFmha(attn)
-    q = torch.empty(5, 6 * 192, dtype=torch.bfloat16)
-    k = torch.empty(9, 6 * 192, dtype=q.dtype)
-    v = torch.empty(9, 6 * 128, dtype=q.dtype)
+    q = torch.empty(5, num_heads * 192, dtype=torch.bfloat16)
+    k = torch.empty(9, num_heads * 192, dtype=q.dtype)
+    v = torch.empty(9, num_heads * 256, dtype=q.dtype)[:, num_heads * 128 :]
     qo_indptr = torch.tensor([0, 2, 5], dtype=torch.int32)
-    output = torch.empty(5, 6, 128, dtype=q.dtype)
-    stats = torch.empty(5, 6, 2)
+    output = torch.empty(5, num_heads, 128, dtype=q.dtype)
+    stats = torch.empty(5, num_heads, 2)
     meta = SimpleNamespace(
         mla_prepare_ctx_cu_seqlens=lambda: qo_indptr,
         max_seq_len=4096,
         kv_cache_block_offsets=torch.empty(2, 2, 64, dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.empty(1),
         host_kv_cache_pool_mapping=torch.zeros(1, 2, dtype=torch.int32),
+        is_spec_decoding_enabled=True,
+        use_spec_decoding=True,
     )
     workspace = torch.empty(fmha._mla_context_workspace_layout(q, k, 2)[1], dtype=torch.uint8)
     params = FmhaParams(
         attn=attn,
         meta=meta,
         fwd=AttentionForwardArgs(
-            attention_mask=PredefinedAttentionMask.FULL,
+            attention_input_type=AttentionInputType.context_only,
+            attention_mask=mask,
             softmax_stats_tensor=stats,
             is_fused_qkv=False,
         ),
@@ -1120,11 +1219,11 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
         key_input=k,
         value_input=v,
         output=output,
-        sequence_lengths=torch.tensor([7, 2], dtype=torch.int32),
+        sequence_lengths=torch.tensor([4, 5], dtype=torch.int32),
         batch_size=2,
         input_seq_length=3,
         max_past_kv_length=7,
-        tokens_per_block=64,
+        tokens_per_block=128,
         cyclic_attention_window_size=4096,
     )
     native_preprocess = Mock()
@@ -1134,22 +1233,30 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     monkeypatch.setattr(prims_context_module, "BatchPrefillTSWrapper", factory)
     fmha.run_mla_context(params)
     first_kv_offsets = wrapper.run.call_args.args[4].clone()
-    params.sequence_lengths.copy_(torch.tensor([2, 7], dtype=torch.int32))
+    params.sequence_lengths.copy_(torch.tensor([3, 6], dtype=torch.int32))
     qo_indptr.copy_(torch.tensor([0, 3, 5], dtype=torch.int32))
     fmha.run_mla_context(params)
     assert factory.call_count == wrapper.plan.call_count == 1
     assert native_preprocess.call_count == wrapper.run.call_count == 2
-    torch.testing.assert_close(first_kv_offsets, torch.tensor([0, 7, 9], dtype=torch.int32))
+    torch.testing.assert_close(first_kv_offsets, torch.tensor([0, 4, 9], dtype=torch.int32))
     torch.testing.assert_close(
-        wrapper.run.call_args.args[4], torch.tensor([0, 2, 9], dtype=torch.int32)
+        wrapper.run.call_args.args[4], torch.tensor([0, 3, 9], dtype=torch.int32)
     )
     assert wrapper.run.call_args.args[3] is qo_indptr
     assert wrapper.run.call_args.kwargs["softmax_stats"] is stats
     assert wrapper.run.call_args.kwargs["out"] is output
-    assert wrapper.run.call_args.args[1].shape == (9, 6, 192)
+    assert wrapper.run.call_args.args[1].shape == (9, num_heads, 192)
     assert wrapper.plan.call_args.kwargs["store_softmax_stats"]
-    assert wrapper.plan.call_args.kwargs["k_dtype"] == k.dtype
-    assert wrapper.plan.call_args.kwargs["v_dtype"] == v.dtype
+    processed_dtype = torch.float8_e4m3fn if fp8 else q.dtype
+    for name in ("q_dtype", "k_dtype", "v_dtype"):
+        assert wrapper.plan.call_args.kwargs[name] == processed_dtype
+    for tensor in wrapper.run.call_args.args[:3]:
+        assert tensor.dtype == processed_dtype
+    assert wrapper.plan.call_args.kwargs["mask_type"] == (
+        "causal" if mask == PredefinedAttentionMask.CAUSAL else "dense"
+    )
+    assert (wrapper.run.call_args.kwargs["scale_softmax_log2"] is not None) == fp8
+    assert (wrapper.run.call_args.kwargs["output_scale"] is not None) == fp8
     assert wrapper.run.call_args.kwargs["validate"] is False
 
 
