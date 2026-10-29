@@ -729,6 +729,8 @@ def make_scheduler(
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
+    never_mix_context_and_generation: bool = False,
+    min_decode_steps_between_context: int = 0,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -756,6 +758,8 @@ def make_scheduler(
             scheduler_capacity=scheduler_capacity,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             enable_recompute_pause=enable_recompute_pause,
+            never_mix_context_and_generation=never_mix_context_and_generation,
+            min_decode_steps_between_context=min_decode_steps_between_context,
             **kwargs,
         )
 
@@ -919,6 +923,94 @@ class TestTokenBudget:
         reqs = [make_gen_request(i) for i in range(5)]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 2  # budget limit first
+
+
+# ===========================================================================
+# Never-mix scheduling
+# ===========================================================================
+
+
+class TestNeverMix:
+    """SchedulerConfig.never_mix_context_and_generation: context and generation never share a step."""
+
+    def test_context_runs_alone_and_generation_gives_back_its_growth(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=110, never_mix_context_and_generation=True)
+        gen = make_gen_request(0)
+        gen.py_batch_idx = 3
+        reqs = [gen, make_ctx_request(1, context_remaining_length=100)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [1]
+        assert out.generation_requests == []
+        mgr.revert_allocate_generation.assert_called_once_with(gen)
+        # The deferred row reads its sampled token from the host next step.
+        assert gen.py_batch_idx is None
+
+    def test_context_gets_the_whole_token_budget(self):
+        # Mixed, the generation row would leave 99 tokens and the context would not fit.
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100, never_mix_context_and_generation=True)
+        reqs = [make_gen_request(0), make_ctx_request(1, context_remaining_length=100)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [1]
+        assert out.generation_requests == []
+
+    def test_generation_runs_when_no_context_fits(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100, never_mix_context_and_generation=True)
+        reqs = [make_gen_request(0), make_ctx_request(1, context_remaining_length=200)]
+        out = sched.schedule_request(reqs, set())
+        assert out.context_requests == []
+        assert ids(out.generation_requests) == [0]
+        mgr.revert_allocate_generation.assert_not_called()
+
+    def test_context_without_generation_is_unchanged(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=200, never_mix_context_and_generation=True)
+        reqs = [make_ctx_request(0, context_remaining_length=100)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+        mgr.revert_allocate_generation.assert_not_called()
+
+    def test_off_by_default(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=110)
+        reqs = [make_gen_request(0), make_ctx_request(1, context_remaining_length=100)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.context_requests) == [1]
+
+    def test_decode_steps_follow_each_context_step(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=200,
+            never_mix_context_and_generation=True,
+            min_decode_steps_between_context=2,
+        )
+        gen = make_gen_request(0)
+        steps = []
+        for step in range(4):
+            ctx = make_ctx_request(10 + step, context_remaining_length=100)
+            out = sched.schedule_request([gen, ctx], set())
+            steps.append((len(out.context_requests), len(out.generation_requests)))
+        # Context first, then two generation-only steps, then context again.
+        assert steps == [(1, 0), (0, 1), (0, 1), (1, 0)]
+
+    def test_decode_interval_does_not_hold_context_without_generation(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=200,
+            never_mix_context_and_generation=True,
+            min_decode_steps_between_context=2,
+        )
+        first = sched.schedule_request(
+            [make_gen_request(0), make_ctx_request(1, context_remaining_length=100)], set()
+        )
+        assert ids(first.context_requests) == [1]
+        out = sched.schedule_request([make_ctx_request(2, context_remaining_length=100)], set())
+        assert ids(out.context_requests) == [2]
 
 
 # ===========================================================================

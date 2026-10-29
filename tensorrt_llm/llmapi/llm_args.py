@@ -4377,6 +4377,27 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
                      "This is orthogonal to "
                      "kv_cache_config.enable_block_reuse."))
 
+    never_mix_context_and_generation: bool = Field(
+        default=False,
+        description=(
+            "Never run context chunks and generation requests in the same "
+            "step. A step that would carry both runs the context chunks alone "
+            "and the generation requests run in the next step, which is "
+            "generation-only and so can replay the full decode CUDA graph. "
+            "Trades time per output token on steps with arriving prefills for "
+            "faster prefill admission. Only the KV cache manager v2 scheduler "
+            "honors it."),
+        status="prototype")
+
+    min_decode_steps_between_context: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "With never_mix_context_and_generation, run at least this many "
+            "generation-only steps after each context step before admitting "
+            "context again (0 = admit context whenever it fits)."),
+        status="prototype")
+
     def _to_pybind(self) -> _SchedulerConfig:
         return _SchedulerConfig(
             capacity_scheduler_policy=self.capacity_scheduler_policy._to_pybind(

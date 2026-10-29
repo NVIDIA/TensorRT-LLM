@@ -4291,6 +4291,13 @@ def create_py_executor_instance(
     if v2_scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         v2_scheduler_capacity += 1
 
+    if (scheduler_config is not None
+            and scheduler_config.never_mix_context_and_generation
+            and not isinstance(kv_cache_manager, KVCacheManagerV2)):
+        logger.warning(
+            "scheduler_config.never_mix_context_and_generation is honored only "
+            "by the KV cache manager v2 scheduler; it has no effect here.")
+
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
         draft_kv_cache_manager = resources.get(
@@ -4316,6 +4323,12 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             # A disaggregated generation worker must not replay context locally.
             enable_recompute_pause=not is_disagg,
+            never_mix_context_and_generation=(
+                scheduler_config.never_mix_context_and_generation
+                if scheduler_config is not None else False),
+            min_decode_steps_between_context=(
+                scheduler_config.min_decode_steps_between_context
+                if scheduler_config is not None else 0),
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
