@@ -478,22 +478,44 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             state["padding_prefix_lengths"] = (key_padding_mask, version, lengths)
         else:
             lengths = cached[2]
-        outputs = []
+        batch_size, seq_len = q.shape[:2]
+        if all(length == seq_len for length in lengths):
+            return self.forward(q, k, v, batch_size, seq_len, timestep=timestep)
+
+        groups: dict[int, list[int]] = {}
         for batch_idx, length in enumerate(lengths):
+            groups.setdefault(length, []).append(batch_idx)
+        if len(groups) == 1:
+            length = lengths[0]
             if length == 0:
-                output = q.new_zeros((1, q.shape[1], self.num_heads * self.head_dim))
-            else:
-                output = self.forward(
-                    q=q[batch_idx : batch_idx + 1, :length],
-                    k=k[batch_idx : batch_idx + 1, :length] if k is not None else None,
-                    v=v[batch_idx : batch_idx + 1, :length] if v is not None else None,
-                    batch_size=1,
-                    seq_len=length,
-                    timestep=timestep,
-                )
-                output = torch.nn.functional.pad(output, (0, 0, 0, q.shape[1] - length))
-            outputs.append(output)
-        return torch.cat(outputs, dim=0)
+                return q.new_zeros((batch_size, seq_len, self.num_heads * self.head_dim))
+            output = self.forward(
+                q=q[:, :length].contiguous(),
+                k=k[:, :length].contiguous() if k is not None else None,
+                v=v[:, :length].contiguous() if v is not None else None,
+                batch_size=batch_size,
+                seq_len=length,
+                timestep=timestep,
+            )
+            return torch.nn.functional.pad(output, (0, 0, 0, seq_len - length))
+
+        output = q.new_zeros((batch_size, seq_len, self.num_heads * self.head_dim))
+        for length, batch_indices in groups.items():
+            if length == 0:
+                continue
+            indices = torch.tensor(batch_indices, device=q.device)
+            group_output = self.forward(
+                q=q[:, :length].index_select(0, indices),
+                k=k[:, :length].index_select(0, indices) if k is not None else None,
+                v=v[:, :length].index_select(0, indices) if v is not None else None,
+                batch_size=len(batch_indices),
+                seq_len=length,
+                timestep=timestep,
+            )
+            output.index_copy_(
+                0, indices, torch.nn.functional.pad(group_output, (0, 0, 0, seq_len - length))
+            )
+        return output
 
     def forward(
         self,
@@ -545,18 +567,21 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 The first ``kv.num_tokens`` rows are real; rows past them are padding,
                 neither cached nor attended, and output zero. ``batch_size`` must be 1.
                 Sparse attention is not supported on this path.
-            key_padding_mask: Boolean valid-prefix mask for dense self-attention.
-            discard_padded_queries: Caller guarantees masked query rows are unused.
-                Required with key_padding_mask; padded output rows are zero-filled.
+            key_padding_mask: Boolean valid-prefix mask, honored only when
+                discard_padded_queries=True. Otherwise retains the legacy TRTLLM
+                behavior of ignoring this backend-specific keyword.
+            discard_padded_queries: Opt in to valid-prefix dense self-attention.
+                Caller guarantees masked query rows are unused; their outputs
+                are zero-filled. Callers requiring general masking must select
+                a backend that supports it, such as VANILLA.
             **kwargs: Additional backend-specific arguments.
 
         Returns:
             Output tensor [B, S, H*D]
         """
-        if key_padding_mask is not None:
+        if key_padding_mask is not None and discard_padded_queries:
             if (
                 kv is not None
-                or not discard_padded_queries
                 or attention_mask != PredefinedAttentionMask.FULL
                 or seq_len_kv not in (None, seq_len)
                 or self.quant_attention_config is not None

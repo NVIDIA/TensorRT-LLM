@@ -381,7 +381,8 @@ def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> No
 
 @_REQUIRES_SM100
 @pytest.mark.parametrize("fused", [False, True])
-def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool) -> None:
+@pytest.mark.parametrize("lengths", [[5, 7], [5, 5], [8, 8], [5, 7, 5, 0], [0, 0]])
+def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool, lengths: list[int]) -> None:
     """Padding never contributes keys, including when ranks need unequal real lengths."""
     attention = visual_trtllm.TrtllmAttention(
         num_heads=2,
@@ -390,8 +391,11 @@ def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool) -> None:
         attention_metadata_state=create_attention_metadata_state(),
     )
     torch.manual_seed(42)
-    q, k, v = [torch.randn(2, 8, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
-    mask = torch.arange(8, device="cuda")[None] < torch.tensor([5, 7], device="cuda")[:, None]
+    batch_size = len(lengths)
+    q, k, v = [
+        torch.randn(batch_size, 8, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    ]
+    mask = torch.arange(8, device="cuda")[None] < torch.tensor(lengths, device="cuda")[:, None]
     expected = (
         torch.nn.functional.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask[:, None, None]
@@ -400,14 +404,60 @@ def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool) -> None:
         .flatten(2)
     )
     query = torch.cat((q, k, v), dim=2) if fused else q
-    kwargs = dict(batch_size=2, seq_len=8, key_padding_mask=mask, discard_padded_queries=True)
-    actual = attention.forward(query, None if fused else k, None if fused else v, **kwargs)
+    kwargs = dict(
+        batch_size=batch_size, seq_len=8, key_padding_mask=mask, discard_padded_queries=True
+    )
+    forward = attention.forward
+    attention.forward = Mock(wraps=forward)
+    actual = forward(query, None if fused else k, None if fused else v, **kwargs)
+    assert attention.forward.call_count == len(set(lengths) - {0})
+    attention.forward = forward
     torch.testing.assert_close(actual[mask], expected[mask], atol=2e-2, rtol=2e-2)
     assert torch.count_nonzero(actual[~mask]) == 0
     with pytest.raises(ValueError, match="discarded padded queries"):
-        attention.forward(q, k, v, batch_size=2, seq_len=8, key_padding_mask=mask)
+        attention.forward(q, k, v, kv=Mock(), **kwargs)
     with pytest.raises(ValueError, match="discarded padded queries"):
         attention.forward(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL, **kwargs)
+    mask[0] = True
     mask[0, 1] = False
     with pytest.raises(ValueError, match="trailing padding"):
         attention.forward(q, k, v, **kwargs)
+
+
+@_REQUIRES_SM100
+def test_trtllm_padding_requires_explicit_opt_in() -> None:
+    """Existing callers retain dense behavior unless they opt into prefix masking."""
+    attention = visual_trtllm.TrtllmAttention(num_heads=2, head_dim=128, dtype=torch.bfloat16)
+    q, k, v = [torch.randn(2, 8, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    mask = torch.zeros(2, 8, device="cuda", dtype=torch.bool)
+    attention._forward_padded_self_attention = Mock(side_effect=AssertionError("not opted in"))
+    expected = attention.forward(q, k, v, batch_size=2, seq_len=8)
+    actual = attention.forward(q, k, v, batch_size=2, seq_len=8, key_padding_mask=mask)
+    torch.testing.assert_close(actual, expected)
+    attention._forward_padded_self_attention.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["dense", "quant", "sparse"])
+def test_legacy_mask_preserves_attention_dispatch(monkeypatch, mode: str) -> None:
+    captured = {}
+    _capture_core_forward(monkeypatch, captured)
+    attention = _make_wrapper(
+        quant_attention_config=visual_trtllm.QuantAttentionConfig() if mode == "quant" else None
+    )
+    if mode == "sparse":
+        attention.sparse_params = SkipSoftmaxParams()
+    q = torch.randn(1, 4, 2, 8)
+    mask = torch.tensor([[True, False, True, False]])
+    backend_args = (
+        SparseBackendForwardArgs(block_sparse_inputs=_make_block_sparse_inputs())
+        if mode == "sparse"
+        else None
+    )
+    kwargs = dict(batch_size=1, seq_len=4, sparse_backend_args=backend_args)
+    expected = attention.forward(q, q, q, **kwargs)
+    expected_args = captured["forward_args"]
+    actual = attention.forward(q, q, q, key_padding_mask=mask, **kwargs)
+    torch.testing.assert_close(actual, expected)
+    assert captured["forward_args"] == expected_args
+    with pytest.raises(ValueError):
+        attention.forward(q, q, q, key_padding_mask=mask, discard_padded_queries=True, **kwargs)
