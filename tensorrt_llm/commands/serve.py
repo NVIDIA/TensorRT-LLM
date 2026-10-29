@@ -488,6 +488,42 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+def _bind_failure(kind: str, host: str, port: int,
+                  error: OSError) -> RuntimeError:
+    """Log a failed listener bind and return the exception to raise.
+
+    An address lookup failure (``socket.gaierror``) is an ``OSError`` too, but
+    no port was ever tried, so it is reported as such instead of being
+    diagnosed as a port conflict. It covers both a name that does not resolve
+    and an address of a family the socket cannot use, such as an IPv6 literal
+    on an IPv4-only listener.
+    """
+    if isinstance(error, socket.gaierror):
+        reason = f"address lookup failed for host {host!r}: {error}"
+        logger.error(f"Failed to bind {kind} socket to {host}:{port} "
+                     f"(pid={os.getpid()}): {reason}")
+        return RuntimeError(f"Failed to bind socket to {host}:{port}: {reason}")
+    holder = _diagnose_port_in_use(port)
+    logger.error(
+        f"Failed to bind {kind} socket to {host}:{port} (pid={os.getpid()}): "
+        f"{error}. Current port holder(s): {holder}")
+    return RuntimeError(f"Failed to bind socket to {host}:{port}: {error}. "
+                        f"Port holder(s): {holder}")
+
+
+def _listener_address_family(kind: str, host: str,
+                             port: int) -> socket.AddressFamily:
+    """The family to bind ``host`` with: IPv6 only if it resolves to nothing else."""
+    try:
+        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                       socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise _bind_failure(kind, host, port, e) from e
+    if all(info[0] == socket.AF_INET6 for info in addr_info):
+        return socket.AF_INET6
+    return socket.AF_INET
+
+
 @contextlib.contextmanager
 def _provision_kv_cache_pool(llm_args: dict,
                              owns_engine: bool = True) -> Iterator[None]:
@@ -625,10 +661,7 @@ def launch_server(
                 "in-memory store cannot be shared across frontends.")
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
-    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                   socket.SOCK_STREAM)
-    address_family = socket.AF_INET6 if all(
-        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    address_family = _listener_address_family("server", host, port)
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # port == 0 lets the kernel pick the port; the caller then needs a way
         # to learn it, either by service discovery or by report_addr.
@@ -650,12 +683,7 @@ def launch_server(
             if port == 0:
                 port = s.getsockname()[1]
         except OSError as e:
-            holder = _diagnose_port_in_use(port)
-            logger.error(
-                f"Failed to bind server socket to {host}:{port} "
-                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
-                               f"Port holder(s): {holder}")
+            raise _bind_failure("server", host, port, e) from e
 
         # Only now is the address final, and the socket stays bound from here
         # until uvicorn takes it over, so no one can steal the port in between.
@@ -906,10 +934,7 @@ def launch_visual_gen_server(
     # uvicorn. VisualGen initialization can take many minutes; if we deferred
     # the bind until uvicorn started, anything else on the host could grab the
     # port in that window and trtllm-serve would die at bind() time.
-    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                   socket.SOCK_STREAM)
-    address_family = socket.AF_INET6 if all(
-        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    address_family = _listener_address_family("VisualGen server", host, port)
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # See launch_server: without this, TIME_WAIT tombstones from the
         # connections this server accepted refuse a restart for ~60s.
@@ -917,12 +942,7 @@ def launch_visual_gen_server(
         try:
             s.bind((host, port))
         except OSError as e:
-            holder = _diagnose_port_in_use(port)
-            logger.error(
-                f"Failed to bind VisualGen server socket to {host}:{port} "
-                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
-                               f"Port holder(s): {holder}")
+            raise _bind_failure("VisualGen server", host, port, e) from e
 
         logger.info(f"Initializing VisualGen ({model})")
 
@@ -2209,14 +2229,8 @@ def disaggregated(
             if disagg_cfg.port == 0:
                 disagg_cfg.port = s.getsockname()[1]
         except OSError as e:
-            holder = _diagnose_port_in_use(disagg_cfg.port)
-            logger.error(
-                f"Failed to bind disaggregated server socket to "
-                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()}): "
-                f"{e}. Current port holder(s): {holder}")
-            raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
-                f"Port holder(s): {holder}")
+            raise _bind_failure("disaggregated server", disagg_cfg.hostname,
+                                disagg_cfg.port, e) from e
 
         _publish_bound_address(report_addr, disagg_cfg.hostname,
                                disagg_cfg.port)
@@ -2406,13 +2420,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         coord_socket.bind((public_host, coord_port))
     except OSError as e:
         coord_socket.close()
-        holder = _diagnose_port_in_use(coord_port)
-        logger.error(f"Failed to bind coordinator socket to "
-                     f"{public_host}:{coord_port} (pid={os.getpid()}): {e}. "
-                     f"Current port holder(s): {holder}")
-        raise RuntimeError(
-            f"Failed to bind socket to {public_host}:{coord_port}: {e}. "
-            f"Port holder(s): {holder}")
+        raise _bind_failure("coordinator", public_host, coord_port, e) from e
 
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold

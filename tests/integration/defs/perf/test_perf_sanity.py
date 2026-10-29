@@ -18,6 +18,7 @@ import copy
 import fcntl
 import glob
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from test_common.perf_sanity_matching import get_test_case_match_keys
 
 from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info, print_warning
+from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT
@@ -1639,6 +1641,24 @@ def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
     """
     val = to_env_dict(env_vars).get("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS")
     return int(float(val)) if val is not None else 0
+
+
+def get_node_address() -> str:
+    """Return the address this node's servers bind and publish to the other roles.
+
+    An IP rather than the hostname, so neither binding it nor dialing a published
+    address needs DNS. get_local_ip() returns loopback when it finds no routable
+    interface, and its hostname-lookup fallback can return a link-local address;
+    other nodes cannot dial either, so the hostname is used instead.
+    """
+    hostname = socket.gethostname()
+    ip = get_local_ip()
+    address = ipaddress.ip_address(ip)
+    if address.is_loopback or address.is_link_local:
+        print_warning(f"No routable IP found on {hostname}; using the hostname instead")
+        return hostname
+    print_info(f"Using {ip} as the server address of {hostname}")
+    return ip
 
 
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
@@ -4777,7 +4797,7 @@ class PerfSanityTestConfig:
             disagg_config = DisaggConfig(
                 name=f"{test_label}-{config_file_base_name}",
                 disagg_serving_type=disagg_serving_type,
-                hostname=socket.gethostname(),
+                hostname=get_node_address(),
                 numa_bind=numa_bind,
                 timeout=timeout,
                 benchmark_mode=benchmark_mode,
