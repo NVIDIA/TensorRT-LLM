@@ -82,7 +82,7 @@ class CoordinatorHarness:
         admission_controller=None,
         is_kv_manager_v2=False,
         defer_unready_gen_receives=False,
-        group_retires_gen_receives=False,
+        cancels_timed_out_gen_receives=False,
         dist=None,
         transceiver=None,
     ) -> None:
@@ -93,7 +93,7 @@ class CoordinatorHarness:
                 kv_transfer_timeout_ms=kv_transfer_timeout_ms,
                 supports_inflight_cancellation=supports_inflight_cancellation,
                 consumes_transfer_buffer=consumes_transfer_buffer,
-                group_retires_gen_receives=group_retires_gen_receives,
+                cancels_timed_out_gen_receives=cancels_timed_out_gen_receives,
             )
         )
         self.transceiver.has_retired_send_session = lambda req: False

@@ -3,9 +3,12 @@
 """Retirement of generation-side KV receives across a gen sync group.
 
 When the gen sync group has more than one rank (any multi-rank worker without
-attention DP; the PP or helix CP ranks of one DP rank under attention DP), a
-receive is retired only inside ``check_gen_transfer_status``, on every rank in
-the same call. A local cancel or deadline only cancels that rank's session.
+attention DP; the PP or helix CP ranks of one DP rank under attention DP), its
+ranks must retire a receive in the same iteration. A client cancel reaches every
+rank in the same iteration, so each rank retires its receive at once. A transfer
+timeout passes on each rank at its own time, so it only cancels that rank's
+session, and ``check_gen_transfer_status`` retires the request on every rank in
+the same call once each rank's session has ended.
 
 Each rank runs a real ``KvCacheTransceiverV2`` (and, where the executor side
 matters, a real ``DisaggTransferCoordinator``) on its own thread over a shared
@@ -148,9 +151,9 @@ def _group_of_two(topology: str):
     return group, [_transceiver(mapping, dist) for dist in dists]
 
 
-def _start_receive(tc: KvCacheTransceiverV2, started_at=None) -> TransferRequest:
-    """Register an in-flight receive the way request_and_receive_async leaves it."""
-    req = TransferRequest(
+def _receiving_request(started_at=None) -> TransferRequest:
+    """A request whose receive is in flight, with no session registered yet."""
+    return TransferRequest(
         _RID,
         is_context_only_request=False,
         state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
@@ -159,105 +162,176 @@ def _start_receive(tc: KvCacheTransceiverV2, started_at=None) -> TransferRequest
         set_kv_cache_transfer_end=lambda _end: None,
         set_kv_cache_size=lambda _size: None,
     )
+
+
+def _start_receive(tc: KvCacheTransceiverV2, started_at=None) -> TransferRequest:
+    """Register an in-flight receive the way request_and_receive_async leaves it."""
+    req = _receiving_request(started_at)
     tc._recv_reqs[_RID] = req
     tc._recv_sessions[_RID] = _writing_session()
     return req
 
 
-def _poll_status(group: FakeDistGroup, tcs) -> list:
+def _check_status_on_all_ranks(group: FakeDistGroup, tcs) -> list:
     return group.run(lambda rank: tcs[rank].check_gen_transfer_status(0))
 
 
-@pytest.mark.parametrize("topology", _TOPOLOGIES)
-def test_a_cancel_on_one_rank_retires_only_with_the_whole_group(topology) -> None:
-    """Rank 0 cancels and its writer stops while rank 1 still receives. Rank 0
-    keeps its drained session and keeps refusing to free the request; both
-    ranks retire it in the same status call once rank 1 has cancelled too."""
-    group, tcs = _group_of_two(topology)
-    reqs = [_start_receive(tc) for tc in tcs]
-    sessions = [tc._recv_sessions[_RID] for tc in tcs]
-
-    assert tcs[0].cancel_request(reqs[0]) is False
-    _writer_reports(sessions[0], AgentResult.FAILED)
-    assert tcs[0].cancel_request(reqs[0]) is False
-
-    assert _poll_status(group, tcs) == [_NOTHING_SETTLED] * 2
-    assert [tc._recv_sessions.get(_RID) for tc in tcs] == sessions
-
-    assert tcs[1].cancel_request(reqs[1]) is False
-    _writer_reports(sessions[1], AgentResult.FAILED)
-    statuses = _poll_status(group, tcs)
-
-    for status, req in zip(statuses, reqs):
-        assert status.cancelled_requests == [req]
-    assert [tc.cancel_request(req) for tc, req in zip(tcs, reqs)] == [True, True]
-    assert [tc._recv_sessions for tc in tcs] == [{}, {}]
-
-
-@pytest.mark.parametrize("topology", _TOPOLOGIES)
-def test_a_cancelled_receive_is_retired_even_if_its_writer_never_reports(topology) -> None:
-    """The context side dropped the transfer, so no writer will ever report.
-    Once every rank has cancelled its session, all of them retire the request
-    in the same status call instead of waiting for a write that never lands.
-    Waiting for in-flight writes is physical ownership's job, which no gen sync
-    group enables."""
-    group, tcs = _group_of_two(topology)
-    reqs = [_start_receive(tc) for tc in tcs]
-    for tc, req in zip(tcs, reqs):
-        assert tc.cancel_request(req) is False
-
-    statuses = _poll_status(group, tcs)
-
-    for status, req in zip(statuses, reqs):
-        assert status.cancelled_requests == [req]
-    assert [tc._recv_sessions for tc in tcs] == [{}, {}]
-    assert [tc.cancel_request(req) for tc, req in zip(tcs, reqs)] == [True, True]
-
-
-@pytest.mark.parametrize("topology", _TOPOLOGIES)
-def test_a_deadline_on_one_rank_fails_the_request_on_every_rank_in_one_round(
-    clock, topology
-) -> None:
-    """Rank 0's receive started earlier and passes its deadline; rank 1's does
-    not, and its write then lands. The timeout check flags neither rank; the
-    poll cancels rank 0's session, and the next poll fails the request as a
-    transfer error on both ranks together instead of on rank 0 alone."""
-    group, tcs = _group_of_two(topology)
+def _harnesses(group: FakeDistGroup, tcs) -> list:
+    """One coordinator harness per rank, over that rank's real transceiver."""
     attention_dp = tcs[0]._mapping.enable_attention_dp
-    ranks = [
+    return [
         CoordinatorHarness(dist=group.rank(rank), enable_attention_dp=attention_dp, transceiver=tc)
         for rank, tc in enumerate(tcs)
     ]
+
+
+def _run_iteration(group: FakeDistGroup, harnesses) -> None:
+    """One executor iteration's receive poll, then the attention-DP error vote
+    that fails a request there (a no-op without attention DP)."""
+    group.run(lambda rank: harnesses[rank].coordinator.poll_gen_transfers())
+    group.run(lambda rank: harnesses[rank].coordinator.handle_errors_synced())
+
+
+def _expected_failure_msg(tcs) -> str:
+    """Without attention DP the poll fails the request; with it, the error vote does."""
+    return _VOTED_ERROR_MSG if tcs[0]._mapping.enable_attention_dp else _GEN_ERROR_MSG
+
+
+def _start_timed_receives(clock, group, tcs, elapsed_s) -> tuple:
+    """Start one receive per rank, rank r's started ``elapsed_s[r]`` seconds ago."""
+    harnesses = _harnesses(group, tcs)
     reqs = [
-        _start_receive(tc, started_at=clock["t"] - elapsed_s)
-        for tc, elapsed_s in zip(tcs, (2.0, 0.0))
+        _start_receive(tc, started_at=clock["t"] - elapsed) for tc, elapsed in zip(tcs, elapsed_s)
     ]
-    for h, req in zip(ranks, reqs):
+    for h, req in zip(harnesses, reqs):
         h.active.append(req)
+    return harnesses, reqs
+
+
+@pytest.mark.parametrize("peer_state", ["landed", "unpublished"])
+@pytest.mark.parametrize("topology", _TOPOLOGIES)
+def test_a_client_cancel_retires_the_receive_on_every_rank_at_once(topology, peer_state) -> None:
+    """A client cancel reaches every rank of the group in the same iteration, so
+    each rank retires its receive at once, whatever its session's state. Rank 0
+    is still being written; rank 1's write has landed, or rank 1 has not
+    published its receive yet. Waiting for rank 0's write to drain, as without
+    gen sync, would leave rank 0 holding the request after rank 1 freed it."""
+    group, tcs = _group_of_two(topology)
+    req0 = _start_receive(tcs[0])
+    session0 = tcs[0]._recv_sessions[_RID]
+    if peer_state == "landed":
+        req1 = _start_receive(tcs[1])
+        _writer_reports(tcs[1]._recv_sessions[_RID], AgentResult.SUCCESS)
+    else:
+        req1 = _receiving_request()
+
+    assert [tcs[0].cancel_request(req0), tcs[1].cancel_request(req1)] == [True, True]
+
+    assert session0.status == SessionStatus.CANCELLED
+    assert all(tc.check_gen_transfer_complete() for tc in tcs)
+    assert _check_status_on_all_ranks(group, tcs) == [_NOTHING_SETTLED] * 2
+
+
+@pytest.mark.parametrize("topology", _TOPOLOGIES)
+def test_a_timeout_on_one_rank_fails_the_request_on_every_rank_in_one_round(
+    clock, topology
+) -> None:
+    """Rank 0's receive started earlier and times out; rank 1's does not, and its
+    write then lands. The poll cancels rank 0's session without a rank-local
+    timeout flag, and the next poll fails the request as a transfer error on
+    both ranks together instead of on rank 0 alone."""
+    group, tcs = _group_of_two(topology)
+    harnesses, reqs = _start_timed_receives(clock, group, tcs, (2.0, 0.0))
     sessions = [tc._recv_sessions[_RID] for tc in tcs]
 
-    group.run(lambda rank: ranks[rank].coordinator.poll_gen_transfers())
-    group.run(lambda rank: ranks[rank].coordinator.check_transfer_timeouts())
+    _run_iteration(group, harnesses)
+    group.run(lambda rank: harnesses[rank].coordinator.check_transfer_timeouts())
 
     assert [session.status for session in sessions] == [
         SessionStatus.CANCELLED,
         SessionStatus.TRANSFERRING,
     ]
-    assert [h.effects.failed for h in ranks] == [[], []]
+    assert [h.effects.failed for h in harnesses] == [[], []]
     assert not any(req.py_kv_transfer_timed_out for req in reqs)
 
-    _writer_reports(sessions[0], AgentResult.FAILED)
     _writer_reports(sessions[1], AgentResult.SUCCESS)
-    group.run(lambda rank: ranks[rank].coordinator.poll_gen_transfers())
-    if attention_dp:
-        group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
+    _run_iteration(group, harnesses)
 
-    error_msg = _VOTED_ERROR_MSG if attention_dp else _GEN_ERROR_MSG
-    for h, req in zip(ranks, reqs):
-        assert h.effects.failed == [(error_msg, [req], False)]
+    for h, req in zip(harnesses, reqs):
+        assert h.effects.failed == [(_expected_failure_msg(tcs), [req], False)]
         assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
         assert not req.py_kv_transfer_timed_out
-    assert [tc._recv_sessions for tc in tcs] == [{}, {}]
+    assert all(tc.check_gen_transfer_complete() for tc in tcs)
+
+
+@pytest.mark.parametrize("topology", _TOPOLOGIES)
+def test_a_receive_that_landed_is_not_failed_by_its_timeout(clock, topology) -> None:
+    """Both writes land before the poll, but rank 0's timeout has passed by
+    then. The landed session is not cancelled, so the request completes."""
+    group, tcs = _group_of_two(topology)
+    harnesses, reqs = _start_timed_receives(clock, group, tcs, (2.0, 0.0))
+    for tc in tcs:
+        _writer_reports(tc._recv_sessions[_RID], AgentResult.SUCCESS)
+
+    _run_iteration(group, harnesses)
+
+    for h, req in zip(harnesses, reqs):
+        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        assert h.effects.failed == []
+    assert all(tc.check_gen_transfer_complete() for tc in tcs)
+
+
+@pytest.mark.parametrize("topology", _TOPOLOGIES)
+def test_timed_out_receives_are_retired_even_if_their_writers_never_report(clock, topology) -> None:
+    """The context side dropped the transfer, so no writer will ever report.
+    Once every rank's receive has timed out, all of them fail the request in
+    the same poll instead of waiting for a write that never lands. Waiting for
+    in-flight writes is physical ownership's job, which no gen sync group
+    enables."""
+    group, tcs = _group_of_two(topology)
+    harnesses, reqs = _start_timed_receives(clock, group, tcs, (2.0, 2.0))
+
+    _run_iteration(group, harnesses)
+
+    for h, req in zip(harnesses, reqs):
+        assert h.effects.failed == [(_expected_failure_msg(tcs), [req], False)]
+    assert all(tc.check_gen_transfer_complete() for tc in tcs)
+
+
+@pytest.mark.parametrize("topology", _TOPOLOGIES)
+def test_a_timeout_cancel_that_raises_still_lets_the_rank_join_the_consensus(
+    clock, topology
+) -> None:
+    """Both receives have timed out, and rank 0's cancel raises before marking
+    its session. Rank 0 still enters the status gather, so neither rank hangs;
+    the next poll cancels rank 0's session and both ranks fail the request."""
+    group, tcs = _group_of_two(topology)
+    harnesses, reqs = _start_timed_receives(clock, group, tcs, (2.0, 2.0))
+    sessions = [tc._recv_sessions[_RID] for tc in tcs]
+    cancel = sessions[0].cancel
+    attempts = []
+
+    def cancel_raising_once():
+        attempts.append(_RID)
+        if len(attempts) == 1:
+            raise RuntimeError("cancel failed")
+        return cancel()
+
+    sessions[0].cancel = cancel_raising_once
+
+    _run_iteration(group, harnesses)
+
+    assert [session.status for session in sessions] == [
+        SessionStatus.TRANSFERRING,
+        SessionStatus.CANCELLED,
+    ]
+    assert [h.effects.failed for h in harnesses] == [[], []]
+
+    _run_iteration(group, harnesses)
+
+    assert attempts == [_RID, _RID]
+    for h, req in zip(harnesses, reqs):
+        assert h.effects.failed == [(_expected_failure_msg(tcs), [req], False)]
 
 
 @pytest.mark.parametrize(
@@ -268,9 +342,10 @@ def test_a_deadline_on_one_rank_fails_the_request_on_every_rank_in_one_round(
     ],
 )
 def test_without_a_gen_sync_group_a_rank_retires_its_own_receive(clock, layout) -> None:
-    """With no gen sync group the rank-local rules stand: a deadline flags the
-    request for the executor's timeout path without cancelling, and
-    cancel_request retires a drained receive itself. No collective is entered."""
+    """With no gen sync group the rank-local rules stand: the transceiver does
+    not cancel a timed-out receive, the timeout check flags the request for the
+    executor's timeout path, and cancel_request waits for a write to drain
+    before it retires the receive. No collective is entered."""
     no_peer = Mock(side_effect=AssertionError("no gen sync group to gather over"))
     dist = SimpleNamespace(rank=0, allgather=no_peer, cp_allgather=no_peer, pp_allgather=no_peer)
     tc = _transceiver(SimpleNamespace(pp_size=1, cp_size=1, **layout), dist)
@@ -279,6 +354,7 @@ def test_without_a_gen_sync_group_a_rank_retires_its_own_receive(clock, layout) 
     h.active.append(req)
     session = tc._recv_sessions[_RID]
 
+    assert tc.check_gen_transfer_status(0) == _NOTHING_SETTLED
     h.coordinator.check_transfer_timeouts()
 
     assert req.py_kv_transfer_timed_out
@@ -287,4 +363,4 @@ def test_without_a_gen_sync_group_a_rank_retires_its_own_receive(clock, layout) 
     assert tc.cancel_request(req) is False
     _writer_reports(session, AgentResult.FAILED)
     assert tc.cancel_request(req) is True
-    assert tc._recv_sessions == {}
+    assert tc.check_gen_transfer_complete()

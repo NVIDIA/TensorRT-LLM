@@ -14,7 +14,11 @@ def inflight_cancel(monkeypatch):
 
 @pytest.fixture
 def clock(monkeypatch):
-    """Freeze the coordinator's ``time.monotonic``; tests advance ``clock["t"]``."""
+    """Freeze ``time.monotonic``; tests advance ``clock["t"]``.
+
+    The patch is process-wide, so the transceiver's receive timeout reads the
+    same clock as the coordinator.
+    """
     now = {"t": 100.0}
     monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: now["t"])
     return now

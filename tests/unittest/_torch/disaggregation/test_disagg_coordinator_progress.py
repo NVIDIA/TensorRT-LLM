@@ -127,56 +127,6 @@ def test_timeout_check_is_rank_local(clock) -> None:
     assert [h.dist.calls for h in ranks] == [[], []]
 
 
-def test_timed_out_receive_under_gen_sync_is_cancelled_by_the_poll_not_flagged(clock) -> None:
-    """Under gen sync the timeout check leaves a receive past its deadline
-    alone instead of flagging it for a rank-local failure. The poll cancels
-    this rank's session, and the consensus in that same poll fails the request
-    as a transfer error."""
-    group = FakeDistGroup(world_size=2, tp_size=2)
-    ranks = _ranks(group, kv_transfer_timeout_ms=1000, group_retires_gen_receives=True)
-    requests = [_receiving(h, 1, started_at=clock["t"]) for h in ranks]
-    clock["t"] += 2.0
-
-    group.run(lambda rank: ranks[rank].coordinator.check_transfer_timeouts())
-
-    assert not any(req.py_kv_transfer_timed_out for req in requests)
-    assert not any("cancel_request:1" in h.transceiver.call_log for h in ranks)
-
-    group.run(lambda rank: ranks[rank].coordinator.poll_gen_transfers())
-
-    assert [h.transceiver.call_log.count("cancel_request:1") for h in ranks] == [1, 1]
-    for h, req in zip(ranks, requests):
-        assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
-        assert h.effects.failed == [
-            ("Error in kv cache transfer for generation requests", [req], False)
-        ]
-    assert not any(req.py_kv_transfer_timed_out for req in requests)
-
-
-def test_deadline_cancel_that_raised_is_retried_on_the_next_poll(clock) -> None:
-    """A deadline cancel that raises is logged, not propagated out of the poll,
-    and the next poll tries again."""
-    h = CoordinatorHarness(kv_transfer_timeout_ms=1000, group_retires_gen_receives=True)
-    req = _receiving(h, 1, started_at=clock["t"] - 2.0)
-    cancel = h.transceiver.cancel_request
-    attempts = []
-
-    def cancel_raising_once(request):
-        attempts.append(request.py_request_id)
-        if len(attempts) == 1:
-            raise RuntimeError("cancel failed")
-        return cancel(request)
-
-    h.transceiver.cancel_request = cancel_raising_once
-
-    h.coordinator.poll_gen_transfers()
-    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-
-    h.coordinator.poll_gen_transfers()
-    assert attempts == [1, 1]
-    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
-
-
 # -- idle progress poll ------------------------------------------------------
 
 

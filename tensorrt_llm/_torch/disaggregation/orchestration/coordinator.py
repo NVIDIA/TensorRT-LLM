@@ -117,9 +117,7 @@ class DisaggTransferCoordinator:
         # Timed-out generation requests whose error response waits for the
         # ADP-safe consensus point.
         self._pending_timed_out_requests: List[LlmRequest] = []
-        # Requests whose timed-out transfer was already cancelled in flight, or,
-        # for a receive under gen sync, whose deadline was already logged (its
-        # cancel repeats every poll).
+        # Requests whose timed-out transfer was already cancelled in flight.
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
@@ -230,8 +228,6 @@ class DisaggTransferCoordinator:
             return
         if self._defer_unready_gen_receives:
             self._publish_ready_gen_receives()
-        if self._transceiver.group_retires_gen_receives:
-            self._cancel_timed_out_group_receives()
         # Gen-transfer status performs cross-rank consensus internally. Enter
         # it symmetrically; ranks with no ready local future contribute an
         # empty ready set.
@@ -245,9 +241,7 @@ class DisaggTransferCoordinator:
         """Flag transfers that exceeded ``kv_transfer_timeout_ms``.
 
         ``only_with_context_sends`` keeps the post-batch call sites gated on an
-        in-flight context send, as they were before the extraction. Receives
-        under gen sync are not flagged; ``poll_gen_transfers`` cancels them
-        (``_cancel_timed_out_group_receives``).
+        in-flight context send, as they were before the extraction.
         """
         if only_with_context_sends and not self._transfers.has_any_inflight_requests():
             return
@@ -256,8 +250,10 @@ class DisaggTransferCoordinator:
             return
 
         def flag_if_timed_out(req: LlmRequest, kind: str) -> None:
-            elapsed_ms = self._elapsed_ms_if_timed_out(req, timeout_ms)
-            if elapsed_ms is not None and not req.py_kv_transfer_timed_out:
+            if req.py_kv_transfer_start_time is None:
+                return
+            elapsed_ms = (time.monotonic() - req.py_kv_transfer_start_time) * 1000
+            if elapsed_ms > timeout_ms and not req.py_kv_transfer_timed_out:
                 verb = (
                     "Requesting cancellation for"
                     if self.inflight_cancel_active()
@@ -275,49 +271,13 @@ class DisaggTransferCoordinator:
         # context side.
         for req in self._transfers.requests_in_transfer().values():
             flag_if_timed_out(req, "context")
-        if self._transceiver.group_retires_gen_receives:
+        if self._transceiver.cancels_timed_out_gen_receives:
+            # The transceiver cancels these itself; a flag would fail the
+            # request on this rank alone.
             return
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_timed_out(req, "generation")
-
-    @staticmethod
-    def _elapsed_ms_if_timed_out(req: LlmRequest, timeout_ms: int) -> Optional[float]:
-        """The request's KV transfer time in ms if it ran past ``timeout_ms``, else None."""
-        if req.py_kv_transfer_start_time is None:
-            return None
-        elapsed_ms = (time.monotonic() - req.py_kv_transfer_start_time) * 1000
-        return elapsed_ms if elapsed_ms > timeout_ms else None
-
-    def _cancel_timed_out_group_receives(self) -> None:
-        """Cancel this rank's session of each receive under gen sync past its deadline.
-
-        The request is not flagged: ``_handle_responses`` would fail a flagged
-        request on this rank alone, even after the group consensus completed
-        its receive. The cancelled session instead joins that consensus, which
-        reports the request cancelled on every rank in the same call, and
-        ``reap_gen_receives`` fails it there as a transfer error. Run from
-        ``poll_gen_transfers``, which every executor loop enters each iteration.
-        """
-        timeout_ms = self._transceiver.kv_transfer_timeout_ms
-        if timeout_ms is None:
-            return
-        for req in self._registry.active_requests():
-            if not req.is_disagg_generation_transmission_in_progress:
-                continue
-            elapsed_ms = self._elapsed_ms_if_timed_out(req, timeout_ms)
-            if elapsed_ms is None:
-                continue
-            if req.py_request_id not in self._timed_out_gen_cancelled_ids:
-                self._timed_out_gen_cancelled_ids.add(req.py_request_id)
-                logger.warning(
-                    f"Generation request {req.py_request_id} passed "
-                    f"kv_transfer_timeout_ms={timeout_ms}ms (elapsed {elapsed_ms:.0f}ms); "
-                    "cancelling this rank's session, the gen sync group retires it"
-                )
-            # Repeated every poll until the consensus retires the request: a no-op
-            # once the session is cancelled, a retry if the cancel raised before.
-            self.request_cancellation(req)
 
     # -- scheduling ----------------------------------------------------------
 
@@ -386,14 +346,14 @@ class DisaggTransferCoordinator:
         per request, and a request retired on one CP rank only frees room there
         first: a rank-local error, or under the C++ transceiver a client cancel
         or a transfer timeout (``KvCacheTransceiverV2`` retires those on every
-        rank together, see ``group_retires_gen_receives``). The pp=1
-        loops call this on every rank every iteration; the dropped requests give
-        back their V2 KV and are retried on a later iteration. Under
-        attention-DP, a request passes the intersection only if every CP rank
-        routed it to the same DP rank. ``ADPRouter.gather_all_rank_states``
-        gives the CP ranks the same loads. ``ADPRouter.create`` does not build
-        ``KVCacheAwareADPRouter`` under helix CP, because each CP rank probes
-        its own prefix matches and they can differ.
+        rank in the same iteration). The pp=1 loops call this on every rank
+        every iteration; the dropped requests give back their V2 KV and are
+        retried on a later iteration. Under attention-DP, a request passes the
+        intersection only if every CP rank routed it to the same DP rank.
+        ``ADPRouter.gather_all_rank_states`` gives the CP ranks the same loads.
+        ``ADPRouter.create`` does not build ``KVCacheAwareADPRouter`` under
+        helix CP, because each CP rank probes its own prefix matches and they
+        can differ.
         """
         if self._dist.cp_size == 1:
             return admitted
@@ -780,19 +740,7 @@ class DisaggTransferCoordinator:
         return False
 
     def request_cancellation(self, request: LlmRequest) -> bool:
-        """Best-effort cancellation that leaves ownership intact on errors.
-
-        Returns False, to be retried, while a receive under gen sync is still
-        unpublished on this rank.
-        """
-        if (
-            self._transceiver.group_retires_gen_receives
-            and request.py_request_id in self._unpublished_gen_receives
-        ):
-            # A peer that already published this receive waits in the consensus for
-            # this rank's session; cancelling here would free the request on this
-            # rank alone. Retry once _publish_ready_gen_receives has published it.
-            return False
+        """Best-effort cancellation that leaves ownership intact on errors."""
         try:
             return self._transceiver.cancel_request(request)
         except Exception as error:

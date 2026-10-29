@@ -472,34 +472,6 @@ def test_deferred_receive_of_a_terminated_request_is_dropped_unpublished(
     assert req.state == terminal_state
 
 
-def test_unpublished_receive_is_cancelled_only_after_publication_under_gen_sync() -> None:
-    """Under gen sync a peer rank may already have published the receive and
-    wait in the group consensus for this rank's session. So cancellation is
-    refused until the receive is published here as well."""
-    h = _deferring_harness({1: _ScriptedEvent(False, True)}, group_retires_gen_receives=True)
-    req = _gen_init(h, 1)
-    h.coordinator.receive_gen_init([req])
-
-    assert h.coordinator.request_cancellation(req) is False
-    assert "cancel_request:1" not in h.transceiver.call_log
-
-    h.coordinator.poll_gen_transfers()
-    # Cancelled now, but still refused until the consensus retires it.
-    assert h.coordinator.request_cancellation(req) is False
-
-    log = h.transceiver.call_log
-    assert log.index("request_and_receive_async:1") < log.index("cancel_request:1")
-
-
-def test_unpublished_receive_is_cancelled_at_once_without_gen_sync() -> None:
-    h = _deferring_harness({1: _ScriptedEvent(False)})
-    req = _gen_init(h, 1)
-    h.coordinator.receive_gen_init([req])
-
-    assert h.coordinator.request_cancellation(req) is True
-    assert h.transceiver.call_log[-1] == "cancel_request:1"
-
-
 @pytest.mark.parametrize(
     "mode_env",
     [
