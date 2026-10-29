@@ -74,10 +74,10 @@ def _visual_gen_telemetry_metadata(pipeline: "BasePipeline", args: VisualGenArgs
     """Build bounded READY metadata from the successfully loaded pipeline."""
     try:
         pipeline_class_name = pipeline.pipeline_class_name
-        entry = PIPELINE_REGISTRY.get(pipeline_class_name)
-        if entry is None or not entry.telemetry_safe:
+        pipeline_entry = PIPELINE_REGISTRY.get(pipeline_class_name)
+        if pipeline_entry is None or not pipeline_entry.telemetry_safe:
             pipeline_class_name = "other"
-            entry = None
+            pipeline_entry = None
 
         resolved_is_public = any(
             candidate.telemetry_safe and type(pipeline) is candidate.pipeline_cls
@@ -119,7 +119,7 @@ def _visual_gen_telemetry_metadata(pipeline: "BasePipeline", args: VisualGenArgs
             model_id=model_id,
             pipeline_class_name=pipeline_class_name,
             resolved_pipeline_class=resolved_pipeline_class,
-            modality=entry.modality if entry is not None else "unknown",
+            modality=pipeline_entry.modality if pipeline_entry is not None else "unknown",
             quantization_algo=quantization_algo,
             dynamic_weight_quant=bool(dynamic_weight_quant),
             quantized_components=quantized_components,
