@@ -471,6 +471,44 @@ class TestHandler:
             handler.commit(rows, _device([token], torch.int32))
             history.append(token)
 
+    @pytest.mark.parametrize("dedupe", ["none", "single_turn"])
+    @pytest.mark.parametrize("from_probs", [False, True])
+    def test_step_matches_plan_draw_commit(self, dedupe, from_probs):
+        config = WatermarkConfig(key=99, context_width=3, deduplicate_contexts=dedupe)
+        handlers = [WatermarkHandler(config, max_num_sequences=4, max_seq_len=64) for _ in range(2)]
+        requests = [_request(i, slot, [5, 6, 7, i]) for i, slot in enumerate([3, 0, 2, 1])]
+        requests[2].py_watermarking = False  # one row carries no watermark
+        for handler in handlers:
+            handler.observe(requests, _can_sample)
+        reference, fused = handlers
+        slots = _device([3, 0, 2, 1])
+        enabled = _device([True, True, False, True], torch.bool)
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        for _ in range(4):
+            logits = torch.randn(4, 3001, device="cuda", generator=generator) * 3
+            temperature = _device([0.7, 1.0, 1.3, 0.9], torch.float32)
+            probs = torch.softmax(logits / temperature[:, None], dim=-1)
+            # A tiny vocabulary of recurring contexts makes the repeat ring fire.
+            fallback = torch.randint(0, 3, (4,), device="cuda", dtype=torch.int32)
+            rows = reference.plan_reference(slots, enabled)
+            keyed = gumbel_sample_reference(probs, rows.seeds[:, 0])
+            expected = torch.where(rows.active[:, 0], keyed.to(torch.int32), fallback)
+            reference.commit_reference(rows, expected)
+            actual = fused.sample_step(
+                probs if from_probs else logits,
+                None if from_probs else temperature,
+                slots,
+                enabled,
+                fallback,
+                from_probs=from_probs,
+            )
+            assert torch.equal(actual, expected)
+        assert torch.equal(fused._tail, reference._tail)
+        assert torch.equal(fused._count, reference._count)
+        if dedupe == "single_turn":
+            size = fused._ring_size  # the last column is a trash column
+            assert torch.equal(fused._ring[:, :size], reference._ring[:, :size])
+
     def test_short_prompt_is_padded(self):
         config, handler = self._handler()
         handler.observe([_request(1, 0, [5])], _can_sample)
