@@ -5,6 +5,7 @@
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,8 @@ _HOST_MEMORY_HEADROOM_FRACTION = 0.1
 # extents.
 _RESIDENCY_POLL_SECONDS = 5.0
 _REFRESH_MAJOR_FAULTS = 1024
+_REFRESH_INITIAL_COOLDOWN_SECONDS = 10.0
+_REFRESH_MAX_COOLDOWN_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -227,10 +230,18 @@ def node_major_page_faults() -> int | None:
 class RankStripedReadAheadSession:
     """Own background POSIX reads and their node-local communicator."""
 
-    def __init__(self, active_communicator, node_communicator, plan: ReadAheadPlan) -> None:
+    def __init__(
+        self,
+        active_communicator,
+        node_communicator,
+        plan: ReadAheadPlan,
+        *,
+        checkpoint_bytes: int,
+    ) -> None:
         self._active_communicator = active_communicator
         self._node_communicator = node_communicator
         self._plan = plan
+        self._checkpoint_bytes = checkpoint_bytes
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
         self._file_descriptors: dict[str, int] = {}
@@ -300,30 +311,81 @@ class RankStripedReadAheadSession:
             raise
 
     def _refresh_dropped_pages(self, executor: ThreadPoolExecutor) -> None:
-        """Until finish(), re-read this rank's extents whenever the node faults pages from storage.
+        """Refresh this rank's extents after fault bursts, with increasing cooldowns.
 
         After the first pass the checkpoint is in the page cache, so
         materialization faults pages in from storage only if the cache dropped
         some. Every node-local rank watches the same node-wide counter, so a
         fault burst that every rank sees makes the ranks re-read the whole
-        checkpoint between them.
+        checkpoint between them. Cooldowns limit repeated reads without ending
+        monitoring, so a late burst can still trigger a refresh. Faults remain
+        measured over the same polling window during the cooldown. Each refresh
+        also requires admission for the full checkpoint, since all node-local
+        readers can refresh their disjoint extents against the same memory pool.
         """
         baseline = node_major_page_faults()
         if baseline is None:
             return
+        pending_faults = 0
+        next_refresh_at = 0.0
+        cooldown = _REFRESH_INITIAL_COOLDOWN_SECONDS
+        warned_at_limit = False
+        warned_memory_deferred = False
         while not self._cancel.wait(_RESIDENCY_POLL_SECONDS):
             faults = node_major_page_faults()
             if faults is None:
                 return
-            if faults - baseline >= _REFRESH_MAJOR_FAULTS:
-                logger.info(
-                    f"Rank-striped read-ahead: {faults - baseline} new major page "
-                    f"faults on this node; re-reading {len(self._plan.extents)} extents."
-                )
-                self._read_pass(executor, self._plan.extents)
-                refreshed = node_major_page_faults()
-                faults = faults if refreshed is None else refreshed
+            new_faults = faults - baseline
             baseline = faults
+            if new_faults >= _REFRESH_MAJOR_FAULTS:
+                # Retain one qualifying burst until a refresh is allowed. Do
+                # not accumulate subthreshold polls over the longer cooldown.
+                pending_faults = max(pending_faults, new_faults)
+            if not pending_faults or time.monotonic() < next_refresh_at:
+                continue
+
+            try:
+                available_memory = effective_available_host_memory()
+            except (OSError, ValueError, psutil.Error) as error:
+                if not warned_memory_deferred:
+                    logger.warning(
+                        "Rank-striped read-ahead: refresh deferred; "
+                        f"could not read available host memory: {error}."
+                    )
+                    warned_memory_deferred = True
+                continue
+            admitted, headroom = memory_admission(self._checkpoint_bytes, available_memory)
+            if not admitted:
+                if not warned_memory_deferred:
+                    logger.warning(
+                        "Rank-striped read-ahead: refresh deferred by admission budget; "
+                        f"checkpoint bytes ({self._checkpoint_bytes}), available host memory "
+                        f"({available_memory}), headroom ({headroom})."
+                    )
+                    warned_memory_deferred = True
+                continue
+            warned_memory_deferred = False
+            if self._cancel.is_set():
+                return
+
+            logger.info(
+                f"Rank-striped read-ahead: {pending_faults} new major page "
+                f"faults on this node; re-reading {len(self._plan.extents)} extents."
+            )
+            self._read_pass(executor, self._plan.extents)
+            if self._cancel.is_set():
+                return
+            pending_faults = 0
+            refreshed = node_major_page_faults()
+            baseline = baseline if refreshed is None else refreshed
+            next_refresh_at = time.monotonic() + cooldown
+            if cooldown == _REFRESH_MAX_COOLDOWN_SECONDS and not warned_at_limit:
+                logger.warning(
+                    "Rank-striped read-ahead: refresh cooldown reached "
+                    f"{cooldown:g} seconds; further refreshes remain rate-limited until finish()."
+                )
+                warned_at_limit = True
+            cooldown = min(2 * cooldown, _REFRESH_MAX_COOLDOWN_SECONDS)
 
     def _close_file_descriptors(self) -> BaseException | None:
         first_error = None
