@@ -5673,6 +5673,8 @@ def create_py_executor_instance(
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
         kv_pool_rebalance_config.check_interval,
+        kv_pool_rebalance_allow_cross_node=llm_args.kv_cache_config.
+        kv_pool_rebalance_config.allow_cross_node_disagg,
         defer_generation_only_release=llm_args.kv_cache_config.
         defer_generation_only_release,
         enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
