@@ -103,8 +103,8 @@ class JsonDictionary:
     """JSON view of a RemoteDictionary.
 
     With ``record_auth_key`` set, every dict value written is signed with an
-    HMAC bound to its key, and ``get`` returns None for a value whose signature
-    is missing or does not match.
+    HMAC bound to its key, and ``get`` returns None for a value that cannot be
+    parsed or whose signature is missing or does not match.
     """
 
     def __init__(self,
@@ -117,7 +117,13 @@ class JsonDictionary:
         bytes_data, _ = self._dict.get(key)
         if bytes_data is None:
             return None
-        value = json.loads(bytes_data.decode('utf-8'))
+        try:
+            value = json.loads(bytes_data.decode('utf-8'))
+        except (ValueError, RecursionError):
+            if self._record_auth_key is None:
+                raise
+            logger.warning(f"Ignoring unreadable metadata record {key}")
+            return None
         if self._record_auth_key is None:
             return value
         if not isinstance(value, dict):

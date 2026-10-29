@@ -42,7 +42,9 @@ class InMemoryDictionary(RemoteDictionary):
 
     def get(self, key):
         value = self.data.get(key)
-        return (None, None) if value is None else (value.encode("utf-8"), None)
+        if value is None:
+            return None, None
+        return (value if isinstance(value, bytes) else value.encode("utf-8")), None
 
     def put(self, key, value):
         self.data[key] = value
@@ -113,18 +115,59 @@ def test_signed_store_ignores_non_dict_record():
     assert store.get("trtllm/d") is None
 
 
-@pytest.mark.asyncio
-async def test_router_lists_only_signed_records():
+UNREADABLE_VALUES = [
+    pytest.param("not json", id="not_json"),
+    pytest.param('{"url": ', id="truncated_json"),
+    pytest.param(b"\xff\xfe", id="invalid_utf8"),
+]
+
+
+@pytest.mark.parametrize("value", UNREADABLE_VALUES)
+def test_signed_store_ignores_unreadable_record(value):
+    raw = InMemoryDictionary()
+    store = JsonDictionary(raw, record_auth_key=RECORD_KEY)
+    store.put("trtllm/good", _record())
+    raw.data["trtllm/bad"] = value
+    assert store.get("trtllm/bad") is None
+    assert store.get("trtllm/good") == _record()
+
+
+@pytest.mark.parametrize("value", UNREADABLE_VALUES)
+def test_unsigned_store_raises_on_unreadable_record(value):
+    raw = InMemoryDictionary()
+    raw.data["trtllm/bad"] = value
+    with pytest.raises(ValueError):
+        JsonDictionary(raw).get("trtllm/bad")
+
+
+def _context_router(store):
     from tensorrt_llm.serve.router import RoundRobinRouter
 
+    return RoundRobinRouter(
+        server_role=ServerRole.CONTEXT, servers=[], metadata_server_cfg=None, metadata_server=store
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_lists_only_signed_records():
     raw = InMemoryDictionary()
     store = JsonDictionary(raw, record_auth_key=RECORD_KEY)
     store.put("trtllm/a", _record("http://127.0.0.1:8001"))
     raw.put("trtllm/b", json.dumps(_record("http://127.0.0.1:9000")))
 
-    router = RoundRobinRouter(
-        server_role=ServerRole.CONTEXT, servers=[], metadata_server_cfg=None, metadata_server=store
-    )
+    router = _context_router(store)
+    assert await router.fetch_live_servers() == {"trtllm/a": "http://127.0.0.1:8001"}
+
+
+@pytest.mark.asyncio
+async def test_router_lists_signed_records_beside_unreadable_ones():
+    raw = InMemoryDictionary()
+    store = JsonDictionary(raw, record_auth_key=RECORD_KEY)
+    store.put("trtllm/a", _record("http://127.0.0.1:8001"))
+    raw.data["trtllm/b"] = "not json"
+    raw.data["trtllm/c"] = b"\xff\xfe"
+
+    router = _context_router(store)
     assert await router.fetch_live_servers() == {"trtllm/a": "http://127.0.0.1:8001"}
 
 
