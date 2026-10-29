@@ -2816,9 +2816,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         echo "[INFRA-RETRY] ${stageName}: SLURM ${classificationSource} matched " +
                             "${classified.detectedPattern}: " +
                             classified.message
-                        if (retryContextAllowsRetry(pipeline, retryContext, classified)) {
-                            throw classified
-                        }
+                        throw classified
                     }
                     // pytest can exit 1 on a setup/body timeout. Require the full rendered
                     // list to detect unexecuted tests, plus single-task/no-perf-failure
@@ -2844,7 +2842,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         }
                     }
                     echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} state=${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}; deferring to classifier."
-                    throw (classified instanceof InfraFailure ? classified : jobFailure)
+                    throw jobFailure
                 }
             }
             echo "Finished test stage execution."
@@ -3799,7 +3797,11 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
             )
             deleteProgressArtifact(stageName, postTag)
             if (!suppressTestReporting) {
-                junit(testResults: "${stageName}/results*.xml", keepProperties: true)
+                if (fileExists("${stageName}/waive_refresh")) {
+                    junit(testResults: "${stageName}/results*.xml", keepProperties: true)
+                } else {
+                    junit(testResults: "${stageName}/results*.xml")
+                }
             }
             }
         }
