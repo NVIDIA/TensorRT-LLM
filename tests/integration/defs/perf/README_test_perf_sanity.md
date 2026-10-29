@@ -31,9 +31,12 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
 
 TPOT is time per output token, so lower values are better. Its reported delta is
-negative for a slowdown, and calculated baselines use P5 of the smoothed history,
-as for the other latency metrics. TPOT is not in `REGRESSION_METRICS`, so these
-statistics are diagnostic and do not determine the default pass/fail verdict.
+negative when latency exceeds the selected baseline. A stored `d_baseline_*`
+override takes precedence; otherwise, the baseline is recalculated as P5 of the
+smoothed history, as for the other latency metrics. Calculated baselines are not
+automatically stored as overrides. Historical TPOT measurements remain valid
+when the comparison direction changes. TPOT is not in `REGRESSION_METRICS`, so
+these statistics are diagnostic and do not determine the default pass/fail verdict.
 
 **Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
 

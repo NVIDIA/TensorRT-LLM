@@ -29,7 +29,7 @@ _TPOT_METRICS = ("d_mean_tpot", "d_median_tpot", "d_p99_tpot")
 
 @pytest.fixture
 def regression_utils(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    # Load the real comparison code without GPU or OpenSearch dependencies.
+    """Load the real comparison code without GPU or OpenSearch dependencies."""
     alternative = ModuleType("defs.trt_test_alternative")
     alternative.print_info = lambda *args, **kwargs: None
     alternative.print_warning = lambda *args, **kwargs: None
@@ -49,7 +49,7 @@ def regression_utils(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
 
 @pytest.fixture(scope="module")
 def metric_lists() -> dict[str, list[str]]:
-    # Read the actual harness lists without importing its serving dependencies.
+    """Read the harness lists without importing its serving dependencies."""
     # The unrelated time-breakdown metrics are not exercised by these tests.
     namespace = {"TIME_BREAKDOWN_METRICS": ()}
     names = {"MAXIMIZE_METRICS", "MINIMIZE_METRICS", "REGRESSION_METRICS"}
@@ -83,6 +83,7 @@ def test_tpot_report_and_gate(
     expected_diff: float,
     is_slowdown: bool,
 ) -> None:
+    """Honor a stored baseline while applying latency signs and the selected gate."""
     data = {0: {metric: value}}
     regression_utils.prepare_regressive_test_cases(
         latest_history_data_dict={},
@@ -101,6 +102,7 @@ def test_tpot_report_and_gate(
 def test_tpot_baseline_uses_low_latency_percentile(
     regression_utils: ModuleType, metric_lists: dict[str, list[str]], metric: str
 ) -> None:
+    """Compute P5 from historical latency measurements, including older samples."""
     history = [
         {"ts_created": "2026-10-01", metric: 6.0},
         {"ts_created": "2026-10-02", metric: 12.0},
@@ -111,3 +113,44 @@ def test_tpot_baseline_uses_low_latency_percentile(
     )
     # The trailing means are 6, 9, 12; their P5 is 6.3 (P95 would be 11.7).
     assert baseline[metric] == pytest.approx(6.3)
+
+
+@pytest.mark.parametrize("metric", _TPOT_METRICS)
+def test_calculated_tpot_baseline_is_not_persisted_as_an_override(
+    regression_utils: ModuleType,
+    metric_lists: dict[str, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    metric: str,
+) -> None:
+    """Reclassifying old measurements recomputes P5 instead of inheriting a calculated P95."""
+    history = [
+        {"ts_created": "2026-10-01", metric: 6.0},
+        {"ts_created": "2026-10-02", metric: 12.0},
+        {"ts_created": "2026-10-03", metric: 18.0},
+    ]
+    uploaded = []
+    monkeypatch.setattr(regression_utils, "get_job_info", lambda: {"b_is_post_merge": True})
+    monkeypatch.setattr(regression_utils, "post_new_perf_data", uploaded.append)
+    stored_fields = {}
+    for maximize, expected_baseline in ((True, 11.7), (False, 6.3)):
+        monkeypatch.setattr(
+            regression_utils,
+            "get_history_data",
+            lambda *args: ({}, {0: stored_fields}, {0: history}),
+        )
+        data = {0: {metric: 9.0}}
+        regression_utils.process_and_upload_test_results(
+            new_data_dict=data,
+            match_keys=[],
+            maximize_metrics=[metric] if maximize else metric_lists["MAXIMIZE_METRICS"],
+            minimize_metrics=[] if maximize else metric_lists["MINIMIZE_METRICS"],
+            regression_metrics=metric_lists["REGRESSION_METRICS"] if not maximize else [],
+        )
+        assert f"baseline={expected_baseline:.4f}" in data[0]["s_regression_info"]
+        assert data[0]["b_is_regression"] is False
+        assert uploaded[-1] == data
+        stored_fields = {
+            key: value for key, value in data[0].items() if key.startswith("d_baseline_")
+        }
+        assert not stored_fields
+    assert "diff=-42.86%" in data[0]["s_regression_info"]
