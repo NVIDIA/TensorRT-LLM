@@ -140,10 +140,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
-    # Block offsets of the mixed-precision staging cache, swapped in for
-    # kv_cache_block_offsets while a mixed-precision layer runs.
-    _mixed_precision_block_offsets: Optional[torch.Tensor] = field(
-        init=False, default=None, repr=False, compare=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -922,6 +918,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Prepare backend state shared by draft-forward execution paths."""
+        if self.draft_mixed_precision_staging is not None:
+            # MTP layers of a mixed draft manager run on its own staging copy.
+            self.swap_for_draft("mixed_precision_staging",
+                                self.draft_mixed_precision_staging)
         return None
 
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
@@ -1182,17 +1182,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         block_offsets = view.buffers.get_buffer(
             (1, view.rows, 2, view.max_blocks_per_seq),
             torch.int32,
-            "mixed_block_offsets",
+            f"{view.name}_block_offsets",
             self.is_cuda_graph,
         )[:, :batch]
         block_offsets.copy_(host, non_blocking=True)
-        self._mixed_precision_block_offsets = block_offsets
+        # Swapped in for kv_cache_block_offsets while a mixed-precision layer runs.
+        view.block_offsets = block_offsets
 
     def _swap_mixed_precision_kv(self, view) -> tuple:
         """Also point the block offsets at the staging pages."""
         saved = (*super()._swap_mixed_precision_kv(view),
                  self.kv_cache_block_offsets)
-        self.kv_cache_block_offsets = self._mixed_precision_block_offsets
+        self.kv_cache_block_offsets = view.block_offsets
         return saved
 
     def _restore_mixed_precision_kv(self, saved: tuple) -> None:

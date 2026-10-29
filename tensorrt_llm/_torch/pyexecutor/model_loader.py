@@ -183,6 +183,10 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             and getattr(model_config.sparse_attention_config, "algorithm",
                         None) in ("dsa", "deepseek_v4")):
         # These backends keep the history in their own pool, in the low-precision format.
+        # A drafter with its own architecture keeps a plain cache in the retained dtype.
+        model_config.extra_attrs[
+            "mixed_precision_draft_kv_cache_quant_algo"] = (mapped_pyt_quant or
+                                                            QuantAlgo.NO_QUANT)
         mapped_pyt_quant = _KV_CACHE_MAP[pyt_kv_cache_dtype.split("_")[1]]
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"

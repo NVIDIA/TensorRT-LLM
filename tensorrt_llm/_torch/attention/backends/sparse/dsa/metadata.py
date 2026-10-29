@@ -96,6 +96,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     # Twin page table (-1 = not retained) and context positions.
     retained_block_table = None
+    draft_retained_block_table = None
     retained_context_positions = None
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
@@ -442,8 +443,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
-        # Draft layers keep a plain cache: no retained rows while the draft manager is swapped in.
-        self.swap_for_draft("retained_block_table", None)
+        # MTP layers on the draft manager use its twin table; other drafters have none.
+        self.swap_for_draft("retained_block_table", self.draft_retained_block_table)
         # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
         # different dual-pool layout. Only native DSA cache managers use the DSA
         # draft-replay buffers below.
@@ -1126,6 +1127,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.cuda_graph_buffers,
                 [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
                 cache_name="retained_block_table",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+        if getattr(self.draft_kv_cache_manager, "high_layers", None):
+            self.draft_retained_block_table = self.get_empty(
+                self.cuda_graph_buffers,
+                [self.max_num_sequences, self.draft_kv_cache_manager.max_blocks_per_seq],
+                cache_name="draft_retained_block_table",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
@@ -2102,17 +2111,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table[: self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True
         )
-        high_table = self.retained_block_table
-        if high_table is not None:
+        for manager, high_table in (
+            (self.kv_cache_manager, self.retained_block_table),
+            (self.draft_kv_cache_manager, self.draft_retained_block_table),
+        ):
+            if high_table is None:
+                continue
+            width = min(max_blocks_used, high_table.shape[1])
             table = torch.full(
-                (self.num_seqs, max_blocks_used), -1, dtype=torch.int32, pin_memory=prefer_pinned()
+                (self.num_seqs, width), -1, dtype=torch.int32, pin_memory=prefer_pinned()
             )
             # Every twin shares one pool and page scale, so one table serves all layers.
-            local = next(iter(self.kv_cache_manager.high_layers))
-            self.kv_cache_manager.fill_high_precision_page_table(
-                self.request_ids, self.kv_cache_manager.pp_layers[local], table.numpy()
+            local = next(iter(manager.high_layers))
+            manager.fill_high_precision_page_table(
+                self.request_ids, manager.pp_layers[local], table.numpy()
             )
-            high_table[: self.num_seqs, :max_blocks_used].copy_(table, non_blocking=True)
+            high_table[: self.num_seqs, :width].copy_(table, non_blocking=True)
+        high_table = self.retained_block_table
+        if high_table is not None:
             # Absolute position of every context token, for the retained-row write.
             self.retained_context_positions = None
             if self.num_ctx_tokens > 0:

@@ -24,10 +24,13 @@ class MixedPrecisionKVStaging:
         layout: str,
         pool_layout: str,
         tokens_per_block: int,
+        name: str = "mixed",
     ) -> None:
         """Allocate the per-rank staging copy for the largest batch and longest sequence."""
         self.manager = manager
         self.buffers = buffers
+        # Buffer-pool name prefix: the target and a mixed draft manager each get their own.
+        self.name = name
         self.rows = rows
         self.layout = layout
         self.block_size = manager.tokens_per_block
@@ -56,7 +59,7 @@ class MixedPrecisionKVStaging:
                 self.max_page_bytes, math.prod(shape[1:]) * high.element_size()
             )
         self.staging_bytes = self.page_starts[-1] * self.max_page_bytes
-        storage = buffers.get_buffer([self.staging_bytes], torch.uint8, "mixed_kv_staging", True)
+        storage = buffers.get_buffer([self.staging_bytes], torch.uint8, f"{name}_kv_staging", True)
         # Zero once: the per-batch gather only writes real tokens, and attention
         # may load the padding of a request's last page before masking it.
         storage.zero_()
@@ -100,7 +103,12 @@ class MixedPrecisionKVStaging:
         manager = self.manager
         buffers = self.buffers
         lengths = [cached + new for cached, new in zip(cached_lengths, seq_lens)]
-        self.page_counts = [-(-length // self.tokens_per_block) for length in lengths]
+        self.page_counts = []
+        for request_id, length in zip(request_ids, lengths):
+            # Cover the allocated capacity: an MTP draft loop appends past this batch's lengths.
+            tokens = max(length, manager.kv_cache_map[request_id].capacity)
+            pages = math.ceil(tokens / self.tokens_per_block)
+            self.page_counts.append(min(pages, self.max_blocks_per_seq))
         batch = len(lengths)
         max_pages = -(-self.max_seq_len // self.block_size)
         self.page_tables = {}
@@ -116,12 +124,12 @@ class MixedPrecisionKVStaging:
             self.page_tables[layer_idx] = buffers.get_buffer(
                 (2, self.rows, max_pages),
                 torch.int32,
-                f"mixed_page_tables_{owner}",
+                f"{self.name}_page_tables_{owner}",
                 capture_graph,
             )[:, :batch]
             self.page_tables[layer_idx].copy_(tables, non_blocking=True)
         self.lengths = buffers.get_buffer(
-            (2, self.rows), torch.int32, "mixed_lengths", capture_graph
+            (2, self.rows), torch.int32, f"{self.name}_lengths", capture_graph
         )[:, :batch]
         self.lengths.copy_(
             torch.tensor(
