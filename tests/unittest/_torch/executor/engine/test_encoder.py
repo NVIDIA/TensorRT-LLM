@@ -16,7 +16,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, Trtll
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import EncoderCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners import encoder as encoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
-    EncoderConfigMixin,
+    EncoderConfig,
     EncoderPreparedInputs,
     EncoderRunner,
     EncoderRunnerConfig,
@@ -37,7 +37,7 @@ def _encoder_config(
     declares_feature_spec: bool,
     tp_size: int = 1,
     encoder_decoder: bool = False,
-) -> tuple[EncoderConfigMixin, tuple[tuple[int, ...], torch.dtype, int]]:
+) -> tuple[EncoderConfig, tuple[tuple[int, ...], torch.dtype, int]]:
     feature_spec = ((480_000,), torch.float32, 1_500)
 
     class _Model:
@@ -357,11 +357,10 @@ def test_encoder_runner_forwards_eager_model_inputs_and_gathers_logits() -> None
 
     outputs = runner._forward_step(
         inputs,
-        gather_ids=torch.tensor([2, 0]),
-        gather_context_logits=False,
+        gather_context_logits=True,
     )
 
-    torch.testing.assert_close(outputs["logits"], torch.tensor([[8, 9, 10, 11], [0, 1, 2, 3]]))
+    torch.testing.assert_close(outputs["logits"], torch.arange(12).reshape(3, 4))
     metadata.on_update_kv_lens.assert_called_once_with()
     model_forward.assert_called_once_with(**inputs, return_context_logits=True)
 

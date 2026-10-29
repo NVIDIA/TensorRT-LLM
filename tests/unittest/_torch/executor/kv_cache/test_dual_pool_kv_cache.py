@@ -121,11 +121,13 @@ def _make_model_config(
 
 
 def _make_mock_model_engine(model_config):
-    """Mock PyTorchModelEngine shell; a real engine needs GPU + loaded weights."""
+    """Mock ModelEngine shell; a real engine needs GPU + loaded weights."""
     engine = Mock()
     engine.model.model_config = model_config
     engine.model.config.torch_dtype = torch.bfloat16
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
+    engine.cuda_graph_batch_sizes = []
+    engine.cuda_graph_padding_enabled = False
     return engine
 
 
@@ -768,9 +770,10 @@ class TestKVCacheV2SchedulerCrossParam:
         mgr._has_cp_helix = False
         mgr.enable_joint_kv_cache_reuse = False
         # Instance attributes of the real manager, so a spec'd Mock does not
-        # auto-create them; the scheduler reads both in __init__.
+        # auto-create them; the scheduler reads them in __init__.
         mgr.enable_block_reuse = False
         mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
+        mgr.can_share_inflight_prefix = False
         return mgr
 
     def test_default_cross_is_none(self):

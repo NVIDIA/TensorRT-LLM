@@ -53,6 +53,7 @@ def kda_prefill(
     max_seqlen: int = 0,
     seq_order: torch.Tensor | None = None,
     cu_chunks: torch.Tensor | None = None,
+    sm_reserve: int = 0,
 ) -> torch.Tensor:
     """Update unique selected V-first state rows using packed raw Q/K/V.
 
@@ -70,6 +71,11 @@ def kda_prefill(
     upper bound for all replays, or zero to use the total token capacity.
     Small-BH and BT16 decomposition consume aligned, head-contiguous beta
     views directly; the engine requires compact beta storage.
+
+    ``sm_reserve`` SMs, held by a kernel resident for the whole step, are left
+    out of the Small-BH persistent grid; blocks beyond the free SMs would wait
+    behind the whole first wave. The routing above stays on the device SM count
+    so it matches BT16's own router.
     """
     device = q.device
     if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
@@ -147,6 +153,8 @@ def kda_prefill(
     if max_seqlen < 0 or max_seqlen > q.shape[1]:
         raise ValueError("max_seqlen must be zero or a sequence-length bound within total tokens")
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    if not 0 <= sm_reserve < sm_count:
+        raise ValueError(f"sm_reserve={sm_reserve} must leave at least one of {sm_count} SMs")
     small_bh_eligible = state_pool.dtype == torch.bfloat16 and q.shape[1] > 1
     if mode == "small-bh" and not small_bh_eligible:
         raise ValueError("Small-BH requires BF16 state and more than one packed token")
@@ -193,7 +201,7 @@ def kda_prefill(
                 state_input=state_pool,
                 state_output=state_pool,
                 state_indices=state_indices,
-                max_active_clusters=sm_count,
+                max_active_clusters=sm_count - sm_reserve,
             )
         return output
     # Torch allocations belong to the CUDA graph's private memory pool during
@@ -252,6 +260,7 @@ def _kda_prefill_fake(
     max_seqlen=0,
     seq_order=None,
     cu_chunks=None,
+    sm_reserve=0,
 ):
     return torch.empty_like(q)
 

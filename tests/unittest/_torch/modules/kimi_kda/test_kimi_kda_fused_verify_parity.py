@@ -154,8 +154,9 @@ def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
     S = W - 1 + M
 
     def _conv_cache(section):
-        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
+        # Raw bf16 projection inputs, dim-contiguous.
+        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.bfloat16).transpose(-1, -2)
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d]
         return cache
 
     return SimpleNamespace(
@@ -490,6 +491,67 @@ def test_fused_verify_falls_back_without_output_norm_weights():
     assert "fuse_output_norm" not in calls[0]
     assert calls[0]["cu_seqlens"] is not None
     assert _rep("fallback vs fused epilogue", fallback_out, fused_out)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_fused_verify_multi_wave_runs_two_cta_kernel(monkeypatch, state_dtype):
+    """A verify grid of more (head, request) tiles than SMs runs the two-CTAs-per-SM kernel, with
+    bitwise the outputs, state and replay caches of ``kda_decode_mtp_kernel``, over two rounds
+    with mixed acceptance."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops as mtp_ops
+
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    batch = num_sms // H + 4
+    steps = M + 1
+    runtime = _make_runtime(seed=1)
+    runtime.finalize_decode_weights()
+    conv_pool, ssm_pool = _make_pools(batch, seed=2)
+    cache = _make_fused_layer_cache(batch, conv_pool)
+    worlds = []
+    for _ in range(2):
+        worlds.append(
+            (
+                ssm_pool.to(state_dtype, copy=True),
+                SimpleNamespace(
+                    **{
+                        key: value.clone() if isinstance(value, torch.Tensor) else value
+                        for key, value in vars(cache).items()
+                    }
+                ),
+            )
+        )
+    select = mtp_ops._select_verify_kernel
+    selected = []
+
+    def v1_reference(**kwargs):
+        selected.append(select(**kwargs))
+        return "v1"
+
+    slots = torch.arange(batch, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    for rnd in range(2):
+        x = (torch.randn(batch * steps, HIDDEN, generator=gen, device="cuda") * 0.5).bfloat16()
+        with monkeypatch.context() as patch:
+            patch.setattr(mtp_ops, "_select_verify_kernel", v1_reference)
+            ref = runtime.forward_verify_fused(x, steps, worlds[0][1], worlds[0][0], slots)
+        out = runtime.forward_verify_fused(x, steps, worlds[1][1], worlds[1][0], slots)
+        assert selected[-1] == "two_cta"
+        assert torch.equal(out, ref), f"round {rnd} out"
+        assert torch.equal(worlds[1][0], worlds[0][0]), f"round {rnd} state"
+        for key in (
+            "kda_conv_q",
+            "kda_conv_k",
+            "kda_conv_v",
+            "kda_k_cache",
+            "kda_g_cache",
+            "kda_v_cache",
+            "kda_beta_cache",
+        ):
+            assert torch.equal(getattr(worlds[1][1], key), getattr(worlds[0][1], key)), key
+        accept = torch.randint(0, M + 1, (batch,), generator=gen, device="cuda", dtype=torch.int32)
+        for _, world_cache in worlds:
+            world_cache.prev_num_accepted_tokens.copy_(accept)
 
 
 class _PrequantizedProjectionStub(torch.nn.Module):

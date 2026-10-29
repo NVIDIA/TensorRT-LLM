@@ -318,9 +318,6 @@ def _run_create_py_executor(
     monkeypatch.setattr(
         py_executor_creator.Distributed, "get", staticmethod(lambda mapping: SimpleNamespace())
     )
-    monkeypatch.setattr(
-        py_executor_creator, "validate_feature_combination", lambda *args, **kwargs: None
-    )
     monkeypatch.setattr(py_executor_creator, "get_calibrator", lambda: _DummyCalibrator())
     monkeypatch.setattr(
         py_executor_creator, "instantiate_sampler", lambda *args, **kwargs: SimpleNamespace()
@@ -360,7 +357,7 @@ def _run_create_py_executor(
             max_seq_len=model_max_seq_len,
         )
 
-    monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
+    monkeypatch.setattr(py_executor_creator, "ModelEngine", _create_model_engine)
 
     def _create_py_executor_instance(**kwargs):
         if ctx_chunk_configs is not None:

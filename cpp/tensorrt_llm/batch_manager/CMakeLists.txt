@@ -34,7 +34,7 @@ set(SRCS
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
-     "${xgrammar_source_dir}/cpp/nanobind/.*\\.cc")
+     "${xgrammar_source_dir}/cpp/tvm_ffi/.*\\.cc")
 
 add_library(tensorrt_llm_xgrammar_static STATIC ${XGRAMMAR_SRCS})
 set_target_properties(
