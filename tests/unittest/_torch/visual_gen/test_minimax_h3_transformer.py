@@ -267,12 +267,13 @@ def test_transformer_accepts_dynamic_nvfp4_configuration() -> None:
 _H3_MEDIA_PROJECTIONS = ("proj_in", "audio_proj_in", "proj_out", "audio_proj_out")
 
 
-def _make_prequantized_nvfp4_model_config(**overrides: object) -> DiffusionModelConfig:
+def _make_prequantized_nvfp4_model_config(
+    quant_config: QuantConfig | None = None, **overrides: object
+) -> DiffusionModelConfig:
     """A ModelOpt NVFP4 export: static weights and activation scales, media projections excluded."""
     return _make_model_config(
-        quant_config=QuantConfig(
-            quant_algo=QuantAlgo.NVFP4, exclude_modules=list(_H3_MEDIA_PROJECTIONS)
-        ),
+        quant_config=quant_config
+        or QuantConfig(quant_algo=QuantAlgo.NVFP4, exclude_modules=list(_H3_MEDIA_PROJECTIONS)),
         dynamic_weight_quant=False,
         force_dynamic_quantization=False,
         **(_NVFP4_SHAPES | overrides),
@@ -1792,3 +1793,110 @@ def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
     # Every parameter, including the re-ordered gate_up_proj and the renamed down_proj.
     for name, parameter in model.named_parameters():
         torch.testing.assert_close(parameter, expected[name].to(parameter.dtype), rtol=0, atol=0)
+
+
+def _export_style_checkpoint(
+    reference_state: dict[str, torch.Tensor],
+    static_model: h3.MiniMaxH3Transformer3DModel,
+    quant_algo: QuantAlgo,
+) -> dict[str, torch.Tensor]:
+    """Build a ModelOpt-style checkpoint for ``static_model`` in the Diffusers layout.
+
+    Non-quantized tensors come from a BF16 model of the same shape. Every quantized Linear
+    gets packed weights and scales in the export's layout: NVFP4 stores ``uint8`` weights
+    ``[N, K/2]``, ``float8_e4m3fn`` block scales ``[N, K/16]``, a per-tensor
+    ``weight_scale_2`` and ``input_scale``; per-tensor FP8 stores ``float8_e4m3fn`` weights
+    ``[N, K]`` with a scalar ``weight_scale`` and ``input_scale``.
+    """
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    generator = torch.Generator().manual_seed(0)
+
+    def to_diffusers(name: str) -> str:
+        return name.replace(".ff.gate_up_proj", ".ff.net.0.proj").replace(".ff.down_proj", ".ff.net.2")
+
+    checkpoint = {to_diffusers(k): v.clone() for k, v in reference_state.items()}
+    for name, module in static_model.named_modules():
+        if not isinstance(module, Linear) or not module.has_any_quant:
+            continue
+        out_features, in_features = module.out_features, module.in_features
+        if name.endswith(".qkv_proj"):
+            targets = [
+                (name[: -len("qkv_proj")] + sub, out_features // 3) for sub in ("to_q", "to_k", "to_v")
+            ]
+        else:
+            targets = [(to_diffusers(name), out_features)]
+        for target, n in targets:
+            for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
+                checkpoint.pop(f"{target}.{suffix}", None)
+            if quant_algo == QuantAlgo.NVFP4:
+                checkpoint[f"{target}.weight"] = torch.randint(
+                    0, 256, (n, in_features // 2), dtype=torch.uint8, generator=generator
+                )
+                checkpoint[f"{target}.weight_scale"] = (
+                    torch.rand(n, in_features // 16, generator=generator) + 0.5
+                ).to(torch.float8_e4m3fn)
+                checkpoint[f"{target}.weight_scale_2"] = torch.tensor(0.01)
+            else:
+                checkpoint[f"{target}.weight"] = (
+                    torch.randn(n, in_features, generator=generator) * 0.05
+                ).to(torch.float8_e4m3fn)
+                checkpoint[f"{target}.weight_scale"] = torch.tensor(0.02)
+            checkpoint[f"{target}.input_scale"] = torch.tensor(0.5)
+            if module.bias is not None:
+                checkpoint[f"{target}.bias"] = torch.randn(n, generator=generator) * 0.01
+    return checkpoint
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and get_sm_version() >= 100),
+    reason="static NVFP4 / FP8 Linears need a Blackwell GPU",
+)
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
+def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
+    """A ModelOpt-style export goes through ``load_weights`` and one forward on the static path."""
+    reference = h3.MiniMaxH3Transformer3DModel(_make_model_config(**_NVFP4_SHAPES))
+    reference_state = {k: v.detach().cpu() for k, v in reference.state_dict().items()}
+    del reference
+
+    quant_config = QuantConfig(quant_algo=quant_algo, exclude_modules=list(_H3_MEDIA_PROJECTIONS))
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_prequantized_nvfp4_model_config(quant_config=quant_config)
+    ).to("cuda")
+    assert not model.model_config.dynamic_weight_quant
+    checkpoint = _export_style_checkpoint(reference_state, model, quant_algo)
+
+    model.load_weights(checkpoint)
+    model.post_load_weights()
+
+    first = model.transformer_blocks[0]
+    assert first.attn.qkv_proj.has_any_quant and first.ff.gate_up_proj.has_any_quant
+    assert torch.isfinite(first.attn.qkv_proj.input_scale).all()
+    for name in _H3_MEDIA_PROJECTIONS:
+        assert not getattr(model, name).has_any_quant
+        assert getattr(model, name).weight.dtype == torch.float32
+
+    # Rows: two text tokens, two video tokens, one audio token.
+    device = "cuda"
+    with torch.inference_mode():
+        video, audio = model(
+            hidden_states=torch.randn(1, 2, _NVFP4_SHAPES["in_channels"], device=device),
+            audio_hidden_states=torch.randn(1, 1, _NVFP4_SHAPES["audio_in_channels"], device=device),
+            encoder_hidden_states=torch.randn(
+                1, 2, _NVFP4_SHAPES["text_dim"], device=device, dtype=torch.bfloat16
+            ),
+            timestep=torch.tensor([1.0], device=device),
+            conditioning_timesteps=torch.tensor([1.0], device=device),
+            timestep_indices=torch.zeros(5, dtype=torch.long, device=device),
+            token_tags=torch.tensor([1, 1, 0, 0, 2], device=device),
+            position_ids=torch.tensor(
+                [[0, 0, 0], [1, 0, 0], [2, 0, 0], [2, 0, 1], [3, 0, 0]], device=device
+            ),
+            video_indices=torch.tensor([2, 3], device=device),
+            audio_indices=torch.tensor([4], device=device),
+            text_indices=torch.tensor([0, 1], device=device),
+            return_dict=False,
+        )
+    assert video.shape == (1, 2, _NVFP4_SHAPES["in_channels"])
+    assert audio.shape == (1, 1, _NVFP4_SHAPES["audio_in_channels"])
+    assert torch.isfinite(video).all() and torch.isfinite(audio).all()
