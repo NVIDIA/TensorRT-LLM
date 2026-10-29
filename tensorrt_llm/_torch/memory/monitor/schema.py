@@ -58,44 +58,26 @@ class StrEnum(str, Enum):
 class Category(StrEnum):
     """Business purpose of a block of device memory.
 
-    Deliberately absent:
+    A category exists only once something produces it; one that nothing
+    produces would sit in the summary table as an empty promise.
 
-    ``cuda_graph``
-        Expressed as :attr:`Placement.TORCH_GRAPH_POOL`. Graph pools hold the
-        captured region's activations and outputs, so a category would double
-        count against :attr:`ACTIVATION`.
-    ``locality_domain``
-        Its bytes are torch-visible (a ``CUDAPluggableAllocator`` installed as
-        a ``MemPool``) and are the model weights, merely placed on a specific
-        NUMA partition. A category would double count against :attr:`WEIGHTS`.
+    Deliberately absent: ``locality_domain``. Its bytes are torch-visible (a
+    ``CUDAPluggableAllocator`` installed as a ``MemPool``) and are the model
+    weights, merely placed on a specific NUMA partition, so a category would
+    double count against :attr:`WEIGHTS`.
     """
 
     WEIGHTS = "weights"
     KV_CACHE_POOL = "kv_cache.pool"
     KV_CACHE_AUX = "kv_cache.aux"
-    ATTENTION_WS = "attention.workspace"
-    MOE_WS = "moe.workspace"
-    MOE_PROFILER = "moe.profiler"
     SAMPLER = "sampler"
-    LOGITS = "logits"
     SPECULATIVE = "speculative"
-    BUFFER_POOL = "buffer_pool"
     COMM_MNNVL = "comm.mnnvl"
     COMM_SYMM_MEM = "comm.symm_mem"
     COMM_DEEPEP = "comm.deepep"
-    COMM_NCCL_WINDOW = "comm.nccl_window"
     COMM_NVLS = "comm.nvls"
-    COMM_ULYSSES = "comm.ulysses"
     DWDP_PAGES = "dwdp.pages"
-    KV_TRANSFER = "kv_transfer"
     CPP_BUFFERS = "cpp_buffers"
-
-    #: Only for allocations with positive evidence of being activations.
-    #: The leftover of ``torch_live - sum(tagged)`` is *not* activation -- it
-    #: also holds untagged weights, workspaces and allocations whose tag was
-    #: lost to trace-ring eviction. That leftover belongs in
-    #: :attr:`UNATTRIBUTED_LIVE`.
-    ACTIVATION = "activation"
 
     #: Allocations made while building the model that are not its parameters
     #: or registered buffers -- workspaces and caches the modules create.
@@ -114,7 +96,9 @@ class Category(StrEnum):
     #: silently inflating whichever category it was guessed into.
     TAGGED_OTHER = "tagged.other"
 
-    #: Default home for ``torch_live - sum(tagged)``.
+    #: Default home for ``torch_live - sum(tagged)``. Not called activation:
+    #: it also holds untagged workspaces and anything whose tag could not be
+    #: recovered, so the name would claim more than is known.
     UNATTRIBUTED_LIVE = "unattributed_live"
 
     #: Everything held by this process that no provider explains: the CUDA
@@ -143,12 +127,6 @@ class Placement(StrEnum):
 
     TORCH_DEFAULT = "torch_default"
     TORCH_GRAPH_POOL = "torch_graph_pool"
-    #: A ``torch.cuda.MemPool``, including pools backed by a pluggable
-    #: allocator. Measured on torch 2.14 to count toward both
-    #: ``memory_reserved()`` and ``memory_allocated()``, and to be separable
-    #: via ``segment_pool_id``. Its *physical* occupancy may still differ from
-    #: its logical size -- see :attr:`Basis.LOGICAL`.
-    TORCH_PRIVATE_POOL = "torch_private_pool"
     NON_TORCH = "non_torch"
 
 

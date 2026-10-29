@@ -254,11 +254,9 @@ class TestNamingRules:
         )
         remainder = derived_entries(frame)[0]
         assert remainder.category is Category.UNATTRIBUTED_LIVE
-        assert remainder.category is not Category.ACTIVATION
+        assert "NOT activation" in remainder.note
         assert remainder.source is Source.DERIVED
-        totals = summarize_by_category(frame)
-        assert totals.get(Category.ACTIVATION) is None
-        assert totals[Category.UNATTRIBUTED_LIVE] == 40 * GIB
+        assert summarize_by_category(frame)[Category.UNATTRIBUTED_LIVE] == 40 * GIB
 
 
 class TestExcludedFromTotals:
