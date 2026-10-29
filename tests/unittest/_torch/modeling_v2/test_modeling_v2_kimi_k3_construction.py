@@ -11,8 +11,14 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     modeling as route_a,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    spec_worker as spec_a,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
     modeling as route_b,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
+    spec_worker as spec_b,
 )
 from tensorrt_llm._torch.models import modeling_kimi_linear as shared
 from tensorrt_llm.functional import AllReduceStrategy
@@ -80,6 +86,26 @@ def test_expert_ckpt_spec_meets_the_shared_loader_contract(target):
     spec.loader(backend, "experts", 3, 0, lambda key: key, lambda key: None)
     assert loaded["global_expert_id"] == 3
     assert loaded["w1_weight"] == "experts.3.w1.weight_packed"
+
+
+@pytest.mark.parametrize("target", [spec_a, spec_b], ids=["tp16_moetp4ep4", "tp16_moetp16ep1"])
+def test_dspark_refine_block_logits_passes_spec_metadata(target, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        target.KimiK3DSparkWorker,
+        "_apply_dspark_markov_bias",
+        lambda self, *args: calls.append(args) or "biased",
+    )
+    worker = target.KimiK3DSparkWorker.__new__(target.KimiK3DSparkWorker)
+    draft_model = types.SimpleNamespace(has_markov_head=True)
+    spec_metadata = object()
+    out = worker._refine_block_logits(
+        draft_model, "logits", {"first_prev_tokens": "prev"}, spec_metadata
+    )
+    assert out == "biased"
+    assert calls == [(draft_model, "logits", "prev", spec_metadata)]
+    no_head = types.SimpleNamespace(has_markov_head=False)
+    assert worker._refine_block_logits(no_head, "logits", {}, spec_metadata) == "logits"
 
 
 def test_tp16_moetp16ep1_requires_the_split_set_explicitly():

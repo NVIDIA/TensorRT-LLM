@@ -1077,6 +1077,19 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
     # Whether this step's block logits are the Kimi K3 decode path's vocabulary shard (see ``_draft_block_logits``).
     _k3_sharded_block_logits = False
 
+    def _refine_block_logits(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+    ) -> torch.Tensor:
+        if not getattr(draft_model, "has_markov_head", False):
+            return gen_logits
+        return self._apply_dspark_markov_bias(
+            draft_model, gen_logits, inputs["first_prev_tokens"], spec_metadata
+        )
+
     def _apply_dspark_markov_bias(
         self,
         draft_model,
