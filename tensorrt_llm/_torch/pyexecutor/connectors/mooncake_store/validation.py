@@ -62,6 +62,27 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
             "is untested. Run with tensor parallelism only."
         )
 
+    if getattr(llm_args.kv_cache_config, "enable_swa_scratch_reuse", False):
+        raise NotImplementedError(
+            "The mooncake-store connector does not support "
+            "kv_cache_config.enable_swa_scratch_reuse. The connector saves a "
+            "sliding window's pages at the end of a prompt from the page indices "
+            "the cache reported when it allocated them, and scratch reuse lets a "
+            "prefill write a window block into a page it does not keep."
+        )
+
+    spec_config = getattr(llm_args, "speculative_config", None)
+    recompute_tail = (
+        getattr(spec_config, "context_recompute_tail", 0) if spec_config is not None else 0
+    )
+    if recompute_tail:
+        raise NotImplementedError(
+            "The mooncake-store connector does not support "
+            "speculative_config.context_recompute_tail. The runtime trims a reserved prefix to leave that tail for "
+            "the drafter after the lookup verified the sliding window at the full end, so the window the trimmed "
+            "load needs was never checked against the store. Leave context_recompute_tail at 0."
+        )
+
     # Only configs with an index-V cache declare the setting.
     sparse_config = llm_args.sparse_attention_config
     if sparse_config is not None and not getattr(sparse_config, "sparse_disable_index_value", True):
@@ -103,6 +124,7 @@ def validate_node_budget(
     *,
     ranks_on_node: Optional[int] = None,
     available_bytes: Optional[int] = None,
+    load_threads: int = 1,
 ) -> None:
     """Reject a segment size this node cannot afford once every rank asks.
 
@@ -118,6 +140,8 @@ def validate_node_budget(
             Defaults to the local MPI communicator's size.
         available_bytes: Host memory to measure against. Defaults to the
             kernel's own figure.
+        load_threads: Asynchronous loader threads per loading rank, each
+            pinning a staging pool of its own.
     """
     from tensorrt_llm._utils import local_mpi_size
 
@@ -131,9 +155,10 @@ def validate_node_budget(
 
     segment_claim = ranks_on_node * max(0, config.global_segment_size)
     # Staging is pinned for the process's lifetime and comes out of the same
-    # DRAM, so it belongs in the sum even when no segment is mounted. One pool
-    # per direction, and a capacity-only rank opens neither.
-    directions = int(config.role.loads) + int(config.role.saves)
+    # DRAM, so it belongs in the sum even when no segment is mounted. Loads get
+    # a pool for the executor and one per asynchronous loader thread, saves
+    # one, and a capacity-only rank opens none.
+    directions = (1 + load_threads) * int(config.role.loads) + int(config.role.saves)
     staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
 
     claimed = segment_claim + staging_claim
@@ -187,17 +212,14 @@ def validate_node_budget(
 
 
 def validate_layout(layout: "KvCacheLayout") -> None:
-    """Reject KV cache geometries this connector cannot key correctly."""
-    windowed = [group.layer_group_id for group in layout.groups if group.window_size is not None]
-    if windowed:
-        raise NotImplementedError(
-            "The mooncake-store connector does not support sliding-window "
-            f"attention (layer groups {windowed} declare a window size). A page's "
-            "validity then depends on where the window sits, which is a property "
-            "of the request that read it rather than of the tokens it holds, so "
-            "content-addressed reuse across instances is not sound."
-        )
+    """Reject KV cache geometries this connector cannot key correctly.
 
+    Sliding-window groups are accepted. A page's bytes are fixed by the tokens
+    up to and including its block, which its key already chains, so a stored
+    page is never wrong for a request that shares the prefix. What a window
+    changes is which pages exist: the scheduler saves a window's pages only at
+    the end of each prompt, and a lookup resumes only where those are present.
+    """
     if not layout.groups:
         raise ValueError(
             "The KV cache layout describes no layer groups, so there is nothing "
