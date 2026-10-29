@@ -507,3 +507,18 @@ class TestStatsSerializer:
         pool_group = d["kvCacheIterationStatsByPoolGroup"]["0"]
         assert "iterSuspendedRequests" not in pool_group
         assert "iterResumedRequests" not in pool_group
+
+
+# TEMPORARY (rerun policy validation): fails once after 70 s, between the CPU
+# stage's rerun_twice_max_duration_s and rerun_once_max_duration_s, so it is
+# rerun once and passes. Revert before merging.
+def test_rerun_policy_fail_once_medium():
+    import os
+    import tempfile
+    import time
+
+    marker = os.path.join(tempfile.gettempdir(), "rerun_policy_medium_once")
+    if not os.path.exists(marker):
+        open(marker, "w").close()
+        time.sleep(70)
+        assert False, "medium-length failure on purpose"
