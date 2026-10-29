@@ -609,6 +609,11 @@ class BaseWorker(GenerationExecutor):
         if validator is not None:
             validator(tags)
 
+    def _validate_sleep_config(self, tags: list[ExecutorMemoryType]) -> None:
+        validator = getattr(self.engine, "validate_sleep_config", None)
+        if validator is not None:
+            validator(tags)
+
     def _invalidate_v1_prefix_cache_for_sleep(
             self, tags: list[ExecutorMemoryType]) -> None:
         invalidator = getattr(self.engine,
@@ -825,6 +830,9 @@ class BaseWorker(GenerationExecutor):
                         ack.get("has_mnnvl_resources", False)
                         for ack in prepare_acks)
 
+                if not errors and action == _SleepWakeupAction.SLEEP:
+                    self._validate_sleep_config(tags)
+
                 if not errors:
                     # MNNVL resource hooks contain subgroup handle exchange,
                     # so peers must enter COMMIT before rank 0 executes them.
@@ -844,12 +852,12 @@ class BaseWorker(GenerationExecutor):
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
                         self._invalidate_v1_prefix_cache_for_sleep(tags)
-                        release_with_tag(*tags)
+                        release_with_tag(*tags, resource=self.engine)
                         torch.cuda.synchronize()
                         gc.collect()
                         torch.cuda.empty_cache()
                     else:
-                        materialize_with_tag(*tags)
+                        materialize_with_tag(*tags, resource=self.engine)
                         torch.cuda.synchronize()
                         run_mnnvl = (getattr(
                             self.engine, "_run_mnnvl_checkpoint_resources",
@@ -956,7 +964,7 @@ class BaseWorker(GenerationExecutor):
         return [tag for tag in tags if tag in parked_tags]
 
     def sleep(self, sleep_tags: list[str]) -> None:
-        """Release GPU virtual memory for the specified memory type tags.
+        """Release GPU memory for the specified memory type tags.
 
         Supports both single-rank (``world_size == 1``) and multi-rank
         (TP/PP > 1) MPI executor deployments.  For multi-rank, a lightweight
@@ -968,11 +976,11 @@ class BaseWorker(GenerationExecutor):
         pause rank-0's event loop, matching the ``@control_action_decorator``
         behaviour used in the Ray executor.
 
-        Only allocations backed by virtual memory (VMM) and registered under
-        the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
-        released.  Components using alternative memory management (e.g.
-        ``LoadFormat.GMS``-managed weights) are not VMM-tagged and will be
-        silently skipped by ``release_with_tag``.
+        Releases runtime virtual-memory allocations and native KV cache V2
+        pools registered under the active
+        :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig`. Components without
+        tagged sleep support (e.g. ``LoadFormat.GMS``-managed weights) are
+        skipped by ``release_with_tag``.
 
         Args:
             sleep_tags: List of
@@ -981,7 +989,7 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None. The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been released on every rank and request
+            tagged allocations have been released on every rank and request
             admission remains closed until ``wakeup()`` succeeds.
 
         Raises:
@@ -1007,9 +1015,10 @@ class BaseWorker(GenerationExecutor):
                 with self.engine._sleep_wakeup_lock, self.engine.control_action(
                 ):
                     torch.cuda.synchronize()
+                    self._validate_sleep_config(tags)
                     local_mutation_started = True
                     self._invalidate_v1_prefix_cache_for_sleep(tags)
-                    release_with_tag(*tags)
+                    release_with_tag(*tags, resource=self.engine)
                     torch.cuda.synchronize()
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -1025,11 +1034,11 @@ class BaseWorker(GenerationExecutor):
             raise
 
     def wakeup(self, wakeup_tags: list[str]) -> None:
-        """Materialize GPU virtual memory for the specified memory type tags.
+        """Materialize GPU memory for the specified memory type tags.
 
         Supports both single-rank (``world_size == 1``) and multi-rank
         (TP/PP > 1) MPI executor deployments.  See :meth:`sleep` for details
-        on VMM scope restrictions, backend prerequisites, and multi-rank
+        on supported allocations, backend prerequisites, and multi-rank
         coordination.
 
         Args:
@@ -1039,7 +1048,7 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None. The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been materialized on every rank.
+            tagged allocations have been materialized on every rank.
             Request admission reopens once every tag from the corresponding
             sleep transition has been restored.
 
@@ -1066,7 +1075,7 @@ class BaseWorker(GenerationExecutor):
                 ):
                     torch.cuda.synchronize()
                     local_mutation_started = True
-                    materialize_with_tag(*tags)
+                    materialize_with_tag(*tags, resource=self.engine)
                     torch.cuda.synchronize()
         except Exception:
             if local_mutation_started:

@@ -173,6 +173,7 @@ def _make_creator(
     creator._dummy_reqs = None
     creator._profiling_stage_data = None
     creator._kv_cache_manager_cls = manager_cls
+    creator._is_kv_cache_manager_v2 = issubclass(manager_cls, KVCacheManagerV2)
     creator._execution_stream = None
     creator._draft_config = None
     creator._skip_est = True

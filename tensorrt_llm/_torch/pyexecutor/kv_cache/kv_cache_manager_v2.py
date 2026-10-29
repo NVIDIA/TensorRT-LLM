@@ -40,6 +40,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -158,6 +159,7 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 
 # Shared by capacity estimation and growth, in addition to speculative tokens.
 BASE_GENERATION_TOKEN_COUNT = 1
+
 
 # Readable name per CacheTier, used only to label level-indexed counters. The levels themselves
 # come from the configured tier list, so several levels may share a name. Keyed by the enum
@@ -2442,6 +2444,8 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
+        self._sleep_restore_mode: RestoreMode | None = None
+        self._sleeping_active_caches: set[int] = set()
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
         # See `wait_allocation_fences`.
         self._allocation_stream: torch.cuda.Stream | None = None
@@ -8310,6 +8314,101 @@ class KVCacheManagerV2(BaseResourceManager):
                 logger.warning("prefetch failed for request %s", req.py_request_id)
                 success = False
         return success
+
+    def validate_sleep_config(self, mode: RestoreMode) -> None:
+        """Reject unsupported ownership and warn about limited backup capacity.
+
+        Live pages of retained internal caches must still fit in the colder tiers;
+        otherwise the release itself fails.
+        """
+        if self._sharing is not None:
+            raise ValueError(
+                "KV_CACHE sleep with an attached KV cache lender requires a lender "
+                "sleep/wake lifecycle, which is not supported. Exclude KV_CACHE "
+                "while a lender is attached."
+            )
+        if mode in (RestoreMode.NONE, RestoreMode.MEMSET):
+            return
+        tiers = self.impl.init_config.cache_tiers
+        gpu_levels = [i for i, tier in enumerate(tiers) if isinstance(tier, GpuCacheTierConfig)]
+        gpu_quota = sum(tiers[i].quota for i in gpu_levels)
+        host_quota = max(
+            (
+                tier.quota
+                for tier in tiers[gpu_levels[-1] + 1 :]
+                if isinstance(tier, HostCacheTierConfig)
+            ),
+            default=0,
+        )
+        if host_quota < gpu_quota:
+            shortfall = gpu_quota - host_quota
+            logger.warning(
+                "KVCacheManagerV2 CPU/PINNED sleep has a host tier below all GPU levels smaller "
+                "than the combined hot and cold GPU cache quota, so reusable pages may be dropped "
+                "and the release fails if live pages of retained internal requests do not fit. "
+                f"Combined GPU quota: {gpu_quota} bytes ({gpu_quota / (1 << 20):.2f} MiB); "
+                f"largest eligible host tier: {host_quota} bytes ({host_quota / (1 << 20):.2f} MiB); "
+                f"shortfall: {shortfall} bytes ({shortfall / (1 << 20):.2f} MiB). "
+                f"Set kv_cache_config.host_cache_size to at least {gpu_quota} bytes "
+                "to back up the full GPU cache."
+            )
+
+    def release_memory(self, mode: RestoreMode) -> None:
+        """Release GPU backing, plus HOST backing for discarded KV, after draining."""
+        if self._sleep_restore_mode is not None:
+            return
+        self.validate_sleep_config(mode)
+        discard = mode in (RestoreMode.NONE, RestoreMode.MEMSET)
+        if discard and any(
+            not self.impl.is_stats_excluded(req_id) or cache.num_committed_tokens != 0
+            for req_id, cache in self.kv_cache_map.items()
+        ):
+            raise RuntimeError(
+                "Discarding KV cache memory requires all user requests to be drained"
+            )
+        self._sleep_restore_mode = mode
+        for req_id, cache in self.kv_cache_map.items():
+            if cache.is_active:
+                self._sleeping_active_caches.add(req_id)
+        self.impl.release_gpu_memory(discard=discard)
+        if discard:
+            self._fresh_pages_filled.clear()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
+
+    def _zero_pools_on_wakeup(self, mode: RestoreMode) -> bool:
+        """Whether restored GPU pools are zeroed before surviving pages return to them."""
+        return mode == RestoreMode.MEMSET
+
+    def materialize_memory(self) -> None:
+        """Restore pool backing and reconnect surviving requests to their cache pages."""
+        mode = self._sleep_restore_mode
+        if mode is None:
+            return
+        self.impl.materialize_gpu_memory(zero=self._zero_pools_on_wakeup(mode))
+        for req_id in self._sleeping_active_caches:
+            cache = self.kv_cache_map[req_id]
+            if not cache.is_active and not cache.resume(self._stream.cuda_stream):
+                raise RuntimeError(f"Could not resume KV cache for request {req_id}")
+            if cache.batch_row is None:
+                self._restore_page_index_bufs(req_id, cache)
+        if _GUARD_PAGE_REQUEST_ID in self.kv_cache_map:
+            self._guard_page_by_layer.clear()
+            for candidate in self._iter_guard_candidate_buffers():
+                key, buffer, pages = self._resolve_guard_candidate(candidate)
+                page = next((int(p) for p in pages if p != BAD_PAGE_INDEX), None)
+                if page is None or not 0 <= page < buffer.shape[0]:
+                    continue
+                if _fill_kv_pages(buffer, [page], self._guard_page_value):
+                    self._guard_page_by_layer[key] = page
+            if not self._guard_page_by_layer:
+                raise RuntimeError("Could not restore the KV cache guard page after wakeup")
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.wait_published()
+            self.sparse_metadata_batch.publish()
+        self._stream.synchronize()
+        self._sleeping_active_caches.clear()
+        self._sleep_restore_mode = None
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()

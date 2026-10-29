@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch import virtual_memory
 from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_TOKENS_PER_BLOCK,
@@ -98,6 +99,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     get_pp_layers,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
@@ -4918,8 +4920,11 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
 
 
 @skip_no_cuda
-def test_v2_hybrid_mamba_state_views_use_logical_slots():
-    mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, num_mamba_layers=2)
+@pytest.mark.parametrize("restore_mode", [None, RestoreMode.NONE])
+def test_v2_hybrid_mamba_state_views_use_logical_slots(restore_mode):
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4, num_mamba_layers=2, host_cache_size=16 << 20
+    )
     try:
         assert len(mgr.all_ssm_states) == 2
         assert len(mgr.all_conv_states) == 2
@@ -4958,9 +4963,21 @@ def test_v2_hybrid_mamba_state_views_use_logical_slots():
                 // conv_scale
             )
 
+        hole = mgr.add_dummy_requests([122], token_nums=[8], is_gen=False)[0]
         mgr.add_dummy_requests([123, 456], token_nums=[8, 8], is_gen=False)
+        mgr.free_resources(hole)
         indices = mgr.get_state_indices([123, 456], [False, False])
         assert all(0 <= index < ssm_slots for index in indices)
+        if restore_mode is not None:
+            mgr.release_memory(restore_mode)
+            mgr.materialize_memory()
+            restored = mgr.get_state_indices([123, 456], [False, False])
+            # The freed hole forces ordinary allocation onto different slots.
+            assert restored != indices
+            assert restored == [
+                mgr.kv_cache_map[rid].get_ssm_block_base_index(mgr.ssm_layer_group_id)
+                for rid in (123, 456)
+            ]
     finally:
         mgr.shutdown()
 
@@ -5960,6 +5977,97 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
                 actual, expected, atol=2e-2, rtol=2e-2, msg=f"verify round {round_idx}"
             )
     torch.testing.assert_close(states, expected_states, atol=1e-3, rtol=1e-3)
+
+
+@skip_no_cuda
+def test_v2_kda_replay_sleep_restores_slot_history():
+    tag = "kda_replay_sleep"
+    with virtual_memory.maybe_scope(True, tag, RestoreMode.CPU) as pool:
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            spec_config=MTPDecodingConfig(max_draft_len=2),
+            conv_state_layout="q_k_v",
+            mamba_n_groups=4,
+            mamba_ssm_cache_dtype=torch.float32,
+            kda_replay_num_spec=2,
+            host_cache_size=16 << 20,
+        )
+    try:
+        assert pool is not None
+        replay = mgr._kda_replay
+        assert replay is not None and replay.prev_num_accepted_tokens is not None
+        hole = mgr.add_dummy_requests([100], token_nums=[8], is_gen=True)[0]
+        mgr.add_dummy_requests([101, 102], token_nums=[8, 8], is_gen=True)
+        mgr.free_resources(hole)
+        old_slots = mgr.get_state_indices([101, 102])
+        replay.prev_num_accepted_tokens[old_slots] = torch.tensor(
+            [1, 2], dtype=torch.int32, device="cuda"
+        )
+        assert replay.pool_layers is not None
+        replay_buffers = tuple(
+            layer[name] for layer in replay.pool_layers for name in _KDA_REPLAY_BUFFERS
+        )
+        for offset, replay_buffer in enumerate(replay_buffers):
+            replay_buffer[old_slots[0]].fill_(offset * 10 + 1)
+            replay_buffer[old_slots[1]].fill_(offset * 10 + 2)
+        expected_rows = [replay_buffer[old_slots].clone() for replay_buffer in replay_buffers]
+        expected_counts = replay.prev_num_accepted_tokens[old_slots].clone()
+
+        mgr.release_memory(RestoreMode.CPU)
+        assert virtual_memory.release_with_tag(tag) > 0
+        assert virtual_memory.materialize_with_tag(tag) > 0
+        torch.cuda.synchronize()
+        mgr.materialize_memory()
+
+        new_slots = mgr.get_state_indices([101, 102])
+        # The freed hole forces this test through replay-history relocation.
+        assert new_slots != old_slots
+        assert new_slots == [
+            mgr.kv_cache_map[rid].get_ssm_block_base_index(mgr.ssm_layer_group_id)
+            for rid in (101, 102)
+        ]
+        torch.testing.assert_close(replay.prev_num_accepted_tokens[new_slots], expected_counts)
+        for replay_buffer, expected in zip(replay_buffers, expected_rows):
+            torch.testing.assert_close(replay_buffer[new_slots], expected)
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("local_num_mamba_layers", [0, 1])
+@pytest.mark.parametrize("new_slot", [5, 7])
+def test_v2_materialize_memory_refreshes_active_slots(
+    monkeypatch, local_num_mamba_layers, new_slot
+):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = local_num_mamba_layers
+    mgr.ssm_layer_group_id = 0
+    mgr._request_id_to_state_index = {101: 5, 202: 9}
+    mgr.kv_cache_map = {
+        101: SimpleNamespace(
+            is_active=True, get_ssm_block_base_index=MagicMock(return_value=new_slot)
+        ),
+        202: SimpleNamespace(is_active=False),
+        303: SimpleNamespace(is_active=True),
+    }
+    mgr._stream = MagicMock()
+    mgr._on_state_slots_relocated = MagicMock()
+    base_materialize = MagicMock()
+    monkeypatch.setattr(KVCacheManagerV2, "materialize_memory", base_materialize)
+    stream_scope = MagicMock(return_value=contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "stream", stream_scope)
+
+    mgr.materialize_memory()
+
+    base_materialize.assert_called_once_with()
+    if local_num_mamba_layers and new_slot != 5:
+        mgr._on_state_slots_relocated.assert_called_once_with([5], [new_slot])
+        stream_scope.assert_called_once_with(mgr._stream)
+        mgr._stream.synchronize.assert_called_once_with()
+        assert mgr._request_id_to_state_index == {101: new_slot, 202: 9}
+    else:
+        mgr._on_state_slots_relocated.assert_not_called()
+        stream_scope.assert_not_called()
+        mgr._stream.synchronize.assert_not_called()
+        assert mgr._request_id_to_state_index == {101: 5, 202: 9}
 
 
 def test_v2_kda_replay_policy_seeds_disaggregated_generation_slots():

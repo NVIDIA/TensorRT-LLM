@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/sparseCache.h"
 
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include <numeric>
@@ -68,10 +69,15 @@ LeaseLayout leaseLayout(SparseCacheInit const& shape)
 // SparseCellArena
 // ---------------------------------------------------------------------------
 
+SparseCellArena::ArenaMemory::ArenaMemory(size_t bytes)
+    : allocator(tierAllocationGranularity(CacheTier::GPU_MEM, bytes))
+    , mapping(roundUp(bytes, allocator.physMemSize()), allocator, divUp(bytes, allocator.physMemSize()))
+{
+}
+
 SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     : mShape(shape)
 {
-    CUstream const stream = nullptr;
     TLLM_CHECK_WITH_INFO(shape.numLayers > 0 && shape.numSelections > 0 && shape.numBuffers > 0
             && shape.entriesPerSelection > 0 && shape.cellsPerBuffer > 0,
         "SparseCellArena requires a positive layer, selection, buffer, entry and cell count");
@@ -130,9 +136,8 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
 
     mNumBytes = cellBytes + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes;
 
-    CUdeviceptr base = 0;
-    cuCheck(cuMemAlloc(&base, mNumBytes));
-    mMemory = CudaUniqPtr<>{reinterpret_cast<std::byte*>(base)};
+    mMemory = std::make_unique<ArenaMemory>(mNumBytes);
+    auto const base = static_cast<CUdeviceptr>(mMemory->mapping.address());
 
     for (auto offset : regionOffset)
     {
@@ -144,6 +149,14 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     mSharedLayerSelection = reinterpret_cast<int32_t*>(shared + layerBytes + slotBytes);
     mIdentity = reinterpret_cast<int32_t*>(shared + layerBytes + slotBytes + selectionBytes);
     mMetadataBase = shared + sharedBytes;
+
+    _initializeMetadata();
+}
+
+void SparseCellArena::_initializeMetadata()
+{
+    CUstream const stream = nullptr;
+    auto const entries = static_cast<size_t>(mShape.numSelections) * mShape.entriesPerSelection;
 
     cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mSharedLayer), mShape.bufferLayer.data(),
         sizeof(int32_t) * mShape.bufferLayer.size(), stream));
@@ -172,6 +185,48 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     // The arena has no stream of its own, so the staging above is ordered on the null
     // stream only. `identity` also dies with this scope. Both want it landed here.
     cuCheck(cuStreamSynchronize(stream));
+}
+
+void SparseCellArena::releaseMemory(bool discard)
+{
+    if (empty())
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(!mSleeping, "Sparse arena memory is already released");
+    cuCheck(cuCtxSynchronize());
+    if (!discard)
+    {
+        mSleepContents.resize(mNumBytes);
+        cuCheck(cuMemcpyDtoH(mSleepContents.data(), static_cast<CUdeviceptr>(mMemory->mapping.address()), mNumBytes));
+    }
+    mSleeping = true;
+    mMemory->mapping.realloc(0);
+    mMemory->allocator.clear();
+}
+
+void SparseCellArena::materializeMemory(bool zero)
+{
+    if (!mSleeping)
+    {
+        return;
+    }
+    mMemory->mapping.realloc(mMemory->mapping.virtualBytes());
+    auto const address = static_cast<CUdeviceptr>(mMemory->mapping.address());
+    if (!mSleepContents.empty())
+    {
+        cuCheck(cuMemcpyHtoD(address, mSleepContents.data(), mNumBytes));
+    }
+    else
+    {
+        if (zero)
+        {
+            cuCheck(cuMemsetD8(address, 0, mNumBytes));
+        }
+        _initializeMetadata();
+    }
+    std::vector<std::byte>{}.swap(mSleepContents);
+    mSleeping = false;
 }
 
 void SparseCellArena::initialiseLease(SparseLeaseIndex slot, CUstream stream)

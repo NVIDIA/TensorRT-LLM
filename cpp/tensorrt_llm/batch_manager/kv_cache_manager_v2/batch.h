@@ -688,6 +688,16 @@ private:
     [[nodiscard]] int32_t const* flushToUnits(LifeCycleId lifeCycle) const;
 
     friend class KvCache;
+    friend class KvCacheManager;
+
+    //! Manager-only sleep transitions. Rows and leases stay owned by this Batch while
+    //! suspended; public per-cache lifecycle calls remain forbidden for members.
+    void _suspendForSleep();
+    void _releaseMemory(bool discard);
+    void _materializeMemory(bool zero);
+    void _resumeAfterSleep();
+
+    bool mSleeping = false;
 
     //! Called by a member being destroyed. Unreachable while seated -- the Batch holds a
     //! reference, so the destructor cannot run -- and kept as the assertion of that.

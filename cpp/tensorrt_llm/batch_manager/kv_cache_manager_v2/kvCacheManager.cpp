@@ -453,6 +453,92 @@ void KvCacheManager::clearReusableBlocks()
     mRadixTree->clear();
 }
 
+void KvCacheManager::releaseGpuMemory(bool discard)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    TLLM_CHECK_WITH_INFO(!mMaterializingGpuMemory.has_value(), "GPU memory restoration is incomplete");
+    TLLM_CHECK_WITH_INFO(!mSleepRestorePending, "Cache memory release or restoration is pending");
+    for (KvCache const* cache : mLivingKvCaches)
+    {
+        TLLM_CHECK_WITH_INFO(cache->status() == KvCache::Status::SUSPENDED || cache->isActive(),
+            "Invalid cache state for memory release");
+        TLLM_CHECK_WITH_INFO(!discard || (isStatsExcluded(cache->id) && cache->numCommittedTokens() == 0),
+            "Discarding KV cache memory requires all user requests to be drained");
+    }
+    mSleepRestorePending = true;
+    for (auto* batch : mLivingBatches)
+    {
+        batch->_suspendForSleep();
+    }
+    for (KvCache* cache : mLivingKvCaches)
+    {
+        if (cache->isActive())
+        {
+            cache->mResumeAfterSleep = true;
+            cache->suspend();
+        }
+        else if (cache->hasScratchSlots())
+        {
+            auto scope = cache->recordEventScope();
+            cache->_freeReservedGpuSlots();
+        }
+    }
+    if (discard)
+    {
+        for (KvCache* cache : mLivingKvCaches)
+        {
+            cache->releaseMemory();
+        }
+        // Released caches retain only their private page layout, with no references into the tree.
+        mRadixTree->clear();
+    }
+    mStorage->releaseMemory(discard);
+    for (auto* batch : mLivingBatches)
+    {
+        batch->_releaseMemory(discard);
+    }
+}
+
+void KvCacheManager::materializeGpuMemory(bool zero)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (!mSleepRestorePending)
+    {
+        return;
+    }
+    if (!mMaterializingGpuMemory.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(mStorage->hasSavedPoolCapacities(),
+            "Cache memory release failed before saving pool capacities; restoration is unsafe");
+        mStorage->materializeMemory(zero);
+        mMaterializingGpuMemory = zero;
+    }
+    TLLM_CHECK_WITH_INFO(
+        *mMaterializingGpuMemory == zero, "Cannot change zero mode while retrying GPU memory restoration");
+    std::vector<KvCache*> releasedCaches;
+    for (KvCache* cache : mLivingKvCaches)
+    {
+        if (cache->status() == KvCache::Status::UNMATERIALIZED)
+        {
+            releasedCaches.push_back(cache);
+        }
+    }
+    KvCache::materializeMemory(releasedCaches);
+    // Every arena must be backed before any Batch republishes graph-visible state.
+    for (auto* batch : mLivingBatches)
+    {
+        batch->_materializeMemory(zero);
+    }
+    for (auto* batch : mLivingBatches)
+    {
+        batch->_resumeAfterSleep();
+    }
+    mMaterializingGpuMemory.reset();
+    mSleepRestorePending = false;
+}
+
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats,

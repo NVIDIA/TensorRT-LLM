@@ -103,8 +103,16 @@ first. New operations are also rejected during transitional and failed states.
 
 ## Memory tags
 
-Only allocations captured by the TensorRT-LLM virtual-memory allocator and
-registered with a requested tag are affected.
+Release affects allocations captured by the TensorRT-LLM virtual-memory allocator
+and registered with a requested tag, plus native KV-cache manager V2 pools under
+the `KV_CACHE` tag. V2 keeps cache objects and logical state while releasing their
+physical GPU storage. `NONE` and `MEMSET` discard KV contents and reusable prefixes
+and release HOST pool backing; `CPU` and
+`PINNED` preserve live request pages through the configured cache tiers, while
+reusable pages may be dropped under capacity pressure. KV release in `CPU` or
+`PINNED` mode warns when the host tier below all GPU levels is smaller than their
+combined GPU quota. Weights-only release and KV discard modes do not use backup
+capacity. See [V2 sleep and wakeup](kvcache.md#sleep-and-wakeup-with-v2).
 
 | `ExecutorMemoryType` | Tag value | Contents |
 | --- | --- | --- |
@@ -112,7 +120,7 @@ registered with a requested tag are affected.
 | `MODEL_ENGINE_MAIN` | `model` | Other main-model engine allocations |
 | `MODEL_WEIGHTS_DRAFT` | `draft_model_weights` | Draft-model parameters |
 | `MODEL_ENGINE_DRAFT` | `draft_model` | Other draft-model engine allocations |
-| `KV_CACHE` | `kv_cache` | KV-cache allocations; KV-cache sleep is rejected when KV-cache manager V2 is enabled |
+| `KV_CACHE` | `kv_cache` | KV-cache allocations, including native V2 pools; V2 KV-cache sleep rejects cache transceivers, KV-moving connectors, and attached KV lenders until their memory-access and registration lifecycles support sleep. Capacity-only connectors are allowed. |
 | `SAMPLER` | `sampler` | Sampling resources |
 | `DRAFTER` | `drafter` | Drafting resources |
 | `GUIDED_DECODER` | `guided_decoder` | Guided-decoding resources |
@@ -346,6 +354,14 @@ storage, unmaps them, and calls `cuMemRelease` on their CUDA physical allocation
 handles. Wakeup calls `cuMemCreate`, remaps new handles at the reserved virtual
 addresses, and restores or initializes contents according to `SleepConfig`.
 
+Native V2 KV pools use the cache manager's own storage lifecycle. Preserving
+modes migrate live pages through its cache tiers; destructive modes retain the
+native cache objects with unmaterialized pages. Wakeup restores pool capacity
+and resumes the caches through normal allocation without reconstructing logical
+request state in Python. GPU pool virtual addresses and metadata buffer addresses
+stay stable; page and scratch slot IDs may change. KV and SSM indices are refreshed
+before graph replay so kernels address the restored pages.
+
 Principal implementation locations are:
 
 - Synchronous API: `tensorrt_llm/llmapi/llm.py`
@@ -357,6 +373,7 @@ Principal implementation locations are:
 - Allocation tagging: `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py`
   and `tensorrt_llm/_torch/pyexecutor/model_loader.py`
 - Python VMM wrapper: `tensorrt_llm/_torch/virtual_memory.py`
+- Native V2 KV pools: `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/`
 - CUDA VMM: `cpp/tensorrt_llm/runtime/virtualMemory.cpp` and
   `cpp/include/tensorrt_llm/runtime/virtualMemory.h`
 - GMS adapter: `tensorrt_llm/_torch/memory/gpu_memory_backend.py`
