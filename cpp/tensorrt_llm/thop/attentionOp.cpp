@@ -728,7 +728,19 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
         params.block_counter = input_params.block_counter;
     }
 
+<<<<<<< ours
     params.multi_processor_count = input_params.multi_processor_count;
+=======
+        op->mUseNvfp4MlaKvCache = op->mKVCacheQuantMode.hasFp4KvCache() && op->mUseTllmGenSparseAttention
+            && !sparse_attn_kv_lens.has_value() && aux_kv_cache_pool_ptr.has_value();
+        op->mFP8ContextMLA = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::isSM100Family()
+                                 || tensorrt_llm::common::isSM120Family())
+            && (op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache);
+        op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache;
+        // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
+        op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64 && head_size == 576;
+>>>>>>> theirs
 
     // cross attn
     params.memory_length_per_sample = input_params.memory_length_per_sample;
@@ -901,6 +913,7 @@ tensorrt_llm::common::op::AttentionContextWorkspaceLayout MHA::contextWorkspaceL
 
 size_t MHA::getWorkspaceSizeForContext(FmhaParams const& p) const
 {
+<<<<<<< ours
     return p.num_tokens == 0 ? 0 : contextWorkspaceLayout(p).totalSize;
 }
 
@@ -914,6 +927,10 @@ size_t MHA::getWorkspaceSizeForGeneration(FmhaParams const& p) const noexcept
     auto const max_num_tokens = static_cast<int32_t>(p.num_gen_tokens);
     auto const max_blocks_per_sequence = static_cast<int32_t>(p.getMaxBlocksPerSequence());
     if (max_num_tokens == 0)
+=======
+    // Only SM100 family supports NVFP4 output.
+    if (!tensorrt_llm::common::isSM100Family())
+>>>>>>> theirs
     {
         return 0;
     }

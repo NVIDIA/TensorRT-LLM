@@ -78,6 +78,12 @@ add_th_common_family(
 target_include_directories(th_common_attention
                            PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 
+target_sources(
+  th_common_attention
+  PRIVATE "${KIMI_K3_MODEL_CSRC}/k3AttnResOp.cpp"
+          "${KIMI_K3_MODEL_CSRC}/k3MnnvlCommOp.cpp"
+          "${KIMI_K3_MODEL_CSRC}/k3MnnvlFusionOp.cpp")
+
 add_th_common_family(
   th_common_gemm_quant
   cutlassScaledMM.cpp

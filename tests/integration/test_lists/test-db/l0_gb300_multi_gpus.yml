@@ -28,14 +28,12 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep4_moetp4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[tp4_ep4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
+  # Covers the GPU cases of tests/unittest/_torch/attention/ on GB300, kernels/ and
+  # multi_gpu/ included; its cpu_only cases run on CPU (l0_cpu). The GPU cases of
+  # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that
+  # directory: an --ignore would change this entry's text, which agg_unit_mem_df.csv
+  # matches to set its parallelism. This post_merge stage is the only Blackwell stage that
+  # runs them.
   - unittest/_torch/attention TIMEOUT (120)
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel
@@ -55,6 +53,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # DWDP expert prefetch on real streams and copies, incl. the gather from
+  # peer GPUs.
+  - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py

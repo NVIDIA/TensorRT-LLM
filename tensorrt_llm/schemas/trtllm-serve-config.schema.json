@@ -64,6 +64,13 @@
           "title": "Enable Balance",
           "type": "boolean"
         },
+        "enable_kv_balanced_admission": {
+          "default": false,
+          "description": "Admit generation-only requests by per-rank KV load. When True and the first 32 queued requests are all generation-only requests without an attention_dp_rank, the attention DP router chooses which of them to admit and which rank takes each, keeping the largest per-rank request count and KV token count low, instead of admitting them in queue order. Request priorities are respected, and a request passed over in 64 admitting rounds is admitted next. Useful on disaggregated generation workers. Has no effect with kv_cache_routing_conversation_affinity, or with enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+          "status": "prototype",
+          "title": "Enable Kv Balanced Admission",
+          "type": "boolean"
+        },
         "enable_kv_cache_aware_routing": {
           "default": false,
           "description": "Enable internal KV cache-aware routing for attention DP. When enabled, distributes requests among ranks within a single instance's attention DP group, routing them to the rank with the matching prefix KV cache to reduce redundant prefill computation.",
@@ -1836,7 +1843,7 @@
     },
     "DwdpConfig": {
       "additionalProperties": false,
-      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\ndouble-buffered P2P remote regions), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
+      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
       "properties": {
         "contention_opt": {
           "default": false,
@@ -1866,6 +1873,13 @@
           "default": 0,
           "description": "The number of prefetch experts per worker.",
           "title": "Num Prefetch Experts",
+          "type": "integer"
+        },
+        "num_prefetch_slots": {
+          "default": 2,
+          "description": "The number of expert prefetch buffer slots. Each slot holds the remote experts of one MoE layer; more slots let the prefetch run further ahead of the MoE compute, at the cost of device memory that is then not available to the KV cache.",
+          "minimum": 2,
+          "title": "Num Prefetch Slots",
           "type": "integer"
         }
       },

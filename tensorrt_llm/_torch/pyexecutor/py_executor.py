@@ -432,6 +432,24 @@ def _request_flag(request, name: str) -> bool:
     return bool(value)
 
 
+def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
+    """Whether a single-rank attention-DP group can skip ADP dummy padding.
+
+    With one rank there is no peer whose collectives an empty batch would
+    stall, so padding only buys a wasted forward pass. A KV connector that
+    moves KV is the exception: canceled or completed loads release their slots
+    only after a forward pass flushes their responses, so an empty rank must
+    still be padded to make progress.
+
+    A module-level function so the minimal executors that unit tests assemble
+    can use it without the ``PyExecutor`` properties.
+    """
+    if executor.dist.tp_size > 1:
+        return False
+    connector = getattr(executor, "kv_connector_manager", None)
+    return connector is None or connector.capacity_only
+
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -3126,17 +3144,26 @@ class PyExecutor:
                     f"Error waiting on PP send handles during cleanup: "
                     f"{traceback.format_exc()}")
 
+    def _pp_rank_schedules(self) -> bool:
+        """Whether this rank computes the schedule that the other PP ranks receive.
+
+        For TP/CP cases, the first rank schedules the requests. For DP cases,
+        each first PP rank schedules its own requests. Every other rank receives
+        the schedule and runs its scheduler locally, so each rank schedules once
+        per iteration.
+        """
+        if self.dist.rank == 0:
+            return True
+        return (self.dist.is_first_pp_rank and self.dist.tp_size > 1
+                and self.enable_attention_dp)
+
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
 
-        # For TP/CP cases, the first rank schedules the requests.
-        # For DP cases, the first PP rank schedules the requests.
         scheduled_batch = None
         serializable_schedule = None
         wait_for_disagg_gen_transfer_progress = False
-        is_dp_broadcast = self.dist.tp_size > 1 and self.enable_attention_dp
-        if self.dist.rank == 0 or (self.dist.is_first_pp_rank
-                                   and is_dp_broadcast):
+        if self._pp_rank_schedules():
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
             )
             fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
@@ -3269,7 +3296,7 @@ class PyExecutor:
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 (scheduled_batch, fitting_disagg_gen_init_requests, _,
                  _) = self._pp_schedule_and_propagate(microbatch_id)
-                if self.dist.rank != 0:
+                if not self._pp_rank_schedules():
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
@@ -5365,7 +5392,7 @@ class PyExecutor:
                                 gpu_forward_start,
                                 gpu_forward_end) as fwd_timing:
                             if self.dwdp_manager is not None:
-                                self.dwdp_manager.prefetch_first_layers()
+                                self.dwdp_manager.start_forward()
                             batch_outputs = self._forward_step(scheduled_batch)
 
                         # None: _forward_step hit an exception and
@@ -5651,6 +5678,10 @@ class PyExecutor:
             self.control_action_done.wait()
         self.control_action_done.clear()
         self._active_control_id = None
+        if self.dwdp_manager is not None:
+            # The action may have changed the expert weights that the last
+            # forward pass already prefetched for the next one.
+            self.dwdp_manager.invalidate_prefetch()
         logger.debug("[control_action] control request finished")
 
     def _sync_and_process_resource_governor_queue(self):
@@ -7061,9 +7092,13 @@ class PyExecutor:
         self,
         waiting_queue: WaitingQueue,
         total_num_active_requests: int,
-        all_ranks_num_active_requests: Optional[List[int]] = None
-    ) -> List[RequestQueueItem]:
-        """Pop requests from waiting_queue based on available capacity."""
+        all_rank_states: Optional[List[RankState]] = None
+    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
+        """Pop requests from waiting_queue based on available capacity.
+
+        Returns the requests and, with attention DP, the ranks the router
+        planned for them (request id -> rank; empty when none are planned).
+        """
         admission_capacity = self._get_request_admission_capacity()
 
         max_new_requests = admission_capacity - total_num_active_requests
@@ -7078,17 +7113,26 @@ class PyExecutor:
                                            admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
+        if self.enable_attention_dp:
+            # FIFO in warmup and the benchmark fill phase, where every request
+            # must fit at once.
+            kv_balance = not (self.is_warmup or
+                              (self.is_benchmark_disagg
+                               and self._benchmark_fill_phase_active))
+            return self.adp_router.pop_requests(waiting_queue,
+                                                all_rank_states,
+                                                max_new_requests,
+                                                self.max_num_active_requests,
+                                                kv_balance=kv_balance)
         new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
-            enable_attention_dp=self.enable_attention_dp,
-            max_num_active_requests=self.max_num_active_requests,
-            all_ranks_num_active_requests=all_ranks_num_active_requests)
-        if (not new_requests or
-                not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
-                or self.enable_attention_dp):
-            return new_requests
-        return self._apply_mm_encoder_admission(waiting_queue, new_requests)
+            enable_attention_dp=False,
+            max_num_active_requests=self.max_num_active_requests)
+        if (not new_requests or not getattr(
+                self, "_mm_encoder_item_scheduling_enabled", False)):
+            return new_requests, {}
+        return self._apply_mm_encoder_admission(waiting_queue, new_requests), {}
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -7102,7 +7146,7 @@ class PyExecutor:
 
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
-            # because _pop_from_waiting_queue needs all_ranks_num_active_requests
+            # because _pop_from_waiting_queue needs the rank states
             # from the allgather result. Moving it to step 5 would require an
             # extra allgather. When introducing new router implementations
             # (e.g. KV-cache-aware) that need new_requests to gather additional
@@ -7171,10 +7215,8 @@ class PyExecutor:
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
                         gpu_forward_time_ms=record.gpu_forward_time_ms)
-            all_ranks_num_active_requests = [
-                s.num_active_requests for s in all_rank_states
-            ]
-            total_num_active_requests = sum(all_ranks_num_active_requests)
+            total_num_active_requests = sum(s.num_active_requests
+                                            for s in all_rank_states)
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
@@ -7186,16 +7228,14 @@ class PyExecutor:
                 # should_enable_overlap_headroom). They still count as live.
                 total_num_active_requests -= count_retiring_requests(
                     active_requests)
-            all_ranks_num_active_requests = None
             all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
 
         # 3. Pop requests from waiting queue
-        new_requests = self._pop_from_waiting_queue(
-            waiting_queue, total_num_active_requests,
-            all_ranks_num_active_requests)
+        new_requests, placement = self._pop_from_waiting_queue(
+            waiting_queue, total_num_active_requests, all_rank_states)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -7213,7 +7253,7 @@ class PyExecutor:
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
-                    self.max_num_active_requests)
+                    self.max_num_active_requests, placement=placement)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
@@ -8194,7 +8234,7 @@ class PyExecutor:
         """Pad an idle attention-DP rank with a role-matched dummy request."""
         if getattr(self, "_enable_remote_tail_adp", False):
             return
-        if not self.enable_attention_dp:
+        if not self.enable_attention_dp or _single_rank_adp_skips_padding(self):
             return
 
         expected_num_active_requests = self.expected_num_active_requests
@@ -8362,6 +8402,10 @@ class PyExecutor:
                 scheduled_batch.attention_dp_phase
                 in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE) and 0
                 in self.model_engine.cuda_graph_runner.padding_dummy_requests)
+            return
+        # With a single attention-DP rank `_can_queue` vetoes only this rank's
+        # own empty batch, so there is no peer to unblock.
+        if _single_rank_adp_skips_padding(self):
             return
         # A canceled connector load can remove the last local request during
         # recovery while peers still need this owner to participate in forward.

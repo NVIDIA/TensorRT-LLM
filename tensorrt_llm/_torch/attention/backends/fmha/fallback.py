@@ -28,7 +28,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_120f
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -243,7 +243,7 @@ class FallbackFmha(PhasedFmha):
         if sparse_algorithm in ("deepseek_v4", "dsa"):
             if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
                 return False
-            if get_sm_version() in (120, 121):
+            if is_sm_120f():
                 return False
         return True
 
