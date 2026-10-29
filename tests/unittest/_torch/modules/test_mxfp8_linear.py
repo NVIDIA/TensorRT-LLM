@@ -797,6 +797,63 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
     torch.testing.assert_close(graph_output, native(replay_x), rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available(),
+    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
+)
+@pytest.mark.parametrize("decode_graph", (False, True))
+def test_mxfp8_linear_consumes_offered_quantized_input(monkeypatch, decode_graph):
+    """A producer-quantized activation replaces the projection's own quantization once.
+
+    The offer is tied to the input tensor object: another tensor ignores it,
+    and a consumed offer is not reused.
+    """
+    if decode_graph and not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+        pytest.skip("FlashInfer CuTeDSL MXFP8 kernels are not available")
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    torch.manual_seed(0)
+    out_f, in_f, rows = 256, 512, 72
+    weight = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    weight_e4m3, weight_scale = quant_bf16_to_mxfp8(weight, 32)
+    lin = Linear(
+        in_features=in_f,
+        out_features=out_f,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+    ).cuda()
+    lin.load_weights([{"weight": weight_e4m3, "weight_scale_inv": weight_scale}])
+    method = lin.quant_method
+    assert isinstance(method, MXFP8LinearMethod)
+    if decode_graph:
+        assert method.enable_flashinfer_auto()
+        method.tune_decode_graph_backends = True
+
+    def run(t):
+        if not decode_graph:
+            return lin(t)
+        with flashinfer_mxfp8_decode_graph_capture():
+            return lin(t)
+
+    x = torch.randn(rows, in_f, dtype=torch.bfloat16, device="cuda")
+    other = 2 * x
+    expected_x, expected_other = run(x), run(other)
+    # A deliberately different activation shows whether the offer was used.
+    other_act, other_scale = torch.ops.trtllm.mxfp8_quantize(other, True)
+
+    MXFP8LinearMethod.offer_quantized_input(lin, x, other_act, other_scale)
+    assert torch.equal(run(x), expected_other)
+    # Consumed: the next call quantizes its own input again.
+    assert torch.equal(run(x), expected_x)
+    # Offered for another tensor: ignored and dropped.
+    MXFP8LinearMethod.offer_quantized_input(lin, other, other_act, other_scale)
+    assert torch.equal(run(x), expected_x)
+    assert torch.equal(run(other), expected_other)
+    MXFP8LinearMethod.offer_quantized_input(lin, x, other_act, other_scale)
+    MXFP8LinearMethod.withdraw_quantized_input(lin)
+    assert torch.equal(run(x), expected_x)
+
+
 def _even_rows(rows: int, rank: int, tp_size: int) -> tuple[int, int]:
     """Row range of `rank` when `rows` are split evenly over `tp_size` ranks."""
     return rank * rows // tp_size, (rank + 1) * rows // tp_size

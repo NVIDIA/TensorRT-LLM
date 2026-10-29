@@ -847,8 +847,24 @@ def mxfp8_quantize_gemm_autotuned(
         quantize_inputs,
         tactic=_choose_mxfp8_tactic(_MXFP8_QUANTIZE_AUTOTUNED_OP,
                                     quantize_runner, quantize_inputs, tune))
-    gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
+    return mxfp8_prequantized_gemm_autotuned(act, act_scale, weight,
+                                             weight_scale, output_dtype, tune)
+
+
+def mxfp8_prequantized_gemm_autotuned(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    tune: bool = False,
+) -> torch.Tensor:
+    """The GEMM stage of ``mxfp8_quantize_gemm_autotuned`` for an activation quantized upstream.
+
+    ``act_scale`` uses the swizzled layout of ``trtllm::mxfp8_quantize``.
+    """
     gemm_inputs = [act, act_scale, weight, weight_scale]
+    gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
     return gemm_runner(gemm_inputs,
                        tactic=_choose_mxfp8_tactic(
                            _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,

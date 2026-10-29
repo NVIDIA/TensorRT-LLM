@@ -20,7 +20,8 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    BufferKind, mxfp8_quantize_gemm_autotuned)
+    BufferKind, mxfp8_prequantized_gemm_autotuned,
+    mxfp8_quantize_gemm_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3673,17 +3674,61 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
+    @staticmethod
+    def offer_quantized_input(module: Linear, input: torch.Tensor,
+                              act_e4m3: torch.Tensor,
+                              act_sf: torch.Tensor) -> None:
+        """Hand the next ``apply`` on ``input`` its MXFP8 quantization from upstream.
+
+        A producer that already quantized ``input`` exactly as
+        ``trtllm::mxfp8_quantize(input, True)`` would (E4M3 data and swizzled
+        UE8M0 scales) offers the result here, and ``apply`` skips its own
+        quantization when it is called with this very tensor. A call with any
+        other tensor ignores the offer, so a view or copy of ``input`` made
+        in between falls back to quantizing.
+        """
+        module._mxfp8_offered_input = (input, act_e4m3, act_sf)
+
+    @staticmethod
+    def withdraw_quantized_input(module: Linear) -> None:
+        """Drop an offer that ``apply`` did not consume."""
+        module._mxfp8_offered_input = None
+
+    @staticmethod
+    def _take_offered_input(
+            module: Linear,
+            input: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        offered = getattr(module, "_mxfp8_offered_input", None)
+        if offered is None:
+            return None
+        module._mxfp8_offered_input = None
+        source, act_e4m3, act_sf = offered
+        if source is not input:
+            return None
+        return act_e4m3.reshape(-1, act_e4m3.shape[-1]), act_sf
+
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
+        offered = self._take_offered_input(module, input)
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
         if self.use_cutlass:
             input = input.contiguous()
-            if (self.tune_decode_graph_backends and not is_torch_compiling()
-                    and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
+            decode_graph = (self.tune_decode_graph_backends
+                            and not is_torch_compiling() and
+                            _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())
+            if decode_graph and offered is not None:
+                output = mxfp8_prequantized_gemm_autotuned(
+                    *offered,
+                    module.weight,
+                    module.weight_scale,
+                    module.dtype,
+                    tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+                )
+            elif decode_graph:
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
                 output = mxfp8_quantize_gemm_autotuned(
                     input,
@@ -3695,7 +3740,9 @@ class MXFP8LinearMethod(LinearMethodBase):
             else:
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
-                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                act_e4m3, act_sf = (offered if offered is not None else
+                                    torch.ops.trtllm.mxfp8_quantize(
+                                        input, True))
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
