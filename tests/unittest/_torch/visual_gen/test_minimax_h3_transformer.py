@@ -1835,7 +1835,9 @@ def _export_style_checkpoint(
         input_scale = torch.tensor(activation_amax / e4m3_max)
 
     def to_diffusers(name: str) -> str:
-        return name.replace(".ff.gate_up_proj", ".ff.net.0.proj").replace(".ff.down_proj", ".ff.net.2")
+        return name.replace(".ff.gate_up_proj", ".ff.net.0.proj").replace(
+            ".ff.down_proj", ".ff.net.2"
+        )
 
     checkpoint = {to_diffusers(k): v.clone() for k, v in reference_state.items()}
     for name, module in static_model.named_modules():
@@ -1844,7 +1846,8 @@ def _export_style_checkpoint(
         out_features, in_features = module.out_features, module.in_features
         if name.endswith(".qkv_proj"):
             targets = [
-                (name[: -len("qkv_proj")] + sub, out_features // 3) for sub in ("to_q", "to_k", "to_v")
+                (name[: -len("qkv_proj")] + sub, out_features // 3)
+                for sub in ("to_q", "to_k", "to_v")
             ]
         else:
             targets = [(to_diffusers(name), out_features)]
