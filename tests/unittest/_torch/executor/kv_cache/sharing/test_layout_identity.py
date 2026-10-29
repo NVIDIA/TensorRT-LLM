@@ -816,6 +816,20 @@ def test_recurrent_state_splits_as_its_pools_are_sized(attention_dp, cp_size, sp
 
 
 @pytest.mark.cpu_only
+def test_an_index_key_role_the_manager_does_not_declare_builds_no_page_table():
+    """Index-key caches are replicated by some models and split by others, so the base manager
+    guesses neither: a manager registering one declares it, as for any role it adds."""
+
+    class Undeclared(Manager):
+        _page_buffer_tensors = KVCacheManagerV2._page_buffer_tensors
+
+    with pytest.raises(ValueError, match="registers role 'index_key' but does not declare"):
+        Undeclared([kv_group(lids=(0,), extra=[("index_key", 64, None)])]).get_page_table()
+    layout = Undeclared([kv_group(lids=(0,))]).get_page_table().page_layout
+    assert {b.role for b in layout.buffers} == {"key", "value"}
+
+
+@pytest.mark.cpu_only
 def test_a_manager_whose_tensors_leave_bytes_of_a_buffer_undescribed_builds_no_page_table():
     """Bytes no tensor describes would never move; the page table refuses them."""
 

@@ -109,9 +109,9 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
         self, layer_id: int, role: str, size: int, tokens: int, state: bool
     ) -> tuple[Tensor, ...]:
         """Index positions are request-wide coordinates, so every rank holds the same bytes; so do
-        the packed side planes. They carry no head axis, which splitting them by the rank's KV
-        heads would assume."""
-        if role in (QSA_INDEX_POSITION, QSA_SIDE_PLANES):
+        the packed side planes and the index keys, which project one head alike on every rank.
+        They carry no head axis, which splitting them by the rank's KV heads would assume."""
+        if role in (QSA_INDEX_POSITION, QSA_SIDE_PLANES, Role.INDEX_KEY):
             return replicated(size)
         return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 

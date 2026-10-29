@@ -13,6 +13,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
@@ -533,6 +534,14 @@ class DSACacheManagerV2(KVCacheManagerV2):
     def get_primary_pool_page_index_params(self, local_layer_idx: int) -> Tuple[int, int]:
         """Return the formal V2 page scale and layer offset for sparse MLA."""
         return self._primary_pool_page_index_params[local_layer_idx]
+
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> Tuple[Tensor, ...]:
+        """The indexer-K cache projects one head alike on every tensor rank."""
+        if role == Role.INDEX_KEY:
+            return replicated(size)
+        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {

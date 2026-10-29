@@ -2771,17 +2771,18 @@ def test_page_buffer_tensors_default_to_head_major():
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major, replicated
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major
 
     manager = object.__new__(KVCacheManagerV2)
     manager.mapping = SimpleNamespace(tp_size=2, tp_rank=0)
     manager._page_kv_heads = lambda layer: (2, 4)
 
-    # K/V default to the TRTLLM head-major layout, split by head over TP; the index-key side
-    # cache is alike on every rank (every shipped index-K, DSA V1 and MiniMax M3, is
-    # TP-replicated).
+    # K/V default to the TRTLLM head-major layout, split by head over TP. An index-key side cache
+    # spreads as its manager says (DSA and MiniMax M3 replicate it, a split one would not), so the
+    # base declares none.
     assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
-    assert manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
+    with pytest.raises(ValueError, match="does not declare how its bytes spread"):
+        manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False)
 
 
 def test_disagg_request_rules_default_to_the_whole_prompt():

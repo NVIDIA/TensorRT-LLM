@@ -144,7 +144,6 @@ from .page_layout import (
     head_major,
     held_bytes,
     owned,
-    replicated,
     token_major,
 )
 from .page_table import (
@@ -3725,21 +3724,17 @@ class KVCacheManagerV2(BaseResourceManager):
         layer of recurrent ``state`` or of attention.
 
         The base manager declares the roles it registers itself: K/V and their block scales
-        head-major (HND) by the layer's KV heads, as the TRTLLM attention kernels write them, and
-        ``Role.INDEX_KEY`` alike on every rank, since every index-key side cache so far (DSA
-        indexer-K, MiniMax M3) projects replicated across TP ranks. A buffer that never moves
-        (``_page_untransferred_roles``, ``_page_derived_roles``) is this rank's own. A manager
-        registering any other role, or laying these out otherwise, overrides this method, building
-        tensors with ``page_layout``'s ``head_major``, ``token_major``, ``sectioned`` and
-        ``replicated`` or declaring its own.
+        head-major (HND) by the layer's KV heads, as the TRTLLM attention kernels write them. A
+        buffer that never moves (``_page_untransferred_roles``, ``_page_derived_roles``) is this
+        rank's own. A manager registering any other role, ``Role.INDEX_KEY`` included, or laying
+        these out otherwise, overrides this method, building tensors with ``page_layout``'s
+        ``head_major``, ``token_major``, ``sectioned`` and ``replicated`` or declaring its own.
 
         Raises:
             ValueError: For a role that moves and that the manager does not declare: guessing how
                 its bytes spread would transfer them wrongly between ranks of different parallel
                 sizes.
         """
-        if role == Role.INDEX_KEY:
-            return replicated(size)
         if role in _HEAD_SPLIT_ROLES:
             return self._page_head_split(layer_id, size, tokens, state)
         if role in self._page_untransferred_roles() | self._page_derived_roles():
