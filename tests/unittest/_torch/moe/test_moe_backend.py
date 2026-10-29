@@ -6397,6 +6397,7 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         _load_balancer_start_wait_gpu_stage=no_op,
         _load_balancer_start_set_cpu_stage=no_op,
         _load_balancer_done_set_cpu_stage=no_op,
+        _maybe_get_perfect_router_expert_ids=lambda token_selected_experts: token_selected_experts,
     )
 
 
