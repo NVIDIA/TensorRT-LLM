@@ -47,6 +47,7 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_input_ids_match_trt_build_helper
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_video_input_ids_match_trt_build_helper
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_video_fast_path_matches_processor_input_ids
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_two_video_fast_path_matches_processor_input_ids
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_float_media_match_uint8_pixels
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_stays_fp32_when_tf32_is_allowed
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_bf16_split_matches_fp32_router

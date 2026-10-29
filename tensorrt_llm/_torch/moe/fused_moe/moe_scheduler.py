@@ -852,7 +852,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
             else [None] * num_chunks
         )
 
-        use_multi_stream = not moe.enable_alltoall and moe.aux_stream is not None
+        # A backend that reuses its buffers across calls can have only one chunk
+        # in flight, and each chunk's output is gone once the next one runs.
+        reuses_buffers = moe.backend.input_requirement.run_moe_reuses_buffers
+        use_multi_stream = (
+            not moe.enable_alltoall and moe.aux_stream is not None and not reuses_buffers
+        )
 
         # ========== Setup auxiliary stream ==========
         if use_multi_stream:
@@ -975,7 +980,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
             row_offset += chunk_size_list[idx_chunk]
             if chunked_used[idx_chunk]:
-                outputs_list.append(outputs)
+                # The last chunk needs no copy: no further ``run_moe`` runs
+                # before the ``torch.cat`` below, which copies it anyway.
+                needs_copy = reuses_buffers and idx_chunk != num_chunks - 1
+                outputs_list.append(outputs.clone() if needs_copy else outputs)
 
         # ========== Wait for auxiliary stream to complete ==========
         if use_multi_stream:
@@ -1142,6 +1150,8 @@ class FusedCommMoEScheduler(MoEScheduler):
        so peers can cross the in-kernel NVLink barrier.
     8. No external Communication.dispatch / Communication.combine.
     9. No multi-stream chunk overlap.
+    10. Reject a backend declaring ``input_requirement.run_moe_reuses_buffers``:
+        chunk outputs are kept, never copied, so such a backend would alias.
 
     ``repeat_idx`` advancement is done by ``ConfigurableMoE.forward_impl``
     after this scheduler returns. The scheduler must not rotate
@@ -1186,6 +1196,19 @@ class FusedCommMoEScheduler(MoEScheduler):
             raise NotImplementedError(
                 "Fused-comm MoE expects BF16 activation; "
                 "quantization happens in backend.quantize_input."
+            )
+
+        # ``run_moe_reuses_buffers`` is an external-comm promise today: this
+        # scheduler already runs its chunks on one stream, but ``_run_chunks``
+        # keeps the tensor each chunk returned, so a backend whose next call
+        # overwrites it would hand ``torch.cat`` the same storage num_chunks
+        # times -- the last chunk's rows, silently, for every chunk. Refuse the
+        # combination rather than honour half of it.
+        if self.moe.backend.input_requirement.run_moe_reuses_buffers:
+            raise NotImplementedError(
+                f"{type(self.moe.backend).__name__} declares "
+                "run_moe_reuses_buffers; the fused-comm (MegaMoE) scheduler "
+                "does not copy chunk outputs and cannot drive it."
             )
 
         x_real, rl_real, input_ids_real, real_all_rank_num_tokens, ep_rank, had_meta = (

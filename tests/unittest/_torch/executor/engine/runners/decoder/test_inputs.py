@@ -70,6 +70,63 @@ def _input_preparer(*, spec_config: DecodingBaseConfig | None = None) -> Decoder
     return input_preparer(decoder_config(is_spec_decode=False, spec_config=spec_config), model=None)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("enabled", "fused"), [(None, False), (False, True), (True, False), (True, True)]
+)
+def test_input_preparer_configured_confidence_flags(enabled: bool | None, fused: bool) -> None:
+    spec_config = (
+        None
+        if enabled is None
+        else SimpleNamespace(
+            enable_confidence_scheduling=enabled, enable_fused_confidence_scheduler=fused
+        )
+    )
+    config = SimpleNamespace(is_spec_decode=False, spec_config=spec_config)
+    inputs = DecoderInputPreparer(
+        buffers=None,
+        config=config,
+        mapping=Mapping(),
+        dist=None,
+        model=None,
+        get_runtime_tokens_per_gen_step=None,
+        iter_states={},
+        lora=None,
+        use_beam_search=False,
+        steady_gen_cache_supported=True,
+    )
+
+    assert inputs._config is config
+    assert inputs._dspark_confidence_enabled is bool(enabled)
+    assert inputs._dspark_trims_submitted_tokens is bool(enabled)
+    assert inputs._dspark_device_windows is bool(enabled and fused)
+    assert inputs.previous_verify_lens == ([] if enabled else None)
+    assert inputs.has_previous_device_draft is False
+
+
+@pytest.mark.cpu_only
+def test_input_preparer_without_config_keeps_confidence_disabled() -> None:
+    inputs = DecoderInputPreparer(
+        buffers=None,
+        config=None,
+        mapping=Mapping(),
+        dist=None,
+        model=None,
+        get_runtime_tokens_per_gen_step=None,
+        iter_states={},
+        lora=None,
+        use_beam_search=False,
+        steady_gen_cache_supported=True,
+    )
+
+    assert inputs._config is None
+    assert inputs._dspark_confidence_enabled is False
+    assert inputs._dspark_trims_submitted_tokens is False
+    assert inputs._dspark_device_windows is False
+    assert inputs.previous_verify_lens is None
+    assert inputs.has_previous_device_draft is False
+
+
 @contextlib.contextmanager
 def input_preparer_and_kv_cache(
     config: DecoderRunnerConfig | None = None,

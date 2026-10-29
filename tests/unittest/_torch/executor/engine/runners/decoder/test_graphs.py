@@ -18,10 +18,42 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs,
     _make_single_token_context_graph_batch,
 )
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("runner_type", "graphs_path"),
+    [
+        (
+            DecoderRunner,
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.DecoderCudaGraphs",
+        ),
+        (
+            EncoderDecoderRunner,
+            "tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder.EncoderDecoderCudaGraphs",
+        ),
+    ],
+)
+def test_cuda_graph_factory_preserves_input_preparer(
+    runner_type: type[DecoderRunner], graphs_path: str
+) -> None:
+    runner = Mock()
+    runner._inputs = object()
+    runner._cuda_graphs_kwargs.side_effect = lambda: DecoderRunner._cuda_graphs_kwargs(runner)
+
+    with patch(graphs_path) as graphs_type:
+        graphs = runner_type._make_cuda_graphs(runner)
+
+    graphs_type.assert_called_once()
+    assert graphs_type.call_args.kwargs["inputs"] is runner._inputs
+    assert graphs_type.call_args.kwargs["warmup_inputs"] is runner._buffers.input_ids_cuda
+    assert graphs is graphs_type.return_value
 
 
 @pytest.mark.cpu_only
