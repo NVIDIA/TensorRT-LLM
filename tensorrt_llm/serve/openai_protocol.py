@@ -2375,7 +2375,7 @@ class StartProfileRequest(OpenAIBaseModel):
         default=None,
         description="Directory where chrome traces are written. Defaults "
         "to the TLLM_TORCH_PROFILER_DIR environment variable, "
-        "then /tmp.")
+        "then a temporary directory.")
     num_steps: Optional[PositiveInt] = Field(
         default=None,
         description="Number of iterations to profile. Must be >= 1 if "

@@ -2070,7 +2070,7 @@ class PyExecutor:
         Args:
             output_dir: Directory where chrome traces are written. If
                 ``None``, falls back to the ``TLLM_TORCH_PROFILER_DIR``
-                environment variable and finally to ``/tmp``.
+                environment variable and finally to a temporary directory.
             num_steps: Number of iterations to profile. If ``None``,
                 profiling runs until ``stop_profile`` is called.
             start_step: Additional iterations to skip before profiling

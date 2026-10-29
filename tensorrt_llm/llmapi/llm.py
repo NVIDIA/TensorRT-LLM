@@ -1671,7 +1671,7 @@ class BaseLLM:
             output_dir (str, optional): Directory where chrome traces are
                 written. If ``None``, falls back to the
                 ``TLLM_TORCH_PROFILER_DIR`` environment variable and finally
-                to ``/tmp``. Defaults to None.
+                to a temporary directory. Defaults to None.
             num_steps (int, optional): Number of engine iterations to
                 capture. When set, the engine stops the window automatically
                 and ``stop_profile`` does not need to be called. When
