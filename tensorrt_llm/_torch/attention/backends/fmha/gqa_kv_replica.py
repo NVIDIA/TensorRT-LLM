@@ -32,6 +32,9 @@ from ....modules.fla.op import gdc_wait_with_memory_clobber
 from .gqa_kv_replica_fused import KvReplicaFusedState, kv_replica_fused_partial
 from .gqa_segmented_decode import draft_block, seg_geometry, segment_attention
 
+# Channels of the KV group's exchange: 0 carries the q all-gather, 1 the all-to-all + merge.
+EXCHANGE_CHANNELS = 2
+
 
 @triton.jit
 def _kv_replica_prep_kernel(

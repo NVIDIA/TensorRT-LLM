@@ -42,7 +42,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from . import gqa_kv_replica_fused, gqa_split_kv_decode
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha, _get_generation_workspace_layout
-from .gqa_kv_replica import kv_replica_decode, kv_replica_fused_decode
+from .gqa_kv_replica import EXCHANGE_CHANNELS, kv_replica_decode, kv_replica_fused_decode
 from .gqa_kv_replica_fused import kv_replica_fused_state, kv_replica_fused_supported
 from .gqa_segmented_decode import segmented_decode, segmented_decode_supported
 from .gqa_split_kv_decode import (
@@ -628,7 +628,7 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
                 metadata.max_num_requests, self._tokens_per_gen_step, attn.num_heads, attn.head_dim
             )
             self._exchange = get_tp_group_exchange(
-                self._mapping, self._kv_replicas, max_bytes, max_merge_rows
+                self._mapping, self._kv_replicas, max_bytes, max_merge_rows, EXCHANGE_CHANNELS
             )
             self._exchange_created = True
 

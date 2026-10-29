@@ -1303,16 +1303,18 @@ _GROUP_EXCHANGES: Dict[tuple, Optional[TPGroupExchange]] = {}
 
 
 def get_tp_group_exchange(
-    mapping, group_size: int, max_bytes: int, max_merge_rows: int
+    mapping, group_size: int, max_bytes: int, max_merge_rows: int, num_channels: int
 ) -> Optional[TPGroupExchange]:
     """The TP subgroup exchange, created by the first call (collective over the TP group, not during graph capture)
-    with these sizes; later calls return it as created."""
+    with these sizes and channels; later calls return it as created."""
     key = (tuple(mapping.tp_group), mapping.tp_rank, group_size, torch.cuda.current_device())
     if key not in _GROUP_EXCHANGES:
         if torch.cuda.is_current_stream_capturing():
             return None
         try:
-            ex = TPGroupExchange.create(mapping, group_size, max_bytes, max_merge_rows)
+            ex = TPGroupExchange.create(
+                mapping, group_size, max_bytes, max_merge_rows, num_channels
+            )
         except (RuntimeError, ValueError) as e:  # callers keep their path without the exchange
             logger.warning(f"[TPGroupExchange] setup failed: {e}")
             ex = None
