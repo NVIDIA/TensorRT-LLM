@@ -1705,6 +1705,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
+    # FMHA library classes this instance tries before the registry's libraries.
+    prepended_fmha_lib_classes: tuple = ()
 
     @staticmethod
     def is_sm_version_trtllm_gen_kernel(sm):
