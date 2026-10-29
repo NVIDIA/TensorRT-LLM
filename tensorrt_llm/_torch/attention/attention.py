@@ -244,7 +244,10 @@ def _helix_note_nccl_specialization(partial_o: torch.Tensor,
         "cache_size_limit.", len(_HELIX_NCCL_SHAPES), limit)
 
 
-@torch.compile(dynamic=False)
+# NCCL requires contiguous chunks. Inductor may pad the transposed buffers
+# behind split views even with pad_outputs=False. Keep fusion, but disable
+# padding for this helper rather than copying every chunk after compilation.
+@torch.compile(dynamic=False, options={"comprehensive_padding": False})
 def _helix_nccl_pre_alltoall(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
