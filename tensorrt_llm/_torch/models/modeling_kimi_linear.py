@@ -189,6 +189,13 @@ _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
     os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
 )
 
+# Off by default. When set to ``1`` and multi-stream is active (CUDA graphs on),
+# the MoE router GEMM runs on the auxiliary stream, concurrently with the latent
+# down projection, instead of in front of the fork. Same kernels, same numerics.
+KIMI_K3_ROUTER_OVERLAP_ENV = "KIMI_K3_ROUTER_OVERLAP"
+_K3_ROUTER_OVERLAP = os.environ.get(KIMI_K3_ROUTER_OVERLAP_ENV, "0") == "1"
+_k3_router_overlap_logged = False
+
 # Opt-in: on the communication-backed (attention-DP) MoE path, run the routed
 # latent RMSNorm and the FP8 1x128 activation quantization of the FP8
 # weight-read latent up-projection as one kernel
@@ -293,6 +300,11 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
     ".self_attn.mixer.k_b_proj_trans_dequant",
     ".self_attn.mixer.v_b_proj_dequant",
 )
+
+# Fold the routed-latent FP8 1x128 activation quant into the MNNVL all-reduce+RMSNorm epilogue
+# (default off; decode-sized messages only). See KimiK3MoERuntime._routed_reduce_up.
+_K3_PUB_AR_QUANT = os.environ.get("K3_PUB_AR_QUANT", "0") == "1"
+_K3_PUB_AR_QUANT_MAX_M = int(os.environ.get("K3_PUB_AR_QUANT_MAX_M", "1024"))
 
 # BF16 shared/latent MLP weights are optionally quantized once after loading.
 # Checkpoint-native attention FP8 is independent of this lossy conversion.
@@ -1702,6 +1714,22 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             )
         return out.reshape(out_shape)
 
+    def forward_prequantized_deepgemm(
+        self,
+        activation: torch.Tensor,
+        activation_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """SM100/103 DeepGEMM projection of an activation already quantized to FP8 1x128 (packed UE8M0 int32
+        scales, MN-major), e.g. by the MNNVL all-reduce epilogue. Same GEMM call as ``forward`` minus its quantize."""
+        return torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
+            activation,
+            activation_scale,
+            self.weight,
+            self.weight_scale,
+            output_dtype=torch.bfloat16,
+            disable_ue8m0_cast=True,
+        )
+
     def forward_prequantized(
         self,
         activation: torch.Tensor,
@@ -1950,6 +1978,43 @@ def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
             f"{sorted(a.name for a in _K3_EXPERT_CKPT_SPECS)}."
         )
     return spec
+
+
+K3_PUB_CTX_SHARED_AR_OVERLAP_ENV = "K3_PUB_CTX_SHARED_AR_OVERLAP"
+K3_PUB_CTX_SHARED_AR_OVERLAP_MIN_TOKENS_ENV = "K3_PUB_CTX_SHARED_AR_OVERLAP_MIN_TOKENS"
+K3_PUB_CTX_SHARED_AR_OVERLAP_CHUNKS_ENV = "K3_PUB_CTX_SHARED_AR_OVERLAP_CHUNKS"
+_CTX_SHARED_AR_OVERLAP_DEFAULT_MIN_TOKENS = 8192
+_CTX_SHARED_AR_OVERLAP_DEFAULT_CHUNKS = 2
+# A chunk below this many tokens would only add launches.
+_CTX_SHARED_AR_OVERLAP_MIN_CHUNK_TOKENS = 1024
+
+
+def _ctx_shared_ar_overlap_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as err:
+        raise ValueError(f"{name} must be an integer; got {raw!r}") from err
+
+
+def _ctx_shared_ar_overlap_min_tokens() -> Optional[int]:
+    """Token threshold of the eager-forward shared-expert overlap; ``None`` when off.
+
+    ``K3_PUB_CTX_SHARED_AR_OVERLAP=1`` turns on the overlapped schedule of
+    ``KimiK3MoERuntime._forward_ctx_overlap`` in eager (non-CUDA-graph)
+    forwards with at least ``K3_PUB_CTX_SHARED_AR_OVERLAP_MIN_TOKENS`` tokens
+    (default 8192). Scheduling only: the same kernels run on the same inputs.
+    Below the threshold a step is bound by host launch time and the extra
+    stream switches would only add host work. Read per call so an A/B can flip
+    it in one process.
+    """
+    if os.environ.get(K3_PUB_CTX_SHARED_AR_OVERLAP_ENV, "0") != "1":
+        return None
+    return _ctx_shared_ar_overlap_int_env(
+        K3_PUB_CTX_SHARED_AR_OVERLAP_MIN_TOKENS_ENV, _CTX_SHARED_AR_OVERLAP_DEFAULT_MIN_TOKENS
+    )
 
 
 # MoE router gate GEMM input dtype: unset or 1/true/yes/on = bf16 everywhere, 0/false/no/off =
@@ -2235,6 +2300,10 @@ class KimiK3MoERuntime(nn.Module):
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
+        self.moe_router_fork_event = torch.cuda.Event() if _K3_ROUTER_OVERLAP else None
+        self.moe_router_ready_event = torch.cuda.Event() if _K3_ROUTER_OVERLAP else None
+        # Third fork/join event of the eager-forward schedule (_forward_ctx_overlap).
+        self.moe_ctx_ar_event = torch.cuda.Event() if self._reduce_routed_output else None
         self.latent_down_stream = _k3_latent_down_stream(
             aux_stream_dict, routed_moe_model_config.moe_backend
         )
@@ -2716,6 +2785,142 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
+    def _routed_reduce_up(
+        self, moe_all_reduce: AllReduce, routed_out: torch.Tensor
+    ) -> torch.Tensor:
+        """Routed-latent all-reduce + RMSNorm + up projection.
+
+        K3_PUB_AR_QUANT=1: when the up projection is the FP8 weight-read GEMM and the all-reduce is the MNNVL
+        one (multi-node TP / Helix), the all-reduce epilogue also emits the 1x128 UE8M0 block-quantized
+        activation, so the standalone quantize kernel of the up projection is skipped.
+        """
+        up = self.routed_expert_up_proj
+        norm = self.routed_expert_norm
+        if (
+            _K3_PUB_AR_QUANT
+            and isinstance(up, _Fp8BlockScaleWeightReadLinear)
+            and not _rubin_mxfp8_is_available()
+            and getattr(moe_all_reduce, "mnnvl_allreduce", None) is not None
+            and routed_out.shape[0] <= _K3_PUB_AR_QUANT_MAX_M
+            and routed_out.shape[-1] % 128 == 0
+        ):
+            logger.info_once(
+                "K3_PUB_AR_QUANT=1: routed-latent MNNVL all-reduce emits RMSNorm + FP8 1x128 quant",
+                key="k3_pub_ar_quant_engaged",
+            )
+            q, sf = moe_all_reduce(
+                routed_out,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE,
+                    norm_weight=norm.weight,
+                    eps=float(norm.variance_epsilon),
+                ),
+            )
+            return up.forward_prequantized_deepgemm(q, sf)
+        routed_latent = moe_all_reduce(
+            routed_out,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=norm.weight,
+                eps=float(norm.variance_epsilon),
+            ),
+        )
+        return self._routed_projection(routed_latent, up)
+
+    def _use_ctx_shared_ar_overlap(self, num_tokens: int) -> bool:
+        """Whether this eager forward takes the overlapped schedule.
+
+        Only for the TP layout where the shared expert reduces inside its own
+        ``down_proj`` and the routed latent is reduced here
+        (``_reduce_routed_output``). In CUDA-graph capture ``do_multi_stream()``
+        is already on and the ordinary fork/join applies, so this is off.
+        """
+        min_tokens = _ctx_shared_ar_overlap_min_tokens()
+        if (
+            min_tokens is None
+            or num_tokens < min_tokens
+            or do_multi_stream()
+            or not self._reduce_routed_output
+            or self.shared_expert_stream is None
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        logger.info_once(
+            "Kimi K3 eager forward: shared expert beside the routed experts on the aux stream, its "
+            f"all-reduce behind the routed one, for forwards of >= {min_tokens} tokens",
+            key="kimi_k3_ctx_shared_ar_overlap",
+        )
+        return True
+
+    def _forward_ctx_overlap(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        all_rank_num_tokens=None,
+    ) -> torch.Tensor:
+        """Eager forward of a large batch with the shared-expert all-reduce hidden.
+
+        The serial order is ``routed experts, shared expert (+ its all-reduce),
+        routed all-reduce + norm, up projection``. Here the shared expert's
+        GEMMs run on the aux stream beside the routed experts, the routed
+        all-reduce goes first, and the shared all-reduce follows on the aux
+        stream beside the routed up projection, in token chunks. The
+        all-reduce kernel launches a thread block per token slice and fills the
+        SMs, so a single large call would hold off the up projection; chunks
+        let it slip in. All three all-reduces share one communication
+        workspace, so each is ordered after the previous by an event, as in
+        the serial order. Every token is reduced on its own (fp32 over ranks,
+        one bf16 rounding), so chunking and the order change nothing in the
+        numbers.
+        """
+        stream = self.shared_expert_stream
+        self.moe_main_event.record()
+        with torch.cuda.stream(stream):
+            self.moe_main_event.wait()
+            # GEMMs only; the reduction is issued below.
+            shared_partial = self.shared_experts(
+                hidden_states, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
+            )
+        routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+        routed_partial = self.routed_experts(
+            routed_in, router_logits, all_rank_num_tokens=all_rank_num_tokens
+        )
+        routed_latent = self.routed_experts.all_reduce(
+            routed_partial,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.routed_expert_norm.weight,
+                eps=float(self.routed_expert_norm.variance_epsilon),
+            ),
+        )
+        num_chunks = max(
+            1,
+            min(
+                _ctx_shared_ar_overlap_int_env(
+                    K3_PUB_CTX_SHARED_AR_OVERLAP_CHUNKS_ENV, _CTX_SHARED_AR_OVERLAP_DEFAULT_CHUNKS
+                ),
+                shared_partial.shape[0] // _CTX_SHARED_AR_OVERLAP_MIN_CHUNK_TOKENS,
+            ),
+        )
+        self.moe_ctx_ar_event.record()
+        with torch.cuda.stream(stream):
+            self.moe_ctx_ar_event.wait()
+            shared_chunks = [
+                self._shared_all_reduce()(chunk) for chunk in shared_partial.chunk(num_chunks)
+            ]
+            self.moe_shared_event.record()
+        routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+        self.moe_shared_event.wait()
+        # Per-chunk sum into the result: the same bf16 adds as ``routed_out + shared_out``.
+        out = torch.empty_like(routed_out)
+        start = 0
+        for chunk in shared_chunks:
+            end = start + chunk.shape[0]
+            torch.add(routed_out[start:end], chunk, out=out[start:end])
+            start = end
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2736,6 +2941,7 @@ class KimiK3MoERuntime(nn.Module):
         projected_input = None
         early_routed_in = None
         router_partials = None
+        overlap_router = False
         route_target = self._route_tail_target(hidden_states.shape[0])
         if hidden_fp8 is not None and not self.accepts_fp8_input():
             hidden_fp8 = None
@@ -2764,6 +2970,32 @@ class KimiK3MoERuntime(nn.Module):
                 # ask for the routing (see _K3_ROUTER_GEMM).
                 router_partials = self._umma_router_partials(hidden_states)
                 router_logits = router_partials[0]
+            elif (
+                _K3_ROUTER_OVERLAP
+                and early_routed_in is None
+                and do_multi_stream()
+                and self.shared_expert_stream is not None
+                and not torch.compiler.is_compiling()
+            ):
+                # KIMI_K3_ROUTER_OVERLAP=1, where the latent down projection is not already
+                # forked onto its own stream (_k3_latent_down_stream): the router GEMM runs on
+                # the aux stream beside the latent down projection on the main stream.
+                overlap_router = True
+                global _k3_router_overlap_logged
+                if not _k3_router_overlap_logged:
+                    _k3_router_overlap_logged = True
+                    logger.info(
+                        f"Kimi K3: {KIMI_K3_ROUTER_OVERLAP_ENV}=1, router GEMM runs on the "
+                        "auxiliary stream concurrently with the latent down projection"
+                    )
+                # Fork before the router so the latent down projection (main stream) starts
+                # at the same time. The aux stream runs router -> shared expert (the shared
+                # branch has slack: it is joined only after the routed experts).
+                self.moe_router_fork_event.record()
+                with torch.cuda.stream(self.shared_expert_stream):
+                    self.moe_router_fork_event.wait()
+                    router_logits = self.gate.compute_logits(hidden_states)
+                    self.moe_router_ready_event.record()
             else:
                 router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
@@ -2775,6 +3007,19 @@ class KimiK3MoERuntime(nn.Module):
         )
         num_tokens = hidden_states.shape[0]
         merged = self._merged_reduce_buffers(hidden_states)
+        if (
+            merged is None
+            and projected_input is None
+            and early_routed_in is None
+            and router_partials is None
+            and route_target is None
+            and (residual is None or not defer_residual)
+            and self._use_ctx_shared_ar_overlap(num_tokens)
+        ):
+            # K3_PUB_CTX_SHARED_AR_OVERLAP=1 (eager large-batch forwards only).
+            out = self._forward_ctx_overlap(hidden_states, router_logits, all_rank_num_tokens)
+            # residual + bf16(routed + shared), as the unfused residual path computes it.
+            return out if residual is None else residual + out
         routed_slot = shared_slot = None
         if merged is not None:
             split = num_tokens * self.moe_hidden_size
@@ -2790,6 +3035,11 @@ class KimiK3MoERuntime(nn.Module):
                 moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
             else:
                 routed_in = self._latent_down(hidden_states, hidden_fp8)
+            if overlap_router:
+                self.moe_router_ready_event.wait()
+                if not torch.cuda.is_current_stream_capturing():
+                    # eager warm-up: the tensor was allocated on the aux stream
+                    router_logits.record_stream(torch.cuda.current_stream())
             if merged is not None:
                 # The finalize writes the routed latent partial straight into the merged buffer
                 # (CUTEDSL_FC12 and the other ExternalComm backends take ``moe_output``).
@@ -2894,15 +3144,8 @@ class KimiK3MoERuntime(nn.Module):
                 # RMSNorm folded into the routed all-reduce (kARRMSNorm): the
                 # MNNVL kernel normalizes straight out of the lamport buffer, so
                 # the reduced row never round-trips through HBM for a norm kernel.
-                routed_latent = moe_all_reduce(
-                    routed_out,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RMS_NORM,
-                        norm_weight=self.routed_expert_norm.weight,
-                        eps=float(self.routed_expert_norm.variance_epsilon),
-                    ),
-                )
-                routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+                # K3_PUB_AR_QUANT=1 also folds the FP8 1x128 quant in (non-Rubin).
+                routed_out = self._routed_reduce_up(moe_all_reduce, routed_out)
         if residual is not None:
             if defer_residual:
                 return _DeferredMoEResidual(residual, routed_out, shared_out)
