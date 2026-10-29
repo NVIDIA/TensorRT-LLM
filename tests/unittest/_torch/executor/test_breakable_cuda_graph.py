@@ -393,6 +393,52 @@ def test_runner_clear_releases_memory_pool_after_graph_reset(monkeypatch):
     assert runner._memory_pool is None
 
 
+@pytest.mark.parametrize(
+    "hidden_size,buckets,dtype",
+    [
+        (1024, (2048, 1536, 1024, 512), torch.float32),
+        (1024, (4096, 2048, 1024, 512), torch.bfloat16),
+    ],
+)
+def test_runner_replays_every_bucket_bitwise_after_all_captures(hidden_size, buckets, dtype):
+    # The body allocates a narrow temporary before its output, so after the
+    # first capture the largest bucket's output sits at an offset inside a
+    # freed pool segment. Later buckets reuse that pool; their outputs must not
+    # land on the shared output they are copied into.
+    narrow = hidden_size // 4
+
+    class Body(nn.Module):
+        def forward(self, value):
+            scaled = value[:, :narrow] * 2
+            output = value * 3
+            output[:, :narrow] += scaled
+            return output
+
+    body = Body().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    static_input = torch.zeros((max(buckets), hidden_size), device="cuda", dtype=dtype)
+    active = {}
+
+    def engine_forward():
+        value = static_input[: active["num_tokens"]]
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(value))
+        return body(value)
+
+    for num_tokens in buckets:
+        active["num_tokens"] = num_tokens
+        runner.capture(num_tokens, engine_forward)
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    for num_tokens in buckets:
+        static_input.normal_(generator=generator)
+        expected = body(static_input[:num_tokens])
+        active["num_tokens"] = num_tokens
+        replayed = runner.execute(num_tokens, engine_forward)
+        torch.cuda.synchronize()
+        assert torch.equal(replayed, expected), f"bucket {num_tokens} replay differs from eager"
+
+
 def test_runner_graph_miss_nested_execute_and_exception_recovery():
     body = _Body().cuda()
     runner = BreakableCUDAGraphRunner(body)

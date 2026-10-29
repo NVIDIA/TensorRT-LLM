@@ -166,7 +166,11 @@ class BreakableCUDAGraphRunner:
             raise RuntimeError("BCG output registered outside capture")
         num_tokens = self._active_num_tokens
         if self._shared_output is None:
-            self._shared_output = make_weak_ref(output)
+            # Every later bucket copies its output into this buffer, so keep it
+            # allocated: if its pool blocks were free, a later capture could
+            # place its body output on them and the copy would read and write
+            # overlapping memory.
+            self._shared_output = output
             return self._shared_output
         if num_tokens > self._shared_output.shape[0]:
             raise ValueError(
