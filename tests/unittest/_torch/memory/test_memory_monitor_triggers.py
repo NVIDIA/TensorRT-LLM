@@ -361,3 +361,146 @@ class TestStartupOutcome:
         assert creator.create_py_executor(llm_args=None) == "executor"
         assert armed_during_startup == [False]
         assert trig._enabled_flag is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+class TestBaselineAcrossReports:
+    """The baseline is taken when startup, warmup included, completes."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        from tensorrt_llm._torch.memory import monitor
+
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+        monitor.clear_baseline()
+        yield
+        monitor.clear_baseline()
+
+    def test_completed_startup_becomes_the_baseline(self, monkeypatch):
+        from tensorrt_llm._torch.memory.monitor import tagging
+
+        monkeypatch.setattr(tagging, "tagging_supported", lambda: False)
+        with tagging.startup_window():
+            pass
+
+        held = torch.empty(512 * MB, dtype=torch.uint8, device="cuda")
+        try:
+            text = report_now(tag="later")
+            assert "since warmup" in text
+            assert "PyTorch, unattributed grew the most (+0.50 GiB)" in text
+        finally:
+            del held
+
+    def test_failed_startup_records_no_baseline(self, monkeypatch):
+        from tensorrt_llm._torch.memory import monitor
+        from tensorrt_llm._torch.memory.monitor import tagging
+
+        monkeypatch.setattr(tagging, "tagging_supported", lambda: False)
+        with pytest.raises(RuntimeError):
+            with tagging.startup_window():
+                raise RuntimeError("load failed")
+        # A half-built executor is not a state to measure growth from.
+        assert monitor._baseline is None
+        assert "since warmup" not in report_now(tag="later")
+
+    def test_startup_report_itself_shows_no_delta(self, monkeypatch):
+        from tensorrt_llm._torch.memory.monitor import tagging, triggers
+
+        monkeypatch.setattr(tagging, "tagging_supported", lambda: False)
+        texts = []
+        real = triggers.report_now
+        monkeypatch.setattr(
+            triggers, "report_now", lambda **kw: texts.append(real(**kw)) or texts[-1]
+        )
+        with tagging.startup_window():
+            pass
+        assert texts and "since warmup" not in texts[0]
+
+
+class TestOomOutsideTorch:
+    """OOMs from C++, cuBLAS and NCCL never reach torch's observer."""
+
+    @pytest.fixture
+    def armed(self, monkeypatch):
+        import tensorrt_llm._torch.memory.monitor.triggers as mod
+
+        monkeypatch.setattr(mod, "_enabled_flag", True)
+        monkeypatch.setattr(mod, "_last_report_at", None)
+        emitted = []
+        monkeypatch.setattr(mod, "report_now", lambda **kw: emitted.append(kw) or "report")
+        return mod, emitted
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "CUDA error: out of memory",
+            "[TensorRT-LLM][ERROR] CUDA runtime error in cudaMallocAsync: out of memory",
+            "cudaErrorMemoryAllocation",
+            "CUDA driver error: CUDA_ERROR_OUT_OF_MEMORY",
+            "NCCL WARN Cuda failure 'out of memory'",
+            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB",
+        ],
+    )
+    def test_recognised(self, armed, message):
+        mod, emitted = armed
+        mod.notify_error(message)
+        assert len(emitted) == 1
+        assert "reported by the executor" in emitted[0]["headline"]
+
+    @pytest.mark.parametrize(
+        "message", ["Encountered an error in decode: index out of range", "error", "", None]
+    )
+    def test_unrelated_errors_are_ignored(self, armed, message):
+        mod, emitted = armed
+        mod.notify_error(message)
+        assert emitted == []
+
+    def test_inert_before_startup(self, monkeypatch):
+        import tensorrt_llm._torch.memory.monitor.triggers as mod
+
+        monkeypatch.setattr(mod, "_enabled_flag", False)
+        emitted = []
+        monkeypatch.setattr(mod, "report_now", lambda **kw: emitted.append(kw))
+        mod.notify_error("CUDA error: out of memory")
+        assert emitted == []
+
+    def test_shares_the_rate_limit_with_the_torch_observer(self, armed, monkeypatch):
+        # A torch OOM is seen by the observer and then caught by the
+        # executor, which passes the same failure on. One report, not two.
+        mod, emitted = armed
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 5000.0)
+        mod._on_out_of_memory(0, 1 << 30, 1 << 30, 1 << 30)
+        mod.notify_error("torch.OutOfMemoryError: CUDA out of memory")
+        assert len(emitted) == 1
+
+    def test_never_raises(self, armed, monkeypatch):
+        mod, _ = armed
+
+        def explode(**kwargs):
+            raise RuntimeError("reporting failed")
+
+        monkeypatch.setattr(mod, "report_now", explode)
+        mod.notify_error("CUDA error: out of memory")
+
+    def test_armed_even_without_a_torch_observer(self, monkeypatch):
+        import tensorrt_llm._torch.memory.monitor.triggers as mod
+
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+        monkeypatch.setattr(mod, "_enabled_flag", False)
+        monkeypatch.setattr(mod, "_attached", False)
+        monkeypatch.delattr(torch._C, "_cuda_attach_out_of_memory_observer", raising=False)
+        assert mod.install_oom_reporter() is True
+        assert mod._enabled_flag is True
+
+    def test_executor_error_handler_passes_its_message_on(self, monkeypatch):
+        from unittest import mock
+
+        import tensorrt_llm._torch.pyexecutor.py_executor as pe
+
+        seen = []
+        monkeypatch.setattr(pe, "monitor_notify_error", seen.append)
+        try:
+            pe.PyExecutor._handle_errors(mock.MagicMock(), "CUDA error: out of memory")
+        except Exception:  # noqa: BLE001 - only the first statement matters here
+            pass
+        assert seen == ["CUDA error: out of memory"]

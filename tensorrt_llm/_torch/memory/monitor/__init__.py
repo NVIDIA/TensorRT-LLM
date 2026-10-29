@@ -52,6 +52,7 @@ __all__ = [
     "Placement",
     "Source",
     "capture",
+    "clear_baseline",
     "current_rank",
     "enabled",
     "render_capture",
@@ -74,6 +75,15 @@ class MonitorCapture:
     rank: int | None
     device_index: int
     checks: "tuple[CheckResult, ...]" = ()
+    #: One line saying what happened, shown above the summary (e.g. the
+    #: failed allocation on OOM).
+    headline: str = ""
+    #: Group totals at the post-warmup baseline, when one was recorded.
+    baseline: "dict | None" = None
+    #: Advice that overrides the summary's own, when the cause is known.
+    suggestion: str = ""
+    #: Whether to list memory taken by each startup step.
+    startup_steps: bool = False
 
 
 def current_rank() -> int | None:
@@ -258,6 +268,11 @@ def _run_checks(by_tag: dict[str, int], torch_live: int) -> tuple:
     return tuple(results)
 
 
+#: Group totals recorded once startup (including warmup) completes. Later
+#: reports show each group's change against it.
+_baseline: dict | None = None
+
+
 def capture(
     *,
     tag: str = "",
@@ -265,6 +280,10 @@ def capture(
     entries: list[Entry] | None = None,
     rank: int | None = None,
     device_index: int | None = None,
+    headline: str = "",
+    record_baseline: bool = False,
+    suggestion: str = "",
+    startup_steps: bool = False,
 ) -> MonitorCapture | None:
     """Collect a snapshot, or ``None`` when the monitor is disabled.
 
@@ -295,8 +314,16 @@ def capture(
         entries = collect_all() + _tag_entries(by_tag)
         checks = _run_checks(by_tag, torch_reading.live)
 
+    global _baseline
+    frame = build_frame(_read_device(device_index), torch_reading, entries)
+    baseline = None if record_baseline else _baseline
+    if record_baseline:
+        from .summary import group_totals
+
+        _baseline = dict(group_totals(frame).sizes)
+
     return MonitorCapture(
-        frame=build_frame(_read_device(device_index), torch_reading, entries),
+        frame=frame,
         capability=probe_capability(),
         tag=tag,
         trigger=trigger,
@@ -304,7 +331,17 @@ def capture(
         rank=rank,
         device_index=device_index,
         checks=checks,
+        headline=headline,
+        baseline=baseline,
+        suggestion=suggestion,
+        startup_steps=startup_steps,
     )
+
+
+def clear_baseline() -> None:
+    """Forget the post-warmup baseline. For tests."""
+    global _baseline
+    _baseline = None
 
 
 def render_capture(snapshot: MonitorCapture) -> str:
@@ -318,4 +355,32 @@ def render_capture(snapshot: MonitorCapture) -> str:
         rank=snapshot.rank,
         device_index=snapshot.device_index,
         checks=list(snapshot.checks),
+        headline=snapshot.headline,
+        baseline=snapshot.baseline,
+        advice=_advice(),
+        suggestion=snapshot.suggestion,
+        startup_steps=snapshot.startup_steps,
     )
+
+
+#: Summary group -> the executor creation step whose tuning advice applies.
+#: The advice text itself is the executor's (``_ExecutorMemoryMonitor``),
+#: handed over at startup, so the two never drift apart.
+_ADVICE_STEP = {
+    "KV_CACHE": "kv_cache",
+    "WEIGHTS": "model",
+    "WORKSPACE": "executor_extra",
+    "TORCH_UNATTRIBUTED": "executor_extra",
+}
+
+
+def _advice() -> dict:
+    from .startup import advice_for_stage
+    from .summary import Group
+
+    result = {}
+    for group_name, step in _ADVICE_STEP.items():
+        text = advice_for_stage(step)
+        if text:
+            result[Group[group_name]] = text
+    return result

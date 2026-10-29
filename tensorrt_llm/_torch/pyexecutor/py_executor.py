@@ -71,6 +71,7 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
+from ..memory.monitor.triggers import notify_error as monitor_notify_error
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -8911,6 +8912,10 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
+        # Allocations outside the PyTorch allocator (cuBLAS, NCCL, C++ pools)
+        # fail with a plain error that lands here rather than in torch's OOM
+        # observer. A no-op unless TLLM_MEM_MONITOR is set.
+        monitor_notify_error(error_msg)
         multi_rank_adp = (self.enable_attention_dp
                           and self.dist.world_size != 1)
         # ``fatal_is_collective_aligned`` is set only by the synchronized caller

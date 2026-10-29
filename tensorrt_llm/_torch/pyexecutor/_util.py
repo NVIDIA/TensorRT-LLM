@@ -48,6 +48,7 @@ from ..attention.backends.sparse.params import \
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
+from ..memory.monitor import startup as _monitor_startup
 from ..memory.monitor.providers import \
     register_provider as _monitor_register_provider
 from ..memory.monitor.providers.kv_cache import \
@@ -1921,6 +1922,8 @@ class KvCacheCreator:
                 "the first penalized request.")
 
         # calculate max memory from peak memory and free gpu memory fraction
+        # The memory monitor compares later usage against this plan.
+        _monitor_startup.record_memory_plan(peak_memory, activation_bytes)
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)

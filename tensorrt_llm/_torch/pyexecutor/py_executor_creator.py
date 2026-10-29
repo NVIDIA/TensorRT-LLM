@@ -38,6 +38,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
+from ..memory.monitor import startup as monitor_startup
 from ..memory.monitor.tagging import startup_window as monitor_startup_window
 from ..memory.monitor.tagging import tag as monitor_tag
 from ..memory.monitor.triggers import \
@@ -87,6 +88,17 @@ class _ExecutorMemoryMonitor:
     def __init__(self):
         self._total_gpu_memory_bytes = torch.cuda.mem_get_info()[1]
         self._samples: list["_ExecutorMemoryMonitor._GpuMemoryUsageSample"] = []
+        # The memory monitor reuses these names and suggestions in its reports.
+        monitor_startup.set_stage_advice(
+            {
+                k.value: v
+                for k, v in self.memory_type_friendly_names.items()
+            },
+            {
+                k.value: v
+                for k, v in self.memory_type_tuning_suggestion.items()
+            },
+        )
 
     @staticmethod
     def _bytes_to_gib(bytes: int) -> float:
@@ -187,10 +199,14 @@ class _ExecutorMemoryMonitor:
         """Catches OOM and prints instructive message."""
 
         free_gpu_memory_bytes_pre = torch.cuda.mem_get_info()[0]
+        monitor_process_pre = monitor_startup.begin_stage()
 
         try:
             yield
         except Exception as e:
+            monitor_startup.record_failed_stage(current_stage.value,
+                                                free_gpu_memory_bytes_pre,
+                                                monitor_process_pre)
             explanation = self._maybe_explain_if_oom(
                 e,
                 current_stage=current_stage,
@@ -200,6 +216,10 @@ class _ExecutorMemoryMonitor:
             raise RuntimeError(explanation) from e
         else:
             free_gpu_memory_bytes_post = torch.cuda.mem_get_info()[0]
+            monitor_startup.record_stage(current_stage.value,
+                                         free_gpu_memory_bytes_pre,
+                                         free_gpu_memory_bytes_post,
+                                         monitor_process_pre)
             self._samples.append(
                 self._GpuMemoryUsageSample(
                     creation_stage=current_stage,

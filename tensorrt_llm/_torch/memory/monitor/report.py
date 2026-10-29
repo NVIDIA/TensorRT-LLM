@@ -75,8 +75,15 @@ def render(
     rank: int | None = None,
     device_index: int | None = None,
     checks: "list[CheckResult] | None" = None,
+    headline: str = "",
+    baseline: "dict | None" = None,
+    advice: "dict | None" = None,
+    suggestion: str = "",
+    startup_steps: bool = False,
 ) -> str:
-    """Render a human-readable report."""
+    """Render a human-readable report: a summary first, allocator detail after."""
+    from .summary import group_totals, render_summary
+
     device, torch_r = frame.device, frame.torch
     out: list[str] = []
     add = out.append
@@ -97,6 +104,20 @@ def render(
         ident.append(f"trigger={trigger}")
     if ident:
         add("  " + " ".join(ident))
+    out.extend(
+        render_summary(
+            frame,
+            group_totals(frame),
+            baseline=baseline,
+            headline=headline,
+            advice=advice,
+            suggestion=suggestion,
+            startup_steps=startup_steps,
+        )
+    )
+
+    add("")
+    add("--- details by allocator ---")
     add(f"  capability: {capability.describe()}")
 
     add("")
