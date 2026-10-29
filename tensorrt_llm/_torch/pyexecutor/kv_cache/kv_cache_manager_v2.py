@@ -3511,6 +3511,13 @@ class KVCacheManagerV2(BaseResourceManager):
             raise ValueError(f"the manager names no global layer for internal layers {missing}")
         global_of = {lid: int(ids[0]) for lid, ids in layer_ids.items()}
         model_of = {lid: int(ids[1]) for lid, ids in layer_ids.items()}
+        stage_layers = {int(layer) for layer in self.pp_layers}
+        unheld = sorted({model_of[lid] for group in grouping for lid in group} - stage_layers)
+        if unheld:
+            raise ValueError(
+                f"the manager names model layers {unheld}, which this pipeline stage does not "
+                f"hold (pp_layers {sorted(stage_layers)})"
+            )
         kv_heads = {lid: self._page_kv_heads(lid) for group in grouping for lid in group}
 
         state_groups = set()
@@ -3532,6 +3539,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         device_pools: dict[int, tuple[DevicePool, ...]] = {}
         buffers: list[BufferDesc] = []
+        # (global layer, role) -> the internal layer whose buffer it names.
+        named: dict[tuple[int, str], int] = {}
         group_buffers: dict[int, list[BufferDesc]] = {lg: [] for lg in range(len(grouping))}
         for pg in self.impl.pool_group_descs:
             g = int(pg.pool_group_index)
@@ -3566,6 +3575,12 @@ class KVCacheManagerV2(BaseResourceManager):
                             raise ValueError(
                                 f"buffer ({lid}, {role}): its tensors hold {declared} bytes on "
                                 f"this rank, not the {size} bytes of its slot"
+                            )
+                        owner = named.setdefault((global_of.get(lid, lid), role), lid)
+                        if owner != lid:
+                            raise ValueError(
+                                f"internal layers {owner} and {lid} both name the {role} buffer "
+                                f"of global layer {global_of.get(lid, lid)}"
                             )
                         desc = BufferDesc(
                             layer=global_of.get(lid, lid),
@@ -3787,22 +3802,32 @@ class KVCacheManagerV2(BaseResourceManager):
         state: bool,
         *,
         head_bytes: Optional[int] = None,
+        total: Optional[int] = None,
         token_major_: bool = False,
         dtype: Optional[str] = None,
     ) -> tuple[Tensor, ...]:
         """A buffer split by head over the ranks attention splits over (tensor ranks) or recurrent
-        state does (``_page_state_split``): ``size // head_bytes`` heads, by default the layer's KV
-        heads on this rank, head-major or, with ``token_major_``, token-major, of elements of type
-        ``dtype``. A buffer whose heads are unknown is this rank's own share."""
+        state does (``_page_state_split``): ``size // head_bytes`` heads on this rank of ``total``
+        over all those ranks, head-major or, with ``token_major_``, token-major, of elements of
+        type ``dtype``. By default an attention buffer's heads are the layer's KV heads, of their
+        total, and a recurrent state's split evenly. An attention buffer with heads of its own
+        (``head_bytes``) states their total, which the layer's KV heads do not tell. A buffer
+        whose heads are unknown is this rank's own share."""
         split = self._page_state_split() if state else ("tp",)
         ranks, _ = grid_place(rank_topology(self.mapping), split)
-        heads, total = self._page_kv_heads(layer_id)
-        if head_bytes is None and not state and heads > 0 and size % heads == 0:
-            head_bytes = size // heads
+        if head_bytes is None and not state:
+            kv_heads, kv_total = self._page_kv_heads(layer_id)
+            if kv_heads > 0 and size % kv_heads == 0:
+                head_bytes, total = size // kv_heads, kv_total
+        elif head_bytes is not None and not state and total is None:
+            raise ValueError(
+                f"heads of {head_bytes} bytes are an attention buffer's own; state how many lie "
+                "over all tensor ranks (total)"
+            )
         if head_bytes is None or size % head_bytes:
             return owned(size, ranks, split)
         heads = size // head_bytes
-        total = total if total and not state else heads * ranks
+        total = total or heads * ranks
         if token_major_:
             return token_major(size, tokens, heads, total, split, dtype=dtype)
         return head_major(size, heads, total, split, dtype=dtype)
@@ -3855,17 +3880,20 @@ class KVCacheManagerV2(BaseResourceManager):
         """The prompt tokens whose pages a disaggregated transfer of the request moves, of this
         rank's prompt (``request.prompt_len``, under Helix its slice): the whole prompt. A manager
         whose receiver recomputes a tail of the prompt overrides this, and is then refused under
-        Helix, where a transfer moves the whole slice."""
+        Helix, where a transfer moves the whole slice. The recompute is the executor's, not the
+        transfer's: today only CSA2's remote-tail replay runs one."""
         return request.prompt_len
 
     def disagg_untransferred_buffers(self, request: LlmRequest) -> frozenset[tuple[int, str]]:
         """The buffers, as (global layer id, role), a transfer of this request leaves for the
-        receiver to rebuild: none. Buffers that never move for any request are
-        ``_page_untransferred_roles`` and ``_page_derived_roles``."""
+        receiver to rebuild: none. The receiver's executor rebuilds them, as only CSA2's
+        remote-tail replay does today; the transfer does not. Buffers that never move for any
+        request are ``_page_untransferred_roles`` and ``_page_derived_roles``."""
         return frozenset()
 
     def disagg_sends_first_tokens(self, request: LlmRequest) -> bool:
-        """Whether a transfer of the request carries its first generated and draft tokens: yes."""
+        """Whether a transfer of the request carries its first generated and draft tokens: yes. A
+        receiver given none computes them itself, as only CSA2's remote-tail replay does today."""
         return True
 
     def disagg_state_slot(self, request: LlmRequest, layer_group: int) -> Optional[int]:

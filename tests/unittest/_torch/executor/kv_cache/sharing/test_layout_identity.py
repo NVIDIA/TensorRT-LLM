@@ -1186,7 +1186,7 @@ def test_virtual_layers_are_numbered_by_model_layer_and_attention_type():
         COMPRESSED = 1
         INDEXER = 2
 
-    manager = Manager([kv_group(lids=(0, 1, 2))])
+    manager = Manager([kv_group(lids=(0, 1, 2))], pp_layers=[4, 5])
     manager._layer_attn_to_layer_id = {
         (4, AttentionType.SLIDING): 0,
         (4, AttentionType.COMPRESSED): 1,
@@ -1284,7 +1284,8 @@ def test_mixed_precision_names_a_model_layer_alike_on_every_pipeline_stage():
     """Every stage of a mixed-precision model names model layer ``m`` ``2 m`` and its twin
     ``2 m + 1``, a stage holding no twin too, so instances split into other pipeline stages pair
     each model layer with itself. Peers naming a model layer otherwise, as a stage naming its
-    layers by its own twins once did or the model served with one precision, are refused."""
+    layers by its own twins once did or the model served with one precision on any stage, are
+    refused."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible
 
     whole = mixed_precision_stage([0, 1, 2, 3])
@@ -1309,6 +1310,43 @@ def test_mixed_precision_names_a_model_layer_alike_on_every_pipeline_stage():
     plain = mixed_precision_stage([0, 1, 2, 3], mixed=False).get_page_table().page_layout
     with pytest.raises(ValueError, match="of model layer 0 against 1"):
         check_compatible(pages["whole"], plain)
+    # A plain stage sharing no layer id with the mixed one it pairs with.
+    plain_last = mixed_precision_stage([2, 3], mixed=False).get_page_table().page_layout
+    with pytest.raises(ValueError, match=r"model layer 2 named \[4\] against \[2\]"):
+        check_compatible(pages["last"], plain_last)
+
+
+@pytest.mark.cpu_only
+def test_layers_named_for_model_layers_the_stage_lacks_or_alike_are_refused():
+    """A manager names its internal layers by the model layers its pipeline stage holds, and no two
+    internal layers' buffers of one role alike; a map keyed otherwise, as by local index, is
+    refused rather than naming another layer's bytes."""
+    manager = Manager([kv_group(lids=(0, 1))], pp_layers=[6, 7])
+    manager._page_layer_ids = lambda: {0: (0, 0), 1: (1, 1)}
+    with pytest.raises(ValueError, match=r"names model layers \[0, 1\], which this pipeline"):
+        manager.get_page_table()
+    manager._page_layer_ids = lambda: {0: (6, 6), 1: (6, 7)}
+    with pytest.raises(ValueError, match="internal layers 0 and 1 both name the key buffer"):
+        manager.get_page_table()
+
+
+@pytest.mark.cpu_only
+def test_an_attention_buffer_with_heads_of_its_own_states_their_total():
+    """One KV head repeated on four tensor ranks says nothing of a buffer split one head per rank
+    by heads of its own size: it states their total, or is refused rather than named alike on
+    every rank."""
+    starts = set()
+    for rank in range(4):
+        manager = attention(4, rank, 1)
+        with pytest.raises(ValueError, match="state how many lie over all tensor ranks"):
+            manager._page_head_split(0, HEAD_BYTES, TPB, False, head_bytes=HEAD_BYTES)
+        (tensor,) = manager._page_head_split(
+            0, HEAD_BYTES, TPB, False, head_bytes=HEAD_BYTES, total=4
+        )
+        (head,) = [axis for axis in tensor.axes if axis.name == "head"]
+        topology = page_table.rank_topology(manager.mapping)
+        starts.add(page_layout.held(head, topology).start)
+    assert starts == {0, 1, 2, 3}
 
 
 @pytest.mark.cpu_only
@@ -1320,7 +1358,7 @@ def test_an_internal_layer_several_attention_types_share_takes_the_first_s_globa
         COMPRESSED = 1
         INDEXER = 2
 
-    manager = Manager([kv_group(lids=(0, 1, 2))])
+    manager = Manager([kv_group(lids=(0, 1, 2))], pp_layers=[4, 5])
     manager._layer_attn_to_layer_id = {
         (4, AttentionType.SLIDING): 0,
         (4, AttentionType.COMPRESSED): 1,
@@ -1424,7 +1462,7 @@ def test_virtual_layers_publish_the_model_layer_they_belong_to():
         COMPRESSED = 1
         INDEXER = 2
 
-    manager = Manager([kv_group(lids=(2, 0)), kv_group(lids=(1, 3))])
+    manager = Manager([kv_group(lids=(2, 0)), kv_group(lids=(1, 3))], pp_layers=[4, 5, 6])
     manager._layer_attn_to_layer_id = {
         (4, AttentionType.SLIDING): 0,
         (4, AttentionType.COMPRESSED): 1,
