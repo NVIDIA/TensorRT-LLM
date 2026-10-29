@@ -87,6 +87,8 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
+_DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
+_CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS = 2
 
 # Page sizes of a standalone drafter's separate KV pool (DFlash, standalone
 # DSpark). The pool keeps the target's kv_cache_config.tokens_per_block when it
@@ -103,6 +105,15 @@ _STANDALONE_DRAFT_TOKENS_PER_BLOCK = 32
 # Aggregated helix skips memory profiling, so its default KV fraction leaves
 # room for prefill activations. TODO(TRTLLM-17127): remove once helix profiles.
 _HELIX_AGG_FREE_GPU_MEMORY_FRACTION = 0.6
+
+
+def _get_num_reserved_index_slots(spec_config: Optional[SpeculativeConfig],
+                                  estimating_kv_cache: bool) -> int:
+    """Return IndexMapper headroom required by the execution policy."""
+    if getattr(spec_config, "enable_confidence_scheduling", False):
+        return (0 if estimating_kv_cache else
+                _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS)
+    return _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -3476,6 +3487,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        manager_extra_kwargs["num_reserved_index_slots"] = (
+            _get_num_reserved_index_slots(spec_config, estimating_kv_cache))
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[

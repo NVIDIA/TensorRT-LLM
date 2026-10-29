@@ -102,7 +102,6 @@ def _make_worker(enable_confidence_scheduling=False):
         max_draft_len=5,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         enable_confidence_scheduling=enable_confidence_scheduling,
-        enable_fused_confidence_scheduler=False,
         confidence_sps_table_path=None,
         confidence_sts_path=None,
     )
@@ -422,17 +421,22 @@ def test_prepare_assigns_slots_to_disagg_generation_requests():
     assert worker._batch_to_slot[:2].tolist() == [s0, s1]
 
 
-def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
+@pytest.mark.parametrize("physical_k", [3, 4, 5])
+@pytest.mark.parametrize("variant", [0, 1])
+def test_prepare_keeps_dummy_generation_requests_on_scratch_row(physical_k, variant):
     """ADP-idle (id 0) and CUDA-graph padding dummies never consume a real slot."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import cuda_graph_dummy_request_id
     from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 
     worker = _make_worker()
+    worker.spec_config.max_draft_len = physical_k
     meta = _make_metadata(max_num_requests=4)
-    worker._lazy_init(_fake_draft_model(), meta)
+    draft_model = _fake_draft_model()
+    draft_model.block_size = physical_k
+    worker._lazy_init(draft_model, meta)
     meta._dspark_worker = worker
 
-    graph_dummy = CUDA_GRAPH_DUMMY_REQUEST_ID - worker.max_draft_len
+    graph_dummy = cuda_graph_dummy_request_id(physical_k, variant=variant, max_draft_len=physical_k)
     meta.request_ids = [1000, ATTENTION_DP_DUMMY_REQUEST_ID, graph_dummy]
     meta.num_generations = 3
     meta.prepare()

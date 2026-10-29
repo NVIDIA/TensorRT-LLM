@@ -1787,6 +1787,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "speculative_config.enable_confidence_scheduling"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "speculative_config.enable_global_pool"
     },
     {
@@ -1942,6 +1947,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "speculative_config.use_relaxed_acceptance_for_thinking"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.validate_confidence_artifact_freshness"
     },
     {
       "capture_policy": "int",

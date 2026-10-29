@@ -554,6 +554,13 @@ class DSparkConfidenceHead(nn.Module):
     def load_weights(self, weights: list) -> None:
         """Load every confidence-head checkpoint parameter strictly."""
         (module_weights, ) = weights
+        self._validate_checkpoint_weights(module_weights)
+        for name, param in self.named_parameters():
+            param.data.copy_(module_weights[name][:])
+
+    def _validate_checkpoint_weights(
+            self, module_weights: dict[str, torch.Tensor]) -> None:
+        """Validate a head namespace before generic embedded parameter loading."""
         expected = dict(self.named_parameters())
         unexpected = [key for key in module_weights if key not in expected]
         missing = [key for key in expected if key not in module_weights]
@@ -568,7 +575,11 @@ class DSparkConfidenceHead(nn.Module):
                 f"DSpark confidence head checkpoint is missing key(s) {sorted(missing)}"
             )
         for name, param in expected.items():
-            param.data.copy_(module_weights[name][:])
+            actual_shape = tuple(module_weights[name].shape)
+            if actual_shape != tuple(param.shape):
+                raise ValueError(
+                    f"DSpark confidence head checkpoint {name} has shape {actual_shape}; "
+                    f"expected {tuple(param.shape)}")
 
 
 class Eagle3Attention(Attention):

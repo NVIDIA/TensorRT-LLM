@@ -11,6 +11,8 @@ from tensorrt_llm._torch.speculative.dspark import (
     resolve_confidence_head,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("key", ["sts_temperatures", "temperatures"])
 def test_loads_native_and_sglang_temperature_keys(tmp_path, key):
@@ -48,6 +50,14 @@ def test_rejects_non_list_temperatures(tmp_path, key, temperatures):
     path.write_text(json.dumps({key: temperatures}), encoding="utf-8")
 
     with pytest.raises(ValueError, match="must contain a non-empty temperature list"):
+        load_sts_temperatures_from_path(str(path))
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf"), -float("inf")])
+def test_rejects_nonfinite_or_nonpositive_temperatures(tmp_path, temperature):
+    path = tmp_path / "sts.json"
+    path.write_text(json.dumps({"temperatures": [1.0, temperature]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="finite positive"):
         load_sts_temperatures_from_path(str(path))
 
 

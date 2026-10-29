@@ -5677,3 +5677,148 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+class TestDSparkConfidenceScheduling:
+    """Config surface for DSpark confidence-scheduled verification."""
+
+    def _cfg(self, **kw):
+        from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+        kw.setdefault("max_draft_len", 5)
+        return DSparkDecodingConfig(**kw)
+
+    def _scheduled(self, **kw):
+        """Scheduling on with the required profiled cost table."""
+        kw["enable_confidence_scheduling"] = True
+        kw.setdefault("confidence_sps_table_path", "/tmp/sps.json")
+        kw.setdefault("confidence_sps_live_fingerprint_path",
+                      "/tmp/runtime.json")
+        return self._cfg(**kw)
+
+    def test_defaults_are_off(self):
+        c = self._cfg()
+        assert c.enable_confidence_scheduling is False
+
+    def test_knobs_require_the_master_switch(self):
+        for kw in ({
+                "confidence_sts_path": "/tmp/sts.json"
+        }, {
+                "confidence_sps_table_path": "/tmp/sps.json"
+        }, {
+                "confidence_sps_live_fingerprint_path": "/tmp/runtime.json"
+        }, {
+                "confidence_admission_receipt_path": "/tmp/admission.json"
+        }, {
+                "confidence_admission_receipt_sha256": "a" * 64
+        }):
+            with pytest.raises(ValueError,
+                               match="enable_confidence_scheduling"):
+                self._cfg(**kw)
+
+    def test_admission_artifacts_are_resolved_at_torch_args_boundary(self):
+        c = self._cfg(enable_confidence_scheduling=True)
+        assert c.enable_confidence_scheduling is True
+
+    def test_removed_legacy_verify_len_tiers_are_rejected(self):
+        with pytest.raises(ValidationError,
+                           match="confidence_verify_len_tiers"):
+            self._scheduled(confidence_verify_len_tiers=[1, 3, 5])
+
+    def test_physical_k1_resolves_confidence_scheduling_to_static(self):
+        c = self._scheduled(
+            max_draft_len=1,
+            confidence_sts_path="/tmp/sts.json",
+            confidence_admission_receipt_path="/tmp/admission.json",
+            confidence_admission_receipt_sha256="a" * 64,
+        )
+
+        assert c.enable_confidence_scheduling is False
+        assert c.confidence_sts_path is None
+        assert c.confidence_sps_table_path is None
+        assert c.confidence_sps_live_fingerprint_path is None
+        assert c.confidence_admission_receipt_path is None
+        assert c.confidence_admission_receipt_sha256 is None
+
+    def test_physical_k1_needs_no_confidence_artifacts(self):
+        c = self._cfg(max_draft_len=1, enable_confidence_scheduling=True)
+
+        assert c.enable_confidence_scheduling is False
+        assert c.max_total_draft_tokens == 1
+        assert c.tokens_per_gen_step == 2
+
+    def test_physical_k1_remains_valid_when_scheduling_is_off(self):
+        c = self._cfg(max_draft_len=1)
+        assert c.enable_confidence_scheduling is False
+        assert c.max_draft_len == 1
+        assert c.max_total_draft_tokens == 1
+        assert c.tokens_per_gen_step == 2
+
+    @staticmethod
+    def _environment(**overrides):
+        values = dict(
+            cuda_graph_config=SimpleNamespace(enable_padding=True),
+            speculative_config=SimpleNamespace(
+                draft_is_embedded_in_target=True),
+            guided_decoding_backend=None,
+            enable_lora=False,
+            lora_config=None,
+            sparse_attention_config=None,
+            pipeline_parallel_size=1,
+            context_parallel_size=1,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_confidence_environment_rejects_standalone_dspark(self):
+        environment = self._environment(speculative_config=SimpleNamespace(
+            draft_is_embedded_in_target=False))
+        with pytest.raises(ValueError,
+                           match="only the embedded DeepSeek-V4 draft"):
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({
+                "cuda_graph_config": None
+            }, "requires cuda_graph_config"),
+            (
+                {
+                    "cuda_graph_config": SimpleNamespace(enable_padding=False)
+                },
+                "enable_padding=True",
+            ),
+            ({
+                "guided_decoding_backend": "xgrammar"
+            }, "guided decoding"),
+            ({
+                "enable_lora": True
+            }, "does not yet support LoRA"),
+            ({
+                "pipeline_parallel_size": 2
+            }, "does not yet support pipeline parallelism"),
+            ({
+                "context_parallel_size": 2
+            }, "context_parallel_size=1"),
+            (
+                {
+                    "sparse_attention_config":
+                    SimpleNamespace(
+                        enable_heuristic_topk=True,
+                        use_cute_dsl_topk=False,
+                        use_cute_dsl_paged_mqa_logits=False,
+                    )
+                },
+                "enable_heuristic_topk",
+            ),
+        ],
+    )
+    def test_confidence_environment_rejects_unsupported_runtime_combinations(
+            self, overrides, message):
+        environment = self._environment(**overrides)
+        with pytest.raises(ValueError, match=message):
+            TorchLlmArgs._validate_dspark_confidence_environment(environment)
+
+    def test_confidence_environment_accepts_padded_cuda_graphs(self):
+        TorchLlmArgs._validate_dspark_confidence_environment(
+            self._environment())

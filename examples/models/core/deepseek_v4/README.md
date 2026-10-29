@@ -472,6 +472,158 @@ MXFP4 routed MoE expert weights, TensorRT LLM automatically applies the routed-e
 configuration.
 
 
+## DSpark confidence verification (prototype)
+
+Confidence-guided verification is **default-off and experimental**. It proposes the full physical
+draft block `K`, then may select a smaller, measured verifier-token budget. It does not reduce the
+physical drafter length. This draft integration is not a production deployment recipe: strict
+receipt generation and performance qualification are external. This decode-only integration still
+needs native-build, distributed, full-model accuracy and performance validation. Mixed-step confidence
+scheduling, optional fused selection and all-K kernel widening are not enabled by this change.
+
+`K` is the physical draft length, `G` is the rank-local request count for a captured graph, and
+`V` is its verifier-token budget. In the cost table, `V=0` denotes the native full-width path;
+positive `V` values denote measured compact layouts. The table must match the configured physical
+`K` and cover every configured graph tier. Default reuse allows a captured graph ladder that is a
+subset of the measured ladder; only captured tiers become executable choices. The complete original
+artifact, including unused measurements and provenance, is still validated and returned unchanged.
+Strict freshness requires the original full ladder and matching live identity. The scheduler never
+invents a missing cell, and any drain-tail tier must be both captured and measured.
+
+### Requested configuration versus actual execution
+
+Set `DSparkDecodingConfig.enable_confidence_scheduling=True` to opt in. By default, structurally
+valid existing costs and calibration can be reused even when their recorded source or GPU-node
+metadata differ from the current run. A warning makes clear that predictions may be stale and
+that positive performance economics have not been established. Reuse does not change target
+verification or the acceptance rule.
+
+Set `validate_confidence_artifact_freshness=True` to require the previous strict live-fingerprint
+and positive workload-admission checks before constructing engines and workers:
+
+| Startup result | Resolved execution |
+| --- | --- |
+| Explicit opt-in with default artifact reuse | Confidence stays enabled; measured costs must still pass schema, finiteness, physical-`K`, measured graph coverage and layout checks. No admission receipt is created or asserted. |
+| Strict validation with missing, unreadable, stale or non-positive admission evidence | Both confidence flags become false and all confidence artifact paths/digests are cleared; ordinary feature-off static `K` runs. A warning explains the fallback. |
+| Physical `K=1` | Feature-off static `K1`; there is no smaller verifier tier. Confidence inputs are ignored and cleared. |
+| Strict validation with a matching receipt and positive aggregate value | Confidence remains requested; the existing environment, graph, checkpoint and runtime checks must still pass. |
+
+An **enabled-native** policy decision is different from startup
+feature-off fallback: it retains the enabled control path while verifying the native layout.
+An enabled compact decision uses a positive measured budget.
+
+Before reporting an "enabled" experiment, inspect the resolved
+`TorchLlmArgs.speculative_config.enable_confidence_scheduling` and record both the requested and
+resolved configuration. Require observed native/compact routing and completed outputs, rather
+than inferring execution from an input YAML flag or a successful server start. Do not count
+startup feature-off fallback as an enabled-native run. With confidence disabled, omit all
+confidence-only fields; explicitly supplying them is a configuration error.
+
+Confidence scheduling requires padded CUDA graphs, PP=1 and CP=1. Guided decoding, LoRA and incompatible
+sparse top-k settings remain unsupported. Per-request logits post-processors are rejected before
+activation. Advanced rejection draft sampling is also unsupported: its sampled proposal prefix
+differs from the greedy prefix that produced the confidence scores. Greedy requests (including
+`top_k=1`) and requests with rejection draft sampling disabled retain their existing behavior.
+Confidence-disabled execution retains its ordinary sampling and post-processing paths.
+
+### Reusing costs and calibration
+
+For default reuse, supply `confidence_sps_table_path` and, when using a calibrated head,
+`confidence_sts_path`. Costs must be finite positive schema-v2 measurements with native and compact
+cells for every configured graph size; STS temperatures must be a finite positive vector with
+one value per physical draft position. Invalid artifacts raise errors rather than being silently
+timed as enabled static execution. Their original metadata is retained; the runner records its
+observed runtime separately instead of rewriting the artifact's provenance.
+
+For example, the confidence portion of a padded-graph configuration is:
+
+```yaml
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 3
+  enable_confidence_scheduling: true
+  confidence_sps_table_path: /your/artifacts/k3-costs.json
+  confidence_sts_path: /your/artifacts/k3-sts.json
+```
+
+This is a configuration example, not an exact-tip GPU-validated reproduction recipe. Keep the
+same checkpoint, physical `K`, inputs, parallelism, graph ladder and other runtime options when
+comparing it with static DSpark (`enable_confidence_scheduling: false`, without confidence-only
+fields). A fair measured comparison keeps source, configuration, inputs and output work matched,
+uses independent model lifetimes, checks actual routing and completed outputs, and records actual
+timings. Reused predictions do not invalidate that measurement: retain their original provenance
+and label freshness unchecked, without promising the earlier gain. Fresh profiling is optional
+and can improve prediction quality. Changing batch size requires a graph ladder covered by the
+supplied table, not a separate per-batch-size package.
+
+Both modes retain the table's configured immediate predicted-goodput margin. If the table
+supplies an `iteration_drain_guard`, its prices and final-drain policy are unchanged. Without that
+optional metadata, default reuse selects by immediate goodput alone; strict validation retains
+native verification. Neither behavior certifies an end-to-end gain.
+
+### Optional freshness and workload-admission validation
+
+With `validate_confidence_artifact_freshness: true`, provide all four prototype inputs:
+
+- `confidence_sps_table_path`: schema-v2 measured costs with exact physical `K`, rank-local graph
+  sizes `G`, native `V=0` cells and supported positive verifier budgets.
+- `confidence_sps_live_fingerprint_path`: an independently supplied fingerprint for that runtime
+  and graph ladder, not a copy relabeled from an older cost artifact.
+- `confidence_admission_receipt_path`: the schema-v1 workload receipt.
+- `confidence_admission_receipt_sha256`: the expected lowercase SHA256 of the **receipt file
+  bytes**, obtained from a trusted, separately reviewed deployment package.
+
+There is no supported public cost-profile/calibration/receipt-generation command in this source
+change. Self-generation requires the separate profiling tooling and its validated instructions;
+the fields above are consumers, not a cost collector. Do not manufacture costs or an admitting
+receipt from unit-test fixtures. A strict receipt's producer must preserve the measured cost,
+workload, calibration, selector-replay and runtime evidence and review their applicability to the
+actual deployment. A source, calibration, physical-`K` or workload change requires reassessment;
+historical scores or timing results cannot be relabeled as new-source qualification.
+
+The receipt envelope contains exactly `schema_version: 1`, `admission` and `admission_sha256`.
+The last field hashes the canonical admission-body JSON
+(`json.dumps(body, sort_keys=True, separators=(",", ":")).encode()`).
+The body contains:
+
+- `physical_k`, `source_head`, `source_diff_sha256`, `runtime_snapshot`;
+- `sps_cost_table_sha256`, `live_engine_fingerprint_sha256`, `selector_identity_sha256`;
+- `workload_identity_sha256`, `calibration_result_sha256`, `selector_replay_sha256`;
+- `policy_steps`, `compact_choices`, `gross_compact_value_ms_lower_bound`,
+  `fixed_confidence_path_overhead_ms_upper_bound`, `safety_margin_ms`, `admitted`.
+
+The selector identity must match `EXACT_SPS_SELECTOR_IDENTITY_SHA256` in
+`tensorrt_llm/_torch/speculative/dspark_planner.py`. Replay the existing marginal selector without
+allocating fixed overhead back to candidates through a `policy_steps / compact_choices` ratio.
+Admission recomputes:
+
+```text
+net_value_lower_bound_ms =
+    gross_compact_value_ms_lower_bound
+    - policy_steps * fixed_confidence_path_overhead_ms_upper_bound
+    - safety_margin_ms
+
+admitted = compact_choices > 0 and net_value_lower_bound_ms > 0
+```
+
+Native decisions still pay the enabled confidence-path overhead, so **all** policy steps count.
+Strict admission does not replace per-decision selection: exact measured tiers and the existing
+iteration/drain guard still determine whether a compact choice is allowed.
+
+Hashes provide integrity and cross-artifact consistency checks, **not signatures or proof of
+origin**. The runtime checks supplied receipt, cost and fingerprint values; it does not independently
+derive the running checkpoint/workload identity, re-execute the calibration or selector replay,
+or verify their referenced result files. The external producer/deployment package remains the
+trust boundary. Hashing an arbitrary receipt and passing that same digest does not establish
+trust or qualify an enabled experiment.
+
+Contract regressions are in `test_dspark_workload_admission.py`,
+`test_dspark_admission_resolution.py` (both under
+`tests/unittest/_torch/speculative/hw_agnostic/`) and
+`tests/unittest/llmapi/test_dspark_workload_admission_config.py`. These fixtures are synthetic
+validator tests, not deployment evidence. `test_dspark_artifact_reuse.py` covers optional
+freshness, unchanged structural guards and the absent-drain behavior.
+
 ## Notes and Troubleshooting
 
 - `DeepSeek-V4 on Hopper requires kv_cache_config.dtype='fp8_ds_mla'`: remove an explicit BF16/FP8
