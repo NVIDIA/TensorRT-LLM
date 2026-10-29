@@ -30,6 +30,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 
 from tensorrt_llm.serve.openai_disagg_server import (
@@ -211,10 +212,59 @@ async def test_unreachable_server_is_skipped_quietly():
     ids=["bare", "http_scheme", "http_scheme_trailing_slash"],
 )
 async def test_server_entry_forms_reach_the_endpoint(scheme, suffix):
-    """A server entry with or without a scheme or trailing slash is dialed as is."""
+    """A server entry with or without a scheme or trailing slash is dialed as is.
+
+    Only the requested paths are checked: whether the measured offset is applied
+    depends on the round-trip time of the machine running the test.
+    """
     async with _StubWorkerServer() as stub:
         fake_self = SimpleNamespace(_req_timeout_secs=30)
         await OpenAIDisaggServer._sync_server_clock(fake_self, f"{scheme}{stub.url}{suffix}")
 
-    assert len(stub.posted_offsets) == 1
+    assert stub.paths, "no request reached the stub server"
     assert set(stub.paths) == {"/steady_clock_offset"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entry",
+    ["https://worker:8443", "https://worker:8443/"],
+    ids=["https_scheme", "https_scheme_trailing_slash"],
+)
+async def test_https_server_entry_is_dialed_as_https(monkeypatch, entry):
+    """An https:// entry keeps its scheme when the handshake URL is built."""
+    urls = []
+
+    class _Response:
+        status = 503
+
+    class _Request:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _RecordingSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def get(self, url, **kwargs):
+            urls.append(url)
+            return _Request()
+
+        def post(self, url, **kwargs):
+            urls.append(url)
+            return _Request()
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *args, **kwargs: _RecordingSession())
+    monkeypatch.setattr(aiohttp, "TCPConnector", lambda *args, **kwargs: None)
+
+    fake_self = SimpleNamespace(_req_timeout_secs=30)
+    await OpenAIDisaggServer._sync_server_clock(fake_self, entry)
+
+    assert urls, "the handshake did not request any URL"
+    assert set(urls) == {"https://worker:8443/steady_clock_offset"}
