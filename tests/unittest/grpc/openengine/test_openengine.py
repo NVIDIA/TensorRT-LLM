@@ -31,6 +31,7 @@ pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    generation_pb2,
     kv_pb2,
     openengine_pb2_grpc,
     server_pb2,
@@ -43,6 +44,14 @@ from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 # grpc's to own, not this test's, so exempt the module the same way the SMG
 # adapter tests do.
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
+
+
+@pytest.fixture(params=["grpcio", "pygrpc-native"])
+def grpc_server(request: pytest.FixtureRequest) -> str:
+    """Runs the server tests on both gRPC server implementations."""
+    if request.param == "pygrpc-native":
+        pytest.importorskip("pygrpc_native", minversion="0.5.0")
+    return request.param
 
 
 def test_format_bind_address_brackets_ipv6() -> None:
@@ -83,7 +92,7 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> 
     asyncio.run(exercise_stop())
 
 
-def test_openengine_server_serves_the_control_contract() -> None:
+def test_openengine_server_serves_the_control_contract(grpc_server: str) -> None:
     """The server binds, attaches Control, answers, and shuts down cleanly.
 
     Exercises TRT-LLM's lifecycle around the servicer -- port-zero resolution,
@@ -108,14 +117,22 @@ def test_openengine_server_serves_the_control_contract() -> None:
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer(host="127.0.0.1", port=0, llm=llm, model="test-model")
+        server = OpenEngineServer(
+            host="127.0.0.1", port=0, llm=llm, model="test-model", grpc_server=grpc_server
+        )
         # port=0 must be replaced by the kernel-assigned port, or nothing
         # downstream (including this test's channel) can reach the server.
         assert server.port != 0
 
         await server.start()
         with pytest.raises(RuntimeError, match="Failed to bind"):
-            OpenEngineServer(host="127.0.0.1", port=server.port, llm=llm, model="test-model")
+            OpenEngineServer(
+                host="127.0.0.1",
+                port=server.port,
+                llm=llm,
+                model="test-model",
+                grpc_server=grpc_server,
+            )
         channel = grpc.aio.insecure_channel(f"127.0.0.1:{server.port}")
         try:
             control = openengine_pb2_grpc.ControlStub(channel)
@@ -139,7 +156,7 @@ def test_openengine_server_serves_the_control_contract() -> None:
     asyncio.run(exercise_server())
 
 
-def test_health_and_control_are_reachable_on_pod_address() -> None:
+def test_health_and_control_are_reachable_on_pod_address(grpc_server: str) -> None:
     """The shared listener accepts Pod-IP probes and control calls on one port."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
@@ -158,7 +175,7 @@ def test_health_and_control_are_reachable_on_pod_address() -> None:
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer("0.0.0.0", 0, llm, "test-model")
+        server = OpenEngineServer("0.0.0.0", 0, llm, "test-model", grpc_server=grpc_server)
         await server.start()
         try:
             async with grpc.aio.insecure_channel(f"{pod_ip}:{server.port}") as channel:
@@ -178,7 +195,84 @@ def test_health_and_control_are_reachable_on_pod_address() -> None:
     asyncio.run(exercise_server())
 
 
-def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+class _StreamingResult:
+    """Streams one token per result, as GenerationResult does."""
+
+    def __init__(self, results: list[SimpleNamespace]) -> None:
+        self._results = results
+        self.finished = False
+        self.prompt_token_ids: list[int] = []
+        self.outputs: list[SimpleNamespace] = []
+        self.cached_tokens = 0
+        self.error = None
+
+    async def __aiter__(self):
+        for result in self._results:
+            self.finished = all(output.finish_reason for output in result.outputs)
+            result.finished = self.finished
+            self.prompt_token_ids = result.prompt_token_ids
+            self.outputs = result.outputs
+            yield result
+
+    def abort(self) -> None:
+        pass
+
+
+def _token_result(token_ids: list[int], text: str, finish_reason: str | None) -> SimpleNamespace:
+    output = SimpleNamespace(
+        index=0,
+        token_ids=token_ids,
+        text=text,
+        logprobs=None,
+        prompt_logprobs=None,
+        finish_reason=finish_reason,
+        stop_reason=None,
+    )
+    return SimpleNamespace(prompt_token_ids=[1, 2], outputs=[output], cached_tokens=0, error=None)
+
+
+def test_generate_streams_through_the_server(grpc_server: str) -> None:
+    """A Generate call streams its tokens and finish event over a real listener."""
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _check_health=lambda: True,
+        generate_async=lambda **kwargs: _StreamingResult(
+            [_token_result([10], "A", None), _token_result([10, 11], "AB", "length")]
+        ),
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", grpc_server=grpc_server)
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                inference = openengine_pb2_grpc.InferenceStub(channel)
+                request = generation_pb2.GenerateRequest(
+                    request_id="request-1",
+                    model="test-model",
+                    prompt="hello",
+                    stopping=generation_pb2.StoppingOptions(max_tokens=2),
+                )
+                responses = [r async for r in inference.Generate(request, timeout=5)]
+        finally:
+            await server.stop(grace=0)
+
+        assert [r.WhichOneof("event") for r in responses] == ["token", "token", "finished"]
+        assert [t.token_id for t in responses[0].token.tokens] == [10]
+        assert responses[0].token.text == "A"
+        assert [t.token_id for t in responses[1].token.tokens] == [11]
+        assert responses[1].token.text == "B"
+        assert responses[2].finished.reason == generation_pb2.FINISH_REASON_LENGTH
+        assert responses[2].usage.completion_tokens == 2
+
+    asyncio.run(exercise_server())
+
+
+def test_standard_grpc_health_check_and_watch(
+    monkeypatch: pytest.MonkeyPatch, grpc_server: str
+) -> None:
     """Readiness changes reach both RPCs without changing server liveness."""
     import tensorrt_llm.grpc.openengine.server as oe_server
 
@@ -192,7 +286,7 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", grpc_server=grpc_server)
         await server.start()
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
@@ -252,7 +346,7 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
     asyncio.run(exercise_server())
 
 
-def test_standard_grpc_health_watch_reports_shutdown() -> None:
+def test_standard_grpc_health_watch_reports_shutdown(grpc_server: str) -> None:
     """Shutdown withdraws inference and finishes watchers without failing liveness."""
     llm = SimpleNamespace(
         args=SimpleNamespace(guided_decoding_backend=None),
@@ -262,7 +356,7 @@ def test_standard_grpc_health_watch_reports_shutdown() -> None:
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", grpc_server=grpc_server)
         await server.start()
         stop_task = None
         try:
@@ -293,7 +387,7 @@ def test_standard_grpc_health_watch_reports_shutdown() -> None:
 
 
 def test_inference_health_timeout_does_not_start_overlapping_checks(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, grpc_server: str
 ) -> None:
     """A stalled predicate withdraws readiness without accumulating worker threads."""
     import tensorrt_llm.grpc.openengine.server as oe_server
@@ -317,7 +411,7 @@ def test_inference_health_timeout_does_not_start_overlapping_checks(
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", grpc_server=grpc_server)
         await server.start()
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
@@ -356,7 +450,7 @@ def test_inference_health_timeout_does_not_start_overlapping_checks(
 
 @pytest.mark.parametrize("fatal_field", ["_fatal_error", "_engine_dead"])
 def test_fatal_engine_failure_fails_liveness_after_temporary_unavailability(
-    monkeypatch: pytest.MonkeyPatch, fatal_field: str
+    monkeypatch: pytest.MonkeyPatch, fatal_field: str, grpc_server: str
 ) -> None:
     """Only a sticky fatal error fails liveness; temporary readiness can recover."""
     import tensorrt_llm.grpc.openengine.server as oe_server
@@ -373,7 +467,7 @@ def test_fatal_engine_failure_fails_liveness_after_temporary_unavailability(
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", grpc_server=grpc_server)
         await server.start()
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
@@ -428,7 +522,9 @@ def test_fatal_engine_failure_fails_liveness_after_temporary_unavailability(
     asyncio.run(exercise_server())
 
 
-def test_inference_health_recovers_after_monitor_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inference_health_recovers_after_monitor_error(
+    monkeypatch: pytest.MonkeyPatch, grpc_server: str
+) -> None:
     """A failed poll clears readiness and a later successful poll restores it."""
     import tensorrt_llm.grpc.openengine.server as oe_server
 
@@ -448,7 +544,7 @@ def test_inference_health_recovers_after_monitor_error(monkeypatch: pytest.Monke
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", grpc_server=grpc_server)
         await server.start()
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
@@ -490,7 +586,7 @@ def test_inference_health_recovers_after_monitor_error(monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize("publisher_enabled", [False, True])
-def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> None:
+def test_event_startup_requires_loaded_publisher(publisher_enabled: bool, grpc_server: str) -> None:
     """Configured events must not advertise a source absent from the loaded engine."""
     from tensorrt_llm.grpc.openengine.kv_events import KvEventsUnavailableError
 
@@ -508,7 +604,9 @@ def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> Non
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer(host="127.0.0.1", port=0, llm=llm, model="test-model")
+        server = OpenEngineServer(
+            host="127.0.0.1", port=0, llm=llm, model="test-model", grpc_server=grpc_server
+        )
         try:
             if publisher_enabled:
                 await server.start()

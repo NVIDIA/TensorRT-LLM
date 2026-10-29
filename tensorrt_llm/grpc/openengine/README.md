@@ -168,6 +168,10 @@ Frontends send heartbeats once per second. A missing heartbeat for 10 seconds wi
 
 Multiple frontends require the default classic IPC executor and a nonzero port. SMG and AutoDeploy do not support this mode. Frontends share host CPU resources, so provision sufficient CPU and benchmark the intended model, router, and connection pool before choosing a frontend count. More processes do not necessarily increase throughput once GPU execution becomes the bottleneck.
 
+## gRPC server implementation
+
+The server runs on `grpc.aio` by default. `--openengine-grpc-server pygrpc-native` runs it on [pygrpc-native](https://github.com/pygrpc/pygrpc-native) instead, a drop-in replacement for `grpc.aio.server()` that does the HTTP/2 and gRPC work in Rust outside the GIL. The servicers, health service and server options stay the same. Install it with `pip install "tensorrt_llm[openengine-native]"`; the server checks for it before loading the model. It works with multiple frontend processes. The internal coordinator between frontends always uses `grpc.aio`.
+
 ## Schema and binding provenance
 
 The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.

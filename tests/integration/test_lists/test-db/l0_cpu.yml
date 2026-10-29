@@ -223,6 +223,7 @@ l0_cpu:
   - unittest/grpc/test_grpc_optional.py::test_protobuf_warning_skips_unavailable_api
   - unittest/grpc/test_grpc_optional.py::test_protobuf_warning_does_not_block_model_startup
   - unittest/grpc/test_grpc_optional.py::test_smg_server_startup_failure_cleans_up
+  - unittest/grpc/test_grpc_optional.py::test_openengine_pygrpc_native_is_checked_before_engine_start
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/test_deepseek_v32_encoding.py

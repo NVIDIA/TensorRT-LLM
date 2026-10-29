@@ -357,6 +357,33 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("installed", [None, "0.4.0"])
+def test_openengine_pygrpc_native_is_checked_before_engine_start(
+    monkeypatch: pytest.MonkeyPatch, installed: Optional[str]
+) -> None:
+    """A missing or too old pygrpc-native fails with an install hint, not after the model loads."""
+    pytest.importorskip("grpc")
+    import click
+
+    from tensorrt_llm.grpc.openengine import server as server_module
+
+    def version(name: str) -> str:
+        if installed is None:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return installed
+
+    monkeypatch.setattr(server_module.importlib.metadata, "version", version)
+    monkeypatch.setattr(server_module, "PyTorchLLM", None)
+    with pytest.raises(click.ClickException, match=r"tensorrt_llm\[openengine-native\]"):
+        server_module.launch_server(
+            "127.0.0.1",
+            0,
+            {"backend": "pytorch", "model": "test-model"},
+            grpc_server="pygrpc-native",
+        )
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("via_config", [False, True])
 def test_smg_rejects_multiple_frontends_before_engine_start(tmp_path, via_config):
     """Config-file overrides must not bypass the SMG single-frontend guard."""
