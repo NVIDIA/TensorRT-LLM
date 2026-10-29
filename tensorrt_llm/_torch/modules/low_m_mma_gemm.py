@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Launcher of the low-M warp-MMA GEMM (``kernels/blackwell/low_m_mma_gemm``) and its tactic heuristic.
 
-Plain projections reach it through the low-M GEMM race of ``modules/low_m_gemm.py``, or directly where a tactic
-is pinned (``pinned_tactic``); fused users (GDN input projection + conv, shared-expert SwiGLU
-(``fused_shared_expert``), GEMM + all-reduce) launch it with the same tactic.
+Plain projections reach it through the low-M GEMM race of ``modules/low_m_gemm.py``; fused users (GDN input
+projection + conv, shared-expert SwiGLU (``fused_shared_expert``), GEMM + all-reduce) launch it with the
+tactic that race picked.
 """
 
 from __future__ import annotations
@@ -52,61 +52,6 @@ def _tactic3(t) -> Tactic:
         t[3] if len(t) > 3 else 0,
         t[4] if len(t) > 4 else 1,
     )
-
-
-# SM 10.3 tactics pinned over the low-M race for the hidden-4096 per-rank shapes at TP8 / TP16. Key (N, K, mode):
-# "bf16" (BF16 weight), "fp8" / "quant" (FP8 weight, E4M3 / BF16 input). Value: ((max rows, tactic), ...) in
-# increasing row order; beyond the last max rows the race decides.
-_SM103_PINNED_TACTICS = {
-    (2560, 4096, "fp8"): ((8, (16, 4, 1, 1)), (16, (8, 1, 1, 0, 3))),
-    (2560, 4096, "quant"): ((8, (16, 4, 1, 1)), (16, (16, 4))),
-    (4096, 1024, "fp8"): ((8, (8, 2, 1, 1)), (24, (8, 2))),
-    (4096, 1024, "quant"): ((8, (8, 2, 1, 1)), (32, (8, 2))),
-    (256, 4096, "quant"): ((8, (16, 2, 1, 1)), (16, (16, 2)), (32, (8, 2, 2))),
-    (256, 4096, "fp8"): ((8, (16, 2, 1, 1)), (16, (16, 2)), (32, (8, 2, 2))),
-    (4096, 128, "quant"): ((8, (2, 2)), (14, (1, 2)), (18, (2, 4)), (32, (1, 4))),
-    (4096, 128, "fp8"): ((8, (2, 2)), (14, (1, 2)), (18, (2, 4)), (32, (1, 4))),
-    (16, 4096, "bf16"): ((16, (32, 1)), (32, (16, 1))),
-    (512, 4096, "bf16"): ((8, (32, 1)), (16, (16, 1))),
-    (2560, 4096, "bf16"): ((8, (16, 2, 1, 1)), (16, (8, 2, 1, 0, 2))),
-    (4096, 1024, "bf16"): ((8, (8, 1, 1, 1)), (32, (8, 2))),
-    (256, 4096, "bf16"): ((8, (16, 1)), (16, (8, 1)), (32, (16, 1))),
-    (4096, 128, "bf16"): ((4, (2, 1)), (16, (1, 2))),
-    (1280, 4096, "fp8"): ((8, (16, 2, 1, 1)), (16, (16, 2)), (32, (8, 2))),
-    (1280, 4096, "quant"): ((8, (16, 2, 1, 1)), (18, (16, 2)), (32, (8, 2))),
-    (1536, 4096, "fp8"): ((8, (16, 2, 1, 1)), (32, (8, 2))),
-    (1536, 4096, "quant"): ((8, (16, 2, 1, 1)), (18, (16, 2)), (32, (8, 2))),
-    (4096, 512, "fp8"): ((8, (4, 2, 1, 1, 3)), (16, (8, 2))),
-    (4096, 512, "quant"): ((16, (4, 4)), (32, (8, 2))),
-    (128, 4096, "quant"): ((8, (8, 2, 4, 1)), (16, (8, 2, 4)), (32, (4, 2, 4))),
-    (128, 4096, "fp8"): ((8, (8, 2, 4, 1)), (16, (8, 2, 4)), (32, (4, 2, 4))),
-    (4096, 64, "fp8"): ((8, (1, 2, 1, 1)), (32, (1, 2))),
-    (4096, 64, "quant"): ((8, (1, 2, 1, 1)), (32, (1, 2))),
-    (8, 4096, "bf16"): ((8, (32, 1)), (32, (8, 1, 8))),
-    (1536, 4096, "bf16"): ((8, (8, 2, 1, 1)), (32, (8, 2))),
-    (4096, 512, "bf16"): ((16, (4, 2)), (32, (8, 1))),
-}
-
-
-def pinned_tactic(m: int, n: int, k: int, mode: str) -> Optional[Tactic]:
-    """The tactic pinned for ``m`` rows of an ``n x k`` projection in ``mode`` (``_SM103_PINNED_TACTICS``), or
-    None: no row, or the kernel cannot run it."""
-    if not warp_mma_supported():
-        return None
-    for max_rows, tactic in _SM103_PINNED_TACTICS.get((n, k, mode), ()):
-        if m <= max_rows:
-            k_warps, n_tiles, ksplit, swap_ab, min_blocks = _tactic3(tactic)
-            if n % (8 * n_tiles) or (k // 64) % (k_warps * ksplit):
-                return None
-            # The kernel swaps A and B only for <= 8 rows and even tiles.
-            return (
-                k_warps,
-                n_tiles,
-                ksplit,
-                int(bool(swap_ab) and m <= 8 and n_tiles % 2 == 0),
-                min_blocks,
-            )
-    return None
 
 
 def conv_supported(m: int, tactic, conv_channels: int, tokens: int) -> bool:

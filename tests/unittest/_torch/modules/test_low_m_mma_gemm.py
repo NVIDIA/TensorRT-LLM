@@ -177,34 +177,6 @@ def test_candidate_tactics(m, n, k):
         )
 
 
-@pytest.mark.parametrize("n,k,mode", sorted(L._SM103_PINNED_TACTICS))
-def test_pinned_tactics(n, k, mode):
-    """Every pinned row runs at its largest row count and matches the dequantized reference."""
-    for m, _ in L._SM103_PINNED_TACTICS[(n, k, mode)]:
-        tactic = L.pinned_tactic(m, n, k, mode)
-        assert tactic is not None
-        x = _act(m, k, 50, outliers=mode != "bf16")
-        if mode == "bf16":
-            w = _bf16_weight(n, k, 51)
-            _assert_close(
-                L.low_m_mma_gemm(x16=x, w_bf16=w, tactic_bf16=tactic), x.float() @ w.float().t()
-            )
-            continue
-        w, s_w = _fp8_weight(n, k, 51)
-        s_in = _scale(x)
-        q = _squant(x, s_in)
-        y = L.low_m_mma_gemm(
-            x16=x if mode == "quant" else None,
-            x8=q if mode == "fp8" else None,
-            w_fp8=w,
-            weight_scale=s_w,
-            input_scale=s_in,
-            fp8_act=mode,
-            tactic=tactic,
-        )
-        _assert_close(y, (q.float() @ w.float().t()) * (s_in * s_w))
-
-
 @pytest.mark.parametrize("inter", [128, 64])
 def test_shared_expert_module_path(inter, monkeypatch, m=7):
     """The MoE block's shared expert (GatedMLP with LoRA layers, as in the model) takes the two-launch low-M path
@@ -260,7 +232,6 @@ def test_shared_expert_module_path(inter, monkeypatch, m=7):
     ref_out, ref_gate = mlp(x), gate(x)
     prepare_low_m_gemm(blk, force=True)
     blk._shared_expert_low_m = blk._shared_expert_low_m_weights()
-    monkeypatch.setattr(L, "_SM103_PINNED_TACTICS", {})
     assert blk._shared_expert_low_m_forward(x) is None  # the race has not picked the warp-MMA GEMM
 
     # Each lookup names the race the plain projection ran: a BF16 or an E4M3 input.
@@ -357,10 +328,10 @@ def test_gdn_conv_epilogue_bitwise(tp16, n, pad):
     assert not torch.equal(epilogue(bad_w)[0][valid, :cd], ref[valid])
 
 
-def test_fp8_race(monkeypatch):
+def test_fp8_race():
     """An FP8 Linear with the low-M dispatcher attached races cuBLAS against the warp-MMA GEMM: after tuning
     the output is the winner's, and the fused users' tactic lookup names the warp-MMA tactic exactly when it
-    won (never while tuning). A pinned shape skips the race."""
+    won (never while tuning)."""
     from tensorrt_llm._torch.autotuner import AutoTuner, autotune
     from tensorrt_llm._torch.modules.linear import Linear
     from tensorrt_llm._torch.modules.low_m_gemm import low_m_gemm_dispatcher, prepare_low_m_gemm
@@ -383,8 +354,6 @@ def test_fp8_race(monkeypatch):
     ref = lin(x)
     prepare_low_m_gemm(lin, force=True)
     dispatcher = low_m_gemm_dispatcher(lin)
-    assert dispatcher.warp_mma_tactic(7, w, s_w, s_in) == L.pinned_tactic(7, 2560, 4096, "quant")
-    monkeypatch.setattr(L, "_SM103_PINNED_TACTICS", {})
     AutoTuner.get().clear_cache()
     with autotune():
         assert dispatcher.warp_mma_tactic(7, w, s_w, s_in) is None

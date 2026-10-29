@@ -710,23 +710,13 @@ class LowMGemmDispatcher:
             # but excluding them for biased calls keeps the race concise.
             runners.append(self._direct)
             runners.append(self._warp_mma)
-        pinned = (
-            None
-            if has_bias
-            else low_m_mma_gemm.pinned_tactic(
-                int(input_2d.shape[0]), int(weight.shape[0]), int(input_2d.shape[1]), "bf16"
-            )
+        best_runner, best_tactic = AutoTuner.get().choose_one(
+            _AUTOTUNER_OP_NAME,
+            runners,
+            self._tuning_config,
+            [input_2d, weight_t],
+            bias=bias_d,
         )
-        if pinned is not None:
-            best_runner, best_tactic = self._warp_mma, pinned
-        else:
-            best_runner, best_tactic = AutoTuner.get().choose_one(
-                _AUTOTUNER_OP_NAME,
-                runners,
-                self._tuning_config,
-                [input_2d, weight_t],
-                bias=bias_d,
-            )
         # Larger M values still share coarse buckets. Revalidate direct tactics
         # before launching the tail-less kernel and use the guaranteed baseline
         # when a cached row tile is incompatible with the runtime M.
@@ -791,11 +781,6 @@ class LowMGemmDispatcher:
             return None
         quantize = input_2d.dtype != torch.float8_e4m3fn
         inputs = [input_2d, weight, weight_scale, input_scale]
-        pinned = low_m_mma_gemm.pinned_tactic(
-            int(input_2d.shape[0]), int(weight.shape[0]), k, "quant" if quantize else "fp8"
-        )
-        if pinned is not None:
-            return self._fp8_runners[quantize][1], pinned, inputs
         runner, tactic = AutoTuner.get().choose_one(
             _FP8_AUTOTUNER_OP_NAME,
             self._fp8_runners[quantize],
@@ -835,10 +820,10 @@ class LowMGemmDispatcher:
         input_scale: Optional[torch.Tensor] = None,
         quantize: bool = True,
     ) -> Optional[Tuple[int, ...]]:
-        """The warp-MMA tactic pinned (``low_m_mma_gemm.pinned_tactic``) or picked by this dispatcher's race for
-        ``num_rows`` rows of the projection ``weight`` (the FP8 race for an E4M3 weight, with a BF16 input when
-        ``quantize``; else the BF16 race), or None: another runner won, the shape was not tuned, or the race is
-        being tuned (callers then run the plain projection, which tunes it).
+        """The warp-MMA tactic this dispatcher's race picked for ``num_rows`` rows of the projection ``weight``
+        (the FP8 race for an E4M3 weight, with a BF16 input when ``quantize``; else the BF16 race), or None:
+        another runner won, the shape was not tuned, or the race is being tuned (callers then run the plain
+        projection, which tunes it).
 
         Fused users launch the warp-MMA kernel with this tactic, so they run where the plain projection would,
         with its summation order.
@@ -854,13 +839,7 @@ class LowMGemmDispatcher:
         if not self._prepared:
             self._init_runners()
         n, k = int(weight.shape[0]), int(weight.shape[1])
-        fp8 = weight.dtype == torch.float8_e4m3fn
-        pinned = low_m_mma_gemm.pinned_tactic(
-            num_rows, n, k, ("quant" if quantize else "fp8") if fp8 else "bf16"
-        )
-        if pinned is not None:
-            return pinned
-        if fp8:
+        if weight.dtype == torch.float8_e4m3fn:
             op, runners = _FP8_AUTOTUNER_OP_NAME, self._fp8_runners[quantize]
             shapes = (
                 torch.Size((num_rows, k)),
