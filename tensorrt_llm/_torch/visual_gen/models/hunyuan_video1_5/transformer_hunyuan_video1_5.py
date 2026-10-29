@@ -298,6 +298,21 @@ class HunyuanVideo15RefinerAttention(Attention):
         bias: bool = True,
         model_config: Optional[DiffusionModelConfig] = None,
     ) -> None:
+        model_config = model_config or DiffusionModelConfig()
+        if model_config.attention.backend == "TRTLLM":
+            # The text refiner needs general key padding, not the valid-prefix
+            # and discarded-query contract of TRTLLM padded self-attention.
+            model_config = model_config.model_copy(
+                update={
+                    "attention": model_config.attention.model_copy(
+                        update={
+                            "backend": "VANILLA",
+                            "quant_attention_config": None,
+                            "sparse_attention_config": None,
+                        }
+                    )
+                }
+            )
         super().__init__(
             hidden_size=dim,
             num_attention_heads=num_attention_heads,
@@ -305,7 +320,7 @@ class HunyuanVideo15RefinerAttention(Attention):
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=False,
             bias=bias,
-            config=model_config or DiffusionModelConfig(),
+            config=model_config,
         )
 
     def forward(
@@ -646,7 +661,11 @@ class HunyuanVideo15Attention(Attention):
                 attention_mask, (seq_len - attention_mask.shape[1], 0), value=True
             ).bool()
 
-        hidden_states = self._attn_impl(query, key, value, key_padding_mask=key_padding_mask)
+        # Context tokens are packed valid-first; padded context rows remain
+        # masked in every block and do not contribute to the video output.
+        hidden_states = self._attn_impl(
+            query, key, value, key_padding_mask=key_padding_mask, discard_padded_queries=True
+        )
 
         # hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
