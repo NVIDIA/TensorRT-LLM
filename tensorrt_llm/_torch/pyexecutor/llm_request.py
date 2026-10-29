@@ -1252,6 +1252,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             py_logits_post_processors=(self.py_logits_post_processors.copy()
                                        if self.py_logits_post_processors
                                        is not None else None),
+            py_apply_batched_logits_processor=self.
+            py_apply_batched_logits_processor,
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
         )

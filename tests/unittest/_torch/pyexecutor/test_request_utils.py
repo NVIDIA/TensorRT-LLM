@@ -451,6 +451,25 @@ def test_child_factory_copies_processor_list_and_preserves_callables(processor_c
     assert len(sibling_processors) == processor_count
 
 
+@pytest.mark.parametrize("apply_batched", [False, True])
+def test_child_factory_copies_the_batched_logits_processor_flag(apply_batched) -> None:
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
+        is_streaming=False,
+        py_apply_batched_logits_processor=apply_batched,
+    )
+    parent.create_child_request(43)
+    parent.create_child_request(44)
+
+    assert [child.py_apply_batched_logits_processor for child in parent.child_requests] == [
+        apply_batched,
+        apply_batched,
+    ]
+
+
 @pytest.mark.parametrize("runtime_field", ["py_mm_encoder_state", "py_mm_encoder_event"])
 def test_child_factory_rejects_multimodal_encoder_ownership(runtime_field) -> None:
     parent = LlmRequest(
