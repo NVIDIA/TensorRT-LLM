@@ -367,12 +367,13 @@ def _transferred(layout: PageLayout) -> dict[tuple[int, str], BufferDesc]:
 def check_compatible(a: PageLayout, b: PageLayout) -> None:
     """Check that two ranks' pages correspond, whichever sends.
 
-    On the layers both hold, which name the same model layers, every buffer either rank transfers
-    the other transfers too, as the same tensors: the same names, axes and extents over all ranks,
-    however each splits them, and elements of the same type where the tensors state one, in pages
-    of as many sub-pages, in layer groups of the same kind. The KV data is of one element type and
-    quantization. Pages pair one to one, so where both transfer attention buffers their pages hold
-    as many tokens.
+    A model layer both ranks transfer buffers of goes by the same global layers on both, so ranks
+    pair a model layer's buffers with its own however their pipeline stages split the model. On
+    the layers both hold, every buffer either rank transfers the other transfers too, as the same
+    tensors: the same names, axes and extents over all ranks, however each splits them, and
+    elements of the same type where the tensors state one, in pages of as many sub-pages, in layer
+    groups of the same kind. The KV data is of one element type and quantization. Pages pair one to
+    one, so where both transfer attention buffers their pages hold as many tokens.
 
     How many tokens each side keeps of a windowed group is not compared: retention margins (reuse
     backoff, draft tokens) legitimately differ between the sides, and a transfer moves the blocks
@@ -427,10 +428,34 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
             # A layer named alike on both sides but of different model layers, as when one side
             # names its layers by pipeline stage, would move one layer's bytes into another's.
             problems.append(f"buffer {key}: of model layer {model_a} against {model_b}")
+    # A side naming a model layer otherwise, as one naming its layers by what its pipeline stage
+    # holds, shares none of its ids with the other and would leave the layer unwritten.
+    names_a, names_b = _model_layer_names(a, group_a), _model_layer_names(b, group_b)
+    for model in sorted(set(names_a) & set(names_b)):
+        if names_a[model] != names_b[model]:
+            problems.append(
+                f"model layer {model} named {sorted(names_a[model])} against "
+                f"{sorted(names_b[model])}"
+            )
     if paged and a.tokens_per_page != b.tokens_per_page:
         problems.append(f"pages of {a.tokens_per_page} tokens against {b.tokens_per_page}")
     if problems:
         raise ValueError("page layouts do not correspond: " + "; ".join(problems))
+
+
+def _model_layer_names(
+    layout: PageLayout, groups: dict[tuple[int, int], int]
+) -> dict[int, set[int]]:
+    """Model layer -> the global layers its transferred buffers lie in."""
+    names: dict[int, set[int]] = {}
+    for buffer in layout.buffers:
+        index = groups.get((buffer.pool_group, buffer.layer))
+        if not buffer.transferred or index is None:
+            continue
+        group = layout.layer_groups[index]
+        model = group.model_layers[group.layers.index(buffer.layer)]
+        names.setdefault(model, set()).add(buffer.layer)
+    return names
 
 
 def sent_bytes(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> dict[int, int]:

@@ -457,6 +457,22 @@ def test_layers_of_one_name_but_other_model_layers_are_refused():
         check_compatible(_with_group(base, model_layers=(1,)), base)
 
 
+def test_model_layers_named_by_other_layers_are_refused():
+    """Peers sharing no layer id can still hold the same model layers: a stage naming model layers
+    4 and 5 as 8 and 10 against one naming them 4 and 5 would pair nothing and leave both
+    unwritten, so it is refused."""
+    topology = Instance().ranks(0)[0]
+    plain = layout(topology, (4, 5), [("key", kv(4), "attention")])
+    doubled = _with_group(
+        layout(topology, (8, 10), [("key", kv(4), "attention")]), model_layers=(4, 5)
+    )
+    with pytest.raises(ValueError, match=r"model layer 4 named \[8\] against \[4\]"):
+        check_compatible(doubled, plain)
+    with pytest.raises(ValueError, match=r"model layer 5 named \[5\] against \[10\]"):
+        check_compatible(plain, doubled)
+    check_compatible(doubled, doubled)
+
+
 def test_layer_groups_keeping_other_windows_correspond():
     """Retention differs legitimately between the sides: a context worker with block reuse keeps a
     reuse-backoff token more (GPT-OSS with Eagle3 keeps 129 tokens of a 128-token window), a
