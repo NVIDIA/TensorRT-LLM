@@ -78,6 +78,7 @@ class _BatchDescFieldSpec:
 BatchDesc.__dataclass_fields__ = _BatchDescFieldSpec.__dataclass_fields__
 del _BatchDescFieldSpec, _dataclasses_bd
 BufferConfig = _cpp.BufferConfig
+SparseCacheConfig = _cpp.SparseCacheConfig
 BufferId = _cpp.BufferId
 CoalescedBuffer = _cpp.CoalescedBuffer
 CacheTier = _cpp.CacheTier
@@ -136,6 +137,7 @@ class _KVCacheManagerConfigFieldSpec:
     enable_partial_commit: bool = True
     pool_rebalance: object = None
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+    host_sparse_pool_quota: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -152,9 +154,6 @@ OutOfPagesError = _cpp.OutOfPagesError
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
-PageStorageSnapshot = _cpp.PageStorageSnapshot
-Batch = _cpp.Batch
-BatchDeviceArray = _cpp.BatchDeviceArray
 PlannedDropHandle = _cpp.PlannedDropHandle
 PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
@@ -163,7 +162,8 @@ PoolRebalanceConfig = _cpp.PoolRebalanceConfig
 ReuseGroupStatus = _cpp.ReuseGroupStatus
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
-ScratchDesc = _cpp.ScratchDesc
+Batch = _cpp.Batch
+IndexTableSpec = _cpp.IndexTableSpec
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
 SsmLayerConfig = _cpp.SsmLayerConfig
@@ -184,6 +184,7 @@ take_poison = _cpp.take_poison
 BeamIndex = int
 CacheLevel = int
 CacheTierConfig = Union[GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig]
+BatchRow = int
 CudaStream = int
 DataRole = str
 LayerGroupId = int
@@ -222,6 +223,7 @@ __all__ = [
     "BatchDesc",
     "BeamIndex",
     "BufferConfig",
+    "SparseCacheConfig",
     "BufferId",
     "CoalescedBuffer",
     "CacheLevel",
@@ -251,6 +253,7 @@ __all__ = [
     "KVCacheUpdatedData",
     "KvCacheStatus",
     "LayerGroupId",
+    "BatchRow",
     "LayerId",
     "LifeCycleId",
     "LogicError",
@@ -262,9 +265,6 @@ __all__ = [
     "PoolGroupPeakBlockStats",
     "PageIndexMode",
     "PageStatus",
-    "PageStorageSnapshot",
-    "Batch",
-    "BatchDeviceArray",
     "PoolDesc",
     "PoolGroupDesc",
     "PoolGroupIndex",
@@ -272,7 +272,8 @@ __all__ = [
     "Priority",
     "ReuseGroupStatus",
     "ReuseScope",
-    "ScratchDesc",
+    "Batch",
+    "IndexTableSpec",
     "KVCacheIterationStatsDelta",
     "ReusedBlocksByLevel",
     "KVCacheStatsDelta",
