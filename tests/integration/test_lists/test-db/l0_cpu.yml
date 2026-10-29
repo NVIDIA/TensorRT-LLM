@@ -244,9 +244,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
-  - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
-  - unittest/llmapi/apps/test_openai_protocol_chat_store.py
-  - unittest/llmapi/apps/test_openai_server_iteration_stats.py
+  - unittest/llmapi/apps/test_prompt_tokens_details_multimodal.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   - unittest/llmapi/apps/test_render_callers.py
   - unittest/llmapi/apps/test_render_core.py

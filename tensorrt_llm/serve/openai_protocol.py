@@ -226,6 +226,16 @@ class StreamOptions(OpenAIBaseModel):
 
 class PromptTokensDetails(OpenAIBaseModel):
     cached_tokens: int = 0
+    image_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if v is not None}
+        return data
 
 
 class UsageInfo(OpenAIBaseModel):

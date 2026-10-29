@@ -1758,7 +1758,8 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
             return
 
         # Append usage info
-        usage_info = _create_usage_info(num_prompt_tokens, result.outputs,
+        usage_info = _create_usage_info(num_prompt_tokens,
+                                        result.outputs,
                                         cached_tokens)
 
         final_usage_chunk = _create_stream_response(
@@ -1915,7 +1916,9 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
         response_message = {"role": "assistant", "content": ""}
 
     # Create usage info from metrics (RequestOutput doesn't have usage in v1)
-    usage_info = _create_usage_info(num_prompt_tokens, outputs, cached_tokens)
+    usage_info = _create_usage_info(num_prompt_tokens,
+                                    outputs,
+                                    cached_tokens)
 
     # Create response
     response = ChatCompletionResponse(
@@ -1970,11 +1973,12 @@ def _create_usage_info(num_prompt_tokens,
     num_generated_tokens = sum(len(output.token_ids) for output in outputs)
 
     # Create usage info
-    usage = UsageInfo(
-        prompt_tokens=num_prompt_tokens,
-        completion_tokens=num_generated_tokens,
-        total_tokens=num_prompt_tokens + num_generated_tokens,
-        prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_tokens))
+    usage = UsageInfo(prompt_tokens=num_prompt_tokens,
+                      completion_tokens=num_generated_tokens,
+                      total_tokens=num_prompt_tokens + num_generated_tokens,
+                      prompt_tokens_details=PromptTokensDetails(
+                          cached_tokens=cached_tokens,
+                      ))
     return usage
 
 
