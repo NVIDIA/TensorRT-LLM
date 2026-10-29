@@ -1,4 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import psutil
 import pynvml
+
+from tensorrt_llm.logger import logger
 
 DEFAULT_HF_MODEL_DIRS = {
     "BaichuanForCausalLM": "baichuan-inc/Baichuan-13B-Chat",
@@ -25,10 +42,27 @@ DEFAULT_HF_MODEL_DIRS = {
 
 
 def get_device_memory():
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    total_memory = mem_info.total / (1024**3)
-    pynvml.nvmlShutdown()
+    """Return the total memory of GPU 0 in GiB.
 
-    return total_memory
+    On unified-memory systems such as DGX Spark (GB10), NVML does not report
+    device memory and ``nvmlDeviceGetMemoryInfo`` raises
+    ``NVMLError_NotSupported``. The GPU then shares system memory, so fall
+    back to the total system memory.
+    """
+    pynvml.nvmlInit()
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        try:
+            total_memory = pynvml.nvmlDeviceGetMemoryInfo(handle).total
+        except pynvml.NVMLError_NotSupported:
+            total_memory = psutil.virtual_memory().total
+            logger.warning(
+                "NVML does not support device memory queries for GPU 0 "
+                "(e.g. unified memory on DGX Spark). Using total system "
+                f"memory ({total_memory / (1024**3):.2f} GiB) to estimate "
+                "max_batch_size and max_num_tokens."
+            )
+    finally:
+        pynvml.nvmlShutdown()
+
+    return total_memory / (1024**3)
