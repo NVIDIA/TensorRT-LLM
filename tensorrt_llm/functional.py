@@ -187,6 +187,8 @@ class MoEAllReduceParams(AllReduceParams):
         eps: float = 1e-06,
         enable_allreduce: bool = True,
         is_cutlass_min_latency: bool = False,
+        match_unfused_numerics: bool = False,
+        mxfp8_out: bool = False,
     ):
         super().__init__(
             bias=bias,
@@ -202,6 +204,14 @@ class MoEAllReduceParams(AllReduceParams):
         self.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx
         self.shared_expert_output = shared_expert_output
         self.is_cutlass_min_latency = is_cutlass_min_latency
+        # Regular mode only. match_unfused_numerics rounds the routed sum to the
+        # activation dtype before the shared-expert add and orders the RMSNorm
+        # reduction as the one-shot AllReduce fusion kernel does, so the result
+        # equals finalize + add + RESIDUAL_RMS_NORM bit for bit. mxfp8_out also
+        # emits the norm as MXFP8 (E4M3 + swizzled UE8M0 scales), as
+        # RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 does.
+        self.match_unfused_numerics = match_unfused_numerics
+        self.mxfp8_out = mxfp8_out
 
     def is_valid(self):
         if self.is_cutlass_min_latency:
