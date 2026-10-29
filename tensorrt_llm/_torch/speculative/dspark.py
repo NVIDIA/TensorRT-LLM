@@ -602,8 +602,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
             f"device_windows={self.verify_planner.device_windows}"
         )
 
-    def _assign_slot(self, req_id: int) -> int:
+    def _assign_slot(self, req_id: int, reset: bool = False) -> int:
         """Get the persistent progress slot for a request."""
+        if reset and req_id in self._req_to_slot:
+            old = self._req_to_slot.pop(req_id)
+            self._managed_residency.pop(req_id, None)
+            self._free_slots.append(old)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
                 raise RuntimeError(
@@ -612,9 +616,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
-            self._ctx_len[slot] = 0
-            self._valid_len[slot] = 0
-            self._position_initialized[slot] = False
+            self._ctx_len[slot].zero_()
+            self._valid_len[slot].zero_()
+            self._position_initialized[slot].zero_()
             if self._confidence_logits is not None:
                 # A recycled slot still holds the previous occupant's scores;
                 # reset to neutral so the first scheduling decision verifies
@@ -648,6 +652,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             old = torch.clamp(old, max=self._position_cap)
             start_pos = torch.clamp(start_pos, max=self._position_cap)
         self._ctx_len[slots] = start_pos
+        self._position_initialized[slots] = True
         self._valid_len[slots] = torch.clamp(
             self._valid_len[slots] + num_accepted_tokens, max=self._win
         )
@@ -1021,6 +1026,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 self._managed_residency.pop(request_id, None)
                 self._ctx_len[slot] = 0
                 self._valid_len[slot] = 0
+                self._position_initialized[slot] = False
                 self._free_slots.append(slot)
 
     def _is_managed_request(self, request_id: int) -> bool:
@@ -1106,6 +1112,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._draft_page_indices = mappings
         self._ctx_len[self._scratch_slot] = 0
         self._valid_len[self._scratch_slot] = 0
+        self._position_initialized[self._scratch_slot] = False
         batch_slots = [self._scratch_slot] * len(request_ids)
         for row in real_rows:
             request_id = request_ids[row]
@@ -1121,6 +1128,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
             self._ctx_len[slot] = position
             self._valid_len[slot] = min(self._win, position)
+            self._position_initialized[slot] = True
             self._managed_residency[request_id] = cache
         # Staging may still be read by an earlier asynchronous H2D. Reuse it
         # only after its copy event, independently of overlapped model execution.

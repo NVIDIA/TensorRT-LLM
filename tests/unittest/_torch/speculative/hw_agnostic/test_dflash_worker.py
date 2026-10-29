@@ -214,7 +214,11 @@ class _FakeDraftCacheManager:
 
 def _bind_device_tables(worker, manager):
     worker._ctx_kv_manager = manager
-    worker._init_ctx_block_tables(num_slots=3, max_blocks=4)
+    worker._ctx_layer_ids = [61]
+    manager.kv_cache_pool_mapping = torch.tensor([[0, 0]] * 7 + [[1, 0]])
+    manager.max_blocks_per_seq = 4
+    pool = [torch.empty(16, 2, 1, 32, 64, device="cuda")]
+    assert worker._init_ctx_block_tables(manager, pool, 3, 1, 1, 64, 32)
     worker._init_unified_draft_tables(manager)
 
 

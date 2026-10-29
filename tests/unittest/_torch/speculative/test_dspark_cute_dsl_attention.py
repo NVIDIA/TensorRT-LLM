@@ -149,7 +149,12 @@ def _reference(
 def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, invalid_case, reason):
     import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
 
-    q, _, _, kv_cache, _, start_pos, sink, _, freqs = _make_inputs()
+    paged_inputs = _make_inputs()
+    q = paged_inputs["q"]
+    kv_cache = torch.empty(q.shape[0], 128, 512, dtype=q.dtype, device=q.device)
+    start_pos = paged_inputs["positions"]
+    sink = paged_inputs["attn_sink"]
+    freqs = paged_inputs["inverse_rope_freqs"]
     inputs = [q, kv_cache, _legacy_valid_len(start_pos), sink, freqs]
     if invalid_case == "q_dtype":
         inputs[0] = q.float()
@@ -222,6 +227,7 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
     def unexpected_launch(*args):
         pytest.fail("invalid inputs reached compilation or a kernel launch")
 
+    monkeypatch.setattr(attention_op, "_get_dspark_arch_str", lambda: "sm_100a")
     key = (6, 128, 32, attention_op._get_dspark_arch_str(), None)
     monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", {key: unexpected_launch})
     monkeypatch.setattr(attention_op, "_compile_dspark_attention", unexpected_launch)

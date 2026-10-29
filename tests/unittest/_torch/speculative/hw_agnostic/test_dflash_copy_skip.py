@@ -17,6 +17,7 @@ DUMMY_SLOT = 0
 def _worker(req_to_slot):
     worker = SimpleNamespace(
         _ctx_buf_inited=True,
+        _has_unified_draft_cache=lambda: False,
         _req_to_slot=dict(req_to_slot),
         _req_ctx_pos={},
         _free_slots=[],

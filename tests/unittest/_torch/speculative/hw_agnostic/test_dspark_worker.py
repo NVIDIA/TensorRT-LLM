@@ -427,7 +427,7 @@ def test_prepare_keeps_cuda_graph_slots_across_replays():
     meta = _make_metadata(max_num_requests=4)
     worker._lazy_init(_fake_draft_model(), meta)
     meta._dspark_worker = worker
-    meta.request_ids = [0, 1, 2]
+    meta.request_ids = [100, 101, 102]
     meta.num_generations = 3
     meta.is_cuda_graph = True
     _prepare(worker, meta)
@@ -939,7 +939,8 @@ def test_lazy_init_publishes_the_runtime_position_ceiling():
 
     # A full target verification accepts K+1 tokens, then DSpark indexes K
     # block positions from that new start. The table length is max index + 1.
-    expected = 4096 + 5 + 1 + 5 + 1
+    # Managed cache positions include the next RoPE frame in addition to the logical index.
+    expected = 4096 + 5 + 1 + 5 + 2
     assert dm._runtime_position_ceiling == expected
     assert dm.dspark_model._runtime_position_ceiling == expected
 
@@ -1074,6 +1075,8 @@ def test_ragged_draft_gathers_each_requests_hidden_state():
         verify_lens=torch.tensor([4, 2], dtype=torch.int32, device="cuda"),
     )
     worker._lazy_init(draft_model, metadata)
+    _bind_manager(worker, [1000, 1001])
+    worker._prepare_managed_history([1000, 1001], 0)
     worker._batch_to_slot[:2] = torch.tensor([0, 1], device="cuda")
     captured = torch.stack(
         [torch.full((HIDDEN * NCAP,), float(index), device="cuda") for index in range(6)]

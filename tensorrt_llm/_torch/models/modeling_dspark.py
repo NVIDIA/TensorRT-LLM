@@ -1896,6 +1896,223 @@ class DSv4DSparkDraftModel(nn.Module):
         x = x.unsqueeze(-2).repeat(1, 1, self.hc_mult, 1)
         return x, main_x, draft_ids
 
+    def _forward_stage_legacy(
+        self,
+        stage: "DSv4DSparkBlock",
+        h: torch.Tensor,
+        main_x: torch.Tensor,
+        start_pos,
+        freqs_cis: torch.Tensor,
+        moe_input_ids: torch.Tensor,
+        stage_window: Optional[torch.Tensor] = None,
+        slots: Optional[torch.Tensor] = None,
+        valid_len: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        pre_mix: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """One DSpark stage = reference ``Block.forward`` with captured-context attn.
+
+        ``h`` is the mHC residual stream ``[T, block, hc_mult, hidden]``. The mHC
+        ``pre_mapping``/``post_mapping`` preserve the leading ``[T, block]`` dims;
+        the captured-context attention and MoE run on the collapsed token axis.
+        Mirrors the reference (unfused) mHC boundaries exactly:
+        ``hc_pre → attn_norm → DSparkAttention → hc_post`` then
+        ``hc_pre → ffn_norm → MoE → hc_post``.
+
+        ``stage_window`` is this stage's persistent rolling captured-context KV
+        window ``[T, window_size, head_dim]`` owned by the worker across decode
+        steps; the attention writes the current ``main_kv`` into it in place. When
+        ``None`` (golden / single-shot) a zero window is allocated per call.
+
+        When ``slots`` (a ``[G]`` int tensor) is given, the CUDA-graph-safe batched
+        attention (:func:`dspark_attention_forward_batched`) is used instead: it
+        takes ``start_pos`` as a ``[G]`` tensor and writes/reads ``stage_window``
+        (then shaped ``[N, window_size, head_dim]``) through the ``slots`` index.
+        """
+        T, block, _, hidden = h.shape
+
+        # --- attention sub-block (captured-context, not paged-KV MLA) ---
+        residual = h
+        if pre_mix is None:
+            post_mix, comb_mix, layer_input = stage.hc_attn.pre_mapping(residual)
+        else:
+            attn_pre, post_mix, comb_mix, layer_input = stage.hc_attn.pre_mapping_lagged(
+                residual, pre_mix
+            )
+        layer_input = stage.input_layernorm(layer_input)  # [T, block, hidden]
+        # Rolling-window cache: persist through the worker-owned ``stage_window``
+        # for cross-step decode, else a fresh zero window for a single block.
+        persist = stage_window is not None
+        kv_cache = (
+            stage_window
+            if persist
+            else torch.zeros(
+                T,
+                self._attn_params["window_size"],
+                self._attn_params["head_dim"],
+                dtype=torch.bfloat16,
+                device=h.device,
+            )
+        )
+        if slots is not None:
+            # Batched, CUDA-graph-safe path (start_pos is a [G] tensor; window is
+            # written/read through ``slots``).
+            attn = dspark_attention_forward_batched(
+                layer_input,
+                main_x,
+                start_pos,
+                kv_cache,
+                slots,
+                valid_len=valid_len,
+                freqs_cis=freqs_cis,
+                persist=True,
+                **stage._dspark_attn,
+                **self._attn_params,
+            )
+        else:
+            attn = _dspark_attention_forward_legacy(
+                layer_input,
+                main_x,
+                start_pos,
+                kv_cache,
+                freqs_cis=freqs_cis,
+                persist=persist,
+                **stage._dspark_attn,
+                **self._attn_params,
+            )
+        if pre_mix is not None:
+            residual = stage.hc_attn.post_mapping(
+                x=attn,
+                residual=residual,
+                post_layer_mix=post_mix,
+                comb_res_mix=comb_mix,
+            )
+            ffn_pre, post_mix, comb_mix, layer_input = stage.hc_ffn.pre_mapping_lagged(
+                residual, attn_pre
+            )
+            layer_input = stage.post_attention_layernorm(layer_input)
+        elif stage.enable_fused_hc:
+            residual, post_mix, comb_mix, layer_input = stage.hc_ffn.fused_hc(
+                x_prev=attn,
+                residual_prev=residual,
+                post_mix_prev=post_mix,
+                comb_mix_prev=comb_mix,
+                norm_weight=stage.post_attention_layernorm.weight,
+                norm_eps=stage.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            residual = stage.hc_attn.post_mapping(
+                x=attn,
+                residual=residual,
+                post_layer_mix=post_mix,
+                comb_res_mix=comb_mix,
+            )
+            post_mix, comb_mix, layer_input = stage.hc_ffn.pre_mapping(residual)
+            layer_input = stage.post_attention_layernorm(layer_input)
+        num_tokens = T * block
+        # FUSED_COMM MoE backends (DeepGEMM MegaMoE) size their in-kernel
+        # NVLink-barrier chunk loop from ``max(all_rank_num_tokens)`` and index
+        # the local slice by ``moe_ep_rank``, so every EP rank must pass the same
+        # globally-gathered per-rank list (here: gen tokens = num_gens * block per
+        # rank). Passing only the local ``[num_tokens]`` desyncs the phase-flip
+        # barrier across ranks (hang / "unspecified launch failure"). Fall back to
+        # the local count for single-rank / non-ADP runs where no list is threaded.
+        moe_all_rank_num_tokens = (
+            all_rank_num_tokens if all_rank_num_tokens is not None else [num_tokens]
+        )
+        # The draft captured-context MoE must mirror the target DeepseekV4MoE's TP
+        # reduction policy. Under attention DP each rank is data-parallel (owns a
+        # distinct set of requests) and needs no cross-rank reduction; but under
+        # plain tensor parallelism (attention_dp off, tp_size > 1) the expert-sharded
+        # MoE output must be all-reduced across ranks -- exactly what the target MoE
+        # does (enable_allreduce = not (POST_MOE_FUSION or tp_size == 1)). Previously
+        # this was hard-coded to False, which dropped the reduction on the non-ADP
+        # path, corrupting the draft block proposals and roughly halving DSpark
+        # acceptance length whenever attention_dp was disabled.
+        moe_enable_allreduce = (
+            not self.model_config.mapping.enable_attention_dp
+            and self.model_config.mapping.tp_size > 1
+        )
+        moe_out = stage.mlp(
+            layer_input.reshape(num_tokens, hidden),
+            input_ids=moe_input_ids,
+            all_rank_num_tokens=moe_all_rank_num_tokens,
+            final_all_reduce_params=AllReduceParams(enable_allreduce=moe_enable_allreduce),
+            do_finalize=True,
+        ).reshape(T, block, hidden)
+        h = stage.hc_ffn.post_mapping(
+            x=moe_out, residual=residual, post_layer_mix=post_mix, comb_res_mix=comb_mix
+        )
+        return (h, ffn_pre) if pre_mix is not None else h
+
+    def _forward_legacy(
+        self,
+        main_hidden: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        start_pos: int,
+        *,
+        kv_windows: Optional[torch.Tensor] = None,
+        temperature: float = 0.0,
+        return_confidence: bool = False,
+        return_logits: bool = False,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> tuple:
+        """Full block-draft forward: chain the ``num_stages`` DSpark stages.
+
+        Mirrors the reference ``Transformer.forward_spec`` (generation path,
+        ``start_pos > 0``): ``forward_embed`` builds the block input + captured
+        context, each stage runs the captured-context backbone, and
+        ``forward_head`` emits the block draft tokens + per-position confidence.
+
+        Args:
+            main_hidden: ``[T, num_capture * hidden]`` captured target context.
+            bonus_token_ids: ``[T]`` last accepted token per request.
+            start_pos: absolute decode position (must be > 0).
+            kv_windows: optional persistent per-stage rolling captured-context KV
+                windows ``[T, num_stages, window_size, head_dim]`` owned by the
+                worker; updated in place each call. ``None`` allocates fresh zero
+                windows (single-shot golden / test path).
+        Returns:
+            ``(draft_tokens [T, block], confidence [T, block] or None)``.
+        """
+        assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
+        if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
+            raise RuntimeError(
+                "DSpark attention weights not cached; call "
+                "cache_attn_weights_from_checkpoint(ckpt_dir, weight_map) after loading."
+            )
+        x, main_x, draft_ids = self.forward_embed(main_hidden, bonus_token_ids)
+        main_x = main_x.unsqueeze(1)  # [T, 1, hidden] for the MQA K/V projection
+        freqs_cis = self._dspark_freqs_table(x.device)
+        moe_input_ids = draft_ids.reshape(-1)
+
+        h = x
+        pre_mix = self._initial_pre_mix(x)
+        for s, stage in enumerate(self.mtp_layers):
+            stage_window = kv_windows[:, s] if kv_windows is not None else None
+            h = self._forward_stage_legacy(
+                stage,
+                h,
+                main_x,
+                start_pos,
+                freqs_cis,
+                moe_input_ids,
+                stage_window,
+                all_rank_num_tokens=all_rank_num_tokens,
+                pre_mix=pre_mix,
+            )
+            if self.uses_lagged_pre:
+                h, pre_mix = h
+
+        return self.forward_head(
+            h,
+            bonus_token_ids,
+            temperature=temperature,
+            return_confidence=return_confidence,
+            return_logits=return_logits,
+            pre_mix=pre_mix,
+        )
+
     def _forward_stage(
         self,
         stage: "DSv4DSparkBlock",
@@ -2515,223 +2732,6 @@ class DSv4DSparkForCausalLM(nn.Module):
         """Batched + masked window back-fill (delegates to the draft model)."""
         return self.dspark_model.write_context_windows_batched(
             main_hidden, positions, slots, mask, kv_windows
-        )
-
-    def _forward_stage_legacy(
-        self,
-        stage: "DSv4DSparkBlock",
-        h: torch.Tensor,
-        main_x: torch.Tensor,
-        start_pos,
-        freqs_cis: torch.Tensor,
-        moe_input_ids: torch.Tensor,
-        stage_window: Optional[torch.Tensor] = None,
-        slots: Optional[torch.Tensor] = None,
-        valid_len: Optional[torch.Tensor] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        pre_mix: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """One DSpark stage = reference ``Block.forward`` with captured-context attn.
-
-        ``h`` is the mHC residual stream ``[T, block, hc_mult, hidden]``. The mHC
-        ``pre_mapping``/``post_mapping`` preserve the leading ``[T, block]`` dims;
-        the captured-context attention and MoE run on the collapsed token axis.
-        Mirrors the reference (unfused) mHC boundaries exactly:
-        ``hc_pre → attn_norm → DSparkAttention → hc_post`` then
-        ``hc_pre → ffn_norm → MoE → hc_post``.
-
-        ``stage_window`` is this stage's persistent rolling captured-context KV
-        window ``[T, window_size, head_dim]`` owned by the worker across decode
-        steps; the attention writes the current ``main_kv`` into it in place. When
-        ``None`` (golden / single-shot) a zero window is allocated per call.
-
-        When ``slots`` (a ``[G]`` int tensor) is given, the CUDA-graph-safe batched
-        attention (:func:`dspark_attention_forward_batched`) is used instead: it
-        takes ``start_pos`` as a ``[G]`` tensor and writes/reads ``stage_window``
-        (then shaped ``[N, window_size, head_dim]``) through the ``slots`` index.
-        """
-        T, block, _, hidden = h.shape
-
-        # --- attention sub-block (captured-context, not paged-KV MLA) ---
-        residual = h
-        if pre_mix is None:
-            post_mix, comb_mix, layer_input = stage.hc_attn.pre_mapping(residual)
-        else:
-            attn_pre, post_mix, comb_mix, layer_input = stage.hc_attn.pre_mapping_lagged(
-                residual, pre_mix
-            )
-        layer_input = stage.input_layernorm(layer_input)  # [T, block, hidden]
-        # Rolling-window cache: persist through the worker-owned ``stage_window``
-        # for cross-step decode, else a fresh zero window for a single block.
-        persist = stage_window is not None
-        kv_cache = (
-            stage_window
-            if persist
-            else torch.zeros(
-                T,
-                self._attn_params["window_size"],
-                self._attn_params["head_dim"],
-                dtype=torch.bfloat16,
-                device=h.device,
-            )
-        )
-        if slots is not None:
-            # Batched, CUDA-graph-safe path (start_pos is a [G] tensor; window is
-            # written/read through ``slots``).
-            attn = dspark_attention_forward_batched(
-                layer_input,
-                main_x,
-                start_pos,
-                kv_cache,
-                slots,
-                valid_len=valid_len,
-                freqs_cis=freqs_cis,
-                persist=True,
-                **stage._dspark_attn,
-                **self._attn_params,
-            )
-        else:
-            attn = _dspark_attention_forward_legacy(
-                layer_input,
-                main_x,
-                start_pos,
-                kv_cache,
-                freqs_cis=freqs_cis,
-                persist=persist,
-                **stage._dspark_attn,
-                **self._attn_params,
-            )
-        if pre_mix is not None:
-            residual = stage.hc_attn.post_mapping(
-                x=attn,
-                residual=residual,
-                post_layer_mix=post_mix,
-                comb_res_mix=comb_mix,
-            )
-            ffn_pre, post_mix, comb_mix, layer_input = stage.hc_ffn.pre_mapping_lagged(
-                residual, attn_pre
-            )
-            layer_input = stage.post_attention_layernorm(layer_input)
-        elif stage.enable_fused_hc:
-            residual, post_mix, comb_mix, layer_input = stage.hc_ffn.fused_hc(
-                x_prev=attn,
-                residual_prev=residual,
-                post_mix_prev=post_mix,
-                comb_mix_prev=comb_mix,
-                norm_weight=stage.post_attention_layernorm.weight,
-                norm_eps=stage.post_attention_layernorm.variance_epsilon,
-            )
-        else:
-            residual = stage.hc_attn.post_mapping(
-                x=attn,
-                residual=residual,
-                post_layer_mix=post_mix,
-                comb_res_mix=comb_mix,
-            )
-            post_mix, comb_mix, layer_input = stage.hc_ffn.pre_mapping(residual)
-            layer_input = stage.post_attention_layernorm(layer_input)
-        num_tokens = T * block
-        # FUSED_COMM MoE backends (DeepGEMM MegaMoE) size their in-kernel
-        # NVLink-barrier chunk loop from ``max(all_rank_num_tokens)`` and index
-        # the local slice by ``moe_ep_rank``, so every EP rank must pass the same
-        # globally-gathered per-rank list (here: gen tokens = num_gens * block per
-        # rank). Passing only the local ``[num_tokens]`` desyncs the phase-flip
-        # barrier across ranks (hang / "unspecified launch failure"). Fall back to
-        # the local count for single-rank / non-ADP runs where no list is threaded.
-        moe_all_rank_num_tokens = (
-            all_rank_num_tokens if all_rank_num_tokens is not None else [num_tokens]
-        )
-        # The draft captured-context MoE must mirror the target DeepseekV4MoE's TP
-        # reduction policy. Under attention DP each rank is data-parallel (owns a
-        # distinct set of requests) and needs no cross-rank reduction; but under
-        # plain tensor parallelism (attention_dp off, tp_size > 1) the expert-sharded
-        # MoE output must be all-reduced across ranks -- exactly what the target MoE
-        # does (enable_allreduce = not (POST_MOE_FUSION or tp_size == 1)). Previously
-        # this was hard-coded to False, which dropped the reduction on the non-ADP
-        # path, corrupting the draft block proposals and roughly halving DSpark
-        # acceptance length whenever attention_dp was disabled.
-        moe_enable_allreduce = (
-            not self.model_config.mapping.enable_attention_dp
-            and self.model_config.mapping.tp_size > 1
-        )
-        moe_out = stage.mlp(
-            layer_input.reshape(num_tokens, hidden),
-            input_ids=moe_input_ids,
-            all_rank_num_tokens=moe_all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=moe_enable_allreduce),
-            do_finalize=True,
-        ).reshape(T, block, hidden)
-        h = stage.hc_ffn.post_mapping(
-            x=moe_out, residual=residual, post_layer_mix=post_mix, comb_res_mix=comb_mix
-        )
-        return (h, ffn_pre) if pre_mix is not None else h
-
-    def _forward_legacy(
-        self,
-        main_hidden: torch.Tensor,
-        bonus_token_ids: torch.Tensor,
-        start_pos: int,
-        *,
-        kv_windows: Optional[torch.Tensor] = None,
-        temperature: float = 0.0,
-        return_confidence: bool = False,
-        return_logits: bool = False,
-        all_rank_num_tokens: Optional[List[int]] = None,
-    ) -> tuple:
-        """Full block-draft forward: chain the ``num_stages`` DSpark stages.
-
-        Mirrors the reference ``Transformer.forward_spec`` (generation path,
-        ``start_pos > 0``): ``forward_embed`` builds the block input + captured
-        context, each stage runs the captured-context backbone, and
-        ``forward_head`` emits the block draft tokens + per-position confidence.
-
-        Args:
-            main_hidden: ``[T, num_capture * hidden]`` captured target context.
-            bonus_token_ids: ``[T]`` last accepted token per request.
-            start_pos: absolute decode position (must be > 0).
-            kv_windows: optional persistent per-stage rolling captured-context KV
-                windows ``[T, num_stages, window_size, head_dim]`` owned by the
-                worker; updated in place each call. ``None`` allocates fresh zero
-                windows (single-shot golden / test path).
-        Returns:
-            ``(draft_tokens [T, block], confidence [T, block] or None)``.
-        """
-        assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
-        if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
-            raise RuntimeError(
-                "DSpark attention weights not cached; call "
-                "cache_attn_weights_from_checkpoint(ckpt_dir, weight_map) after loading."
-            )
-        x, main_x, draft_ids = self.forward_embed(main_hidden, bonus_token_ids)
-        main_x = main_x.unsqueeze(1)  # [T, 1, hidden] for the MQA K/V projection
-        freqs_cis = self._dspark_freqs_table(x.device)
-        moe_input_ids = draft_ids.reshape(-1)
-
-        h = x
-        pre_mix = self._initial_pre_mix(x)
-        for s, stage in enumerate(self.mtp_layers):
-            stage_window = kv_windows[:, s] if kv_windows is not None else None
-            h = self._forward_stage_legacy(
-                stage,
-                h,
-                main_x,
-                start_pos,
-                freqs_cis,
-                moe_input_ids,
-                stage_window,
-                all_rank_num_tokens=all_rank_num_tokens,
-                pre_mix=pre_mix,
-            )
-            if self.uses_lagged_pre:
-                h, pre_mix = h
-
-        return self.forward_head(
-            h,
-            bonus_token_ids,
-            temperature=temperature,
-            return_confidence=return_confidence,
-            return_logits=return_logits,
-            pre_mix=pre_mix,
         )
 
     def _prepare_confidence_head_for_load(self, weights: Dict) -> None:

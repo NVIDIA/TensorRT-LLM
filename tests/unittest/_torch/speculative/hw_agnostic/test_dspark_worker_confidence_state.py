@@ -38,7 +38,10 @@ def _worker(num_rows=2):
     worker._ctx_len = torch.zeros(num_rows + 1, dtype=torch.long)
     worker._valid_len = torch.zeros(num_rows + 1, dtype=torch.long)
     worker._position_initialized = torch.zeros(num_rows + 1, dtype=torch.bool)
-    worker._kv_windows = torch.zeros(num_rows + 1, 1, 4, 2)
+    worker._draft_kv_manager = object()
+    worker._draft_kv_buffers = ()
+    worker._draft_block_tables = torch.zeros(num_rows + 1, 1, dtype=torch.int32)
+    worker._draft_capacities = torch.full((num_rows + 1,), 4, dtype=torch.long)
     worker._win = 4
     worker._position_cap = None
     worker._confidence_logits = torch.full((num_rows + 2, 3), 30.0)
@@ -57,8 +60,8 @@ def _draft_model():
 
     return SimpleNamespace(
         block_size=3,
-        forward_batched=Mock(side_effect=forward),
-        write_context_windows_batched=Mock(),
+        forward=Mock(side_effect=forward),
+        write_context_pages=Mock(),
     )
 
 
@@ -117,10 +120,10 @@ def test_mixed_ragged_draft_uses_generation_offsets_for_hidden_and_positions(ret
         positions=positions,
     )
 
-    args = model.forward_batched.call_args.args
+    args = model.forward.call_args.args
     assert args[0][:, 0].tolist() == [5.0, 8.0]
     assert args[2].tolist() == [103, 202]
-    backfill = model.write_context_windows_batched.call_args.args
+    backfill = model.write_context_pages.call_args.args
     assert backfill[0][:, :, 0][backfill[3]].tolist() == [3.0, 4.0, 7.0]
     assert backfill[3].tolist() == [[True, True, False], [True, False, False]]
 
@@ -153,7 +156,7 @@ def test_padding_offsets_do_not_index_past_captured_hidden_or_positions():
         accepted_counts=[2, 2],
     )
 
-    assert model.forward_batched.call_args.args[0][0].tolist() == [2.0, 2.0]
+    assert model.forward.call_args.args[0][0].tolist() == [2.0, 2.0]
     assert worker._confidence_logits[0].tolist() == [-3.0, -3.0, -3.0]
     assert worker._confidence_logits[worker._scratch_slot + 1].tolist() == [30.0, 30.0, 30.0]
 
@@ -264,6 +267,7 @@ def test_embedded_checkpoint_load_preserves_optional_confidence_bias(monkeypatch
     stage.confidence_head = DSparkConfidenceHead(hidden_size=2, block_size=2)
     draft.mtp_layers = nn.ModuleList([stage])
     draft.num_stages = 1
+    draft._use_bf16_linear = False
     draft.post_load_weights = Mock()
     draft.cache_attn_weights_from_state_dict = Mock()
     wrapper = modeling_dspark.DSv4DSparkForCausalLM.__new__(modeling_dspark.DSv4DSparkForCausalLM)

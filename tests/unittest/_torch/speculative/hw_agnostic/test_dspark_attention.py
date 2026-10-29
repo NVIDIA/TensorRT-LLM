@@ -100,7 +100,13 @@ def test_batched_attention_rejects_mismatched_window_size():
         for name, param in inspect.signature(forward).parameters.items()
         if param.default is inspect.Parameter.empty
     }
-    args.update(window_size=64, rope_head_dim=64)
+    args.update(
+        window_size=64,
+        rope_head_dim=64,
+        block_tables=torch.empty(0, dtype=torch.int32),
+        capacities=torch.empty(0, dtype=torch.int32),
+        valid_len=torch.empty(0, dtype=torch.int32),
+    )
     with pytest.raises(ValueError, match="128-token window"):
         forward(**args)
 

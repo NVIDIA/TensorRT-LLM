@@ -990,6 +990,7 @@ def test_dspark_forward_publishes_execution_not_confidence_flag(return_confidenc
     from tensorrt_llm._torch.speculative.dspark import DSv4DSparkWorker
 
     worker = DSv4DSparkWorker.__new__(DSv4DSparkWorker)
+    worker._draft_kv_manager = object()
     worker.spec_config = types.SimpleNamespace(max_draft_len=1)
     worker.return_confidence = return_confidence
     worker.guided_decoder = None

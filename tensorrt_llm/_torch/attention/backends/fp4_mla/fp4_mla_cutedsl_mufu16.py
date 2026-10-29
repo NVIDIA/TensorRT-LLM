@@ -5156,8 +5156,6 @@ def _runtime_t336_prepare_p_source(
         p_stage_base=p_stage_base,
         score_half_idx=score_half_idx,
     )
-    if is_compute_warp:
-        cute.nvgpu.cfence()
     owned_psf_word, prequant_row_sum = _finalize_p4_n256_score_half_psf_source(
         sPSF,
         group_max_values,
@@ -5609,7 +5607,6 @@ def _finish_pipelined_score_loads(
         tidx,
         producer_warp_base,
     )
-    cute.nvgpu.cfence()
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     if prims.elect_sync():
         _arrive_smem_p4_mapped_leader_mbar(
@@ -5747,7 +5744,6 @@ def _finalize_pipelined_tile(
         has_previous_tile,
     )
     if is_compute_warp:
-        cute.nvgpu.cfence()
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
     _store_prepacked_p4_n256_score_half_to_direct_a(
@@ -5759,8 +5755,6 @@ def _finalize_pipelined_tile(
         p_stage_base=p_stage_base,
         score_half_idx=score_half_idx,
     )
-    if is_compute_warp:
-        cute.nvgpu.cfence()
     owned_psf_word, row_sum = _finalize_p4_n256_score_half_psf_source(
         sPSF,
         group_max_values,

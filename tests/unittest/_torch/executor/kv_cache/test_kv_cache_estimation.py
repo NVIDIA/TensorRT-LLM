@@ -1545,7 +1545,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     ):
         creator = KvCacheCreator(
             model_engine=model_engine,
-            mapping=Mock(cp_config={}),
+            mapping=Mapping(),
             net_max_seq_len=max_seq_len,
             kv_connector_manager=None,
             max_num_tokens=256,
@@ -2098,6 +2098,8 @@ def test_standalone_draft_kv_dtype_follows_the_drafter_attention(
     creator._mapping = SimpleNamespace(
         has_cp_helix=lambda: False, enable_attention_dp=True, tp_size=16
     )
+
+    creator._draft_config.mapping = creator._mapping
 
     kwargs = creator._get_unified_draft_cache_kwargs()
 
