@@ -40,6 +40,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
         GPU_LEVEL,
         AttentionLayerConfig,
+        AttentionReusePolicy,
         Batch,
         BatchDesc,
         BufferConfig,
@@ -99,6 +100,7 @@ else:
         DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
         GPU_LEVEL,
         AttentionLayerConfig,
+        AttentionReusePolicy,
         Batch,
         BatchDesc,
         BufferConfig,
@@ -693,6 +695,16 @@ class TestRetention(TestKVCacheManagerV2):
         for level in (-1, 1):
             with self.subTest(level=level), self.assertRaises(IndexError):
                 self.manager.prefetch_reuse(ReuseScope(), [1, 2, 3, 4], CacheLevel(level))
+
+    def test_prefetch_without_a_live_kv_cache(self) -> None:
+        """Prefetch works while no KV cache holds the manager, as on a server's first step."""
+        self._prepare_retention(host_quota=2 << 20)
+        tokens = list(range(8))
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
+        self._cache(tokens)
+        self._close_caches()
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, CacheLevel(1)))
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
 
     def test_offload_reload_preserves_priority_and_partial_reuse(self) -> None:
         self._prepare_retention(host_quota=2 << 20)
@@ -1689,6 +1701,54 @@ class TestNoBatching(TestKVCacheManagerV2):
         )
         with self.assertRaisesRegex(RuntimeError, "already been dropped"):
             long_handle.drop()
+
+    def test_planned_drop_handle_skips_private_swa(self) -> None:
+        """A private SWA life cycle commits no pages, so it must not void the drop plan."""
+        tokens_per_block = 8
+        window_size = 8
+
+        def layer(layer_id: int, window: int | None, policy: AttentionReusePolicy):
+            return AttentionLayerConfig(
+                layer_id=LayerId(layer_id),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=1024),
+                    BufferConfig(role=Role.VALUE, size=1024),
+                ],
+                sliding_window_size=window,
+                reuse_policy=policy,
+            )
+
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=tokens_per_block,
+                cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+                layers=[
+                    layer(0, window_size, AttentionReusePolicy.REQUIRED),
+                    layer(1, None, AttentionReusePolicy.REQUIRED),
+                    layer(2, window_size, AttentionReusePolicy.PRIVATE),
+                ],
+            )
+        )
+        tokens = [self.next_token() for _ in range(tokens_per_block * 3)]
+        kv_cache = self.manager.create_kv_cache(None, tokens)
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            self.assertTrue(kv_cache.resume(stream))
+            self.assertTrue(kv_cache.resize(len(tokens)))
+            kv_cache.commit(tokens)
+            kv_cache.stop_committing()
+            drop_handle = kv_cache.plan_committed_block_drop()
+            self.assertIsNotNone(drop_handle)
+        _ = stream_holder.take_finish_event()
+        kv_cache.close()
+        assert drop_handle is not None
+        self.assertEqual(self.manager.probe_reuse(None, tokens), len(tokens))
+
+        # Dropping the plan releases the required SWA window; the private layer
+        # never had committed pages, and the full-attention blocks before the
+        # window stay reusable.
+        drop_handle.drop()
+        self.assertEqual(self.manager.probe_reuse(None, tokens), len(tokens) - window_size)
 
     def test_int32_ndarray_ingest_matches_list(self) -> None:
         """Zero-copy int32-ndarray ingest must hash identically to the list path.
