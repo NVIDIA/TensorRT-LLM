@@ -374,11 +374,11 @@ class TransferStatus
 {
 public:
     virtual ~TransferStatus() = default;
-    /// NIXL statuses return true only on success. Bounce statuses return true on success and on a
-    /// failure proven never to write the destination again (a source read by an orphaned local
-    /// gather may still be in flight); a failure without that proof stays false. Backends that
-    /// cannot distinguish failure from completion (mooncake) return true on any terminal state —
-    /// use wait() for the outcome.
+    /// True once the transfer is over and will not read its source or write its destination memory
+    /// again. After a failure it may turn true when the result is set or later, or never if the backend
+    /// cannot prove it. It does not turn back to false, except that a NIXL status reads false after release() or
+    /// once its agent is gone. Mooncake cannot tell failure from completion and returns true on any
+    /// terminal state. The outcome comes from wait().
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
 

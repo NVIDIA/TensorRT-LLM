@@ -50,6 +50,16 @@ add_tllm_gtest(
   tllm::executor_bounce_core
   LABELS
   "unit;executor;bounce;host")
+add_tllm_gtest(
+  bounceFailedRequestTest
+  OWNER
+  executor
+  SOURCES
+  bounceFailedRequestTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_core
+  LABELS
+  "unit;executor;bounce;host")
 # Header-only: knob resolution (agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_*
 # env > default), byte-size suffixes, garbage fallback, derived-timeout
 # invariants.
@@ -141,6 +151,7 @@ if(NIXL_ROOT)
         ${BOUNCE_DIR}/BuddyAllocator.cpp
         ${BOUNCE_DIR}/CreditScheduler.cpp
         ${BOUNCE_DIR}/BounceMessage.cpp
+        ${BOUNCE_DIR}/BounceResult.cpp
         ${BOUNCE_DIR}/BounceArena.cpp
         ${BOUNCE_DIR}/ExecPool.cpp
         ${BOUNCE_DIR}/GatherScatterKernel.cu

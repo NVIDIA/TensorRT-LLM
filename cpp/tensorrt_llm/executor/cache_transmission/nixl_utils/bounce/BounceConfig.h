@@ -166,9 +166,9 @@ struct BounceConfig
     int requestTimeoutMs{30000}; // request_timeout_ms; must be > 0 — the whole failure model
                                  // (abandoned-flow resolution, receiver lease, quarantine) hangs off
                                  // this timer, so applyParam rejects 0 (negatives already fail the
-                                 // strict unsigned parse) and keeps the current value. It also bounds
-                                 // how long a failed request waits for the receiver's answers (after
-                                 // the failure, and again after each answer) before resolving in-doubt.
+                                 // strict unsigned parse) and keeps the current value, and BounceSender
+                                 // rejects a non-positive one. It also bounds a failed request's answer
+                                 // wait (see FailedRequest).
     // Receiver-side lease on granted regions — DERIVED in deriveDependentTimeouts() as
     // 2 x requestTimeoutMs, not an independent knob (tests may still set the field directly). A
     // dead sender emits neither DATA nor a cancel, which is unobservable through the protocol

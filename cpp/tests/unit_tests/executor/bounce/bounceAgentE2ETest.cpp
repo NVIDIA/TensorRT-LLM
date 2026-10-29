@@ -232,7 +232,14 @@ TEST(BounceAgentE2E, FailureWithNothingSentIsCompleted)
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(a->getBounceSubmitCount(), 1u) << "the request must take the bounce path";
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kFAILURE);
-    EXPECT_TRUE(status->isCompleted()) << "nothing was sent, so the destination is quiescent";
+    // An eager gather the failure orphaned may still be reading the source; it ends shortly after.
+    auto const completeBy = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!status->isCompleted() && std::chrono::steady_clock::now() < completeBy)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(status->isCompleted())
+        << "nothing was sent, so the request stops accessing memory once its gathers end";
     auto const detail = status->getLastStatusStr();
     EXPECT_NE(detail.find("no GRANT/ACK progress"), std::string::npos) << detail;
     EXPECT_EQ(detail.find("not proven quiescent"), std::string::npos) << detail;

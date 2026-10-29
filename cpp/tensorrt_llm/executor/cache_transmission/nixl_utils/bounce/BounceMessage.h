@@ -97,10 +97,11 @@ static_assert(sizeof(BounceCreditEntry) == 24, "BounceCreditEntry must be 24 byt
 static_assert(sizeof(BounceScatterRun) == 36, "BounceScatterRun must be 36 bytes");
 
 inline constexpr std::uint32_t kBounceMagic = 0x424E4332U; // 'B''N''C''2'
-// v2: DATA scatter entries became strided RUNS (BounceScatterRun). The out-of-band capability
-// handshake checks this version before bounce is selected; decodeHeader also rejects a mismatched
-// control message defensively.
-inline constexpr std::uint16_t kBounceVersion = 2U;
+// v2: DATA scatter entries became strided RUNS (BounceScatterRun). v3: a chunk NACK, like an ACK,
+// follows the chunk's last write into the destination, and a refused DATA is NACKed; the sender relies
+// on both. The out-of-band capability handshake checks this version before bounce is selected;
+// decodeHeader also rejects a mismatched control message defensively.
+inline constexpr std::uint16_t kBounceVersion = 3U;
 
 // ---- encode (each returns a self-contained blob: header + payload) ----
 /// WANT carries the per-chunk byte sizes the sender will write (the receiver allocates a region of
@@ -122,10 +123,11 @@ inline constexpr std::uint16_t kBounceVersion = 2U;
 [[nodiscard]] std::string encodeData(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint32_t numChunks,
     std::uint64_t regionHandle, std::vector<BounceScatterRun> const& entries);
 [[nodiscard]] std::string encodeAck(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle);
-/// NACK: the receiver KNOWS this chunk/request cannot complete (scatter failure, ungrantable chunk
-/// size, plan overflow), so the sender fails it now instead of waiting out requestTimeoutMs.
-/// Header-only like ACK. The sender fails the WHOLE request on any NACK, so chunkIdx/regionHandle are
-/// informational only (0 when the receiver has no chunk context, e.g. a rejected WANT).
+/// NACK: the receiver KNOWS this chunk/request cannot complete (scatter failure, a DATA it refused,
+/// ungrantable chunk size, plan overflow), so the sender fails it now instead of waiting out
+/// requestTimeoutMs. Header-only like ACK. A chunk NACK names (chunkIdx, regionHandle) like an ACK and
+/// promises, like an ACK, that the chunk will not write the destination again. A request-level NACK (a
+/// rejected WANT) carries 0/0; it precedes every grant, so it matches no sent chunk.
 [[nodiscard]] std::string encodeNack(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle);
 
 // ---- decode ----
