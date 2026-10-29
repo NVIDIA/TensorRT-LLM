@@ -129,8 +129,10 @@ def _prefix_programs(
                 n_ok = offs_n < tok_hi
                 page = tl.load(pidx_ptr + p0 + offs_n // TPB, mask=n_ok, other=0).to(tl.int64)
                 base = pool_ptr + page * pool_ps + h * pool_hs + (offs_n % TPB) * pool_ss
-                k = tl.load(base[:, None] + dims[None, :], mask=n_ok[:, None], other=0.0)
-                v = tl.load(base[:, None] + pool_kvs + dims[None, :], mask=n_ok[:, None], other=0.0)
+                k = tl.load(base[:, None] + dims[None, :], mask=n_ok[:, None], other=0.0,
+                             eviction_policy="evict_last")
+                v = tl.load(base[:, None] + pool_kvs + dims[None, :], mask=n_ok[:, None], other=0.0,
+                             eviction_policy="evict_last")
                 scores = tl.dot(q, tl.trans(k)) * sm_scale_log2
                 scores = tl.where(n_ok[None, :], scores, _NEG)
                 m_new = tl.maximum(m_i, tl.max(scores, 1))
@@ -724,6 +726,7 @@ def fused_sampling_attention(
     overlap: bool = True,
     tail_num_warps: int = 2,
     tail_num_stages: int = 2,
+    sm90_tune: bool = True,  # apply SM90-specific tuning (evict_last already in kernel)
     ctx: Optional[CtxPrefix] = None,
 ) -> None:
     """One layer: persist the step's K/V, attend prefix + tail, write ``out`` (batch order).
@@ -761,6 +764,13 @@ def fused_sampling_attention(
     num_kv_heads = k.shape[1]
     gs = num_heads // num_kv_heads
     tokens_per_block = pool.shape[3]
+    # SM90 (H100) tuning: evict_last is already in the kernel; bump warps/stages.
+    if sm90_tune and q.device.type == "cuda":
+        import torch
+        cc = torch.cuda.get_device_capability(q.device)
+        if cc == (9, 0):  # SM90
+            num_warps = max(num_warps, 8)
+            num_stages = max(num_stages, 3)
     assert ntok % q_len == 0 and out.stride(2) == 1 and pool.stride(4) == 1
     assert q_len * gs <= MAX_QUERIES_PER_TILE and q_len <= 16
     for tensor in (q, k, v):

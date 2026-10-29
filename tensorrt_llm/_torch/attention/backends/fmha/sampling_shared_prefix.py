@@ -932,6 +932,8 @@ def _graph_float_workspace_bytes(
     prefix = _prefill_split_bytes(key, rows * key.q_len, groups, num_sms)
     if key.q_len > 1:
         # Speculative decoding: the tail is a causal prefill with q_len queries per row.
+        # Use the original formula but note that in practice FlashInfer's SM90 kernel
+        # needs this full workspace (reducing it below ~128MB causes internal OOB on SM90).
         tail = _prefill_split_bytes(key, rows * key.q_len, rows, num_sms)
     elif key.num_heads != key.num_kv_heads:
         tail = _prefill_split_bytes(key, rows, rows, num_sms)
@@ -2000,12 +2002,12 @@ def _graph_wrappers(
             "HND",
             backend=_backend_from_env(),
             use_cuda_graph=True,
-            qo_indptr_buf=torch.zeros((groups + 1,), dtype=torch.int32, device=device),
-            paged_kv_indptr_buf=torch.zeros((groups + 1,), dtype=torch.int32, device=device),
+            qo_indptr_buf=torch.zeros((groups + 1 + 1024,), dtype=torch.int32, device=device),
+            paged_kv_indptr_buf=torch.zeros((groups + 1 + 1024,), dtype=torch.int32, device=device),
             paged_kv_indices_buf=torch.zeros(
-                (graph.prefix_capacity,), dtype=torch.int32, device=device
+                (graph.prefix_capacity + 64,), dtype=torch.int32, device=device
             ),
-            paged_kv_last_page_len_buf=torch.zeros((groups,), dtype=torch.int32, device=device),
+            paged_kv_last_page_len_buf=torch.zeros((groups + 1024,), dtype=torch.int32, device=device),
         )
         if key.q_len > 1:
             tail = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -2013,12 +2015,12 @@ def _graph_wrappers(
                 "HND",
                 backend=_backend_from_env(),
                 use_cuda_graph=True,
-                qo_indptr_buf=torch.zeros((graph.rows + 1,), dtype=torch.int32, device=device),
+                qo_indptr_buf=torch.zeros((graph.rows + 1 + 1024,), dtype=torch.int32, device=device),
                 paged_kv_indptr_buf=torch.zeros(
-                    (graph.rows + 1,), dtype=torch.int32, device=device
+                    (graph.rows + 1 + 1024,), dtype=torch.int32, device=device
                 ),
                 paged_kv_indices_buf=torch.zeros(
-                    (graph.tail_capacity,), dtype=torch.int32, device=device
+                    (graph.tail_capacity + 64,), dtype=torch.int32, device=device
                 ),
                 paged_kv_last_page_len_buf=graph.tail_last_page_len,
             )
@@ -2029,10 +2031,10 @@ def _graph_wrappers(
                 use_cuda_graph=True,
                 use_tensor_cores=key.num_heads != key.num_kv_heads,
                 paged_kv_indptr_buffer=torch.zeros(
-                    (graph.rows + 1,), dtype=torch.int32, device=device
+                    (graph.rows + 1 + 1024,), dtype=torch.int32, device=device
                 ),
                 paged_kv_indices_buffer=torch.zeros(
-                    (graph.tail_capacity,), dtype=torch.int32, device=device
+                    (graph.tail_capacity + 64,), dtype=torch.int32, device=device
                 ),
                 paged_kv_last_page_len_buffer=graph.tail_last_page_len,
             )
@@ -2402,6 +2404,14 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         fused = graph is not None and fused_supported(
             num_heads, num_kv_heads, head_dim, qkv.dtype, q_len
         )
+        # SM90 (H100): FlashInfer BatchPrefillWithPagedKVCacheWrapper crashes for
+        # spec-decode tail (q_len>1) at large batch sizes; force Triton fused path for
+        # spec steps on SM90 regardless of TLLM_SAMPLING_SHARED_PREFIX_FUSED setting.
+        if not fused and q_len > 1 and graph is not None:
+            import torch as _torch
+            cc = _torch.cuda.get_device_capability(qkv.device)
+            if cc == (9, 0):
+                fused = True
         if graph is not None:
             if fused:
                 prefix_wrapper = tail_wrapper = None
