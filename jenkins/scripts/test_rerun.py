@@ -54,7 +54,6 @@ RERUN_POLICY_KEYS = {
     "rerun_once_max_duration_s": _is_seconds,
     "max_failed_tests": lambda value: value is None or _is_count(value),
     "rerun_timeout_tests": lambda value: isinstance(value, bool),
-    "rerun_timeout_max_tests": _is_count,
 }
 
 
@@ -225,8 +224,7 @@ def generate_rerun_tests_list(outdir,
     #    - If longer and no known failure signatures: add to rerun_0.txt
     # Part 2. Tests that are unfinished (still running when the pytest process
     #    ended, e.g. killed by pytest-timeout's thread method, which CI uses):
-    #    - If the policy reruns timed-out tests: the first rerun_timeout_max_tests
-    #      in test list order go to rerun_1.txt, the rest to rerun_0.txt
+    #    - If the policy reruns timed-out tests: add to rerun_1.txt
     #    - Otherwise: add to rerun_0.txt
     # Part 3. Tests that are not run
     #    add to rerun_1.txt (will rerun 1 time)
@@ -275,7 +273,6 @@ def generate_rerun_tests_list(outdir,
     twice_max = policy["rerun_twice_max_duration_s"]
     once_max = policy["rerun_once_max_duration_s"]
     rerun_timeout_tests = policy["rerun_timeout_tests"]
-    max_timeout = policy["rerun_timeout_max_tests"]
     # (test name, rerun times, reason), in the order the lists are written.
     decisions = []
 
@@ -301,17 +298,12 @@ def generate_rerun_tests_list(outdir,
         # Part 2: process unfinished tests
         elif test in unfinished_tests:
             unfinished_count += 1
-            if not rerun_timeout_tests:
-                decisions.append((test, 0, "it terminated unexpectedly"))
-            elif unfinished_count <= max_timeout:
+            if rerun_timeout_tests:
                 decisions.append(
                     (test, 1, "it terminated unexpectedly and this stage "
                      "reruns timed-out tests"))
             else:
-                decisions.append(
-                    (test, 0, "it terminated unexpectedly and "
-                     f"rerun_timeout_max_tests ({max_timeout}) timed-out "
-                     "tests are already rerun"))
+                decisions.append((test, 0, "it terminated unexpectedly"))
         # Part 3: process tests that did not run
         else:
             decisions.append((test, 1, "it did not run"))

@@ -25,9 +25,6 @@
 #                               when the pytest process ended (CI runs pytest-timeout
 #                               with --timeout-method=thread, which ends the process
 #                               on a timeout). Each is rerun once.
-#   rerun_timeout_max_tests     With rerun_timeout_tests, rerun at most this many
-#                               timed-out tests, in test list order; the rest are
-#                               not rerun.
 #
 # Tests that never started because an earlier test ended the pytest process are
 # rerun once whenever rerun_enabled is true.
@@ -38,7 +35,6 @@ default:
   rerun_once_max_duration_s: 600
   max_failed_tests: null
   rerun_timeout_tests: false
-  rerun_timeout_max_tests: 1
 
 stages:
   # TEMPORARY (rerun policy validation): exercises this rule with deliberate
@@ -52,7 +48,6 @@ stages:
     rerun_twice_max_duration_s: 60
     rerun_once_max_duration_s: 120
     rerun_timeout_tests: true
-    rerun_timeout_max_tests: 1
 # Example:
 # stages:
 #   - match: "*-PerfSanity-*"
@@ -61,4 +56,3 @@ stages:
 #     max_failed_tests: 10
 #   - match: "GB200-4_GPUs-PyTorch-1"
 #     rerun_timeout_tests: true
-#     rerun_timeout_max_tests: 2
