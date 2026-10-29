@@ -21,7 +21,7 @@ indexer shape, page format, verify width, selection engine and
 - exactly one generation request (the in-kernel schedule and the exchange
   slots are per request);
 - a tensor-parallel group of a GPU-verified size, without attention DP;
-- the compiled ``glm_moe_dsa_cross_rank_topk`` op and a local logits width it accepts.
+- the compiled ``cross_rank_topk`` op and a local logits width it accepts.
 
 The decision of a forward (``decide_cp_uniform``) reads only inputs that are
 identical on all ranks of the group for the same forward, so the ranks make
@@ -54,7 +54,7 @@ def decide_cp(
 
     Args:
         world_size: Tensor-parallel group size of the GEN ranks.
-        op_available: Whether ``torch.ops.trtllm.glm_moe_dsa_cross_rank_topk`` exists.
+        op_available: Whether the kernel constants are known (a positive group size).
         local_capacity: Local logits columns the group needs at the indexer
             ``max_seq_len`` (largest per-rank page share).
         max_local_capacity: Largest local width the compiled kernel accepts.
@@ -79,7 +79,7 @@ def decide_cp(
             False, f"tensor-parallel size {world_size} not in {SUPPORTED_WORLD_SIZES}"
         )
     if not op_available:
-        return policy.Decision(False, "glm_moe_dsa_cross_rank_topk op is not built")
+        return policy.Decision(False, "cross_rank_topk op is not built")
     if local_capacity <= 0 or local_capacity > max_local_capacity:
         return policy.Decision(
             False, f"local logits width {local_capacity} > kernel limit {max_local_capacity}"
@@ -102,7 +102,7 @@ def rank_local_reason(
     workspace creation, which keeps every rank native when any rank has one.
 
     Args:
-        op_available: Whether ``torch.ops.trtllm.glm_moe_dsa_cross_rank_topk`` exists.
+        op_available: Whether the kernel constants are known (a positive group size).
         local_capacity: Local logits columns the group needs (rank-uniform).
         max_local_capacity: Largest local width this rank's compiled kernel
             accepts (derived from the device's shared memory).
@@ -114,7 +114,7 @@ def rank_local_reason(
     if not cute_dsl_available:
         return "CUTLASS DSL unavailable"
     if not op_available:
-        return "glm_moe_dsa_cross_rank_topk op is not built"
+        return "cross_rank_topk op is not built"
     if local_capacity > max_local_capacity:
         return f"local logits width {local_capacity} > kernel limit {max_local_capacity}"
     return ""

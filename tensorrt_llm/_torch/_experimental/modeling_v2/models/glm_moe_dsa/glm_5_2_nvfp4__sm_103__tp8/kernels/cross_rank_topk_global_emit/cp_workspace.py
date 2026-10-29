@@ -17,7 +17,7 @@
 cross_rank_topk_global_emit owns one multicast workspace per tensor-parallel group, allocated with
 the native ``McastGPUBuffer`` and used by nothing else (cross_rank_topk's and
 cross_rank_topk_cluster_merge's workspaces are separate ones). Its layout and Lamport protocol are
-cross_rank_topk_cluster_merge's, defined by the ``glm_moe_dsa_cross_rank_topk_global_emit`` kernel
+cross_rank_topk_cluster_merge's, defined by the ``cross_rank_topk_global_emit`` kernel
 (``crossRankTopkGlobalEmit.h``): every 32-bit word starts as ``0xFFFFFFFF`` and the kernel rotates
 three buffers with per-CTA epoch words held in a separate per-rank state tensor.
 
@@ -39,7 +39,9 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-# Indices of torch.ops.trtllm.glm_moe_dsa_cross_rank_topk_global_emit_workspace_info().
+from ... import native_ops
+
+# Indices of native_ops.cross_rank_topk_global_emit_workspace_info().
 INFO_WORKSPACE_WORDS = 0
 INFO_TOPK = 1
 INFO_MAX_RANKS = 2
@@ -95,22 +97,16 @@ _FAILED: Dict[Tuple, str] = {}
 _OP_INFO: Dict[Tuple[int, int], list] = {}
 
 
-def op_info(world_size: int = 8) -> Optional[list]:
-    """Constants of the compiled kernel for a group size, or None when the op is not built.
+def op_info(world_size: int = 8) -> list:
+    """Constants of the compiled kernel for a group size.
 
     Queried once per group size and current device (the region calls it on
-    every eager forward); a missing op is not cached, so an op loaded later
-    is seen.
+    every eager forward).
     """
     key = (world_size, torch.cuda.current_device() if torch.cuda.is_available() else -1)
     info = _OP_INFO.get(key)
     if info is None:
-        try:
-            info = list(
-                torch.ops.trtllm.glm_moe_dsa_cross_rank_topk_global_emit_workspace_info(world_size)
-            )
-        except (AttributeError, RuntimeError):
-            return None
+        info = list(native_ops.cross_rank_topk_global_emit_workspace_info(world_size))
         _OP_INFO[key] = info
     return list(info)
 
@@ -118,7 +114,7 @@ def op_info(world_size: int = 8) -> Optional[list]:
 def cluster_reason(info: Optional[list]) -> str:
     """Why this device cannot keep every row's cluster resident ("" when it can)."""
     if info is None or len(info) <= INFO_MAX_ACTIVE_CLUSTERS:
-        return "glm_moe_dsa_cross_rank_topk_global_emit op is not built"
+        return "cross_rank_topk_global_emit op is not built"
     clusters, rows = info[INFO_MAX_ACTIVE_CLUSTERS], info[INFO_MAX_ROWS]
     if clusters < rows:
         return f"{clusters} co-resident 8-CTA clusters < {rows} rows"
@@ -185,7 +181,7 @@ def get_workspace(
 def _local_capability_reason(mapping, info, prepare) -> str:
     """This rank's op, group size, cluster residency and preparation check ("" when capable)."""
     if info is None:
-        return "glm_moe_dsa_cross_rank_topk_global_emit op is not built"
+        return "cross_rank_topk_global_emit op is not built"
     if mapping.tp_size > info[INFO_MAX_RANKS]:
         return f"tp_size {mapping.tp_size} > {info[INFO_MAX_RANKS]}"
     reason = cluster_reason(info)

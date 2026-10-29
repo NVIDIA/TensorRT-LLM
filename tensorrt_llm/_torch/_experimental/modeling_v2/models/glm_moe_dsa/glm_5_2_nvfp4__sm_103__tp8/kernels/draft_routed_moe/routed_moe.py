@@ -17,7 +17,7 @@
 The MTP layer of the GLM-5.2 NVFP4 checkpoint is unquantized, so its routed
 experts run FlashInfer's TRT-LLM-Gen BF16 MoE (``FlashinferTrtllmGenBf16Impl``,
 ``trtllm_bf16_moe``). ``routed_output`` replaces that call with
-``torch.ops.trtllm.glm_moe_dsa_draft_routed_moe`` on the leaf's own weight buffers (no
+``native_ops.draft_routed_moe`` on the leaf's own weight buffers (no
 copy, no re-layout) and returns the same finalized ``[R, 6144]`` BF16 tensor,
 bit for bit:
 
@@ -61,6 +61,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from ... import native_ops
+
 HIDDEN = 6144
 INTER = 256
 NUM_EXPERTS = 256
@@ -102,7 +104,6 @@ FLAG_OPTIONS = (
 FC1_RING_CHUNKS_DEEP = 20
 FC1_DYNAMIC_SMEM_BUDGET = 220 * 1024
 
-OP_NAME = "glm_moe_dsa_draft_routed_moe"
 
 # Launch configuration (``launch_config``): (ctas, warps) of each kernel and extra flag bits (2: FC2 weights prefetched
 # into L2 by the FC1 warps, 4: early dependent trigger, 8: FC1 tile pairs, 16: FC2 expert pairs, 32: deeper weight
@@ -132,10 +133,6 @@ DEFAULT_FLAGS = (
     | FLAG_EARLY_TRIGGER_TRIPLES
     | FLAG_FC1_EVICT_FIRST,
 )
-
-
-def op_available() -> bool:
-    return hasattr(torch.ops.trtllm, OP_NAME)
 
 
 def _pdl_enabled() -> bool:
@@ -323,8 +320,6 @@ def eligibility(
         return False, f"logits {tuple(router_logits.shape)} {router_logits.dtype}"
     if torch.compiler.is_compiling():
         return False, "torch.compile tracing"
-    if not op_available():
-        return False, f"torch.ops.trtllm.{OP_NAME} is not built"
     owner, reason = resolve_owner(module)
     if owner is None:
         return False, reason
@@ -365,7 +360,7 @@ def run(owner, routing_bias, x, router_logits, debug_fc2=None, timeline=None) ->
     if routing_bias.data_ptr() % 16 != 0:
         routing_bias = routing_bias.clone(memory_format=torch.contiguous_format)
     rm = owner.routing_method
-    return getattr(torch.ops.trtllm, OP_NAME)(
+    return native_ops.draft_routed_moe(
         x,
         router_logits,
         routing_bias,

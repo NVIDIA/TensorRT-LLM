@@ -15,13 +15,13 @@
 """rope_kv_append: fused per-layer MLA RoPE / FP8 query / latent KV append, DSA indexer
 K-cache scatter, and top-k id -> global KV index bridge.
 
-Two CUDA ops back this package (``cpp/tensorrt_llm/kernels/glmMoeDsa/ropeKvAppend.cu``):
+Two CUDA ops back this package (``glm_5_2_nvfp4__sm_103__tp8/csrc/ropeKvAppend.cu``):
 
-* ``trtllm::glm_moe_dsa_rope_kv_append`` writes exactly the bytes of the
+* ``native_ops.rope_kv_append`` writes exactly the bytes of the
   native ``trtllm::mla_rope_generation`` (FP8 MLA cache, absorption mode, no
   helix) and, when given the indexer inputs, of
   ``trtllm::indexer_k_cache_scatter_op`` in one launch.
-* ``trtllm::glm_moe_dsa_topk_index_bridge`` writes the values of
+* ``native_ops.topk_index_bridge`` writes the values of
   ``trtllm::convert_req_index_to_global`` (or its grouped variant) and the
   native top-k reuse copy in one launch.
 
@@ -41,7 +41,7 @@ import torch
 
 from tensorrt_llm._utils import get_sm_version
 
-from ... import dispatch
+from ... import dispatch, native_ops
 
 FEATURE_ID = "rope_kv_append"
 
@@ -277,7 +277,7 @@ def mla_rope_generation(
                 indexer_k.slot_mapping_scale,
             ]
             idx_tokens = indexer_k.num_tokens
-    torch.ops.trtllm.glm_moe_dsa_rope_kv_append(
+    native_ops.rope_kv_append(
         fused_q,
         q_pe,
         latent_cache,
@@ -385,7 +385,7 @@ def topk_bridge(
     tokens_per_block = metadata.kv_cache_manager.tokens_per_block
     block_table = metadata.block_table[metadata.num_contexts : metadata.num_seqs]
     req_idx = metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens]
-    return torch.ops.trtllm.glm_moe_dsa_topk_index_bridge(
+    return native_ops.topk_index_bridge(
         topk,
         num_rows,
         req_idx,

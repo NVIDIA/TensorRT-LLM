@@ -26,22 +26,22 @@ forks:
   inside the kernel instead (no native RMSNorm launch);
 * ``rope.mla_rope_generation``: rope_kv_append's generation rope in which each thread
   triggers the dependents right after the global reads of its work item
-  (``trtllm::glm_moe_dsa_indexer_layer_rope_kv_append``);
+  (``native_ops.indexer_layer_rope_kv_append``);
 * ``cp_indexer_decode.try_cp_indexer_decode``: the cross_rank_topk / cross_rank_topk_cluster_merge
   GEN indexer region with cross_rank_topk's CP logits kernel waiting for its programmatic primary at
   entry and launched with PDL (``fp8_paged_mqa_logits_cp``).
 
 Registered entry points (``dispatch.get_impl("indexer_layer_front", name)``): ``dsa_proj``,
-``rope_available``, ``mla_rope_generation``, ``cp_indexer_decode``.
+``mla_rope_generation``, ``cp_indexer_decode``.
 """
 
+from ... import native_ops
 from ...dispatch import register
 from .cp_indexer_decode import try_cp_indexer_decode
 from .query_proj import IndexerFrontConfig, IndexerFrontQueryProjection, dsa_proj
-from .rope import mla_rope_generation, rope_available
+from .rope import mla_rope_generation
 
 register("indexer_layer_front", "dsa_proj", dsa_proj)
-register("indexer_layer_front", "rope_available", rope_available)
 register("indexer_layer_front", "mla_rope_generation", mla_rope_generation)
 register("indexer_layer_front", "cp_indexer_decode", try_cp_indexer_decode)
 
@@ -50,6 +50,5 @@ __all__ = [
     "IndexerFrontQueryProjection",
     "dsa_proj",
     "mla_rope_generation",
-    "rope_available",
     "try_cp_indexer_decode",
 ]

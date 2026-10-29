@@ -231,15 +231,8 @@ def forward_absorption_generation(
                     # dependents after its last read (the same bytes).
                     rope_owner = "rope_kv_append"
                     if dispatch.is_enabled("indexer_layer_front"):
-                        front_rope = dispatch.get_impl("indexer_layer_front", "rope_available")()
-                        dispatch.log_capability(
-                            "indexer_layer_front",
-                            "rope",
-                            front_rope,
-                            "" if front_rope else "indexer_layer_front rope op not loaded",
-                        )
-                        if front_rope:
-                            rope_owner = "indexer_layer_front"
+                        dispatch.log_capability("indexer_layer_front", "rope", True, "")
+                        rope_owner = "indexer_layer_front"
                     dispatch.get_impl(rope_owner, "mla_rope_generation")(
                         self.mqa,
                         fused_q,

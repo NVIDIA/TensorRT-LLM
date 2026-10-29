@@ -175,7 +175,7 @@ def predict_copy(indexer, metadata, num_gen_tokens: int) -> Optional[rope_ops.Br
 def copy_reason(copy: Optional[rope_ops.BridgeCopy], rows: int, top_k: int) -> str:
     """Why the cross_rank_topk_global_emit op cannot perform ``copy`` for ``rows`` top-k rows ("" when it can).
 
-    These are the checks of ``trtllm::glm_moe_dsa_topk_index_bridge``; a copy that fails them
+    These are the checks of ``native_ops.topk_index_bridge``; a copy that fails them
     is left to rope_kv_append's path, which reports it.
     """
     if copy is None or copy.rows <= 0:

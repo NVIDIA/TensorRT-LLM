@@ -32,7 +32,6 @@ add_subdirectory(fusedGatedRMSNormQuant)
 add_subdirectory(mamba2MTPSSMCache)
 add_subdirectory(kdaDecode)
 add_subdirectory(kimiK3AttnRes)
-add_subdirectory(glmMoeDsa)
 add_subdirectory(mhcKernels)
 add_subdirectory(compressorKernels)
 add_subdirectory(fusedSampling)
@@ -79,15 +78,6 @@ list(FILTER SRC_CPP EXCLUDE REGEX "kdaDecode/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "kdaDecode/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "kimiK3AttnRes/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "kimiK3AttnRes/.*")
-# The GLM-5.2 GB300 target's kernels build in glmMoeDsa/'s own library; the
-# other glmMoeDsa/ kernels stay in this glob.
-list(
-  FILTER
-  SRC_CU
-  EXCLUDE
-  REGEX
-  "glmMoeDsa/(crossRankTopk|crossRankTopkClusterMerge|crossRankTopkGlobalEmit|denseMlp|draftLiveRowHop|draftRoutedMoe|draftTail|indexerLayerRopeKvAppend|postAttentionHop|postAttentionHopFromPartials|postAttentionHopRouting|ropeKvAppend|sparseMlaDecode)\\.cu$"
-)
 list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")

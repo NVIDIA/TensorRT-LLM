@@ -173,10 +173,8 @@ add_th_common_family(
   mhcOp.cpp
   compressorOp.cpp)
 
-add_th_common_family(th_common_glm_moe_dsa)
-
 # GLM bindings keep their existing family targets; source lists live with the
-# model. The GLM-5.2 GB300 target's torch ops go to th_common_glm_moe_dsa.
+# model.
 add_subdirectory(glmMoeDsa)
 
 add_library(
@@ -187,8 +185,7 @@ add_library(
   $<TARGET_OBJECTS:th_common_distributed>
   $<TARGET_OBJECTS:th_common_sequence>
   $<TARGET_OBJECTS:th_common_visual_gen>
-  $<TARGET_OBJECTS:th_common_decoding>
-  $<TARGET_OBJECTS:th_common_glm_moe_dsa>)
+  $<TARGET_OBJECTS:th_common_decoding>)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)

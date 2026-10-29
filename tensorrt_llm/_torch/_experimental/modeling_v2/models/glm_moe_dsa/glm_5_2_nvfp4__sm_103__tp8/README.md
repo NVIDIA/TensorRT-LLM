@@ -8,7 +8,9 @@ The fast paths were designed and tuned for this layout, and the target runs ever
 engine hook (`TP8_PATHS` in `modeling.py`). Their code lives in this directory: the plan
 (`dispatch.py`), the attention adoption (`attention.py`, `attention_forward.py`), the layer
 composition (`layers.py`), the speculative worker (`spec_worker.py`), the step-loop hooks
-(`runtime.py`), and one kernel package per fast path under `kernels/`.
+(`runtime.py`), and one kernel package per fast path under `kernels/`. The CUDA kernels and
+their torch ops are in `csrc/`, built into `libth_modeling_v2_glm_moe_dsa.so`; `__init__.py`
+loads them as `native_ops`, and `fake_ops.py` fakes every op.
 
 Other sm_103 layouts are served by other targets or by the built-in model: tep4 by
 `../glm_5_2_nvfp4__sm_103__tep4`, and everything else by the built-in implementation.

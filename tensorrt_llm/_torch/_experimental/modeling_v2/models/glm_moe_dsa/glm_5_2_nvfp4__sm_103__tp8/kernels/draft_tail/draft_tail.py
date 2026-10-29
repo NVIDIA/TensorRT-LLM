@@ -19,9 +19,9 @@ Replaces, for one MTP draft step, the native sequence
     logits = lm_head(hidden)                     # [R, V/tp] BF16, vocab shard
     tokens = greedy_sample_draft_with_tp_gather(logits)
 
-with ``trtllm::glm_moe_dsa_draft_tail`` (GEMV, rank-local maximum and a
+with ``native_ops.draft_tail`` (GEMV, rank-local maximum and a
 compact cross-rank exchange in one launch) or, in ``logits`` mode, the native
-GEMM followed by ``trtllm::glm_moe_dsa_draft_tail_from_logits``. Both return, on
+GEMM followed by ``native_ops.draft_tail_from_logits``. Both return, on
 every rank, the token id of the largest BF16 logit over all vocab shards,
 lowest global id on ties, NaN highest: the selection rule of the native
 gather. The two modes differ in whose BF16 logits they select from:
@@ -57,6 +57,7 @@ from typing import Callable, Dict, Optional
 
 import torch
 
+from ... import native_ops
 from ...dispatch import log_capability
 
 FEATURE = "draft_tail"
@@ -291,7 +292,7 @@ class DraftTailRunner:
         opts = self.options
         tokens, common = self._common_args(hidden.shape[0], vocab_offset, keys_out)
         scratch, keys, off, rank, size, mode, mc, uc, peers = common
-        torch.ops.trtllm.glm_moe_dsa_draft_tail(
+        native_ops.draft_tail(
             hidden,
             weight,
             tokens,
@@ -319,7 +320,7 @@ class DraftTailRunner:
     ) -> torch.Tensor:
         tokens, common = self._common_args(logits.shape[0], vocab_offset, keys_out)
         scratch, keys, off, rank, size, mode, mc, uc, peers = common
-        torch.ops.trtllm.glm_moe_dsa_draft_tail_from_logits(
+        native_ops.draft_tail_from_logits(
             logits,
             tokens,
             scratch,

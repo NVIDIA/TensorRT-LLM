@@ -59,7 +59,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._utils import get_sm_version
 
-from ... import dispatch
+from ... import dispatch, native_ops
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -76,11 +76,6 @@ TOP_K = 2048
 SUPPORTED_SM_VERSIONS = (100, 103)
 
 
-def op_available() -> bool:
-    """Whether the loaded TensorRT-LLM build registers the sparse_mla_decode kernel."""
-    return hasattr(torch.ops.trtllm, "glm_moe_dsa_sparse_mla_decode")
-
-
 _DEVICE_SUPPORT: Dict[int, bool] = {}
 
 # Dispatch accounting of this process (see the module docstring).
@@ -93,9 +88,8 @@ def device_supported(device_index: int) -> bool:
     """Whether the device can launch the 16-CTA cluster kernel (cached per device)."""
     if device_index not in _DEVICE_SUPPORT:
         _DEVICE_SUPPORT[device_index] = bool(
-            op_available()
-            and get_sm_version() in SUPPORTED_SM_VERSIONS
-            and torch.ops.trtllm.glm_moe_dsa_sparse_mla_decode_supported(device_index)
+            get_sm_version() in SUPPORTED_SM_VERSIONS
+            and native_ops.sparse_mla_decode_supported(device_index)
         )
     return _DEVICE_SUPPORT[device_index]
 
@@ -142,7 +136,7 @@ def sparse_mla_decode(
         seq_len_q: Query rows per sequence.
         out: ``[R, 8 * 512]`` BF16 output.
     """
-    torch.ops.trtllm.glm_moe_dsa_sparse_mla_decode(
+    native_ops.sparse_mla_decode(
         q_fp8, kv_pool_ptr, indices, bmm1_scale, bmm2_scale, seq_lens_kv, seq_len_q, out
     )
     return out
@@ -176,14 +170,8 @@ def static_ineligibility(attn: "TrtllmAttention") -> Optional[str]:
         return "chunked attention"
     if get_sm_version() not in SUPPORTED_SM_VERSIONS:
         return f"SM {get_sm_version()}"
-    # The layer is in the domain from here on: a missing kernel or a failed device
-    # query is an error of the selected candidate, not a per-rank fallback.
-    if not op_available():
-        raise RuntimeError(
-            "the plan enables sparse_mla_decode, but this "
-            "TensorRT-LLM build does not register "
-            "torch.ops.trtllm.glm_moe_dsa_sparse_mla_decode"
-        )
+    # The layer is in the domain from here on: a failed device query is an error of
+    # the selected candidate, not a per-rank fallback.
     device = torch.cuda.current_device()
     if not device_supported(device):
         raise RuntimeError(

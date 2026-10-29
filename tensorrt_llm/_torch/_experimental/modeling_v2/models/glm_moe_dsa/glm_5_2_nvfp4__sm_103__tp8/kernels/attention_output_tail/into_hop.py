@@ -33,7 +33,7 @@ rounding), with two changes for ``attention_output_into_hop``:
   caller passes an ``out`` with the hop's row count. The buffer index is read from the protocol state after
   ``griddepcontrol.wait``; the PDL successor is released only after that
   wait (producer side of the contract in
-  ``cpp/tensorrt_llm/kernels/glmMoeDsa/postAttentionHopFromPartials.h``).
+  ``glm_5_2_nvfp4__sm_103__tp8/csrc/postAttentionHopFromPartials.h``).
   When every CTA owns a multiple of 8 columns (e.g. 48 on 128 CTAs) the
   words are first gathered in shared memory and each row chunk of 8 columns
   goes out as one 16-byte multicast store, as the post_attention_hop's own publish does;

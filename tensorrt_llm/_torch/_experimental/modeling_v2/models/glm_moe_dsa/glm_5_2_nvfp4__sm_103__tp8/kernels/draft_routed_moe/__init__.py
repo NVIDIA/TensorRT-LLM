@@ -23,8 +23,8 @@ Entry point registered with ``dispatch``:
 """
 
 from ...dispatch import register
-from .routed_moe import eligibility, launch_config, op_available, routed_output
+from .routed_moe import eligibility, launch_config, routed_output
 
 register("draft_routed_moe", "routed_output", routed_output)
 
-__all__ = ["eligibility", "launch_config", "op_available", "routed_output"]
+__all__ = ["eligibility", "launch_config", "routed_output"]

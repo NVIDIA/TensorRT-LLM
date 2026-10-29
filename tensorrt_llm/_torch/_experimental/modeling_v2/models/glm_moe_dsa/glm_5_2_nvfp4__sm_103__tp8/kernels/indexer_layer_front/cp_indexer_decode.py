@@ -22,7 +22,7 @@ and every decline is theirs, evaluated from the same host state before any devic
 difference is the logits launch: ``indexer_layer_front/cp_logits_runner.py`` (wait at entry,
 programmatic dependent of the generation rope), whose logits are
 bit-identical to the context-partitioned logits kernel's. The top-k
-(``glm_moe_dsa_cross_rank_topk_cluster_merge`` or ``glm_moe_dsa_cross_rank_topk``)
+(``cross_rank_topk_cluster_merge`` or ``cross_rank_topk``)
 then runs on them unchanged.
 
 A ``False`` return leaves no side effect; the adapter then tries cross_rank_topk_cluster_merge's and

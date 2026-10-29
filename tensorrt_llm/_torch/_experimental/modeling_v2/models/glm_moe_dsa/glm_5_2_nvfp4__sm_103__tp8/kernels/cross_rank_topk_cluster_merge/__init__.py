@@ -17,7 +17,7 @@
 
 cross_rank_topk_cluster_merge extends cross_rank_topk (``cross_rank_topk``): the region, its policy
 and its CP logits kernel are cross_rank_topk's (``indexer_topk/cross_rank_*.py``); the select / exchange /
-merge op is ``glm_moe_dsa_cross_rank_topk_cluster_merge`` (``crossRankTopkClusterMerge.h``), which
+merge op is ``cross_rank_topk_cluster_merge`` (``crossRankTopkClusterMerge.h``), which
 merges each verify row on the row's eight CTAs as one thread-block cluster and keeps per-CTA epoch
 words. Its output rows are byte-identical to cross_rank_topk's (set and order) on every rank.
 

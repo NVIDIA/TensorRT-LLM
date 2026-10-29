@@ -16,7 +16,7 @@
 
 Replaces the rank-local compute of a BF16 ``GatedMLP`` with plain SwiGLU at
 decode row counts: ``gate_up_proj`` GEMM, SwiGLU and ``down_proj`` GEMM become
-two weight-streaming kernels (``trtllm::glm_moe_dsa_dense_mlp``). The result is
+two weight-streaming kernels (``native_ops.dense_mlp``). The result is
 the same rank-local partial that native ``down_proj`` returns when its
 all-reduce is disabled; the caller's all-reduce, residual and normalization
 stay native. Intermediate rounding follows the native path: gate and up are
@@ -32,6 +32,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from ... import native_ops
+
 # Largest activation row count of the kernels (MMA N side).
 MAX_ROWS = 8
 # Contraction sizes must be multiples of this for the default tilings
@@ -46,13 +48,6 @@ DOWN_ROW_MULTIPLE = 16
 # one-chunk L2 prefetch.
 GATE_UP_VARIANT = 1
 DOWN_VARIANT = 0
-
-_OP_NAME = "glm_moe_dsa_dense_mlp"
-
-
-def op_available() -> bool:
-    """Return True when the ``trtllm::glm_moe_dsa_dense_mlp`` op is registered."""
-    return hasattr(torch.ops.trtllm, _OP_NAME)
 
 
 def _linear_is_plain_bf16(linear) -> bool:
@@ -127,8 +122,6 @@ def check_eligibility(
         return False, "hidden/intermediate sizes not supported by the tiling"
     if gate_up_w.device != x.device or down_w.device != x.device:
         return False, "weights on a different device"
-    if not op_available():
-        return False, "trtllm::glm_moe_dsa_dense_mlp op not built"
     return True, ""
 
 
@@ -147,6 +140,6 @@ def dense_mlp_forward(
     dispatch.log_capability("dense_mlp", f"dense_mlp:{reason or 'engaged'}", eligible, reason)
     if not eligible:
         return None
-    return torch.ops.trtllm.glm_moe_dsa_dense_mlp(
+    return native_ops.dense_mlp(
         x, mlp.gate_up_proj.weight, mlp.down_proj.weight, GATE_UP_VARIANT, DOWN_VARIANT
     )

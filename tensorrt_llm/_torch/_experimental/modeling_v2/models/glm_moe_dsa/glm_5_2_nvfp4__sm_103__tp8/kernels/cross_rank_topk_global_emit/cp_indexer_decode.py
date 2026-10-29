@@ -17,11 +17,11 @@ cross_rank_topk_cluster_merge's top-k that also writes rope_kv_append's bridge o
 
 Same region, policy, CP logits kernel and id output as cross_rank_topk_cluster_merge
 (``cross_rank_topk_cluster_merge/``), which are cross_rank_topk's (``indexer_topk/cross_rank_*.py``): rank
-``r`` scores the 64-token pages ``p % world == r``, and ``glm_moe_dsa_cross_rank_topk_global_emit``
+``r`` scores the 64-token pages ``p % world == r``, and ``cross_rank_topk_global_emit``
 selects, exchanges and merges the candidates into the tie-aware exact top-``index_topk`` of every
 row, the same rows cross_rank_topk_cluster_merge writes. At the emission it also writes the call's
 rope_kv_append bridge outputs (``bridge.py``): the global KV-pool rows of the layer's remap group
-and the native top-k copy rows, the values ``trtllm::glm_moe_dsa_topk_index_bridge`` writes
+and the native top-k copy rows, the values ``native_ops.topk_index_bridge`` writes
 from the same rows.
 
 With ``indexer_layer_front`` also selected, the CP logits come from indexer_layer_front's launcher
@@ -42,6 +42,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
+from ... import native_ops
 from ..indexer_topk import cross_rank_policy
 from . import bridge as global_emit_bridge
 from . import cp_workspace
@@ -148,7 +149,7 @@ def cp_topk_from_local_logits(
         The pool rows: ``[len(layer_ids), next_n, index_topk]`` with
         ``layer_ids``, else ``[next_n, index_topk]``.
     """
-    return torch.ops.trtllm.glm_moe_dsa_cross_rank_topk_global_emit(
+    return native_ops.cross_rank_topk_global_emit(
         local_logits,
         kv_lens,
         out,

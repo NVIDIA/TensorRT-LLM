@@ -28,7 +28,7 @@ Entry points registered with ``dispatch``:
 """
 
 from ...dispatch import register
-from .hop import HopRoutingTransport, engagement_counts, op_available, split_routing
+from .hop import HopRoutingTransport, engagement_counts, split_routing
 from .routed_moe import routed_output, routed_output_into_hop
 
 register("hop_routing", "make_transport", HopRoutingTransport.create)
@@ -39,7 +39,6 @@ register("hop_routing", "routed_output_into_hop", routed_output_into_hop)
 __all__ = [
     "HopRoutingTransport",
     "engagement_counts",
-    "op_available",
     "routed_output",
     "routed_output_into_hop",
     "split_routing",

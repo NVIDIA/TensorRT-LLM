@@ -66,9 +66,9 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ... import native_ops
 from ...dispatch import log_capability
 
 FEATURE = "post_attention_hop"
@@ -84,7 +84,6 @@ WORKSPACE_BYTES = LAMPORT_BUFFER_BYTES * NUM_LAMPORT_BUFFERS
 CLUSTER_CTAS = 8
 ROUTER_EXPERT_GROUPS = 4
 ROUTER_MAX_ROW_GROUPS = 3
-_OP_NAME = "glm_moe_dsa_post_attention_hop"
 
 # Host-side call counters for dispatch-engagement reporting. They count Python
 # calls (eager runs and CUDA graph captures), not graph replays.
@@ -153,30 +152,6 @@ def native_allreduce_ineligibility(
     if mapping not in MNNVLAllReduce.allreduce_mnnvl_workspaces:
         return "no native MNNVL all-reduce on this TP group"
     return None
-
-
-def op_available() -> bool:
-    """Whether the compiled ``trtllm::glm_moe_dsa_post_attention_hop`` op is loaded."""
-    return hasattr(torch.ops.trtllm, _OP_NAME)
-
-
-def _register_fake() -> None:
-    if not op_available():
-        return
-    try:
-
-        @torch.library.register_fake(f"trtllm::{_OP_NAME}")
-        def _(input, residual, gamma, eps, router_weight, uc_buffer, mc_ptr, flags, rank, nranks):
-            rows = input.numel() // input.shape[-1]
-            logits = (
-                input.new_empty((rows, NUM_EXPERTS), dtype=torch.float32)
-                if router_weight is not None
-                else input.new_empty((0,), dtype=torch.float32)
-            )
-            return [torch.empty_like(input), torch.empty_like(residual), logits]
-    except RuntimeError as error:
-        # Already registered by an earlier import in this process.
-        logger.debug(f"[glm_moe_dsa] post_attention_hop fake registration skipped: {error}")
 
 
 def static_ineligibility(mapping: Mapping, hidden_size: int, dtype: torch.dtype) -> Optional[str]:
@@ -275,9 +250,7 @@ class PostAttnHop:
         # Local capability first, agreed over the world communicator so that
         # either every rank creates the TP communicator and workspace or none.
         local_reason = ""
-        if not op_available():
-            local_reason = "trtllm::glm_moe_dsa_post_attention_hop is not loaded"
-        elif not MnnvlMemory.supports_mnnvl():
+        if not MnnvlMemory.supports_mnnvl():
             local_reason = "MNNVL is not supported on this device"
         world = mpi_comm()
         if world.allreduce(0 if local_reason else 1) != world.Get_size():
@@ -412,7 +385,7 @@ class PostAttnHop:
         _count("engaged")
         if router_weight is not None:
             _count("engaged_router")
-        normed, residual_out, logits = getattr(torch.ops.trtllm, _OP_NAME)(
+        normed, residual_out, logits = native_ops.post_attention_hop(
             hidden_states.contiguous(),
             residual.contiguous(),
             norm_weight.contiguous(),
@@ -425,6 +398,3 @@ class PostAttnHop:
             NUM_RANKS,
         )
         return normed, residual_out, (logits if router_weight is not None else None)
-
-
-_register_fake()

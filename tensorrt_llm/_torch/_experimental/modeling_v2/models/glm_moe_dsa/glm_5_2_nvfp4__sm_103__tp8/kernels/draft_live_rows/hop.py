@@ -45,6 +45,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ... import native_ops
 from ...dispatch import log_capability
 
 FEATURE = "draft_live_rows"
@@ -58,7 +59,6 @@ WORKSPACE_BYTES = 3 * MAX_ROWS * NUM_RANKS * HIDDEN_SIZE * 2
 CLUSTER_CTAS = 8
 ROUTER_EXPERT_GROUPS = 4
 ROUTER_MAX_ROW_GROUPS = 3
-_OP_NAME = "glm_moe_dsa_draft_live_row_hop"
 
 # Host-side call counters. They count Python calls (eager runs and CUDA graph
 # captures), not graph replays.
@@ -88,52 +88,6 @@ def reset_engagement_counts() -> None:
 def required_sms(rows: int) -> int:
     """SMs one live-row hop of ``rows`` live rows needs (every CTA co-resident)."""
     return CLUSTER_CTAS * max(rows, ROUTER_EXPERT_GROUPS * min(rows, ROUTER_MAX_ROW_GROUPS))
-
-
-def op_available() -> bool:
-    """Whether the compiled ``trtllm::glm_moe_dsa_draft_live_row_hop`` op is loaded."""
-    return hasattr(torch.ops.trtllm, _OP_NAME)
-
-
-def all_ranks_true(comm: Any, local: bool) -> bool:
-    """Collective AND of ``local`` over ``comm``, the post_attention_hop's TP communicator.
-
-    Every rank of ``comm`` calls it at the same point, whatever its own
-    ``local`` is.
-    """
-    from tensorrt_llm._torch.distributed.ops import _mnnvl_workspace_all_succeeded
-
-    return _mnnvl_workspace_all_succeeded(comm, bool(local))
-
-
-def _register_fake() -> None:
-    if not op_available():
-        return
-    try:
-
-        @torch.library.register_fake(f"trtllm::{_OP_NAME}")
-        def _(
-            input,
-            residual,
-            row_ids,
-            gamma,
-            eps,
-            router_weight,
-            uc_buffer,
-            mc_ptr,
-            flags,
-            rank,
-            nranks,
-        ):
-            rows = row_ids.shape[0]
-            return [
-                input.new_empty((rows, HIDDEN_SIZE)),
-                residual.new_empty((rows, HIDDEN_SIZE)),
-                input.new_empty((rows, NUM_EXPERTS), dtype=torch.float32),
-            ]
-    except RuntimeError as error:
-        # Already registered by an earlier import in this process.
-        logger.debug(f"[glm_moe_dsa] draft_live_rows fake registration skipped: {error}")
 
 
 class LiveRowHop:
@@ -182,11 +136,6 @@ class LiveRowHop:
             # An enabled post_attention_hop always has its communicator; without one there is no
             # group to agree in.
             return None, "post_attention_hop hop has no communicator"
-        local = op_available()
-        if not all_ranks_true(comm, local):
-            if not local:
-                return None, f"trtllm::{_OP_NAME} is not loaded"
-            return None, f"another rank lacks trtllm::{_OP_NAME}"
         return cls(post_attn_hop), ""
 
     def __init__(self, post_attn_hop: Any):
@@ -259,7 +208,7 @@ class LiveRowHop:
         Callers check :meth:`can_run` first.
         """
         _count("engaged")
-        return getattr(torch.ops.trtllm, _OP_NAME)(
+        return native_ops.draft_live_row_hop(
             hidden_states.contiguous(),
             residual.contiguous(),
             row_ids,
@@ -272,6 +221,3 @@ class LiveRowHop:
             self.rank,
             NUM_RANKS,
         )
-
-
-_register_fake()

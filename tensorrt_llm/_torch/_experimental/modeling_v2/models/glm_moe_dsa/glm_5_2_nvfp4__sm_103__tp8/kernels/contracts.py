@@ -83,7 +83,7 @@ ATTENTION_TAIL_COMMUNICATION_RULE = (
     "cross-boundary fusion) adds a publication: after its griddepcontrol.wait "
     "the o_proj kernel also writes the partial (-0.0 mapped to +0.0) into "
     "the post_attention_hop hop's Lamport transport under the attention_output_into_hop protocol of "
-    "cpp/tensorrt_llm/kernels/glmMoeDsa/postAttentionHopFromPartials.h, and the "
+    "glm_5_2_nvfp4__sm_103__tp8/csrc/postAttentionHopFromPartials.h, and the "
     "ordinary partial stays available."
 )
 ATTENTION_TAIL_PDL_RULE = (

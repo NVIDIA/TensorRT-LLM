@@ -31,7 +31,7 @@ The package imports no other package's code.
 """
 
 from ...dispatch import register
-from .hop import LiveRowHop, engagement_counts, op_available, required_sms, reset_engagement_counts
+from .hop import LiveRowHop, engagement_counts, required_sms, reset_engagement_counts
 from .step0 import Step0LiveRows, select_step0, step0_ineligibility
 
 register("draft_live_rows", "make_live_row_hop", LiveRowHop.for_post_attn_hop)
@@ -42,7 +42,6 @@ __all__ = [
     "LiveRowHop",
     "Step0LiveRows",
     "engagement_counts",
-    "op_available",
     "required_sms",
     "reset_engagement_counts",
     "select_step0",

@@ -16,7 +16,7 @@
 
 Same region, policy, CP logits kernel and output contract as cross_rank_topk
 (``indexer_topk/cross_rank_indexer_decode.py``): rank ``r`` scores the 64-token pages
-``p % world == r``, and ``glm_moe_dsa_cross_rank_topk_cluster_merge`` selects, exchanges and merges
+``p % world == r``, and ``cross_rank_topk_cluster_merge`` selects, exchanges and merges
 the candidates into the tie-aware exact top-``index_topk`` of every row, the
 same set and order on every rank and the same rows cross_rank_topk writes.
 
@@ -33,6 +33,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
+from ... import native_ops
 from ..indexer_topk import cross_rank_policy
 from . import cp_workspace
 
@@ -102,7 +103,7 @@ def cp_topk_from_local_logits(
     Returns:
         ``out`` holding the same global top-k selection on every rank.
     """
-    torch.ops.trtllm.glm_moe_dsa_cross_rank_topk_cluster_merge(
+    native_ops.cross_rank_topk_cluster_merge(
         local_logits,
         kv_lens,
         out,

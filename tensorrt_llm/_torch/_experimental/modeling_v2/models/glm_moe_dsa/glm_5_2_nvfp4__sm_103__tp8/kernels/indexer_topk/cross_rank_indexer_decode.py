@@ -19,7 +19,7 @@ indexer queries and weights and keeps its own copy of the indexer K cache.
 The ranks split the scan instead of repeating it: rank ``r`` scores the
 64-token pages ``p`` with ``p % world == r`` for every causal verify row
 (``fp8_paged_mqa_logits_cross_rank``, logits bit-identical to the native kernel's
-for the same K), and the ``glm_moe_dsa_cross_rank_topk`` op selects each rank's local
+for the same K), and the ``cross_rank_topk`` op selects each rank's local
 candidates, exchanges them through cross_rank_topk's own multicast Lamport workspace and
 merges them into the tie-aware exact top-``index_topk`` of every row,
 identically on every rank. Rows with at most ``index_topk`` valid tokens get
@@ -47,6 +47,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
+from ... import native_ops
 from . import cross_rank_policy
 
 __all__ = [
@@ -97,7 +98,7 @@ def cp_topk_from_local_logits(
     Returns:
         ``out`` holding the same global top-k selection on every rank.
     """
-    torch.ops.trtllm.glm_moe_dsa_cross_rank_topk(
+    native_ops.cross_rank_topk(
         local_logits,
         kv_lens,
         out,

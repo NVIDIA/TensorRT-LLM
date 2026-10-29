@@ -18,7 +18,7 @@ cross_rank_topk_cluster_merge's CP top-k emission (selected with ``cross_rank_to
 cross_rank_topk_global_emit extends cross_rank_topk_cluster_merge
 (``cross_rank_topk_cluster_merge``), cross_rank_topk (``cross_rank_topk``) and rope_kv_append
 (``rope_kv_append``): the GEN indexer region is cross_rank_topk_cluster_merge's (cross_rank_topk's
-policy and CP logits kernel), and its top-k op ``glm_moe_dsa_cross_rank_topk_global_emit``
+policy and CP logits kernel), and its top-k op ``cross_rank_topk_global_emit``
 (``crossRankTopkGlobalEmit.h``) writes, besides the id rows, the outputs of rope_kv_append's
 ``topkBridgeKernel`` for the call: the global KV-pool rows of the layer's remap group and the native
 top-k copy rows. The backend's remap then returns those rows instead of launching the bridge, and

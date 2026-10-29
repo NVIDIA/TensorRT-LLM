@@ -16,12 +16,12 @@
 
 ``HopRoutingTransport`` wraps the ``attention_output_into_hop`` :class:`IntoHopTransport` of a
 ``post_attention_hop``. The producer side is the into-hop entry's unchanged (the attention tail
-publishes into the same transport); the hop runs ``trtllm::glm_moe_dsa_post_attention_hop_routing``,
+publishes into the same transport); the hop runs ``native_ops.post_attention_hop_routing``,
 which returns the into-hop entry's normalized hidden, residual and router logits bit for bit plus
 the native DeepSeek-V3 routing of every row (expert ids int32 ``[R, 8]`` and
 weights FP32 ``[R, 8]`` holding the bf16-rounded native weights, descending
 native key order). See
-``cpp/tensorrt_llm/kernels/glmMoeDsa/postAttentionHopRouting.h`` for the
+``glm_5_2_nvfp4__sm_103__tp8/csrc/postAttentionHopRouting.h`` for the
 arithmetic, the gather protocol and the memory-order contract.
 
 The gather buffers and the parity word are private to hop_routing and shared by every
@@ -33,10 +33,10 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from ... import native_ops
 from ...dispatch import log_capability
 
 FEATURE = "hop_routing"
-_OP_NAME = "glm_moe_dsa_post_attention_hop_routing"
 HIDDEN_SIZE = 6144
 NUM_EXPERTS = 256
 TOP_K = 8
@@ -67,25 +67,6 @@ def reset_engagement_counts() -> None:
     _counts.clear()
 
 
-def op_available(op_name: str = _OP_NAME) -> bool:
-    """Whether ``trtllm::<op_name>`` (default: the routing hop) is loaded."""
-    return hasattr(torch.ops.trtllm, op_name)
-
-
-def _agreed_op_reason(hop, op_name: str = _OP_NAME) -> str:
-    """Why no rank of ``hop``'s group may use the routing hop ("" when every
-    rank may). Agreed once per hop and op over the hop's TP communicator."""
-    cache = hop.__dict__.setdefault("_hop_routing_op_reason", {})
-    if op_name in cache:
-        return cache[op_name]
-    local = "" if op_available(op_name) else f"trtllm::{op_name} is not loaded"
-    comm = getattr(hop, "comm", None)
-    agreed = comm is None or comm.allreduce(0 if local else 1) == comm.Get_size()
-    reason = local or ("" if agreed else f"trtllm::{op_name} is not loaded on another rank")
-    cache[op_name] = reason
-    return reason
-
-
 class _GatherState:
     """Gather buffers and parity of one ``post_attention_hop`` workspace."""
 
@@ -105,7 +86,7 @@ def _gather_state(hop) -> _GatherState:
 class HopRoutingTransport:
     """into-hop producer view plus the routing hop."""
 
-    def __init__(self, into_hop, op_name: str = _OP_NAME):
+    def __init__(self, into_hop):
         self.into_hop = into_hop
         self.hop = into_hop.hop
         self.rank = into_hop.rank
@@ -118,24 +99,16 @@ class HopRoutingTransport:
         # into-hop entry's).
         self.early_poll = into_hop.early_poll
         self.router_load = into_hop.router_load
-        # Tests may use the diagnostic build (``..._diag``, stamps).
-        self.op_name = op_name
 
     @classmethod
-    def create(cls, into_hop, op_name: str = _OP_NAME) -> Optional["HopRoutingTransport"]:
+    def create(cls, into_hop) -> Optional["HopRoutingTransport"]:
         """The routing hop of ``into_hop``'s hop, or None (into-hop path).
 
-        Rank-uniform: ``into_hop`` exists on all ranks of the group or on none, and
-        the op's availability is agreed over the hop's TP group the first
-        time, at the same point of model construction on every rank.
+        Rank-uniform: ``into_hop`` exists on all ranks of the group or on none.
         """
-        reason = (
-            "attention_output_into_hop transport unavailable"
-            if into_hop is None
-            else _agreed_op_reason(into_hop.hop, op_name)
-        )
+        reason = "attention_output_into_hop transport unavailable" if into_hop is None else ""
         log_capability(FEATURE, "routing_hop", not reason, reason)
-        return None if reason else cls(into_hop, op_name)
+        return None if reason else cls(into_hop)
 
     def can_run(
         self,
@@ -175,7 +148,7 @@ class HopRoutingTransport:
         ``logits_in`` (tests only) replaces the logits the routing reads.
         """
         _count("hop_routing_hop")
-        normed, residual_out, logits, routing = getattr(torch.ops.trtllm, self.op_name)(
+        normed, residual_out, logits, routing = native_ops.post_attention_hop_routing(
             residual.contiguous(),
             norm_weight.contiguous(),
             float(eps),
@@ -201,51 +174,12 @@ def split_routing(routing: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return routing[0], routing[1].view(torch.float32)
 
 
-def _register_fake() -> None:
-    if not op_available():
-        return
-    try:
-
-        @torch.library.register_fake(f"trtllm::{_OP_NAME}")
-        def _(
-            residual,
-            gamma,
-            eps,
-            router_weight,
-            routing_bias,
-            uc_buffer,
-            flags,
-            gather,
-            zstate,
-            rank,
-            nranks,
-            early_poll,
-            router_load,
-            routed_scaling,
-            logits_in=None,
-            stamps=None,
-        ):
-            rows = residual.numel() // HIDDEN_SIZE
-            return [
-                torch.empty_like(residual),
-                torch.empty_like(residual),
-                residual.new_empty((rows, NUM_EXPERTS), dtype=torch.float32),
-                residual.new_empty((2, rows, TOP_K), dtype=torch.int32),
-            ]
-    except RuntimeError:
-        # Already registered by an earlier import in this process.
-        pass
-
-
-_register_fake()
-
 __all__ = [
     "GATHER_SENTINEL",
     "NUM_STAMPS",
     "MAX_GRID_CTAS",
     "HopRoutingTransport",
     "engagement_counts",
-    "op_available",
     "reset_engagement_counts",
     "split_routing",
 ]

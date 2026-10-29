@@ -135,8 +135,8 @@ that more than one category imports.
 GLM-5.2's low-latency target, `glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8`, serves GLM-5.2
 NVFP4 decode on sm_103 with the attention heads and the experts tensor-parallel over eight
 ranks; its routing module admits only that layout. Its fast paths are packages under the
-target's own `kernels/`, one per fast path, with their C++ kernels and ops in
-`cpp/tensorrt_llm/kernels/glmMoeDsa` and `cpp/tensorrt_llm/thop/glmMoeDsa`; the target's
+target's own `kernels/`, one per fast path, with their CUDA kernels and torch ops in the
+target's `csrc/` (`torch.ops.mv2_glm_moe_dsa_glm_5_2_nvfp4_sm_103_tp8`); the target's
 `dispatch.py` selects them and lists the knobs, and its layers run the composition of
 `layers.py`. The target is gated end to end by
 `tests/integration/defs/accuracy/modeling_v2/test_glm_moe_dsa.py` (GSM8K under `require`).

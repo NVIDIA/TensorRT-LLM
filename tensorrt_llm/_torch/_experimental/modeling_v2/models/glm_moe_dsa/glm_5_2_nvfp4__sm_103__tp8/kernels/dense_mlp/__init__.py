@@ -19,8 +19,8 @@ lora_params) -> Optional[Tensor]`` (``None`` means "run the native module").
 """
 
 from ... import dispatch
-from .dense_mlp import check_eligibility, dense_mlp_forward, op_available
+from .dense_mlp import check_eligibility, dense_mlp_forward
 
 dispatch.register("dense_mlp", "dense_mlp_forward", dense_mlp_forward)
 
-__all__ = ["check_eligibility", "dense_mlp_forward", "op_available"]
+__all__ = ["check_eligibility", "dense_mlp_forward"]

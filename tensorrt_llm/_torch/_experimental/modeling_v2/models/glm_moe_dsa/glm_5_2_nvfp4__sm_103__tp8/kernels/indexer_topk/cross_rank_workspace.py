@@ -17,7 +17,7 @@
 cross_rank_topk owns one multicast workspace per tensor-parallel group, allocated with the
 native ``McastGPUBuffer`` (the class behind the MNNVL all-reduce workspaces)
 and used by nothing else. Its layout and Lamport protocol are defined by the
-``glm_moe_dsa_cross_rank_topk`` kernel (``crossRankTopk.h``): every 32-bit word starts as
+``cross_rank_topk`` kernel (``crossRankTopk.h``): every 32-bit word starts as
 ``0xFFFFFFFF`` and the kernel rotates three buffers with a device epoch held
 in a separate per-rank state tensor.
 
@@ -42,7 +42,9 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-# Indices of torch.ops.trtllm.glm_moe_dsa_cross_rank_topk_workspace_info().
+from ... import native_ops
+
+# Indices of native_ops.cross_rank_topk_workspace_info().
 _INFO_WORKSPACE_WORDS = 0
 _INFO_TOPK = 1
 _INFO_MAX_RANKS = 2
@@ -90,12 +92,9 @@ _WORKSPACES: Dict[Tuple, CpWorkspace] = {}
 _FAILED: Dict[Tuple, str] = {}
 
 
-def op_info(world_size: int = 8) -> Optional[list]:
-    """Constants of the compiled kernel for a group size, or None when the op is not built."""
-    try:
-        return list(torch.ops.trtllm.glm_moe_dsa_cross_rank_topk_workspace_info(world_size))
-    except (AttributeError, RuntimeError):
-        return None
+def op_info(world_size: int = 8) -> list:
+    """Constants of the compiled kernel for a group size."""
+    return list(native_ops.cross_rank_topk_workspace_info(world_size))
 
 
 def _key(mapping) -> Tuple:
@@ -154,7 +153,7 @@ def get_workspace(
 def _local_capability_reason(mapping, info, prepare) -> str:
     """This rank's op, group size and preparation check ("" when capable)."""
     if info is None:
-        return "glm_moe_dsa_cross_rank_topk op is not built"
+        return "cross_rank_topk op is not built"
     if mapping.tp_size > info[_INFO_MAX_RANKS]:
         return f"tp_size {mapping.tp_size} > {info[_INFO_MAX_RANKS]}"
     if prepare is not None:

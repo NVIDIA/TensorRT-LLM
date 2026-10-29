@@ -14,9 +14,9 @@
 # limitations under the License.
 """indexer_layer_front generation rope: rope_kv_append's fused rope with the trigger after the last read.
 
-``trtllm::glm_moe_dsa_indexer_layer_rope_kv_append``
-(``cpp/tensorrt_llm/kernels/glmMoeDsa/indexerLayerRopeKvAppend.cu``) takes the
-arguments of ``trtllm::glm_moe_dsa_rope_kv_append`` and writes the same bytes (FP8 query,
+``native_ops.indexer_layer_rope_kv_append``
+(``glm_5_2_nvfp4__sm_103__tp8/csrc/indexerLayerRopeKvAppend.cu``) takes the
+arguments of ``native_ops.rope_kv_append`` and writes the same bytes (FP8 query,
 latent and indexer K caches, FMHA scheduler buffers). Its kernel executes
 ``griddepcontrol.launch_dependents`` right after its last global read instead
 of at its end (a block counts as triggered at its first thread's
@@ -28,22 +28,16 @@ rope's outputs only after its own ``griddepcontrol.wait`` and writes no
 global memory before it, as rope_kv_append's dependents already must.
 
 The caller (the adapter's rope_kv_append branch of ``_mla_gen_rope``) checks rope_kv_append's
-``rope_eligible`` first and uses this op only when it is available
-(:func:`rope_available`); otherwise rope_kv_append's op runs.
+``rope_eligible`` first and uses this op when indexer_layer_front is enabled; otherwise
+rope_kv_append's op runs.
 """
 
 from typing import List, Optional
 
 import torch
 
+from ... import native_ops
 from ..rope_kv_append.ops import IndexerKScatter, _consume
-
-OP_NAME = "glm_moe_dsa_indexer_layer_rope_kv_append"
-
-
-def rope_available() -> bool:
-    """Whether this process has the indexer_layer_front rope op (built in, or a development build loaded)."""
-    return hasattr(torch.ops.trtllm, OP_NAME)
 
 
 def mla_rope_generation(
@@ -77,7 +71,7 @@ def mla_rope_generation(
                 indexer_k.slot_mapping_scale,
             ]
             idx_tokens = indexer_k.num_tokens
-    getattr(torch.ops.trtllm, OP_NAME)(
+    native_ops.indexer_layer_rope_kv_append(
         fused_q,
         q_pe,
         latent_cache,
