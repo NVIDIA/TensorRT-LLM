@@ -33,6 +33,7 @@ from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qw
 
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import (
     BasePipeline,
@@ -74,7 +75,7 @@ from .packing import (
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
-from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from .transformer_minimax_h3 import MiniMaxH3StaticContext, MiniMaxH3Transformer3DModel
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
@@ -160,6 +161,62 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
     @property
     def tp_group_name(self) -> str:
         return self.tp_group_pg.group_name
+
+
+class _MiniMaxH3CUDAGraphRunner(CUDAGraphRunner):
+    """CUDAGraphRunner that treats the H3 transformer's ``static_context`` as an input.
+
+    The base runner keys, clones and copies flat tensors only. H3's forward also takes a
+    ``MiniMaxH3StaticContext`` (refined text embeddings and RoPE tables), constant within a
+    request but different between requests, so its tensors join the graph key, are cloned
+    into static buffers at capture and copied in place at replay like any other input. The
+    layout checks the forward would otherwise sync on are resolved host-side through the
+    transformer's ``h3_layout`` extra key (``register_cuda_graph_extra_key_fns``).
+    """
+
+    @staticmethod
+    def _context_key_parts(prefix: str, context: MiniMaxH3StaticContext) -> list:
+        cos, sin = context.rotary_emb
+        return [
+            (f"{prefix}.text_embeds", tuple(context.text_embeds.shape)),
+            (f"{prefix}.rotary_cos", tuple(cos.shape)),
+            (f"{prefix}.rotary_sin", tuple(sin.shape)),
+        ]
+
+    def _get_tensor_shape_key(self, *args, **kwargs):
+        parts = []
+        for i, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                parts.append((f"arg{i}", tuple(arg.shape)))
+            elif isinstance(arg, MiniMaxH3StaticContext):
+                parts.extend(self._context_key_parts(f"arg{i}", arg))
+        for k in sorted(kwargs):
+            v = kwargs[k]
+            if isinstance(v, torch.Tensor):
+                parts.append((k, tuple(v.shape)))
+            elif isinstance(v, MiniMaxH3StaticContext):
+                parts.extend(self._context_key_parts(k, v))
+        return tuple(parts)
+
+    @staticmethod
+    def _clone_input(value):
+        if isinstance(value, MiniMaxH3StaticContext):
+            cos, sin = value.rotary_emb
+            return MiniMaxH3StaticContext(
+                text_embeds=value.text_embeds.clone(), rotary_emb=(cos.clone(), sin.clone())
+            )
+        return CUDAGraphRunner._clone_input(value)
+
+    @staticmethod
+    def _copy_input(static, value):
+        if isinstance(value, MiniMaxH3StaticContext) and isinstance(
+            static, MiniMaxH3StaticContext
+        ):
+            static.text_embeds.copy_(value.text_embeds)
+            static.rotary_emb[0].copy_(value.rotary_emb[0])
+            static.rotary_emb[1].copy_(value.rotary_emb[1])
+            return static
+        return CUDAGraphRunner._copy_input(static, value)
 
 
 @register_pipeline(
@@ -276,10 +333,6 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "enters the offload context, so staged components would be used "
                 "directly on the wrong device."
             )
-        if pipeline_config.cuda_graph.enable:
-            raise NotImplementedError(
-                "CUDA graphs are not yet supported for MiniMax-H3's packed layout inputs."
-            )
         self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
         vae_size = pipeline_config.parallel.parallel_vae_size
         if not 1 <= vae_size <= world_size:
@@ -289,6 +342,24 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.processor = None
         self._sleep_manager: Optional["PipelineSleepManager"] = None
         super().__init__(pipeline_config)
+
+    def _setup_cuda_graphs(self) -> None:
+        """Wrap the transformer with the ``static_context``-aware runner.
+
+        Same composition with torch.compile as the base implementation: the runner wraps the
+        outer ``transformer.forward`` while the compiled blocks run inside the captured graph.
+        One graph per packed layout: the key holds every input shape, so a new prompt length
+        or canvas captures a new graph at its first request (warmup covers the configured
+        resolutions with its own prompt length).
+        """
+        if not self.pipeline_config.cuda_graph.enable:
+            return
+        runner = _MiniMaxH3CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        self.transformer.register_cuda_graph_extra_key_fns(runner)
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
+        logger.info(f"CUDA graph runner: wrapping transformer.forward (MiniMax-H3){compile_note}")
+        self.transformer.forward = runner.wrap(self.transformer.forward)
+        self._cuda_graph_runners["transformer"] = runner
 
     def _check_sleep_world_size(self) -> None:
         config = self.pipeline_config
@@ -1275,7 +1346,14 @@ class MiniMaxH3Pipeline(BasePipeline):
             _check_denoise_step(video_velocity[:, condition_rows:], "video", index)
             audio_velocity = audio_velocity[:, audio_condition_rows:]
             _check_denoise_step(audio_velocity, "audio", index)
-            return video_velocity[:, condition_rows:].float(), {"audio": audio_velocity.float()}
+            video_velocity = video_velocity[:, condition_rows:].float()
+            audio_velocity = audio_velocity.float()
+            if self._cuda_graph_runners:
+                # Graph outputs are weak references into the replay buffers, which the next
+                # replay overwrites; the scheduler keeps its own copy.
+                video_velocity = video_velocity.clone()
+                audio_velocity = audio_velocity.clone()
+            return video_velocity, {"audio": audio_velocity}
 
         timer.mark_denoise_start()
         generated_latents, extra_latents = self.denoise(

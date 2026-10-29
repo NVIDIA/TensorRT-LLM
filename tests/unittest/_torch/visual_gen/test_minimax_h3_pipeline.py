@@ -390,10 +390,10 @@ def test_pipeline_keeps_torch_compile_enabled(
     MiniMaxH3Pipeline(disabled)
     assert not disabled.torch_compile.enable, "pipeline force-enabled torch.compile"
 
-    rejected = _config(TorchCompileConfig(enable=True))
-    rejected.cuda_graph = SimpleNamespace(enable=True)
-    with pytest.raises(NotImplementedError, match="CUDA graphs"):
-        MiniMaxH3Pipeline(rejected)
+    graphed = _config(TorchCompileConfig(enable=True))
+    graphed.cuda_graph = SimpleNamespace(enable=True)
+    MiniMaxH3Pipeline(graphed)
+    assert graphed.torch_compile.enable, "pipeline disabled torch.compile under CUDA graphs"
 
 
 def test_modular_manifest_discovers_h3_pipeline_and_transformer_config(tmp_path: Path) -> None:
@@ -1780,3 +1780,57 @@ def test_pipeline_accepts_tp(
     config.visual_gen_mapping.ulysses_size = ulysses_size
     MiniMaxH3Pipeline(config)
     assert initialized == [config]
+
+
+def _static_context(seq_len: int, text: int, width: int = 4):
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 import (
+        MiniMaxH3StaticContext,
+    )
+
+    return MiniMaxH3StaticContext(
+        text_embeds=torch.randn(1, text, width),
+        rotary_emb=(torch.randn(seq_len, width), torch.randn(seq_len, width)),
+    )
+
+
+def test_cuda_graph_runner_keys_static_context_shapes() -> None:
+    """The graph key covers the request-static text embeddings and RoPE tables too."""
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
+
+    runner = h3_pipeline._MiniMaxH3CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    hidden = torch.zeros(1, 6, 8)
+    key_a = runner._get_tensor_shape_key(
+        hidden_states=hidden, static_context=_static_context(8, 2), return_dict=False
+    )
+    key_b = runner._get_tensor_shape_key(
+        hidden_states=hidden, static_context=_static_context(8, 3), return_dict=False
+    )
+    assert ("hidden_states", (1, 6, 8)) in key_a
+    assert ("static_context.text_embeds", (1, 2, 4)) in key_a
+    assert ("static_context.rotary_cos", (8, 4)) in key_a
+    assert key_a != key_b, "a different text length must select a different graph"
+
+
+def test_cuda_graph_runner_clones_and_copies_static_context() -> None:
+    """Capture clones the context into static buffers; replay refreshes them in place."""
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
+
+    runner = h3_pipeline._MiniMaxH3CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    live = _static_context(8, 2)
+    static = runner._clone_input(live)
+    assert static is not live
+    assert static.text_embeds.data_ptr() != live.text_embeds.data_ptr()
+    torch.testing.assert_close(static.text_embeds, live.text_embeds)
+    torch.testing.assert_close(static.rotary_emb[1], live.rotary_emb[1])
+
+    fresh = _static_context(8, 2)
+    returned = runner._copy_input(static, fresh)
+    assert returned is static, "replay must keep the captured buffers"
+    torch.testing.assert_close(static.text_embeds, fresh.text_embeds)
+    torch.testing.assert_close(static.rotary_emb[0], fresh.rotary_emb[0])
+
+    # Plain tensors and non-tensors keep the base behaviour.
+    tensor_static = runner._clone_input(torch.ones(3))
+    assert runner._copy_input(tensor_static, torch.zeros(3)) is tensor_static
+    assert tensor_static.sum() == 0
+    assert runner._copy_input(True, False) is False
