@@ -443,6 +443,12 @@ class LinearMethodBase(ABC):
         raise NotImplementedError(
             "This quantization method does not support output slicing")
 
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        """Validate slicing support and prepare quantization-specific state."""
+        raise NotImplementedError(
+            "This quantization method does not support output slicing")
+
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
                                tp_group: List[int], *args, **kwargs):
@@ -684,6 +690,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     end: int) -> torch.Tensor:
         bias = module.bias[start:end] if module.bias is not None else None
         return self.apply(module, input, bias, weight=module.weight[start:end])
+
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        # Quantized subclasses must explicitly opt in to their slice preparation.
+        if type(self) is not UnquantizedLinearMethod:
+            super().prepare_output_slice(module, start, end)
 
     def load_weights_vanilla(self,
                              module: Linear,
@@ -1435,6 +1447,14 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if module.bias is not None:
             output = output + module.bias[start:end]
         return output
+
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        module.transform_weights()
+        if module._output_slice_cache is None:
+            module._output_slice_cache = Fp8BlockScaleWeightSliceCache()
+        module._output_slice_cache.prepare(module.weight, module.weight_scale,
+                                           start, end)
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
@@ -4530,7 +4550,7 @@ class Linear(nn.Module):
         return self.quant_method.apply_slice(self, input, start, end)
 
     def prepare_output_slice(self, start: int, end: int) -> None:
-        """Validate output slicing and prepare FP8 scales after weight transformation."""
+        """Validate output slicing and prepare method-specific state."""
         if self.tp_mode == TensorParallelMode.ROW or self.gather_output:
             raise ValueError(
                 "Output slicing requires a local COLUMN projection")
@@ -4540,18 +4560,7 @@ class Linear(nn.Module):
             raise NotImplementedError(
                 "Output slicing does not support locality-domain shards or LoRA"
             )
-        if type(self.quant_method) not in (UnquantizedLinearMethod,
-                                           FP8BlockScalesLinearMethod):
-            raise NotImplementedError(
-                "Output slicing supports unquantized and FP8 block-scale projections"
-            )
-        if type(self.quant_method) is not FP8BlockScalesLinearMethod:
-            return
-        self.transform_weights()
-        if self._output_slice_cache is None:
-            self._output_slice_cache = Fp8BlockScaleWeightSliceCache()
-        self._output_slice_cache.prepare(self.weight, self.weight_scale, start,
-                                         end)
+        self.quant_method.prepare_output_slice(self, start, end)
 
     def forward(
         self,

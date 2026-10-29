@@ -5,7 +5,15 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import (
+    FP8QDQLinearMethod,
+    FP8RowwiseLinearMethod,
+    Linear,
+    NVFP4LinearMethod,
+    TensorParallelMode,
+    UnquantizedLinearMethod,
+    W8A16FP8LinearMethod,
+)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.quantization.utils.fp8_utils import Fp8BlockScaleWeightSliceCache
@@ -123,7 +131,11 @@ def test_linear_output_slice_reload(backend):
 
 
 @pytest.mark.cpu_only
-def test_prepare_output_slice_rejects_unsupported_projection_before_forward():
+@pytest.mark.parametrize(
+    "quant_method",
+    [NVFP4LinearMethod, FP8QDQLinearMethod, FP8RowwiseLinearMethod, W8A16FP8LinearMethod],
+)
+def test_prepare_output_slice_rejects_unsupported_projection_before_forward(quant_method):
     linear = Linear(
         8,
         16,
@@ -139,9 +151,37 @@ def test_prepare_output_slice_rejects_unsupported_projection_before_forward():
         linear.prepare_output_slice(0, 8)
 
     linear.lora = None
-    linear.quant_method = NVFP4LinearMethod()
-    with pytest.raises(NotImplementedError, match="FP8 block-scale"):
+    linear.quant_method = quant_method()
+    with pytest.raises(NotImplementedError, match="output slicing"):
         linear.prepare_output_slice(0, 8)
+
+
+@pytest.mark.cpu_only
+def test_prepare_output_slice_dispatches_to_linear_method():
+    prepared_ranges = []
+
+    class PreparedLinearMethod(UnquantizedLinearMethod):
+        def prepare_output_slice(self, module: Linear, start: int, end: int) -> None:
+            prepared_ranges.append((start, end))
+
+    linear = Linear(
+        8,
+        16,
+        bias=False,
+        dtype=torch.float32,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        quant_config=QuantConfig(),
+        reduce_output=False,
+    )
+    linear.quant_method = PreparedLinearMethod()
+    with torch.no_grad():
+        linear.weight.copy_(torch.arange(128, dtype=torch.float32).view(16, 8))
+    inputs = torch.arange(16, dtype=torch.float32).view(2, 8)
+
+    linear.prepare_output_slice(4, 12)
+    actual = linear.forward_slice(inputs, 4, 12)
+    torch.testing.assert_close(actual, torch.nn.functional.linear(inputs, linear.weight[4:12]))
+    assert prepared_ranges == [(4, 12), (4, 12)]
 
 
 @pytest.mark.cpu_only
