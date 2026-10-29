@@ -306,6 +306,7 @@ class TestKernel:
 
     def test_does_not_distort_the_distribution(self):
         # Averaged over random seeds the keyed draw must be an exact sample from p.
+        torch.manual_seed(0)
         probs = torch.tensor([0.5, 0.25, 0.125, 0.0625, 0.0625, 0.0, 0.0, 0.0], device="cuda")
         rows = 400_000
         seeds = torch.randint(-(2**62), 2**62, (rows,), device="cuda", dtype=torch.int64)
@@ -340,6 +341,7 @@ class TestKeyedRecovery:
     ROWS = 600_000
 
     def _run(self, num_draft, *, draft_keyed=True, recovery_key="secondary"):
+        torch.manual_seed(0)
         p = torch.tensor(self.P, device="cuda")
         q = torch.tensor(self.Q, device="cuda")
         rows, vocab = self.ROWS, p.numel()
