@@ -764,19 +764,3 @@ def test_s3_hook_skips_xdist_controller(monkeypatch):
     worker = Config(numprocesses=2)
     s3_output_hooks.pytest_configure(worker)
     assert registered == [worker]
-
-
-# TEMPORARY (rerun policy validation): fails once after 150 s, over the CPU
-# stage's rerun_once_max_duration_s. Its id puts the "ConnectionResetError" fail
-# signature in the wrapper's culprit list, so it is rerun once and passes.
-# Revert before merging.
-@pytest.mark.parametrize("signature", ["ConnectionResetError"])
-def test_rerun_policy_fail_signature(signature):
-    import tempfile
-    import time
-
-    marker = os.path.join(tempfile.gettempdir(), "rerun_policy_signature_once")
-    if not os.path.exists(marker):
-        open(marker, "w").close()
-        time.sleep(150)
-        assert False, f"slow {signature} failure on purpose"
