@@ -872,7 +872,12 @@ def content_shard(buffers: Sequence[BufferDesc], topology: RankTopology) -> Shar
     """The share of a layer group's content the rank at ``topology`` holds, read from the group's
     ``buffers``: ranks of its grid hold the same share exactly when they hold the same indices of
     every split axis of the transferred buffers, and shares are numbered in the order of the
-    indices they hold. The whole content when every rank holds alike."""
+    indices they hold. The whole content when every rank holds alike.
+
+    The numbering names the same indices under every rank count that divides, or is divided by,
+    each split axis's extent, as attention heads and TP sizes do. Where an axis's extent and rank
+    count do not divide one another, each rank of the dimensions the group splits over is a share
+    of its own, so that no other rank count can name other indices alike."""
 
     def share(place: RankTopology) -> tuple:
         return tuple(
@@ -882,6 +887,12 @@ def content_shard(buffers: Sequence[BufferDesc], topology: RankTopology) -> Shar
     mine = share(topology)
     if not mine:
         return ShardDesc()
+    axes = [a for b in buffers if b.transferred for t in b.tensors for a in t.axes if a.split]
+    counts = [grid_place(topology, a.split)[0] for a in axes]
+    if any(a.extent % n and n % a.extent for a, n in zip(axes, counts)):
+        dims = [dim for dim in GRID_DIMENSIONS if any(dim in a.split for a in axes)]
+        size, rank = grid_place(topology, dims)
+        return ShardDesc(size, rank) if size > 1 else ShardDesc()
     shares = {
         share(
             dataclasses.replace(

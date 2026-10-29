@@ -3581,13 +3581,38 @@ class KVCacheManagerV2(BaseResourceManager):
                         group_buffers[lg].append(desc)
 
         rebuilt = sorted({b.role for b in buffers if b.role in derived})
-        rebuild = getattr(getattr(self, "rebuild_disagg_imported_cache", None), "__func__", None)
-        if rebuilt and rebuild is KVCacheManagerV2.rebuild_disagg_imported_cache:
-            raise ValueError(
-                f"{type(self).__name__} derives its {rebuilt} buffers from the transferred ones but "
-                "does not override rebuild_disagg_imported_cache, so an import would leave them "
-                "stale"
+        if rebuilt:
+            # Where each hook comes from: the manager itself for one bound to it, else the first
+            # class of its MRO defining it.
+            roles_owner, rebuild_owner = (
+                next((c for c in (self, *type(self).__mro__) if name in vars(c)), None)
+                for name in ("_page_derived_roles", "rebuild_disagg_imported_cache")
             )
+            rebuild = (
+                vars(rebuild_owner)["rebuild_disagg_imported_cache"] if rebuild_owner else None
+            )
+            if (
+                getattr(rebuild, "__func__", rebuild)
+                is KVCacheManagerV2.rebuild_disagg_imported_cache
+            ):
+                raise ValueError(
+                    f"{type(self).__name__} derives its {rebuilt} buffers from the transferred "
+                    "ones but does not override rebuild_disagg_imported_cache, so an import would "
+                    "leave them stale"
+                )
+            if (
+                isinstance(roles_owner, type)
+                and isinstance(rebuild_owner, type)
+                and roles_owner is not rebuild_owner
+                and issubclass(roles_owner, rebuild_owner)
+            ):
+                added = sorted(set(rebuilt) - set(super(roles_owner, self)._page_derived_roles()))
+                if added:
+                    raise ValueError(
+                        f"{roles_owner.__name__} derives its {added} buffers, but its rebuild comes from "
+                        f"{rebuild_owner.__name__}, which does not know them; override "
+                        "rebuild_disagg_imported_cache with them"
+                    )
 
         layer_groups: list[LayerGroupDesc] = []
         total_kv_heads: dict[int, int] = {}

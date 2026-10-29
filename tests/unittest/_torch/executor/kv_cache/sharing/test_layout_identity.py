@@ -617,6 +617,45 @@ def test_head_ranges_name_the_shares_the_ranks_hold():
 
 
 @pytest.mark.cpu_only
+def test_a_split_its_rank_count_does_not_divide_gives_every_rank_its_own_share():
+    """Three heads over two ranks: ranks of other counts could hold other heads under the same
+    share numbers, so each rank names its own."""
+    buffer = BufferDesc(0, "key", 0, 0, 0, 2 * HEAD_BYTES, tensors=head_major(2 * HEAD_BYTES, 2, 3))
+    shards = [content_shard([buffer], RankTopology(tp_size=2, tp_rank=r)) for r in range(2)]
+    assert shards == [ShardDesc(2, 0), ShardDesc(2, 1)]
+
+
+@pytest.mark.cpu_only
+def test_a_derived_role_a_subclass_adds_needs_its_own_rebuild():
+    """A subclass naming more derived roles than the class whose rebuild it inherits is refused:
+    that rebuild knows only its own roles."""
+
+    class Parent(Manager):
+        def _page_derived_roles(self):
+            return frozenset({"v_scale"})
+
+        def rebuild_disagg_imported_cache(self, requests):
+            pass
+
+    class Adds(Parent):
+        def _page_derived_roles(self):
+            return super()._page_derived_roles() | {"k_scale"}
+
+    class Rebuilds(Adds):
+        def rebuild_disagg_imported_cache(self, requests):
+            super().rebuild_disagg_imported_cache(requests)
+
+    groups = [kv_group(lids=(0,), extra=[("v_scale", 32, None), ("k_scale", 32, None)])]
+    mappers = {"v_scale": "replicated", "k_scale": "replicated"}
+    assert Parent(groups, mappers=mappers).get_page_table().page_layout.rebuilds_untransferred
+    with pytest.raises(
+        ValueError, match=r"Adds derives its \['k_scale'\] buffers, but its rebuild"
+    ):
+        Adds(groups, mappers=mappers).get_page_table()
+    assert Rebuilds(groups, mappers=mappers).get_page_table().page_layout.rebuilds_untransferred
+
+
+@pytest.mark.cpu_only
 def test_a_share_counts_the_ranks_of_every_dimension_its_tensors_split_over():
     """A state buffer split over tensor times context ranks has a share per place in that grid;
     untransferred and replicated buffers decide nothing."""
@@ -935,7 +974,8 @@ def test_published_shards_are_the_shares_the_topology_gives(
 
     Attention: a rank at place ``p`` of an attention data-parallel group of ``n`` tensor ranks
     holds the heads from ``p * T // n``; its share's first head, ``index * T // count``, is that
-    head, and two ranks have equal shares exactly when they hold the same heads. State: the share
+    head, and two ranks have equal shares exactly when they hold the same heads, or, where ``T``
+    and ``n`` do not divide one another (no checkpoint loads so), the same place. State: the share
     is the rank's place in the grid recurrent state splits over.
     """
     layouts = [
@@ -960,9 +1000,16 @@ def test_published_shards_are_the_shares_the_topology_gives(
             state.shard,
         )
     for one, first_one in zip(layouts, first_heads):
+        ranks = tensor_ranks_per_group(one.topology)
+        even = num_kv_heads % ranks == 0 or ranks % num_kv_heads == 0
         for other, first_other in zip(layouts, first_heads):
             same_share = one.layer_groups[0].shard == other.layer_groups[0].shard
-            assert same_share == (first_one == first_other), (one.topology, other.topology)
+            same = (
+                first_one == first_other
+                if even
+                else one.topology.tp_rank % ranks == other.topology.tp_rank % ranks
+            )
+            assert same_share == same, (one.topology, other.topology)
 
 
 # -- which ranks of an instance hold the same bytes ---------------------------------------------
