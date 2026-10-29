@@ -869,14 +869,14 @@ files = [
 
 [[package]]
 name = "google-api-core"
-version = "2.43.0"
+version = "2.43.1"
 description = "Google API client core library"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "google_api_core-2.43.0-py3-none-any.whl", hash = "sha256:dd588ae9de5e372be89b87c68b1e1555fe89add1809d623182b773d14f96859a"},
-    {file = "google_api_core-2.43.0.tar.gz", hash = "sha256:d67355a22d995a009b6c5ca98744ea35fbf4f9c2c006aa0588c0941d1ceb5216"},
+    {file = "google_api_core-2.43.1-py3-none-any.whl", hash = "sha256:c2b7138ceb84c756a960fd1d579c4c261534b7f7ecaafbf644c03bc4171bc830"},
+    {file = "google_api_core-2.43.1.tar.gz", hash = "sha256:490ae28b0a292e7bef30382824671ded0dd5c9fc52bbd3a44099972f82c47297"},
 ]
 
 [package.dependencies]
@@ -1655,15 +1655,15 @@ files = [
 
 [[package]]
 name = "platformdirs"
-version = "4.13.6"
+version = "4.14.0"
 description = "A small Python package for determining appropriate platform-specific dirs, e.g. a `user data dir`."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "python_version == \"3.12\""
 files = [
-    {file = "platformdirs-4.13.6-py3-none-any.whl", hash = "sha256:21fc198fb09f3e78cadcdfd8a6ae4fd65cadc64a3cba78b694321c2996114a3e"},
-    {file = "platformdirs-4.13.6.tar.gz", hash = "sha256:211d176e24674b5895dedf9021c262bcf9fad008a70610bfb147d4a8d6d8fe1b"},
+    {file = "platformdirs-4.14.0-py3-none-any.whl", hash = "sha256:1dadfc59a8a5d7565b3d9270ae8fa71c065595352c4277b41c11ee6c222c4b91"},
+    {file = "platformdirs-4.14.0.tar.gz", hash = "sha256:83f009c1e8c5fc36869b5171755b291887bd2cade7965233cdfabd23d754720b"},
 ]
 
 [[package]]
@@ -2115,14 +2115,14 @@ typing-extensions = ">=4.16.0"
 
 [[package]]
 name = "python-discovery"
-version = "1.6.6"
+version = "1.6.7"
 description = "Python interpreter discovery"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "python_discovery-1.6.6-py3-none-any.whl", hash = "sha256:95e644ce8625c62dc195a603da9f8138ca5a35048224911b2cf7b3028025527a"},
-    {file = "python_discovery-1.6.6.tar.gz", hash = "sha256:d687024fec55c489e7a465c7f5644300a4d9dbf7727a556a85660536ee922933"},
+    {file = "python_discovery-1.6.7-py3-none-any.whl", hash = "sha256:5422f67e5f533bb02d7b73de1c422ed74037536fd869e05156c07565926ec68e"},
+    {file = "python_discovery-1.6.7.tar.gz", hash = "sha256:7f7c28568c8ec3d988d8bddbdbec8e65f08e8767e52f734e18b8b498549b9b70"},
 ]
 
 [package.dependencies]
@@ -2604,14 +2604,14 @@ files = [
 
 [[package]]
 name = "smart-open"
-version = "8.0.4"
+version = "9.0.0"
 description = "Utils for streaming large files (S3, HDFS, GCS, SFTP, Azure Blob Storage, gzip, bz2, zst...)"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "smart_open-8.0.4-py3-none-any.whl", hash = "sha256:8a3a67679942fa40d1a93ed3aea37619b4b4ec5458f1d5a9228dfc301db11b4c"},
-    {file = "smart_open-8.0.4.tar.gz", hash = "sha256:8cff8321f0b0ae4bd9cb0cd0c507c135ad6aa980171248fca520b645fd6ff717"},
+    {file = "smart_open-9.0.0-py3-none-any.whl", hash = "sha256:48bdc5e5daba5e52c3a45f108aeab22de3e6c594c593d6dea1134be3f14ad4b4"},
+    {file = "smart_open-9.0.0.tar.gz", hash = "sha256:317d2e3b5491673dd30d4bd38120b91e0846451fe361fdf9273fcb2278594be3"},
 ]
 
 [package.dependencies]
@@ -2620,12 +2620,12 @@ wrapt = "*"
 [package.extras]
 all = ["smart_open[azure,gcs,http,lz4,s3,ssh,webhdfs,zst]"]
 azure = ["azure-common", "azure-core", "azure-storage-blob (>=12.7.0)"]
-dev = ["awscli", "boto3-stubs[s3]", "moto[server]", "numpy", "pre-commit", "pyopenssl", "pytest", "pytest-rerunfailures", "pytest-timeout", "pytest-xdist[psutil]", "pytest_benchmark", "responses", "smart_open[all]", "typing_extensions"]
+dev = ["awscli", "boto3-stubs[s3]", "moto[server]", "numpy", "pre-commit", "pyopenssl", "pytest (<9.2)", "pytest-rerunfailures", "pytest-timeout", "pytest-xdist[psutil]", "pytest_benchmark", "responses", "smart_open[all]", "typing_extensions"]
 gcs = ["google-cloud-storage (>=2.6.0)"]
 http = ["requests"]
 lz4 = ["lz4"]
 s3 = ["boto3 (>=1.9.17)"]
-ssh = ["paramiko"]
+ssh = ["paramiko (>=3.2)"]
 webhdfs = ["requests"]
 zst = ["backports.zstd (>=1.0.0) ; python_version < \"3.14\""]
 

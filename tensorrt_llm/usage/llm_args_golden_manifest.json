@@ -29,6 +29,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_kv_balanced_admission"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.enable_kv_cache_aware_routing"
     },
     {

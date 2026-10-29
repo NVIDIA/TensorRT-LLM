@@ -1491,9 +1491,9 @@ class ModelLoader:
                         #      compatibility check (GMS has no disk fallback).
                         #   4. `materialize_module`: zero-copy bind GMS
                         #      pool storage onto the model parameters.
-                        #   5. Per-module `cache_derived_state`: recompute
-                        #      Python-side state from real, materialized
-                        #      tensors without re-running one-shot transforms.
+                        #   5. Mark materialized weights as transformed, then
+                        #      recompute Python-side derived state without
+                        #      re-running one-shot transforms.
                         #   6. `post_load_publish`: apply the format-specific
                         #      receiver publication policy.
                         with timing_metric(
@@ -1511,6 +1511,7 @@ class ModelLoader:
                             self._check_gms_source_identity(gms_backend)
 
                             gms_backend.materialize_module(model)
+                            self._mark_weights_transformed(model)
                             self._walk_cache_state(model)
 
                             self._post_load_publish(
