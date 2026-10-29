@@ -32,7 +32,8 @@ from tensorrt_llm._torch.modules.linear import (TensorParallelMode,
 from tensorrt_llm._torch.utils import (ActivationType,
                                        replace_parameter_and_save_metadata,
                                        swizzle_sf, unswizzle_sf)
-from tensorrt_llm._utils import get_sm_version, is_device_integrated, is_sm_100f
+from tensorrt_llm._utils import (get_sm_version, is_device_integrated,
+                                 is_sm_100f, is_sm_120f)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.functional import \
@@ -1466,7 +1467,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
     def _needs_e8m0_resmooth(self):
-        return is_sm_100f() or get_sm_version() == 120
+        return is_sm_100f() or is_sm_120f()
 
     def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
         if self._needs_e8m0_resmooth():
@@ -4016,7 +4017,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                               num_groups=num_local_experts)
 
         if is_w4a16_nvfp4:
-            # W4A16 path: BF16/FP16 activations multiplied by FP4 weights.
+            # W4A16 path: BF16 activations multiplied by FP4 weights.
             # FlashInfer's W4A16 packer expects the ModelOpt scale contract:
             # normalized FP8 block scales plus per-expert ``weight_global_scale``.
             w1_alpha_b12x = w1_w_scale_2.to(torch.float32).contiguous()
@@ -4068,8 +4069,10 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         )
 
         # Replace the wrapper's per-instance output buffer with a shared one.
-        # Layers run sequentially on a single stream, so a single buffer of the
-        # right shape is correct and saves
+        # Layers run sequentially on a single stream, and a multi-chunk forward
+        # copies every chunk but the last out of it, the trailing ``torch.cat``
+        # the last (the backend declares ``run_moe_reuses_buffers``), so a
+        # single buffer of the right shape is correct and saves
         # ``(num_moe_layers - 1) * max_num_tokens * hidden_size * 2`` bytes —
         # ~2.5 GB on Nemotron-Super-120B with ``max_num_tokens=2048``,
         # ``hidden=8192``, bf16, 80 MoE layers.

@@ -29,7 +29,13 @@ from tensorrt_llm._torch.pyexecutor._util import (
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DFlashDecodingConfig,
+    DSparkDecodingConfig,
+    Eagle3DecodingConfig,
+    KvCacheConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.mapping import CpType, Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -1257,22 +1263,23 @@ class TestExternalDrafterKvDtype:
 
 
 class TestStandaloneDrafterPageSize:
-    """A standalone drafter's separate pool has its own page size.
+    """A standalone drafter's pool keeps the target's page size only where its kernels accept it.
 
     The target's tokens_per_block is whatever its attention backend or the
     deployment config chose (FP4 MLA forces 128), and the drafter's block-decode
     kernels need not accept it: trtllm-gen MLA decode takes 32 or 64 only. The
-    pool is built with the drafter's page size, and the budget split must charge
-    the same one, since per-request quotas round up to whole pages.
+    pool keeps a target page size every drafter kernel accepts and is built with
+    the drafter's page size otherwise, and the budget split must charge the same
+    one, since per-request quotas round up to whole pages.
     """
 
-    TARGET_TOKENS_PER_BLOCK = 128
+    KEPT_AND_REPLACED = [(64, 64), (128, _STANDALONE_DRAFT_TOKENS_PER_BLOCK)]
 
-    def _creator(self, mocker):
+    def _creator(self, mocker, target_tokens_per_block):
         from tensorrt_llm.models.modeling_utils import QuantConfig
 
         c, draft_model_config, _ = TestExternalDrafterKvDtype()._creator(mocker, QuantConfig())
-        c._tokens_per_block = self.TARGET_TOKENS_PER_BLOCK
+        c._tokens_per_block = target_tokens_per_block
         # Read by the draft manager-class resolution on both the cost and the
         # allocation path; the resolution itself is not under test here.
         c._cache_transceiver_config = None
@@ -1280,19 +1287,49 @@ class TestStandaloneDrafterPageSize:
         c._validate_or_fallback_kv_cache_manager_v2 = Mock(side_effect=lambda cls, *_: cls)
         return c, draft_model_config
 
-    def test_standalone_drafter_page_size_is_independent_of_the_target(self, mocker):
-        c, _ = self._creator(mocker)
-        assert c._get_draft_tokens_per_block() == _STANDALONE_DRAFT_TOKENS_PER_BLOCK
-        assert c._get_draft_tokens_per_block() != c._tokens_per_block
+    @pytest.mark.parametrize(
+        "spec_config",
+        [DSparkDecodingConfig(max_draft_len=4), DFlashDecodingConfig(max_draft_len=4)],
+        ids=["dspark", "dflash"],
+    )
+    @pytest.mark.parametrize(
+        "target_tokens_per_block, draft_tokens_per_block",
+        [
+            (64, 64),
+            (32, 32),
+            (128, _STANDALONE_DRAFT_TOKENS_PER_BLOCK),
+            (16, _STANDALONE_DRAFT_TOKENS_PER_BLOCK),
+        ],
+    )
+    def test_standalone_drafter_keeps_a_target_page_size_its_kernels_accept(
+        self, mocker, spec_config, target_tokens_per_block, draft_tokens_per_block
+    ):
+        c, _ = self._creator(mocker, target_tokens_per_block)
+        c._speculative_config = spec_config
+        assert c._get_draft_tokens_per_block() == draft_tokens_per_block
 
-    def test_draft_layers_of_the_target_keep_the_target_page_size(self, mocker):
+    @pytest.mark.parametrize(
+        "spec_config",
+        [
+            MTPDecodingConfig(num_nextn_predict_layers=1, max_draft_len=4),
+            Eagle3DecodingConfig(max_draft_len=4, speculative_model="draft-model"),
+        ],
+        ids=["mtp", "eagle3"],
+    )
+    @pytest.mark.parametrize("target_tokens_per_block", [64, 128])
+    def test_draft_layers_of_the_target_keep_the_target_page_size(
+        self, mocker, spec_config, target_tokens_per_block
+    ):
         """MTP/Eagle3 draft layers run on the target's attention metadata."""
-        c, _ = self._creator(mocker)
-        c._speculative_config = MTPDecodingConfig(num_nextn_predict_layers=1, max_draft_len=4)
-        assert c._get_draft_tokens_per_block() == self.TARGET_TOKENS_PER_BLOCK
+        c, _ = self._creator(mocker, target_tokens_per_block)
+        c._speculative_config = spec_config
+        assert c._get_draft_tokens_per_block() == target_tokens_per_block
 
-    def test_cost_charges_the_draft_page_size(self, mocker):
-        c, _ = self._creator(mocker)
+    @pytest.mark.parametrize("target_tokens_per_block, draft_tokens_per_block", KEPT_AND_REPLACED)
+    def test_cost_charges_the_draft_page_size(
+        self, mocker, target_tokens_per_block, draft_tokens_per_block
+    ):
+        c, _ = self._creator(mocker, target_tokens_per_block)
         size_spy = mocker.spy(KVCacheManagerV2, "get_cache_size_per_token")
         bytes_spy = mocker.spy(KVCacheManagerV2, "get_cache_bytes_per_request")
         quota_spy = mocker.spy(KVCacheManagerV2, "get_cache_quota_per_request")
@@ -1305,12 +1342,13 @@ class TestStandaloneDrafterPageSize:
 
         for spy in (size_spy, bytes_spy, quota_spy):
             assert spy.call_count == 1, spy
-            assert spy.call_args.kwargs["tokens_per_block"] == (
-                _STANDALONE_DRAFT_TOKENS_PER_BLOCK
-            ), spy
+            assert spy.call_args.kwargs["tokens_per_block"] == draft_tokens_per_block, spy
 
-    def test_allocation_uses_the_page_size_the_cost_charged(self, mocker):
-        c, draft_model_config = self._creator(mocker)
+    @pytest.mark.parametrize("target_tokens_per_block, draft_tokens_per_block", KEPT_AND_REPLACED)
+    def test_allocation_uses_the_page_size_the_cost_charged(
+        self, mocker, target_tokens_per_block, draft_tokens_per_block
+    ):
+        c, draft_model_config = self._creator(mocker, target_tokens_per_block)
         draft_model_config.sparse_attention_config = None
         c._model_engine.max_cuda_graph_batch_size = 1
         c._skip_est = False
@@ -1327,7 +1365,7 @@ class TestStandaloneDrafterPageSize:
 
         assert create.call_count == 1
         allocated = create.call_args.kwargs["tokens_per_block"]
-        assert allocated == _STANDALONE_DRAFT_TOKENS_PER_BLOCK
+        assert allocated == draft_tokens_per_block
         assert size_spy.call_args.kwargs["tokens_per_block"] == allocated
 
 
