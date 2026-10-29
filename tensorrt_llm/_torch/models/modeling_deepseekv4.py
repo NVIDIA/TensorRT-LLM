@@ -1625,6 +1625,9 @@ class DeepseekV4Gate(nn.Module):
 
 
 class DeepseekV4MoE(nn.Module):
+    # Set per instance in __init__; the default covers instances built without it.
+    _per_layer_dynamic_eplb_enabled = False
+
     def __init__(
         self,
         *,
