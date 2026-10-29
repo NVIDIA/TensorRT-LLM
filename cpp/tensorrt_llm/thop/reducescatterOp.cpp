@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 #if ENABLE_MULTI_DEVICE
@@ -29,6 +30,7 @@
 #endif // ENABLE_MULTI_DEVICE
 
 #include <cassert>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -57,6 +59,39 @@ public:
     {
         TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, -1);
         mNcclComm = getComm(mGroup);
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+        constexpr size_t kMinGroupSize = 8;
+        if (mGroup.size() >= kMinGroupSize)
+        {
+            static std::map<std::set<int>, std::shared_ptr<ncclComm_t>> prefillComms;
+            static std::mutex prefillMutex;
+            std::lock_guard<std::mutex> const lock(prefillMutex);
+            auto cached = prefillComms.find(mGroup);
+            if (cached == prefillComms.end())
+            {
+                constexpr int kTargetSmMajor = 10;
+                constexpr int kTargetSmMinor = 3;
+                constexpr int kMinRuntimeVersion = NCCL_VERSION(2, 31, 0);
+                constexpr int kPrefillCtas = 64;
+                auto const* properties = at::cuda::getCurrentDeviceProperties();
+                int runtimeVersion = 0;
+                NCCLCHECK_THROW(ncclGetVersion(&runtimeVersion));
+                bool const locallyEligible = properties->major == kTargetSmMajor && properties->minor == kTargetSmMinor
+                    && runtimeVersion >= kMinRuntimeVersion;
+                auto eligible = torch::full(
+                    {1}, locallyEligible ? 1 : 0, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+                NCCLCHECK_THROW(ncclAllReduce(eligible.data_ptr(), eligible.mutable_data_ptr(), 1, ncclInt32, ncclMin,
+                    *mNcclComm, at::cuda::getCurrentCUDAStream()));
+                std::shared_ptr<ncclComm_t> prefillComm;
+                if (eligible.item<int32_t>() != 0)
+                {
+                    prefillComm = getComm(mGroup, kPrefillCtas);
+                }
+                cached = prefillComms.emplace(mGroup, std::move(prefillComm)).first;
+            }
+            mPrefillNcclComm = cached->second;
+        }
+#endif
         TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, -1);
         return 0;
     }
@@ -98,8 +133,15 @@ public:
             auto output = torch::empty(outputShape, input.options());
             if (use_nccl_reducescatter)
             {
+                constexpr size_t kMinPrefillBytes = 2 * 1024 * 1024;
+                constexpr size_t kMaxPrefillBytes = 16 * 1024 * 1024;
+                auto const outputBytes = output.nbytes();
+                auto const& communicator = mPrefillNcclComm != nullptr && input.scalar_type() == at::kBFloat16
+                        && outputBytes >= kMinPrefillBytes && outputBytes <= kMaxPrefillBytes
+                    ? mPrefillNcclComm
+                    : mNcclComm;
                 ncclReduceScatter(input.data_ptr(), output.mutable_data_ptr(), output.numel(), (*getDtypeMap())[type],
-                    ncclSum, *mNcclComm, stream);
+                    ncclSum, *communicator, stream);
             }
             else
             {
@@ -129,6 +171,7 @@ public:
 private:
     std::set<int> mGroup;
     std::shared_ptr<ncclComm_t> mNcclComm;
+    std::shared_ptr<ncclComm_t> mPrefillNcclComm;
 };
 
 class ReducescatterPgOp
