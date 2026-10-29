@@ -51,6 +51,15 @@ class TestExtractModule:
     """Tests for _extract_module which parses module name from __name__."""
 
     def test_standard_subpackage(self):
+        # TEMPORARY (rerun policy validation): fails on the first attempt in a
+        # pod and passes on the rerun. Revert before merging.
+        import os
+        import tempfile
+
+        marker = os.path.join(tempfile.gettempdir(), "rerun_policy_fail_once")
+        if not os.path.exists(marker):
+            open(marker, "w").close()
+            assert False, "first attempt fails on purpose"
         assert _extract_module("tensorrt_llm.runtime.generation") == "runtime"
 
     def test_torch_subpackage(self):

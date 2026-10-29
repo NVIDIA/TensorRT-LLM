@@ -119,6 +119,17 @@ def test_output_config_preserves_sampler_and_prompt_logprobs(
 @pytest.mark.cpu_only
 def test_get_startup_metrics_promotes_model_engine_stages() -> None:
     """Verify startup metrics promote saved engine stages while retaining executor metrics."""
+    # TEMPORARY (rerun policy validation): hangs on the first attempt in a pod, past
+    # the TIMEOUT (1) on its l0_cpu.yml entry, so pytest-timeout ends the process.
+    # Timed-out tests are not rerun, so the isolated run reports it as terminated
+    # unexpectedly. Revert before merging.
+    import os
+    import tempfile
+
+    marker = os.path.join(tempfile.gettempdir(), "rerun_policy_hang_once")
+    if not os.path.exists(marker):
+        open(marker, "w").close()
+        time.sleep(600)
     worker = object.__new__(BaseWorker)
     worker.doing_shutdown = True
     worker.engine = SimpleNamespace(
