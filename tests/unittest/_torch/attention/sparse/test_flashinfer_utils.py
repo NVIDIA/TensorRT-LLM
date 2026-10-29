@@ -25,7 +25,7 @@ from tensorrt_llm._torch.attention.backends.sparse.flashinfer_utils import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimeParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -61,8 +61,10 @@ def test_sm120_sm121_sparse_mla_requires_packed_cache_dtype(
 ) -> None:
     with (
         patch(
-            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
-            return_value=sm,
+            "tensorrt_llm._torch.attention.backends.trtllm.is_sm_120f",
+            side_effect=lambda sm_version=None: is_sm_120f(
+                sm if sm_version is None else sm_version
+            ),
         ),
         pytest.raises(
             ValueError,
@@ -82,7 +84,7 @@ def test_sm120_sm121_sparse_mla_requires_packed_cache_dtype(
 
 def test_flashinfer_sparse_mla_missing_private_op_warns() -> None:
     with (
-        patch.object(flashinfer_sparse_mla, "get_sm_version", return_value=120),
+        patch.object(flashinfer_sparse_mla, "is_sm_120f", return_value=True),
         patch.object(
             flashinfer_sparse_mla,
             "get_sparse_mla_op",
@@ -175,7 +177,7 @@ def test_inline_scale_kv_quant_scatter_layout() -> None:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() not in (120, 121),
+    not torch.cuda.is_available() or not is_sm_120f(),
     reason="FlashInfer sparse MLA requires SM 120 or SM 121",
 )
 def test_dsa_sparse_mla_cuda_graph_capture_replay() -> None:

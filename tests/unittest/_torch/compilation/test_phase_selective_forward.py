@@ -231,6 +231,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         enabled=False,
         is_warmup_only=False,
         padding_dummy_requests={},
+        reset_padding_dummies=Mock(),
     )
     graphs.preallocate_padding_dummies = Mock()
     warmup = object.__new__(DecoderWarmup)
@@ -241,6 +242,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     warmup._warmup_timer = _WarmupTimer(rank=0)
     warmup._agreement = SimpleNamespace(agree_flag=lambda value: value, agree_shapes=lambda s: s)
     warmup._graphs = graphs
+    warmup._metadata = SimpleNamespace(_warmup_dspark_ragged_compressor_metadata=Mock())
     warmup._context_warmups_supported = True
     warmup._torch_compile_bypass = runner._bypass_torch_compile
     warmup._get_full_general_warmup_requests = Mock(return_value=[(4, 0)])
