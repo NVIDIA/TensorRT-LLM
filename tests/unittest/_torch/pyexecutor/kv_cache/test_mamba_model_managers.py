@@ -1466,7 +1466,7 @@ def test_constructor_validates_before_pool_and_binds_after_slot_capacity(monkeyp
         self.mapping = kwargs["mapping"]
         self.layer_offsets = {0: 0, 1: 1}
         self.impl = SimpleNamespace(
-            get_layer_group_id=lambda layer: 0,
+            get_buffer_group_id=lambda layer, role: 0,
             get_page_index_scale=lambda layer, role: 1,
             get_page_index_upper_bound=lambda layer, role: 5,
         )
