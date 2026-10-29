@@ -194,6 +194,7 @@ l0_cpu:
   - unittest/docs/test_llmapi_reference_docs.py
   - unittest/dynamo
   - unittest/evaluate/test_image_generation_eval_cli.py
+  - unittest/evaluate/test_json_mode_eval.py
   - unittest/executor/test_base_worker.py ISOLATION
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py
