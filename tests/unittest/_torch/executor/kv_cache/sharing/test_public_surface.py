@@ -82,6 +82,7 @@ INTERNALS = {
     # The hooks a manager builds its page table with; the lender reads the table it returns.
     "_page_buffer_tensors",
     "_page_head_split",
+    "_page_state_split",
     "_page_untransferred_roles",
     "_page_rebuilds_untransferred",
     "_page_layer_ids",

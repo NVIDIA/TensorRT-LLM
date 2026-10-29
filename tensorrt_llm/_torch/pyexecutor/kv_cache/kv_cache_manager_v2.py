@@ -138,10 +138,11 @@ from .page_layout import (
     BufferDesc,
     LayerGroupDesc,
     PageLayout,
-    ShardDesc,
     Tensor,
+    content_shard,
     grid_place,
     head_major,
+    held_bytes,
     owned,
     replicated,
     token_major,
@@ -149,9 +150,7 @@ from .page_layout import (
 from .page_table import (
     DevicePool,
     ManagerLayout,
-    attention_shard,
     buffer_expansions,
-    group_shard,
     has_sparse_buffers,
     is_non_required_layer,
     is_private_layer,
@@ -3524,23 +3523,13 @@ class KVCacheManagerV2(BaseResourceManager):
             lid: buffer_expansions(cfg, tokens_per_block) for lid, cfg in layer_cfg.items()
         }
 
-        # The grid attention heads split over, and the one recurrent state splits over: tensor
-        # ranks, none under attention data parallelism, times context ranks under Helix.
         mapping = self.mapping
-        attention_dp = bool(getattr(mapping, "enable_attention_dp", False))
-        tp_size = 1 if attention_dp else max(int(mapping.tp_size), 1)
-        tp_rank = 0 if tp_size == 1 else int(mapping.tp_rank) % tp_size
+        topology = rank_topology(mapping)
         cp_rank, cp_size = int(self._helix_cp_rank), int(self._helix_cp_size)
-        state_cp_rank, state_cp_size = (0, 1) if attention_dp else (cp_rank, cp_size)
-        state_shard = (
-            ShardDesc()
-            if tp_size * state_cp_size == 1
-            else ShardDesc(tp_size * state_cp_size, tp_rank * state_cp_size + state_cp_rank)
-        )
 
         device_pools: dict[int, tuple[DevicePool, ...]] = {}
         buffers: list[BufferDesc] = []
-        shards: dict[int, list[ShardDesc]] = {lg: [] for lg in range(len(grouping))}
+        group_buffers: dict[int, list[BufferDesc]] = {lg: [] for lg in range(len(grouping))}
         for pg in self.impl.pool_group_descs:
             g = int(pg.pool_group_index)
             pools = tuple(
@@ -3566,8 +3555,15 @@ class KVCacheManagerV2(BaseResourceManager):
                             tensors = self._page_buffer_tensors(
                                 lid, role, size, tokens_per_block // expansion, state
                             )
+                            declared = sum(held_bytes(t, topology) for t in tensors)
                         except ValueError as error:
                             raise ValueError(f"buffer ({lid}, {role}): {error}") from error
+                        if declared != size:
+                            # Bytes no tensor describes would never move, or be moved twice.
+                            raise ValueError(
+                                f"buffer ({lid}, {role}): its tensors hold {declared} bytes on "
+                                f"this rank, not the {size} bytes of its slot"
+                            )
                         desc = BufferDesc(
                             layer=global_of.get(lid, lid),
                             role=role,
@@ -3580,14 +3576,7 @@ class KVCacheManagerV2(BaseResourceManager):
                             expansion=expansion,
                         )
                         buffers.append(desc)
-                        if not transfer or not desc.split:
-                            continue
-                        heads, total = kv_heads[lid]
-                        shards[lg].append(
-                            state_shard
-                            if state
-                            else attention_shard(tp_size, tp_rank, heads, total)
-                        )
+                        group_buffers[lg].append(desc)
 
         layer_groups: list[LayerGroupDesc] = []
         total_kv_heads: dict[int, int] = {}
@@ -3626,7 +3615,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     num_sink_blocks=-(-sink_tokens // tokens_per_block),
                     pool_group=g,
                     layers=tuple(layer for layer, _ in named),
-                    shard=group_shard(shards[lg], ShardDesc(tp_size, tp_rank)),
+                    shard=content_shard(group_buffers[lg], topology),
                     read_window=read,
                     model_layers=tuple(model_layer for _, model_layer in named),
                 )
@@ -3639,7 +3628,7 @@ class KVCacheManagerV2(BaseResourceManager):
             },
             layer_groups=tuple(layer_groups),
             buffers=tuple(buffers),
-            topology=rank_topology(mapping),
+            topology=topology,
             total_kv_heads_by_layer=total_kv_heads,
             dtype=self._page_dtype(),
             quant_mode=self._page_quant_mode(),
@@ -3691,24 +3680,19 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _page_kv_heads(self, layer: int) -> tuple[int, int | None]:
         """(KV heads on this rank, KV heads over all tensor-parallel ranks or None if unknown) of
-        internal layer ``layer``. A virtual layer counts the heads of its model layer; an internal
-        layer past the local layers counts those of the first."""
-        virtual = self._virtual_layers()
-        index = layer
-        if virtual is not None and layer in virtual[0]:
-            model_layer = virtual[0][layer][0]
-            if model_layer in self.pp_layers:
-                index = list(self.pp_layers).index(model_layer)
+        internal layer ``layer``: those of its model layer (``_page_layer_ids``), 0 heads on this
+        rank for a model layer this pipeline stage does not hold."""
+        model_layer = int(self._page_layer_ids()[layer][1])
+        pp_layers = [int(m) for m in self.pp_layers]
         per_layer = list(self.num_kv_heads_per_layer or ())
-        per_rank = int(per_layer[index if index < len(per_layer) else 0] or 0) if per_layer else 0
+        index = pp_layers.index(model_layer) if model_layer in pp_layers else len(per_layer)
+        per_rank = int(per_layer[index] or 0) if index < len(per_layer) else 0
         total = self.num_kv_heads
         if isinstance(total, int):
             return per_rank, int(total)
-        if total is None or virtual is not None or layer >= len(self.pp_layers):
-            # An extra internal layer (FP4 MLA's tail) is no model layer.
+        if total is None or model_layer >= len(total) or total[model_layer] is None:
             return per_rank, None
-        value = total[int(self.pp_layers[layer])]
-        return per_rank, None if value is None else int(value)
+        return per_rank, int(total[model_layer])
 
     def _page_buffer_tensors(
         self, layer_id: int, role: str, size: int, tokens: int, state: bool
@@ -3736,7 +3720,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if role in _HEAD_SPLIT_ROLES:
             return self._page_head_split(layer_id, size, tokens, state)
         if role in self._page_untransferred_roles():
-            split = ("tp", "cp") if state else ("tp",)
+            split = self._page_state_split() if state else ("tp",)
             return owned(size, grid_place(rank_topology(self.mapping), split)[0], split)
         raise ValueError(
             f"{type(self).__name__} registers role {role!r} but does not declare how its bytes "
@@ -3755,10 +3739,10 @@ class KVCacheManagerV2(BaseResourceManager):
         token_major_: bool = False,
     ) -> tuple[Tensor, ...]:
         """A buffer split by head over the ranks attention splits over (tensor ranks) or recurrent
-        state does (tensor times context ranks): ``size // head_bytes`` heads, by default the
-        layer's KV heads on this rank, head-major or, with ``token_major_``, token-major. A buffer
-        whose heads are unknown is this rank's own share."""
-        split = ("tp", "cp") if state else ("tp",)
+        state does (``_page_state_split``): ``size // head_bytes`` heads, by default the layer's KV
+        heads on this rank, head-major or, with ``token_major_``, token-major. A buffer whose heads
+        are unknown is this rank's own share."""
+        split = self._page_state_split() if state else ("tp",)
         ranks, _ = grid_place(rank_topology(self.mapping), split)
         heads, total = self._page_kv_heads(layer_id)
         if head_bytes is None and not state and heads > 0 and size % heads == 0:
@@ -3770,6 +3754,14 @@ class KVCacheManagerV2(BaseResourceManager):
         if token_major_:
             return token_major(size, tokens, heads, total, split)
         return head_major(size, heads, total, split)
+
+    def _page_state_split(self) -> tuple[str, ...]:
+        """The parallel dimensions recurrent state splits over, as its pools are sized
+        (``mamba_effective_tp_size``): tensor times context ranks under Helix, else tensor ranks,
+        which attention data parallelism makes one rank alone (``grid_place``)."""
+        if self._has_cp_helix and not getattr(self.mapping, "enable_attention_dp", False):
+            return ("tp", "cp")
+        return ("tp",)
 
     def _page_rebuilds_untransferred(self) -> bool:
         """Whether the untransferred buffers derive from the others and are rebuilt after the

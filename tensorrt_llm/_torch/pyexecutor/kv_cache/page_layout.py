@@ -43,9 +43,11 @@ __all__ = [
     "RankTopology",
     "ShardDesc",
     "Tensor",
+    "content_shard",
     "grid_place",
     "head_major",
     "held",
+    "held_bytes",
     "layout_from_dict",
     "layout_to_dict",
     "owned",
@@ -397,12 +399,9 @@ class LayerGroupDesc:
     A block held only by the kept window may remain unwritten without preventing
     resumption when it lies outside the read window.
 
-    A group's transferred buffers split over one grid of ranks, set by its kind:
-    attention groups over the tensor-parallel ranks of one attention data-parallel
-    group; state groups over the tensor-parallel ranks, over none under attention
-    data parallelism, and over tensor times context ranks, context-minor, under
-    Helix. ``shard`` is this rank's share; each buffer's ``tensors`` say how it
-    splits.
+    Each buffer's ``tensors`` say how it splits over the ranks; ``shard`` is the share
+    of the group's content this rank holds, by the indices its transferred buffers
+    hold (``content_shard``), so ranks with equal shares hold equal bytes.
 
     Attributes:
         kind: "attention" for attention KV data, or "state" for recurrent state.
@@ -813,24 +812,65 @@ def _same_group(layout: PageLayout, desc: LayerGroupDesc) -> LayerGroupDesc | No
     return None
 
 
-def _held_indices(layout: PageLayout, desc: LayerGroupDesc) -> tuple | None:
-    """The indices this rank holds of every split axis of the group's transferred buffers, by
-    (layer, role, tensor, axis); None when no transferred buffer splits."""
+def _split_holdings(buffers: Sequence[BufferDesc], topology: RankTopology) -> tuple:
+    """The indices the rank at ``topology`` holds of every split axis of the transferred buffers
+    among ``buffers``, as ((layer, role, tensor, axis), progression) pairs in that key order."""
     out = []
-    for buffer in layout.buffers:
-        if (
-            buffer.pool_group != desc.pool_group
-            or buffer.layer not in desc.layers
-            or not buffer.transferred
-            or not buffer.split
-        ):
+    for buffer in buffers:
+        if not buffer.transferred or not buffer.split:
             continue
         for tensor in buffer.tensors:
             for axis in tensor.axes:
                 if axis.split:
                     key = (buffer.layer, buffer.role, tensor.name, axis.name)
-                    out.append((key, held(axis, layout.topology)))
-    return tuple(sorted(out, key=lambda item: item[0])) if out else None
+                    out.append((key, held(axis, topology)))
+    return tuple(sorted(out, key=lambda item: item[0]))
+
+
+def _held_indices(layout: PageLayout, desc: LayerGroupDesc) -> tuple | None:
+    """The indices this rank holds of every split axis of the group's transferred buffers, by
+    (layer, role, tensor, axis); None when no transferred buffer splits."""
+    buffers = [
+        b for b in layout.buffers if b.pool_group == desc.pool_group and b.layer in desc.layers
+    ]
+    return _split_holdings(buffers, layout.topology) or None
+
+
+def content_shard(buffers: Sequence[BufferDesc], topology: RankTopology) -> ShardDesc:
+    """The share of a layer group's content the rank at ``topology`` holds, read from the group's
+    ``buffers``: ranks of its grid hold the same share exactly when they hold the same indices of
+    every split axis of the transferred buffers, and shares are numbered in the order of the
+    indices they hold. The whole content when every rank holds alike."""
+
+    def share(place: RankTopology) -> tuple:
+        return tuple(
+            (key, (p.start, p.step, p.count)) for key, p in _split_holdings(buffers, place)
+        )
+
+    mine = share(topology)
+    if not mine:
+        return ShardDesc()
+    shares = {
+        share(
+            dataclasses.replace(
+                topology,
+                tp_rank=tp_rank,
+                cp_rank=cp_rank,
+                dp_rank=tp_rank if topology.attention_dp else topology.dp_rank,
+            )
+        )
+        for tp_rank in range(topology.tp_size)
+        for cp_rank in range(topology.cp_size)
+    }
+    if len(shares) == 1:
+        return ShardDesc()
+    return ShardDesc(len(shares), sorted(shares).index(mine))
+
+
+def held_bytes(tensor: Tensor, topology: RankTopology) -> int:
+    """Bytes of the tensor's local piece on the rank at ``topology``: one per index it holds of
+    every axis together."""
+    return math.prod(held(axis, topology).count for axis in tensor.axes)
 
 
 def replica_ranks(

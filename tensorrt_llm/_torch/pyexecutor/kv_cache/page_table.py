@@ -22,9 +22,9 @@ from __future__ import annotations
 import dataclasses
 import enum
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping
 
-from .page_layout import PageLayout, RankTopology, ShardDesc, layout_from_dict, layout_to_dict
+from .page_layout import PageLayout, RankTopology, layout_from_dict, layout_to_dict
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, SsmLayerConfig
@@ -227,28 +227,3 @@ def rank_topology(mapping: object) -> RankTopology:
         dp_rank=tp_rank if adp else 0,
         attention_dp=adp,
     )
-
-
-def attention_shard(tp_size: int, tp_rank: int, heads: int, total: int | None) -> ShardDesc:
-    """The share of a head-sharded attention buffer a rank holds: ``total`` heads over ``tp_size``
-    ranks, rank ``r`` holding ``heads`` from ``r * total // tp_size``."""
-    if tp_size == 1:
-        return ShardDesc()
-    if heads <= 0 or total is None or total <= 0:
-        return ShardDesc(tp_size, tp_rank)
-    if any(rank * total // tp_size % heads for rank in range(tp_size)):
-        # Some rank's heads straddle two shares, so each rank's buffer is a share of its own.
-        return ShardDesc(tp_size, tp_rank)
-    # total // heads distinct shares; fewer heads than ranks are repeated, so a single head is one
-    # share that every rank holds.
-    count = max(total // heads, 1)
-    return ShardDesc(count, min((tp_rank * total // tp_size) // heads, count - 1))
-
-
-# A layer group is whole when every transferred buffer holds the same bytes on every rank
-# (replicated, or one KV head shared by all ranks); else it is the share this rank holds.
-def group_shard(shards: Sequence[ShardDesc], fallback: ShardDesc) -> ShardDesc:
-    parts = {s for s in shards if s.count != 1}
-    if not parts:
-        return ShardDesc()
-    return parts.pop() if len(parts) == 1 else fallback

@@ -3586,11 +3586,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if role == MambaRole.CONV_STATE:
             d_conv_m1 = int(self.conv_state_shape[1])
             conv_elem_size = self.conv_state_dtype.itemsize
-            ranks, _ = grid_place(page_topology(self.mapping), ("tp", "cp"))
+            split = self._page_state_split()
+            ranks, _ = grid_place(page_topology(self.mapping), split)
             return sectioned([
                 int(dim) * d_conv_m1 * conv_elem_size
                 for dim in self.conv_section_dims
-            ], ranks, ("tp", "cp"))
+            ], ranks, split)
         if role == MambaRole.SSM_STATE:
             _, head_dim, d_state = self.ssm_state_shape
             return self._page_head_split(layer_id,

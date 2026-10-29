@@ -44,12 +44,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     RankTopology,
     ShardDesc,
     Tensor,
+    content_shard,
     head_major,
     replicated,
     sectioned,
     token_major,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import attention_shard
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryKind,
     MemoryRegion,
@@ -375,6 +375,7 @@ class Manager:
 
     get_page_table = KVCacheManagerV2.get_page_table
     _page_head_split = KVCacheManagerV2._page_head_split
+    _page_state_split = KVCacheManagerV2._page_state_split
     _page_rebuilds_untransferred = KVCacheManagerV2._page_rebuilds_untransferred
     _page_layer_configs = KVCacheManagerV2._page_layer_configs
     _page_layer_ids = KVCacheManagerV2._page_layer_ids
@@ -487,7 +488,7 @@ class Manager:
         if kind == "replicated":
             return replicated(size)
         if kind == "sectioned":
-            split = ("tp", "cp") if state else ("tp",)
+            split = self._page_state_split() if state else ("tp",)
             ranks, _ = page_layout.grid_place(page_table.rank_topology(self.mapping), split)
             return sectioned(layout["section_bytes"], ranks, split)
         return self._page_head_split(
@@ -591,7 +592,7 @@ def test_kv_heads_name_the_share_each_rank_holds(case):
 
 
 # (KV heads T, TP size, heads per rank) -> each rank's share. Rank r holds its heads from
-# r * T // tp; where any rank's range starts inside a share, every rank is a share of its own.
+# r * T // tp, so ranks share a share exactly when their ranges start alike.
 UNALIGNED_HEADS = {
     (6, 4, 2): [ShardDesc(4, r) for r in range(4)],
     (12, 8, 2): [ShardDesc(8, r) for r in range(8)],
@@ -602,10 +603,35 @@ UNALIGNED_HEADS = {
 
 
 @pytest.mark.cpu_only
-def test_unaligned_head_ranges_give_every_rank_its_own_share():
+def test_head_ranges_name_the_shares_the_ranks_hold():
     for (total, tp_size, per_rank), shares in UNALIGNED_HEADS.items():
-        got = [attention_shard(tp_size, r, per_rank, total) for r in range(tp_size)]
+        size = per_rank * HEAD_BYTES
+        buffer = BufferDesc(0, "key", 0, 0, 0, size, tensors=head_major(size, per_rank, total))
+        got = [
+            content_shard([buffer], RankTopology(tp_size=tp_size, tp_rank=r))
+            for r in range(tp_size)
+        ]
         assert got == shares, f"{total} heads over {tp_size} ranks: {got}"
+
+
+@pytest.mark.cpu_only
+def test_a_share_counts_the_ranks_of_every_dimension_its_tensors_split_over():
+    """A state buffer split over tensor times context ranks has a share per place in that grid;
+    untransferred and replicated buffers decide nothing."""
+    state = BufferDesc(0, "ssm", 0, 0, 0, 32, tensors=head_major(32, 1, 4, ("tp", "cp")))
+    whole = BufferDesc(0, "ple", 0, 1, 0, 32)
+    local = BufferDesc(
+        0, "scratch", 0, 2, 0, 32, tensors=page_layout.owned(32, 4), transferred=False
+    )
+    got = [
+        content_shard(
+            [whole, state, local], RankTopology(tp_size=2, tp_rank=t, cp_size=2, cp_rank=c)
+        )
+        for t in range(2)
+        for c in range(2)
+    ]
+    assert got == [ShardDesc(4, i) for i in range(4)]
+    assert content_shard([whole, local], RankTopology(tp_size=2, tp_rank=1)) == ShardDesc()
 
 
 @pytest.mark.cpu_only
@@ -669,8 +695,7 @@ def mixed_shares(tp_size, tp_rank, heads):
     return manager
 
 
-# name: (ranks, heads per layer). The group's first buffer is layer 0's. At TP8 the narrowest
-# share equals the fallback, and the first buffer's too with eight heads first; at TP6 none does.
+# name: (ranks, heads per layer). Each rank holds one head of each layer, from r * heads // ranks.
 MIXED_SHARES = {
     "eight_first": (8, (8, 4)),
     "four_first": (8, (4, 8)),
@@ -681,24 +706,27 @@ MIXED_SHARES = {
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("case", list(MIXED_SHARES))
-def test_a_group_whose_buffers_hold_different_shares_is_each_rank_alone(case):
-    """The two layers' buffers hold shares of different counts, so the group falls back to each
-    rank's own share of the ranks, and no two ranks name a block alike."""
+def test_ranks_holding_the_same_heads_of_every_layer_name_a_block_alike(case):
+    """The two layers' buffers split the ranks into shares of different counts; two ranks name a
+    block alike exactly when they hold the same head of both layers."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._identity import Identity
 
     tp_size, heads = MIXED_SHARES[case]
     keys = np.arange(3 * 32, dtype=np.uint8).reshape(3, 32)
-    names = set()
+    names, held_heads = [], []
     for rank in range(tp_size):
         geometry = derive_layout(mixed_shares(tp_size, rank, heads))
-        assert geometry.page_layout.layer_groups[0].shard == ShardDesc(tp_size, rank), (
-            f"rank {rank}: the group's share is not the rank's own"
-        )
         identity = Identity(
             b"scope", layout_id(geometry.page_layout), geometry.layers, geometry.shards
         )
-        names |= {row.tobytes() for row in identity.object_keys(0, keys)}
-    assert len(names) == tp_size * len(keys), "two ranks name a block alike"
+        names.append([row.tobytes() for row in identity.object_keys(0, keys)])
+        held_heads.append(tuple(rank * h // tp_size for h in heads))
+    for rank in range(tp_size):
+        for other in range(tp_size):
+            same = held_heads[rank] == held_heads[other]
+            assert (names[rank] == names[other]) == same, (rank, other, held_heads)
+            if not same:
+                assert not set(names[rank]) & set(names[other]), (rank, other)
 
 
 @pytest.mark.cpu_only
@@ -709,8 +737,39 @@ def test_recurrent_state_is_described_and_sharded_by_rank():
     assert group.kind == "state" and group.shard == ShardDesc(2, 1)
     assert geometry.recurrent == (True,) and geometry.windows == (None,)
     by_role = {b.role: b for b in layout.buffers}
-    assert by_role["conv_state"].tensors == sectioned((32, 32, 32), 2, ("tp", "cp"))
-    assert by_role["ssm_state"].tensors == head_major(128, 4, 8, ("tp", "cp"))
+    assert by_role["conv_state"].tensors == sectioned((32, 32, 32), 2, ("tp",))
+    assert by_role["ssm_state"].tensors == head_major(128, 4, 8, ("tp",))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "attention_dp, cp_size, split, shard",
+    [
+        (False, 1, ("tp",), ShardDesc(2, 1)),
+        (False, 2, ("tp", "cp"), ShardDesc(4, 3)),
+        (True, 1, ("tp",), ShardDesc()),
+        (True, 2, ("tp",), ShardDesc()),
+    ],
+)
+def test_recurrent_state_splits_as_its_pools_are_sized(attention_dp, cp_size, split, shard):
+    """Over tensor times context ranks under Helix, else over tensor ranks, and over none under
+    attention data parallelism, Helix or not (``mamba_effective_tp_size``)."""
+    manager = attention_and_state(2, 1, attention_dp, 4, cp_size, cp_size - 1)
+    assert manager._page_state_split() == split
+    state = derive_layout(manager).page_layout.layer_groups[1]
+    assert state.kind == "state" and state.shard == shard
+
+
+@pytest.mark.cpu_only
+def test_a_manager_whose_tensors_leave_bytes_of_a_buffer_undescribed_builds_no_page_table():
+    """Bytes no tensor describes would never move; the page table refuses them."""
+
+    class Partial(Manager):
+        def _page_buffer_tensors(self, layer_id, role, size, tokens, state):
+            return replicated(size // 2)
+
+    with pytest.raises(ValueError, match="hold 32 bytes on this rank, not the 64 bytes"):
+        Partial([kv_group(lids=(0,))]).get_page_table()
 
 
 def tensor_ranks_per_group(topology):
@@ -1273,7 +1332,7 @@ def test_a_manager_whose_parts_disagree_is_refused():
         ),
         (
             recurrent_state,
-            "ddbb463ba7a5ec34551df4ac7de306d27cd28d4bbf984e9645004ec26f005747",
+            "3201395d345391d3859437bfc3bf0b2a12cc2e6fe8e91638bc41607abc920d44",
         ),
     ],
     ids=["head_sharded_with_expanded_replicated_role", "recurrent_state"],
@@ -2303,9 +2362,11 @@ def test_the_layout_types_keep_their_module_fields_and_members():
             *(t.__name__ for t in LAYOUT_TYPES),
             "GRID_DIMENSIONS",
             "Progression",
+            "content_shard",
             "grid_place",
             "head_major",
             "held",
+            "held_bytes",
             "layout_from_dict",
             "layout_to_dict",
             "owned",
