@@ -837,6 +837,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_simple_format = logprobs_simple_format
         # SamplingParams.watermarking: None/True requests a watermark, False opts out.
         self.py_watermarking = watermarking
+        # Cached by TorchSampler: the request filters nothing but its temperature.
+        self.py_watermark_neutral: Optional[bool] = None
         # Router Replay: attach routed_experts to this request's output.
         self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits

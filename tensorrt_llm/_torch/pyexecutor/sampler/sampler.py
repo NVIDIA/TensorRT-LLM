@@ -1069,7 +1069,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             slot_modes = self._slot_params.modes
             watermark.observe(
                 [request for request in requests if not request.is_dummy],
-                lambda request: slot_modes[request.py_seq_slot] is SamplingMode.SAMPLING,
+                lambda request: slot_modes[cast(int, request.py_seq_slot)] is SamplingMode.SAMPLING,
                 self._watermark_row_is_neutral,
             )
             flags = [watermark.is_enabled(slot) for slot in live_slots_per_row]
