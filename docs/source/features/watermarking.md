@@ -68,6 +68,14 @@ positions are not scored. A fixed key reuses random values across documents, so 
 assumes independent inputs; measure the false-positive rate on representative unwatermarked text
 before relying on a decision. Detection outputs can help an attacker imitate or strip the watermark.
 
+## Compatibility
+
+Watermarking works with CUDA graphs, the overlap scheduler, chunked prefill, tensor, pipeline, expert and
+attention data parallelism, disaggregated serving (configure both workers identically), guided decoding, and
+the one-model speculative modes described above. KV cache reuse, sliding window attention, logits
+post-processors, LoRA and Helix parallelism are untested. See the
+[feature combination matrix](feature-combination-matrix.md).
+
 ## Limitations
 
 - Greedy (`temperature=0`) and beam-search requests cannot carry a watermark and are generated normally.
