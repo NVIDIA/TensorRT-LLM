@@ -395,6 +395,28 @@ class TestSlackPick:
         assert q.peek_request() is first
         assert drain(q) == [2, 1]
 
+    def test_peek_requests_follows_admission_order(self):
+        q = fixed_slack(14.0, 20.0)
+        now = 1000.0
+        q.add_requests(
+            [
+                make_item(1, gen_arrival=now - 5, orig_arrival=now - 18),
+                make_item(2, gen_arrival=now - 4, orig_arrival=now - 10),
+                make_item(3, gen_arrival=now - 3, orig_arrival=now - 12),
+                make_item(4, gen_arrival=now - 21, orig_arrival=now - 21.5),
+                make_item(5, gen_arrival=now - 1, orig_arrival=now - 30),
+            ]
+        )
+        q.set_now(now, 0.0)
+        assert [r.id for r in q.peek_requests(3)] == [4, 3, 2]
+        assert q.admission_groups(q.peek_requests(3)) == [0, 1, 2]
+        assert q.peek_requests(0) == []
+        assert admit(q).id == 4
+        assert [r.id for r in q.peek_requests(10)] == [3, 2, 5, 1]
+        assert len(q) == 4
+        assert drain(q) == [3, 2, 5, 1]
+        assert q.peek_requests(2) == []
+
     def test_stats_line(self):
         q = fixed_slack(14.0, 20.0)
         now = 100.0
