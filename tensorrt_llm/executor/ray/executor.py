@@ -14,8 +14,10 @@
 # limitations under the License.
 import asyncio
 import os
+import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
     import ray
@@ -44,12 +46,14 @@ from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
 from ..rpc_proxy_mixin import RpcExecutorMixin
-from ..utils import RequestError
+from ..utils import EngineDeadError, RequestError
 from .gpu_worker import RayGPUWorker, RayWorkerWrapper
 
 __all__ = [
     "RayExecutor",
 ]
+
+_MEMORY_OPERATION_TIMEOUT_S = 300.0
 
 
 class RayExecutor(RpcExecutorMixin, GenerationExecutor):
@@ -66,6 +70,10 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         super().__init__(model_world_size, postproc_worker_config,
                          is_llm_executor)
 
+        self._memory_control_lock = threading.Lock()
+        self._memory_control_failed = False
+        self._memory_operation_active: str | None = None
+        self._memory_parked_tags: set[str] = set()
         self.has_start_local_cluser = False
         runtime_env = {
             "env_vars": {
@@ -229,21 +237,37 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 for worker in workers
             ])
 
-    @unwrap_ray_errors()
-    def collective_rpc(
-            self,
-            method: str,
-            args: tuple = (),
-            kwargs: Optional[dict] = None,
-            non_block: bool = False,
-            unique_reply_rank: Optional[int] = None,
-            target_ranks: int | list[int] | None = None) -> list[Any]:
+    def _collective_rpc_refs(self,
+                             method: str,
+                             args: tuple = (),
+                             kwargs: Optional[dict] = None,
+                             unique_reply_rank: Optional[int] = None,
+                             target_ranks: int | list[int] | None = None,
+                             *,
+                             report_group_state: bool = False) -> list[Any]:
         if target_ranks is None:
             target_ranks = unique_reply_rank
         workers = (self.workers if target_ranks is None else
                    [self.workers[rank] for rank in target_ranks] if isinstance(
                        target_ranks, list) else [self.workers[target_ranks]])
         kwargs = kwargs or {}
+
+        if method == "get_memory_status":
+            with self._memory_control_lock:
+                state = ("failed" if self._memory_control_failed else
+                         self._memory_operation_active
+                         if report_group_state else None)
+                parked_tags = sorted(self._memory_parked_tags)
+            if state:
+                # Report the group gate without queueing behind a blocking actor
+                # operation. Recovery checks must still query the actual worker.
+                return [
+                    ray.put({
+                        "state":
+                        state,
+                        "parked_tags": [] if state == "failed" else parked_tags
+                    }) for _ in workers
+                ]
 
         refs = []
         for w in workers:
@@ -255,6 +279,300 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 # Ray actor doesn't work with __getattr__ delegation.
                 refs.append(w.call_worker_method.remote(method, *args,
                                                         **kwargs))
+        return refs
+
+    @unwrap_ray_errors()
+    def sleep(self, sleep_tags: list[str]) -> None:
+        """Validate every worker before sending sleep to the whole worker group."""
+        self._run_memory_operation("sleep", (sleep_tags, ))
+
+    async def sleep_async(self, sleep_tags: list[str]) -> None:
+        """Await group-wide preflight and sleep without blocking the event loop."""
+        with unwrap_ray_errors():
+            await self._run_memory_operation_async("sleep", (sleep_tags, ))
+
+    @contextmanager
+    def _memory_control(self,
+                        *,
+                        require_running: bool = False) -> Iterator[None]:
+        """Serialize dispatch without holding the lock across remote completion.
+
+        Args:
+            require_running: Reject submission while any tag remains parked.
+
+        Yields:
+            Control while no other caller can submit or change memory state.
+
+        Raises:
+            RuntimeError: A transition is active or the worker group failed.
+        """
+        self._memory_control_lock.acquire()
+        try:
+            if self._memory_operation_active:
+                raise RuntimeError(
+                    "Ray sleep/wakeup is in progress: admission transition "
+                    f"'{self._memory_operation_active}'.")
+            if self._memory_control_failed:
+                raise RuntimeError(
+                    "Ray sleep/wakeup failed; restart the entire worker group.")
+            if require_running and self._memory_parked_tags:
+                raise RuntimeError(
+                    "Cannot enqueue requests while runtime memory is parked.")
+            yield
+        finally:
+            self._memory_control_lock.release()
+
+    @contextmanager
+    def _memory_operation(self, method: str) -> Iterator[None]:
+        """Close dispatch for a memory operation without holding a thread lock.
+
+        Args:
+            method: Sleep or wakeup worker method.
+
+        Yields:
+            Exclusive permission to run the whole-group memory operation.
+
+        Raises:
+            RuntimeError: Another operation is active or the group failed.
+        """
+        with self._memory_control():
+            if not self.workers:
+                raise RuntimeError(
+                    "Workers must be initialized before sleep/wakeup.")
+            self._memory_operation_active = "parking" if method == "sleep" else "waking"
+        try:
+            yield
+        finally:
+            with self._memory_control_lock:
+                self._memory_operation_active = None
+
+    def _fail_memory_group(self) -> None:
+        """Latch failed admission and stop actors after an uncertain operation.
+
+        Actor termination is asynchronous. Keep the latch set even when a kill
+        request fails; only a new executor can admit requests again.
+        """
+        with self._memory_control_lock:
+            if self._memory_control_failed:
+                return
+            self._memory_control_failed = True
+            error = RuntimeError(
+                "Ray sleep/wakeup failed; restart the entire worker group.")
+            self._set_fatal_error(error)
+            pending = list(self._results.values())
+            workers = list(self.workers or [])
+        for result in pending:
+            try:
+                result.queue.put(EngineDeadError(error))
+            except (RuntimeError, ValueError) as notification_error:
+                logger.error(
+                    f"Could not notify a pending result: {notification_error}")
+        for worker in workers:
+            try:
+                ray.kill(worker, no_restart=True)
+            except (ray.exceptions.RayError, RuntimeError) as error:
+                logger.error(
+                    f"Could not stop a failed sleep/wakeup worker: {error}")
+
+    def _wait_for_pending_calls(self) -> None:
+        """Wait for earlier actor calls without charging the validation deadline."""
+        try:
+            ray.get([
+                worker.wait_for_pending_calls.remote()
+                for worker in self.workers
+            ])
+        except ray.exceptions.RayActorError:
+            self._fail_memory_group()
+            raise
+
+    async def _wait_for_pending_calls_async(self) -> None:
+        """Keep admission closed while earlier actor calls complete."""
+        try:
+            await asyncio.gather(*[
+                worker.wait_for_pending_calls.remote()
+                for worker in self.workers
+            ])
+        except ray.exceptions.RayActorError:
+            self._fail_memory_group()
+            raise
+
+    def _run_memory_operation(self, method: str, args: tuple) -> list[Any]:
+        """Run a whole-group operation without imposing a request-drain deadline.
+
+        Args:
+            method: Sleep or wakeup worker method.
+            args: Arguments forwarded to every worker.
+
+        Returns:
+            Results after every worker completes.
+
+        Raises:
+            Exception: Validation or execution failed. Uncertain execution
+                failure permanently closes admission and stops the actors.
+        """
+        with self._memory_operation(method):
+            self._wait_for_pending_calls()
+            try:
+                ray.get(self._collective_rpc_refs(f"validate_{method}", args),
+                        timeout=_MEMORY_OPERATION_TIMEOUT_S)
+            except (ray.exceptions.RayActorError,
+                    ray.exceptions.GetTimeoutError):
+                self._fail_memory_group()
+                raise
+            try:
+                # Sleep includes draining requests of arbitrary generation length.
+                timeout = None if method == "sleep" else _MEMORY_OPERATION_TIMEOUT_S
+                results = ray.get(self._collective_rpc_refs(method, args),
+                                  timeout=timeout)
+                with self._memory_control_lock:
+                    if method == "sleep":
+                        self._memory_parked_tags.update(args[0])
+                    else:
+                        self._memory_parked_tags.difference_update(args[0])
+                return results
+            except (ray.exceptions.RayActorError,
+                    ray.exceptions.GetTimeoutError, KeyboardInterrupt,
+                    SystemExit):
+                self._fail_memory_group()
+                raise
+            except Exception:
+                recovered = False
+                try:
+                    if len(self.workers) == 1:
+                        statuses = ray.get(self._collective_rpc_refs(
+                            "get_memory_status", ()),
+                                           timeout=_MEMORY_OPERATION_TIMEOUT_S)
+                        recovered = self._accept_single_worker_recovery(
+                            statuses)
+                except Exception as error:
+                    logger.error(f"Could not verify worker recovery: {error}")
+                finally:
+                    if not recovered:
+                        self._fail_memory_group()
+                raise
+
+    def _accept_single_worker_recovery(
+            self, statuses: list[dict[str, object]]) -> bool:
+        """Synchronize driver admission with a confirmed recoverable worker.
+
+        Args:
+            statuses: Memory status replies after a single-worker operation fails.
+
+        Returns:
+            Whether the worker reports a consistent running or parked state.
+        """
+        if len(statuses) != 1:
+            return False
+        state = statuses[0].get("state")
+        tags = statuses[0].get("parked_tags")
+        if (state not in ("running", "parked") or not isinstance(tags, list)
+                or not all(isinstance(tag, str) for tag in tags)
+                or bool(tags) != (state == "parked")):
+            return False
+        with self._memory_control_lock:
+            self._memory_parked_tags = set(tags)
+        return True
+
+    async def _run_memory_operation_async(self, method: str,
+                                          args: tuple) -> list[Any]:
+        """Await the group operation without blocking the caller's event loop.
+
+        Args:
+            method: Sleep or wakeup worker method.
+            args: Arguments forwarded to every worker.
+
+        Returns:
+            Results after every worker completes.
+
+        Raises:
+            Exception: Validation or execution failed; uncertain
+                execution requires a new worker group.
+            asyncio.CancelledError: Cancellation closes the group after dispatch.
+        """
+        with self._memory_operation(method):
+            await self._wait_for_pending_calls_async()
+            try:
+                await asyncio.wait_for(asyncio.gather(
+                    *self._collective_rpc_refs(f"validate_{method}", args)),
+                                       timeout=_MEMORY_OPERATION_TIMEOUT_S)
+            except (ray.exceptions.RayActorError, asyncio.TimeoutError,
+                    TimeoutError):
+                self._fail_memory_group()
+                raise
+            try:
+                timeout = None if method == "sleep" else _MEMORY_OPERATION_TIMEOUT_S
+                results = await asyncio.wait_for(
+                    asyncio.gather(*self._collective_rpc_refs(method, args)),
+                    timeout=timeout)
+                with self._memory_control_lock:
+                    if method == "sleep":
+                        self._memory_parked_tags.update(args[0])
+                    else:
+                        self._memory_parked_tags.difference_update(args[0])
+                return results
+            except (asyncio.CancelledError, ray.exceptions.RayActorError,
+                    asyncio.TimeoutError, TimeoutError):
+                self._fail_memory_group()
+                raise
+            except Exception:
+                recovered = False
+                try:
+                    if len(self.workers) == 1:
+                        statuses = await asyncio.wait_for(
+                            asyncio.gather(*self._collective_rpc_refs(
+                                "get_memory_status", ())),
+                            timeout=_MEMORY_OPERATION_TIMEOUT_S)
+                        recovered = self._accept_single_worker_recovery(
+                            statuses)
+                except Exception as error:
+                    logger.error(f"Could not verify worker recovery: {error}")
+                finally:
+                    if not recovered:
+                        self._fail_memory_group()
+                raise
+
+    @staticmethod
+    def _check_sleep_rpc(method: str) -> None:
+        if method == "sleep":
+            raise ValueError(
+                "Sleep requires group-wide coordination. Use LLM.release() "
+                "or AsyncLLM.release() instead of collective_rpc('sleep').")
+
+    @unwrap_ray_errors()
+    def collective_rpc(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
+        self._check_sleep_rpc(method)
+        if method == "wakeup":
+            if non_block or unique_reply_rank is not None or target_ranks is not None or kwargs:
+                raise ValueError(
+                    "Wakeup requires all workers and completion; use LLM.resume()."
+                )
+            return self._run_memory_operation(method, args)
+        if method == "get_memory_status":
+            refs = self._collective_rpc_refs(method,
+                                             args,
+                                             kwargs,
+                                             unique_reply_rank,
+                                             target_ranks,
+                                             report_group_state=True)
+            return refs if non_block else ray.get(refs)
+        with self._memory_control(
+                require_running=method in ("submit", "enqueue_request")):
+            if method == "call_worker_method" and (
+                (args and args[0] in
+                 ("sleep", "wakeup", "submit", "enqueue_request")) or
+                (kwargs or {}).get("method_name")
+                    in ("sleep", "wakeup", "submit", "enqueue_request")):
+                raise ValueError(
+                    "Use LLM.release() or LLM.resume() for memory controls.")
+            refs = self._collective_rpc_refs(method, args, kwargs,
+                                             unique_reply_rank, target_ranks)
         return refs if non_block else ray.get(refs)
 
     @unwrap_ray_errors()
@@ -265,12 +583,33 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             kwargs: Optional[dict] = None,
             unique_reply_rank: Optional[int] = None,
             target_ranks: int | list[int] | None = None) -> list[Any]:
-        refs = self.collective_rpc(method,
-                                   args,
-                                   kwargs,
-                                   non_block=True,
-                                   unique_reply_rank=unique_reply_rank,
-                                   target_ranks=target_ranks)
+        self._check_sleep_rpc(method)
+        if method == "wakeup":
+            if unique_reply_rank is not None or target_ranks is not None or kwargs:
+                raise ValueError(
+                    "Wakeup requires all workers; use AsyncLLM.resume().")
+            with unwrap_ray_errors():
+                return await self._run_memory_operation_async(method, args)
+        if method == "get_memory_status":
+            return await asyncio.gather(
+                *self._collective_rpc_refs(method,
+                                           args,
+                                           kwargs,
+                                           unique_reply_rank,
+                                           target_ranks,
+                                           report_group_state=True))
+        with self._memory_control(
+                require_running=method in ("submit", "enqueue_request")):
+            if method == "call_worker_method" and (
+                (args and args[0] in
+                 ("sleep", "wakeup", "submit", "enqueue_request")) or
+                (kwargs or {}).get("method_name")
+                    in ("sleep", "wakeup", "submit", "enqueue_request")):
+                raise ValueError(
+                    "Use AsyncLLM.release() or AsyncLLM.resume() for memory controls."
+                )
+            refs = self._collective_rpc_refs(method, args, kwargs,
+                                             unique_reply_rank, target_ranks)
         return await asyncio.gather(*refs)
 
     def get_startup_metrics(self) -> dict:
@@ -291,15 +630,21 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         logprob_params = self._get_logprob_params(request)
 
         with nvtx_range_debug("rpc_submit"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
-        result = GenerationResult(
-            request,
-            background_error_handler=self._handle_background_error,
-            executor=self,
-            disaggregated_params=request.disaggregated_params,
-            logprob_params=logprob_params)
-        self._results[request.id] = result
+            with self._memory_control(require_running=True):
+                result = GenerationResult(
+                    request,
+                    background_error_handler=self._handle_background_error,
+                    executor=self,
+                    disaggregated_params=request.disaggregated_params,
+                    logprob_params=logprob_params)
+                # Publish the result before the RPC can return a rejection or
+                # the memory controller can terminate the worker group.
+                self._results[request.id] = result
+                try:
+                    self.rpc_client.submit(request).remote(need_response=False)
+                except Exception:
+                    self._results.pop(request.id, None)
+                    raise
 
         return result
 

@@ -345,11 +345,9 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(
     selected = creator._validate_or_fallback_kv_cache_manager_v2(
         KVCacheManagerV2, model_config, kv_cache_config
     )
-    resolved = resolved_kv_cache_manager_is_v2(
-        kv_cache_config, max_beam_width, enable_sleep=enable_sleep
-    )
+    resolved = resolved_kv_cache_manager_is_v2(kv_cache_config, max_beam_width)
 
-    assert selected is (KVCacheManager if enable_sleep else KVCacheManagerV2)
+    assert selected is KVCacheManagerV2
     assert resolved is issubclass(selected, KVCacheManagerV2)
     assert selected is (KVCacheManagerV2 if resolved else KVCacheManager)
 
@@ -402,7 +400,7 @@ def test_resolved_v2_respects_an_explicit_v1_request():
     "block_reuse_config",
     [{"policy": "per_conversation"}, {"swa_endpoint_rewind_tokens": 32}],
 )
-def test_sleep_rejects_v2_only_block_reuse_config(block_reuse_config):
+def test_sleep_preserves_v2_only_block_reuse_config(block_reuse_config):
     creator = object.__new__(KvCacheCreator)
     creator._max_beam_width = 1
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig())
@@ -412,10 +410,12 @@ def test_sleep_rejects_v2_only_block_reuse_config(block_reuse_config):
     )
     kv_cache_config = KvCacheConfig(block_reuse_config=block_reuse_config)
 
-    with pytest.raises(NotImplementedError, match="requires KVCacheManagerV2.*SleepConfig"):
+    assert (
         creator._validate_or_fallback_kv_cache_manager_v2(
             KVCacheManagerV2, model_config, kv_cache_config
         )
+        is KVCacheManagerV2
+    )
 
 
 @pytest.mark.parametrize("max_beam_width", [None, 1, 2, 4])

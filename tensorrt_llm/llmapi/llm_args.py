@@ -7725,8 +7725,8 @@ class TorchLlmArgs(BaseLlmArgs):
             )
         if self.sleep_config is not None:
             raise ValueError(
-                "Mixed-precision KV requires KVCacheManagerV2, which does not support "
-                "sleep_config.")
+                "Mixed-precision KV with sleep_config is not supported; "
+                "mixed-precision pool restoration has not been qualified.")
         sparse = self.sparse_attention_config
         if sparse is not None and sparse.algorithm not in ("dsa",
                                                            "deepseek_v4"):

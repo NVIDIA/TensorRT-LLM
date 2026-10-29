@@ -73,6 +73,32 @@ bool allBlockPagesDroppable(Block const& block)
 
 } // namespace
 
+KvCacheIntrospection::DiscardBackingBytes KvCacheIntrospection::discardBackingBytes(KvCacheManager& manager)
+{
+    auto const lock = manager.lockExclusive();
+    TLLM_CHECK(manager.mMemoryState == KvCacheManager::MemoryState::kReleased && manager.mSleepDiscard);
+    auto& storage = manager.storage();
+    auto const& allocator = *storage.mGpuPhysMemAllocator;
+    DiscardBackingBytes result;
+    result.gpuPhysical = (allocator.mPool.outstandingCount() + allocator.mPool.cachedCount()) * allocator.physMemSize();
+    for (CacheLevel level{0}; level < storage.numCacheLevels(); ++level)
+    {
+        for (PoolGroupIndex group{0}; group < storage.numPoolGroups(level); ++group)
+        {
+            for (auto const& pool : storage.poolGroup(level, group).mPools)
+            {
+                if (pool->medium() == CacheTier::HOST_MEM)
+                {
+                    auto const& host = static_cast<HostSlotPool const&>(*pool).mHostMem;
+                    result.hostCommitted += host.mBacking.committedSize();
+                    result.hostRegistered += host.mBacking.registeredSize();
+                }
+            }
+        }
+    }
+    return result;
+}
+
 KvCacheIntrospection::ActivePageStats KvCacheIntrospection::activePageStats(KvCache const& kvCache)
 {
     auto& storageMgr = kvCache.manager().storage();

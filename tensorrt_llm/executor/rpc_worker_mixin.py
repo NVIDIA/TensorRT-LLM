@@ -24,6 +24,7 @@ from ..llmapi.utils import logger_debug
 from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
+from .utils import ErrorResponse
 
 
 class RpcWorkerMixin:
@@ -219,7 +220,13 @@ class RpcWorkerMixin:
         """Submits a request to the worker."""
         with nvtx_range_debug("RpcWorker.submit", color="blue", category="Worker"):
             logger_debug(f"[worker] Submitting request {request.id}", color="green")
-            result = super().submit(request)
+            try:
+                result = super().submit(request)
+            except Exception as error:
+                # Fire-and-forget submissions cannot return RPC errors. Send
+                # admission failures through the same stream as request output.
+                self._response_queue.put([ErrorResponse(request.id, str(error), -1)])
+                raise
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
             return result
 

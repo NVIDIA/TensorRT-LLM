@@ -173,6 +173,20 @@ TEST_P(HostMemPageModeTest, AllocatesAndResizes)
     EXPECT_EQ(memory.size(), HostMem::sizeGranularity());
     memory.resize(2 * HostMem::sizeGranularity());
     EXPECT_EQ(memory.size(), 2 * HostMem::sizeGranularity());
+    auto const address = memory.address();
+    for (int cycle = 0; cycle < 2; ++cycle)
+    {
+        memory.resize(0);
+        EXPECT_EQ(memory.address(), address);
+        EXPECT_EQ(memory.size(), 0);
+        EXPECT_EQ(memory.vmSize(), 4 * HostMem::sizeGranularity());
+        memory.resize(HostMem::sizeGranularity());
+        EXPECT_EQ(memory.address(), address);
+        EXPECT_EQ(memory.size(), HostMem::sizeGranularity());
+        cudaPointerAttributes attributes{};
+        ASSERT_EQ(cudaPointerGetAttributes(&attributes, reinterpret_cast<void*>(memory.address())), cudaSuccess);
+        EXPECT_EQ(attributes.type, cudaMemoryTypeHost);
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(ThpModes, HostMemPageModeTest, testing::Values("0", "1"));

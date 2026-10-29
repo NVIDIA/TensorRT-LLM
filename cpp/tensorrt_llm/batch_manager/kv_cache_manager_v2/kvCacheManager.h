@@ -153,6 +153,24 @@ public:
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
 
+    //! Monotonic version of completed reuse-tree resets, including discard sleep.
+    [[nodiscard]] uint64_t getReuseStateVersion() const;
+
+    //! Suspend living caches and release GPU backing while retaining their logical state.
+    //! Discard also releases HOST backing, invalidates reusable blocks, and releases stats-excluded cache pages in
+    //! place.
+    void releaseGpuMemory(bool discard = false);
+
+    //! Check ownership and offload capacity without changing cache state.
+    void validateMemoryRelease(bool discard = false) const;
+
+    //! Whether native backing, caches and Batch bindings are usable. Not serving readiness.
+    [[nodiscard]] bool isMemoryReady() const;
+
+    //! Restore backing and discarded pages. Previously active caches resume, and Batch
+    //! members republish their indices. Unbatched consumers must refresh their own indices.
+    void materializeGpuMemory(bool zero = false);
+
     // ---- KvCache creation -------------------------------------------------
 
     // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream.
@@ -550,6 +568,19 @@ public:
     friend class Batch;
 
 private:
+    enum class MemoryState
+    {
+        kActive,    //!< Backing and bindings are usable.
+        kReleasing, //!< Suspension or backing release is in progress.
+        kReleased,  //!< Backing is released; logical caches remain.
+        kRestoring, //!< Restoration is incomplete; only eligible retries may proceed.
+        kFailed,    //!< Recovery cannot establish validity; shut down the manager.
+    };
+
+    void _validateMemoryRelease(bool discard) const;
+    void _restoreGpuMemory(bool zero);
+    void _recoverMemoryRelease();
+
     //! Units a step selects per buffer of this life cycle. The cache must hold a whole
     //! selection on top of everything in flight, so this is what the in-flight headroom is
     //! measured against.
@@ -701,6 +732,14 @@ private:
 
     // Weak references to all living KvCaches.
     std::set<KvCache*> mLivingKvCaches;
+    //! Batches outlive neither their manager nor its storage.
+    std::set<Batch*> mLivingBatches;
+    //! Fix the zeroing policy from the first restore attempt until every binding is restored.
+    std::optional<bool> mMaterializingGpuMemory;
+
+    MemoryState mMemoryState = MemoryState::kActive;
+    bool mSleepDiscard = false;
+    uint64_t mReuseStateVersion = 0;
 
     // Moving averages used for ratio rebalancing.
     MovingAverage mAvgReusedLength;
