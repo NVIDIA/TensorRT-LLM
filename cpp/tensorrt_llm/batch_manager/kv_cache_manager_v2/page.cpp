@@ -473,7 +473,7 @@ void SharedPageLock::releasePageIndex()
         // entry. updateBasePageIndex deliberately returns BAD for this ordinal.
         auto const& lc = page()->manager->lifeCycles().getLifeCycle(mUser.lifeCycle);
         auto const* attention = std::get_if<AttnLifeCycle>(&lc);
-        TLLM_CHECK_DEBUG(std::holds_alternative<SsmLifeCycle>(lc) || (attention && attention->allowsCheckpoint()));
+        TLLM_CHECK_DEBUG(std::holds_alternative<SsmLifeCycle>(lc) || (attention && allowsCheckpoint(*attention)));
         return;
     }
     int oldBaseIndex

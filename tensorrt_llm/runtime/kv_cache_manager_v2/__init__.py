@@ -183,6 +183,7 @@ sequence_to_blockchain_keys = _cpp.sequence_to_blockchain_keys
 take_poison = _cpp.take_poison
 
 BeamIndex = int
+CacheGroupId = int
 CacheLevel = int
 CacheTierConfig = Union[GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig]
 BatchRow = int
@@ -227,6 +228,7 @@ __all__ = [
     "SparseCacheConfig",
     "BufferId",
     "CoalescedBuffer",
+    "CacheGroupId",
     "CacheLevel",
     "CacheTier",
     "CacheTierConfig",

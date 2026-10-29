@@ -808,17 +808,14 @@ std::vector<LayerId> KvCacheManager::layerIds() const
 LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 {
     auto const& lifeCycles = mStorage->layerToLifeCycleIds().at(layerId);
-    if (lifeCycles.size() != 1)
-    {
-        throw std::invalid_argument("Layer " + std::to_string(layerId) + " has buffers in "
-            + std::to_string(lifeCycles.size())
-            + " layer groups because its buffers use different reuse policies; look up its layer group per "
-              "buffer with get_buffer_group_id(layer_id, role) / getBufferGroupId(layerId, role)");
-    }
+    TLLM_CHECK_WITH_INFO(lifeCycles.size() == 1,
+        "Layer %d has buffers in %zu layer groups because its buffers use different reuse policies; "
+        "look up its layer group per buffer with get_buffer_group_id(layer_id, role) / getBufferGroupId(layerId, role)",
+        layerId, lifeCycles.size());
     return lifeCycles.front();
 }
 
-LayerGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
+CacheGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
 {
     return mStorage->getBufferAttr(layerId, role).lifeCycleId;
 }
@@ -834,9 +831,9 @@ TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() con
     return result;
 }
 
-TypedVec<LayerGroupId, std::vector<BufferId>> KvCacheManager::bufferGrouping() const
+TypedVec<CacheGroupId, std::vector<BufferId>> KvCacheManager::bufferGrouping() const
 {
-    TypedVec<LayerGroupId, std::vector<BufferId>> result(mLifeCycles.size());
+    TypedVec<CacheGroupId, std::vector<BufferId>> result(mLifeCycles.size());
     std::unordered_map<LayerId, std::vector<BufferId>> buffersByLayer;
     for (auto const& buffer : allBufferIds())
     {

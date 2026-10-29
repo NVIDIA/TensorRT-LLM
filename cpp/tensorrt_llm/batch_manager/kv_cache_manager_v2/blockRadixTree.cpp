@@ -490,7 +490,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 
     // If this is a full-attention block or a sink block: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && alc->requiresPrefixCoverage()
+    if (alc && requiresPrefixCoverage(*alc)
         && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
@@ -899,7 +899,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
-            if (!attn->requiresPrefixCoverage())
+            if (!requiresPrefixCoverage(*attn))
             {
                 continue;
             }

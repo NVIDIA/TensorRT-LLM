@@ -2446,7 +2446,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             {
                 for (auto const& [lc, attention] : cache.manager().lifeCycles().attentionLifeCycles())
                 {
-                    if (!attention->allowsCheckpoint()
+                    if (!kv::allowsCheckpoint(*attention)
                         || (groups && std::find(groups->begin(), groups->end(), lc.value()) == groups->end()))
                     {
                         continue;
@@ -3665,22 +3665,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
         .def_prop_ro(
             "layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); },
-            "Deprecated: use buffer_grouping. Partitions uniform layers by lifecycle; raises ValueError "
+            "Deprecated: use buffer_grouping. Partitions uniform layers by lifecycle; raises RuntimeError "
             "if any layer spans several groups. Member order does not describe physical memory order.")
         .def_prop_ro(
             "buffer_grouping", [](kv::KvCacheManager const& self) { return self.bufferGrouping().raw(); },
-            "Buffer membership indexed by lifecycle group ID. Each buffer appears once; member order is unspecified.")
+            "Buffer membership indexed by CacheGroupId. Each buffer appears once; member order is unspecified.")
         .def(
             "get_layer_group_id",
             [](kv::KvCacheManager const& self, kv::LayerId layerId) { return self.getLayerGroupId(layerId).value(); },
             nb::arg("layer_id"),
-            "Deprecated: use get_buffer_group_id. Returns a uniform layer's group; raises ValueError for a split "
+            "Deprecated: use get_buffer_group_id. Returns a uniform layer's group; raises RuntimeError for a split "
             "layer.")
         .def(
             "get_buffer_group_id",
             [](kv::KvCacheManager const& self, kv::LayerId layerId, kv::DataRole const& role)
             { return self.getBufferGroupId(layerId, role).value(); },
-            nb::arg("layer_id"), nb::arg("role"), "Lifecycle group of one buffer of the layer.")
+            nb::arg("layer_id"), nb::arg("role"), "CacheGroupId of one buffer of the layer.")
         .def(
             "get_sparse_cache_max_units",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)

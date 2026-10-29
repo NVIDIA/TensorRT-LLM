@@ -223,11 +223,11 @@ def test_ssm_buffer_reuse_policies(length):
         assert manager.get_buffer_group_id(2, "old_x") == private
         assert manager.get_layer_group_id(0) == manager.get_buffer_group_id(0, "key")
         for layer_id in (1, 2):
-            with pytest.raises(ValueError, match="layer groups"):
+            with pytest.raises(RuntimeError, match="layer groups"):
                 manager.get_layer_group_id(layer_id)
         assert manager.num_layers == 3
         assert sorted(manager.layer_ids) == [0, 1, 2]
-        with pytest.raises(ValueError, match="layer groups"):
+        with pytest.raises(RuntimeError, match="layer groups"):
             _ = manager.layer_grouping
         for group in (required, private):
             assert sorted({buffer.layer_id for buffer in manager.buffer_grouping[group]}) == [1, 2]

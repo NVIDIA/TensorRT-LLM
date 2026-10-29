@@ -259,8 +259,7 @@ void KvCache::_collectReuseCandidates()
         }
         // OPTIONAL checks coverage at the REQUIRED endpoint without shortening it.
         // Use the ordinary SWA live ranges, including sinks and multi-page windows.
-        if (attention && attention->allowsCheckpoint() && end > 0 && end % mTokensPerBlock == 0
-            && attention->windowSize)
+        if (attention && allowsCheckpoint(*attention) && end > 0 && end % mTokensPerBlock == 0 && attention->windowSize)
         {
             auto const stale = getStaleRange(lifeCycles[lc], end, mTokensPerBlock);
             auto& candidates = mOptionalCandidates[lc];
@@ -312,7 +311,7 @@ void KvCache::_collectReuseCandidates()
 
 bool KvCache::_needsFreshPrefixPages(LifeCycleId lc) const
 {
-    return !requiresPrefixCoverage(mManager->lifeCycles()[lc])
+    return !mManager->lifeCycles().isSsm(lc) && !requiresPrefixCoverage(mManager->lifeCycles()[lc])
         && std::find(mSelectedOptionalGroups.begin(), mSelectedOptionalGroups.end(), lc)
         == mSelectedOptionalGroups.end();
 }
@@ -599,13 +598,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
         {
             bool isSsm = mManager->lifeCycles().isSsm(lc);
             auto const& lifeCycle = mManager->lifeCycles()[lc];
-            // Every SSM policy needs one writable state slot. Handle SSM first because private and
-            // unselected optional groups also need fresh state, but must not allocate per-token-block pages.
-            if (isSsm)
-            {
-                numSlotsNeeded[lc] += 1;
-            }
-            else if (_needsFreshPrefixPages(lc))
+            if (_needsFreshPrefixPages(lc))
             {
                 auto const stale = _getStaleRange(mHistoryLength, lifeCycle);
                 for (BlockOrdinal ord{0}; ord < stale.beg; ++ord)
@@ -618,8 +611,9 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
                 }
                 numSlotsNeeded[lc] += static_cast<SlotCount>(privateOrdinals[lc].size());
             }
-            else if (hasPartial)
+            else if (isSsm || hasPartial)
             {
+                // Every SSM policy needs one writable state slot, independent of prefix length.
                 numSlotsNeeded[lc] += 1;
             }
         }
@@ -1490,7 +1484,7 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     std::vector<LifeCycleId> attachedLcs;
     for (auto const& [lcIdx, attn] : mManager->lifeCycles().attentionLifeCycles())
     {
-        if (!attn->requiresPrefixCoverage())
+        if (!requiresPrefixCoverage(*attn))
         {
             continue;
         }
@@ -2152,9 +2146,9 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
             // A partial tail can expire pages still needed at the preceding
             // aligned checkpoint. Keep its entire live window until publication.
             int const alignedEnd = newHistoryLength / mTokensPerBlock * mTokensPerBlock;
-            bool const keepAlignedCheckpoint = alc.allowsCheckpoint()
-                && ord < BlockOrdinal{alignedEnd / mTokensPerBlock} && !_getStaleRange(alignedEnd, lc).contains(ord);
-            bool holdForCommit = !alc.isPrivate() && (!mManager->commitMinSnapshot() || keepAlignedCheckpoint)
+            bool const keepAlignedCheckpoint = allowsCheckpoint(alc) && ord < BlockOrdinal{alignedEnd / mTokensPerBlock}
+                && !_getStaleRange(alignedEnd, lc).contains(ord);
+            bool holdForCommit = !isPrivateLifeCycle(alc) && (!mManager->commitMinSnapshot() || keepAlignedCheckpoint)
                 && !isCommitted && (mCommitState == CommitState::ALLOWED);
 
             for (BeamIndex bi{0}; bi < sb.pages.size(); ++bi)
@@ -3053,7 +3047,7 @@ SharedPtr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
                 // committed->block may differ from `ret`: a page can be moved to a longer
                 // sibling block, or replaced there by one with larger token coverage.
                 auto const* attention = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[lcId]);
-                if (attention && attention->allowsCheckpoint())
+                if (attention && allowsCheckpoint(*attention))
                 {
                     TLLM_CHECK(dynamicPointerCast<UncommittedPage>(page) || dynamicPointerCast<CommittedPage>(page));
                 }
@@ -3165,7 +3159,7 @@ bool KvCache::_checkSanity() const
                     auto page = blockPageGetPage(bp);
                     auto const* attention = std::get_if<AttnLifeCycle>(&lcs[lc]);
                     auto committed = dynamicPointerCast<CommittedPage>(page);
-                    if (attention && attention->allowsCheckpoint() && committed)
+                    if (attention && allowsCheckpoint(*attention) && committed)
                     {
                         TLLM_CHECK_DEBUG(isCommitted && committed->numTokensInBlock > 0
                             && committed->numTokensInBlock <= mTokensPerBlock);

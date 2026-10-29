@@ -502,7 +502,7 @@ TEST_F(ReplayCacheTest, SsmBufferPolicySplitsLayerAcrossGroups)
     {
         SCOPED_TRACE(std::to_string(buffer.layer) + "/" + buffer.role);
         EXPECT_EQ(manager->getBufferGroupId(buffer.layer, buffer.role), buffer.isPrivate ? privateGroup : required);
-        EXPECT_THROW(manager->getLayerGroupId(buffer.layer), std::invalid_argument);
+        EXPECT_THROW(manager->getLayerGroupId(buffer.layer), tensorrt_llm::common::TllmException);
     }
     EXPECT_THROW(manager->getBufferGroupId(1, "missing"), std::out_of_range);
 
@@ -510,7 +510,7 @@ TEST_F(ReplayCacheTest, SsmBufferPolicySplitsLayerAcrossGroups)
     auto layerIds = manager->layerIds();
     std::sort(layerIds.begin(), layerIds.end());
     EXPECT_EQ(layerIds, (std::vector<LayerId>{0, 1, 2, 3}));
-    EXPECT_THROW(manager->layerGrouping(), std::invalid_argument);
+    EXPECT_THROW(manager->layerGrouping(), tensorrt_llm::common::TllmException);
     auto const grouping = manager->bufferGrouping();
     ASSERT_EQ(grouping.size(), LayerGroupId{3});
     size_t count = 0;

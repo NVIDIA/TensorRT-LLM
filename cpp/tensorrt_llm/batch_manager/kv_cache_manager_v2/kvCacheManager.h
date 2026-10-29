@@ -287,20 +287,20 @@ public:
     std::vector<LayerId> layerIds() const;
 
     //! Deprecated: use getBufferGroupId(). Returns the shared group of a uniform layer.
-    //! Throws std::invalid_argument if the queried layer spans several lifecycle groups.
+    //! Throws common::TllmException if the queried layer spans several lifecycle groups.
     LayerGroupId getLayerGroupId(LayerId layerId) const;
 
-    //! Group of one buffer; throws std::out_of_range for an unknown buffer.
-    LayerGroupId getBufferGroupId(LayerId layerId, DataRole const& role) const;
+    //! Cache group of one buffer; throws std::out_of_range for an unknown buffer.
+    CacheGroupId getBufferGroupId(LayerId layerId, DataRole const& role) const;
 
     //! Deprecated: use bufferGrouping(). Partitions uniform layers by lifecycle.
-    //! Throws std::invalid_argument if any layer spans several groups. Member order
+    //! Throws common::TllmException if any layer spans several groups. Member order
     //! is unspecified; use poolGroupDescs() to inspect physical buffer ordering.
     TypedVec<LayerGroupId, std::vector<LayerId>> layerGrouping() const;
 
-    //! Buffer membership indexed by lifecycle group ID. Each buffer appears once.
+    //! Buffer membership indexed by CacheGroupId. Each buffer appears once.
     //! Member order is unspecified and does not describe physical memory ordering.
-    TypedVec<LayerGroupId, std::vector<BufferId>> bufferGrouping() const;
+    TypedVec<CacheGroupId, std::vector<BufferId>> bufferGrouping() const;
 
     // Iterator over all buffer identifiers. Mirrors Python's all_buffer_ids property.
     std::vector<BufferId> allBufferIds() const;

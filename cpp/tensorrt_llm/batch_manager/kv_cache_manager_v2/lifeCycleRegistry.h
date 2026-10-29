@@ -42,21 +42,6 @@ struct AttnLifeCycle
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
     ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
 
-    bool isPrivate() const noexcept
-    {
-        return reusePolicy == ReusePolicy::PRIVATE;
-    }
-
-    bool requiresPrefixCoverage() const noexcept
-    {
-        return reusePolicy == ReusePolicy::REQUIRED;
-    }
-
-    bool allowsCheckpoint() const noexcept
-    {
-        return reusePolicy == ReusePolicy::OPTIONAL;
-    }
-
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
         int numBlocks = divUp(historyLength, tokensPerBlock);
@@ -145,6 +130,11 @@ inline bool requiresPrefixCoverage(LifeCycle const& lc)
     return reusePolicy(lc) == ReusePolicy::REQUIRED;
 }
 
+inline bool allowsCheckpoint(LifeCycle const& lc)
+{
+    return reusePolicy(lc) == ReusePolicy::OPTIONAL;
+}
+
 // Free function: compute stale range via std::visit.
 inline HalfOpenRange<BlockOrdinal> getStaleRange(LifeCycle const& lc, int historyLength, int tokensPerBlock)
 {
@@ -177,7 +167,10 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, in
 // Integer id assigned to each unique LifeCycle.
 using LifeCycleId = StrongIndex<int, struct LifeCycleIdTag>;
 
-// Alias for public exposure (same meaning as LifeCycleId).
+// Public cache groups correspond one-to-one with lifecycles.
+using CacheGroupId = LifeCycleId;
+
+// Legacy public name for a lifecycle group.
 using LayerGroupId = LifeCycleId;
 
 // ---------------------------------------------------------------------------

@@ -865,7 +865,7 @@ private:
     std::vector<LifeCycleId> mSelectedOptionalGroups;
     void _collectReuseCandidates();
     void _selectOptionalGroups(std::vector<LifeCycleId> const& groups);
-    // PRIVATE and unselected OPTIONAL groups need fresh pages for the claimed prefix.
+    // PRIVATE and unselected OPTIONAL attention groups need fresh pages for the claimed prefix.
     bool _needsFreshPrefixPages(LifeCycleId lc) const;
 
     // SWA scratch slot support.
