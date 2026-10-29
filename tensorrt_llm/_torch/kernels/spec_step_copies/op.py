@@ -45,7 +45,12 @@ def is_supported() -> bool:
 
 def _is_i32(t: torch.Tensor) -> bool:
     """A contiguous CUDA int32 tensor."""
-    return t.is_cuda and t.dtype == torch.int32 and t.is_contiguous()
+    return _is_i32_view(t) and t.is_contiguous()
+
+
+def _is_i32_view(t: torch.Tensor) -> bool:
+    """A CUDA int32 tensor of any strides."""
+    return t.is_cuda and t.dtype == torch.int32
 
 
 def _compile(name: str, args: tuple):
@@ -113,7 +118,8 @@ class SlotScatter:
 
         Args:
             outputs: The forward's ``new_tokens`` [rows_total, a], ``next_new_tokens`` [rows_total, b],
-                ``new_tokens_lens`` [rows_total] and ``next_draft_tokens`` [rows_total, c], int32.
+                ``new_tokens_lens`` [rows_total] and ``next_draft_tokens`` [rows_total, c], int32; the 2-D ones of
+                any strides (e.g. transposed views of one token buffer).
             row_begin: The first row of ``outputs`` to move.
             rows: The number of rows to move.
             slots: The distinct slot of each moved row, int32 [>= rows] on the device.
@@ -123,8 +129,9 @@ class SlotScatter:
             store_next_draft: int32 [num_slots, width].
 
         Returns:
-            False, launching nothing, when an argument is outside what the kernel covers (a non-contiguous or
-            non-int32 tensor, a store of another layout, fewer output rows or slots than ``rows``); True otherwise.
+            False, launching nothing, when an argument is outside what the kernel covers (a non-int32 tensor, a
+            non-contiguous length, slot or store tensor, a store of another layout, fewer output rows or slots than
+            ``rows``); True otherwise.
         """
         if rows == 0:
             return True
@@ -134,10 +141,7 @@ class SlotScatter:
         next_draft = outputs["next_draft_tokens"]
         num_slots = store_lens.numel()
         tensors = (
-            new_tokens,
-            next_new_tokens,
             lens,
-            next_draft,
             slots,
             store_new_tokens,
             store_next_new_tokens,
@@ -146,6 +150,7 @@ class SlotScatter:
         )
         if not (
             all(_is_i32(t) for t in tensors)
+            and all(_is_i32_view(t) for t in (new_tokens, next_new_tokens, next_draft))
             and new_tokens.dim() == next_new_tokens.dim() == next_draft.dim() == 2
             and lens.dim() == store_lens.dim() == 1
             and min(t.shape[0] for t in (new_tokens, next_new_tokens, lens, next_draft))
@@ -182,6 +187,9 @@ class SlotScatter:
             next_new_tokens.shape[1],
             store_next_draft.shape[1],
             next_draft.shape[1],
+            *new_tokens.stride(),
+            *next_new_tokens.stride(),
+            *next_draft.stride(),
         )
         if SlotScatter._kernel is None:
             SlotScatter._kernel = _compile("scatter", args)
