@@ -86,19 +86,13 @@ def test_checkpoint_must_parse(tmp_path):
 # ------------------------------------------------------------------- tmpdir
 
 
-def test_tmpdir_must_be_set():
+def test_tmpdir_must_be_set_outside_tmp_and_short_enough():
     with pytest.raises(environment.EnvironmentError, match="TMPDIR is not set"):
         environment.check_tmpdir({"CLAUDE_CODE_TMPDIR": "/scratch/x"})
-
-
-@pytest.mark.parametrize("value", ["/tmp", "/tmp/mine"])
-def test_tmpdir_under_slash_tmp_is_rejected(value):
-    with pytest.raises(environment.EnvironmentError, match="points into /tmp"):
-        environment.check_tmpdir({"TMPDIR": value, "CLAUDE_CODE_TMPDIR": value})
-
-
-def test_the_boundary_is_inclusive_on_the_side_that_binds():
-    """61 works and 62 does not: the RPC socket's path must fit in ``sun_path``."""
+    for value in ("/tmp", "/tmp/mine"):
+        with pytest.raises(environment.EnvironmentError, match="points into /tmp"):
+            environment.check_tmpdir({"TMPDIR": value, "CLAUDE_CODE_TMPDIR": value})
+    # 61 works and 62 does not: the RPC socket's path must fit in ``sun_path``.
     environment.check_tmpdir({"TMPDIR": "/s" + "a" * 59, "CLAUDE_CODE_TMPDIR": _SCRATCH})
     with pytest.raises(environment.EnvironmentError, match="at most 61"):
         environment.check_tmpdir({"TMPDIR": "/s" + "a" * 60, "CLAUDE_CODE_TMPDIR": _SCRATCH})
@@ -118,7 +112,7 @@ def test_claim_skips_a_card_that_fails_the_lone_probe():
     assert any("lone-process probe" in n for n in notes)
 
 
-def test_claim_reports_why_when_it_cannot_fill_the_world_size():
+def test_a_claim_it_cannot_fill_says_why():
     runner = make_runner(
         smi=_smi_rows(_healthy_row(0), "1, 20000, 183359, 0, 10.3", "2, 180000, 183359, 97, 10.3")
     )
@@ -127,9 +121,7 @@ def test_claim_reports_why_when_it_cannot_fill_the_world_size():
     message = str(excinfo.value)
     assert "need 3 healthy sm_103" in message
     assert "device 1" in message and "device 2" in message
-
-
-def test_wrong_architecture_is_refused_with_the_reason():
+    # The wrong architecture is refused with the reason.
     runner = make_runner(smi=_smi_rows(_healthy_row(0, cap="10.0"), _healthy_row(1, cap="10.0")))
     with pytest.raises(PreflightError) as excinfo:
         preflight.claim_devices(1, "sm_103", "/p", runner=runner)
@@ -177,25 +169,6 @@ def _reference(tmp_path, name, payload):
     return f"{_REFERENCES_DIR}/{name}"
 
 
-def test_a_missing_model_key_is_named_before_anything_is_built(tmp_path):
-    reference = _reference(tmp_path, "gsm8k.yaml", {"openai/gpt-oss-120b": [{"accuracy": 90.0}]})
-    task = _task(
-        tmp_path,
-        accuracy={"benchmark": "gsm8k", "reference_yaml": reference, "model_key": "XiaomiMiMo/x"},
-    )
-    with pytest.raises(PreflightError) as excinfo:
-        preflight.check_accuracy_anchors(task)
-    message = str(excinfo.value)
-    assert "unit `core`" in message
-    assert "XiaomiMiMo/x" in message
-    assert reference in message
-    # `load_reference_score`'s own words, surfaced rather than flattened to
-    # "not found" -- including the instruction that the anchor is never
-    # invented, which is the part that says what to do next.
-    assert "has no entry for 'XiaomiMiMo/x'" in message
-    assert "never invented" in message
-
-
 # -------------------------------------------------------------- end to end
 
 
@@ -212,42 +185,69 @@ def test_run_preflight_resolves_identity(tmp_path):
     assert result.checkpoint_config["architectures"] == ["Qwen3MoeForCausalLM"]
 
 
-def test_a_bad_anchor_stops_the_run_before_a_single_device_is_probed(tmp_path):
+def test_a_missing_model_key_stops_the_run_before_a_single_device_is_probed(tmp_path):
     """The anchor check is pure file reading, so it runs before any probe of the host."""
-    reference = _reference(tmp_path, "gsm8k.yaml", {"someone/else": [{"accuracy": 90.0}]})
+    reference = _reference(tmp_path, "gsm8k.yaml", {"openai/gpt-oss-120b": [{"accuracy": 90.0}]})
     task = _task(
         tmp_path,
-        accuracy={
-            "benchmark": "gsm8k",
-            "reference_yaml": reference,
-            "model_key": "openai/gpt-oss-120b",
-        },
+        accuracy={"benchmark": "gsm8k", "reference_yaml": reference, "model_key": "XiaomiMiMo/x"},
     )
 
     def runner(argv, env=None, timeout=0):  # pragma: no cover - must not run
         raise AssertionError(f"probed the host before checking the spec: {argv}")
 
-    with pytest.raises(PreflightError, match="unit `core`"):
+    with pytest.raises(PreflightError) as excinfo:
         preflight.run_preflight(task, runner=runner)
+    message = str(excinfo.value)
+    assert "unit `core`" in message
+    assert "XiaomiMiMo/x" in message
+    assert reference in message
+    # `load_reference_score`'s own words, surfaced rather than flattened to
+    # "not found" -- including the instruction that the anchor is never
+    # invented, which is the part that says what to do next.
+    assert "has no entry for 'XiaomiMiMo/x'" in message
+    assert "never invented" in message
 
 
-# ------------------------------------------------------- a pending or placeholder anchor
+# --------------------------------------------------------------- a placeholder anchor
 
 
-def test_a_pending_anchor_needs_the_logit_gate_as_its_oracle(tmp_path):
-    accuracy = {"benchmark": "gsm8k", "anchor": "pending", "model_key": "x/y"}
-    with pytest.raises(PreflightError, match="pending.*no logit"):
-        preflight.check_accuracy_anchors(_task(tmp_path, accuracy=accuracy))
-    accuracy["logits"] = {"reference": "logits.reference.json.gz"}
-    notes = preflight.check_accuracy_anchors(_task(tmp_path, accuracy=accuracy))
-    assert "pending; the logit gate is the oracle" in notes[0]
-
-
-def test_an_anchor_that_reads_as_a_fraction_or_a_placeholder_is_refused(tmp_path):
+def test_an_anchor_is_in_percent_and_committed_where_the_gates_read_it(tmp_path):
     """Anchors are in percent: 1.0 under a floor of reference - k*SE passes any engine."""
+    import subprocess
+
     reference = _reference(tmp_path, "gsm8k.yaml", {"x/y": [{"accuracy": 1.0}]})
     task = _task(
         tmp_path, accuracy={"benchmark": "gsm8k", "reference_yaml": reference, "model_key": "x/y"}
     )
-    with pytest.raises(PreflightError, match="fraction or a placeholder"):
+    with pytest.raises(PreflightError, match="reads as a fraction"):
         preflight.check_accuracy_anchors(task)
+    # A low placeholder is an anchor; uncommitted, no gate (each measures a commit) reads it.
+    _reference(tmp_path, "gsm8k.yaml", {"x/y": [{"accuracy": 10.0}]})
+    git = ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    with pytest.raises(PreflightError, match="commit it to the run's branch"):
+        preflight.check_accuracy_anchors(task)
+    subprocess.run([*git, "add", reference], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "anchor"], check=True)
+    assert "= 10" in preflight.check_accuracy_anchors(task)[0]
+
+
+def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_path):
+    fp8 = {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}, "members": ["dep4"]}
+    task = _task(
+        tmp_path,
+        parallel="unified",
+        members=["tp4", "dep4"],
+        accuracy={"benchmark": "gsm8k", "reference_yaml": "x.yaml", "benchmark_members": "tp4"},
+        variants={"kv_fp8": {**fp8, "gates": ["accuracy"]}},
+    )
+    with pytest.raises(PreflightError, match="`core`'s benchmark at none of dep4"):
+        preflight.check_variant_anchors(task, 4)
+    del task["accuracy"]["benchmark_members"]
+    assert "relative, core's own score at dep4" in preflight.check_variant_anchors(task, 4)[0]
+    task["features"] = ["disagg"]
+    task["environment"]["gpus_per_node"] = 4
+    task["accuracy"]["disagg"] = {"test": "tests/test_d.py::TestM::test_auto_dtype", "devices": 8}
+    with pytest.raises(PreflightError, match="more than the 4 devices one node holds"):
+        preflight.check_disagg_placement(task)

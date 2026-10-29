@@ -12,11 +12,14 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
+from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
 from agent_flow.workflows.trtllm_modeling_v2.spec import derive
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
 from .conftest import SCRATCH
+
+DISAGG_LAUNCHER = tree_anchors.ANCHORS["disagg_launcher"].hint
 
 
 def _checkpoint(root: Path) -> Path:
@@ -76,24 +79,59 @@ def test_what_the_checkpoint_carries_is_built_into_a_spec_the_run_takes(tmp_path
 
 
 def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
-    goal = "-mtp multimodal:smoke tp1 dep4 isl=1024 osl=256 arch=sm_103 disagg@dep4"
-    leg_b = {"contrast_command": "leg_b.sh", "contrast_env": {"MV2_LEG": "b"}}
-    path = _derive(
-        tmp_path,
-        goal,
-        device={"arch": "sm_100", "gpus_per_node": 4},
-        defaults={"witness": {"disagg": leg_b}},
+    goal = (
+        "-mtp multimodal:smoke tp1 dep4 isl=1024 osl=256 arch=sm_103 disagg@dep4 kv=bf16/fp8 "
+        "concurrency=8/256"
     )
+    site = dict(
+        device={"arch": "sm_100", "gpus_per_node": 4},
+        defaults={"disagg": {"env": {"LLM_MODELS_ROOT": "/models"}}},
+    )
+    # The node id is named beside the tree's disaggregated launcher: asked for until it is found.
+    with pytest.raises(derive.DeriveError, match="accuracy.disagg.test"):
+        _derive(tmp_path, goal, **site)
+    launcher = tmp_path / "repo" / DISAGG_LAUNCHER
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("def launch_disaggregated_llm(config):\n    pass\n")
+    path = _derive(tmp_path, goal, clean=True, **site)
     spec = load_and_validate_task_yaml(path)
     assert spec["features"] == ["multimodal", "disagg"] and spec["arch"] == "sm_103"
     assert spec["profile"] == {"default": "standard", "multimodal": "smoke"}
-    # dep4's two legs take two nodes: the hop is proven on one, dep4 by the aggregated units.
-    assert spec["members"] == {"default": ["tp1", "dep4"], "disagg": ["dep2"]}
-    assert spec["coverage"] == {
-        "accept": ["core@dep2", "multimodal@dep2", "disagg@tp1", "disagg@dep4"]
+    # disagg where the goal puts it; its test lays its two engines out on dep4's node.
+    assert spec["members"] == {"default": ["tp1", "dep4"], "disagg": ["dep4"]}
+    assert spec["coverage"] == {"accept": ["disagg@tp1"]}
+    # The first KV dtype is every gate's; each other one a variant judged against core's score.
+    assert "--kv_cache_dtype=fp8" not in spec["runtime"]["extra_flags"]
+    assert spec["variants"]["kv_fp8"]["gates"] == ["accuracy"]
+    assert spec["variants"]["kv_fp8"]["llm_api_options"] == {"kv_cache_config": {"dtype": "fp8"}}
+    assert spec["accuracy"]["disagg"] == {
+        "env": {"LLM_MODELS_ROOT": "/models"},
+        "test": f"{DISAGG_LAUNCHER}::TestNewModel::test_auto_dtype",
     }
-    assert spec["accuracy"]["witness"]["disagg"]["contrast_command"].endswith("leg_b.sh")
     assert "--max_seq_len=1280" in spec["runtime"]["extra_flags"]
+    # The batch holds the goal's concurrency, whatever the default says.
+    assert "--max_batch_size=256" in spec["runtime"]["extra_flags"]
+
+
+def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_is_asked(tmp_path):
+    checkpoint = _checkpoint(tmp_path)
+    config = json.loads((checkpoint / "config.json").read_text())
+    del config["_name_or_path"]
+    (checkpoint / "config.json").write_text(json.dumps(config))
+    with pytest.raises(derive.DeriveError) as excinfo:
+        cli._derive_spec(
+            checkpoint, _site(tmp_path), tmp_path / "ws", goal="multimodal tune", clean=False
+        )
+    assert "accuracy.model_key" in str(excinfo.value) and "concurrency" not in str(excinfo.value)
+    spec = yaml.safe_load((tmp_path / "ws" / derive.SPEC_FILENAME).read_text())
+    # Concurrency is not asked: 1/32/128 by default, attention DP only at the high point per rank.
+    loads = {c["name"]: c["workload"]["concurrency"] for c in spec["perf"]["configs"]}
+    assert loads == {"tp1": [1, 32, 128], "tep4": [1, 32, 128], "dep4": [512]}
+    # The checkpoint's drafter is left out: the goal names its features and not it.
+    assert spec["features"] == ["multimodal"]
+    assert "features (left out)" in (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
+    with pytest.raises(derive.DeriveError, match="kv= is named once"):
+        derive.parse_goal("kv=fp8 kv=nvfp4")
 
 
 def test_an_open_question_stops_before_the_run_and_is_answered_in_the_spec(tmp_path):

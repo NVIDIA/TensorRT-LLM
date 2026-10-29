@@ -153,17 +153,14 @@ def _fake_site(tmp_path: Path) -> tuple[Path, Path]:
     return site, repo
 
 
-def _real(site: Path, **env) -> RunEnvironment:
-    return RunEnvironment(
-        kind="local", python=sys.executable, world_size=1, env={"PYTHONPATH": str(site), **env}
-    )
-
-
 def _real_boot(tmp_path: Path, **env) -> check_result.GateResult:
     site, repo = _fake_site(tmp_path)
+    environment = RunEnvironment(
+        kind="local", python=sys.executable, world_size=1, env={"PYTHONPATH": str(site), **env}
+    )
     task = _task(tmp_path, trtllm_repo_path=str(repo))
     return boot_checks.run_boot_gate(
-        _real(site, **env), task_data=task, unit="core", member="tp1", workdir=tmp_path / "gates"
+        environment, task_data=task, unit="core", member="tp1", workdir=tmp_path / "gates"
     )
 
 

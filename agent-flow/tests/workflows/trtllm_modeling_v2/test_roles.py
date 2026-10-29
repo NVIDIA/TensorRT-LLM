@@ -23,17 +23,6 @@ def _isolated_driving_agent(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_every_prompt_role_is_routable():
-    assert set(roles.ROLES) == set(PromptBundle.__dataclass_fields__)
-
-
-def test_without_an_agents_block_every_role_inherits_the_driving_agent():
-    for role in roles.ROLES:
-        agent = roles.resolve_role_agent({}, role)
-        assert (agent.backend, agent.model) == ("claude-code", "claude-test-model"), role
-        assert agent.reasoning_effort is None
-
-
 @pytest.mark.parametrize(
     "backend,env",
     [
@@ -98,7 +87,9 @@ def test_a_backend_switch_never_inherits_the_other_backends_model(monkeypatch):
     )
 
 
-def test_nested_harness_markers_require_explicit_backend():
+def test_an_unknown_or_nested_parent_never_silently_uses_a_default():
+    with pytest.raises(ModelSelectionError, match="agents.defaults.model"):
+        roles.resolve_role_agents({}, environ={})
     env = {"CLAUDECODE": "1", "CODEX_THREAD_ID": "nested"}
     with pytest.raises(ModelSelectionError, match="Both Claude and Codex"):
         roles.resolve_role_agents({}, environ=env)
@@ -106,12 +97,8 @@ def test_nested_harness_markers_require_explicit_backend():
     assert {a.model for a in roles.resolve_role_agents(task, environ=env).values()} == {"chosen"}
 
 
-def test_unknown_parent_never_silently_uses_a_default():
-    with pytest.raises(ModelSelectionError, match="agents.defaults.model"):
-        roles.resolve_role_agents({}, environ={})
-
-
-def test_a_role_override_changes_only_that_role():
+def test_a_role_override_changes_only_that_role_and_the_rest_inherit_the_driving_agent():
+    assert set(roles.ROLES) == set(PromptBundle.__dataclass_fields__)  # every prompt is routable
     task = {
         "agents": {
             "roles": {
@@ -122,17 +109,22 @@ def test_a_role_override_changes_only_that_role():
     }
     planner = roles.resolve_role_agent(task, "planner")
     kernel_writer = roles.resolve_role_agent(task, "kernel_writer")
-    assembler = roles.resolve_role_agent(task, "assembler")
     assert (planner.backend, planner.model) == ("claude-code", "claude-other")
     assert (kernel_writer.backend, kernel_writer.model, kernel_writer.reasoning_effort) == (
         "codex",
         "codex-test-model",
         "high",
     )
-    assert (assembler.backend, assembler.model) == ("claude-code", "claude-test-model")
+    for role in set(roles.ROLES) - {"planner", "kernel_writer"}:
+        agent = roles.resolve_role_agent(task, role)
+        assert (agent.backend, agent.model, agent.reasoning_effort) == (
+            "claude-code",
+            "claude-test-model",
+            None,
+        ), role
 
 
-def test_the_spec_accepts_an_agents_block(tmp_path):
+def test_the_spec_accepts_an_agents_block_of_known_roles_only(tmp_path):
     spec = _valid_spec(tmp_path)
     spec["agents"] = {
         "defaults": {"backend": "claude-code", "model": "claude-x"},
@@ -140,20 +132,27 @@ def test_the_spec_accepts_an_agents_block(tmp_path):
     }
     data = task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert data["agents"]["roles"]["planner"]["backend"] == "codex"
-
-
-def test_the_spec_rejects_an_unknown_role(tmp_path):
-    spec = _valid_spec(tmp_path)
     spec["agents"] = {"roles": {"wizard": {"backend": "codex"}}}
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert "unknown role(s) ['wizard']" in str(excinfo.value)
 
 
-def test_a_claude_role_keeps_its_stop_hook(tmp_path):
-    """The hook refuses a turn that wrote nothing; the file is validated when read."""
+def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
+    """The hook refuses a turn that wrote nothing; the file is validated when read.
+
+    Codex refuses per-client Claude SDK hooks, so a Stop hook would fail the turn.
+    """
     workflow = _workflow(tmp_path)
-    workflow.task_data = {"agents": {"roles": {"assembler": {"reasoning_effort": "high"}}}}
+    kb = {"kb": {"type": "http", "url": "https://kb.test/mcp"}}
+    workflow.task_data = {
+        "agents": {
+            "roles": {
+                "assembler": {"reasoning_effort": "high"},
+                "planner": {"backend": "codex", "extra_mcp_servers": kb},
+            }
+        }
+    }
     layer = workflow._make_agent("assembler", "system")
     backend = layer.config.backend
     assert (backend.kind, backend.model, backend.reasoning_effort) == (
@@ -165,26 +164,17 @@ def test_a_claude_role_keeps_its_stop_hook(tmp_path):
     assert backend.cwd == workflow.workspace
     assert layer.config.required_tools == ()
 
-
-def test_a_codex_role_gets_no_claude_hooks(tmp_path):
-    """Codex refuses per-client Claude SDK hooks, so a Stop hook would fail the turn."""
-    workflow = _workflow(tmp_path)
-    workflow.task_data = {
-        "agents": {
-            "roles": {
-                "planner": {
-                    "backend": "codex",
-                    "extra_mcp_servers": {"kb": {"type": "http", "url": "https://kb.test/mcp"}},
-                }
-            }
-        }
-    }
     layer = workflow._make_agent("planner", "system")
     backend = layer.config.backend
     assert (backend.kind, backend.model) == ("codex", "codex-test-model")
     assert backend.hooks is None
-    assert backend.extra_mcp_servers == {"kb": {"type": "http", "url": "https://kb.test/mcp"}}
+    assert backend.extra_mcp_servers == kb
     assert layer.config.required_tools == ()
+    # Without the user's plugins, and, once the agent probe has read them, their skills.
+    assert backend.plugins is False and backend.disabled_skills == ()
+    workflow._foreign_skills = {"codex": ("imagegen", "cluster-jobs")}
+    backend = workflow._make_agent("planner", "system").config.backend
+    assert backend.disabled_skills == ("imagegen", "cluster-jobs")
 
 
 def test_probe_primers_and_turns_share_pinned_models(tmp_path, monkeypatch):

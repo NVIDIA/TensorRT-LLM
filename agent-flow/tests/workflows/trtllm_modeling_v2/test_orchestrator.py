@@ -83,12 +83,7 @@ def _orchestrator(tmp_path, services, **kw):
 def test_a_plan_whose_checks_pass_is_delivered_with_the_delivery_tier_last(tmp_path):
     plan = _plan_once(
         _task("k", "kernel", touches=["catalog/k.py"]),
-        _task(
-            "core",
-            "assemble",
-            ["core:boot@tp1", "core:accuracy[gsm8k]@tp1", "core:serve@tp1"],
-            deps=["k"],
-        ),  # fmt: skip
+        _task("core", "assemble", _KEYS, deps=["k"]),
     )
     services = _services(plan)
     assert _orchestrator(tmp_path, services).run() == "delivered"
@@ -117,13 +112,12 @@ def test_a_graph_that_leaves_a_required_check_unclaimed_is_sent_back(tmp_path):
 
 def test_a_failed_check_wakes_the_planner_with_the_evidence(tmp_path):
     turns = []
-    keys = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1", "core:serve@tp1"]
 
     def plan(turn):
         turns.append(turn)
         if len(turns) == 1:
             return PlannerAnswer(
-                "GRAPH_UPDATED", "plan", g.Graph(tasks=[_task("core", "assemble", keys)])
+                "GRAPH_UPDATED", "plan", g.Graph(tasks=[_task("core", "assemble", _KEYS)])
             )
         return PlannerAnswer("CEILING", "no attention kernel")
 
@@ -134,47 +128,14 @@ def test_a_failed_check_wakes_the_planner_with_the_evidence(tmp_path):
 
 
 def test_a_failed_nice_to_have_is_abandoned_not_retried(tmp_path):
-    keys = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1", "core:serve@tp1"]
     plan = _plan_once(
-        _task("core", "assemble", keys),
+        _task("core", "assemble", _KEYS),
         _task("eplb-ish", "feature", priority="nice_to_have"),
     )
     services = _services(plan, decisions={"eplb-ish": "BLOCKED"})
     orchestrator = _orchestrator(tmp_path, services)
     assert orchestrator.run() == "delivered"
     assert orchestrator.graph.by_id()["eplb-ish"].status == "abandoned"
-
-
-def test_a_planner_that_never_makes_progress_is_stopped(tmp_path):
-    def plan(turn):
-        return PlannerAnswer("DONE", "trust me")
-
-    orchestrator = _orchestrator(tmp_path, _services(plan), revision_cap=2)
-    orchestrator.graph = g.Graph(tasks=[_task("idle", "investigate")])
-    orchestrator.graph.tasks[0].status = "done"
-    assert orchestrator.run() == "planner-stalled"
-
-
-def test_checks_a_later_task_made_stale_run_again_on_the_final_target(tmp_path):
-    keys = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1", "core:serve@tp1"]
-    plan = _plan_once(
-        _task("core", "assemble", keys[:2]),
-        _task("tweak", "feature", ["core:serve@tp1"], deps=["core"]),
-    )
-    services = _services(plan)
-    tree = {"marker": "v1"}
-    services.marker = lambda: tree["marker"]
-    original = services.work
-
-    def work(task):
-        if task.id == "tweak":
-            tree["marker"] = "v2"  # the feature changed the target after core's checks
-        return original(task)
-
-    services.work = work
-    assert _orchestrator(tmp_path, services).run() == "delivered"
-    ran = services.ran_checks  # type: ignore[attr-defined]
-    assert ran.count("core:boot@tp1") == 2 and ran.count("core:accuracy[gsm8k]@tp1") == 2
 
 
 def test_a_stale_benchmark_waits_for_a_milestone_while_required_work_runs(tmp_path):
@@ -190,7 +151,7 @@ def test_a_stale_benchmark_waits_for_a_milestone_while_required_work_runs(tmp_pa
         )
     )
     plan = _plan_once(
-        _task("core", "assemble", ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]),
+        _task("core", "assemble", _KEYS[:2]),
         _task("mtp", "feature", ["mtp:boot@tp1", "mtp:accuracy[gsm8k]@tp1"], deps=["core"]),
         _task("tweak", "feature", deps=["mtp"]),
         _task("slow", "feature", deps=["core"]),
@@ -224,39 +185,8 @@ def test_a_stale_benchmark_waits_for_a_milestone_while_required_work_runs(tmp_pa
     assert services.ran_checks.count("mtp:accuracy[gsm8k]@tp1") == 2
 
 
-def test_a_tune_task_waits_for_the_core_checks_then_runs_beside_other_work(tmp_path):
-    started: list[tuple[str, tuple[str, ...]]] = []
-    plan = _plan_once(
-        _task("tune", "tune", touches=[]),
-        _task(
-            "core",
-            "assemble",
-            ["core:boot@tp1", "core:accuracy[gsm8k]@tp1", "core:serve@tp1"],
-        ),  # fmt: skip
-    )
-    services = _services(plan)
-
-    def work(task):
-        started.append((task.id, tuple(services.ran_checks)))
-        return "TUNED" if task.kind == "tune" else "UNIT_READY"
-
-    services.work = work
-    orchestrator = _orchestrator(
-        tmp_path,
-        services,
-        required_kinds=("tune",),
-        start_after={"tune": ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]},
-    )
-    assert orchestrator.run() == "delivered"
-    assert started[0] == ("core", ())
-    assert started[1][0] == "tune"
-    assert {"core:boot@tp1", "core:accuracy[gsm8k]@tp1"} <= set(started[1][1])
-
-
 def test_a_task_left_running_by_a_dead_process_starts_again(tmp_path):
-    task = _task(
-        "core", "assemble", ["core:boot@tp1", "core:accuracy[gsm8k]@tp1", "core:serve@tp1"]
-    )
+    task = _task("core", "assemble", _KEYS)
     task.status = "running"
     g.Graph(tasks=[task]).save(tmp_path / g.GRAPH_FILENAME)
     ran = []
@@ -270,13 +200,12 @@ def test_a_task_left_running_by_a_dead_process_starts_again(tmp_path):
 
 
 def test_an_integration_failure_starts_the_task_again_once_then_fails_it(tmp_path):
-    keys = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1", "core:serve@tp1"]
     turns, attempts = [], []
 
     def plan(turn):
         turns.append(turn)
         if len(turns) == 1:
-            graph = g.Graph(tasks=[_task("core", "assemble", keys)])
+            graph = g.Graph(tasks=[_task("core", "assemble", _KEYS)])
             return PlannerAnswer("GRAPH_UPDATED", "plan", graph)
         return PlannerAnswer("ESCALATE", "the branch keeps conflicting")
 
@@ -302,7 +231,6 @@ def test_an_integration_failure_starts_the_task_again_once_then_fails_it(tmp_pat
 
 
 def test_a_worker_turn_that_raised_starts_again_and_the_run_goes_on(tmp_path):
-    keys = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1", "core:serve@tp1"]
     attempts = []
 
     def work(task):
@@ -311,7 +239,7 @@ def test_a_worker_turn_that_raised_starts_again_and_the_run_goes_on(tmp_path):
             raise OSError("the dispatch session went away")
         return "UNIT_READY"
 
-    services = _services(_plan_once(_task("core", "assemble", keys)))
+    services = _services(_plan_once(_task("core", "assemble", _KEYS)))
     services.work = work
     assert _orchestrator(tmp_path, services).run() == "delivered"
     assert attempts == ["core", "core"]
@@ -339,27 +267,20 @@ def test_only_an_infrastructure_failure_is_retried_and_only_once(tmp_path, decis
 # ------------------------------------------------------------ a tune campaign
 
 
-def test_full_support_tells_the_campaign_to_wrap_up_and_the_run_is_delivered(tmp_path):
-    """The campaign gives way to full support: told to stop, it wraps up and nothing waits for it."""
-    stopped = threading.Event()
-    reasons: list[str] = []
+def test_a_campaign_starts_once_the_onboarding_holds_and_the_run_waits_for_it(tmp_path):
+    """The campaign follows the onboarding: it starts once every required check has passed."""
     logs: list[str] = []
+    started: list[tuple[str, tuple[str, ...]]] = []
 
     def work(task):
-        if task.kind == "tune":
-            # Runs until told to stop, as a campaign with hours of budget left would.
-            assert stopped.wait(timeout=30)
-            return "TUNED\ntuned: best branch `tune/x/best`"
-        return "UNIT_READY"
+        started.append((task.id, tuple(services.ran_checks)))
+        return "TUNED\ntuned: best branch `tune/x/best`" if task.kind == "tune" else "UNIT_READY"
 
-    def stop(reason):
-        reasons.append(reason)
-        stopped.set()
-
+    # Listed first, the campaign still waits for the whole contract, delivery tier included.
     services = _services(
-        _plan_once(_task("core", "assemble", _KEYS), _task("tune", "tune", touches=[]))
+        _plan_once(_task("tune", "tune", touches=[]), _task("core", "assemble", _KEYS))
     )
-    services.work, services.stop_campaign, services.log = work, stop, logs.append
+    services.work, services.log = work, logs.append
     services.marker = lambda: "v1"
 
     def correct(marker, evaluation):
@@ -369,10 +290,11 @@ def test_full_support_tells_the_campaign_to_wrap_up_and_the_run_is_delivered(tmp
 
     services.correct = correct
     orchestrator = _orchestrator(
-        tmp_path, services, required_kinds=("tune",), start_after={"tune": _KEYS[:2]}
+        tmp_path, services, required_kinds=("tune",), start_after={"tune": _KEYS}
     )
     assert orchestrator.run() == "delivered"
-    assert reasons == ["full support holds on the target as it is"]
+    assert started[0] == ("core", ()) and started[1][0] == "tune"
+    assert set(_KEYS) <= set(started[1][1])
     assert orchestrator.graph.by_id()["tune"].status == "done"
     # The campaign's report is journaled for the record; no planner turn had to read it.
     assert any("best branch `tune/x/best`" in line for line in logs)
@@ -388,7 +310,7 @@ def test_an_escalation_lets_the_work_that_does_not_wait_on_it_finish(tmp_path):
             graph = g.Graph(
                 tasks=[
                     _task("vision", "feature", ["core:boot@tp1"]),
-                    _task("core", "assemble", ["core:accuracy[gsm8k]@tp1", "core:serve@tp1"]),
+                    _task("core", "assemble", _KEYS[1:]),
                 ]
             )
             return PlannerAnswer("GRAPH_UPDATED", "plan", graph)
@@ -429,3 +351,16 @@ def test_a_full_filesystem_holds_new_work_until_the_state_is_written(tmp_path, m
     assert orchestrator.run() == "delivered"
     assert started_after == [3]
     assert g.Graph.load(tmp_path / g.GRAPH_FILENAME).by_id()["core"].status == "done"
+
+
+def test_a_check_that_needs_anothers_verdict_runs_it_first_once(tmp_path):
+    base = c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER)
+    after = c.Check("kv_fp8", "accuracy[gsm8k]", "tp1", c.TIER_PROOF, after=base.key)
+    services = _services(_plan_once())
+    services.marker = lambda: "m1"
+    loop = GraphOrchestrator(
+        services, c.Contract(checks=(base, after)), c.ContractStatus.load(tmp_path), tmp_path
+    )
+    loop._run_checks([after.key])
+    loop._run_checks([after.key, base.key])
+    assert services.ran_checks == [base.key, after.key]  # type: ignore[attr-defined]

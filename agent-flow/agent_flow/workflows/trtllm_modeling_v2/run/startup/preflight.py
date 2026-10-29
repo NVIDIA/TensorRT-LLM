@@ -30,16 +30,17 @@ import yaml
 
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
-from ...checks import check_config, check_runtime, logit_agreement
+from ...checks import check_config, check_runtime
+from ...checks import disagg as disagg_checks
 from ...checks.check_config import resolve_llm_api_options, speculation_flags
 from ...checks.runtime_evidence import reports_unsupported_architecture
 from ...infra.compute import environment as environment_mod
 from ...infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
 from ...infra.compute.environment import RunEnvironment, resolve_environment, scheduler_owns_devices
+from ...infra.git import git_output
 from ...operators.coverage import MODELING_V2_PACKAGE
 from ...spec.derive import hybrid_marker
 from ...spec.task_schema import (
-    anchor_pending,
     assembly_units,
     derive_checkpoint_segment,
     derive_family,
@@ -50,8 +51,9 @@ from ...spec.task_schema import (
     resolve_per_unit,
     widest_world_size,
 )
-from ...spec.variants import variant_anchor_pending, variant_gates
+from ...spec.variants import ANCHOR_RELATIVE, anchor_state, base_unit, variant_gates
 from ...spec.variants import variants as variants_of
+from ..validation import contract as contract_mod
 
 # A device is claimable when it is this close to empty. Not 100%: a healthy
 # idle card still shows a little in use (ECC tables, the driver's own context).
@@ -390,23 +392,7 @@ def check_accuracy_anchors(
         return []
 
     notes: list[str] = []
-    logits = logit_agreement.LogitsSpec.from_task(task_data).enabled
     for unit in units if units is not None else assembly_units(task_data):
-        if anchor_pending(accuracy, unit):
-            if not logits:
-                raise PreflightError(
-                    f"accuracy anchor for unit `{unit}` is pending, and the run has no logit "
-                    f"reference (`accuracy.logits`) to be its correctness oracle instead. A "
-                    f"benchmark score compared with nothing proves nothing, and the run must "
-                    f"not measure its own reference: name the logit reference, or record the "
-                    f"anchor row from a written source."
-                )
-            notes.append(
-                f"accuracy anchor [{unit}]: pending; the logit gate is the oracle, the "
-                f"benchmark is not a check, and delivery stays incomplete until a row is "
-                f"recorded from a written source"
-            )
-            continue
         declared = str(resolve_per_unit(accuracy, "reference_yaml", unit) or "").strip()
         if not declared:
             notes.append(
@@ -452,10 +438,18 @@ def check_accuracy_anchors(
         if score <= PLACEHOLDER_ANCHOR_MAX:
             raise PreflightError(
                 f"accuracy anchor for unit `{unit}` is {score:g} ({declared}: {model_key}). "
-                f"Anchors are recorded in percent, so this is a fraction or a placeholder, "
-                f"and a floor under it passes any engine. Record the real score from a "
-                f"written source, or say `accuracy.anchor: pending` and let the logit gate "
-                f"be the oracle."
+                f"Anchors are recorded in percent, so this reads as a fraction. Record the "
+                f"score in percent from a written source, or a low placeholder in percent "
+                f"(e.g. 10 for GSM8K: it catches an engine that answers nothing) until a "
+                f"measured one replaces it."
+            )
+        uncommitted = _uncommitted(task_data, declared)
+        if uncommitted:
+            raise PreflightError(
+                f"accuracy anchor for unit `{unit}`: the checkout holds {uncommitted} "
+                f"uncommitted. Each check measures a snapshot of a commit and reads the anchor "
+                f"table from it, so this row exists for preflight and not for any gate: commit "
+                f"it to the run's branch."
             )
         notes.append(
             f"accuracy anchor [{unit}]: {benchmark or 'eval'} {model_key} "
@@ -464,22 +458,71 @@ def check_accuracy_anchors(
     return notes
 
 
-def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list[str]:
-    """Every configuration variant with an accuracy gate resolves its own anchor row.
+def _uncommitted(task_data: Mapping[str, Any], declared: str) -> str:
+    """``declared`` (an anchor table) as the checkout's git holds it uncommitted; "" otherwise."""
+    repo = Path(str(task_data.get("trtllm_repo_path") or ""))
+    path = Path(declared) if Path(declared).is_absolute() else repo / declared
+    try:
+        rel = path.resolve().relative_to(repo.resolve())
+    except (OSError, ValueError):
+        return ""  # outside the checkout: a snapshot does not move it
+    dirt = git_output(repo, "status", "--porcelain", "--untracked-files=all", "--", str(rel))
+    return str(rel) if dirt and dirt.strip() else ""
 
-    A variant's accuracy gate looks its row up under the variant's name, with
-    the variant's own ``accuracy`` overlay (``checks/check_config.variant_spec``).
+
+def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list[str]:
+    """Every configuration variant with an accuracy gate has an anchor its gate can read.
+
+    A variant that names a row of its own looks it up under the variant's name,
+    with its own ``accuracy`` overlay (``checks/check_config.variant_spec``). A
+    relative one (``spec.variants.anchor_state``) is judged against its unit's
+    benchmark at the same member, which the contract must owe.
     """
     notes: list[str] = []
+    contract = None
     for name in variants_of(task_data):
         if "accuracy" not in variant_gates(task_data, name):
             continue
-        spec = check_config.variant_spec(task_data, name, world_size=world_size)
-        if variant_anchor_pending(task_data, spec, name):
-            notes.append(f"accuracy anchor [{name}]: pending; the variant owes no accuracy check")
+        if anchor_state(task_data, name) == ANCHOR_RELATIVE:
+            contract = contract or contract_mod.compile_contract(task_data, world_size)
+            own = [c for c in contract.checks if c.unit == name and c.gate.startswith("accuracy[")]
+            alone = [c.member for c in own if not c.after]
+            if alone:
+                raise PreflightError(
+                    f"configuration variant `{name}` is judged against its unit's own score "
+                    f"(its anchor is relative), but the contract measures "
+                    f"`{base_unit(task_data, name)}`'s benchmark at none of {', '.join(alone)}: "
+                    f"run the variant's benchmark where its unit's runs (its `members`), or give "
+                    f"it a reference row of its own (`accuracy: {{anchor: recorded, "
+                    f"discriminators: ...}}`)."
+                )
+            notes.append(
+                f"accuracy anchor [{name}]: relative, {base_unit(task_data, name)}'s own score "
+                f"at {', '.join(c.member for c in own) or 'its member'}"
+            )
             continue
+        spec = check_config.variant_spec(task_data, name, world_size=world_size)
         notes.extend(check_accuracy_anchors(spec, [name]))
     return notes
+
+
+def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
+    """The disaggregated-serving test asks for no more devices than one node holds.
+
+    The tree's launcher (``launch_disaggregated_llm``) starts every worker on one
+    host; a job asking for more devices than a node has is refused by the spool.
+    """
+    spec = disagg_checks.DisaggSpec.from_task(task_data)
+    if spec is None or not spec.devices or not spec.node_gpus:
+        return []
+    if spec.devices > spec.node_gpus:
+        raise PreflightError(
+            f"accuracy.disagg.devices is {spec.devices}, more than the {spec.node_gpus} devices "
+            f"one node holds: the tree's disaggregated launcher starts every worker on one "
+            f"host, so the test runs on one node. Write it for {spec.node_gpus} devices or fewer "
+            f"(its context and generation workers between them) and set `devices` to match."
+        )
+    return [f"disagg: the test {spec.test} runs on {spec.devices} devices of one node"]
 
 
 #: Public LLM configuration schema, read without importing the GPU runtime.
@@ -604,8 +647,8 @@ def check_kv_cache_configs(
             handed.setdefault(described, []).append(label(launch))
     for described, labels in handed.items():
         notes.append(
-            f"kv cache: {', '.join(labels)}: boot, acceptance and the witness legs "
-            f"and {_LLM_API_GATE} use `kv_cache_config` {described}"
+            f"kv cache: {', '.join(labels)}: boot, acceptance and {_LLM_API_GATE} use "
+            f"`kv_cache_config` {described}"
         )
     marker = hybrid_marker(checkpoint_config)
     exposed = [label(launch) for launch in launches if launch.reuse and not launch.snapshots]
@@ -885,6 +928,7 @@ def run_preflight(
     notes.extend(check_accuracy_anchors(task_data, units))
     notes.extend(check_variant_anchors(task_data, world_size))
     notes.extend(check_launch_settings(task_data))
+    notes.extend(check_disagg_placement(task_data))
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
     notes.extend(check_kv_cache_configs(task_data, checkpoint_config))
@@ -990,6 +1034,7 @@ __all__ = [
     "SpecInconsistencyError",
     "UnsupportedSpeculationError",
     "check_capture_lists",
+    "check_disagg_placement",
     "check_variant_anchors",
     "check_kv_cache_configs",
     "check_speculation_support",

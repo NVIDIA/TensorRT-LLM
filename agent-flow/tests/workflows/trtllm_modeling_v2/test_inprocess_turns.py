@@ -35,9 +35,9 @@ class _Config:
 class StreamingLayer:
     """An ``AgentLayer`` as the executor sees it: a config with an observer, and ``aforward``.
 
-    Each turn streams a tool call, a thinking block and its text through the
-    config's observer, as ``AgentLayer._execute`` does, and writes ``stderr``
-    as the CLI's stderr reader would. ``hold`` keeps a turn open until set.
+    Each turn streams its session, a tool call, a thinking block and its text
+    through the config's observer, as ``AgentLayer._execute`` does, and writes
+    ``stderr`` as the CLI's stderr reader would. ``hold`` keeps a turn open until set.
     """
 
     def __init__(self, *, stderr: str = "", hold: threading.Event | None = None) -> None:
@@ -51,6 +51,10 @@ class StreamingLayer:
             self.config.on_activity(kind, event)
 
     async def aforward(self, prompt: str) -> str:
+        session = SessionInitEvent(
+            backend="codex", model="resolved-model", reasoning_effort="medium", session_id="s1"
+        )
+        self._observe("session", session)
         self._observe("tool", ToolCallEvent(name="Bash", input={"command": f"echo {prompt}"}))
         self._observe("thinking", ThinkingEvent(text="first line\nsecond line"))
         if self.stderr:
@@ -100,50 +104,26 @@ def test_a_turn_leaves_its_prompt_activity_and_answer_as_it_goes(tmp_path):
     assert "text: done with go" in activity
     done = json.loads((root / "001-kernel_writer.done").read_text())
     assert done["outcome"] == "answered" and done["error"] == ""
+    # The effective session configuration is retained in the terminal record.
+    assert done["sessions"][0]["model"] == "resolved-model"
+    assert done["sessions"][0]["reasoning_effort"] == "medium"
 
 
-def test_a_turn_past_its_bound_is_stopped_and_raises_what_an_unanswered_turn_raises(tmp_path):
+def test_a_turn_past_its_bound_is_stopped_and_retried_as_an_infrastructure_failure(tmp_path):
+    # Imported here: importing the orchestrator first walks into the stages' import cycle.
+    from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import _not_the_task
+
     layer = StreamingLayer(hold=threading.Event())
     executor = InProcessTurnExecutor(lambda r: layer, timeout_s=0.2, records=tmp_path)
     started = time.monotonic()
     with pytest.raises(
         TurnTimeout, match=r"001-kernel_writer: no answer within 0.2s \(the kernel_writer turn"
-    ):
+    ) as raised:
         executor.run(_request())
     assert time.monotonic() - started < 5
     # Cancelled, not abandoned: the CLI an AgentLayer started is stopped with it.
     assert layer.cancelled
     done = json.loads((tmp_path / "001-kernel_writer.done").read_text())
     assert done["outcome"] == "timed out" and "001-kernel_writer.activity.log" in done["error"]
-
-
-def test_effective_session_configuration_is_retained_in_the_terminal_record(tmp_path):
-    class MeasuredLayer(StreamingLayer):
-        async def aforward(self, prompt):
-            self._observe(
-                "session",
-                SessionInitEvent(
-                    backend="codex",
-                    model="resolved-model",
-                    reasoning_effort="medium",
-                    session_id="s1",
-                ),
-            )
-            return await super().aforward(prompt)
-
-    InProcessTurnExecutor(lambda request: MeasuredLayer(), records=tmp_path).run(_request())
-    done = json.loads((tmp_path / "001-kernel_writer.done").read_text())
-    assert done["sessions"][0]["model"] == "resolved-model"
-    assert done["sessions"][0]["reasoning_effort"] == "medium"
-
-
-def test_a_timed_out_task_turn_is_retried_as_an_infrastructure_failure(tmp_path):
-    # Imported here: importing the orchestrator first walks into the stages' import cycle.
-    from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import _not_the_task
-
-    executor = InProcessTurnExecutor(
-        lambda r: StreamingLayer(hold=threading.Event()), timeout_s=0.05
-    )
-    with pytest.raises(TurnTimeout) as raised:
-        executor.run(_request())
+    # What an unanswered turn raises: the orchestrator retries it as the run's failure.
     assert _not_the_task(f"raised {type(raised.value).__name__}: {raised.value}")

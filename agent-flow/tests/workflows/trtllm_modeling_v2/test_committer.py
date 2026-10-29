@@ -65,20 +65,15 @@ def isolated_git_env(tmp_path, monkeypatch):
     return home
 
 
-def _commit_raw(repo, message, path, content="x\n", env=None):
+def _commit_raw(repo, message, path, content="x\n"):
     (repo / path).parent.mkdir(parents=True, exist_ok=True)
     (repo / path).write_text(content)
     _git(repo, "add", path)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-q", "-m", message],
-        check=True,
-        capture_output=True,
-        env=env,
-    )
+    _git(repo, "commit", "-q", "-m", message)
     return _git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
-def test_audit_commits_finds_every_kind_of_violation(tmp_path, repo):
+def test_audit_commits_finds_every_kind_of_violation(repo):
     base = _git(repo, "rev-parse", "HEAD").stdout.strip()
     good = _commit_raw(repo, "good\n\nSigned-off-by: Test <t@example.invalid>", "good.py")
     unsigned = _commit_raw(repo, "unsigned", "unsigned.py")

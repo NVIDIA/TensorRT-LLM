@@ -30,34 +30,21 @@ def _replanning(*reasons):
     return plan
 
 
-def test_a_failed_task_runs_again_under_its_own_id(tmp_path):
+def test_a_failed_task_runs_again_under_its_own_id_up_to_the_bound(tmp_path):
     runs = []
 
     def work(task):
         runs.append((task.id, task.attempts))
-        return "BLOCKED" if len(runs) == 1 else "UNIT_READY"
-
-    services = _services(_replanning("plan", "core failed on a fixed flow defect: retry"))
-    services.work = work
-    assert _orchestrator(tmp_path, services).run() == "delivered"
-    assert runs == [("core", 1), ("core", 2)]
-    saved = g.Graph.load(tmp_path / g.GRAPH_FILENAME).by_id()["core"]
-    assert (saved.status, saved.attempts) == ("done", 2)
-
-
-def test_retries_stop_at_the_bound_with_the_reason(tmp_path):
-    runs = []
-
-    def work(task):
-        runs.append(task.attempts)
         return "BLOCKED"
 
     plan = _replanning("again")
     services = _services(plan)
     services.work = work
     assert _orchestrator(tmp_path, services, revision_cap=10).run() == "planner-refused"
-    assert runs == list(range(1, g.MAX_ATTEMPTS + 1))
+    assert runs == [("core", n) for n in range(1, g.MAX_ATTEMPTS + 1)]
     assert any(f"failed on attempt {g.MAX_ATTEMPTS} of" in r for r in plan.turns[-1].refusals)
+    saved = g.Graph.load(tmp_path / g.GRAPH_FILENAME).by_id()["core"]
+    assert (saved.status, saved.attempts) == ("failed", g.MAX_ATTEMPTS)
 
 
 def test_an_attempt_whose_worktree_was_never_prepared_does_not_spend_a_worker_run(tmp_path):

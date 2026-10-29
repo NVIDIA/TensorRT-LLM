@@ -149,31 +149,22 @@ def test_ordinary_boot_runs_boundaries_in_one_engine_and_one_contract_check(tmp_
 
 
 @pytest.mark.parametrize(
-    "phase,request_id,field,value,missing,reason",
+    "request_id,change,reason",
     [
-        ("loaded", "probe0", "token_ids", [9, 1, 2, 3], False, "must agree"),
-        ("loaded", "probe0", "token_ids", [0, 1], False, "must agree"),
-        ("baseline", "probe0", "token_ids", [0, 1], False, "must agree"),
-        ("loaded", "probe0", "token_ids", [], False, "generated nothing"),
-        ("loaded", "probe0", "token_ids", None, True, "generated nothing"),
-        ("loaded", "probe0", "record", None, True, "no record"),
-        ("loaded", "long0", "prompt_tokens", None, True, "prompt tokens"),
-        ("loaded", "long0", "prompt_tokens", 3, False, "prompt tokens"),
-        ("loaded", "long0", "token_ids", [], False, "generated nothing"),
-        ("loaded", "fill0", "token_ids", [], False, "generated nothing"),
+        ("probe0", lambda r: r.update(token_ids=[9, 1, 2, 3]), "must agree"),
+        ("probe0", lambda r: r.update(token_ids=[0, 1]), "must agree"),
+        ("fill0", lambda r: r.update(token_ids=[]), "generated nothing"),
+        ("probe0", dict.clear, "no record"),
+        ("long0", lambda r: r.pop("prompt_tokens"), "prompt tokens"),
+        ("long0", lambda r: r.update(prompt_tokens=3), "prompt tokens"),
     ],
 )
 def test_boot_refuses_incomplete_boundary_evidence(
-    tmp_path, monkeypatch, phase, request_id, field, value, missing, reason
+    tmp_path, monkeypatch, request_id, change, reason
 ):
     def mutate(record):
-        if record.get("phase") == phase and record["id"] == request_id:
-            if field == "record":
-                record.clear()
-            elif missing:
-                record.pop(field)
-            else:
-                record[field] = value
+        if record.get("phase") == "loaded" and record["id"] == request_id:
+            change(record)
 
     result, _, _ = _run_boot(tmp_path, monkeypatch, mutate=mutate)
     assert not result.passed
@@ -234,7 +225,7 @@ def _parted(gap):
     return mutate
 
 
-def test_a_probe_that_parts_at_a_near_tie_passes_and_says_so(tmp_path, monkeypatch):
+def test_a_probe_that_parts_at_a_near_tie_passes_and_past_the_margin_fails(tmp_path, monkeypatch):
     result, specs, events = _run_boot(tmp_path, monkeypatch, mutate=_parted(0.05))
     assert result.passed, result.detail
     assert "near-tie(s) (probe0 step 2: baseline 2, loaded 9, 0.050 apart)" in result.detail
@@ -243,16 +234,13 @@ def test_a_probe_that_parts_at_a_near_tie_passes_and_says_so(tmp_path, monkeypat
     assert probes and all(r["logprobs"] == boot_checks.BOUNDARY_TOP_K for r in probes)
     asked = [e[2] for e in events if e[0] == "submit" and getattr(e[2], "logprobs", 0)]
     assert len(asked) == len(probes)
-
-
-def test_a_probe_that_parts_past_the_margin_fails(tmp_path, monkeypatch):
     result, _, _ = _run_boot(tmp_path, monkeypatch, mutate=_parted(2.0))
     assert not result.passed
     assert "must agree on 4 tokens" in result.detail
     assert "past the near-tie margin 0.150" in result.detail
 
 
-def test_boundaries_run_once_per_unit_at_the_member_that_batches_most():
+def test_boundaries_run_once_per_unit_at_the_member_that_batches_most(tmp_path, monkeypatch):
     assert boot_checks.boundary_member(["tp4", "tep4", "dep4"]) == "dep4"
     assert boot_checks.boundary_member(["tp4", "tep8"]) == "tep8"
     task = copy.deepcopy(_TASK)
@@ -264,9 +252,7 @@ def test_boundaries_run_once_per_unit_at_the_member_that_batches_most():
     task["accuracy"]["envelope"]["members"] = ["tp4"]
     spec = boot_checks.BootBoundarySpec.from_task(task)
     assert [m for m in ("tp4", "tep4", "dep4") if spec.runs_at(task, "core", m, 4)] == ["tp4"]
-
-
-def test_a_boot_at_another_member_runs_no_boundaries(tmp_path, monkeypatch):
+    # A boot at another member runs none.
     task = copy.deepcopy(_TASK)
     task["accuracy"]["envelope"]["members"] = ["tp2"]
     result, specs, _ = _run_boot(tmp_path, monkeypatch, task=task, member="tp1")

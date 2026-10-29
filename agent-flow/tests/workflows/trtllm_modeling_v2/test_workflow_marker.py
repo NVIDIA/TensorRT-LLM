@@ -50,30 +50,18 @@ def _commit(repo: Path, name: str, text: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "name",
+    "name,seen",
     [
-        "tests/unittest/test_new.py",
-        "tensorrt_llm/README.md",
-        "examples/llm-api/quickstart_advanced.py",
+        ("tests/unittest/test_new.py", False),
+        ("tensorrt_llm/README.md", False),
+        ("examples/llm-api/quickstart_advanced.py", False),
+        ("tensorrt_llm/models/target.py", True),
+        ("tensorrt_llm/llmapi/llm.py", True),
     ],
 )
-def test_a_commit_no_gate_can_see_keeps_the_marker(checkout, name):
+def test_only_a_commit_a_gate_can_see_changes_the_marker(checkout, name, seen):
     workflow = _workflow(checkout)
     before = workflow._target_marker()
     assert before.startswith("tree:")
     _commit(checkout, name, "edited\n")
-    assert workflow._target_marker() == before
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "tensorrt_llm/models/target.py",
-        "tensorrt_llm/llmapi/llm.py",
-    ],
-)
-def test_a_commit_a_gate_can_see_changes_the_marker(checkout, name):
-    workflow = _workflow(checkout)
-    before = workflow._target_marker()
-    _commit(checkout, name, "edited\n")
-    assert workflow._target_marker() != before
+    assert (workflow._target_marker() != before) is seen

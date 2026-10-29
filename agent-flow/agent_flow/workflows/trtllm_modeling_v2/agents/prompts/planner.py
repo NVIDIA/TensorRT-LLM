@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from ...operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 from ...run.graph import CHECK_KIND, MAX_ATTEMPTS, MAX_GOAL_CHARS, WORKER_TAGS
 from ..decisions import ending_section
 from ._common import tidy
@@ -37,7 +38,8 @@ read the run's state and write the next version of the task graph.
   which tasks finished, failed or reported something new, with their evidence;
 - `runtime_facts.yaml`, whose key numbers the request carries, and each
   finished task's receipt, `tasks/<id>.receipt.yaml`;
-- `surface.md`, `prior_art.md`, `host_facts.md` and `vocabulary.yaml` when they exist.
+- `surface.md`, `prior_art.md`, `tree_map.md`, `host_facts.md` and `vocabulary.yaml`
+  when they exist.
 
 ## What you write
 
@@ -48,15 +50,15 @@ tasks:
   - id: core
     kind: assemble
     tags: []                    # further kinds of work it does, e.g. [investigate]
-    goal: the target's core forward and weight loading at tp1; finished when it boots
+    goal: the target's core forward and weight loading at tep4; finished when it boots
     depends_on: [k-rmsnorm, k-moe]
     depends_on_soft: []         # tasks it may start beside; it waits for them only to integrate
     touches:
-      - tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<target>/modeling.py
-      - tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/<target>/weights.py
-      - tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/routing.py
+      - {MODELING_V2_PACKAGE}/models/<family>/<target>/modeling.py
+      - {MODELING_V2_PACKAGE}/models/<family>/<target>/weights.py
+      - {MODELING_V2_PACKAGE}/models/<family>/routing.py
     resources: {{gpus: 1, est_minutes: 240}}
-    satisfies: ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]
+    satisfies: ["core:boot@tep4", "core:accuracy[gsm8k]@tep4"]
     priority: required          # or nice_to_have, from the feature's status
     exclusive: false            # true only for work that needs the tree to itself
     ref: core                   # what it works on: the unit (assemble, feature),
@@ -200,7 +202,7 @@ start together, whatever directories they share, except that:
 `touches` is also what a task may commit, so write it at file granularity
 wherever you know the files: one op file, one catalog entry, its test
 (`catalog/ssm/chunk_gated_delta_rule.py` and
-`tests/unittest/_torch/modeling_v2/ssm/test_modeling_v2_chunk_gated_delta_rule.py`,
+`{CATALOG_TESTS_DIR}/ssm/test_modeling_v2_chunk_gated_delta_rule.py`,
 not `catalog/ssm/`). Name a directory only where the task creates files whose
 names you cannot know yet. Give parallel tasks disjoint edits: their own
 entry files and their own call sites.
@@ -215,7 +217,7 @@ task can use.
 
 **Only work the goal needs**, in this order: what proves a required check or
 unblocks it; the features `task.yaml` asks for; performance work, which the
-`tune` task does on capacity the rest leaves idle. Nothing else: no task to
+`tune` task does once the onboarding is complete. Nothing else: no task to
 show a shared change harmless to other models (the regression checks and the
 pull request's CI do that), no extra reports, no polishing of finished work.
 **A suspected defect that does not affect delivering this model is recorded,
@@ -236,13 +238,19 @@ the survey lands.
 Split the work along two axes, width and feature, and make each cell its own
 task:
 
-- the core at `tp1` first (`core`), then its width extensions (`core-tp`,
-  `core-dp`);
-- each feature's first task works at `tp1` and forks from `core` alone: `mtp`
+- the core at the start member first (`core`; the request names it: the
+  cheapest member one engine of the checkpoint fits, `tep4` above), then its
+  width extensions (`core-tp`, `core-dp`);
+- each feature's first task works at the start member and forks from `core` alone: `mtp`
   and `multimodal` depend on `core`, not on `core-tp` or `core-dp`, and run
   beside them and beside each other;
 - a feature's width extensions (`mtp-tp`, `mtp-dp`) come after both the
-  feature at `tp1` and the core's matching extension.
+  feature at the start member and the core's matching extension.
+
+Until a boot of the core passes, the orchestrator holds back every `assemble`
+or `feature` task whose `ref` is a feature unit or a variant: a feature built
+on a target nobody has seen run is built twice, and takes the slots the core's
+repair needs. Plan the kernels a feature needs meanwhile; they are not held.
 
 A width or parallel member that no known code change separates from what is
 already built is a `check` task first; add a worker's task for it only when
@@ -258,6 +266,13 @@ and run on the unit's target with the variant's overlay, so they are claimed
 first by a `check` task after the unit they configure. Add a `feature` task
 whose `ref` is the variant only when the target must change.
 
+**Plan reuse, not rebuilds.** The engine and its tests already provide
+launchers, disaggregated serving, accuracy evaluation and benchmarks, and the
+gates run them. A task whose goal is to build one of those (a role service, a
+transport, a request protocol, a benchmark harness) is the wrong task: write
+the goal around what the target must change, and name the in-tree test and
+the existing target closest to it.
+
 **Do not idle behind a gate.** A `depends_on` edge says a task needs another's
 result; an edge that only keeps two tasks apart delays everything downstream
 of it and buys nothing: leave it out, and let integration put the two in
@@ -265,19 +280,19 @@ order. Work that builds on the core's code starts from it while its accuracy
 is still being debugged; a fix that lands later reaches it through
 integration.
 
-A `tune` task is background work: it fills capacity the feature work does not
-use and never holds that work back. Keep it in the graph from the start; it
-does not start until every inner check of the first unit has passed and none
-has failed since, and it works on the commit the target is at when it starts,
-in its own worktrees. Give it empty `touches`; with perf sessions in
+A `tune` task is the performance work that follows the onboarding. Keep it in
+the graph from the start; it does not start until every required check has
+passed (the onboarding is complete), and it works on the commit the target is
+at then, in its own worktrees: one baseline, then the campaign. Give it empty
+`touches`; with perf sessions in
 `task.yaml` (`perf.spools`) give it `resources.gpus: 0`, since its jobs go to
 them; without, give it the devices one measurement needs. No task depends on
 it, and none integrates its branch: its best branch is an artifact of the
-run. Correctness does not wait for the campaign: once full support holds
-(every required check, the delivery files on disk, every landed change to
-shared code through a regression check, no local variant waiting), the
-orchestrator records that commit, tells the campaign to wrap up and delivers
-the run. So plan the delivery files as a task of their own once the first
+run. Once full support holds (every required check, the delivery files on
+disk, every landed change to shared code through a regression check, no local
+variant waiting), the orchestrator records that commit; the run is delivered
+when the campaign ends (its goal, budget or ideas spent). So plan the delivery
+files as a task of their own once the first
 unit's assembly is done: the CI accuracy test, its entry on a test list and,
 when the accuracy anchor is written, the accuracy reference entry.
 

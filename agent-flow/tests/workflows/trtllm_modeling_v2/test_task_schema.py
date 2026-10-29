@@ -48,7 +48,7 @@ def _write(tmp_path, spec) -> str:
         ("envelope", "long_prompts", [None, 0, 2], [True, False, -1, 1.5, "0"]),
         ("envelope", "probes", [None, ["question"]], [[], [""], [" "], [1], "question"]),
         ("boot", "keywords", [None, [], [""], ["word"]], [[1], "word"]),
-        ("boot.greedy", "tokens", [None, 1, 24], [True, False, 0, 1.5, "1"]),
+        ("disagg", "devices", [None, 1, 8], [True, False, 0, 1.5, "1"]),
         ("acceptance", "num_prompts", [None, 1, 32], [True, False, 0, 1.5, "1"]),
         ("acceptance", "text_field", [None, "question"], ["", " ", 1]),
     ],
@@ -71,16 +71,6 @@ def test_optional_workload_fields_keep_their_type_and_boundary_rules(
                     task_schema.load_and_validate_task_yaml(path)
 
 
-def test_optional_field_errors_are_batched_even_when_gate_is_disabled(tmp_path):
-    spec = _valid_spec(tmp_path)
-    spec["accuracy"]["serve"] = {"enabled": False, "max_tokens": True, "prompt": " "}
-    with pytest.raises(task_schema.TaskSchemaError) as excinfo:
-        task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
-    message = str(excinfo.value)
-    assert "accuracy.serve.max_tokens" in message
-    assert "accuracy.serve.prompt" in message
-
-
 def test_valid_spec_round_trips_and_fills_defaults(tmp_path):
     spec = _valid_spec(tmp_path)
     del spec["parallel"]
@@ -95,108 +85,80 @@ def test_every_problem_is_batched_into_one_message(tmp_path):
     spec = _valid_spec(tmp_path)
     del spec["arch"]
     del spec["environment"]
-    del spec["accuracy"]
     spec["checkpoint_path"] = "/definitely/not/here"
+    # A disabled gate's fields are still validated.
+    spec["accuracy"]["serve"] = {"enabled": False, "max_tokens": True, "prompt": " "}
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     message = str(excinfo.value)
-    for expected in ("arch", "environment", "accuracy", "non-existent path"):
+    for expected in (
+        "arch",
+        "environment",
+        "non-existent path",
+        "accuracy.serve.max_tokens",
+        "accuracy.serve.prompt",
+    ):
         assert expected in message
 
 
-@pytest.mark.parametrize(
-    "segment,expected",
-    [
-        ("tp8", ("tp", 8)),
-        ("tep4", ("tep", 4)),
-        ("dep4", ("dep", 4)),
-        ("unified", ("unified", None)),
-    ],
-)
-def test_parallel_segments_parse(segment, expected):
-    assert task_schema.parse_parallel_segment(segment) == expected
-
-
-@pytest.mark.parametrize("segment", ["tp0", "ep4"])
-def test_bad_parallel_segments_are_rejected(segment):
-    with pytest.raises(task_schema.TaskSchemaError):
-        task_schema.parse_parallel_segment(segment)
+def test_parallel_segments_parse_and_bad_ones_are_rejected():
+    for segment, expected in {
+        "tp8": ("tp", 8),
+        "tep4": ("tep", 4),
+        "dep4": ("dep", 4),
+        "unified": ("unified", None),
+    }.items():
+        assert task_schema.parse_parallel_segment(segment) == expected
+    for segment in ("tp0", "ep4"):
+        with pytest.raises(task_schema.TaskSchemaError):
+            task_schema.parse_parallel_segment(segment)
 
 
 # ------------------------------------------------------------- the member set
 
 
-def _unified(tmp_path, members=None) -> dict:
-    spec = _valid_spec(tmp_path)
-    spec["parallel"] = task_schema.PARALLEL_UNIFIED
-    if members is not None:
-        spec["members"] = members
-    return spec
-
-
-def test_a_unified_run_defaults_to_the_baseline_pair_plus_the_degenerate_path(tmp_path):
-    data = task_schema.load_and_validate_task_yaml(_write(tmp_path, _unified(tmp_path)))
+def test_the_member_set_of_a_unified_run_a_concrete_segment_and_a_per_unit_mapping(tmp_path):
+    concrete = _valid_spec(tmp_path)
+    data = task_schema.load_and_validate_task_yaml(_write(tmp_path, concrete))
+    assert task_schema.members_for(data, "core", 4) == ["tp1"]
+    # Unified: the baseline pair plus the degenerate path.
+    spec = concrete | {"parallel": task_schema.PARALLEL_UNIFIED}
+    data = task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert task_schema.members_for(data, "core", 4) == ["tp4", "tep4", "dep4"]
     assert task_schema.members_for(data, "core", 8) == ["tp8", "tep8", "dep8"]
-
-
-def test_a_concrete_segment_is_its_own_member_set(tmp_path):
-    data = task_schema.load_and_validate_task_yaml(_write(tmp_path, _valid_spec(tmp_path)))
-    assert task_schema.members_for(data, "core", 4) == ["tp1"]
-
-
-def test_a_per_unit_mapping_is_layered_over_default(tmp_path):
-    spec = _unified(tmp_path, {"default": ["tp4", "tep4", "dep4"], "multimodal": ["tep4"]})
-    spec["features"] = ["multimodal"]
+    # A per-unit mapping is layered over the default.
+    spec |= {
+        "members": {"default": ["tp4", "tep4", "dep4"], "multimodal": ["tep4"]},
+        "features": ["multimodal"],
+    }
     data = task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert task_schema.members_for(data, "core", 4) == ["tp4", "tep4", "dep4"]
     assert task_schema.members_for(data, "multimodal", 4) == ["tep4"]
 
 
-def test_unknown_feature_is_rejected_by_name(tmp_path):
-    spec = _valid_spec(tmp_path)
-    spec["features"] = ["mtp", "telepathy"]
-    with pytest.raises(task_schema.TaskSchemaError) as excinfo:
-        task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
-    assert "telepathy" in str(excinfo.value)
-    assert "mtp" in str(excinfo.value)  # listed among the known features
-
-
-def test_derive_slug_is_a_safe_path_component(tmp_path):
+def test_the_slug_is_a_safe_path_component_and_assembly_puts_core_first(tmp_path):
     checkpoint = tmp_path / "DeepSeek-R1-0528_NVFP4"
     checkpoint.mkdir()
-    spec = _valid_spec(tmp_path)
-    spec["checkpoint_path"] = str(checkpoint)
-    spec["parallel"] = "dep4"
+    spec = _valid_spec(tmp_path) | {"checkpoint_path": str(checkpoint), "parallel": "dep4"}
+    spec["features"] = ["mtp", "multimodal"]
     data = task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     slug = task_schema.derive_slug(data)
     assert slug == "deepseek-r1-0528-nvfp4-sm_103-dep4"
     assert "/" not in slug and " " not in slug
-
-
-def test_assembly_units_put_core_first(tmp_path):
-    spec = _valid_spec(tmp_path)
-    spec["features"] = ["mtp", "multimodal"]
-    data = task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert task_schema.assembly_units(data) == ["core", "mtp", "multimodal"]
 
 
 # ------------------------------------------------------ closed key sets
 
 
-def test_a_misspelled_feature_key_does_not_silently_build_core_only(tmp_path):
+def test_a_misspelled_key_is_refused_with_its_spelling_at_any_depth(tmp_path):
+    # A misspelled `features` must not silently build core only.
     spec = _valid_spec(tmp_path) | {"feature": ["mtp"]}
+    spec["accuracy"]["toleranace"] = "x"
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert "unknown key 'feature'" in str(excinfo.value)
     assert "did you mean 'features'" in str(excinfo.value)
-
-
-def test_nested_blocks_are_closed_too(tmp_path):
-    spec = _valid_spec(tmp_path)
-    spec["accuracy"]["toleranace"] = "x"
-    with pytest.raises(task_schema.TaskSchemaError) as excinfo:
-        task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert "did you mean 'accuracy.tolerance'" in str(excinfo.value)
 
 
@@ -217,7 +179,13 @@ def test_every_key_the_schema_accepts_actually_validates(tmp_path):
         "dataset_path": str(repo),
         "llm_api_options": {"core": str(repo / "o.yaml")},
         "benchmark_args": ["--apply_chat_template"],
-        "boot": {"max_tokens": 32, "greedy": {"prompts": 4, "tokens": 24}},
+        "boot": {"max_tokens": 32},
+        "disagg": {
+            "test": "tests/integration/defs/accuracy/test_disaggregated_serving.py::TestX::test_auto_dtype",
+            "devices": 4,
+            "timeout": 3600,
+            "env": {"LLM_MODELS_ROOT": "/models"},
+        },
     }
     spool = tmp_path / "spool"
     spool.mkdir()
@@ -242,73 +210,60 @@ def test_every_key_the_schema_accepts_actually_validates(tmp_path):
 # ------------------------------- a spec must work on another machine
 
 
-def test_llm_api_options_written_relative_resolve_next_to_the_spec(tmp_path):
+def test_llm_api_options_written_relative_resolve_next_to_the_spec_once(tmp_path):
     (tmp_path / "core.yaml").write_text("kv_cache_config: {}\n", encoding="utf-8")
     spec = _valid_spec(tmp_path)
-    spec.setdefault("accuracy", {})["llm_api_options"] = "core.yaml"
-    data = task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
-    assert data["accuracy"]["llm_api_options"] == str((tmp_path / "core.yaml").resolve())
-
-
-def test_resolving_an_already_resolved_spec_is_idempotent(tmp_path):
-    (tmp_path / "core.yaml").write_text("kv_cache_config: {}\n", encoding="utf-8")
-    spec = _valid_spec(tmp_path)
-    spec.setdefault("accuracy", {})["llm_api_options"] = "core.yaml"
+    spec["accuracy"]["llm_api_options"] = "core.yaml"
     once = task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
+    assert once["accuracy"]["llm_api_options"] == str((tmp_path / "core.yaml").resolve())
     spec["accuracy"]["llm_api_options"] = once["accuracy"]["llm_api_options"]
     twice = task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
     assert twice["accuracy"]["llm_api_options"] == once["accuracy"]["llm_api_options"]
 
 
-# ---------------------------- the speculator, replay and kv-quant feature kinds
+# ---------------------------- the speculator and disaggregation feature kinds
 
 
-def test_mtp_and_dspark_are_refused_together(tmp_path):
-    spec = _valid_spec(tmp_path)
-    spec["features"] = ["mtp", "dspark"]
+@pytest.mark.parametrize(
+    "features,fragments",
+    [
+        # The known features are listed beside the unknown one.
+        (["mtp", "telepathy"], ("telepathy", "mtp")),
+        (["mtp", "dspark"], ("spelled `dspark`",)),
+    ],
+)
+def test_an_unknown_feature_or_two_speculators_are_refused(tmp_path, features, fragments):
+    spec = _valid_spec(tmp_path) | {"features": features}
     with pytest.raises(task_schema.TaskSchemaError) as excinfo:
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
-    assert "spelled `dspark`" in str(excinfo.value)
+    for fragment in fragments:
+        assert fragment in str(excinfo.value)
 
 
-_DECODER = {
-    "contrast_env": {"TRTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY": "0"},
-    "window": 128,
-    "prompt_tokens": 4096,
-}
-_ENCODER = {
-    "contrast_env": {"TRTLLM_DSV41_ENCODER_SWA_BOUNDED_REPLAY": "0"},
-    "window": 128,
-    "prefix_tokens": 4096,
-    "reuse_alignment": 2,
-}
-_KV = {
-    "contrast_env": {"TRTLLM_DSV41_KV_STORAGE": "bf16"},
-    "expected_bytes_per_token": 890,
-}
-
-
-def _with_witness(tmp_path, features, witness):
+def test_an_anchor_without_a_number_is_a_placeholder_not_a_state(tmp_path):
     spec = _valid_spec(tmp_path)
-    spec["features"] = features
-    spec["accuracy"]["witness"] = {**witness, "enabled": True}
-    return _write(tmp_path, spec)
+    spec["accuracy"]["anchor"] = "pending"
+    with pytest.raises(task_schema.TaskSchemaError, match="record a low placeholder"):
+        task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
+    spec["accuracy"]["anchor"] = "relative"  # a unit's own score is no anchor for it
+    with pytest.raises(task_schema.TaskSchemaError, match="only a configuration variant"):
+        task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
 
 
-def test_the_replay_and_kv_quant_witness_blocks_validate(tmp_path):
-    data = task_schema.load_and_validate_task_yaml(
-        _with_witness(
-            tmp_path,
-            ["kv_quant", "decoder_replay", "encoder_replay"],
-            {"decoder_replay": _DECODER, "encoder_replay": _ENCODER, "kv_quant": _KV},
-        )
-    )
-    # `exact` changes what the unit claims, so the resolved spec states it.
-    assert data["accuracy"]["witness"]["kv_quant"]["exact"] is True
-
-
-@pytest.mark.parametrize("witness", [{}, {"disagg": {"contrast_env": {"MYMODEL_DISAGG": "1"}}}])
-def test_a_spec_owing_the_disagg_witness_must_declare_its_leg_b(tmp_path, witness):
-    """Without a block, or with one that names no launcher, the spec is refused."""
-    with pytest.raises(task_schema.TaskSchemaError, match=r"contrast_command.*declare"):
-        task_schema.load_and_validate_task_yaml(_with_witness(tmp_path, ["disagg"], witness))
+@pytest.mark.parametrize(
+    "block,error",
+    [
+        (None, r"needs 'accuracy.disagg.test'"),
+        ({"devices": 4}, r"needs 'accuracy.disagg.test'"),
+        ({"test": "/abs/test_x.py::T::t"}, r"repository-relative pytest node id"),
+        ({"test": "tests/test_x.py"}, r"repository-relative pytest node id"),
+        ({"test": "tests/test_x.py::T::t", "env": {"1BAD": "x"}}, r"not a shell variable name"),
+    ],
+)
+def test_the_disagg_feature_names_a_node_id_it_can_run(tmp_path, block, error):
+    spec = _valid_spec(tmp_path)
+    spec["features"] = ["disagg"]
+    if block is not None:
+        spec["accuracy"]["disagg"] = block
+    with pytest.raises(task_schema.TaskSchemaError, match=error):
+        task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))

@@ -18,7 +18,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..agents.prompts.tags import tag_section
 from . import sol as sol_mod
+from .attempts import ATTEMPTS_FILE
 from .records import Measurement
+from .sol_consensus import METHODS
 from .spec import TuneSpec
 
 PACKAGE = Path(__file__).resolve().parent.parent
@@ -40,6 +42,10 @@ class CampaignContext:
     standings_table: str  # markdown
     notes: str = ""
     sister_engines: Sequence[str] = field(default_factory=list)
+    #: The perf points a measurement reports (``campaign.perf_points``): ``microbench.share``'s keys.
+    points: Sequence[str] = field(default_factory=list)
+    #: The latest finished attempts (``attempts.digest``), markdown; "" before the first.
+    attempts: str = ""
 
 
 def render_request(
@@ -53,16 +59,25 @@ def render_request(
     job_prefix: str,
     branch: str,
     modeling_edits: bool = True,
+    share: Mapping[str, Any] | None = None,
 ) -> Path:
     out_dir = ctx.campaign_dir / "candidates" / slug
     (out_dir / "microbench").mkdir(parents=True, exist_ok=True)
     R = ctx.repo
     spools = ", ".join(f"`{s}`" for s in ctx.dev_spools)
-    embargo = "\n".join(f"- `{e}`" for e in ctx.embargo)
+    # An embargo exists only when the request set one (an evaluation); a product run reads everything.
+    embargo = ""
+    if ctx.embargo:
+        embargo = (
+            "\n## Embargo (do not read, grep or call)\n\n"
+            + "\n".join(f"- `{e}`" for e in ctx.embargo)
+            + "\n"
+        )
     sisters = ""
     if ctx.sister_engines:
         sisters = (
-            "\nOther engines that implement this model (strategies may inform you; write your own kernels): "
+            "\nOther engines that implement this model, prior art for this turn: their kernels, "
+            "layouts and strategies may be adapted (keep the license header, name the origin): "
             + ", ".join(f"`{s}`" for s in ctx.sister_engines)
             + "\n"
         )
@@ -71,6 +86,14 @@ def render_request(
         if modeling_edits
         else "**Do not edit the target's forward in this turn**: deliver the entry (or entries), their GPU tests "
         "and the micro-bench; integration into the forward is a later candidate."
+    )
+    points = ", ".join(f"`{p}`" for p in ctx.points) or "the measurement's"
+    shares = (
+        "\nThe roadmap's estimate of the step share its kernels take, per perf point: "
+        + ", ".join(f"`{p}` {float(f):.1%}" for p, f in share.items())
+        + ". Measure your own for `microbench.share`.\n"
+        if isinstance(share, Mapping) and share
+        else ""
     )
     kernel_choices = ctx.perf_root / "08-kernel-sources" / "kernel_choices.json"
     job = f"{job_prefix}-<what>"
@@ -113,10 +136,7 @@ Micro-bench: write your own script under `microbench/` and run it inside a job w
 
 {scope}
 
-## Embargo (do not read, grep or call)
-
-{embargo}
-{sisters}
+{embargo}{sisters}
 ## Workload and where the campaign stands
 
 {ctx.workload}
@@ -124,29 +144,45 @@ Micro-bench: write your own script under `microbench/` and run it inside a job w
 {ctx.standings_table}
 
 {ctx.notes}
-
+{_attempts_section(ctx)}
 ## The hypothesis to pursue
 
 {hypothesis}
-
+{shares}
 ## Deliverables
 
 {deliverables}
+
+{FINDINGS_ASK}
 
 ## What the measurement reads from your decision
 
 Python verifies isolated changes with your identical `microbench.script` on the current best
 and the stacked candidate, one run per revision, no repeats. Export `benchmark()` returning
 `{{case: callable}}` for the exact `microbench.cases` list. Each callable runs the real op/module
-on the current CUDA stream, importing the active checkout's code (eager or a captured graph).
-The wrapper performs 10 warmups and 100 synchronized CUDA-event timings per case; do not return
-claimed timings. Projections and development results are not evidence. Correctness gates still run before every keep.
+on the current CUDA stream, importing the active checkout's code (eager or a captured graph),
+at the shapes the perf points run it at (their batch and sequence lengths), and returns its
+output tensor(s). The wrapper performs 10 warmups and 100 synchronized CUDA-event timings per
+case; do not return claimed timings.
+
+The stage projects your e2e gain from the timings and `microbench.share`: for each case, the
+fraction of each perf point's step its kernels take, `{{case: {{<point>: <fraction>}}}}` with
+points among {points}. Take the fraction from the profile of that point (the roadmap's), as the
+kernels' **exposed** time over the step's wall time: work another stream overlaps saves
+nothing, and at concurrency 1 the step holds host gaps. A case sped up `s` (as a fraction) at
+share `f` saves `f * (1 - 1/(1 + s))` of the step. A candidate keeps when a point gains at least
+the campaign's threshold and none loses it; its outputs must stay roughly with the control's
+(the wrapper compares them; a broken kernel shows). Nothing else gates a keep: every few keeps a
+checkpoint measures e2e, the first output token's distribution and the target's suite on the
+best tree, and a failure rolls those keeps back. Your own projections and development results
+are not evidence.
 
 Declare `perf_scope: e2e` for serving/scheduling, host, overlap, communication or system-wide
 effects a local harness cannot represent, and explain why. Python checks known kinds/paths;
 it cannot infer every semantic interaction inside a forward. Only those candidates are served,
 once per revision/config against a same-host control, with no post-control or automatic rerun.
-Cumulative serving validation happens once at campaign wrap-up, not after each local keep.
+Cumulative serving validation happens at the checkpoints and once at wrap-up, not after each
+local keep.
 
 For e2e candidates also name in `decision.yaml`:
 
@@ -158,6 +194,67 @@ A config outside `changed_members` whose server log lacks the marker, and whose 
 match the control, is not judged. This never triggers another measurement.
 """
     path = out_dir / "request.md"
+    path.write_text(text)
+    return path
+
+
+def _attempts_section(ctx: CampaignContext) -> str:
+    if not ctx.attempts:
+        return ""
+    return f"""
+## What earlier attempts found
+
+The stage's verdicts and numbers, and each turn's findings (`{ctx.campaign_dir / ATTEMPTS_FILE}` holds
+them all). Start from them: do not repeat an approach that lost unless you change what made it lose,
+take up a `next` that fits your hypothesis, and say in your `findings` which ones you used.
+
+{ctx.attempts}
+"""
+
+
+#: What every decision carries for the turns after it, success or not.
+FINDINGS_ASK = (
+    "Every decision, CANDIDATE, DROPPED or BLOCKED, carries `findings`: "
+    "`[{what, evidence, next}]`, each a measured fact this turn established (a shape where the "
+    "kernel loses, a fusion the layout forbids, a bound the profile shows), the job receipt or "
+    "numbers behind it, and what a later attempt should try or avoid because of it. A failed "
+    "attempt with its findings is a result: the next turns start from it."
+)
+
+
+def render_revise_request(
+    ctx: CampaignContext, *, slug: str, worktree: Path, best_branch: str, reason: str
+) -> Path:
+    """A candidate the stage measured and failed, for a reason its turn can fix: once more."""
+    out_dir = ctx.campaign_dir / "candidates" / slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+    text = f"""# Tuner request: revise {slug}
+
+Kind: REVISE, once. The stage measured your candidate and did not keep it:
+
+```
+{reason[:1500]}
+```
+
+Read your `decision.yaml` in `{out_dir}`, the micro-bench evidence beside it and the ledger
+`{ctx.campaign_dir / "perf_ledger.jsonl"}` (`candidate_microbench` for `{slug}`: the timings,
+outputs and projection per perf point). Then fix what failed in `{worktree}`:
+
+- outputs off the control's: find the numerical defect (a missed scale, a wrong accumulator,
+  a mask, a layout) and fix it; do not loosen the comparison;
+- slower at a perf point: dispatch by shape so that point keeps the old path, or make it fast
+  there too; the stage projects every point;
+- a candidate the stage could not run (its `microbench.share`, `perf_scope`, commits or harness):
+  fix the declaration or the harness.
+
+Run the target tests on the dev spools ({", ".join(f"`{s}`" for s in ctx.dev_spools)}; launch + poll,
+`--tree {worktree}`, env script `{ctx.env_script}`), commit with `git -C {worktree} commit -s`, and
+update `{out_dir / "decision.yaml"}` in place: `commits:` = `git -C {worktree} rev-list --reverse
+{best_branch}..HEAD`, `decision: CANDIDATE`, or `DROPPED` when the failure is the idea's, not the
+code's. {FINDINGS_ASK} The stage measures the revision once more, the same way; there is no second
+revise.
+{_attempts_section(ctx)}"""
+    path = out_dir / "revise-request.md"
     path.write_text(text)
     return path
 
@@ -177,15 +274,17 @@ the decision file you must write at the end.
   --tree <worktree>`) and polling.
 - Never emit more than ~150 lines in a single Write/Edit call; build big files with several calls.
 - Always give grep/rg/find an explicit search root (your worktree's target dir, a shared module path, the
-  package); never search from the repository root or the current directory -- an embargoed file's lines in
-  a search result are a read of it. If one appears anyway, do not use it and say so in your final message.
+  package); never search from the repository root or the current directory: it is slow and floods the
+  context, and where your request lists an embargo, an embargoed file's lines in a search result are a
+  read of it. If one appears anyway, do not use it and say so in your final message.
 - Edit only inside your worktree and your candidate output dir (and append to kernel_choices.json).
 - Commit in your worktree with `git -C <worktree> commit -s -m "..."` (no co-author lines). Do not push.
 - Formatting polish is not required; correctness and measured numbers are.
 - Get a minimal version working and measured early, then iterate. Budget ~3 h of wall time;
   record and drop sub-ideas that stall.
 
-Final message: <= 25 lines: decision, files changed, test results, micro-bench table, projection, risks."""
+Final message: <= 25 lines: decision, files changed, test results, micro-bench table, projection,
+findings, risks."""
 
 
 def render_rebase_request(
@@ -269,7 +368,7 @@ commits). Add the gate on top of it.
 
 The orchestrator measures the variant at every perf config, like any candidate. It is a WIN only if it
 loses nowhere (the members in this mode are now neutral) and every point `{slug}` won still wins, or holds
-its gain within the loss floor; then the keep gate runs, as for any keep. There is one variant per
+its gain within the loss floor; then it keeps, as any win does. There is one variant per
 candidate."""
     return render_request(
         ctx,
@@ -302,8 +401,14 @@ class TuneRequests:
             f"- Earlier choices for this target: `{s.workdir / '08-kernel-sources' / 'kernel_choices.json'}` (chosen + "
             "alternatives with timings); extend it, do not re-race what is recorded.",
             f"- Prior art in this repository: `git -C {s.repo} log --oneline -i --grep='perf' -- "
-            "tensorrt_llm/_torch/modules/<similar module> tensorrt_llm/_torch/models/<similar model>` (strategies "
-            "for the same op shapes in other models -- never the embargoed in-tree implementation of this model).",
+            "<a similar module's or model's files>` (find them by the op or class name; `tree_map.md` in the "
+            "workspace says where the engine's backends, ops and kernels are): what the same op shapes "
+            "gained in other models"
+            + (
+                ", never an embargoed path."
+                if s.embargo
+                else ", and this model's own in-tree implementation."
+            ),
             "- Profiles of the current best tree: the latest `roadmap*.yaml` evidence in the campaign workdir.",
         ]
         return "\n".join(lines)
@@ -322,29 +427,69 @@ class TuneRequests:
         ]
         lines = ["## Paths", "", "| name | value |", "|---|---|"]
         lines += [f"| {k} | {v if str(v).startswith('`') else f'`{v}`'} |" for k, v in rows]
-        lines += [
-            "",
-            "## Embargo (do not read, grep or call)",
-            "",
-            *(f"- `{e}`" for e in s.embargo),
-        ]
+        if s.embargo:
+            lines += [
+                "",
+                "## Embargo (do not read, grep or call)",
+                "",
+                *(f"- `{e}`" for e in s.embargo),
+            ]
         return "\n".join(lines)
 
     def _sisters_line(self) -> str:
         if not self.spec.sister_engines:
             return ""
         return (
-            "\n- Other engines that implement this model (strategies, not code): "
+            "\n- Other engines that implement this model (prior art: kernels and strategies may be "
+            "adapted, license header kept and origin named): "
             + ", ".join(f"`{e}`" for e in self.spec.sister_engines)
             + "."
         )
 
-    def sol_request(self, baseline: Measurement, problems: Sequence[str] = ()) -> Path:
+    def _sol_method(self, method: str) -> str:
+        """How ``method`` counts the necessary work: each a different source of the same numbers."""
         s = self.spec
-        sol_dir = s.workdir / "sol"
+        best = s.workdir / "worktrees" / "best"
+        if method == "analytic":
+            return (
+                "**Method: analytic.** Count the necessary work from the model's config "
+                f"(`{s.model}/config.json`) and the workload alone, by formula: the weights a step "
+                "must read, the KV cache it reads and writes, the attention, expert and projection "
+                "FLOPs, at each perf point's batch and context. Do not read the target's forward or "
+                "ops for the counts (only its module names, to name regions): this is what any "
+                "implementation of the model must do."
+            )
+        if method == "code":
+            return (
+                "**Method: code.** Count the necessary work from the target's forward and ops as "
+                f"written, in `{best}` under `{s.target}`: each module's shapes and dtypes at each "
+                "perf point, and what it must read and compute. A copy, a padding or a recompute the "
+                "math does not need is the implementation's cost, not necessary work."
+            )
+        spools = ", ".join(f"`{p}`" for p in s.dev_spools)
+        return (
+            "**Method: profile.** Start from a profile of the baseline tree "
+            f"(`{best}`) at each perf point, in a job on a dev spool ({spools}: `python3 "
+            f"{PACKAGE}/infra/compute/spoolctl.py --spool <spool> launch --gpus <n> --wall 1h "
+            f"--tree {best} sol-profile '<command>'`, then `status`; jobs source `{s.env_script}`): "
+            f"`{PACKAGE}/tune/harness/bench.py --nsys` for the kernels each step runs and their "
+            "times, and `ncu` over a bounded window of decode steps (`--launch-skip`, "
+            "`--launch-count`; `dram__bytes_read.sum`, `dram__bytes_write.sum` and the FLOP "
+            "counters) for each hot kernel's counted traffic and FLOPs. Group the kernels into "
+            "regions, count each region's necessary work by formula from the shapes the profile "
+            "shows, and give what the profiler counted as `measured_bytes` / `measured_flops`: "
+            "necessary work may not exceed it (the calculator refuses that)."
+        )
+
+    def sol_request(
+        self, baseline: Measurement, problems: Sequence[str] = (), method: str = "analytic"
+    ) -> Path:
+        s = self.spec
+        sol_dir = s.workdir / "sol" / method
         sol_dir.mkdir(parents=True, exist_ok=True)
-        what = "sol" if not problems else "sol-fix"
+        what = f"sol-{method}" + ("-fix" if problems else "")
         request = s.workdir / f"{what}-request.md"
+        methods = [str(m) for m in s.sol.get("methods") or METHODS]
         keys = ", ".join(baseline.headline())
         fix = ""
         if problems:
@@ -360,13 +505,23 @@ class TuneRequests:
             "Use only user-provided, explicitly sourced public hardware capacities; if unavailable, "
             "leave the bound unknown rather than guessing. Source labels are not proof of publicness: "
             "check the underlying material before copying it.\n\n"
-            f"Read the input contract in `{PACKAGE / 'tune' / 'sol.py'}`. Write "
+            + self._sol_method(method)
+            + "\n\n"
+            + (
+                f"Work alone: the stage asks {len(methods)} analyses by different methods "
+                f"({', '.join(methods)}) and reconciles them, and agreement counts only between "
+                f"independent analyses: do not read `{s.workdir / 'sol'}/<another method>/`. "
+                "Name regions `<module path>/<decode|prefill>/<perf point>`, per rank, so the "
+                "analyses can be matched.\n\n"
+                if len(methods) > 1
+                else ""
+            )
+            + f"Read the input contract in `{PACKAGE / 'tune' / 'sol.py'}`. Write "
             f"`{sol_dir / 'work.yaml'}` with `hardware`, `regions`, and optional `headline`. "
             "Hardware capacities use FLOP/s and byte/s, each `{value, source}`, plus `assumptions` "
             "naming precision, dense/sparse mode, memory boundary and device/rank scope. "
             f"Hardware label (not a spec lookup): {s.sol.get('gpu') or 'unspecified'}.\n"
-            f"Read `{s.model}` config and `{s.workdir / 'worktrees' / 'best'}` under `{s.target}` "
-            "for necessary work. Every region has a stable `id` (module path + phase + shape + rank "
+            "Every region has a stable `id` (module path + phase + shape + rank "
             "/ invocation scope), `flops`, `bytes`, `assumptions`, and optionally `measured_ms` with "
             "`measurement_source`. Work and timings must cover exactly the same invocations. "
             "Keep nested/overlapping regions separate. Unknown quantities are null, not zero.\n"
@@ -384,7 +539,7 @@ class TuneRequests:
             "Run the CPU-only deterministic calculator (no GPU job or toolkit dependency):\n\n"
             f"```sh\npython {shlex.quote(str(PACKAGE / 'tune' / 'sol.py'))} "
             f"--input {shlex.quote(str(sol_dir / 'work.yaml'))} "
-            f"--output {shlex.quote(str(s.workdir / sol_mod.SOL_FILENAME))}\n```\n\n"
+            f"--output {shlex.quote(str(sol_dir / sol_mod.SOL_FILENAME))}\n```\n\n"
             "The stage recomputes the output and rejects edited headline numbers. "
             "Write the decision file `"
             + str(s.workdir / f"{what}-decision.yaml")
@@ -394,6 +549,48 @@ class TuneRequests:
             + fix
             + "\n"
         )
+        return request
+
+    def sol_adjudication_request(self, disputes: Sequence[Mapping], methods: Sequence[str]) -> Path:
+        """The analyses disagree on ``disputes``: one turn rules on each, by choosing among them."""
+        s = self.spec
+        sol_dir = s.workdir / "sol"
+        rows = "\n".join(
+            f"| `{d['item']}` | "
+            + ", ".join(f"{m}: {float(v):.6g}" for m, v in d["values"].items())
+            + f" | {d['why']} |"
+            for d in disputes
+        )
+        request = s.workdir / "sol-adjudicate-request.md"
+        request.write_text(f"""# Tuner request: sol-adjudicate
+
+The stage asked {len(methods)} independent SOL analyses ({", ".join(methods)}): their outputs are
+`{sol_dir}/<method>/sol.yaml`, their inputs `{sol_dir}/<method>/work.yaml`. Capacities are in
+FLOP/s and byte/s, ceilings in tok/s. They agree on everything but:
+
+| item | each analysis | why it is disputed |
+|---|---|---|
+{rows}
+
+For each item, find which analysis's work model is right: read their entries and assumptions and
+check them against the model's config (`{s.model}`), the target's code
+(`{s.workdir / "worktrees" / "best"}` under `{s.target}`) and the counted traffic of the profile
+analysis; rerun the calculator (`{PACKAGE / "tune" / "sol.py"}`) on a copy when it helps. A capacity
+is a public, sourced number: check the source. A ceiling only one analysis models holds only if
+you confirm its work counts yourself.
+
+You choose; you write no new numbers. Write `{sol_dir / "rulings.yaml"}`:
+
+```yaml
+rulings:
+  - item: <the item, as listed>
+    analysis: <one of the analyses listed for it, or null when none holds>
+    evidence: <what you checked, with the numbers>
+```
+
+An item without a valid ruling stays unknown: not ranked on and never a goal. Then write the
+decision file `{s.workdir / "sol-adjudicate-decision.yaml"}` with `decision: CANDIDATE`.
+""")
         return request
 
     def sol_ask(self, what: str) -> str:
@@ -439,32 +636,40 @@ class TuneRequests:
             "validates it with perf_optimize's own `load_ledger` + `cross_validate`."
         )
 
-    def roadmap(self, n: int, tried: Sequence[str] = ()) -> Path:
-        """Write the roadmap request for the current best tree."""
+    def roadmap(self, n: int, attempts: str = "") -> Path:
+        """Write the roadmap request for the current best tree; ``attempts``: what was tried."""
         what = "roadmap" if n == 1 else f"roadmap-{n}"
         path = self.spec.workdir / f"{what}.yaml"
         request = self.spec.workdir / f"{what}-request.md"
         again = ""
-        if tried:
+        if attempts:
             again = (
                 "\n\nThis is roadmap "
                 + str(n)
                 + ": re-profile the best tree (`"
                 + str(self.spec.workdir / "worktrees" / "best")
-                + "`) -- the kept candidates moved the profile. Already attempted (do not repeat; "
-                "their decision files under `"
+                + "`) -- the kept candidates moved the profile. Rank with what the attempts so far "
+                "found: an approach that lost comes back only with a change that answers why it lost "
+                "(say which in its hypothesis); a `next` worth ranking becomes an item; a keep rolled "
+                "back together with others may come back alone. Their decision files are under `"
                 + str(self.spec.workdir / "candidates")
-                + "/<slug>/decision.yaml` list measured follow-ups worth ranking): "
-                + ", ".join(f"`{t}`" for t in tried)
-                + "."
+                + "/<slug>/decision.yaml`; the whole list is `"
+                + str(self.spec.workdir / ATTEMPTS_FILE)
+                + "`.\n\n## What earlier attempts found\n\n"
+                + attempts
             )
         request.write_text(
-            f"# Tuner request: {what}\n\nProfile the target at the campaign config (nsys through the substrate: "
+            f"# Tuner request: {what}\n\nProfile the target at each perf point of the campaign config "
+            "(nsys through the substrate: "
             f"`{PACKAGE}/tune/harness/bench.py --nsys` in a spool job, read with "
             "`nsys stats --report cuda_gpu_kern_sum` on its `.nsys-rep`), read the forward, and "
             f"write `{path}`: a YAML list of "
-            "`{slug, kind, hypothesis, evidence, expected, modeling_edits, sources}` ranked by the "
-            "exclusive time each can remove; `sources` names where the idea and its kernel options "
+            "`{slug, kind, hypothesis, evidence, expected, share, modeling_edits, sources}` ranked by "
+            "the time each can recover: at each point, its kernels' exposed share of the step (the "
+            "critical path over the step's wall time: work another stream overlaps recovers nothing) "
+            "times how far they sit from their speed of light (1 - SOL time / measured time). "
+            "`share` is that exposed share per point, `{<point>: <fraction>}`; the tuner refines it "
+            "and the stage projects e2e gains from it. `sources` names where the idea and its kernel options "
             "come from (`profile`, `code-reading`, `flashinfer`, `repo-prior-art`, `sister-engine`, "
             "`kernel-choices`, each with a reference). Then write the "
             "decision file `"

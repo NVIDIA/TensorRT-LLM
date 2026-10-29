@@ -145,14 +145,6 @@ def served(spool):
     thread.join(timeout=5)
 
 
-def test_the_receipt_carries_the_exit_code(spool, clock):
-    sched = make(spool, clock)
-    submit(spool, "free-fail", "exit 7")
-    pump(sched, lambda: rc(spool, "free-fail") is not None)
-    assert rc(spool, "free-fail") == 7
-    assert record(spool, "free-fail")["reason"] == "exit"
-
-
 def test_the_watcher_removes_the_allocations_mpi_context(spool, clock):
     environ = {
         "PATH": os.environ["PATH"],
@@ -288,11 +280,12 @@ def test_cancel_is_the_sanctioned_kill(spool, clock):
     assert not (SpoolPaths(spool).cancel / "long").exists()
 
 
-def test_processes_a_finished_job_leaves_behind_are_reaped(spool, clock):
+def test_the_receipt_carries_the_exit_code_and_leftover_processes_are_reaped(spool, clock):
     sched = make(spool, clock)
-    submit(spool, "leaky", "sleep 300 & echo started", header="gpus=2")
+    submit(spool, "leaky", "sleep 300 & echo started; exit 7", header="gpus=2")
     pump(sched, lambda: rc(spool, "leaky") is not None)
-    assert rc(spool, "leaky") == 0
+    assert rc(spool, "leaky") == 7
+    assert record(spool, "leaky")["reason"] == "exit"
     pump(sched, lambda: not sched.jobs)
     assert "left behind" in SpoolPaths(spool).log("leaky").read_text()
 

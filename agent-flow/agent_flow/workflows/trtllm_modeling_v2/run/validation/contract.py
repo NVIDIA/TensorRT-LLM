@@ -7,9 +7,9 @@ The contract is the run's definition of "done". It names each check by unit,
 gate and member, with a tier that says when it runs:
 
 - ``inner``: after every change to the target (boot, accuracy, and the serve
-  and logit gates where the spec turns them on or can derive them);
-- ``proof``: what proves a feature is on (a witness, acceptance), and the
-  checks of each configuration variant (``spec/variants.py``);
+  gate where the spec turns it on or can derive it);
+- ``proof``: what proves a feature is on (acceptance, the disaggregated-serving
+  test), and the checks of each configuration variant (``spec/variants.py``);
 - ``delivery``: once, on the tree being delivered (the
   serve gate at one rank).
 
@@ -33,13 +33,13 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 
 import yaml
 
-from ...checks import check_config, logit_agreement, serve
+from ...checks import check_config, disagg, serve
 from ...checks.accuracy import resolve_discriminators
-from ...checks.boot import GreedySetting, resolve_boot_spec
+from ...checks.boot import resolve_boot_spec
 from ...checks.check_config import (
     load_llm_api_options,
     order_members_by_cost,
@@ -48,24 +48,20 @@ from ...checks.check_config import (
     resolve_runtime,
     speculation_flags,
 )
-from ...checks.witness import WITNESS_KINDS
 from ...infra.files import write_text_atomic
 from ...spec import variants as variants_mod
 from ...spec.task_schema import (
-    BENCHMARK_MEMBERS_EVERY,
-    EQUIVALENCE_WITNESS_FEATURES,
+    DISAGG_FEATURE,
     PROFILE_BRINGUP,
     PROFILE_CERTIFIED,
     PROFILE_SMOKE,
     SPECULATORS,
     TaskSchemaError,
-    anchor_pending,
     assembly_units,
     members_for,
     parse_parallel_segment,
     profile_of,
     resolve_per_unit,
-    witness_owed,
 )
 
 TIER_INNER = "inner"
@@ -82,13 +78,6 @@ MILESTONE_FILENAME = "correctness.jsonl"
 MILESTONE_BRINGUP = "bringup"
 MILESTONE_CORRECTNESS = "correctness"
 
-#: The verdict name each witness kind returns (see witness.py).
-_WITNESS_GATE = {
-    "residency": "residency",
-    "equivalence": "equivalence",
-    "kv_quant": "kv_quant",
-}
-
 
 @dataclass(frozen=True)
 class Check:
@@ -104,6 +93,9 @@ class Check:
     equivalence: str = field(default="", compare=False)
     #: What the check reads from outside the checkout, as a digest; see :func:`check_inputs`.
     inputs: str = field(default="", compare=False)
+    #: The check whose verdict on the same target this one needs first: the unit's
+    #: benchmark at the same member, for a variant whose anchor is relative.
+    after: str = field(default="", compare=False)
 
     @property
     def key(self) -> str:
@@ -113,8 +105,7 @@ class Check:
 @dataclass(frozen=True)
 class Contract:
     checks: tuple[Check, ...]
-    #: Why a unit's accuracy benchmark is owed where it is and nowhere else,
-    #: one line per unit whose benchmark is sampled (:func:`benchmark_members`).
+    #: Why a unit or variant owes less than every check at every member, one line each.
     notes: tuple[str, ...] = ()
 
     def required(self) -> tuple[Check, ...]:
@@ -126,7 +117,11 @@ class Contract:
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "checks": [
-                {k: v for k, v in asdict(c).items() if k not in ("equivalence", "inputs") or v}
+                {
+                    k: v
+                    for k, v in asdict(c).items()
+                    if k not in ("equivalence", "inputs", "after") or v
+                }
                 for c in self.checks
             ]
         }
@@ -146,15 +141,10 @@ class Contract:
         return "\n".join(lines)
 
 
-def _witness_gate(unit: str) -> str:
-    kind = WITNESS_KINDS[unit]
-    return f"replay[{unit}]" if kind == "replay" else _WITNESS_GATE[kind]
-
-
 #: Accuracy-block keys only other gates read. Every other key, one added
 #: later included, is part of an accuracy check's equivalence.
 _NOT_ACCURACY_INPUTS = frozenset(
-    {"boot", "acceptance", "witness", "envelope", "serve", "logits", "benchmark_members"}
+    {"boot", "acceptance", "disagg", "envelope", "serve", "benchmark_members"}
 )
 
 
@@ -348,57 +338,37 @@ def _width(member: str) -> int:
         return 0
 
 
-def benchmark_members(
-    task_data: Mapping[str, Any], unit: str, members: Sequence[str], features: Sequence[str]
-) -> tuple[list[str], str]:
-    """Where ``unit``'s accuracy benchmark runs, of ``members`` (in their order), and why.
-
-    Every member when the logit gate is not owed, when
-    ``accuracy.benchmark_members`` is ``every`` or when the unit's profile is
-    ``certified``. Otherwise one (:func:`benchmark_member`): the logit gate and
-    the boot's greedy tokens, owed at every member, prove the rest. The second
-    value is a line for the contract's notes; ``""`` where every member runs it.
-    """
-    accuracy = task_data.get("accuracy") or {}
-    every = list(members)
-    if (
-        len(every) <= 1
-        or accuracy.get("benchmark_members") == BENCHMARK_MEMBERS_EVERY
-        or profile_of(task_data, unit) == PROFILE_CERTIFIED
-        or not logit_agreement.LogitsSpec.from_task(task_data).enabled
-    ):
-        return every, ""
-    member, why = benchmark_member(task_data, unit, every, features)
-    proven = ", ".join(m for m in every if m != member)
-    return [member], (
-        f"{unit}: accuracy at {member} ({why}); {proven} proven by the logit gate and "
-        "the boot's greedy tokens"
-    )
+def benchmark_members(task_data: Mapping[str, Any], unit: str, members: Sequence[str]) -> list[str]:
+    """Where ``unit``'s accuracy benchmark runs: every member, or the one ``benchmark_members`` names."""
+    named = (task_data.get("accuracy") or {}).get("benchmark_members")
+    return [str(named)] if named in members else list(members)
 
 
-def benchmark_member(
-    task_data: Mapping[str, Any], unit: str, members: Sequence[str], features: Sequence[str]
-) -> tuple[str, str]:
-    """The one member of ``members`` ``unit``'s benchmark runs at, and why.
+def benchmark_member(task_data: Mapping[str, Any], members: Sequence[str]) -> tuple[str, str]:
+    """The one member of ``members`` a configuration variant's benchmark runs at, and why.
 
-    The member ``accuracy.benchmark_members`` names; else the cheapest whose
-    served engine the logit gate does not run whole
-    (:func:`~..checks.logit_agreement.unseen`: attention DP; a speculator,
-    unless the unit's boot compares the HF reference's greedy tokens); else
-    the widest, the cheapest to start among equals.
+    The member ``accuracy.benchmark_members`` names; else an attention-DP member,
+    whose served engine takes the most paths (the router, dummy requests, per-rank
+    caches); else the widest, the cheapest to start among equals.
     """
     named = (task_data.get("accuracy") or {}).get("benchmark_members")
     if named in members:
         return str(named), "named in accuracy.benchmark_members"
     ranked = order_members_by_cost(list(members))
-    greedy = GreedySetting.from_task(task_data, unit) is not None
     for member in ranked:
-        unseen = logit_agreement.unseen(member, features)
-        if greedy:
-            unseen.pop(logit_agreement.UNSEEN_SPECULATION, None)
-        if unseen:
-            return member, "; ".join(unseen.values())
+        if parse_parallel_segment(member)[0] == "dep":
+            return member, "attention DP serves through the most paths"
     return max(ranked, key=_width), "the widest"
+
+
+def relative_to(base: str, gate: str, member: str, owned: Collection[str]) -> str:
+    """The unit's check a relative variant's ``gate`` at ``member`` is judged against; "" if none.
+
+    Only a benchmark has one: the unit's own benchmark at the same member, when
+    the contract owes it (``owned``).
+    """
+    key = f"{base}:{gate}@{member}"
+    return key if gate.startswith("accuracy[") and key in owned else ""
 
 
 def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
@@ -410,18 +380,17 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
 
     Each unit owes what its profile (``task_schema.profile_of``) asks:
     ``smoke`` its boot alone, ``bringup`` its checks at its cheapest member,
-    ``certified`` its benchmark at every member and its witness. A feature the
-    equivalence witness proves (``disagg``) owes that witness alone: its boot
-    and accuracy would run an aggregated engine, which the units before it
-    prove. A storage or scheduling variant (one with no acceptance gate) boots
-    at every member of its unit and runs its benchmark at one
+    ``certified`` its boot boundaries and the serve gate. ``disagg`` owes its
+    disaggregated-serving test alone, once (``checks/disagg.py``): its boot and
+    accuracy would run one aggregated engine, which the units before it prove.
+    A storage or scheduling variant (one with no acceptance gate) boots at
+    every member of its unit and runs its benchmark at one
     (:func:`benchmark_member`) unless it names its members; a variant of
-    ``disagg`` owes the equivalence witness. A ``smoke`` or ``bringup`` run
-    owes no variant and no delivery check.
+    ``disagg`` owes nothing of its own, its axis being proven on core. A
+    ``smoke`` or ``bringup`` run owes no variant and no delivery check.
     """
     accuracy = task_data.get("accuracy") or {}
     serving = serve.ServeSpec.from_task(task_data).enabled
-    logits = logit_agreement.LogitsSpec.from_task(task_data).enabled
     units = assembly_units(task_data)
     lean = profile_of(task_data) in (PROFILE_SMOKE, PROFILE_BRINGUP)
     checks: list[Check] = []
@@ -444,11 +413,14 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
                 inputs = check_inputs(task_data, unit, gate, m, features)
                 checks.append(Check(unit, gate, m, tier, equivalence=same, inputs=inputs))
 
-        if unit in EQUIVALENCE_WITNESS_FEATURES:
-            add(_witness_gate(unit), TIER_PROOF)
+        if unit == DISAGG_FEATURE:
+            # The test sets its own engines' layout on one node: it runs once, at the
+            # member the request validates fully (benchmark_member).
+            member, why = benchmark_member(task_data, members)
+            add(disagg.GATE_NAME, TIER_PROOF, at=[member])
             notes.append(
-                f"{unit}: the equivalence witness alone proves it; its boot and accuracy "
-                "would run an aggregated engine"
+                f"{unit}: its disaggregated-serving test alone proves it, once at {member} "
+                f"({why}); its boot and accuracy would run one aggregated engine"
             )
             continue
         add("boot", TIER_INNER)
@@ -456,22 +428,9 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             notes.append(f"{unit}: the smoke profile owes its boot alone")
             continue
         benchmark = resolve_per_unit(accuracy, "benchmark", unit) or "accuracy"
-        measured, note = benchmark_members(task_data, unit, members, features)
-        if note:
-            notes.append(note)
-        if anchor_pending(accuracy, unit):
-            notes.append(
-                f"{unit}: accuracy anchor pending; the logit gate is its correctness oracle "
-                "and the benchmark is not a check"
-            )
-        else:
-            add(f"accuracy[{benchmark}]", TIER_INNER, at=measured)
+        add(f"accuracy[{benchmark}]", TIER_INNER, at=benchmark_members(task_data, unit, members))
         if serving:
             add(serve.GATE_NAME, TIER_INNER, at=[serve.serve_member(members)])
-        if logits:
-            add(logit_agreement.GATE_NAME, TIER_INNER)
-        if unit in WITNESS_KINDS and witness_owed(task_data, unit):
-            add(_witness_gate(unit), TIER_PROOF)
         # Speculative decoding preserves the output distribution by construction, so a
         # draft path that computes the wrong thing passes boot and accuracy and shows
         # only as speed: per-prompt acceptance is the detector.
@@ -486,12 +445,8 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         members = order_members_by_cost(members_for(spec, name, world_size))
         base = variants_mod.base_unit(task_data, name)
         built = units[1 : units.index(base) + 1] if base in units else []
-        if base in EQUIVALENCE_WITNESS_FEATURES:
-            gate = _witness_gate(base)
-            checks.extend(
-                Check(name, gate, m, TIER_PROOF, inputs=check_inputs(spec, name, gate, m, built))
-                for m in members
-            )
+        if base == DISAGG_FEATURE:
+            notes.append(f"{name}: a variant of {base} owes no check; its axis is proven on core")
             continue
         benchmark = resolve_per_unit(spec.get("accuracy") or {}, "benchmark", name) or "accuracy"
         gate_names = {
@@ -500,20 +455,22 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
             "acceptance": "acceptance",
         }
         gates = variants_mod.variant_gates(task_data, name)
-        if variants_mod.variant_anchor_pending(task_data, spec, name):
-            gates = tuple(gate for gate in gates if gate != "accuracy")
         if level == PROFILE_SMOKE:
             gates = ("boot",)
         everywhere = order_members_by_cost(members_for(task_data, base, world_size))
         named = variants_mod.variants(task_data)[name].get("members")
+        relative = variants_mod.anchor_state(task_data, name) == variants_mod.ANCHOR_RELATIVE
+        if relative and "accuracy" in gates:
+            notes.append(f"{name}: its anchor is {base}'s own score at the same member and target")
         for gate in gates:
             at = members
             if gate == "boot" and "acceptance" not in gates:
                 at = [*members, *(m for m in everywhere if m not in members)]
             elif gate == "accuracy" and not named and level != PROFILE_CERTIFIED and len(at) > 1:
-                member, why = benchmark_member(spec, name, members, built)
+                member, why = benchmark_member(spec, members)
                 at = [member]
                 notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")
+            owned = {c.key for c in checks}
             checks.extend(
                 Check(
                     name,
@@ -521,6 +478,7 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
                     m,
                     TIER_PROOF,
                     inputs=check_inputs(spec, name, gate_names[gate], m, built),
+                    after=relative_to(base, gate_names[gate], m, owned) if relative else "",
                 )
                 for m in at
             )
@@ -571,6 +529,8 @@ class Verdict:
     reads_marker: str = ""
     #: How long the check's gate ran, in seconds; 0 when it did not say.
     duration_s: float = 0.0
+    #: The score a benchmark measured (``GateResult.measured``), pass or fail.
+    measured: float | None = None
 
 
 #: Fields written only when they say something.
@@ -581,8 +541,17 @@ _UNSAID: dict[str, Any] = {
     "reads": "",
     "reads_marker": "",
     "duration_s": 0.0,
+    "measured": None,
 }
 _VERDICT_FIELDS = frozenset(f.name for f in fields(Verdict))
+
+
+def _score(value: Any) -> float | None:
+    """A benchmark score a gate reported; ``None`` for one it did not."""
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _seconds(value: Any) -> float:
@@ -645,6 +614,7 @@ class ContractStatus:
             reads=reads[0],
             reads_marker=reads[1],
             duration_s=_seconds(getattr(result, "duration_s", 0.0)),
+            measured=_score(getattr(result, "measured", None)),
         )
         self.verdicts.append(verdict)
         line = {k: v for k, v in asdict(verdict).items() if k not in _UNSAID or v != _UNSAID[k]}
@@ -741,6 +711,23 @@ def evaluate(
         else:
             failed.append((check, verdict))
     return Evaluation(tuple(passed), tuple(failed), tuple(missing), tuple(shared))
+
+
+def verdict_on(
+    status: ContractStatus,
+    key: str,
+    marker: str,
+    holds: Callable[[Verdict], bool] | None = None,
+) -> Verdict | None:
+    """``key``'s latest verdict if it is about the target at ``marker``, as :func:`evaluate` reads it."""
+    verdict = status.latest().get(key)
+    if verdict is None:
+        return None
+    if verdict.marker == marker or (
+        marker and holds is not None and verdict.reads and verdict.reads_marker and holds(verdict)
+    ):
+        return verdict
+    return None
 
 
 def measured_commit(

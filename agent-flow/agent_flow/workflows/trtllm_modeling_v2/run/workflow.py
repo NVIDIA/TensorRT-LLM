@@ -48,7 +48,7 @@ from agent_flow.console import print_message
 from agent_flow.logger import get_logger
 
 from ..agents.prompts import PromptBundle, build_trtllm_modeling_v2_prompts
-from ..agents.roles import resolve_role_agents
+from ..agents.roles import PACKAGED_SKILLS_DIR, resolve_role_agents
 from ..agents.slots import AgentGate, Priority, turn_priority
 from ..agents.turns import InProcessTurnExecutor, TurnRequest, TurnTimeout
 from ..checks import boot as boot_checks
@@ -83,7 +83,8 @@ from .validation import contract as contract_mod
 
 #: How many tasks run at once: the CLI's --max-parallel-tasks default.
 DEFAULT_MAX_PARALLEL_TASKS = orchestrator_mod.DEFAULT_MAX_PARALLEL_TASKS
-#: How many graph revisions without a check turning green end the run.
+#: How many graph revisions without progress (a task done, a change landed, a check
+#: turning green) end the run.
 DEFAULT_REVISION_CAP = 6
 #: While tasks, checks or a planner turn are in flight, how long a task that finished
 #: with its checks green waits to reach the planner with the events after it. A
@@ -251,6 +252,9 @@ class TrtllmModelingV2Workflow:
         self._engine_limits: list[Any] = []
         # Whether the survey review already sent this run's survey back once.
         self._survey_reviewed = False
+        # Backend kind -> the skills its sessions load besides the run's own (the user's),
+        # which the agent probe reads and every role then runs without.
+        self._foreign_skills: dict[str, tuple[str, ...]] = {}
 
     # ------------------------------------------------------------- lifecycle
 
@@ -306,9 +310,13 @@ class TrtllmModelingV2Workflow:
                     # The workspace is the session cwd so the run's own
                     # materialized skills are the ones the agent discovers,
                     # rather than whatever happens to be configured in the
-                    # repository it is editing.
+                    # repository it is editing. The user's own skills and
+                    # plugins stay out: no role is briefed on them, and an
+                    # unattended session should not reach Slack or mail.
                     cwd=self.workspace,
                     writable_roots=self._writable_roots(),
+                    disabled_skills=self._foreign_skills.get(agent.backend, ()),
+                    plugins=False,
                 ),
                 session=SessionConfig(mode=session_mode, fork_from=fork_from),
             )
@@ -505,7 +513,7 @@ class TrtllmModelingV2Workflow:
         Claude Code reads `.claude/skills`, Codex `.agents/skills`; both are the
         session's cwd-relative skill directories. Returns the first.
         """
-        source = Path(__file__).resolve().parent.parent / "agents" / "skills"
+        source = PACKAGED_SKILLS_DIR
         destinations = [self.workspace / name for name in SKILL_DIRS]
         if not source.is_dir():
             return destinations[0]

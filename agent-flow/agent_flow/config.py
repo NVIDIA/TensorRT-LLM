@@ -20,6 +20,10 @@ class BackendConfig:
     # Code's maximum, or the effort Codex's own configuration sets.
     reasoning_effort: str | None = None
     disabled_skills: tuple[str, ...] = ()
+    # ``False`` runs Codex without the plugins and apps its user installed
+    # (Slack, mail, drives...): an unattended session gets only the tools it
+    # is configured with here. Claude Code takes plugins from its settings.
+    plugins: bool = True
     tools: list[Any] | None = None
     # Native SDK hook configuration. Claude accepts HookMatcher callbacks.
     # Codex requires hooks to be configured and trusted in its native config;

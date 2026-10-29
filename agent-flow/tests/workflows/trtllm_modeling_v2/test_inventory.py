@@ -6,15 +6,17 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 
 import pytest
 
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
     MARKER,
+    PROBE_SOURCE,
     RECEIPT_ABSENT,
     RECEIPT_PASSED,
-    Inventory,
     format_surface,
     parse_inventory,
     probe_command,
@@ -54,7 +56,7 @@ def _inventory_payload(**overrides):
     return payload
 
 
-def test_the_payload_is_found_in_a_log_full_of_engine_chatter():
+def test_entries_in_a_log_full_of_engine_chatter_are_sorted_into_spendable_uncertified_and_rotted():
     stdout = (
         "[TRT-LLM] loading plugins\nrank 0 initialized\n"
         + MARKER
@@ -63,17 +65,6 @@ def test_the_payload_is_found_in_a_log_full_of_engine_chatter():
     )
     inventory = parse_inventory(stdout, arch="sm_103")
     assert inventory.ok
-    assert len(inventory.catalog) == 3
-
-
-def test_a_silent_probe_is_an_error_carrying_the_tail():
-    inventory = parse_inventory("import failed\nTraceback\nImportError: no module", arch="sm_103")
-    assert not inventory.ok
-    assert "ImportError" in inventory.error
-
-
-def test_entries_are_sorted_into_spendable_uncertified_and_rotted():
-    inventory = parse_inventory(MARKER + json.dumps(_inventory_payload()), arch="sm_103")
     assert [e.name for e in inventory.spendable] == ["fused_qk_norm_rope"]
     assert [e.name for e in inventory.uncertified] == ["flashinfer_silu_and_mul"]
     assert [e.name for e in inventory.rotted] == ["gone"]
@@ -87,7 +78,10 @@ def test_the_probe_is_never_launched_as_engine_work():
     assert "__SURVEY_JSON__" in command
 
 
-def test_a_failed_probe_is_reported_rather_than_raised():
+def test_a_failed_probe_is_reported_as_an_error_not_as_a_measurement():
+    silent = parse_inventory("import failed\nTraceback\nImportError: no module", arch="sm_103")
+    assert not silent.ok and "ImportError" in silent.error  # the tail is carried
+
     class _Result:
         ok, returncode, timed_out = False, 1, False
         stdout, stderr = "", "ModuleNotFoundError: tensorrt_llm"
@@ -97,17 +91,10 @@ def test_a_failed_probe_is_reported_rather_than_raised():
         RunEnvironment(kind="local", python="python3"),
         shell_runner=lambda *a, **k: _Result(),
     )
-    assert not inventory.ok
-    assert "exited 1" in inventory.error
-
-
-# ---------------------------------------------------------------- rendering
-
-
-def test_a_failed_probe_is_not_presented_as_a_measurement():
-    failed = format_surface(Inventory(arch="sm_103", error="probe exited 127"))
-    assert "The inventory probe reported an error" in failed
-    assert "evidence of absence" in failed
+    assert not inventory.ok and "exited 1" in inventory.error
+    surface = format_surface(inventory)
+    assert "The inventory probe reported an error" in surface
+    assert "evidence of absence" in surface
 
 
 # ------------------------------------------------- the probe, actually run
@@ -153,14 +140,9 @@ def _fake_repo(tmp_path, entries, model_ops=()):
     return tmp_path
 
 
-def _run_probe(repo, arch="sm_103"):
-    import subprocess
-    import sys
-
-    from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import PROBE_SOURCE
-
+def _run_probe(repo, arch="sm_103", prelude=""):
     proc = subprocess.run(
-        [sys.executable, "-c", PROBE_SOURCE, str(repo), arch],
+        [sys.executable, "-c", prelude + PROBE_SOURCE, str(repo), arch],
         capture_output=True,
         text=True,
         timeout=120,
@@ -177,8 +159,10 @@ _INLINE_PASS = ("SM_103",)
     ids=["this-arch", "other-arch"],
 )
 def test_the_probe_reads_the_entrys_archs(tmp_path, archs, expected):
+    """The probe here runs on an interpreter with no engine: that does not condemn the catalog."""
     repo = _fake_repo(tmp_path, [("norm/x.py", "torch.ops.trtllm.x", archs)])
     inventory = _run_probe(repo)
+    assert inventory.error and inventory.rotted == ()
     assert inventory.catalog[0].receipt == expected
     assert inventory.catalog[0].cells == 2
 
@@ -202,15 +186,6 @@ def test_another_targets_ops_are_promotable_not_spendable(tmp_path):
     assert op not in inventory.spendable and op not in inventory.uncertified
     assert "router" not in inventory.unwrapped_ops
     assert "`fam/ckpt__sm_103__tp1/ops/moe/router`" in format_surface(inventory)
-
-
-def test_an_engine_that_will_not_import_does_not_condemn_the_whole_catalog(tmp_path):
-    """The probe here runs on an interpreter with no engine."""
-    repo = _fake_repo(tmp_path, [("norm/x.py", "torch.ops.trtllm.x", _INLINE_PASS)])
-    inventory = _run_probe(repo)
-    assert inventory.error
-    assert inventory.rotted == ()
-    assert inventory.catalog[0].receipt == RECEIPT_PASSED
 
 
 # ------------------------------------------------- how the op plane is enumerated
@@ -249,24 +224,9 @@ sys.modules["tensorrt_llm"] = trtllm
 '''
 
 
-def _run_probe_with_fake_torch(repo, arch="sm_103"):
-    import subprocess
-    import sys
-
-    from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import PROBE_SOURCE
-
-    proc = subprocess.run(
-        [sys.executable, "-c", _FAKE_TORCH + PROBE_SOURCE, str(repo), arch],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    return parse_inventory(proc.stdout + proc.stderr, arch=arch)
-
-
 def test_the_op_plane_is_read_from_the_schema_registry_not_from_dir(tmp_path):
     repo = _fake_repo(tmp_path, [("comm/allgather.py", "torch.ops.trtllm.allgather", _INLINE_PASS)])
-    inventory = _run_probe_with_fake_torch(repo)
+    inventory = _run_probe(repo, prelude=_FAKE_TORCH)
 
     assert "allgather" in inventory.trtllm_ops
     assert "fp4_quantize" in inventory.trtllm_ops

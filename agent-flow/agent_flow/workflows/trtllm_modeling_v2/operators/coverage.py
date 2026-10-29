@@ -108,7 +108,8 @@ TIER_DESCRIPTION: dict[int, str] = {
     ),
     TIER_TRITON: (
         "native torch cannot express it, or does so at a cost that breaks the "
-        "gate's budget, so write a Triton kernel"
+        "gate's budget, so write a Triton kernel, adapted from an existing one "
+        "(FlashInfer, vLLM, SGLang) where there is one"
     ),
 }
 

@@ -14,7 +14,6 @@ into the workspace is fully explicit.
 from __future__ import annotations
 
 import re
-import shlex
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -29,7 +28,7 @@ from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from ..tune.schema import validate_perf_block
 from .schema_keys import reject_unknown_keys
-from .variants import VARIANTS_FIELD, validate_variants
+from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
 
 REQUIRED_PATH_FIELDS: tuple[str, ...] = (
     "checkpoint_path",
@@ -93,121 +92,17 @@ SPECULATORS: frozenset[str] = frozenset(
 # modules OR DSpark stages and never both.
 MTP_NAMESPACE_FEATURES: tuple[str, ...] = ("mtp", "dspark")
 
-# The engine batch limit BOTH legs of a token-comparing witness (residency,
-# kv_quant, equivalence) run at. It replaces the runtime block's
-# `max_batch_size` in leg A's public LLM configuration, and a `contrast_command` leg B
-# is handed it as MV2FLOW_WITNESS_MAX_BATCH_SIZE. `1` is the value that
-# gives both legs the same schedule. Unset keeps the runtime block's limit.
-WITNESS_BATCH_SIZE_KEY = "max_batch_size"
-
-# The keys every witness block may carry. `expected_mib` is the residency
-# witness's prediction, `contrast_command` the equivalence witness's second
-# launcher. `timeout` is seconds PER LEG, where the one-engine boot budget does
-# not fit.
-# The workload a token-comparing witness (residency, kv_quant, equivalence)
-# declares, as the acceptance gate does: `prompts` or `prompts_file`,
-# `max_tokens`, and `min_generated_tokens` (default 32) -- a witness whose
-# continuations are shorter fails as too short to compare. With none, the
-# declared acceptance prompts, else the boot prompts.
-WITNESS_WORKLOAD_KEYS: tuple[str, ...] = (
-    "prompts",
-    "prompts_file",
-    "max_tokens",
-    "min_generated_tokens",
-)
-WITNESS_KEYS: tuple[str, ...] = (
-    "contrast_env",
-    "expected_mib",
-    "contrast_command",
-    "timeout",
-    WITNESS_BATCH_SIZE_KEY,
-    *WITNESS_WORKLOAD_KEYS,
-)
-
-# Features gated by the EQUIVALENCE witness (token identity across a hop).
+# `accuracy.disagg`: the tree's own disaggregated-serving accuracy test for this target
+# (checks/disagg.py), the one check the `disagg` feature owes. The run writes it beside the
+# tree's tests that serve through `trtllm-serve disaggregated`.
 #
-#   contrast_command  REQUIRED, with `contrast_env`. Leg B's launcher: a context
-#                     engine and a generation engine with the state handed
-#                     between them. A word of it naming a file beside the spec
-#                     is resolved against the spec's directory
-#   prompt_tokens     optional list: one generated prompt of at least that many
-#                     tokens each, added to the boot prompts on BOTH legs
-#   legs_env          optional mapping, see WITNESS_LEGS_ENV_KEY
-EQUIVALENCE_WITNESS_FEATURES: tuple[str, ...] = ("disagg",)
-EQUIVALENCE_WITNESS_REQUIRED: tuple[str, ...] = ("contrast_command", "contrast_env")
-
-# The environment BOTH legs of an equivalence witness run under: leg A's
-# process, and leg B's launcher, which is handed it as
-# MV2FLOW_WITNESS_LEGS_ENV to apply to every engine it starts. A variable may
-# not be in both this and `contrast_env`: there it is the contrast.
-WITNESS_LEGS_ENV_KEY = "legs_env"
-
-# The cache transceiver both engines of leg B run, as the LLM API's
-# `CacheTransceiverConfig` takes it (`backend`, `transceiver_runtime`, ...).
-# The `contrast_command` is handed it as MV2FLOW_WITNESS_TRANSCEIVER.
-WITNESS_TRANSCEIVER_KEY = "cache_transceiver_config"
-
-EQUIVALENCE_WITNESS_KEYS: tuple[str, ...] = (
-    "contrast_env",
-    "contrast_command",
-    "prompt_tokens",
-    "timeout",
-    WITNESS_BATCH_SIZE_KEY,
-    WITNESS_LEGS_ENV_KEY,
-    WITNESS_TRANSCEIVER_KEY,
-    *WITNESS_WORKLOAD_KEYS,
-)
-
-# The bounded-replay witness parameters, per feature, each REQUIRED.
-#
-#   window         the checkpoint's sliding window (e.g. 128)
-#   prompt_tokens  decoder_replay: the long prompt's length, at least. Must
-#                  exceed `window`
-#   prefix_tokens  encoder_replay: the shared prefix's length. Must exceed
-#                  `window`
-REPLAY_WITNESS_REQUIRED: dict[str, tuple[str, ...]] = {
-    "decoder_replay": ("contrast_env", "window", "prompt_tokens"),
-    "encoder_replay": ("contrast_env", "window", "prefix_tokens"),
-}
-# `reuse_alignment`: the reuse boundary must be a multiple of this. A model that
-# compresses global KV in pairs (compress ratio 2) needs 2. Default 1, i.e. no
-# constraint.
-REPLAY_WITNESS_OPTIONAL: dict[str, tuple[str, ...]] = {
-    "decoder_replay": ("timeout",),
-    "encoder_replay": ("reuse_alignment", "timeout"),
-}
-
-# The witness builds its long prompt as a request-entry `--prompt` argument, one
-# word per token at least. Linux caps ONE argv string at 128 KiB
-# (MAX_ARG_STRLEN) and fails the exec with E2BIG, which surfaces as a leg that
-# "did not complete". 16384 words of the witness's prose
-# (`checks/witness_inputs.py`) are ~89 KB.
-MAX_WITNESS_PROMPT_WORDS = 16384
-
-# Native KV storage can be lossy (exact: false); only exact storage owes token identity.
-KV_QUANT_WITNESS_KEYS: tuple[str, ...] = (
-    "contrast_env",
-    "expected_bytes_per_token",
-    "exact",
-    "bytes_tolerance",
-    "timeout",
-    WITNESS_BATCH_SIZE_KEY,
-    *WITNESS_WORKLOAD_KEYS,
-)
-DEFAULT_BYTES_TOLERANCE = 0.02
-
-# Every feature whose witness block is a DECLARATION -- a workload or a figure
-# the verdict is judged against, or the launcher of the leg it compares -- and
-# is therefore required at spec time, once witnesses are on.
-DECLARED_WITNESS_FEATURES: tuple[str, ...] = (
-    *REPLAY_WITNESS_REQUIRED,
-    "kv_quant",
-    *EQUIVALENCE_WITNESS_FEATURES,
-)
-
-# `accuracy.witness.enabled`: whether the contract owes the witnesses at all.
-# Off by default.
-WITNESS_ENABLED_KEY = "enabled"
+#   test     REQUIRED with the disagg feature: its repository-relative pytest node id, e.g.
+#            `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestX::test_y`
+#   devices  the devices it starts its engines on (default two engines at the member's width)
+#   timeout  seconds (default 7200)
+#   env      the environment the test runs under (`LLM_MODELS_ROOT`, ...)
+DISAGG_FEATURE = "disagg"
+DISAGG_KEYS: tuple[str, ...] = ("test", "devices", "timeout", "env")
 
 # Workload and field documentation lives in task.example.yaml. These key sets
 # close the accepted blocks; cross-field constraints are validated below.
@@ -296,9 +191,8 @@ COVERAGE_KEYS: tuple[str, ...] = ("accept",)
 #: from unit or variant name, and ``default``, to a profile). ``smoke`` owes a
 #: unit's boot only; ``bringup`` gates each unit at its cheapest member, and no
 #: configuration variant and no delivery check; ``standard`` is the contract as
-#: the spec states it; ``certified`` also turns on the witnesses, boot boundary
-#: phases and the serve gate, and runs each unit's benchmark at every member. A
-#: switch the spec sets itself keeps its value.
+#: the spec states it; ``certified`` also turns on boot boundary phases and the
+#: serve gate. A switch the spec sets itself keeps its value.
 PROFILE_FIELD = "profile"
 PROFILE_SMOKE = "smoke"
 PROFILE_BRINGUP = "bringup"
@@ -335,8 +229,8 @@ ACCURACY_KEYS: tuple[str, ...] = (
     # model to a list discriminated by quant_algo / kv_cache_quant_algo /
     # spec_dec_algo, and the match is exact.
     "discriminators",
-    # Per-unit configuration for the two-leg WITNESS gates.
-    "witness",
+    # The disaggregated-serving test the `disagg` feature owes (checks/disagg.py).
+    "disagg",
     # `trtllm-eval` takes these two as its OWN flags rather than through the
     # options YAML, so they have to be declarable here.
     "max_seq_len",
@@ -351,49 +245,32 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "samples",
     "benchmark_members",
     "anchor",
-    "logits",
 )
 
-# `accuracy.anchor: pending` (scalar, or per unit): no written anchor exists
-# for the unit yet. Its accuracy benchmark is not a check; the logit gate
-# against the HF reference (`accuracy.logits`) is the unit's correctness
-# oracle, and delivery stays incomplete until a row is recorded from a written
-# source.
-ANCHOR_PENDING = "pending"
-ANCHOR_RECORDED = "recorded"
-ANCHOR_STATES: tuple[str, ...] = (ANCHOR_RECORDED, ANCHOR_PENDING)
+# `accuracy.anchor`: what a unit's or a variant's accuracy floor stands on.
+#
+#   recorded  a row of reference_yaml: a written source, a measurement, or a deliberately
+#             low placeholder until one of those is known.
+#   relative  a configuration variant only: its unit's own score at the same member, on
+#             the same state of the target (a KV dtype against `auto`, say). The default
+#             for a variant that names no reference row of its own.
+ANCHOR_STATES: tuple[str, ...] = (ANCHOR_RECORDED, ANCHOR_RELATIVE)
 
 # `accuracy.benchmark_members`: where each unit's accuracy benchmark runs.
 #
-#   sampled  (default) with the logit gate on: at one member, the cheapest
-#            whose served engine the logit gate does not run whole (attention
-#            DP; a speculator, unless the boot compares greedy tokens), else
-#            the widest. The logit gate and the boot's greedy tokens, owed at
-#            every member, prove the rest. Without the logit gate, at every
-#            member.
-#   every    at every member, whatever else the contract owes.
+#   every    (default) at every member.
 #   <member> at that member (`dep4`, ...), for each unit that has it.
-BENCHMARK_MEMBERS_SAMPLED = "sampled"
 BENCHMARK_MEMBERS_EVERY = "every"
-BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_SAMPLED, BENCHMARK_MEMBERS_EVERY)
+#: The concurrencies a perf campaign measures when nothing says: low latency, middle, high
+#: throughput. An attention-DP member measures only the last, times its ranks.
+DEFAULT_PERF_CONCURRENCY: tuple[int, ...] = (1, 32, 128)
+BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 
 # Boot workloads allow run-wide keys and per-unit overlays. Keywords match
 # generated text, never logs; absent multimodal images use the repository asset.
-BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens", "greedy")
+BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens")
 BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "keywords", "keywords_any", "images", "render")
 BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
-
-# `accuracy.boot.greedy` (run-wide, or a unit's own entry): wherever the run has
-# an HF logit reference (`accuracy.logits.reference`), the boot also sends its
-# first text prompts as token ids and the engine's first greedy tokens must be
-# the reference's, up to a near-tie (checks/boot.py, `GreedySetting`).
-#
-#   enabled   default true; false compares no tokens. A configuration variant
-#             compares none unless its own entry says true.
-#   prompts   how many of the reference's text prompts (default 4)
-#   tokens    greedy tokens compared per prompt (default 24, at most the
-#             reference's continuation)
-GREEDY_KEYS: tuple[str, ...] = ("enabled", "prompts", "tokens")
 
 # Optional runtime-boundary phases of ordinary boot (checks/boot.py).
 # Disabled by default; certified enables them unless explicitly disabled.
@@ -428,6 +305,8 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "mounts",
     "time_limit",
     "gpus_per_node",
+    # Each device's memory, GiB: the intake lint sizes engines and disaggregation by it.
+    "gpu_memory_gib",
     # Pyxis reuses an already-imported container of this name on the node.
     "container_name",
     # A checkpoint the STOCK modeling path already supports, used by
@@ -805,6 +684,10 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
     ):
         errors.append(f"'{ENVIRONMENT_FIELD}.mounts' must be a list of strings")
 
+    memory = block.get("gpu_memory_gib")
+    if memory is not None and not (_number(memory) and memory > 0):
+        errors.append(f"'{ENVIRONMENT_FIELD}.gpu_memory_gib' must be a positive number of GiB")
+
     proxy = block.get("substrate_checkpoint")
     if proxy is not None:
         if not isinstance(proxy, str) or not proxy.strip():
@@ -871,180 +754,37 @@ def _validate_fields(
             errors.append(f"'{where}.{key}' {message}")
 
 
-def _validate_contrast_env(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
-    contrast_env = entry.get("contrast_env")
-    if not isinstance(contrast_env, dict) or not contrast_env:
-        errors.append(
-            f"'{where}.contrast_env' is required and must be a non-empty mapping: "
-            f"a witness with no changed variable compares a run to itself"
-        )
-    elif not all(isinstance(v, (str, int, float, bool)) for v in contrast_env.values()):
-        errors.append(f"'{where}.contrast_env' values must be scalars the shell can carry")
-
-
-def _validate_witness_timeout(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
-    timeout = entry.get("timeout")
-    if timeout is not None and not _positive_int(timeout):
-        errors.append(f"'{where}.timeout' must be a whole number of seconds >= 1, got {timeout!r}")
-
-
-def _validate_witness_workload(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
-    """Validate a token-comparing witness block's declared workload."""
-    _validate_acceptance_workload(
-        {k: v for k, v in entry.items() if k in ("prompts", "prompts_file", "max_tokens")},
-        errors,
-        where,
-    )
-    minimum = entry.get("min_generated_tokens")
-    if minimum is not None and not _positive_int(minimum):
-        errors.append(f"'{where}.min_generated_tokens' must be an integer >= 1")
-
-
-def _validate_witness_batch_size(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
-    value = entry.get(WITNESS_BATCH_SIZE_KEY)
-    if value is not None and not _positive_int(value):
-        errors.append(
-            f"'{where}.{WITNESS_BATCH_SIZE_KEY}' must be an integer >= 1 (1 gives both legs "
-            f"the same schedule), got {value!r}"
-        )
-
-
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-def _validate_legs_env(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
-    """Validate the optional ``legs_env``: shell variables, none of them the contrast."""
-    legs_env = entry.get(WITNESS_LEGS_ENV_KEY)
-    if legs_env is None:
+def _validate_disagg(block: Any, errors: list[str]) -> None:
+    """Validate ``accuracy.disagg``: the disaggregated-serving test the run writes and names."""
+    where = f"{ACCURACY_FIELD}.disagg"
+    if not isinstance(block, dict):
+        errors.append(f"'{where}' must be a mapping")
         return
-    key = f"{where}.{WITNESS_LEGS_ENV_KEY}"
-    if not isinstance(legs_env, dict) or not legs_env:
-        errors.append(f"'{key}' must be a non-empty mapping from variable to value")
-        return
-    for name, value in legs_env.items():
-        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
-            errors.append(f"'{key}' names {name!r}, which is not a shell variable name")
-        if not isinstance(value, (str, int, float, bool)):
-            errors.append(f"'{key}.{name}' must be a scalar the shell can carry")
-    contrast_env = entry.get("contrast_env")
-    if isinstance(contrast_env, dict):
-        shared = sorted(str(name) for name in set(legs_env) & set(contrast_env))
-        if shared:
-            errors.append(
-                f"'{key}' and '{where}.contrast_env' both set {', '.join(shared)}: a variable "
-                f"leg B sets differently is the contrast, not something the legs share"
-            )
-
-
-def _validate_equivalence_witness(entry: Mapping[str, Any], errors: list[str], where: str) -> None:
-    """Validate an equivalence witness block: leg B is the run's own launcher."""
-    reject_unknown_keys(entry, EQUIVALENCE_WITNESS_KEYS, errors, where=where)
-    command = entry.get("contrast_command")
-    if not isinstance(command, str) or not command.strip():
-        errors.append(
-            f"'{where}.contrast_command' is required and must be a non-empty string: declare "
-            f"leg B's launcher, which starts a context and a generation engine and hands the "
-            f"state between them"
-        )
-    _validate_contrast_env(entry, errors, where)
-    _validate_legs_env(entry, errors, where)
-    transceiver = entry.get(WITNESS_TRANSCEIVER_KEY)
-    if transceiver is not None and (
-        not isinstance(transceiver, dict)
-        or not transceiver
-        or not all(isinstance(k, str) for k in transceiver)
+    reject_unknown_keys(block, DISAGG_KEYS, errors, where=where)
+    test = block.get("test")
+    if test is not None and (
+        not isinstance(test, str) or "::" not in test or Path(test).is_absolute()
     ):
         errors.append(
-            f"'{where}.{WITNESS_TRANSCEIVER_KEY}' must be a non-empty mapping of "
-            f"CacheTransceiverConfig fields (e.g. backend: NIXL)"
+            f"'{where}.test' must be a repository-relative pytest node id "
+            f"(`tests/.../test_x.py::TestY::test_z`), got {test!r}"
         )
-    lengths = entry.get("prompt_tokens")
-    if lengths is not None:
-        if not isinstance(lengths, list) or not lengths:
-            errors.append(f"'{where}.prompt_tokens' must be a non-empty list of integers")
+    _validate_fields(block, {"devices": _POS_INT, "timeout": _POS_INT}, errors, where)
+    env = block.get("env")
+    if env is not None:
+        if not isinstance(env, dict):
+            errors.append(f"'{where}.env' must be a mapping from variable to value")
         else:
-            for value in lengths:
-                if not _positive_int(value):
+            for name, value in env.items():
+                if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
                     errors.append(
-                        f"'{where}.prompt_tokens' entries must be integers >= 1, got {value!r}"
+                        f"'{where}.env' names {name!r}, which is not a shell variable name"
                     )
-                elif value > MAX_WITNESS_PROMPT_WORDS:
-                    errors.append(
-                        f"'{where}.prompt_tokens' entry {value} is over "
-                        f"{MAX_WITNESS_PROMPT_WORDS}; each prompt travels as one argv string, "
-                        f"which Linux caps at 128 KiB"
-                    )
-    _validate_witness_timeout(entry, errors, where)
-    _validate_witness_batch_size(entry, errors, where)
-    _validate_witness_workload(entry, errors, where)
-
-
-def _validate_replay_witness(
-    feature: str, entry: Mapping[str, Any], errors: list[str], where: str
-) -> None:
-    """Validate a bounded-replay witness block: the workload is DECLARED here."""
-    reject_unknown_keys(
-        entry,
-        (*REPLAY_WITNESS_REQUIRED[feature], *REPLAY_WITNESS_OPTIONAL[feature]),
-        errors,
-        where=where,
-    )
-    for key in REPLAY_WITNESS_REQUIRED[feature]:
-        if entry.get(key) is None:
-            errors.append(
-                f"'{where}.{key}' is required: the {feature} witness sizes its workload "
-                f"from the spec, never from the run it judges"
-            )
-    _validate_contrast_env(entry, errors, where)
-
-    window = entry.get("window")
-    if window is not None and not _positive_int(window):
-        errors.append(f"'{where}.window' must be an integer >= 1, got {window!r}")
-        window = None
-    for key in ("prompt_tokens", "prefix_tokens"):
-        value = entry.get(key)
-        if value is None or key not in REPLAY_WITNESS_REQUIRED[feature]:
-            continue
-        if not _positive_int(value):
-            errors.append(f"'{where}.{key}' must be an integer >= 1, got {value!r}")
-        elif window is not None and value <= window:
-            errors.append(
-                f"'{where}.{key}' is {value}, which does not exceed window={window}. At or "
-                f"under the window, replay on and replay off do the same work, and the "
-                f"witness passes for a target that implements nothing."
-            )
-        elif value > MAX_WITNESS_PROMPT_WORDS:
-            errors.append(
-                f"'{where}.{key}' is {value}; the witness prompt travels as one argv "
-                f"string, which Linux caps at 128 KiB, so the limit is "
-                f"{MAX_WITNESS_PROMPT_WORDS}"
-            )
-    alignment = entry.get("reuse_alignment")
-    if alignment is not None and not _positive_int(alignment):
-        errors.append(f"'{where}.reuse_alignment' must be an integer >= 1, got {alignment!r}")
-    _validate_witness_timeout(entry, errors, where)
-
-
-def _validate_kv_quant_witness(entry: dict[str, Any], errors: list[str], where: str) -> None:
-    """Validate the ``kv_quant`` witness block, filling ``exact``'s default."""
-    reject_unknown_keys(entry, KV_QUANT_WITNESS_KEYS, errors, where=where)
-    expected = entry.get("expected_bytes_per_token")
-    if not _positive_int(expected):
-        errors.append(
-            f"'{where}.expected_bytes_per_token' is required and must be an integer >= 1, "
-            f"computed from the checkpoint's storage formats before the run; got {expected!r}"
-        )
-    exact = entry.setdefault("exact", True)
-    if not isinstance(exact, bool):
-        errors.append(f"'{where}.exact' must be true or false, got {exact!r}")
-    elif exact or entry.get("contrast_env") is not None:
-        _validate_contrast_env(entry, errors, where)
-    tolerance = entry.get("bytes_tolerance")
-    if tolerance is not None and (not _number(tolerance) or not 0 <= tolerance < 1):
-        errors.append(f"'{where}.bytes_tolerance' must be a fraction in [0, 1), got {tolerance!r}")
-    _validate_witness_timeout(entry, errors, where)
-    _validate_witness_batch_size(entry, errors, where)
-    _validate_witness_workload(entry, errors, where)
+                if not isinstance(value, (str, int, float, bool)):
+                    errors.append(f"'{where}.env.{name}' must be a scalar the shell can carry")
 
 
 def load_prompts_file(path: str | Path) -> tuple[str, ...]:
@@ -1220,16 +960,6 @@ def _validate_boot_level(level: Mapping[str, Any], errors: list[str], where: str
         if not isinstance(prompts_file, str) or not Path(prompts_file).is_file():
             errors.append(f"'{where}.prompts_file' does not exist: {prompts_file}")
     _validate_fields(level, {"keywords": _STRINGS, "max_tokens": _POS_INT}, errors, where)
-    greedy = level.get("greedy")
-    if greedy is not None:
-        at = f"{where}.greedy"
-        if not isinstance(greedy, dict):
-            errors.append(f"'{at}' must be a mapping")
-            return
-        reject_unknown_keys(greedy, GREEDY_KEYS, errors, where=at)
-        _validate_fields(
-            greedy, {"enabled": _FLAG, "prompts": _POS_INT, "tokens": _POS_INT}, errors, at
-        )
 
 
 def _validate_boot(block: Any, errors: list[str]) -> None:
@@ -1274,11 +1004,6 @@ def resolve_per_unit(accuracy: Mapping[str, Any], key: str, unit: str | None) ->
             chosen = value.get("default")
         return chosen
     return value
-
-
-def anchor_pending(accuracy: Mapping[str, Any], unit: str | None) -> bool:
-    """Whether ``unit`` has no written accuracy anchor yet (``accuracy.anchor: pending``)."""
-    return resolve_per_unit(accuracy, "anchor", unit) == ANCHOR_PENDING
 
 
 def resolve_samples(
@@ -1451,47 +1176,6 @@ def _validate_serve(block: Any, errors: list[str]) -> None:
     )
 
 
-# Logit agreement compares against the recorded HF reference, not the run's output.
-LOGITS_KEYS: tuple[str, ...] = ("enabled", "reference", "prompts", "threshold_factor", "timeout")
-#: The reference a spec that names none gets, when the file is beside the spec.
-DEFAULT_LOGIT_REFERENCE = "logits.reference.json.gz"
-
-
-def _validate_logits(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.logits``."""
-    where = f"{ACCURACY_FIELD}.logits"
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping")
-        return
-    reject_unknown_keys(block, LOGITS_KEYS, errors, where=where)
-    enabled = block.get("enabled")
-    if enabled is not None and not isinstance(enabled, bool):
-        errors.append(f"'{where}.enabled' must be true or false")
-    reference = block.get("reference")
-    if reference is not None and (not isinstance(reference, str) or not reference.strip()):
-        errors.append(f"'{where}.reference' must be a path")
-    elif reference is None and enabled is not False:
-        errors.append(
-            f"'{where}.reference' names the reference file "
-            f"(checks/logit_reference.py writes it); without one set enabled: false"
-        )
-    elif reference is not None and enabled is not False and not Path(reference).is_file():
-        errors.append(f"'{where}.reference' does not exist: {reference}")
-    prompts = block.get("prompts")
-    if prompts is not None and (
-        not isinstance(prompts, list)
-        or not prompts
-        or not all(isinstance(p, str) and p.strip() for p in prompts)
-        or len(set(prompts)) != len(prompts)
-    ):
-        errors.append(f"'{where}.prompts' must be a non-empty list of distinct prompt ids")
-    factor = block.get("threshold_factor")
-    if factor is not None and (not _number(factor) or not factor > 0):
-        errors.append(f"'{where}.threshold_factor' must be a number > 0")
-    if block.get("timeout") is not None and not _positive_int(block["timeout"]):
-        errors.append(f"'{where}.timeout' must be an integer >= 1")
-
-
 def _bounds_server_length(accuracy: Mapping[str, Any]) -> bool:
     """Whether the spec says what sequence length ``trtllm-serve`` sizes its cache for."""
     if accuracy.get("max_seq_len") is not None:
@@ -1511,9 +1195,8 @@ def _bounds_server_length(accuracy: Mapping[str, Any]) -> bool:
 def _profile_defaults(profile: Any, accuracy: dict[str, Any]) -> None:
     """The switches the run's ``profile`` sets where ``accuracy`` leaves them unsaid, in place.
 
-    ``certified`` turns on boot boundary phases, the serve gate and the witnesses,
-    and runs each unit's benchmark at every member; ``bringup`` and ``smoke``
-    turn boot boundary phases and the serve gate off. ``standard`` sets nothing.
+    ``certified`` turns on boot boundary phases and the serve gate; ``bringup``
+    and ``smoke`` turn them off. ``standard`` sets nothing.
     """
     if profile not in (PROFILE_SMOKE, PROFILE_BRINGUP, PROFILE_CERTIFIED):
         return
@@ -1524,36 +1207,21 @@ def _profile_defaults(profile: Any, accuracy: dict[str, Any]) -> None:
             accuracy[key] = {"enabled": on}
         elif isinstance(block, dict):
             block.setdefault("enabled", on)
-    if on:
-        witness = accuracy.get("witness")
-        if witness is None:
-            accuracy["witness"] = {WITNESS_ENABLED_KEY: True}
-        elif isinstance(witness, dict):
-            witness.setdefault(WITNESS_ENABLED_KEY, True)
-        accuracy.setdefault("benchmark_members", BENCHMARK_MEMBERS_EVERY)
 
 
 def derive_gate_defaults(data: dict[str, Any], spec_dir: Path) -> None:
     """Turn on, in place, the gates the spec leaves unsaid and the run can derive.
 
-    - ``accuracy.logits``: a block that names no reference and does not turn
-      the gate off gets :data:`DEFAULT_LOGIT_REFERENCE` in ``spec_dir`` when
-      that file is there;
-    - ``accuracy.serve``: a block without ``enabled`` gets it, true wherever
-      the spec bounds the server's sequence length (:func:`_bounds_server_length`).
-
-    A spec that says ``enabled: false`` keeps either off. A ``profile`` sets its
-    switches first (:func:`_profile_defaults`).
+    ``accuracy.serve``: a block without ``enabled`` gets it, true wherever the
+    spec bounds the server's sequence length (:func:`_bounds_server_length`). A
+    spec that says ``enabled: false`` keeps it off. A ``profile`` sets its
+    switches first (:func:`_profile_defaults`). ``spec_dir`` is the spec's
+    directory.
     """
     accuracy = data.get(ACCURACY_FIELD)
     if not isinstance(accuracy, dict):
         return
     _profile_defaults(profile_of(data), accuracy)
-    logits = accuracy.get("logits")
-    default = spec_dir / DEFAULT_LOGIT_REFERENCE
-    unnamed = isinstance(logits, dict) and logits.get("reference") is None
-    if (logits is None or (unnamed and logits.get("enabled") is not False)) and default.is_file():
-        accuracy["logits"] = {**(logits or {}), "reference": str(default.resolve())}
     serve = accuracy.get("serve")
     if serve is None or (isinstance(serve, dict) and "enabled" not in serve):
         accuracy["serve"] = {**(serve or {}), "enabled": _bounds_server_length(accuracy)}
@@ -1637,8 +1305,8 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
     if block.get("envelope") is not None:
         _validate_envelope(block["envelope"], errors)
 
-    if block.get("logits") is not None:
-        _validate_logits(block["logits"], errors)
+    if block.get("disagg") is not None:
+        _validate_disagg(block["disagg"], errors)
 
     if block.get("serve") is not None:
         _validate_serve(block["serve"], errors)
@@ -1650,7 +1318,8 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
         if state not in ANCHOR_STATES:
             errors.append(
                 f"'{ACCURACY_FIELD}.anchor{'.' + str(where) if where else ''}' must be one of "
-                f"{list(ANCHOR_STATES)}; got {state!r}"
+                f"{list(ANCHOR_STATES)}; got {state!r}. Without a written anchor, record a "
+                f"low placeholder in reference_yaml and replace it when a measured one is known"
             )
 
     members = block.get("benchmark_members")
@@ -1660,49 +1329,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
             f"'{ACCURACY_FIELD}.benchmark_members' must be one of {list(BENCHMARK_MEMBERS)} "
             f"or a member (tp4, dep4, ...); got {members!r}"
         )
-
-    witness = block.get("witness")
-    if witness is not None:
-        if not isinstance(witness, dict):
-            errors.append(f"'{ACCURACY_FIELD}.witness' must be a mapping from unit to a block")
-        else:
-            for unit, entry in witness.items():
-                where = f"{ACCURACY_FIELD}.witness.{unit}"
-                if unit == WITNESS_ENABLED_KEY:
-                    if not isinstance(entry, bool):
-                        errors.append(f"'{where}' must be true or false")
-                    continue
-                if not isinstance(entry, dict):
-                    errors.append(f"'{where}' must be a mapping")
-                    continue
-                # Closed per feature.
-                if unit in REPLAY_WITNESS_REQUIRED:
-                    _validate_replay_witness(str(unit), entry, errors, where)
-                    continue
-                if unit == "kv_quant":
-                    _validate_kv_quant_witness(entry, errors, where)
-                    continue
-                if unit in EQUIVALENCE_WITNESS_FEATURES:
-                    _validate_equivalence_witness(entry, errors, where)
-                    continue
-                reject_unknown_keys(entry, WITNESS_KEYS, errors, where=where)
-                _validate_witness_timeout(entry, errors, where)
-                _validate_witness_batch_size(entry, errors, where)
-                _validate_witness_workload(entry, errors, where)
-                command = entry.get("contrast_command")
-                if command is not None and (not isinstance(command, str) or not command.strip()):
-                    errors.append(f"'{where}.contrast_command' must be a non-empty string")
-                _validate_contrast_env(entry, errors, where)
-                predicted = entry.get("expected_mib")
-                values = predicted.values() if isinstance(predicted, dict) else [predicted]
-                if predicted is not None and (
-                    not all(_number(v) and v > 0 for v in values)
-                    or (isinstance(predicted, dict) and not predicted)
-                ):
-                    errors.append(
-                        f"'{where}.expected_mib' must be a positive number, or a mapping from "
-                        f"member (and `default`) to one"
-                    )
 
     # A mapping of scalars (the whole run) or of unit -> mapping of scalars.
     discriminators = block.get("discriminators")
@@ -1753,27 +1379,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
         )
 
 
-def witness_enabled(task_data: Mapping[str, Any]) -> bool:
-    """Whether the contract owes the witnesses (``accuracy.witness.enabled``); off by default."""
-    accuracy = task_data.get(ACCURACY_FIELD)
-    witness = accuracy.get("witness") if isinstance(accuracy, Mapping) else None
-    return isinstance(witness, Mapping) and witness.get(WITNESS_ENABLED_KEY) is True
-
-
-def witness_owed(task_data: Mapping[str, Any], unit: str) -> bool:
-    """Whether the contract owes ``unit``'s witness.
-
-    Always for a feature the equivalence witness proves (``disagg``): its boot
-    and accuracy run an aggregated engine, so the witness is its only proof.
-    Otherwise when the witnesses are on, or the unit's profile is ``certified``.
-    """
-    return (
-        unit in EQUIVALENCE_WITNESS_FEATURES
-        or witness_enabled(task_data)
-        or profile_of(task_data, unit) == PROFILE_CERTIFIED
-    )
-
-
 def _validate_profile(data: Mapping[str, Any], errors: list[str]) -> None:
     """``profile``: one of :data:`PROFILES`, or a mapping from unit, variant or ``default`` to one."""
     profile = data.get(PROFILE_FIELD)
@@ -1797,54 +1402,54 @@ def _validate_profile(data: Mapping[str, Any], errors: list[str]) -> None:
             errors.append(f"'{PROFILE_FIELD}.{unit}' must be one of {list(PROFILES)}")
 
 
-def _require_declared_witnesses(data: Mapping[str, Any], errors: list[str]) -> None:
-    """A feature whose owed witness judges against a DECLARED value needs it here."""
-    features = data.get(FEATURES_FIELD)
+def _require_relative_on_variants(data: Mapping[str, Any], errors: list[str]) -> None:
+    """``anchor: relative`` names a configuration variant: a unit has no unit under it."""
     accuracy = data.get(ACCURACY_FIELD)
-    if not isinstance(features, list) or not isinstance(accuracy, dict):
-        return
-    witness = accuracy.get("witness")
-    witness = witness if isinstance(witness, dict) else {}
-    for feature in features:
-        if feature not in DECLARED_WITNESS_FEATURES or feature in witness:
-            continue
-        if not witness_owed(data, feature):
-            continue
-        if feature in EQUIVALENCE_WITNESS_FEATURES:
-            keys = EQUIVALENCE_WITNESS_REQUIRED
-        else:
-            keys = REPLAY_WITNESS_REQUIRED.get(feature) or ("expected_bytes_per_token", "exact")
-        errors.append(
-            f"feature {feature!r} needs 'accuracy.witness.{feature}' ({', '.join(keys)}): "
-            f"a unit that implements nothing passes both boot and accuracy, so the "
-            f"witness is the only gate that can tell, and what it judges against has to "
-            f"be declared before the run."
-        )
+    anchor = accuracy.get("anchor") if isinstance(accuracy, dict) else None
+    variants = data.get("variants") if isinstance(data.get("variants"), dict) else {}
+    for where, state in (
+        anchor.items() if isinstance(anchor, dict) else [("", anchor)] if anchor is not None else []
+    ):
+        if state == ANCHOR_RELATIVE and where not in variants:
+            errors.append(
+                f"'{ACCURACY_FIELD}.anchor{'.' + str(where) if where else ''}' is "
+                f"{ANCHOR_RELATIVE!r}, which only a configuration variant can be: it is judged "
+                f"against its unit's own score. A unit's anchor is a row of reference_yaml"
+            )
 
 
-def _beside_spec(command: str, spec_dir: Path) -> str:
-    """``command`` with each word naming a file in ``spec_dir`` made absolute; else unchanged."""
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        return command
-    moved = [
-        str((spec_dir / word).resolve())
-        if word and not Path(word).is_absolute() and (spec_dir / word).is_file()
-        else word
-        for word in words
+def gpus_per_node(data: Mapping[str, Any]) -> int | None:
+    """The most devices one node of the run holds: ``environment`` or one of its sessions."""
+    env = data.get(ENVIRONMENT_FIELD) or {}
+    sizes = [env.get("gpus_per_node")] + [
+        s.get("gpus_per_node") for s in env.get("sessions") or () if isinstance(s, Mapping)
     ]
-    return shlex.join(moved) if moved != words else command
+    sizes = [s for s in sizes if isinstance(s, int) and not isinstance(s, bool) and s > 0]
+    return max(sizes) if sizes else None
+
+
+def _require_disagg_test(data: Mapping[str, Any], errors: list[str]) -> None:
+    """The ``disagg`` feature names the test that proves it: nothing else crosses the hop."""
+    features = data.get(FEATURES_FIELD)
+    if not isinstance(features, list) or DISAGG_FEATURE not in features:
+        return
+    accuracy = data.get(ACCURACY_FIELD)
+    block = accuracy.get("disagg") if isinstance(accuracy, dict) else None
+    if not isinstance(block, dict) or not block.get("test"):
+        errors.append(
+            f"feature {DISAGG_FEATURE!r} needs 'accuracy.disagg.test': the node id of the "
+            f"disaggregated-serving accuracy test the run writes beside the tree's own (they "
+            f"serve through `trtllm-serve disaggregated`); boot and accuracy run one aggregated "
+            f"engine and never cross the hop."
+        )
 
 
 def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
     """Make paths the user writes NEXT TO the spec portable, in place.
 
-    ``accuracy.llm_api_options``, the witness and acceptance prompt files, boot
-    images and the logit reference are resolved against the **spec's own
-    directory** and written back as absolute; of a witness's
-    ``contrast_command``, each word naming a file the spec's directory holds is
-    made absolute. Absolute paths are untouched, so a workspace copy of an
+    ``accuracy.llm_api_options``, the acceptance prompt files and boot images
+    are resolved against the **spec's own directory** and written back as
+    absolute. Absolute paths are untouched, so a workspace copy of an
     already-resolved spec re-resolves to itself.
 
     Deliberately NOT applied to ``checkpoint_path``, ``trtllm_repo_path`` or
@@ -1867,14 +1472,6 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
         accuracy["llm_api_options"] = {k: absolute(v) for k, v in options.items()}
     elif options is not None:
         accuracy["llm_api_options"] = absolute(options)
-
-    witness = accuracy.get("witness")
-    if isinstance(witness, dict):
-        for block in witness.values():
-            if isinstance(block, dict) and block.get("prompts_file") is not None:
-                block["prompts_file"] = absolute(block["prompts_file"])
-            if isinstance(block, dict) and isinstance(block.get("contrast_command"), str):
-                block["contrast_command"] = _beside_spec(block["contrast_command"], spec_dir)
 
     # A `dataset` may be a cached dataset id ("openai/gsm8k"), which reads like
     # a relative path, so it is resolved only when the spec's directory holds it.
@@ -1907,10 +1504,6 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
                         else i
                         for i in entry["images"]
                     ]
-
-    logits = accuracy.get("logits")
-    if isinstance(logits, dict) and logits.get("reference") is not None:
-        logits["reference"] = absolute(logits["reference"])
 
 
 def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
@@ -2089,7 +1682,8 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             _validate_accuracy(data[ACCURACY_FIELD], errors)
         except TaskSchemaError as exc:
             errors.append(str(exc))
-        _require_declared_witnesses(data, errors)
+        _require_disagg_test(data, errors)
+        _require_relative_on_variants(data, errors)
 
     if errors:
         bullet = "\n  - "
@@ -2114,20 +1708,20 @@ def assembly_units(data: Mapping[str, Any]) -> list[str]:
 
 
 __all__ = [
-    "ANCHOR_PENDING",
     "ANCHOR_RECORDED",
+    "ANCHOR_RELATIVE",
     "ANCHOR_STATES",
-    "anchor_pending",
+    "gpus_per_node",
     "COVERAGE_FIELD",
     "COVERAGE_KEYS",
     "resolve_per_unit",
     "resolve_samples",
     "BENCHMARK_MEMBERS",
     "BENCHMARK_MEMBERS_EVERY",
-    "BENCHMARK_MEMBERS_SAMPLED",
-    "DEFAULT_LOGIT_REFERENCE",
-    "GREEDY_KEYS",
+    "DEFAULT_PERF_CONCURRENCY",
     "derive_gate_defaults",
+    "DISAGG_FEATURE",
+    "DISAGG_KEYS",
     "ACCEPTANCE_UNIT_KEYS",
     "ACCEPTANCE_WORKLOAD_KEYS",
     "ACCURACY_FIELD",
@@ -2141,9 +1735,6 @@ __all__ = [
     "ENVIRONMENT_FIELD",
     "ENVIRONMENT_KEYS",
     "ENVIRONMENT_KINDS",
-    "DECLARED_WITNESS_FEATURES",
-    "WITNESS_ENABLED_KEY",
-    "DEFAULT_BYTES_TOLERANCE",
     "FEATURES_FIELD",
     "FEATURE_FAMILIES",
     "SPECULATORS",
@@ -2154,20 +1745,8 @@ __all__ = [
     "PROFILE_SMOKE",
     "PROFILE_STANDARD",
     "profile_of",
-    "KV_QUANT_WITNESS_KEYS",
-    "LOGITS_KEYS",
-    "MAX_WITNESS_PROMPT_WORDS",
     "MEMBERS_FIELD",
     "MTP_NAMESPACE_FEATURES",
-    "REPLAY_WITNESS_OPTIONAL",
-    "REPLAY_WITNESS_REQUIRED",
-    "EQUIVALENCE_WITNESS_FEATURES",
-    "EQUIVALENCE_WITNESS_KEYS",
-    "EQUIVALENCE_WITNESS_REQUIRED",
-    "WITNESS_BATCH_SIZE_KEY",
-    "WITNESS_KEYS",
-    "WITNESS_LEGS_ENV_KEY",
-    "WITNESS_TRANSCEIVER_KEY",
     "PARALLEL_FIELD",
     "PARALLEL_UNIFIED",
     "REQUIRED_PATH_FIELDS",
@@ -2192,6 +1771,4 @@ __all__ = [
     "members_for",
     "parse_parallel_segment",
     "widest_world_size",
-    "witness_enabled",
-    "witness_owed",
 ]

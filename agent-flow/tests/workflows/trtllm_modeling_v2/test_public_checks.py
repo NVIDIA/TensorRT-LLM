@@ -14,11 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import (
-    check_config,
-    runtime_evidence,
-    witness_protocol,
-)
+from agent_flow.workflows.trtllm_modeling_v2.checks import check_config, runtime_evidence
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import (
     engine_driver,
     reuse_probe,
@@ -29,7 +25,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
 from .test_gates import _TASK, _env
 
 
-@pytest.mark.parametrize("driver", ["logit_driver.py", "serve_driver.py", "test_driver.py"])
+@pytest.mark.parametrize("driver", ["serve_driver.py", "test_driver.py"])
 def test_measured_drivers_start_by_path_without_agent_flow(driver, tmp_path):
     # -I -S hides the controller PYTHONPATH and editable-install hooks. Add only
     # installed dependencies (serve's benchmark client needs PyYAML), not agent_flow.
@@ -103,12 +99,13 @@ def test_shared_options_preserve_nested_settings_and_refuse_ambiguous_inputs(tmp
         )
 
 
-def test_public_entry_preserves_witness_warmup_and_all_sequences(monkeypatch, capsys):
+def test_public_entry_streams_each_request_and_refuses_what_it_cannot_judge(monkeypatch):
     calls = []
-    sequences = [
-        SimpleNamespace(token_ids=[i], text=f"answer {i}", finish_reason="length") for i in (1, 2)
-    ]
-    output = SimpleNamespace(outputs=sequences, prompt_token_ids=[3], cached_tokens=0)
+    output = SimpleNamespace(
+        outputs=[SimpleNamespace(token_ids=[1], text="answer", finish_reason="length")],
+        prompt_token_ids=[3],
+        cached_tokens=0,
+    )
 
     class Params:
         def __init__(self, **kwargs):
@@ -118,9 +115,6 @@ def test_public_entry_preserves_witness_warmup_and_all_sequences(monkeypatch, ca
         def __init__(self, **kwargs):
             calls.append(("construct", kwargs))
 
-        def generate(self, prompts, params):
-            calls.append(("warmup", prompts))
-
         def generate_async(self, prompt, params, streaming=False):
             calls.append(("stream", prompt))
             return iter([output])
@@ -128,25 +122,19 @@ def test_public_entry_preserves_witness_warmup_and_all_sequences(monkeypatch, ca
     monkeypatch.setitem(
         sys.modules, "tensorrt_llm", SimpleNamespace(LLM=LLM, SamplingParams=Params)
     )
-    monkeypatch.setenv("TRTLLM_WITNESS_FULL_OUTPUT", "1")
     spec = {
         "llm": {"model": "/model", "kv_cache_config": {"enable_block_reuse": True}},
-        "sampling": {"n": 2},
-        "warmup": True,
-        "witness": True,
-        "requests": [{"id": "w0", "prompt": "hello", "max_tokens": 2}],
+        "requests": [{"id": "r0", "prompt": "hello", "max_tokens": 2}],
     }
     llm, params = engine_driver.build_llm(spec)
     engine_driver.run_workload(llm, params, spec)
-    assert [c[0] for c in calls] == ["construct", "warmup", "stream"]
+    assert [c[0] for c in calls] == ["construct", "stream"]
     assert calls[0][1]["kv_cache_config"] == spec["llm"]["kv_cache_config"]
-    text = capsys.readouterr().out
-    assert witness_protocol.parse_witness_token_ids(text) == ((1,), (2,))
     with pytest.raises(ValueError, match="one sequence"):
-        engine_driver.build_llm({**spec, "witness": False})
+        engine_driver.build_llm({**spec, "sampling": {"n": 2}})
     with pytest.raises(ValueError, match="normalized"):
         engine_driver.build_llm({**spec, "dataset": {"source": "offline"}})
-    assert len(calls) == 3  # Unsupported workloads fail before allocating an engine.
+    assert len(calls) == 2  # Unsupported workloads fail before allocating an engine.
 
 
 def test_normalization_preserves_source_skip_template_order_and_image_requests(tmp_path):

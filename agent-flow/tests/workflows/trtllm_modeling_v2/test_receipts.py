@@ -42,18 +42,6 @@ def _journal(tmp_path: Path) -> Journal:
     return journal
 
 
-def _turn(journal: Journal, role: str, what: str, decision: Path, raw: dict, result: str | None):
-    """One dispatched turn as the workflow leaves it: its report, its decision file."""
-    report = journal.record_dispatch(
-        role, what, f"Do {what}.\n\n{decision_file_instruction(decision)}"
-    )
-    decision.parent.mkdir(parents=True, exist_ok=True)
-    decision.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    if result is not None:
-        journal.record_result(report, result)
-    return report
-
-
 # ------------------------------------------------------- the execution stage
 
 
@@ -91,19 +79,16 @@ def test_a_finished_task_keeps_a_receipt_with_the_commits_it_integrated(tmp_path
             for n in (1, 2):
                 (tree / "a.py").write_text(f"A = {n + 1}\n")
                 _git(tree, "commit", "-q", "-am", f"mtp: step {n}")
+            # The turn as the workflow leaves it: its report, its decision file.
             decision = ws / "decisions" / "mtp-assembler-1.yaml"
-            raw = {
-                "decision": "UNIT_READY",
-                "summary": "mtp at tp1.\n\nFor the planner: depth 3 only.",
-            }
-            report = _turn(
-                self.workflow.journal,
-                "assembler",
-                task.id,
-                decision,
-                raw,
-                "UNIT_READY; mtp at tp1.",
+            journal = self.workflow.journal
+            report = journal.record_dispatch(
+                "assembler", task.id, f"Do {task.id}.\n\n{decision_file_instruction(decision)}"
             )
+            decision.parent.mkdir(parents=True)
+            summary = "mtp at tp1.\n\nFor the planner: depth 3 only."
+            decision.write_text(yaml.safe_dump({"decision": "UNIT_READY", "summary": summary}))
+            journal.record_result(report, "UNIT_READY; mtp at tp1.")
             return r.TaskResult.answered("assembler", decision, report)
 
     stage = Worker(ws, integration)
@@ -120,14 +105,9 @@ def test_a_finished_task_keeps_a_receipt_with_the_commits_it_integrated(tmp_path
     later = _Stage(ws, integration)
     [tip] = later._landed_commits("mtp")
     assert tip.endswith("mtp: step 2 (the branch tip)")
-
-
-def test_a_task_that_did_not_finish_leaves_no_receipt(tmp_path):
-    stage = _Stage(tmp_path)
-    stage._keep_receipt(
-        g.Task(id="core", kind="assemble", goal="g"), r.TaskResult("BLOCKED", "no GPU")
-    )
-    assert not (tmp_path / "tasks").exists()
+    # A task that did not finish leaves none.
+    later._keep_receipt(g.Task(id="core", kind="assemble", goal="g"), r.TaskResult("BLOCKED", "x"))
+    assert r.read(ws / "tasks", "core") is None
 
 
 # ----------------------------------------------------------- the whole run

@@ -8,6 +8,8 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
 from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import (
     GraphOrchestrator,
@@ -61,22 +63,17 @@ def _review(tid, deps=(), status="pending", **kw):
 # ------------------------------------------------------------------ the rule
 
 
-def test_a_started_review_covers_its_batch_and_nothing_landed_after_it():
+@pytest.mark.parametrize("status,left", [("done", ["k2"]), ("failed", ["k1", "k2"])])
+def test_a_review_covers_its_batch_and_nothing_landed_after_it_unless_it_failed(status, left):
     graph = g.Graph(
         tasks=[
             _shared("k1", "done"),
             _shared("k2", "done"),
-            _review("r0", status="done", covers=["k1@1"]),
+            _review("r0", status=status, covers=["k1@1"]),
         ]
     )
-    assert g.regression_batch(graph, _OWN) == ["k2"]
-    assert list(g.unreviewed_shared_changes(graph, _OWN)) == ["k2"]
-
-
-def test_a_failed_review_covers_nothing():
-    graph = g.Graph(tasks=[_shared("k1", "done"), _review("r0", status="failed", covers=["k1@1"])])
-    assert g.regression_batch(graph, _OWN) == ["k1"]
-    assert list(g.unreviewed_shared_changes(graph, _OWN)) == ["k1"]
+    assert g.regression_batch(graph, _OWN) == left
+    assert list(g.unreviewed_shared_changes(graph, _OWN)) == left
 
 
 # ------------------------------------------------------------------- the loop

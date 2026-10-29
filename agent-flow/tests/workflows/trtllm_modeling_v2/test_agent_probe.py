@@ -24,7 +24,6 @@ from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import (
     ProbedAgent,
     hint_for,
     probe_agents,
-    read_probe_file,
 )
 
 from .test_workflow import _workflow
@@ -50,11 +49,6 @@ class SayingLayer:
         pass
 
 
-def test_a_file_never_written_is_a_failure_whatever_the_turn_said(tmp_path):
-    problem = read_probe_file(tmp_path / "1.out", "n0nce", "", "/repo")
-    assert "did not run the command" in problem
-
-
 def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_file, monkeypatch):
     said = "Bash failed: Error: connect EPERM /tmp/claude/srt-mux-9.sock"
     monkeypatch.setattr(agent_probe, "make_probe_layer", lambda a, w: SayingLayer(a, w, said))
@@ -68,6 +62,8 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     assert not bootstrap._run_preflight(workflow, workflow._init_state(task_file, log), log)
     journal = (tmp_path / "ws" / "journal.md").read_text(encoding="utf-8")
     assert "agent probe failed" in journal and "srt-mux-9.sock" in journal
+    # The file never written fails the probe, whatever the turn said.
+    assert "did not run the command" in journal
     assert "a plain terminal or a tmux session on the login node" in journal
     assert not (tmp_path / "ws" / AGENT_PROBE_RECORD).exists()
     # Nothing past it ran: not the substrate gate, not the survey.
@@ -87,7 +83,10 @@ class ReadOnlyCodexLayer:
 
     async def aforward(self, prompt: str) -> str:
         session = SessionInitEvent(
-            backend="codex", sandbox="read-only", approval_policy="untrusted"
+            backend="codex",
+            sandbox="read-only",
+            approval_policy="untrusted",
+            skills=["trtllm-modeling-v2-entry", "slack-notes"],
         )
         self.config.on_activity("session", session)
         command = next(line.strip() for line in prompt.splitlines() if line.startswith("    "))
@@ -110,3 +109,22 @@ def test_a_codex_session_the_site_keeps_read_only_fails_the_probe(tmp_path):
     assert outcome.settings == "sandbox read-only, approvals untrusted"
     assert "ran read-only" in outcome.problem
     assert "allow no writable sandbox" in hint_for(outcome.problem)
+    assert outcome.skills == ("trtllm-modeling-v2-entry", "slack-notes")
+
+
+def test_the_users_skills_are_what_the_run_does_not_ship():
+    outcomes = [
+        agent_probe.ProbeOutcome(
+            ProbedAgent(AgentConfig("codex", "", None), ("planner",)),
+            skills=("trtllm-modeling-v2-entry", "cluster-jobs"),
+        ),
+        agent_probe.ProbeOutcome(
+            ProbedAgent(AgentConfig("codex", "", "high"), ("assembler",)),
+            skills=("imagegen",),
+        ),
+        agent_probe.ProbeOutcome(ProbedAgent(AgentConfig("claude-code", "", None), ("tuner",))),
+    ]
+    assert agent_probe.foreign_skills(outcomes, ("trtllm-modeling-v2-entry",)) == {
+        "codex": ("cluster-jobs", "imagegen"),
+        "claude-code": (),
+    }

@@ -166,11 +166,15 @@ def resolve_floor(
     benchmark: str,
     reference: float,
     output: str = "",
+    relative: bool = False,
 ) -> tuple[accuracy_policy.Floor | None, str]:
-    """The floor ``reference`` gets under ``accuracy.floor``, and where its count came from."""
+    """The floor ``reference`` gets under ``accuracy.floor``, and where its count came from.
+
+    ``relative``: ``reference`` is the unit's own score at this member, on this target.
+    """
     policy = accuracy_policy.resolve_floor_policy(accuracy)
     samples, source = resolve_samples(accuracy, unit, benchmark, output)
-    return accuracy_policy.floor_for(policy, reference, samples), source
+    return accuracy_policy.floor_for(policy, reference, samples, relative), source
 
 
 def run_accuracy_gate(
@@ -183,19 +187,23 @@ def run_accuracy_gate(
     timeout: int = ACCURACY_TIMEOUT_S,
     unit: str | None = None,
     member: str | None = None,
+    relative: bool = False,
 ) -> GateResult:
     """Run ``trtllm-eval`` and compare against the anchor. One-sided.
 
     The floor is ``reference - k * SE`` by default (:func:`resolve_floor`), a
     fixed ``reference - tolerance`` under ``accuracy.floor.rule: tolerance``.
-    The engine is held to the unit's options file (:func:`engine_declaration`).
+    ``relative``: ``reference`` is the unit's own score at this member on this
+    target (a configuration variant's ``anchor: relative``), and the SE is that
+    of the difference. The engine is held to the unit's options file
+    (:func:`engine_declaration`).
     """
     accuracy = dict(task_data.get("accuracy") or {})
     benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or "gsm8k")
     tolerance = float(accuracy.get("tolerance", 0.0))
     env = with_mode(environment, MODE_REQUIRE)
     _verdict = verdict_factory(inspect_tree(task_data))
-    planned, _ = resolve_floor(accuracy, unit, benchmark, reference)
+    planned, _ = resolve_floor(accuracy, unit, benchmark, reference, relative=relative)
 
     def floor_fields(floor: accuracy_policy.Floor | None) -> dict[str, Any]:
         if floor is None:
@@ -266,7 +274,7 @@ def run_accuracy_gate(
             **floor_fields(planned),
         )
 
-    floor, source = resolve_floor(accuracy, unit, benchmark, reference, combined)
+    floor, source = resolve_floor(accuracy, unit, benchmark, reference, combined, relative)
     if floor is None:
         return _verdict(
             passed=False,

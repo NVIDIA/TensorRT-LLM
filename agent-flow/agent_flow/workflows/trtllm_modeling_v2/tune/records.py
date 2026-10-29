@@ -19,7 +19,7 @@ import statistics
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Collection, Iterable, Mapping, Sequence
+from typing import Any, Collection, Iterable, Mapping
 
 # The two headline metrics, both higher-is-better: tok/s/user at the lowest concurrency (the
 # latency end) and output tok/s/GPU at the highest (the throughput end).
@@ -101,8 +101,9 @@ class Measurement:
         return out
 
     def headline(self) -> dict[str, float]:
-        """``{"con1.tok_s_user": ..., "con128.output_tok_s_gpu": ...}`` for the curve's two ends.
+        """The curve's two ends, and the throughput of every point between them.
 
+        ``{"con1.tok_s_user": ..., "con32.output_tok_s_gpu": ..., "con128.output_tok_s_gpu": ...}``.
         Over several perf configs, each config's headline prefixed by its name.
         """
         if self.parts:
@@ -118,6 +119,8 @@ class Measurement:
         out[f"con{hi}.{THROUGHPUT_METRIC}"] = float(self.points[hi][THROUGHPUT_METRIC] or 0.0)
         if lo == hi:
             return out
+        for c in sorted(self.points)[1:-1]:
+            out[f"con{c}.{THROUGHPUT_METRIC}"] = float(self.points[c][THROUGHPUT_METRIC] or 0.0)
         # Judged for regressions too: a change that buys throughput by wrecking latency at the
         # same point shows here.
         out[f"con{hi}.{LATENCY_METRIC}"] = float(self.points[hi][LATENCY_METRIC] or 0.0)
@@ -188,43 +191,6 @@ class NoiseFloor:
         site = site_of(metric)
         shared = [value for m, value in self.spread.items() if site_of(m) == site]
         return max(shared) if shared else self.default
-
-
-def _member_floor(runs: Mapping[str, Sequence[Measurement]]) -> NoiseFloor:
-    """The spread of each member's runs (two or more), keyed by its sites; ``""`` keys none."""
-    spread: dict[str, float] = {}
-    counts = []
-    for member, samples in runs.items():
-        if len(samples) < 2:
-            continue
-        floor = NoiseFloor.from_measurements(samples)
-        counts.append(floor.samples)
-        for metric, value in floor.spread.items():
-            key = f"{member}.{metric}" if member else metric
-            spread[key] = max(spread.get(key, 0.0), value)
-    return NoiseFloor(spread=spread, samples=min(counts, default=0))
-
-
-def ground_floors(repeats: Sequence[Measurement]) -> tuple[NoiseFloor, NoiseFloor]:
-    """``(same_host, cross_host)``: how repeats of one measurement spread, member by member.
-
-    The same-host floor is, per site, the widest spread of one host's runs of a member (two or
-    more there); the cross-host spread is that of a member's runs over two hosts or more. A keep
-    is judged against controls of its own host, so only the first is a floor; the second says
-    how far apart the hosts read.
-    """
-    by_host: dict[str, dict[str, list[Measurement]]] = {}
-    hosts: dict[str, set[str]] = {}
-    every: dict[str, list[Measurement]] = {}
-    for m in repeats:
-        for member, run in (m.parts or {"": m}).items():
-            host = str(run.meta.get("hostname") or "")
-            by_host.setdefault(host, {}).setdefault(member, []).append(run)
-            hosts.setdefault(member, set()).add(host)
-            every.setdefault(member, []).append(run)
-    same = NoiseFloor.widest([_member_floor(runs) for runs in by_host.values()])
-    cross = _member_floor({k: v for k, v in every.items() if len(hosts[k]) > 1})
-    return same, cross
 
 
 @dataclass(frozen=True)

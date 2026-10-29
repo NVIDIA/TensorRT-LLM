@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..checks.check_config import checkpoint_remote_code
+from ..spec.task_schema import DEFAULT_PERF_CONCURRENCY
 from .measure import BenchPart, BenchSpec
 from .serving_config import derive_serving_config, write_serving_config
 
@@ -26,18 +27,16 @@ class TuneSpec:
     isl: int
     osl: int
     concurrency: list[int]
-    reference: str
     spools: list[str]
     dev_spools: list[str]
     env_script: Path
-    noise_repeats: int = 0
     campaign: dict = field(default_factory=dict)
     embargo: list[str] = field(default_factory=list)
     sister_engines: list[str] = field(default_factory=list)
     wall: str = "2h"
     #: The perf configs, when ``perf.configs`` names several; every measurement covers all.
     parts: list[BenchPart] = field(default_factory=list)
-    #: Stop dispatching once every headline metric is this multiple of the stock reference's.
+    #: Stop dispatching once every headline metric is this multiple of the baseline's.
     goal_ratio: float | None = None
     #: The commit to tune. Empty means the checkout's ``HEAD``, measured in place; a commit is
     #: measured in the campaign's own ``best`` worktree, so commits landing on the checkout
@@ -59,7 +58,7 @@ class TuneSpec:
         spools = [str(s) for s in perf.get("spools") or session_spools]
         workdir = Path(workspace).resolve() / "tune"
         isl, osl = int(workload.get("isl", 1024)), int(workload.get("osl", 1024))
-        concurrency = [int(c) for c in workload.get("concurrency", [1, 128])]
+        concurrency = [int(c) for c in workload.get("concurrency", DEFAULT_PERF_CONCURRENCY)]
         identity = [Path(p).resolve() for p in perf.get("identity_configs") or []]
         parts = [_part(task, workdir, entry) for entry in perf.get("configs") or []]
         if parts:
@@ -85,13 +84,11 @@ class TuneSpec:
             isl=isl,
             osl=osl,
             concurrency=concurrency,
-            reference=str(perf.get("reference", "stock")),
             spools=[str(Path(s).resolve()) for s in spools],
             dev_spools=[str(Path(s).resolve()) for s in perf.get("dev_spools") or spools],
             env_script=Path(
                 perf.get("env_script") or Path(workspace) / "tune" / "env.sh"
             ).resolve(),
-            noise_repeats=int(perf.get("noise_repeats", 0)),
             campaign=dict(perf.get("campaign") or {}),
             embargo=[
                 str(e)
@@ -100,7 +97,7 @@ class TuneSpec:
             sister_engines=[str(s) for s in perf.get("sister_engines") or []],
             wall=str(perf.get("wall", "2h")),
             parts=parts,
-            goal_ratio=float(goal["ratio_to_reference"]) if "ratio_to_reference" in goal else None,
+            goal_ratio=float(goal["ratio_to_baseline"]) if "ratio_to_baseline" in goal else None,
             sol={"enabled": True, **dict(perf.get("sol") or {})},
             goal_pct_of_sol=float(goal["pct_of_sol"]) if "pct_of_sol" in goal else None,
             task=dict(task),

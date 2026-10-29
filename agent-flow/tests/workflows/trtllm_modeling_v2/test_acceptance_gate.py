@@ -84,12 +84,19 @@ def tree(monkeypatch):
     return current
 
 
+def _gate(tmp_path, require, off=None, task_data=None, **kw):
+    """The gate on the default task, the require leg printing ``require`` and the off leg ``off``."""
+    return acceptance_checks.run_acceptance_gate(
+        _env(), task_data=task_data or _task(), workdir=tmp_path, runner=_legs(require, off), **kw
+    )
+
+
+_DSPARK = dict(task_data=_task(dspark={"min_absolute": 2.0}, min_prompts=1), unit="dspark")
+
+
 def test_a_drop_against_stock_that_the_paired_test_finds_fails(tmp_path):
     worse = [r - 0.4 for r in _BASE]
-    result = acceptance_checks.run_acceptance_gate(
-        _env(), task_data=_task(), workdir=tmp_path,
-        runner=_legs(_driver_output(worse), _driver_output(_BASE)),
-    )  # fmt: skip
+    result = _gate(tmp_path, _driver_output(worse), _driver_output(_BASE))
     assert not result.passed
     assert "paired over 32 prompt(s)" in result.detail
     assert "subtly wrong" in result.detail
@@ -101,29 +108,20 @@ def test_a_ratio_under_the_floor_that_is_noise_passes(tmp_path):
     noisy = [b + (1.4 if i % 2 == 0 else -1.8) for i, b in enumerate(base)]
     paired = acceptance_checks.RegressionPolicy().compare(base, noisy)
     assert not paired.significant
-    result = acceptance_checks.run_acceptance_gate(
-        _env(), task_data=_task(), workdir=tmp_path,
-        runner=_legs(_driver_output(noisy), _driver_output(base)),
-    )  # fmt: skip
+    result = _gate(tmp_path, _driver_output(noisy), _driver_output(base))
     weighted = sum(noisy) / sum(base)
     assert weighted < 0.95
     assert result.passed, result.detail
 
 
 def test_acceptance_of_one_means_every_draft_was_rejected(tmp_path):
-    result = acceptance_checks.run_acceptance_gate(
-        _env(), task_data=_task(), workdir=tmp_path,
-        runner=_legs(_driver_output([1.0] * 32), _driver_output(_BASE)),
-    )  # fmt: skip
+    result = _gate(tmp_path, _driver_output([1.0] * 32), _driver_output(_BASE))
     assert not result.passed and "every draft was rejected" in result.detail
 
 
 def test_a_short_answer_workload_fails_as_too_short_not_as_a_low_number(tmp_path):
     """Answers that end in EOS after 2-3 tokens read 1.00 whatever the drafter does."""
-    result = acceptance_checks.run_acceptance_gate(
-        _env(), task_data=_task(dspark={"min_absolute": 2.0}, min_prompts=1), unit="dspark",
-        workdir=tmp_path, runner=_legs(_driver_output([1.0] * 3, iterations=[2, 2, 3])),
-    )  # fmt: skip
+    result = _gate(tmp_path, _driver_output([1.0] * 3, iterations=[2, 2, 3]), **_DSPARK)
     assert not result.passed
     assert "workload too short to measure acceptance" in result.detail
     assert "4 generation iteration(s) over 3 prompt(s)" in result.detail
@@ -134,10 +132,7 @@ def test_a_short_answer_workload_fails_as_too_short_not_as_a_low_number(tmp_path
 def test_per_prompt_acceptance_is_reported_beside_the_mean(tmp_path):
     """Requests combine iteration-weighted: 647 accepted tokens over 200 iterations."""
     rates = [152 / 44, 256 / 114, 239 / 42]
-    result = acceptance_checks.run_acceptance_gate(
-        _env(), task_data=_task(dspark={"min_absolute": 2.0}, min_prompts=1), unit="dspark",
-        workdir=tmp_path, runner=_legs(_driver_output(rates, iterations=[44, 114, 42])),
-    )  # fmt: skip
+    result = _gate(tmp_path, _driver_output(rates, iterations=[44, 114, 42]), **_DSPARK)
     assert result.passed, result.detail
     assert result.measured == pytest.approx(647 / 200)
     assert "prompt mean 3.80" in result.summary()

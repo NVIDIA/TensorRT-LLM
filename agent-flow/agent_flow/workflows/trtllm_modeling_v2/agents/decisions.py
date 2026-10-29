@@ -59,8 +59,8 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
         ),
         Decision(
             "BLOCKED",
-            "nothing in this turn can move the entry: the environment, or a prerequisite "
-            "outside it; say which",
+            "nothing in this turn can move the entry: the environment (a refused job or no "
+            "session, never a job still queued), or a prerequisite outside it; say which",
             f"{_TO_PLANNER} with your summary",
             False,
         ),
@@ -78,7 +78,8 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "the work cannot go on in this turn: a callable no catalog entry covers "
             "(`blocked_reason: vocabulary_gap`, the callable in `missing_entry`), or what "
             "you lack (`knowledge_gap`), an accuracy you cannot close (`accuracy_shortfall`) "
-            "or the site (`environment`). Block as soon as you know",
+            "or the site (`environment`: a refused job or no session, never a job still "
+            "queued). Block as soon as you know",
             f"{_TO_PLANNER} at once with `blocked_reason`, `missing_entry` and your "
             "summary: it adds the missing entry's kernel task and retries yours, or "
             "re-plans",

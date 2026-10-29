@@ -51,6 +51,30 @@ work and write.
 - A command longer than a few minutes is launched and polled, never blocked
   on: a tool call over about eight minutes aborts while its job runs on
   unseen.
+- **Reuse what the tree already runs.** TensorRT-LLM's tests are maintained
+  examples of almost everything a task touches: how an engine starts with a
+  feature on, the arguments and environment it needs, the score a
+  configuration reaches, how serving is measured. When something fails, and
+  before you write a launcher, server, transport, harness or benchmark of your
+  own, find the test that already does it and start from its configuration.
+  `tree_map.md` in the workspace says where each kind is in this checkout,
+  and what finds it if the tree has moved:
+  - unit tests, by area (attention, executor, modeling_v2, multimodal,
+    speculative, disaggregation, the LLM API): one op, cache behaviour,
+    transfer or API path;
+  - accuracy tests (classes on `LlmapiAccuracyTestHarness`, their scores in
+    the reference YAMLs beside them; the disaggregated ones serve through
+    `launch_disaggregated_llm`): configurations that serve and score end to
+    end;
+  - perf tests and `trtllm-bench`: how serving is measured;
+  - the CI test lists (`l0_*.yml`): the model and feature combinations CI
+    runs, so the ones known to work.
+
+  Grep them for the feature, or a model of the same family; reuse the
+  configuration or helper; reproduce with one test (`pytest <file>::<test>`)
+  through the spool. They show what works; this run's checks still give its
+  verdicts. When nothing in the tree covers what you need, say so in your
+  report before you build it.
 - Follow the repository's `AGENTS.md`.
 """
 

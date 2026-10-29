@@ -25,7 +25,6 @@ from ...checks.delivery import Check as DeliveryCheck
 from ...checks.delivery import DeliveryReport, accuracy_test_path, verify_delivery
 from ...infra.git import CommitPolicy
 from ...operators.coverage import model_ops_tests_dir
-from ...spec.task_schema import anchor_pending as unit_anchor_pending
 from ...spec.task_schema import assembly_units, resolve_per_unit
 from ..records.state import WorkflowState
 from . import contract as contract_mod
@@ -124,12 +123,6 @@ def run_deliver_phase(
     return False
 
 
-def anchor_pending(workflow) -> bool:
-    """Whether a unit has no written accuracy anchor yet (``accuracy.anchor``)."""
-    accuracy = workflow.task_data.get("accuracy") or {}
-    return any(unit_anchor_pending(accuracy, unit) for unit in assembly_units(workflow.task_data))
-
-
 def delivery_failures(workflow) -> list[str]:
     """What fails of the delivery checks on disk and the gate findings, one line each.
 
@@ -173,7 +166,6 @@ def delivery_report(workflow, *, run_tests: bool = False) -> DeliveryReport:
             workflow.task_data["trtllm_repo_path"], workflow._preflight.family
         ),
         commit_policy=CommitPolicy.from_task(workflow.task_data, workspace=workflow.workspace),
-        anchor_pending=anchor_pending(workflow),
     )
     tested = tests_check(workflow, report, run=run_tests)
     if run_tests:

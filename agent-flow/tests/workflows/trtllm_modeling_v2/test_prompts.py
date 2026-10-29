@@ -24,10 +24,14 @@ from agent_flow.workflows.trtllm_modeling_v2.run.graph import WORKER_TAGS
 ROLES = tuple(f.name for f in dataclasses.fields(DEFAULT_PROMPTS))
 
 
-def test_every_worker_tag_has_a_section_and_a_summary():
+def test_every_worker_tag_has_a_section_and_a_summary_and_sections_follow_the_tags():
     assert tuple(TAG_PROMPTS) == WORKER_TAGS == tuple(TAG_SUMMARIES)
     for tag, section in TAG_PROMPTS.items():
         assert section.startswith(f"## Tag `{tag}`"), tag
+    text = tag_section(("assemble", "feature", "investigate"))
+    assert text.index("## Tag `assemble`") < text.index("## Tag `feature`")
+    assert text.index("## Tag `feature`") < text.index("## Tag `investigate`")
+    assert tag_section(()) == ""
 
 
 def test_a_tasks_tags_are_its_kind_then_its_own_each_after_what_it_brings():
@@ -41,24 +45,20 @@ def test_a_tasks_tags_are_its_kind_then_its_own_each_after_what_it_brings():
     assert task_tags("investigate", ["nonsense"]) == ("investigate",)
 
 
-def test_the_sections_follow_the_tags_in_order():
-    text = tag_section(("assemble", "feature", "investigate"))
-    assert text.index("## Tag `assemble`") < text.index("## Tag `feature`")
-    assert text.index("## Tag `feature`") < text.index("## Tag `investigate`")
-    assert tag_section(()) == ""
-
-
-def test_the_environment_block_reaches_every_role():
+def test_every_role_gets_the_environment_and_only_committing_roles_the_commit_rules():
     environment = resolve_environment(
         {"environment": {"kind": "local", "python": "/opt/venv/bin/python", "env": {}}},
         devices=[0, 1],
         world_size=2,
     )
-    bundle = build_trtllm_modeling_v2_prompts(environment=environment)
+    policy = CommitPolicy(allowed_paths=("tensorrt_llm/", "tests/"))
+    bundle = build_trtllm_modeling_v2_prompts(environment=environment, commit_policy=policy)
     for role in ROLES:
         text = getattr(bundle, role)
         assert "CUDA_VISIBLE_DEVICES=0,1" in text, role
         assert "symptom to report" in text, role
+        assert ("## Committing" in text) == (role in ("kernel_writer", "assembler")), role
+    assert "Commit only under `tensorrt_llm/`, `tests/`" in bundle.assembler
 
 
 def test_a_task_roles_default_prompt_is_the_worker_plus_its_decision_block():
@@ -68,12 +68,3 @@ def test_a_task_roles_default_prompt_is_the_worker_plus_its_decision_block():
         assert prompt.index("## Ending your turn") < prompt.index("## The decision file"), role
     assert "## The decision file" not in DEFAULT_PROMPTS.tuner
     assert "## Your decision" in DEFAULT_PROMPTS.tuner
-
-
-def test_only_the_committing_roles_get_the_commit_rules():
-    policy = CommitPolicy(allowed_paths=("tensorrt_llm/", "tests/"))
-    bundle = build_trtllm_modeling_v2_prompts(commit_policy=policy)
-    for role in ROLES:
-        told = "## Committing" in getattr(bundle, role)
-        assert told == (role in ("kernel_writer", "assembler")), role
-    assert "Commit only under `tensorrt_llm/`, `tests/`" in bundle.assembler

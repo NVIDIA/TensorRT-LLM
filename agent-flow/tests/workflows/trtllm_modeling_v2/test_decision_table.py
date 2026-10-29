@@ -14,11 +14,6 @@ from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator
 _TASK_ROLES = ("kernel_writer", "assembler", "surveyor")
 
 
-def test_each_role_validates_exactly_the_decisions_its_table_row_names():
-    for role, table in D.DECISIONS.items():
-        assert D.DECISIONS_BY_AGENT[role] == tuple(d.name for d in table), role
-
-
 def test_every_decision_a_task_role_writes_ends_its_task_one_way():
     for role in _TASK_ROLES:
         for decision in D.DECISIONS[role]:
@@ -28,8 +23,9 @@ def test_every_decision_a_task_role_writes_ends_its_task_one_way():
     assert orchestrator.FINISHED == D.finishing() | {orchestrator.TUNED, orchestrator.CHECKED}
 
 
-def test_every_prompt_lists_its_decisions_and_no_other():
-    for role in D.DECISIONS:
+def test_each_role_validates_and_its_prompt_lists_exactly_its_table_row():
+    for role, table in D.DECISIONS.items():
+        assert D.DECISIONS_BY_AGENT[role] == tuple(d.name for d in table), role
         prompt = getattr(DEFAULT_PROMPTS, role)
         assert D.decision_list(role) in prompt or " | ".join(D.names(role)) in prompt, role
         listed = set(re.findall(r"^- `([A-Z_]+)`: ", prompt, flags=re.M))

@@ -25,15 +25,6 @@ def _graph(*tasks):
     return g.Graph(tasks=list(tasks))
 
 
-def test_a_goal_the_planner_writes_stays_short():
-    long = _t("a", goal="x" * (g.MAX_GOAL_CHARS + 1))
-    current = _graph(long)
-    # Kept as it was: the planner did not write it this turn.
-    assert g.apply_revision(current, _graph(_t("a", goal=long.goal)), "keep")[1] == []
-    refusals = g.apply_revision(_graph(), _graph(_t("a", goal=long.goal)), "add")[1]
-    assert refusals and "characters" in refusals[0]
-
-
 def test_every_inadmissible_property_is_named():
     graph = _graph(
         _t("a", "wizard", deps=["b", "ghost"], touches=["/etc/passwd"], gpus=16),
@@ -117,13 +108,28 @@ def test_a_revision_keeps_what_the_orchestrator_owns(tmp_path):
     assert adopted.revisions[-1].reason == "split c into d"
     path = adopted.save(tmp_path / g.GRAPH_FILENAME)
     assert g.Graph.load(path).by_id()["b"].status == "running"
+    # A planner cannot mark a task running or done: one marked running that no worker runs
+    # never finishes.
+    proposed = _graph(_t("a", status="pending"), _t("b", status="running"), _t("e", status="done"))
+    adopted, errors = g.apply_revision(_graph(_t("a", status="done"), _t("b")), proposed, "r")
+    assert errors == []
+    assert [(t.id, t.status) for t in adopted.tasks] == [
+        ("a", "done"),
+        ("b", "pending"),
+        ("e", "pending"),
+    ]
 
 
-def test_a_revision_without_a_reason_or_with_errors_is_refused():
+def test_a_revision_without_a_reason_with_errors_or_with_a_long_new_goal_is_refused():
     current = _graph(_t("a"))
     assert g.apply_revision(current, _graph(_t("b")), " ")[1]
     adopted, errors = g.apply_revision(current, _graph(_t("b", deps=["nope"])), "why")
     assert adopted is current and errors
+    long = _t("a", goal="x" * (g.MAX_GOAL_CHARS + 1))
+    refusals = g.apply_revision(_graph(), _graph(_t("a", goal=long.goal)), "add")[1]
+    assert refusals and "characters" in refusals[0]
+    # Kept as it was: the planner did not write it this turn.
+    assert g.apply_revision(_graph(long), _graph(_t("a", goal=long.goal)), "keep")[1] == []
 
 
 def test_a_gated_kind_never_starts_while_others_do():
@@ -132,27 +138,7 @@ def test_a_gated_kind_never_starts_while_others_do():
     assert {t.id for t in g.next_to_start(graph, 4)} == {"tune", "k1"}
 
 
-def test_a_planner_cannot_mark_a_task_running_or_done():
-    """A task marked running that no worker runs never finishes."""
-    current = g.Graph(
-        tasks=[g.Task(id="a", kind="kernel", goal="x"), g.Task(id="b", kind="kernel", goal="y")]
-    )
-    current.tasks[1].status = "done"
-    proposed = g.Graph(tasks=[g.Task(id="a", kind="kernel", goal="x"), g.Task(id="b", kind="kernel", goal="y"),
-                              g.Task(id="c", kind="kernel", goal="z")])  # fmt: skip
-    proposed.tasks[0].status = "running"  # copied from a stale graph.yaml
-    proposed.tasks[1].status = "pending"
-    proposed.tasks[2].status = "done"
-    adopted, errors = g.apply_revision(current, proposed, "r")
-    assert errors == []
-    assert [(t.id, t.status) for t in adopted.tasks] == [
-        ("a", "pending"),
-        ("b", "done"),
-        ("c", "pending"),
-    ]
-
-
-def test_a_planner_retries_a_failed_task_in_place(tmp_path):
+def test_a_planner_retries_a_failed_task_in_place_until_its_last_attempt(tmp_path):
     """A failed task written back as pending runs again under its id, as its next attempt."""
     current = _graph(_t("a", status="failed"), _t("b", status="done"), _t("c", attempts=2))
     # The attempt count is the orchestrator's, whatever the planner writes.
@@ -167,9 +153,7 @@ def test_a_planner_retries_a_failed_task_in_place(tmp_path):
     ]
     path = adopted.save(tmp_path / g.GRAPH_FILENAME)
     assert g.Graph.load(path).by_id()["a"].attempts == 2
-
-
-def test_a_task_that_failed_every_attempt_is_not_retried_again():
+    # Not once it failed every attempt.
     current = _graph(_t("a", status="failed", attempts=g.MAX_ATTEMPTS), _t("b"))
     adopted, errors = g.apply_revision(current, _graph(_t("a"), _t("b")), "once more")
     assert adopted is current

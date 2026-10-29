@@ -30,10 +30,11 @@ from typing import Any, Callable, ContextManager, Sequence
 from ...checks import test_results
 from ...infra.compute.commands import CommandSpec
 from ...infra.compute.executor import FEATURE, select_command_executor
+from ...operators.coverage import CATALOG_TESTS_DIR
 
 #: The declared list a regression check runs: the package's source-level gates,
 #: the catalog's entries and every target's own.
-PACKAGE_TESTS: tuple[str, ...] = ("tests/unittest/_torch/modeling_v2",)
+PACKAGE_TESTS: tuple[str, ...] = (CATALOG_TESTS_DIR,)
 #: Where a check's selections go, under the workspace: ``<this>/<task id>/``.
 SELECTIONS_DIRNAME = "regression"
 #: How many failing tests a failure names before it counts the rest.

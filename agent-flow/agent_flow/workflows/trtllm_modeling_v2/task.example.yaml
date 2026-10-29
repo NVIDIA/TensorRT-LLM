@@ -28,10 +28,9 @@ parallel: tp1
 
 # Feature units, built after core in the order listed: mtp, eagle3, dflash, dspark, multimodal,
 # host_offload, disagg, kv_quant, decoder_replay, encoder_replay. Speculators get the acceptance
-# gate; host_offload, kv_quant and the replay features a witness. disagg owes its equivalence
-# witness alone, always: its boot and accuracy would run an aggregated engine. Give it members
-# whose two legs fit one node (`members: {..., disagg: [dep2]}`): the units before it prove the
-# wider ones. `mtp.*` stages that are a DSpark block drafter (`dspark_*` config keys) are `dspark`,
+# gate. disagg owes its disaggregated-serving test alone (`accuracy.disagg`, below), once, at the
+# member the request validates fully, on one node: its boot and accuracy would run an aggregated
+# engine. `mtp.*` stages that are a DSpark block drafter (`dspark_*` config keys) are `dspark`,
 # never `mtp`.
 features: []
 
@@ -49,10 +48,11 @@ features: []
 #     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
 #     env: {}                       # added to the gate command's environment
 #     # Where they differ: benchmark, reference_yaml, model_key, discriminators, benchmark_args,
-#     # samples, acceptance.
-#     accuracy: {discriminators: {kv_cache_quant_algo: FP8}}
+#     # samples, acceptance, anchor. Naming no row of its own, a variant is judged against its
+#     # unit's own score at the same member and target (`anchor: relative`: KV fp8 against auto).
+#     # With a row: `{discriminators: {kv_cache_quant_algo: FP8}}`, layered over the unit's.
 #     note: KV cache stored as FP8
-#   # A variant of disagg owes the equivalence witness at each of its members instead. A variant
+#   # A variant of disagg owes nothing: its axis is proven on core. A variant
 #   # on a feature unit that changes a KV dtype or chunking is a combination; core's own variant
 #   # proves the axis, so add it only when the request names it.
 
@@ -62,7 +62,7 @@ features: []
 
 # `smoke` (a unit's boot alone), `bringup` (each unit at its cheapest member; no variant, no
 # delivery check), `standard` (the default: this file as written), `certified` (also the
-# witnesses, boot boundary phases and the serve gate, and each benchmark at every member). For the
+# boot boundary phases and the serve gate, and each benchmark at every member). For the
 # run, or per unit and variant over `default`. A switch the spec sets itself keeps its value.
 # profile: {default: standard, multimodal: smoke}
 
@@ -139,15 +139,19 @@ environment:
   # container_name: trtllm-modeling-v2      # pyxis skips the import when this name exists
   # mounts: [/lustre:/lustre]
   # gpus_per_node: 4
+  # gpu_memory_gib: 288                     # per device: the lint sizes engines and disagg by it
   # time_limit: "04:00:00"
   #
-  # The sessions the run stands on, each one node whose main process is the spool scheduler (a bare
-  # `spool` is one, `default`); `trtllm-modeling-v2 session render --task task.yaml --name a` writes
-  # its entry script. With a `time_limit` it is in hand-over `handover_lead` before its end.
+  # The sessions the run stands on, each an allocation whose main process is the spool scheduler (a
+  # bare `spool` is one, `default`); `trtllm-modeling-v2 session render --task task.yaml --name a`
+  # writes its entry script. With a `time_limit` it is in hand-over `handover_lead` before its end.
+  # `nodes: N` runs the entry once on each of N nodes, each a watcher of the spool: a job submitted
+  # with `--nodes N` holds them all. No check of this workflow needs more than one node.
   # sessions:
   #   - name: a
   #     spool: /path/to/scratch/spool          # the gate spool above; absolute, one per session
   #     role: gates                            # gates | work | any (the default)
+  #     nodes: 1                               # default 1
   #     gpus_per_node: 4
   #     time_limit: "24:00:00"
   #     handover_lead: "01:00:00"              # default 1h
@@ -186,69 +190,34 @@ accuracy:
   # benchmark's is not known (gsm8k, mmlu, mmmu, gpqa_*): a count, or per unit.
   # samples: {default: 1319, multimodal: 900}
 
-  # `sampled` (default): with the logit gate owed, a unit's benchmark runs at one member, the
-  # cheapest the logit gate does not run whole (attention DP; a speculator whose boot compares no
-  # greedy tokens), else the widest; the logit gate and the boot's greedy tokens prove the rest.
-  # Without the logit gate, at every member. `every`: at every member. A member (`dep4`): there.
-  # benchmark_members: sampled
+  # Where each unit's benchmark runs: `every` member (the default), or the one member named
+  # (`dep4`). A configuration variant's runs at one member either way (attention DP first).
+  # benchmark_members: every
 
-  # `pending` where no written anchor exists yet (default `recorded`; or per unit): the benchmark is
-  # no check, the logit gate must be the oracle, and delivery stays incomplete until the row is
-  # recorded. Anchors are in percent; one of 1 or less is refused.
-  # anchor: {multimodal: pending}
+  # Anchors are in percent; one of 1 or less is refused. Where no written or measured anchor exists
+  # yet, record a low placeholder (e.g. 10 on GSM8K) and replace it when one is measured (the
+  # user's, the reference's on this hardware, or the onboarding's). Commit the rows: each check
+  # reads the anchor table from the commit it measures. Replacing a row runs the checks again.
 
-  # The reference_yaml row's model; default: the checkpoint path's last two components.
+  # The reference_yaml row's model, stated (`org/model`); default: the checkpoint path's last two
+  # components, which name no model when config.json states no `_name_or_path`.
   # model_key: openai/gpt-oss-120b
 
   # The row's tags, matched EXACTLY (`quant_algo`, `kv_cache_quant_algo`, `spec_dec_algo`). Omitted,
   # the untagged row: for a quantized checkpoint the bf16 number. Flat, or per unit:
   # discriminators: {core: {quant_algo: NVFP4}, mtp: {quant_algo: NVFP4, spec_dec_algo: MTP}}
 
-  # The WITNESSES, for the features boot and accuracy cannot see: owed with `enabled: true` or under
-  # the unit's `profile: certified`, and then required for kv_quant and the replay features; disagg's
-  # is owed, and its block required, always. Each
-  # compares one observable across two legs that differ in one variable. Any block may set
-  # `timeout` (seconds per leg; default 1800). A token-comparing witness (host_offload, kv_quant,
-  # disagg) takes `prompts` or `prompts_file`, `max_tokens` and `min_generated_tokens` (default 32),
-  # else the acceptance or boot prompts; `max_batch_size` runs both legs at it (1: exact).
-  # witness:
-  #   enabled: true
-  #   host_offload:
-  #     contrast_env: {MYMODEL_HOST_OFFLOAD: "0"}   # the leg WITHOUT the offload
-  #     # Predicted from the checkpoint's shapes (or per member); the target prints
-  #     # `__DEVICE_MEMORY_MIB__ <MiB>` once per rank, after its weights load, before the KV pool.
-  #     expected_mib: 48800
-  #   disagg:
-  #     # Leg B, REQUIRED with its `contrast_env`: the run's own launcher of a context and a
-  #     # generation engine of the member's width that hand the state between them (contract in
-  #     # checks/witness_protocol.py); a file beside this spec resolves against its directory.
-  #     contrast_command: scripts/my_leg_b.py
-  #     contrast_env: {MYMODEL_DISAGG: "1"}         # leg B's environment alone
-  #     cache_transceiver_config: {backend: NIXL}   # leg B's MV2FLOW_WITNESS_TRANSCEIVER
-  #     prompt_tokens: [131, 2050, 4097]  # extra prose prompts, BOTH legs; each at most 16384
-  #     timeout: 2700
-  #     max_batch_size: 1
-  #     # BOTH legs: what leg B's engines refuse under disaggregation, pinned off in leg A too.
-  #     legs_env: {MYMODEL_ENCODER_REPLAY: "0", MYMODEL_DECODER_REPLAY: "0"}
-  #   # The target prints `MODELING_V2_WITNESS kv_bytes_per_token=<int>` once per rank under
-  #   # TRTLLM_MODELING_V2_WITNESS=1; `exact: false` names a lossy attention path: no identity leg.
-  #   kv_quant:
-  #     contrast_env: {MYMODEL_KV_STORAGE: bf16}   # the leg WITH bf16 storage; required if exact
-  #     expected_bytes_per_token: 656              # one rank's persistent bytes per token
-  #     exact: true                                # default
-  #     bytes_tolerance: 0.02                      # default
-  #     max_batch_size: 1
-  #   # Bounded replay: the target prints `MODELING_V2_WITNESS forwarded_tokens=<int>
-  #   # decoder_tokens=<int> ...` per context request. Each size exceeds the window, at most 16384.
-  #   decoder_replay:
-  #     contrast_env: {MYMODEL_DECODER_REPLAY: "0"}  # replay OFF
-  #     window: 128            # the checkpoint's sliding window
-  #     prompt_tokens: 4096
-  #   encoder_replay:
-  #     contrast_env: {MYMODEL_ENCODER_REPLAY: "0"}  # replay OFF
-  #     window: 128
-  #     prefix_tokens: 4096
-  #     reuse_alignment: 2     # default 1; e.g. a KV compression ratio the boundary may not split
+  # The DISAGG gate: disaggregation is proven by the tree's own kind of test, a pytest node that
+  # serves the model through `trtllm-serve disaggregated` (a context and a generation engine, the
+  # KV hand-off between them) and scores a benchmark across that hop. The run writes it beside the
+  # tree's tests that already do so for other models; the gate runs it from its pytest root, as CI
+  # does, and passes only when every test the node id selects passed (a skip fails it). REQUIRED
+  # with the disagg feature.
+  # disagg:
+  #   test: tests/integration/defs/accuracy/test_disaggregated_serving.py::TestMyModel::test_auto_dtype
+  #   env: {LLM_MODELS_ROOT: /path/to/models}   # what the test reads
+  #   devices: 4                   # default: two engines at the member's width, at most a node
+  #   timeout: 7200                # default, seconds
 
   # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration per prompt
   # against built-in modeling (`=off`; fails under a 0.95 ratio when a paired test finds the drop
@@ -270,9 +239,7 @@ accuracy:
 
   # The BOOT gate's workload, run-wide or per unit; keywords match
   # generated text only. A `multimodal` unit with no image prompt sends the tree's
-  # tests/integration/test_input_files/merlion.png. With a logit reference the boot also holds its
-  # first greedy tokens to the reference's; a variant does only if it changes lossless settings
-  # alone or its own entry says so.
+  # tests/integration/test_input_files/merlion.png.
   # boot:
   #   prompts:
   #     - "The capital of France is"
@@ -281,7 +248,6 @@ accuracy:
   #   # prompts_file: boot_prompts.yaml   # or a YAML/JSON list of plain prompts
   #   keywords: [Paris]             # each must appear in some generated text
   #   max_tokens: 32                # default
-  #   greedy: {enabled: true, prompts: 4, tokens: 24}   # the defaults
   #   multimodal:
   #     prompts:
   #       - prompt: "<|User|><image>What vegetable is this? One word.<|Assistant|>"
@@ -318,17 +284,6 @@ accuracy:
   #   prompt: "The capital of France is"   # default
   #   max_tokens: 32               # default
   #   timeout: 1800                # default, seconds for /health
-
-  # The LOGIT gate, on wherever a reference is named (or `logits.reference.json.gz` sits beside this
-  # file): each position's log-prob of the HF reference's top-1 token, held to the reference's own
-  # bf16-vs-fp32 spread times `threshold_factor`. Make the reference once:
-  #   python checks/logit_reference.py --model <checkpoint> --out logits.reference.json.gz
-  # logits:
-  #   reference: logits.reference.json.gz
-  #   enabled: true                # default; false keeps the block and owes nothing
-  #   prompts: [capital, clips, long, image0]   # default: every one the unit takes
-  #   threshold_factor: 3.0        # default
-  #   timeout: 1800                # default
 
   # `trtllm-eval`'s own flags. Without `max_seq_len` the eval sizes its KV cache for the
   # checkpoint's `max_position_embeddings` and dies.
@@ -375,10 +330,15 @@ accuracy:
 # ------------------------------------------------------------- performance
 # The tune campaign (tune/stage.py): with `enabled: true`, a `tune` task that starts once the
 # core's correctness checks hold (on a target onboarded elsewhere, `trtllm-modeling-v2 tune --task
-# task.yaml --workspace W`). Perf is never a release gate; every kept change passes accuracy.
+# task.yaml --workspace W`). Perf is never a release gate. A micro/module candidate is judged by
+# its micro-bench, projected to e2e through `microbench.share`, with its outputs held roughly to
+# the control's; a win keeps at once. A checkpoint every few keeps measures e2e, the first output
+# token's distribution and the target's suite on the best tree, and a failure rolls those keeps
+# back. The accuracy benchmark runs once, on the final tree.
 # perf:
 #   enabled: true
-#   workload: {isl: 8192, osl: 1024, concurrency: [1, 128]}   # default 1024, 1024, [1, 128]
+#   workload: {isl: 8192, osl: 1024, concurrency: [1, 32, 128]}   # default 1024, 1024, [1, 32, 128]
+#                                  # derive gives a dep member only the high point x its ranks
 #   identity_configs: [<LLM-API yaml>]   # default: derived from the workload
 #   configs:                       # instead of `workload`: serving validation workloads
 #     - name: chat                 # system-wide candidates and final cumulative e2e cover all
@@ -387,20 +347,28 @@ accuracy:
 #     - name: batch
 #       workload: {isl: 8192, osl: 1024, concurrency: [128]}
 #       llm_api_options: {enable_chunked_prefill: true}   # over the derived serving config
-#   goal: {ratio_to_reference: 1.1}  # stop once every headline is 1.1x the reference; or/and
+#   goal: {ratio_to_baseline: 1.1}   # stop once every headline is 1.1x the baseline; or/and
 #                                    # pct_of_sol: 0.7, 70% of each headline's SOL ceiling
-#   sol: {enabled: true}            # public roofline turn (default on); optional `gpu` is a label
-#                                    # capacities require public sources; input schema: tune/sol.py
-#   reference: stock               # default: the same configs under modeling_v2 "off"; or `none`
+#   sol:                           # public roofline turns; input schema: tune/sol.py
+#     enabled: true                # default; optional `gpu` is a label: capacities need public sources
+#     methods: [analytic, code, profile]   # independent analyses: config formulas, the code
+#                                  # as written, a profile (its counted traffic bounds the work)
+#     tolerance: 0.15              # ceilings this close agree (the highest is taken); the rest
+#                                  # is ruled on once, by choosing an analysis, or stays unknown
 #   spools: [<whole-node session spools for e2e measurements>]   # default: the sessions' spools
-#   dev_spools: [<sessions for 1-GPU tuner jobs and the keep gate>]   # default: `spools`
+#   dev_spools: [<sessions for 1-GPU tuner jobs and the correctness checks>]   # default: `spools`
 #   env_script: <sourced by every perf job>   # default <workspace>/tune/env.sh
-#   noise_repeats: 0               # default: one baseline; positive = explicit extra baseline runs
 #   wall: 2h                       # default; one perf job's wall limit
 #   model: /path/to/checkpoint     # default checkpoint_path (and `target`: the run's target)
 #   campaign:                      # every value shown is the default but max_hours (none)
-#     enabled: true                # false: the baseline and reference only
-#     min_gain: 0.01               # keep threshold = max(min_gain, noise_factor x spread)
+#     enabled: true                # false: the baseline only
+#     min_gain: 0.01               # an e2e win = max(min_gain, noise_factor x spread)
+#     min_projected_gain: 0.005    # a micro/module win: a point's projected e2e gain
+#     micro_noise: 0.02            # a micro-bench speedup this small counts as none
+#     module_tolerance: 0.05       # outputs farther than this (relative) from the control's
+#     checkpoint_keeps: 3          # a checkpoint every 3 keeps, or once they project
+#     checkpoint_gain: 0.05        # 5 % at a point; a LOSS or a correctness FAIL rolls them back
+#     logits: {top_k: 20, max_kl: 0.1, min_top1: 0.9, tie_margin: 0.15}   # and `prompts`
 #     noise_factor: 3.0
 #     ttft_tolerance: 0.1          # a first token this much slower at concurrency 1 is a loss
 #     max_parallel_tuners: 4
@@ -410,11 +378,10 @@ accuracy:
 #     max_roadmaps: 2              # a spent roadmap with budget left is refreshed on the best tree
 #     max_hours: 24                # the campaign's wall budget
 #     idle_settle_s: 120           # a measurement starts on a node idle this long
-#     smoke: true                  # one short serve per world size before the baseline
-#     smoke_wall: 45m
-#     gate_tests: true             # the target's and the contract's tests, on every tree gated
+#     gate_tests: true             # the target's and the contract's tests, at each checkpoint
 #     kernel_ledger: require       # or off: no kernel ledger asked of a roadmap
 #     kernel_coverage_pct: 80      # the GPU time a roadmap's kernel ledger must cover
-#     accuracy: {unit: core, members: [tp1, dep4]}   # the keep gate's; or {gate: off}
-#   source_embargo: [<this checkpoint's in-tree modeling, its modules and kernels>]
-#   sister_engines: [<other engines' checkouts: strategies may inform, code may not be copied>]
+#     accuracy: {unit: core, members: [dep4]}   # the final tree's; default the widest member;
+#                                  # {gate: off} also turns off the first-token check
+#   source_embargo: []           # only for an evaluation that must not see an existing implementation
+#   sister_engines: [<other engines' checkouts: prior art; kernels and strategies may be adapted>]

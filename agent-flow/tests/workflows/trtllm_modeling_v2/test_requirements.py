@@ -20,13 +20,13 @@ def test_a_smoke_unit_is_left_unjudged_by_the_specs_own_choice():
 
 
 def _data(**extra):
-    """The request, with witnesses on: the disaggregated witness covers ``disagg``."""
+    """The request: the disaggregated-serving test covers ``disagg``."""
     return {
         "parallel": "unified",
         "members": ["tp1", "tep4"],
         "features": ["disagg", "multimodal"],
         "perf": {"workload": {"isl": 8192, "osl": 1024}},
-        "accuracy": {"witness": {"enabled": True}},
+        "accuracy": {"disagg": {"test": "tests/accuracy/test_disagg.py::TestM::test_auto_dtype"}},
         **extra,
     }
 
@@ -52,3 +52,20 @@ def test_preflight_stops_on_a_gap_and_writes_the_matrix(tmp_path, monkeypatch):
     written = yaml.safe_load((tmp_path / r.COVERAGE_FILENAME).read_text())
     assert written["members"] == ["tp1", "tep4"]
     assert sections and "left uncovered" in sections[0][0]
+
+
+def test_disaggs_test_runs_once_and_a_pair_of_features_is_proven_only_where_named():
+    data = {
+        **_data(),
+        "features": ["disagg", "multimodal"],
+        "profile": {"multimodal": "smoke"},
+        "members": {"default": ["tp1", "tep4"], "disagg": ["dep2"]},
+    }
+    matrix = r.requirements_matrix(data, c.compile_contract(data, world_size=4), 4)
+    assert not matrix.gaps()
+    assert "runs once, at dep2" in matrix.cell("disagg", "tp1").reason
+    # dep2 is the test's place, not a column of the request.
+    assert matrix.cell("core", "dep2") is None and "| core | certified | certified |  |" in (
+        matrix.render()
+    )
+    assert matrix.cell("disagg+multimodal", "tep4").accepted

@@ -5,9 +5,7 @@
 """Run normalized requests through public LLM / SamplingParams / generate APIs.
 
 The spec contains ``llm`` constructor options, ``sampling`` options and ordered
-``requests``. Witnesses explicitly warm up the complete prompt batch, then
-stream each request and print every sequence using the external witness
-protocol. Ordinary checks do not warm up their correctness workload.
+``requests``, streamed in windows of ``concurrency`` and recorded one per request.
 """
 
 from __future__ import annotations
@@ -27,7 +25,6 @@ import reuse_probe  # noqa: E402
 import workload_io as wio  # noqa: E402
 
 MODELING_V2_ENV = "TRTLLM_MODELING_V2"
-WITNESS_OUTPUT_ENV = "TRTLLM_WITNESS_FULL_OUTPUT"
 
 
 def build_llm(spec: Mapping[str, Any]) -> tuple[Any, Any]:
@@ -41,12 +38,8 @@ def build_llm(spec: Mapping[str, Any]) -> tuple[Any, Any]:
     if mode:
         options["modeling_v2"] = mode
     sampling = SamplingParams(**spec.get("sampling", {}))
-    if not spec.get("witness") and (
-        getattr(sampling, "n", 1) != 1 or getattr(sampling, "use_beam_search", False)
-    ):
-        raise ValueError(
-            "correctness checks require one sequence without beam search; witnesses support multiple sequences"
-        )
+    if getattr(sampling, "n", 1) != 1 or getattr(sampling, "use_beam_search", False):
+        raise ValueError("correctness checks require one sequence without beam search")
     return LLM(**options), sampling
 
 
@@ -176,8 +169,6 @@ def _run_requests(
             else p
             for p in inputs
         ]
-    if spec.get("warmup"):
-        llm.generate(inputs, base)
     summary = {"requests": 0, "reported": 0, "hits": 0, "reused_tokens": 0}
     concurrency = max(1, int(spec.get("concurrency", 1)))
     for start in range(0, len(requests), concurrency):
@@ -212,12 +203,6 @@ def _run_requests(
                 summary["reported"] += 1
                 summary["hits"] += int(cached > 0)
                 summary["reused_tokens"] += cached
-            if spec.get("witness"):
-                for sequence in record["sequences"]:
-                    print(f"[{index}] Generated text: {sequence['text'][:200]!r}...")
-                    if os.environ.get(WITNESS_OUTPUT_ENV) == "1":
-                        print(f"[{index}] Witness token ids: {sequence['token_ids']}")
-                        print(f"[{index}] Witness text: {sequence['text']!r}")
     return summary
 
 
@@ -228,7 +213,7 @@ def run_workload(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
         result = _run_requests(
             llm,
             base,
-            {**spec, **phase, "warmup": False},
+            {**spec, **phase},
             phase=phase["id"],
         )
         for key, value in result.items():
@@ -243,23 +228,9 @@ def run_workload(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--spec")
-    source.add_argument("--request-json", help="inline normalized witness spec")
-    parser.add_argument(
-        "--prompt", action="append", help="witness prompt, one argv string per prompt"
-    )
+    parser.add_argument("--spec", required=True)
     options = parser.parse_args(argv)
-    spec = json.loads(
-        Path(options.spec).read_text(encoding="utf-8") if options.spec else options.request_json
-    )
-    if options.prompt:
-        if not options.request_json or not spec.get("witness"):
-            parser.error("--prompt requires a witness --request-json configuration")
-        spec["requests"] = [
-            {"id": f"w{i}", "prompt": prompt, "max_tokens": spec["sampling"]["max_tokens"]}
-            for i, prompt in enumerate(options.prompt)
-        ]
+    spec = json.loads(Path(options.spec).read_text(encoding="utf-8"))
     import tensorrt_llm
 
     wio.emit(wio.DRIVER_MARKER, {"tensorrt_llm": str(tensorrt_llm.__file__), "api": "LLM"})

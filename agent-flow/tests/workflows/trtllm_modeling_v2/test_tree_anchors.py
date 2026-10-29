@@ -38,14 +38,12 @@ def _write(root: Path, rel: str, text: str) -> Path:
     return path
 
 
-def test_a_directory_anchor_is_its_hint_while_the_hint_exists(tmp_path):
+def test_a_directory_anchor_is_its_hint_or_found_where_it_moved_and_scanned_there(tmp_path):
     hint = ANCHORS["attention_backends"].hint
-    _write(tmp_path, f"{hint}/sparse.py", "def f(): ...\n")
-    found = tree_anchors.resolve(tmp_path, "attention_backends")
+    _write(tmp_path / "at-hint", f"{hint}/sparse.py", "def f(): ...\n")
+    found = tree_anchors.resolve(tmp_path / "at-hint", "attention_backends")
     assert (found.paths, found.via) == ((hint,), "hint")
-
-
-def test_a_moved_directory_is_found_by_what_it_defines_and_scanned_there(tmp_path):
+    # Moved, it is found by what it defines.
     _write(
         tmp_path,
         "tensorrt_llm/_torch/attn/impl/trtllm.py",

@@ -41,7 +41,6 @@ def _campaign(tmp_path: Path, **campaign):
             "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]},
             "spools": ["s1"],
             "env_script": "/env.sh",
-            "reference": "none",
             "sol": {"enabled": False},
             "campaign": {"max_parallel_tuners": 1, "kernel_ledger": "off", **campaign},
         },
@@ -97,7 +96,7 @@ def _candidate(spec, stage, what: str, text: str) -> None:
 def test_a_spent_budget_ends_the_campaign_with_what_it_has_and_says_so(tmp_path):
     spec = _campaign(tmp_path, max_hours=8)
     clock, turns, logs = _Clock(), [], []
-    state = {"phase": "campaign", "noise_spread": {}, "noise_samples": 0,
+    state = {"phase": "campaign",
              "started_at": clock.now - 9 * HOUR}  # fmt: skip
     stage = _stage(spec, state, lambda role, what, prompt: turns.append(what) or "", clock, logs)
     assert stage.run() == "tuned"
@@ -143,7 +142,7 @@ def test_what_is_in_flight_finishes_and_nothing_new_is_issued(tmp_path):
             clock.now += 9 * HOUR  # this turn runs past the budget
         return ""
 
-    state = {"phase": "campaign", "noise_spread": {}, "noise_samples": 0}
+    state = {"phase": "campaign"}
     stage = _stage(spec, state, dispatch, clock, logs)
     assert stage.run() == "tuned"
     assert turns == ["roadmap", "fast-path", "side-path"]

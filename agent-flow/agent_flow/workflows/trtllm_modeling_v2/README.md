@@ -18,8 +18,9 @@ The agent prepares the spec and launches the workflow; missing inputs must be re
 
 **The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
 derive` writes a starting spec (no `site.yaml` needed), and `trtllm-modeling-v2 intake lint` checks
-it for slow or stalling choices (eager gates, a batch below the claimed concurrency, disaggregation
-wider than one node, variant cross products, variants that boot at every member, a feature proven
+it for slow or stalling choices (eager gates, a batch below the claimed concurrency, a member too
+narrow for one engine, disaggregation wider than a session, variant cross products, variants that
+boot at every member, a feature proven
 at several members or again under another axis, unusable accuracy anchors, open-ended boot probes) and blocks an accuracy check that runs without CUDA graphs and
 what would stop preflight (uncovered requested cells, a KV-cache dtype the engine does not load),
 and prints the contract's checks per unit and variant, the
@@ -54,6 +55,15 @@ backend model environment overrides, then the launching session. Claude uses its
 assistant model, which can lag a switch; Codex queries its live thread. If lookup is unavailable,
 set the model explicitly. Custom models and effort remain available through `agents.defaults` and
 `agents.roles` in [task.example.yaml](task.example.yaml). Model inheritance does not grant permissions.
+Roles load the run's own skills only: preflight's agent probe reads the skills a session would load
+and turns off the user's, and Codex roles run without the user's plugins and apps.
+
+**While it runs**, the operator keeps the sessions alive and leaves the work to the run. Never cancel
+a job the run submitted (a gate, a worker's test) or run a replacement check beside it: a cancelled
+check proves nothing, runs again, and the planner never learns why. To change the direction, send
+`trtllm-modeling-v2 feedback --workspace <ws> "<what to change and why>"`: a few sentences (at most
+1200 characters) naming any evidence by its path, not status reports. A message rides with the
+planner's next turn; `--now` wakes it, for what must change before that.
 
 ## Design
 
@@ -69,14 +79,24 @@ set the model explicitly. Custom models and effort remain available through `age
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    the operator handles cluster allocations and session renewal.
-5. **Tune optionally:** tuning can start after core checks pass or run independently. Tuner proposals
-   run in parallel; verification and keeps currently serialize. Local speedups need final cumulative
-   end-to-end validation. Results stay on a separate best branch, with `tune/summary.md`,
+5. **Tune optionally:** tuning starts once onboarding is complete (every required check has passed),
+   or runs on its own (`trtllm-modeling-v2 tune`). It measures one baseline, with no smoke, stock
+   reference or repeat, then starts the campaign; the run is delivered when the campaign ends. Tuner
+   proposals run in parallel; verification and keeps serialize. A micro-bench speedup is projected
+   to end-to-end through the share of the step its kernels take, its outputs held roughly to the
+   control's, and a win keeps at once. Every few keeps a checkpoint measures end-to-end, the first
+   output token's distribution and the target's suite, and a failure rolls those keeps back; the
+   accuracy benchmark runs once, on the final tree. Perf points default to concurrency 1/32/128,
+   an attention-DP member's to the high point. The speed of light comes from independent
+   analyses (config formulas, the code, a profile), reconciled: what they dispute is ruled on
+   once, by choosing among them, or stays unknown. Every finished attempt, failed or not, reaches
+   the later requests with the stage's verdict and the turn's findings (`tune/attempts.md`), and
+   a loss the code can fix goes back to its turn once. Results stay on a separate best branch, with `tune/summary.md`,
    `perf_ledger.jsonl` and `UNMERGED_OPTIMIZATIONS.md`; they are not merged into delivery automatically.
 
-Current tuning retains configurable smoke, stock reference and noise repeats. A strict single
-baseline and parallel candidate measurement remain planned changes. Disaggregation currently uses a
-supplied contrast leg; through-the-hop accuracy is not implemented. Engine attestation still needs
+Parallel candidate measurement remains a planned change. Disaggregation is proven by the
+tree's own disaggregated-serving accuracy test for the target (`accuracy.disagg.test`), run as CI
+runs it; the flow deploys nothing of its own. Engine attestation still needs
 an internal rank hook where public APIs provide no resolved facts.
 
 ## Code map

@@ -51,19 +51,15 @@ def test_the_gsm8k_standard_error_is_three_quarters_of_a_point():
 # ----------------------------------------------- the paired acceptance comparison
 
 
-def test_a_real_drop_is_both_significant_and_large():
+def test_a_regression_is_a_drop_both_significant_and_large():
     baseline = [2.6 + 0.3 * math.sin(i) for i in range(32)]
     candidate = [b - 0.5 + 0.05 * math.cos(i) for i, b in enumerate(baseline)]
     result = stats.paired_test(baseline, candidate, min_effect=0.1)
     assert result.significant and result.regressed
     assert "paired over 32 prompt(s)" in result.describe()
-
-
-def test_significance_alone_is_not_a_regression():
-    """A tiny but consistent drop on a large workload is below the minimum effect."""
+    # A tiny but consistent drop on a large workload is below the minimum effect.
     baseline = [3.0 + 0.1 * (i % 5) for i in range(200)]
-    candidate = [b - 0.01 for b in baseline]
-    result = stats.paired_test(baseline, candidate, min_effect=0.1)
+    result = stats.paired_test(baseline, [b - 0.01 for b in baseline], min_effect=0.1)
     assert result.significant and not result.regressed
 
 
@@ -72,21 +68,19 @@ def test_significance_alone_is_not_a_regression():
 
 def test_the_floor_is_statistical_by_default(tmp_path):
     """With no rule stated the floor is anchor - 2 SE, not a fixed tolerance."""
-    result = accuracy_checks.run_accuracy_gate(
-        _env(), task_data=_TASK, reference=_ANCHOR, runner=_eval(90.0), workdir=tmp_path
-    )
+
+    def gate(score):
+        return accuracy_checks.run_accuracy_gate(
+            _env(), task_data=_TASK, reference=_ANCHOR, runner=_eval(score), workdir=tmp_path
+        )
+
+    result = gate(90.0)
     assert not result.passed
     assert result.floor == pytest.approx(_ANCHOR - 2 * 0.734, abs=0.01)
     assert result.se == pytest.approx(0.734, abs=1e-3) and result.samples == 1319
     assert "2.00 x SE 0.73 (n=1319)" in result.detail
     assert "SE 0.73" in result.summary() and "floor 90.83" in result.summary()
-
-
-def test_a_score_inside_two_se_passes(tmp_path):
-    result = accuracy_checks.run_accuracy_gate(
-        _env(), task_data=_TASK, reference=_ANCHOR, runner=_eval(91.2), workdir=tmp_path
-    )
-    assert result.passed
+    assert gate(91.2).passed  # inside two SE
 
 
 # ----------------------------------------------------- the cross-member finding

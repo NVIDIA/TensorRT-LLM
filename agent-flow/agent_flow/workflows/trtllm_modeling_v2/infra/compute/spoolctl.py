@@ -291,6 +291,11 @@ def _add_spool_option(parser: argparse.ArgumentParser) -> None:
 
 def _add_job_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gpus", help="device count, or 'all' for the whole node")
+    parser.add_argument(
+        "--nodes",
+        type=int,
+        help="whole nodes the job holds (a session of that many nodes); each runs the command",
+    )
     parser.add_argument("--wall", help="wall limit from start (7200, 90m, 2h, HH:MM:SS); 0 = none")
     parser.add_argument("--owner", help="requester prefix (default $MV2FLOW_JOB_PREFIX)")
     parser.add_argument(
@@ -336,6 +341,8 @@ def job_header(args: argparse.Namespace, owner: str | None, token: str) -> dict[
     header: dict[str, object] = {}
     if args.gpus is not None:
         header["gpus"] = args.gpus
+    if getattr(args, "nodes", None) and args.nodes > 1:
+        header["nodes"] = args.nodes
     if args.wall is not None:
         header["wall"] = int(_sched.parse_duration(args.wall))
     if owner:

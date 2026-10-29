@@ -48,6 +48,8 @@ SESSION_KEYS: tuple[str, ...] = (
     "name",
     "spool",
     "role",
+    # Nodes of one allocation, a watcher on each: multi-node jobs (`nodes=N`) span them.
+    "nodes",
     "gpus_per_node",
     "time_limit",
     "handover_lead",
@@ -82,6 +84,8 @@ class SessionSpec:
     name: str
     spool: str
     role: str = "any"
+    #: Nodes of the allocation, each running a watcher of the spool.
+    nodes: int = 1
     #: ``None`` lets the scheduler discover the devices; 0 makes a GPU-free session.
     gpus_per_node: int | None = None
     time_limit_s: float | None = None
@@ -133,6 +137,7 @@ def sessions_from_task(task_data: Mapping[str, Any]) -> tuple[SessionSpec, ...]:
                 name=str(raw["name"]),
                 spool=str(raw["spool"]),
                 role=str(raw.get("role", "any")),
+                nodes=int(raw.get("nodes") or 1),
                 gpus_per_node=None if gpus is None else int(gpus),
                 time_limit_s=parse_duration(str(limit)) if limit else None,
                 time_limit=str(limit) if limit else None,
@@ -251,6 +256,11 @@ def validate_sessions(
             role = raw.get("role", "any")
             if role not in SESSION_ROLES:
                 errors.append(f"'{at}.role' must be one of {SESSION_ROLES}; got {role!r}")
+            nodes = raw.get("nodes")
+            if nodes is not None and (
+                not isinstance(nodes, int) or isinstance(nodes, bool) or nodes < 1
+            ):
+                errors.append(f"'{at}.nodes' must be an integer >= 1")
             gpus = raw.get("gpus_per_node")
             if gpus is not None and (
                 not isinstance(gpus, int) or isinstance(gpus, bool) or gpus < 0
@@ -337,6 +347,13 @@ def render_session_entry(
         "#",
         "# Run it as the allocation's command. The scheduler it execs is the",
         "# allocation's main process; work arrives as files in the spool.",
+        *(
+            [
+                f"# With nodes: {session.nodes} it runs once on each node, each a watcher of the spool."
+            ]
+            if session.nodes > 1
+            else []
+        ),
         "set -u",
         f"SPOOL={shlex.quote(session.spool)}",
         *(f"export {assignment}" for assignment in env_assignments(env)),
@@ -355,7 +372,9 @@ def render_session_entry(
         "  nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv 2>&1",
         "  free -g 2>&1 | head -2; df -h /dev/shm 2>&1 | tail -1",
         "  cat /sys/fs/cgroup/memory.max 2>/dev/null",
-        '} > "$SPOOL/session_entry.log" 2>&1',
+        '} > "$SPOOL/session_entry.log" 2>&1'
+        if session.nodes == 1
+        else '} > "$SPOOL/session_entry.$(hostname).log" 2>&1',
         "",
         f'exec "${{MV2FLOW_SCHEDULER_PYTHON:-python3}}" {shlex.quote(str(SCHEDULER_PATH))} watch "$SPOOL" '
         f"{watch} --session {shlex.quote(session.name)}",
@@ -442,6 +461,9 @@ def broker_submission(
         f"    partition={json.dumps(submit.get('partition'))}" if submit.get("partition") else None,
         f"    account={json.dumps(submit.get('account'))}" if submit.get("account") else None,
         f"    qos={json.dumps(submit.get('qos'))}" if submit.get("qos") else None,
+        f"    nodes={session.nodes}" if session.nodes > 1 else None,
+        # One watcher per node: the entry runs once on each.
+        "    ntasks_per_node=1" if session.nodes > 1 else None,
         f"    gpus_per_node={session.gpus_per_node}" if session.gpus_per_node else None,
         f"    time_limit={json.dumps(session.time_limit)}" if session.time_limit else None,
         f"    mounts={json.dumps(list(submit.get('mounts') or []))}"

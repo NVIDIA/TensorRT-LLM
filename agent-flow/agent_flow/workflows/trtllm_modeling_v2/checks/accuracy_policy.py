@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -58,10 +59,18 @@ class Floor:
     k: float | None = None
     #: Points under the tolerance rule.
     tolerance: float | None = None
+    #: The reference is the unit's own score, measured as this one is (``anchor: relative``):
+    #: the SE is that of the difference of two measurements.
+    relative: bool = False
 
     def describe(self) -> str:
         """``reference 92.08 - 2.00 x SE 0.75 (n=1319) = 90.59``, or the tolerance form."""
         se = f"SE {self.se:.2f} (n={self.samples})" if self.se is not None else "SE unknown"
+        if self.relative:
+            what = f"the unit's own score {self.reference:.4f}"
+            if self.rule == FLOOR_STATISTICAL:
+                return f"{what} - {self.k:.2f} x {se} of the difference = {self.value:.4f}"
+            return f"{what} - tol {self.tolerance:.2f} = {self.value:.4f} (fixed tolerance)"
         if self.rule == FLOOR_STATISTICAL:
             return f"reference {self.reference:.4f} - {self.k:.2f} x {se} = {self.value:.4f}"
         return (
@@ -80,6 +89,24 @@ def statistical_floor(reference: float, samples: int, k: float = DEFAULT_FLOOR_K
         se=se,
         samples=samples,
         k=k,
+    )
+
+
+def relative_floor(reference: float, samples: int, k: float = DEFAULT_FLOOR_K) -> Floor:
+    """``reference - k * SE`` where ``reference`` is the unit's own score, measured as this one is.
+
+    Both scores carry their binomial error, so the SE is that of their
+    difference: sqrt(2) times one score's.
+    """
+    se = math.sqrt(2) * binomial_se(reference, samples)
+    return Floor(
+        value=reference - k * se,
+        reference=reference,
+        rule=FLOOR_STATISTICAL,
+        se=se,
+        samples=samples,
+        k=k,
+        relative=True,
     )
 
 
@@ -124,12 +151,20 @@ def resolve_floor_policy(accuracy: Mapping[str, Any]) -> FloorPolicy:
     )
 
 
-def floor_for(policy: FloorPolicy, reference: float, samples: int | None) -> Floor | None:
-    """The floor ``policy`` puts under ``reference``; ``None`` if it needs an unknown count."""
+def floor_for(
+    policy: FloorPolicy, reference: float, samples: int | None, relative: bool = False
+) -> Floor | None:
+    """The floor ``policy`` puts under ``reference``; ``None`` if it needs an unknown count.
+
+    ``relative``: ``reference`` is the unit's own score (:func:`relative_floor`).
+    """
     if policy.rule == FLOOR_TOLERANCE:
-        return tolerance_floor(reference, policy.tolerance, samples)
+        floor = tolerance_floor(reference, policy.tolerance, samples)
+        return Floor(**{**floor.__dict__, "relative": relative})
     if samples is None:
         return None
+    if relative:
+        return relative_floor(reference, samples, policy.k)
     return statistical_floor(reference, samples, policy.k)
 
 
@@ -200,6 +235,7 @@ __all__ = [
     "KNOWN_BENCHMARK_SAMPLES",
     "ShiftFinding",
     "floor_for",
+    "relative_floor",
     "resolve_floor_policy",
     "statistical_floor",
     "systematic_shift",

@@ -20,6 +20,8 @@ Input YAML::
         assumptions: "work formula, invocation count and traffic boundary"
         measured_ms: null
         measurement_source: "commit, workload, timing method and artifact"
+        measured_bytes: null  # optional: the traffic a profiler counted (ncu), an upper bound
+        measured_flops: null  # of the necessary work: bytes/flops may not exceed it
     headline: {}
 
 Use explicit, sourced public capacities; source labels alone do not prove their
@@ -55,6 +57,8 @@ if TYPE_CHECKING:
 SOL_FILENAME = "sol.yaml"
 BOUNDS = ("compute", "memory")
 METHOD = "roofline"
+#: Necessary work may exceed what a profiler counted by this much (its window, rounding).
+TRAFFIC_SLACK = 0.1
 
 
 def _number(value: Any, where: str, *, positive: bool = False) -> float:
@@ -171,6 +175,17 @@ def calculate(inputs: Mapping[str, Any]) -> dict:
                     )
                 row["headroom_ms"] = measured - lower
                 row["pct_of_sol"] = 100 * (lower / measured)
+        for key, work in (("measured_bytes", "bytes"), ("measured_flops", "flops")):
+            if entry.get(key) is None:
+                continue
+            counted = _number(entry[key], f"{region_id}.{key}", positive=True)
+            _text(entry.get("measurement_source"), f"{region_id}.measurement_source")
+            row[key] = counted
+            if entry.get(work) is not None and float(entry[work]) > counted * (1 + TRAFFIC_SLACK):
+                raise ValueError(
+                    f"{region_id}: necessary {work} exceed what the profiler counted ({key}); "
+                    "fix the work or its memory boundary"
+                )
         regions.append(row)
     ceilings, unknown = {}, {}
     for key, entry in _mapping(inputs.get("headline", {}), "headline").items():
@@ -244,8 +259,12 @@ class SolCeilings:
         )
 
 
-def load_sol(path: Path, baseline: Measurement) -> tuple[SolCeilings | None, list[str]]:
-    """Recompute CLI output from its inputs; never trust hand-entered headline numbers."""
+def load_result(path: Path, baseline: Measurement) -> tuple[dict | None, list[str]]:
+    """The calculator's output at ``path``, recomputed from its inputs and held to the baseline.
+
+    Never trusts hand-entered numbers: an output its inputs do not reproduce, or a ceiling
+    below what the baseline already measured, is refused.
+    """
     if not Path(path).is_file():
         return None, [f"{path} was not written"]
     try:
@@ -256,23 +275,32 @@ def load_sol(path: Path, baseline: Measurement) -> tuple[SolCeilings | None, lis
                 "SOL output differs from calculation; rerun sol.py, do not edit ceilings"
             )
         headline = baseline.headline()
-        unknown = dict(result["unknown"])
         for key, value in headline.items():
             _number(value, f"baseline.{key}", positive=True)
-            if key not in result["ceilings"]:
-                unknown.setdefault(key, "no full-interval work model")
-            elif value > result["ceilings"][key]["value"]:
+            if key in result["ceilings"] and value > result["ceilings"][key]["value"]:
                 raise ValueError(f"{key}: baseline exceeds ceiling; fix scope/work/capacity")
         if set(result["ceilings"]) - set(headline):
             raise ValueError("ceilings contain metrics outside the baseline")
-        return SolCeilings(
-            METHOD,
-            {k: Ceiling(**v) for k, v in result["ceilings"].items()},
-            regions=result["regions"],
-            unknown=unknown,
-        ), []
+        return result, []
     except (OSError, ValueError, yaml.YAMLError) as exc:
         return None, [str(exc)]
+
+
+def load_sol(path: Path, baseline: Measurement) -> tuple[SolCeilings | None, list[str]]:
+    """Recompute CLI output from its inputs; never trust hand-entered headline numbers."""
+    result, errors = load_result(path, baseline)
+    if result is None:
+        return None, errors
+    unknown = dict(result["unknown"])
+    for key in baseline.headline():
+        if key not in result["ceilings"]:
+            unknown.setdefault(key, "no full-interval work model")
+    return SolCeilings(
+        METHOD,
+        {k: Ceiling(**v) for k, v in result["ceilings"].items()},
+        regions=result["regions"],
+        unknown=unknown,
+    ), []
 
 
 def render_table(sol: SolCeilings, measurements: list[Measurement]) -> str:
@@ -370,6 +398,7 @@ __all__ = [
     "calculate",
     "describe",
     "from_state",
+    "load_result",
     "load_sol",
     "render_table",
 ]

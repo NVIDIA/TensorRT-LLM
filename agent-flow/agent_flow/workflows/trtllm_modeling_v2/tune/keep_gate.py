@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The keep gate: the contract's accuracy gate, on the tree a keep would make the best.
+"""The tune campaign's correctness: the contract's accuracy gate, its suite, its logits run.
 
-The contract's :func:`..checks.accuracy.run_accuracy_gate` owns the measurement.
-``perf.campaign.accuracy`` selects the unit (default ``core``), members (default ``tp1`` and
-the unit's widest member), or ``gate: off``.
+The campaign keeps a win at once; each cumulative checkpoint runs the target's suite
+(:meth:`KeepGate.tests_only`) and the first-token logits check (:meth:`KeepGate.logits_job`)
+on the best tree, and the final tree passes the accuracy gate once
+(:meth:`KeepGate.accuracy_only`). The contract's :func:`..checks.accuracy.run_accuracy_gate`
+owns that measurement. ``perf.campaign.accuracy`` selects the unit (default ``core``), members
+(default the unit's widest member), or ``gate: off`` (no accuracy gate and no logits check).
 
 Dev-session spool jobs run one ``trtllm-eval`` per member and the target's suite plus modeling_v2
 contract tests (``tests``), concurrently where devices allow. ``run_accuracy_gate`` first
@@ -51,6 +54,8 @@ KEEP_FILE = "keep.json"
 PART_FILE = "result.json"
 #: The suite's wall limit; a member's is the contract's own (``ACCURACY_TIMEOUT_S``).
 TESTS_WALL = "1h"
+#: One token per prompt: the engine's load is most of it.
+LOGITS_WALL = "45m"
 PASS, FAIL, ERROR = "PASS", "FAIL", "ERROR"
 #: Receipts of a job that measured nothing about the tree: the substrate ended it, the
 #: session refused it, or it imported another checkout than the one under test.
@@ -83,14 +88,14 @@ _UNLIKE_TP1 = {"dep": 0, "tep": 1, "tp": 2}
 
 
 def default_members(members: Sequence[str]) -> list[str]:
-    """``tp1`` (else the narrowest member) and the widest member, the least like tp1 among equals."""
-    first = "tp1" if "tp1" in members else min(members, key=lambda m: (_width(m), m))
+    """The widest member, the least like tp1 among equals: one, since accuracy runs rarely."""
     wide = max(_width(m) for m in members)
-    last = min(
-        (m for m in members if _width(m) == wide),
-        key=lambda m: (_UNLIKE_TP1.get(parse_parallel_segment(m)[0], len(_UNLIKE_TP1)), m),
-    )
-    return list(dict.fromkeys([first, last]))
+    return [
+        min(
+            (m for m in members if _width(m) == wide),
+            key=lambda m: (_UNLIKE_TP1.get(parse_parallel_segment(m)[0], len(_UNLIKE_TP1)), m),
+        )
+    ]
 
 
 class _Capture:
@@ -125,6 +130,8 @@ class KeepGate:
     tests: tuple[str, ...] = ()
     #: The floor the anchor gets before any output is read, for the record.
     planned_floor: Mapping[str, Any] = field(default_factory=dict)
+    #: Why this gate runs no accuracy part though the campaign has one (:meth:`tests_only`).
+    skipped: str = ""
 
     @property
     def suite_devices(self) -> int:
@@ -138,8 +145,29 @@ class KeepGate:
 
     @property
     def ungated(self) -> bool:
-        """No accuracy gate: a keep passes the suite alone and is recorded as ungated."""
-        return not self.members
+        """No accuracy gate (``perf.campaign.accuracy.gate: off``): nothing scores the tune."""
+        return not self.members and not self.skipped
+
+    def tests_only(self) -> "KeepGate":
+        """The suite alone: a checkpoint's (accuracy runs once, on the final tree)."""
+        if self.ungated:
+            return self
+        return replace(self, members=(), skipped="accuracy runs once, on the final tree")
+
+    def accuracy_only(self) -> "KeepGate":
+        """The accuracy part alone: the final tree's, the suite having run at each checkpoint."""
+        return replace(self, tests=())
+
+    def logits_job(self, check: Any, tree: Path, out: Path) -> GateJob:
+        """The first-token logits run on ``tree`` at the gate's member (``tune/logits_check.py``)."""
+        from . import logits_check
+
+        member = self.members[0]
+        environment = replace(self.environment, world_size=_width(member) or 1)
+        script = logits_check.job_script(
+            check, self.spec, environment, unit=self.unit, member=member, tree=tree, out=out
+        )
+        return GateJob("logits", script, _width(member) or 1, LOGITS_WALL)
 
     def parts(self) -> list[str]:
         """The widest member first (it needs the most devices free), then the rest, then the suite."""
@@ -316,7 +344,7 @@ class KeepGate:
                 + f" (anchor {self.reference:.2f})"
             )
         else:
-            bits.append("no accuracy gate (perf.campaign.accuracy.gate: off)")
+            bits.append(self.skipped or "no accuracy gate (perf.campaign.accuracy.gate: off)")
         if self.tests:
             bits.append(f"tests: {parts.get(TESTS_PART, {}).get('summary', '')}")
         return "; ".join(bits)

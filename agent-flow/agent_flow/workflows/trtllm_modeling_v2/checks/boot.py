@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cold-start generation, greedy reference agreement and boot workload coverage."""
+"""Cold-start generation, boot workload coverage and the optional boot boundary phases."""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from ..checks.logit_reference import Reference, load_reference
-from ..checks.logit_reference import ReferenceError as LogitReferenceError
 from ..infra.compute.environment import RunEnvironment
 from ..spec.task_schema import (
     BOOT_KEYS,
@@ -40,7 +38,6 @@ from .check_runtime import (
     with_mode,
     write_driver_spec,
 )
-from .logit_agreement import DEFAULT_THRESHOLD_FACTOR, MIN_MAX_DELTA
 from .runtime_evidence import attest_engine, engine_failure, engine_records
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
@@ -64,202 +61,6 @@ DEFAULT_BOOT_IMAGE_KEYWORDS: tuple[str, ...] = (
     "sculpture",
     "water",
 )
-
-
-#: ``accuracy.boot.greedy`` when the spec says nothing: four prompts, 24 tokens each.
-DEFAULT_GREEDY_PROMPTS = 4
-
-
-DEFAULT_GREEDY_TOKENS = 24
-
-
-@dataclass(frozen=True)
-class GreedySetting:
-    """``accuracy.boot.greedy``: whose greedy tokens the boot holds the engine's to, and how many.
-
-    A differing token the reference's top-1 leads by at most ``tie_factor``
-    times the reference's spread is a near-tie, past which the prompt is not
-    compared; any other differing token fails the boot.
-    """
-
-    reference: str
-    prompts: int = DEFAULT_GREEDY_PROMPTS
-    tokens: int = DEFAULT_GREEDY_TOKENS
-    tie_factor: float = DEFAULT_THRESHOLD_FACTOR
-
-    @classmethod
-    def from_task(cls, task_data: Mapping[str, Any], unit: str | None) -> "GreedySetting | None":
-        """The setting ``unit``'s boot runs under; ``None`` when its boot compares no tokens.
-
-        On wherever ``accuracy.logits`` names a reference, unless
-        ``accuracy.boot.greedy.enabled`` (or the unit's own entry) is false. A
-        configuration variant compares only when it changes nothing but
-        reference_compatible settings (``feature_evidence.reference_compatible``), or when its own entry,
-        ``accuracy.boot.<variant>.greedy``, says ``enabled: true``.
-        """
-        accuracy = task_data.get("accuracy") or {}
-        if not isinstance(accuracy, Mapping):
-            return None
-        logits = accuracy.get("logits")
-        logits = logits if isinstance(logits, Mapping) else {}
-        reference = str(logits.get("reference") or "").strip()
-        boot = accuracy.get("boot")
-        boot = boot if isinstance(boot, Mapping) else {}
-        block = dict(boot.get("greedy") or {}) if isinstance(boot.get("greedy"), Mapping) else {}
-        chosen = boot.get(unit) if unit is not None else None
-        own = chosen.get("greedy") if isinstance(chosen, Mapping) else None
-        if isinstance(own, Mapping):
-            block.update(own)
-        if (
-            is_variant(task_data, unit)
-            and not (isinstance(own, Mapping) and own.get("enabled"))
-            and not feature_evidence.reference_compatible(
-                check_config.subject_fields(task_data, unit)
-            )
-        ):
-            return None
-        if not reference or block.get("enabled") is False:
-            return None
-        return cls(
-            reference=reference,
-            prompts=int(block.get("prompts") or DEFAULT_GREEDY_PROMPTS),
-            tokens=int(block.get("tokens") or DEFAULT_GREEDY_TOKENS),
-            tie_factor=float(logits.get("threshold_factor") or DEFAULT_THRESHOLD_FACTOR),
-        )
-
-
-@dataclass(frozen=True)
-class GreedyPrompt:
-    """One reference prompt whose first greedy tokens the boot holds the engine's to."""
-
-    id: str
-    input_ids: tuple[int, ...]
-    #: The reference's first greedy tokens, as many as the boot compares.
-    expected: tuple[int, ...]
-    #: Per compared step, the reference's top-k token ids and log-probs, best first.
-    top_ids: tuple[tuple[int, ...], ...]
-    top_logprobs: tuple[tuple[float, ...], ...]
-
-
-@dataclass(frozen=True)
-class GreedyWorkload:
-    """The prompts a boot compares, the margin a differing token is a near-tie within, and why any were left out."""
-
-    source: str
-    prompts: tuple[GreedyPrompt, ...] = ()
-    tie_margin: float = 0.0
-    notes: tuple[str, ...] = ()
-    #: Why the boot cannot compare anything; it fails with this.
-    error: str = ""
-
-    @property
-    def tokens(self) -> int:
-        return max((len(p.expected) for p in self.prompts), default=0)
-
-    def requests(self) -> list[dict[str, Any]]:
-        """Engine-driver requests: each prompt as its token ids, for its compared tokens."""
-        return [
-            {"id": f"g{n}", "token_ids": list(p.input_ids), "max_tokens": len(p.expected)}
-            for n, p in enumerate(self.prompts)
-        ]
-
-
-def greedy_workload(
-    setting: GreedySetting, limits: EngineLimits, reference: Reference | None = None
-) -> GreedyWorkload:
-    """The reference's text prompts a boot sends: the first ``setting.prompts`` the engine can take.
-
-    ``reference`` defaults to the file ``setting`` names; one that cannot be
-    read, or none of whose text prompts fits, is the workload's ``error``.
-    """
-    source = Path(setting.reference).name
-    if reference is None:
-        try:
-            reference = load_reference(setting.reference)
-        except LogitReferenceError as exc:
-            return GreedyWorkload(source, error=f"the boot's greedy reference: {exc}")
-    tokens = min(setting.tokens, reference.continuation)
-    chosen: list[GreedyPrompt] = []
-    notes: list[str] = []
-    for prompt in reference.prompts:
-        if len(chosen) >= setting.prompts or prompt.images:
-            continue
-        refused = limits.refuses(len(prompt.input_ids), tokens)
-        if refused:
-            notes.append(f"{prompt.id} left out: {refused}")
-            continue
-        steps = range(prompt.prompt_positions, prompt.prompt_positions + tokens)
-        chosen.append(
-            GreedyPrompt(
-                id=prompt.id,
-                input_ids=prompt.input_ids,
-                expected=prompt.continuation_ids[:tokens],
-                top_ids=tuple(prompt.top_ids[p] for p in steps),
-                top_logprobs=tuple(prompt.top_logprobs[p] for p in steps),
-            )
-        )
-    margin = setting.tie_factor * max(reference.spread.max_abs_delta, MIN_MAX_DELTA)
-    if not chosen or not tokens:
-        return GreedyWorkload(
-            source,
-            notes=tuple(notes),
-            error=f"no text prompt of the greedy reference {reference.path} fits this unit's "
-            f"engine{': ' + '; '.join(notes) if notes else ''}; make a reference with "
-            f"shorter prompts, or set accuracy.boot.greedy.enabled: false",
-        )
-    return GreedyWorkload(source, tuple(chosen), margin, tuple(notes))
-
-
-def judge_greedy(
-    workload: GreedyWorkload, records: Sequence[Mapping[str, Any] | None]
-) -> tuple[list[str], list[str]]:
-    """The engine's greedy tokens against the reference's: the failures, and the near-ties.
-
-    ``records`` are the engine driver's, one per prompt of ``workload`` in
-    order (``None`` where it returned none).
-    """
-    failures: list[str] = []
-    ties: list[str] = []
-    for prompt, record in zip(workload.prompts, records):
-        if record is None:
-            failures.append(f"{prompt.id}: the engine returned no record")
-            continue
-        seen = record.get("prompt_tokens")
-        if isinstance(seen, int) and seen != len(prompt.input_ids):
-            failures.append(
-                f"{prompt.id}: the engine's prompt is {seen} tokens and the reference's "
-                f"{len(prompt.input_ids)}"
-            )
-            continue
-        generated = [int(t) for t in record.get("token_ids") or ()]
-        for step, want in enumerate(prompt.expected):
-            if step >= len(generated):
-                failures.append(
-                    f"{prompt.id}: the engine generated {len(generated)} of "
-                    f"{len(prompt.expected)} tokens"
-                )
-                break
-            got = generated[step]
-            if got == want:
-                continue
-            ids, logprobs = prompt.top_ids[step], prompt.top_logprobs[step]
-            if got in ids:
-                gap = logprobs[0] - logprobs[ids.index(got)]
-                if gap <= workload.tie_margin:
-                    ties.append(
-                        f"{prompt.id} step {step}: engine {got}, reference {want}, "
-                        f"{gap:.3f} apart in the reference"
-                    )
-                    break
-                behind = f"the engine's token {gap:.3f} behind in the reference"
-            else:
-                behind = "the engine's token is not in the reference's top-k"
-            failures.append(
-                f"{prompt.id} step {step}: engine token {got}, reference {want} ({behind}, past "
-                f"the near-tie margin {workload.tie_margin:.3f})"
-            )
-            break
-    return failures, ties
 
 
 @dataclass(frozen=True)
@@ -315,7 +116,6 @@ class BootSpec:
     items: tuple[BootPrompt, ...] = ()
     #: Where the spec came from, named in a verdict.
     source: str = "the default boot prompts"
-    greedy: GreedySetting | None = None
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any], source: str) -> "BootSpec":
@@ -380,24 +180,20 @@ def resolve_boot_spec(
     ``accuracy.boot`` (run-wide keys, with a per-unit entry layered over
     them) when task.yaml declares it, else the default. A unit whose target
     implements ``multimodal`` (and whose scope is not ``text_only``) and whose
-    spec sends no image gets the default image prompt appended. Wherever the
-    run has an HF logit reference, the spec carries the greedy comparison
-    (:meth:`GreedySetting.from_task`).
+    spec sends no image gets the default image prompt appended.
     """
     accuracy = task_data.get("accuracy") or {}
     block = accuracy.get("boot") if isinstance(accuracy, Mapping) else None
-    greedy = GreedySetting.from_task(task_data, unit)
     if isinstance(block, Mapping) and _declares_workload(block):
-        merged = {k: v for k, v in block.items() if k in BOOT_KEYS and k != "greedy"}
+        merged = {k: v for k, v in block.items() if k in BOOT_KEYS}
         chosen = block.get(unit) if unit is not None else None
         where = "accuracy.boot"
         if isinstance(chosen, Mapping) and _declares_workload(chosen):
-            merged.update({k: v for k, v in chosen.items() if k != "greedy"})
+            merged.update(chosen)
             where = f"accuracy.boot.{unit}"
         spec = BootSpec.from_mapping(merged, where)
     else:
         spec = BootSpec()
-    spec = replace(spec, greedy=greedy)
     implemented = {str(f) for f in (features or ())}
     if (
         "multimodal" in implemented
@@ -414,15 +210,11 @@ def resolve_boot_spec(
 
 
 def _declares_workload(block: Mapping[str, Any]) -> bool:
-    """Whether a level of ``accuracy.boot`` says what to send: any key but ``greedy``, at it or below."""
-    for key, value in block.items():
-        if key == "greedy":
-            continue
-        if key in BOOT_KEYS or not isinstance(value, Mapping):
-            return True
-        if set(value) - {"greedy"}:
-            return True
-    return False
+    """Whether a level of ``accuracy.boot`` says what to send, at it or below."""
+    return any(
+        key in BOOT_KEYS or not isinstance(value, Mapping) or bool(value)
+        for key, value in block.items()
+    )
 
 
 #: The top log-probs each boundary probe's tokens carry, to tell a near-tie from a defect.
@@ -487,8 +279,8 @@ class BootBoundarySpec:
         "Two plus two equals",
     )
     timeout: int = 2 * BOOT_TIMEOUT_S
-    #: Nats; the greedy comparison's floor (``DEFAULT_THRESHOLD_FACTOR * MIN_MAX_DELTA``).
-    tie_margin: float = DEFAULT_THRESHOLD_FACTOR * MIN_MAX_DELTA
+    #: Nats between a probe's two legs' tokens that still reads as a near-tie.
+    tie_margin: float = 0.15
     #: The members whose boot runs the phases; empty: one per unit.
     members: tuple[str, ...] = ()
 
@@ -662,9 +454,7 @@ def run_boot_gate(
 
     ``features`` is the features the target under test implements, not those
     the run will finish with (default the run's). ``spec`` is the workload
-    (:func:`resolve_boot_spec`); with ``spec.greedy`` the engine's first
-    greedy tokens must be the HF reference's up to a near-tie
-    (:func:`judge_greedy`). The engine is held to what the gate declared
+    (:func:`resolve_boot_spec`). The engine is held to what the gate declared
     (:func:`engine_failure`). ``mode`` other than ``require`` is a control run
     on the stock implementation, recorded as ``boot[<mode>]``. When enabled,
     ``accuracy.envelope`` appends sequential baseline and loaded boundary phases
@@ -686,19 +476,11 @@ def run_boot_gate(
     requests = spec.requests(task_data.get("trtllm_repo_path"))
     declared_requests = len(requests)
     limits = EngineLimits.from_config(config)
-    greedy = greedy_workload(spec.greedy, limits) if spec.greedy is not None else None
-    if greedy is not None and greedy.error:
-        return _verdict(name=gate_name, member=member, passed=False, detail=greedy.error)
-    if greedy is not None:
-        config["sampling"].update(temperature=0.0, top_k=1, top_p=1.0)
-        requests += greedy.requests()
     subjects = check_config.subject_fields(task_data, unit)
     # A prompt the engine must split proves chunking only where the engine chunks: a variant
     # that turns chunked prefill off is about chunking too, and owes no split prompt.
     chunks = feature_evidence.about(subjects, feature_evidence.CHUNKED) and limits.chunked_prefill
-    if chunks and not any(
-        len(p.input_ids) > limits.max_num_tokens for p in (greedy.prompts if greedy else ())
-    ):
+    if chunks:
         length = chunk_probe_tokens(limits.max_num_tokens, limits.max_seq_len)
         if length is None:
             return _verdict(
@@ -734,10 +516,6 @@ def run_boot_gate(
         config=config,
         requests=requests,
         max_tokens=spec.max_tokens,
-        # Together, so the greedy tokens are compared as a batch decodes them: a
-        # member whose benchmark runs elsewhere has only this to show batching works.
-        concurrency=len(requests) if greedy is not None else 1,
-        ignore_eos=greedy is not None,
         reuse_probe=True,
         phases=phases,
     )
@@ -796,11 +574,6 @@ def run_boot_gate(
             f"{len(requests)} prompt(s) ({', '.join(absent)})",
             **ran,
         )
-    # The reference's prompts are judged by their tokens, which may decode to whitespace.
-    compared = [
-        records.get(n)
-        for n in range(declared_requests, declared_requests + len(greedy.prompts if greedy else ()))
-    ]
     texts = texts[:declared_requests]
     empty = [requests[n]["id"] for n, text in enumerate(texts) if not (text or "").strip()]
     if empty:
@@ -808,21 +581,6 @@ def run_boot_gate(
             passed=False,
             detail=f"the engine exited cleanly but generated nothing for {', '.join(empty)}",
             **ran,
-        )
-    agreed = ""
-    if greedy is not None:
-        failures, ties = judge_greedy(greedy, compared)
-        if failures:
-            return _verdict(
-                passed=False,
-                detail=f"the engine's greedy tokens are not the HF reference's "
-                f"({greedy.source}): {'; '.join(failures)}",
-                **ran,
-            )
-        agreed = (
-            f"; the first {greedy.tokens} greedy tokens of {len(greedy.prompts)} prompt(s) of "
-            f"{greedy.source} are the HF reference's"
-            + (f", up to {len(ties)} near-tie(s) ({'; '.join(ties)})" if ties else "")
         )
     chunked = ""
     if chunks:
@@ -851,7 +609,7 @@ def run_boot_gate(
     return _verdict(
         passed=True,
         detail=f"engine cold-started and produced {checked} for {len(texts)} prompt(s)"
-        f"{sent}; workload: {spec.source}{agreed}{chunked}"
+        f"{sent}; workload: {spec.source}{chunked}"
         + (boundary.describe(config) if phases else "")
         + (
             f"; boundary probes agreed up to {len(boundary_ties)} near-tie(s) "
@@ -927,15 +685,8 @@ __all__ = [
     "DEFAULT_BOOT_IMAGE",
     "DEFAULT_BOOT_IMAGE_KEYWORDS",
     "DEFAULT_BOOT_IMAGE_PROMPT",
-    "DEFAULT_GREEDY_PROMPTS",
-    "DEFAULT_GREEDY_TOKENS",
-    "GreedyPrompt",
-    "GreedySetting",
-    "GreedyWorkload",
     "chunk_probe_tokens",
     "chunk_shortfall",
-    "greedy_workload",
-    "judge_greedy",
     "missing_keywords",
     "resolve_boot_spec",
     "run_boot_gate",

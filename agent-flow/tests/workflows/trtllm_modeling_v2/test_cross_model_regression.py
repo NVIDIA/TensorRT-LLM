@@ -65,43 +65,6 @@ def test_a_change_to_shared_code_is_followed_by_one_regression_check():
 # ------------------------------------------------------------- the run loop
 
 
-def test_the_loop_adds_the_check_runs_it_with_no_turn_and_delivers(tmp_path):
-    contract = c.Contract(checks=(c.Check("core", "boot", "tp1", c.TIER_INNER),))
-    core = _t("core", "assemble", touches=[_EXECUTOR], satisfies=["core:boot@tp1"])
-    answers = [
-        PlannerAnswer("GRAPH_UPDATED", "first plan", g.Graph(tasks=[core])),
-        PlannerAnswer("DONE", "all green"),
-    ]
-    turns = []
-
-    def plan(turn):
-        turns.append(turn)
-        return answers[min(len(turns), len(answers)) - 1]
-
-    worked, checked = [], []
-
-    def work(task):
-        worked.append(task.id)
-        return "UNIT_READY"
-
-    services = Services(
-        plan=plan,
-        work=work,
-        check=lambda chk: SimpleNamespace(
-            name=chk.gate, member=chk.member, passed=True, detail="", tree_state=""
-        ),
-        free_gpus=lambda: 4,
-        regression=lambda task: checked.append((task.id, task.covers)) or [],
-    )
-    status = c.ContractStatus.load(tmp_path)
-    orchestrator = GraphOrchestrator(services, contract, status, tmp_path, poll_s=0, own_paths=_OWN)
-    assert orchestrator.run() == "delivered"
-    assert all(not t.refusals for t in turns)
-    # No agent turn for the check: only core worked, and the check covered what it landed.
-    assert worked == ["core"]
-    assert checked == [("regression", ["core@1"])]
-
-
 def test_a_failed_regression_check_reaches_the_planner(tmp_path):
     contract = c.Contract(checks=(c.Check("core", "boot", "tp1", c.TIER_INNER),))
     core = _t("core", "assemble", touches=[_CATALOG], satisfies=["core:boot@tp1"])

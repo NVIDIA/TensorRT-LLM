@@ -138,6 +138,20 @@ async def test_backend_disables_skills_in_codex_config(monkeypatch):
         )
 
 
+async def test_backend_can_run_without_the_users_plugins(monkeypatch):
+    monkeypatch.setattr(codex_module, "CodexTransport", FakeTransport)
+    monkeypatch.setattr(codex_module, "_resolve_codex_bin", lambda: "/configured/codex")
+    from agent_flow.backends import create_backend
+    from agent_flow.config import BackendConfig
+
+    instance = create_backend(BackendConfig(kind="codex", model="m", plugins=False))
+    async with instance:
+        assert instance._transport.config.config_overrides == (
+            "features.plugins=false",
+            "features.apps=false",
+        )
+
+
 async def test_session_options_use_developer_instructions_and_preserve_native_defaults(
     backend, tmp_path
 ):

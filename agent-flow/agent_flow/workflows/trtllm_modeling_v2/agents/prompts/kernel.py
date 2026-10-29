@@ -61,9 +61,10 @@ class KernelContext:
 KERNEL_SOURCES = """\
 ## Where a kernel comes from
 
-An op in `torch.ops.trtllm` is registered from Python (`tensorrt_llm/_torch/custom_ops/*.py`:
-the file name is its source) or from C++ (`cpp/tensorrt_llm/thop/*.cpp`), and grepping the op's
-name there finds it. A FlashInfer callable no op wraps is tier 3: the entry's `__call__` calls
+An op in `torch.ops.trtllm` is registered from Python (a `torch.library.custom_op("trtllm::...")`
+under the custom ops `tree_map.md` lists: the file name is its source) or from C++ (a
+`TORCH_LIBRARY_FRAGMENT(trtllm, ...)` / `TORCH_LIBRARY_IMPL(trtllm, ...)` block), and
+`git grep` for the op's name finds it. A FlashInfer callable no op wraps is tier 3: the entry's `__call__` calls
 `flashinfer.<module>.<name>` itself. What the entry certifies follows the source: a JIT-compiled
 kernel (CuTe DSL, Triton, FlashInfer) states the architecture it compiled for and that the JIT
 path ran; a compiled-in C++ kernel is in the wheel or not. Say which in the entry's `note`.

@@ -7,7 +7,8 @@ The schema says whether a spec is well formed. This says whether it is a good
 one for the request: settings that make every gate slow (eager graphs, a batch
 below the concurrency it claims), scope that multiplies the contract (variant
 cross products, a feature proven at several members or again under another
-axis, a disaggregated member wider than one node), accuracy that
+axis, a member too narrow for one engine, a disaggregated member wider than a
+session), accuracy that
 cannot judge anything (a placeholder anchor, a chat-template protocol cut off
 early), boot probes that fail on near ties, a launch the environment cannot
 start, and notes that tell the roles what not to read but nothing about the
@@ -29,7 +30,6 @@ from __future__ import annotations
 import json
 import math
 import re
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
@@ -37,10 +37,12 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 import yaml
 
 from ..checks import accuracy_policy, check_config
+from ..checks import disagg as disagg_checks
 from ..operators import prior_art, tree_anchors
 from . import variants as variants_mod
 from .task_schema import (
     assembly_units,
+    gpus_per_node,
     members_for,
     parse_parallel_segment,
     profile_of,
@@ -60,14 +62,14 @@ PLAUSIBLE_ANCHOR: dict[str, float] = {"gsm8k": 60.0}
 CHAT_TEMPLATE_MIN_OUTPUT = 1024
 #: A chunked-prefill engine splitting prompts finer than this pays a context step per chunk.
 SMALL_CHUNK_TOKENS = 4096
+#: The share of a device's memory one engine's weights may take: the rest holds the KV cache,
+#: activations and CUDA graphs. A member below the width this implies cannot serve the model.
+#: (A 344-GiB checkpoint has served disaggregated on two 277-GiB devices per engine: 62%.)
+ENGINE_WEIGHT_FRACTION = 0.75
 #: Notes past this many characters stop being a brief: every role reads them in every turn.
 NOTES_BRIEF_CHARS = 6000
 #: The prior-art leads of each kind the notes are expected to name (or set aside).
 PRIOR_ART_NAMED_PER_KIND = 3
-#: Variables a leg-B launcher may read without the spec setting them: the flow's, the
-#: engine's and the scheduler's own.
-LAUNCHER_ENV_PREFIXES = ("MV2FLOW_", "TRTLLM_", "CUDA_", "NCCL_", "UCX_", "SLURM_", "OMPI_", "PMI")
-LAUNCHER_ENV_NAMES = ("PATH", "HOME", "USER", "TMPDIR", "PYTHONPATH", "LD_LIBRARY_PATH")
 
 _ACCEPT = re.compile(r"intake-accept:\s*([a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)", re.I)
 _BROAD_EMBARGO = re.compile(
@@ -84,10 +86,6 @@ _INTAKE_PROCESS = re.compile(
     r"|\b(?:do not|don't|never)\s+(?:start|launch|run)\s+(?:the\s+)?(?:workflow|run)\b"
     r"|\bno\s+(?:workflow|agent turns?|builds?|slurm jobs?)\b[^.]{0,120}\b(?:allowed|permitted)\b",
     re.I,
-)
-# What a launcher script reads from its environment (Python or shell).
-_ENV_READ = re.compile(
-    r"""(?:os\.environ(?:\.get)?\s*[\[(]\s*|os\.getenv\s*\(\s*|\$\{?)['"]?([A-Z][A-Z0-9_]{2,})"""
 )
 _BRIEF_WORDS = ("architecture", "prior art")
 _PLACEHOLDER_WORDS = ("placeholder", "uncalibrated", "unmeasured", "pending")
@@ -170,6 +168,8 @@ class LintContext:
     base: Path | None = None
     constraints: list[str] = field(default_factory=list)
     prior_art: prior_art.PriorArt | None = None
+    #: The checkpoint's weights in bytes (its safetensors index, else its files); ``None`` unread.
+    weight_bytes: int | None = None
 
     @property
     def notes(self) -> str:
@@ -222,11 +222,7 @@ def _ranks_sharing_batch(member: str) -> int:
     return (size or 1) if kind == "dep" else 1
 
 
-def _gpus_per_node(task: Mapping[str, Any]) -> int | None:
-    env = task.get("environment") or {}
-    sizes = [env.get("gpus_per_node")] + [s.get("gpus_per_node") for s in env.get("sessions") or ()]
-    sizes = [s for s in sizes if isinstance(s, int) and s > 0]
-    return max(sizes) if sizes else None
+_gpus_per_node = gpus_per_node
 
 
 def _benchmark(accuracy: Mapping[str, Any]) -> str:
@@ -263,6 +259,56 @@ def _variant_axes(entry: Mapping[str, Any]) -> set[str]:
     return axes
 
 
+def checkpoint_weight_bytes(checkpoint: str | Path | None) -> int | None:
+    """The checkpoint's weights in bytes: its safetensors index's total, else its files' sizes."""
+    if not checkpoint:
+        return None
+    root = Path(str(checkpoint))
+    try:
+        index = json.loads((root / "model.safetensors.index.json").read_text(encoding="utf-8"))
+        total = int((index.get("metadata") or {}).get("total_size") or 0)
+        if total > 0:
+            return total
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        total = sum(f.stat().st_size for f in root.glob("*.safetensors"))
+    except OSError:
+        return None
+    return total or None
+
+
+def engine_width(weight_bytes: int | None, gpu_memory_gib: Any) -> int | None:
+    """The fewest devices (a power of two) one engine's weights fit on; ``None`` unknown."""
+    memory = gpu_memory_gib
+    if not weight_bytes or not isinstance(memory, (int, float)) or memory <= 0:
+        return None
+    room = ENGINE_WEIGHT_FRACTION * float(memory) * 2**30
+    width = 1
+    while weight_bytes / width > room:
+        width *= 2
+    return width
+
+
+def _engine_width(ctx: LintContext) -> int | None:
+    return engine_width(ctx.weight_bytes, ctx.environment.get("gpu_memory_gib"))
+
+
+def _gib(nbytes: float) -> str:
+    return f"{nbytes / 2**30:.0f} GiB"
+
+
+def _session_nodes(task: Mapping[str, Any]) -> int:
+    """The most nodes one session the gates run on holds (``environment.sessions[].nodes``)."""
+    sessions = (task.get("environment") or {}).get("sessions") or ()
+    nodes = [
+        s.get("nodes") or 1
+        for s in sessions
+        if isinstance(s, Mapping) and s.get("role", "any") in ("gates", "any")
+    ]
+    return max([n for n in nodes if isinstance(n, int)] or [1])
+
+
 def _host_path(environment: Mapping[str, Any], path: str) -> Path | None:
     """Where ``path``, as the run's commands see it, lives on this host; ``None``: in the image only."""
     if not environment.get("container_image"):
@@ -288,7 +334,8 @@ def cuda_graph_rules(ctx: LintContext) -> Iterator[Finding]:
     if ctx.contract is None:
         checked = scored = set(eager)
     else:
-        required = ctx.contract.required()
+        # The disaggregated-serving test configures its own engines, whatever `runtime` says.
+        required = [c for c in ctx.contract.required() if c.gate != disagg_checks.GATE_NAME]
         checked = {c.unit for c in required}
         scored = {c.unit for c in required if str(c.gate).startswith("accuracy")}
     blocked = [name for name in eager if name in scored]
@@ -400,27 +447,81 @@ def kv_cache_rules(ctx: LintContext) -> Iterator[Finding]:
             )
 
 
+def placement_rules(ctx: LintContext) -> Iterator[Finding]:
+    """Every member holds one engine of the checkpoint; disaggregation's two engines fit one node."""
+    task = ctx.task
+    width = _engine_width(ctx)
+    memory = ctx.environment.get("gpu_memory_gib")
+    if ctx.contract is not None and width is not None and width > 1:
+        members = {c.member for c in ctx.contract.required()}
+        narrow = sorted((m for m in members if _width(m) < width), key=lambda m: (_width(m), m))
+        if narrow:
+            yield Finding(
+                "member-too-narrow",
+                WARN,
+                f"{', '.join(narrow)} hold one engine on fewer than {width} devices: the "
+                f"checkpoint's {_gib(ctx.weight_bytes or 0)} of weights take more than "
+                f"{ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device there, which leaves "
+                "the KV cache and CUDA graphs no room, if it loads at all",
+                f"gate members of {width} devices or more; an estimate from the weights alone, "
+                "so accept it in notes where a member is known to serve",
+            )
+    per_node = _gpus_per_node(task)
+    if not per_node:
+        return
+    nodes = _session_nodes(task)
+    if nodes > 1:
+        yield Finding(
+            "session-nodes-unneeded",
+            INFO,
+            f"a gates session holds {nodes} nodes, but no check needs more than one (the "
+            "disaggregated-serving test runs on one node): a multi-node allocation waits "
+            "longer to start and to renew than single-node ones",
+            "use single-node sessions",
+        )
+    if "disagg" not in assembly_units(task):
+        return
+    spec = disagg_checks.DisaggSpec.from_task(task) or disagg_checks.DisaggSpec(
+        test="", node_gpus=per_node
+    )
+    required = ctx.contract.required() if ctx.contract is not None else ()
+    gated = [c.member for c in required if c.gate == disagg_checks.GATE_NAME]
+    member = gated[0] if gated else (members_for(task, "disagg", ctx.world) or [None])[0]
+    if spec.devices and spec.devices > per_node:
+        yield Finding(
+            "disagg-placement",
+            BLOCK,
+            f"accuracy.disagg.devices is {spec.devices}, more than one {per_node}-GPU node: the "
+            "tree's disaggregated launcher (`launch_disaggregated_llm`) starts every worker on "
+            "one host, so the test runs on one node, and a job asking for more is refused",
+            f"write the test for {per_node} devices or fewer (its context and generation "
+            "workers between them) and set `devices` to match",
+        )
+        return
+    devices = spec.device_count(member)
+    if width is not None and devices and 2 * width > devices:
+        yield Finding(
+            "disagg-placement",
+            WARN,
+            f"the disaggregated-serving test at {member} runs on {devices} devices of one node, "
+            f"and one engine of the checkpoint takes {width} ({_gib(ctx.weight_bytes or 0)} of "
+            f"weights at most {ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device): its "
+            "context and generation workers do not both fit",
+            "an estimate from the weights alone: accept it in notes where both are known to "
+            "fit; otherwise the tree's single-node launcher cannot serve this checkpoint "
+            "disaggregated here, so accept `disagg@*` in coverage.accept and say why in notes",
+        )
+
+
+def _width(member: str) -> int:
+    try:
+        return parse_parallel_segment(member)[1] or 1
+    except Exception:
+        return 1
+
+
 def scope_rules(ctx: LintContext) -> Iterator[Finding]:
     task = ctx.task
-    per_node = _gpus_per_node(task)
-    if "disagg" in assembly_units(task) and per_node:
-        wide = [
-            m
-            for m in members_for(task, "disagg", ctx.world)
-            if (parse_parallel_segment(m)[1] or 1) * 2 > per_node
-        ]
-        if wide:
-            fits = f"dep{per_node // 2}" if per_node >= 2 else "a smaller member"
-            yield Finding(
-                "disagg-two-nodes",
-                WARN,
-                f"disagg is gated at {', '.join(wide)}: its context and generation legs need "
-                f"{2 * max(parse_parallel_segment(m)[1] or 1 for m in wide)} GPUs, more than one "
-                f"{per_node}-GPU node, so the witness needs a cross-node transport and a two-node "
-                "allocation the run's sessions do not manage",
-                f"gate disagg in the flow at {fits} (both legs on one node) and check the wider "
-                "member outside it; list it in coverage.accept and say so in notes",
-            )
     crossed = sorted(
         name
         for name, entry in (task.get("variants") or {}).items()
@@ -440,7 +541,7 @@ def scope_rules(ctx: LintContext) -> Iterator[Finding]:
         yield Finding(
             "profile-certified",
             INFO,
-            "the certified profile owes every unit's benchmark at every member and its witness",
+            "the certified profile turns on boot boundaries and the serve gate",
         )
 
 
@@ -608,17 +709,29 @@ def accuracy_rules(ctx: LintContext) -> Iterator[Finding]:
     plausible = PLAUSIBLE_ANCHOR.get(benchmark)
     low = [v for v in values if plausible is not None and v < plausible]
     marked = any(word in text.lower() for word in _PLACEHOLDER_WORDS)
-    if low or marked:
-        what = f"{', '.join(f'{v:g}' for v in low)} " if low else ""
+    replace = (
+        "replace the row, committed, when a measured anchor is known (the user's, the "
+        "reference implementation's on this hardware, or one the onboarding measures): every "
+        "accuracy check then runs again"
+    )
+    if low:
+        yield Finding(
+            "accuracy-placeholder-anchor",
+            INFO,
+            f"the {benchmark} anchor {', '.join(f'{v:g}' for v in low)} is a low placeholder: "
+            f"its floor catches an engine that answers nothing and passes one that answers "
+            f"({_floors(accuracy, values)}); a configuration variant is judged against its "
+            "unit's own score, not this row",
+            replace,
+        )
+    elif marked:
         yield Finding(
             "accuracy-placeholder-anchor",
             WARN,
-            f"the {benchmark} anchor {what}is a placeholder: every accuracy gate it floors either "
-            f"passes a broken target or fails a working one ({_floors(accuracy, values)})",
-            "start the reference measurement now (the reference implementation on this "
-            "hardware, under the gates' exact protocol) and replace the rows when it lands; "
-            "until then keep the placeholder a few points under the score you expect, so it "
-            "catches a broken target without failing a working one",
+            f"the {benchmark} anchor is marked a placeholder but sits at a score a working "
+            f"target may miss ({_floors(accuracy, values)}): a guess too high fails every "
+            "accuracy check and sends the workers after a defect that is not there",
+            f"set the placeholder well under the score you expect (e.g. 10); {replace}",
         )
 
 
@@ -655,63 +768,20 @@ def boot_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
-def witness_rules(ctx: LintContext) -> Iterator[Finding]:
-    """A witness's contrast launcher must exist by the time it runs, and read only what the spec sets."""
-    witness = ctx.accuracy.get("witness") or {}
-    for feature, block in witness.items() if isinstance(witness, Mapping) else ():
-        if not isinstance(block, Mapping) or not block.get("contrast_command"):
-            continue
-        command = str(block["contrast_command"])
-        try:
-            words = shlex.split(command)
-        except ValueError:
-            words = command.split()
-        scripts = [Path(w) for w in words if w.endswith((".py", ".sh"))]
-        if not scripts:
-            continue
-        script = (
-            scripts[0] if scripts[0].is_absolute() or ctx.base is None else ctx.base / scripts[0]
+def disagg_rules(ctx: LintContext) -> Iterator[Finding]:
+    """The disaggregated-serving test the run writes is named, and is there or planned."""
+    spec = disagg_checks.DisaggSpec.from_task(ctx.task)
+    if spec is None or "disagg" not in assembly_units(ctx.task) or not ctx.repo:
+        return
+    test_file = Path(ctx.repo) / spec.test.partition("::")[0]
+    if not test_file.is_file():
+        yield Finding(
+            "disagg-test-pending",
+            INFO,
+            f"disagg's test {spec.test} is not in the tree yet: the run writes it beside the "
+            "tree's tests that serve through `trtllm-serve disaggregated`; say in notes which task "
+            "does",
         )
-        if not script.is_file():
-            yield Finding(
-                "witness-contrast-pending",
-                INFO,
-                f"{feature}'s contrast leg {script} does not exist yet: the run has to write it at "
-                "that path before the witness runs; say in notes which task does",
-            )
-            continue
-        try:
-            text = script.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        given = {
-            str(k)
-            for source in (
-                block.get("contrast_env"),
-                block.get("legs_env"),
-                ctx.environment.get("env"),
-            )
-            if isinstance(source, Mapping)
-            for k in source
-        }
-        unset = sorted(
-            name
-            for name in set(_ENV_READ.findall(text))
-            if not name.startswith(LAUNCHER_ENV_PREFIXES)
-            and name not in LAUNCHER_ENV_NAMES
-            and name not in given
-        )
-        if unset:
-            yield Finding(
-                "witness-contrast-env",
-                WARN,
-                f"{feature}'s contrast leg {script} reads {', '.join(unset)}, which neither "
-                "contrast_env, legs_env nor environment.env sets: the witness cannot pass "
-                "without editing the spec",
-                "set them in contrast_env (that leg only) or legs_env (both legs), or point "
-                "contrast_command at the launcher the run will write and say in notes which task "
-                "writes it",
-            )
 
 
 def environment_rules(ctx: LintContext) -> Iterator[Finding]:
@@ -785,10 +855,10 @@ def notes_rules(ctx: LintContext) -> Iterator[Finding]:
             "notes-broad-embargo",
             WARN,
             "notes forbid reading existing implementations in general terms: roles then avoid "
-            "in-tree kernels, attention backends and other targets' ops, the cheapest rungs "
-            "of the sourcing ladder",
+            "in-tree kernels, attention backends, other targets' ops, kernel libraries and "
+            "other engines' implementations, the prior art that saves the most work",
             "name embargoed paths in `source_embargo` only, and say in notes that in-tree "
-            "kernels, backends and other models' targets are open to reuse",
+            "kernels, backends, other models' targets and other engines are open to reuse",
         )
 
 
@@ -848,13 +918,14 @@ RULES: tuple[Rule, ...] = (
     cuda_graph_rules,
     runtime_rules,
     kv_cache_rules,
+    placement_rules,
     scope_rules,
     contract_rules,
     feature_rules,
     coverage_rules,
     accuracy_rules,
     boot_rules,
-    witness_rules,
+    disagg_rules,
     environment_rules,
     notes_rules,
     engine_rules,
@@ -931,6 +1002,7 @@ def lint_task(
         config=config,
         repo=repo,
         base=base,
+        weight_bytes=checkpoint_weight_bytes(checkpoint),
     )
     if config is not None:
         ctx.constraints = prior_art.engine_constraints(config, repo)

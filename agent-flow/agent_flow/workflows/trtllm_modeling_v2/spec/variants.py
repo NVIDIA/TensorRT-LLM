@@ -30,6 +30,9 @@ from typing import Any, Mapping
 from .schema_keys import reject_unknown_keys
 
 VARIANTS_FIELD = "variants"
+#: What an accuracy floor stands on (`accuracy.anchor`; see task_schema.ANCHOR_STATES).
+ANCHOR_RECORDED = "recorded"
+ANCHOR_RELATIVE = "relative"
 VARIANT_KEYS: tuple[str, ...] = (
     "unit",
     "members",
@@ -51,7 +54,10 @@ VARIANT_ACCURACY_KEYS: tuple[str, ...] = (
     "benchmark_args",
     "samples",
     "acceptance",
+    "anchor",
 )
+#: The variant accuracy keys that name a reference row of the variant's own.
+VARIANT_ROW_KEYS: tuple[str, ...] = ("benchmark", "reference_yaml", "model_key", "discriminators")
 RUNTIME_OVERLAY_KEYS: tuple[str, ...] = (
     "cuda_graph",
     "chunked_prefill",
@@ -77,6 +83,27 @@ def is_variant(data: Mapping[str, Any], name: str | None) -> bool:
 def base_unit(data: Mapping[str, Any], name: str) -> str:
     """The unit whose target a variant configures."""
     return str(variants(data)[name].get("unit") or "core")
+
+
+def anchor_state(data: Mapping[str, Any], name: str) -> str:
+    """What ``name``'s accuracy floor stands on: ``recorded`` or ``relative`` (``task_schema``).
+
+    A unit's is a row of reference_yaml. A variant's is its own ``accuracy.anchor``,
+    else ``recorded`` when it names a row of its own (:data:`VARIANT_ROW_KEYS`), else
+    ``relative``: its unit's own score at the same member, on the same target.
+    """
+    accuracy = data.get("accuracy") or {}
+    if not is_variant(data, name):
+        return ANCHOR_RECORDED
+    own = variants(data)[name].get("accuracy") or {}
+    stated = own.get("anchor") or (
+        accuracy.get("anchor", {}).get(name)
+        if isinstance(accuracy.get("anchor"), Mapping)
+        else None
+    )
+    if stated:
+        return str(stated)
+    return ANCHOR_RECORDED if any(own.get(key) for key in VARIANT_ROW_KEYS) else ANCHOR_RELATIVE
 
 
 def variant_gates(data: Mapping[str, Any], name: str) -> tuple[str, ...]:
@@ -160,6 +187,12 @@ def validate_variants(
             reject_unknown_keys(
                 entry["accuracy"], VARIANT_ACCURACY_KEYS, errors, where=f"{where}.accuracy"
             )
+            anchor = entry["accuracy"].get("anchor")
+            if anchor is not None and anchor not in (ANCHOR_RECORDED, ANCHOR_RELATIVE):
+                errors.append(
+                    f"'{where}.accuracy.anchor' must be {ANCHOR_RECORDED!r} (a row of its own) "
+                    f"or {ANCHOR_RELATIVE!r} (its unit's own score); got {anchor!r}"
+                )
         if not (entry.get("runtime") or entry.get("llm_api_options") or entry.get("env")):
             errors.append(
                 f"'{where}' changes nothing: give it `runtime`, `llm_api_options` or `env`"
@@ -174,21 +207,6 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str
         else:
             merged[key] = copy.deepcopy(value)
     return merged
-
-
-def variant_anchor_pending(data: Mapping[str, Any], spec: Mapping[str, Any], name: str) -> bool:
-    """Whether variant ``name`` has no written anchor (``accuracy.anchor``).
-
-    Its own say where the anchor mapping names it, else its base unit's: a
-    variant of a unit whose anchor is pending has none of its own either.
-    """
-    # task_schema validates the variants with this module, so it is read here, when called.
-    from .task_schema import ANCHOR_PENDING, anchor_pending
-
-    own = (spec.get("accuracy") or {}).get("anchor")
-    if isinstance(own, Mapping) and name in own:
-        return own[name] == ANCHOR_PENDING
-    return anchor_pending(data.get("accuracy") or {}, base_unit(data, name))
 
 
 def describe(data: Mapping[str, Any], name: str) -> str:
@@ -210,15 +228,18 @@ def describe(data: Mapping[str, Any], name: str) -> str:
 
 
 __all__ = [
+    "ANCHOR_RECORDED",
+    "ANCHOR_RELATIVE",
     "DEFAULT_VARIANT_GATES",
     "OPTIONS_DIRNAME",
     "VARIANTS_FIELD",
     "VARIANT_GATES",
+    "VARIANT_ROW_KEYS",
+    "anchor_state",
     "base_unit",
     "describe",
     "is_variant",
     "validate_variants",
-    "variant_anchor_pending",
     "variant_gates",
     "variants",
 ]

@@ -24,6 +24,7 @@ from agent_flow.console import print_message, print_rule
 from agent_flow.prompts import dump_prompt_bundle
 
 from ...agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
+from ...agents.roles import packaged_skills
 from ...agents.turns import TURNS_DIRNAME
 from ...checks import check_config, gate_cli
 from ...infra.compute.environment import (
@@ -366,6 +367,8 @@ def _prove_agents(workflow, log) -> bool:
     else:
         reusable, why = False, "this is a new run"
     if reusable:
+        recorded = (read_json(record_path) or {}).get("foreign_skills") or {}
+        workflow._foreign_skills = {str(k): tuple(v) for k, v in recorded.items()}
         workflow.journal.event("agent probe not run", f"{why}; `{record_path}`")
         print_message(f"[bold green]✔ agent probe[/bold green] not run: {why}", log)
         return True
@@ -373,6 +376,7 @@ def _prove_agents(workflow, log) -> bool:
     outcomes = agent_probe.probe_agents(
         agents, workflow.workspace, repo=repo, head=workflow._head()
     )
+    workflow._foreign_skills = agent_probe.foreign_skills(outcomes, packaged_skills())
     if not all(outcome.ok for outcome in outcomes):
         record_path.unlink(missing_ok=True)
         report = agent_probe.format_failures(outcomes)
@@ -387,7 +391,12 @@ def _prove_agents(workflow, log) -> bool:
     record_path.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(
         record_path,
-        {"at": time.time(), "inputs": inputs, "agents": [a.as_dict() for a in agents]},
+        {
+            "at": time.time(),
+            "inputs": inputs,
+            "agents": [a.as_dict() for a in agents],
+            "foreign_skills": {k: list(v) for k, v in workflow._foreign_skills.items()},
+        },
     )
     proven = "; ".join(
         outcome.probed.label
@@ -395,7 +404,16 @@ def _prove_agents(workflow, log) -> bool:
         + f": {', '.join(outcome.probed.roles)}"
         for outcome in outcomes
     )
-    workflow.journal.event("agent probe passed", f"run because {why}; {proven}; `{record_path}`")
+    turned_off = "; ".join(
+        f"{backend} roles run without {', '.join(names)}"
+        for backend, names in workflow._foreign_skills.items()
+        if names
+    )
+    workflow.journal.event(
+        "agent probe passed",
+        f"run because {why}; {proven}; `{record_path}`"
+        + (f"; the user's skills are off ({turned_off}), and their plugins" if turned_off else ""),
+    )
     print_message(
         f"[bold green]✔ agent probe[/bold green] {len(agents)} agent(s) ran Bash in the "
         f"workspace and read the checkout's HEAD: {escape_markup(proven)}",

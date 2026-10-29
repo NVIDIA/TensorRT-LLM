@@ -28,6 +28,25 @@ what it needs in header lines among its first :data:`HEADER_SCAN_LINES` lines, f
 ``gpus`` is a device count or ``all`` (the whole node, exclusively). Without it a ``free-`` name
 holds nothing and any other name holds the whole node.
 
+MULTI-NODE JOBS
+===============
+
+::
+
+    <spool>/gangs/<name>/record.json       its nodes: the leader first, then each member
+    <spool>/gangs/<name>/ready/<watcher>   a member drained for it
+    <spool>/gangs/<name>/go.json           every node is drained: each starts its part
+    <spool>/gangs/<name>/parts/<rank>.json how each node's part ended
+
+A job declaring ``nodes=N`` holds N whole nodes of one allocation: one watcher per node, all on
+this spool (a session of ``nodes: N``). The watcher that admits it leads: it picks N-1 live peers
+of its allocation and records them; each stops admitting GPU work and, once drained, says it is
+ready. When all are, the leader claims the job, writes ``go.json`` and every node runs the same
+script under ``MV2FLOW_JOB_NODES``, ``MV2FLOW_JOB_NODE_RANK``, ``MV2FLOW_JOB_HOSTS`` and
+``MV2FLOW_JOB_MASTER``, rank 0's log at ``logs/<name>.log``, rank r's at ``logs/<name>.node<r>.log``.
+A part that fails stops the others; the job's receipt waits for every part and carries the
+first that failed. One multi-node job holds a spool's nodes at a time.
+
 LOST ALLOCATIONS
 ================
 
@@ -95,6 +114,7 @@ import math
 import os
 import re
 import resource
+import shutil
 import signal
 import socket
 import subprocess
@@ -118,6 +138,12 @@ except ImportError:  # run by path: the sibling modules are on sys.path[0]
 # --------------------------------------------------------------------------- protocol
 
 HEADER_TAG = "#spool:"
+
+#: Files under ``gangs/<name>/`` (MULTI-NODE JOBS).
+GANG_RECORD = "record.json"
+GANG_READY = "ready"
+GANG_GO = "go.json"
+GANG_PARTS = "parts"
 
 #: Prefix of the line that counts a job's re-runs after lost allocations (:func:`stamp_rerun`).
 RERUN_TAG = "#spool-rerun:"
@@ -147,6 +173,8 @@ RC_LAUNCH_FAILED = 215
 RC_CANCELLED = 216
 RC_MIXED_CHECKOUT = 217
 RC_NODE_LOST = 218
+#: A multi-node job's part stopped because another node's part failed.
+RC_GANG_STOPPED = 219
 
 #: Verdict reasons of a job its session ended, not the job: nothing in them is a verdict.
 SESSION_LOSS_REASONS = frozenset({"orphaned", "node_lost"})
@@ -247,6 +275,13 @@ def _parse_gpus(text: str) -> int | None:
     return value
 
 
+def _parse_nodes(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise ValueError("must be >= 1")
+    return value
+
+
 def _parse_tree(text: str) -> str:
     if not text.startswith("/"):
         raise ValueError("must be an absolute path")
@@ -263,6 +298,7 @@ def _parse_word(text: str) -> str:
 #: a misspelt limit that is silently ignored is a limit nobody has.
 HEADER_KEYS: dict[str, tuple[str, Callable[[str], object]]] = {
     "gpus": ("gpus", _parse_gpus),
+    "nodes": ("nodes", _parse_nodes),
     "priority": ("priority", int),
     "wall": ("wall_s", parse_duration),
     "owner": ("owner", _parse_word),
@@ -278,6 +314,8 @@ class JobSpec:
     name: str
     #: Device count, or ``None`` for the whole node.
     gpus: int | None = 0
+    #: Whole nodes the job holds; more than one makes it a multi-node job (MULTI-NODE JOBS).
+    nodes: int = 1
     priority: int = 0
     #: Wall-clock limit from START, in seconds. ``None`` takes the watcher's default; 0 is none.
     wall_s: float | None = None
@@ -301,6 +339,11 @@ class JobSpec:
     def holds_gpus(self) -> bool:
         """Whether the job takes part in device accounting."""
         return self.gpus is None or self.gpus > 0
+
+    @property
+    def gang(self) -> bool:
+        """Whether the job holds more than one node."""
+        return self.nodes > 1
 
     def describe_gpus(self) -> str:
         return ALL_GPUS if self.gpus is None else str(self.gpus)
@@ -526,7 +569,7 @@ def read_device_memory_mib() -> dict[str, int] | None:
 class SpoolPaths:
     """Where each part of the protocol lives under one spool."""
 
-    SUBDIRS = ("pending", "running", "done", "logs", "history", "watchers", "cancel")
+    SUBDIRS = ("pending", "running", "done", "logs", "history", "watchers", "cancel", "gangs")
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -537,6 +580,7 @@ class SpoolPaths:
         self.history = self.root / "history"
         self.watchers = self.root / "watchers"
         self.cancel = self.root / "cancel"
+        self.gangs = self.root / "gangs"
         self.status = self.root / "watcher.status"
         self.snapshot = self.root / "status.json"
         self.handover = self.root / HANDOVER_DIRNAME
@@ -725,6 +769,8 @@ class RunningJob:
     failure_line: str = ""
     #: Every pid this scheduler has sent a signal to.
     signalled: set[int] = field(default_factory=set)
+    #: This node's part of a multi-node job: ``name``, ``rank``, ``nodes``, ``hosts``, ``members``.
+    gang: dict | None = None
 
     @property
     def wall_s(self) -> float:
@@ -774,6 +820,8 @@ class Scheduler:
         self._device_read_epoch = 0.0
         #: This pass's native locations by job tree (see _admission_hold).
         self._native_seen: dict[str, list[str]] = {}
+        #: The multi-node job this node drains for, while it forms (see _serve_gangs).
+        self._reserved_for = ""
         self.paths.ensure()
 
     # ------------------------------------------------------------- lifecycle
@@ -831,6 +879,7 @@ class Scheduler:
         for job in list(self.jobs.values()):
             self._advance(job, now, table)
         self._recover_orphans(now, table)
+        self._serve_gangs(now)
         self._plan_handover(now)
         self._admit(now)
         self.heartbeat()
@@ -962,6 +1011,11 @@ class Scheduler:
             spec.wall_s = self.config.default_wall_s if spec.holds_gpus else 0.0
         if spec.tree and not Path(spec.tree).is_dir():
             spec.errors.append(f"tree {spec.tree} is not a directory this watcher can see")
+        if spec.gang and spec.gpus is not None:
+            spec.errors.append(
+                f"asks for {spec.nodes} nodes and {spec.gpus} GPU(s): a multi-node job holds "
+                f"whole nodes; drop gpus or set gpus=all"
+            )
         if spec.gpus is not None and spec.gpus > len(self.config.devices):
             spec.errors.append(
                 f"asks for {spec.gpus} GPU(s); this session hands out "
@@ -993,6 +1047,23 @@ class Scheduler:
             hold = self._admission_hold(spec, now)
             if hold is not None:
                 self._wait(spec, hold.reason)
+                continue
+            if spec.gang:
+                leads = self._leads(spec.name)
+                if blocked_by is not None and not leads:
+                    self._wait(spec, f"queued behind {blocked_by}")
+                    continue
+                hold = self._gang_step(spec, now)
+                if hold is not None:
+                    self._wait(spec, hold.reason)
+                    # Only a formed job this node leads holds back the work ranked below it.
+                    if self._leads(spec.name):
+                        blocked_by = spec.name
+                continue
+            if self._reserved_for and spec.holds_gpus:
+                self._wait(
+                    spec, f"this node is reserved for the multi-node job {self._reserved_for}"
+                )
                 continue
             if spec.holds_gpus:
                 if blocked_by is not None:
@@ -1198,6 +1269,224 @@ class Scheduler:
         self.pending_reasons[spec.name] = reason
         self._last_pending.append(spec)
 
+    # ----------------------------------------------------------------- gangs
+
+    def _live(self, now: float) -> set[str]:
+        """The watchers of this spool that heart-beat within :data:`WATCHER_STALE_S`."""
+        return {str(w.get("watcher")) for w in self.paths.live_watchers(WATCHER_STALE_S, now)} | {
+            self.watcher_id
+        }
+
+    def _leads(self, name: str) -> bool:
+        """Whether this watcher leads the formed multi-node job ``name``."""
+        record = read_json(self.paths.gangs / name / GANG_RECORD)
+        return bool(record) and record.get("leader") == self.watcher_id
+
+    def _gang_step(self, spec: JobSpec, now: float) -> "Hold | None":
+        """Form multi-node job ``spec`` with this node leading, then start it once all drained.
+
+        ``None`` once it started here (or another watcher claimed it); otherwise why it waits.
+        """
+        root = self.paths.gangs / spec.name
+        record = read_json(root / GANG_RECORD)
+        live = self._live(now)
+        if record is not None and record.get("leader") not in live:
+            shutil.rmtree(root, ignore_errors=True)
+            record = None
+        if record is None:
+            others = sorted(p.name for p in self.paths.gangs.iterdir() if p.is_dir())
+            if others:
+                return Hold(f"the multi-node job {others[0]} holds this session's nodes")
+            peers = sorted(
+                (
+                    w
+                    for w in self.paths.live_watchers(WATCHER_STALE_S, now)
+                    if w.get("slurm_job") == self.slurm_job
+                    and w.get("watcher") != self.watcher_id
+                    and w.get("host") != self.host
+                ),
+                key=lambda w: (str(w.get("host")), str(w.get("watcher"))),
+            )[: spec.nodes - 1]
+            if len(peers) < spec.nodes - 1:
+                return Hold(
+                    f"asks for {spec.nodes} nodes; allocation {self.slurm_job} has "
+                    f"{1 + len(peers)} live on this spool"
+                )
+            try:
+                root.mkdir()
+            except FileExistsError:
+                return Hold("another watcher is forming it")
+            record = {
+                "name": spec.name,
+                "leader": self.watcher_id,
+                "allocation": self.slurm_job,
+                "members": [self.watcher_id, *(str(w["watcher"]) for w in peers)],
+                "hosts": [self.host, *(str(w.get("host")) for w in peers)],
+                "formed": utc_iso(now),
+            }
+            write_json_atomic(root / GANG_RECORD, record)
+        if record.get("leader") != self.watcher_id:
+            return Hold(f"its nodes are formed by {record.get('leader')}")
+        members, hosts = list(record["members"]), list(record["hosts"])
+        lost = [h for m, h in zip(members[1:], hosts[1:]) if m not in live]
+        if lost:
+            shutil.rmtree(root, ignore_errors=True)
+            return Hold(f"{', '.join(lost)} stopped heart-beating; its nodes are formed again")
+        placed = self._place(spec, now)
+        if isinstance(placed, Hold):
+            return Hold(f"this node: {placed.reason}")
+        waiting = [
+            h for m, h in zip(members[1:], hosts[1:]) if not (root / GANG_READY / m).exists()
+        ]
+        if waiting:
+            return Hold(f"waiting for {', '.join(waiting)} to drain for it")
+        pending = self.paths.pending / f"{spec.name}.sh"
+        running = self.paths.running / f"{spec.name}.sh"
+        try:
+            os.rename(pending, running)
+        except OSError:
+            return None
+        self._spec_cache.pop(spec.name, None)
+        self.paths.archive(spec.name)
+        write_json_atomic(root / GANG_GO, {"hosts": hosts, "started": utc_iso(now)})
+        gang = {"name": spec.name, "rank": 0, "nodes": len(members), "hosts": hosts}
+        self._launch(spec, running, placed, now, gang={**gang, "members": members})
+        return None
+
+    def _serve_gangs(self, now: float) -> None:
+        """This node's part in the multi-node jobs that name it: drain while one forms, then run."""
+        self._reserved_for = ""
+        live: set[str] | None = None
+        for root in sorted(p for p in self.paths.gangs.iterdir() if p.is_dir()):
+            record = read_json(root / GANG_RECORD)
+            members = list((record or {}).get("members") or [])
+            if self.watcher_id not in members[1:]:
+                continue
+            rank, name = members.index(self.watcher_id), root.name
+            part = f"{name}.node{rank}"
+            if part in self.jobs or (root / GANG_PARTS / f"{rank}.json").exists():
+                continue
+            live = self._live(now) if live is None else live
+            if record.get("leader") not in live:
+                shutil.rmtree(root, ignore_errors=True)
+                continue
+            if read_json(root / GANG_GO) is None:
+                self._reserved_for = name
+                if not any(job.spec.holds_gpus for job in self.jobs.values()):
+                    (root / GANG_READY).mkdir(exist_ok=True)
+                    (root / GANG_READY / self.watcher_id).touch()
+                continue
+            script = self.paths.running / f"{name}.sh"
+            try:
+                text = script.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            spec = self._classify(job_spec_from_script(part, text, submitted=now))
+            self.paths.archive(part)
+            gang = {"name": name, "rank": rank, "nodes": len(members), "hosts": record["hosts"]}
+            self._launch(
+                spec, script, tuple(self._free_devices()), now, gang={**gang, "members": members}
+            )
+
+    def _gang_stop(self, job: RunningJob, now: float) -> Verdict | None:
+        """Why this node's part of a multi-node job must stop: another part failed, or a lost node."""
+        gang = job.gang or {}
+        root = self.paths.gangs / gang.get("name", "")
+        for path in sorted((root / GANG_PARTS).glob("*.json")):
+            part = read_json(path) or {}
+            if int(path.stem) != gang.get("rank") and part.get("rc") not in (None, 0):
+                return Verdict(
+                    RC_GANG_STOPPED,
+                    "gang_stopped",
+                    f"node {path.stem} ({part.get('host')}) of {gang.get('name')} ended "
+                    f"rc={part.get('rc')} ({part.get('reason')})",
+                )
+        live = self._live(now)
+        lost = [h for m, h in zip(gang.get("members", ()), gang.get("hosts", ())) if m not in live]
+        if lost:
+            return Verdict(
+                RC_NODE_LOST,
+                "node_lost",
+                f"{', '.join(lost)} of {gang.get('name')} stopped heart-beating",
+            )
+        return None
+
+    def _write_gang_receipt(self, job: RunningJob, now: float) -> None:
+        """Record this node's part; the leader's receipt waits for every node's."""
+        gang = job.gang or {}
+        root = self.paths.gangs / gang["name"]
+        verdict = job.verdict or Verdict(RC_LAUNCH_FAILED, "launch_failed")
+        mine = root / GANG_PARTS / f"{gang['rank']}.json"
+        if not mine.exists():
+            mine.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(
+                mine,
+                {
+                    "rank": gang["rank"],
+                    "host": self.host,
+                    "rc": verdict.rc,
+                    "reason": verdict.reason,
+                    "detail": verdict.detail,
+                    "started": utc_iso(job.started),
+                    "ended": utc_iso(now),
+                },
+            )
+        if gang["rank"] > 0:
+            self._log(job, f"node {gang['rank']} ended rc={verdict.rc} reason={verdict.reason}")
+            job.receipt_written = True
+            return
+        if not self._holds(gang["name"]):
+            job.receipt_written = True
+            return
+        parts = {int(p.stem): read_json(p) or {} for p in (root / GANG_PARTS).glob("*.json")}
+        live = self._live(now)
+        for rank, (member, host) in enumerate(zip(gang["members"], gang["hosts"])):
+            if rank in parts:
+                continue
+            if member in live:
+                return  # its part is still running there
+            parts[rank] = {
+                "rank": rank,
+                "host": host,
+                "rc": RC_NODE_LOST,
+                "reason": "node_lost",
+                "detail": f"{host} stopped heart-beating before its part ended",
+            }
+        failed = [parts[r] for r in sorted(parts) if parts[r].get("rc") not in (None, 0)]
+        failed.sort(key=lambda p: p.get("reason") == "gang_stopped")
+        if failed:
+            first = failed[0]
+            verdict = Verdict(
+                int(first["rc"]),
+                str(first.get("reason")),
+                f"node {first.get('rank')} ({first.get('host')}): {first.get('detail') or ''}".rstrip(
+                    ": "
+                ),
+            )
+        else:
+            verdict = self._judge_provenance(job, Verdict(0, "exit"))
+        job.verdict = verdict
+        record = self._record(
+            job.spec,
+            verdict,
+            devices=list(job.devices),
+            started=utc_iso(job.started),
+            started_epoch=job.started,
+            ended=utc_iso(now),
+            duration_s=round(now - job.started, 3),
+            wall_s=job.wall_s,
+            unsafe_pids=list(job.unsafe_pids),
+            nodes=gang["nodes"],
+            hosts=list(gang["hosts"]),
+            parts=[
+                {k: parts[r].get(k) for k in ("rank", "host", "rc", "reason")}
+                for r in sorted(parts)
+            ],
+        )
+        self._finish_files(gang["name"], record, job.log_path, now)
+        shutil.rmtree(root, ignore_errors=True)
+        job.receipt_written = True
+
     # ---------------------------------------------------------------- launch
 
     def _job_environment(self, spec: JobSpec, devices: tuple[str, ...]) -> dict[str, str]:
@@ -1240,13 +1529,39 @@ class Scheduler:
             return
         self._spec_cache.pop(spec.name, None)
         self.paths.archive(spec.name)
+        self._launch(spec, running, devices, now)
+
+    def _launch(
+        self,
+        spec: JobSpec,
+        running: Path,
+        devices: tuple[str, ...],
+        now: float,
+        *,
+        gang: dict | None = None,
+    ) -> None:
+        """Start ``running`` as job ``spec`` on ``devices``; a multi-node part when ``gang``."""
         log_path = self.paths.log(spec.name)
         env = self._job_environment(spec, devices)
+        if gang is not None:
+            env.update(
+                {
+                    "MV2FLOW_JOB_NODES": str(gang["nodes"]),
+                    "MV2FLOW_JOB_NODE_RANK": str(gang["rank"]),
+                    "MV2FLOW_JOB_HOSTS": ",".join(gang["hosts"]),
+                    "MV2FLOW_JOB_MASTER": gang["hosts"][0],
+                }
+            )
         header = (
             f"=== start {utc_iso(now)} on {self.host} job={spec.name} "
             f"gpus={spec.describe_gpus()} devices={','.join(devices) or '-'} "
             f"wall={int(spec.wall_s or 0)}s watcher={self.watcher_id} ===\n"
         )
+        if gang is not None:
+            header += (
+                f"=== node {gang['rank']} of {gang['nodes']} of {gang['name']}: "
+                f"{','.join(gang['hosts'])} ===\n"
+            )
         if spec.tree:
             header += f"=== tree {spec.tree} (working directory and first PYTHONPATH entry) ===\n"
         try:
@@ -1269,11 +1584,15 @@ class Scheduler:
         except OSError as exc:
             self._finalize_unstarted(spec, RC_LAUNCH_FAILED, "launch_failed", str(exc))
             return
-        job = RunningJob(spec=spec, proc=proc, devices=devices, started=now, log_path=log_path)
+        job = RunningJob(
+            spec=spec, proc=proc, devices=devices, started=now, log_path=log_path, gang=gang
+        )
         # The scheduler's own header is not the job's progress.
         job.log_size = len(header.encode("utf-8")) + 1
         job.last_progress = now
         self.jobs[spec.name] = job
+        if gang is not None and gang["rank"] > 0:
+            return  # the leader records the job; a member's part is its own
         write_json_atomic(
             self.paths.running / f"{spec.name}.json",
             {
@@ -1382,8 +1701,13 @@ class Scheduler:
 
     def _limit_verdict(self, job: RunningJob, now: float) -> Verdict | None:
         """Why a still-running job must stop now, if it must."""
-        if (self.paths.cancel / job.spec.name).exists():
+        name = job.gang["name"] if job.gang else job.spec.name
+        if (self.paths.cancel / name).exists():
             return Verdict(RC_CANCELLED, "cancelled", "cancel requested through the spool")
+        if job.gang:
+            stop = self._gang_stop(job, now)
+            if stop is not None:
+                return stop
         if job.wall_s and now - job.started > job.wall_s:
             return Verdict(
                 RC_WALL_LIMIT,
@@ -1465,6 +1789,9 @@ class Scheduler:
         }
 
     def _write_receipt(self, job: RunningJob, now: float) -> None:
+        if job.gang:
+            self._write_gang_receipt(job, now)
+            return
         if not self._holds(job.spec.name):
             # This watcher fell silent long enough for another to find the run
             # lost; what it found (a re-run, or a receipt) stands.
@@ -1566,6 +1893,8 @@ class Scheduler:
         now = self.clock()
         if not job.receipt_written:
             self._write_receipt(job, now)
+        if not job.receipt_written:
+            return  # a multi-node job's receipt waits for its other nodes' parts
         self.jobs.pop(job.spec.name, None)
         (self.paths.cancel / job.spec.name).unlink(missing_ok=True)
 

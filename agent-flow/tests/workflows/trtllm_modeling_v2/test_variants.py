@@ -81,9 +81,7 @@ def test_variant_checks_are_named_by_the_variant_at_its_own_members(tmp_path):
 
 def test_a_variant_runs_under_its_units_spec_with_its_overlay(tmp_path):
     data = _load(tmp_path, _spec(tmp_path))
-    spec = check_config.variant_spec(
-        data, "mtp7", world_size=4, options_dir=tmp_path / "ws" / "variants"
-    )
+    spec = check_config.variant_spec(data, "mtp7", world_size=4, options_dir=tmp_path / "v")
     accuracy = spec["accuracy"]
     options = yaml.safe_load(open(check_config.resolve_llm_api_options(accuracy, "mtp7")))
     assert options["speculative_config"] == {"decoding_type": "MTP", "max_draft_len": 7}
@@ -93,10 +91,7 @@ def test_a_variant_runs_under_its_units_spec_with_its_overlay(tmp_path):
     assert task_schema.members_for(spec, "mtp7", 4) == ["tep4"]
     assert spec["environment"]["env"]["X"] == "1"
     assert gate_cli.features_for(spec, "mtp7") == ["mtp"]
-
-
-def test_a_variant_appends_its_flags_and_overrides_its_anchor_row(tmp_path):
-    data = _load(tmp_path, _spec(tmp_path))
+    # A variant appends its flags and overrides its anchor row.
     spec = check_config.variant_spec(data, "kv_fp8", world_size=4, options_dir=tmp_path / "v")
     runtime = check_config.resolve_runtime(spec, "kv_fp8")
     assert runtime["cuda_graph"] is True
@@ -142,3 +137,44 @@ def test_each_member_is_launched_and_scheduled_at_its_own_width(tmp_path):
     runner._member_runner("tep2", "all")
     # One runner per width, and per class its jobs queue at (`priority.py`).
     assert sorted(runner._member_runners) == [("1", 0), ("2", 0), ("all", 0)]
+
+
+def test_a_variant_without_a_row_is_judged_against_its_units_score_on_the_same_target(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
+    from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
+
+    spec = _spec(tmp_path)
+    del spec["variants"]["kv_fp8"]["accuracy"]  # names no row of its own: relative
+    data = _load(tmp_path, spec)
+    contract = contract_mod.compile_contract(data, world_size=4)
+    check = next(c for c in contract.checks if c.key == "kv_fp8:accuracy[gsm8k]@tp1")
+    assert check.after == "core:accuracy[gsm8k]@tp1"
+    workflow = TrtllmModelingV2Workflow(workspace=tmp_path / "ws")
+    workflow.environment = RunEnvironment(kind="local", python="python3", world_size=1)
+    workflow.task_data, workflow._contract = data, contract
+    runner = CheckRunner(workflow)
+    runner._reference_score = lambda unit, spec=None: 50.0
+    calls = []
+
+    def gate(env, *, reference, unit, relative=False, **kwargs):
+        calls.append((unit, reference, relative))
+        measured = 88.0 if unit == "core" else 87.0
+        return SimpleNamespace(measured=measured, infrastructure="", detail="", summary=str)
+
+    monkeypatch.setattr(accuracy_checks, "run_accuracy_gate", gate)
+    workflow._contract_status().record(
+        "core",
+        SimpleNamespace(name=check.gate, member="tp1", passed=True, detail="", measured=90.0),
+        marker=workflow._target_marker(),
+    )
+    runner._gate_call(check)(None)
+    assert calls == [("kv_fp8", 90.0, True)]
+    # Measured on another state of the target: the unit's benchmark runs here first.
+    workflow._contract_status().verdicts.clear()
+    calls.clear()
+    runner._gate_call(check)(None)
+    assert calls == [("core", 50.0, False), ("kv_fp8", 88.0, True)]

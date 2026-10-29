@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Framework check execution: member runners, snapshot provenance, gates and witnesses."""
+"""Framework check execution: member runners, snapshot provenance and gates."""
 
 from __future__ import annotations
 
@@ -17,9 +17,8 @@ from agent_flow.console import print_message
 from ...checks import acceptance as acceptance_checks
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
-from ...checks import check_config, gate_records, logit_agreement, serve
+from ...checks import check_config, disagg, gate_records, serve
 from ...checks import verdict as check_result
-from ...checks import witness as witness_mod
 from ...checks.accuracy import resolve_model_key
 from ...infra.compute.environment import RunEnvironment
 from ...infra.compute.executor import (
@@ -98,7 +97,7 @@ class CheckRunner:
         """The gate runner for ``member``: under a scheduler, a job asking for its world size.
 
         ``gpus`` overrides the request, for a check that starts more engines
-        than one member's worth (the equivalence witness's leg B).
+        than one member's worth (the disaggregated-serving test's two).
         """
         env = self._member_env(member)
         if self.workflow._shell_runner_override is not None:
@@ -198,7 +197,7 @@ class CheckRunner:
     def _noting_session_loss(self, runner: Any) -> Any:
         """``runner``, remembering why each command it ran was ended by its session.
 
-        A witness reports such a command as an ordinary failure; the note lets
+        A gate may report such a command as an ordinary failure; the note lets
         `_gate_until_verdict` tell the two apart.
         """
         runner = self.pin.runner(runner) if self.pin else runner
@@ -210,51 +209,6 @@ class CheckRunner:
             return result
 
         return run
-
-    def _run_witness(self, unit: str, member: str, log) -> "check_result.GateResult":
-        """Run the witness gate `unit`'s feature needs, at `member`.
-
-        A configuration variant runs its unit's witness under its own spec
-        (a `disagg` variant's KV-cache dtype, say). A missing `accuracy.witness`
-        block fails it rather than skipping it: boot and accuracy are blind to
-        the feature by construction.
-        """
-        task_data, features = self._spec_for(unit)
-        base = (
-            variants_mod.base_unit(self.task_data, unit)
-            if variants_mod.is_variant(self.task_data, unit)
-            else unit
-        )
-        kind = witness_mod.WITNESS_KINDS[base]
-        # The same entry point a standalone run uses (`trtllm-modeling-v2 gate
-        # witness`), over the workload the block declares.
-        result = self._gate_until_verdict(
-            lambda: witness_mod.run_declared_witness(
-                self._member_env(member),
-                kind=kind,
-                unit=unit,
-                member=member,
-                task_data=task_data,
-                # Leg B starts a context and a generation engine: twice the member.
-                runner=self._member_runner(member, "all" if kind == "equivalence" else None),
-                features=features,
-                workdir=self.workspace / "witness" / unit,
-                boot=boot_checks.resolve_boot_spec(task_data, unit),
-            ),
-            log,
-        )
-        self.gate_log.record(result)
-        self.journal.event("gate", result.summary())
-        if not result.passed and result.stdout_tail.strip():
-            # The summary quotes only the first difference; the tail (both legs
-            # around each difference, or a dead leg's last lines) goes to the
-            # journal and the run's log.
-            self.journal.section(
-                f"witness `{result.name}` failed: evidence",
-                f"```\n{result.stdout_tail.rstrip()}\n```",
-            )
-            print_message(escape_markup(result.stdout_tail.rstrip()), log)
-        return result
 
     def _reference_score(self, unit: str | None = None, spec: Any = None) -> float:
         # `unit` is load-bearing: the accuracy references discriminate rows by
@@ -368,8 +322,8 @@ class CheckRunner:
         return view
 
     # ------------------------------------------------------------------ gates
-    def _gate_call(self, check: contract_mod.Check) -> Callable[[Any], Any] | None:
-        """``check``'s gate, as a function of the runner it launches with; ``None`` for a witness."""
+    def _gate_call(self, check: contract_mod.Check) -> Callable[[Any], Any]:
+        """``check``'s gate, as a function of the runner it launches with."""
         unit, member, gate = check.unit, check.member, check.gate
         spec, features = self._spec_for(unit)
         env = self._member_env(member)
@@ -385,6 +339,8 @@ class CheckRunner:
                 **common(runner),
             )  # fmt: skip
         if gate.startswith("accuracy["):
+            if variants_mod.anchor_state(self.task_data, unit) == variants_mod.ANCHOR_RELATIVE:
+                return lambda runner: self._relative_accuracy(check, env, spec, workdir, runner)
             return lambda runner: accuracy_checks.run_accuracy_gate(
                 env, reference=self._reference_score(unit, spec), workdir=workdir, **common(runner)
             )
@@ -393,9 +349,9 @@ class CheckRunner:
                 env, features=features, workdir=workdir,
                 records=gate_records.records_for(self.workspace), **common(runner),
             )  # fmt: skip
-        if gate == logit_agreement.GATE_NAME:
-            return lambda runner: logit_agreement.run_logit_gate(
-                env, features=features, workdir=workdir, **common(runner)
+        if gate == disagg.GATE_NAME:
+            return lambda runner: disagg.run_disagg_gate(
+                env, workdir=workdir, task_data=spec, runner=runner, unit=unit, member=member
             )
         if gate == serve.GATE_NAME:
             return lambda runner: serve.run_serve_gate(
@@ -403,19 +359,75 @@ class CheckRunner:
                 boot=boot_checks.resolve_boot_spec(spec, unit, features),
                 **common(runner),
             )  # fmt: skip
-        return None
+        raise ValueError(f"contract check {check.key} names no gate this workflow runs")
+
+    def _relative_accuracy(
+        self, check: contract_mod.Check, env: RunEnvironment, spec: Any, workdir: Any, runner: Any
+    ) -> "check_result.GateResult":
+        """A variant's benchmark against its unit's own score at the same member, on this target.
+
+        The unit's verdict on this target gives the score (the orchestrator runs
+        that check first: :attr:`~..contract.Check.after`). Without one -- a
+        change landed between the two -- the unit's benchmark runs here first,
+        on the same snapshot and devices.
+        """
+        base = variants_mod.base_unit(self.task_data, check.unit)
+        key = f"{base}:{check.gate}@{check.member}"
+        marker = self.pin.marker if self.pin else self.workflow._target_marker()
+        status = getattr(self.workflow, "_contract_status", None)
+        holds = getattr(self.workflow, "_verdict_holds", None)
+        verdict = contract_mod.verdict_on(status(), key, marker, holds) if status else None
+        if verdict is not None:
+            score, why = verdict.measured, verdict.detail
+        else:
+            first = self._gate_call(
+                contract_mod.Check(base, check.gate, check.member, contract_mod.TIER_INNER)
+            )(runner)
+            self.journal.event("gate", f"{first.summary()} (measured as {check.unit}'s anchor)")
+            if first.infrastructure:
+                return first
+            score, why = first.measured, first.detail
+        if score is None:
+            return check_result.GateResult(
+                name=check.gate,
+                member=check.member,
+                passed=False,
+                detail=f"{key} measured no score on this target ({why}), so {check.unit}, whose "
+                "anchor is that score, has nothing to be judged against",
+            )
+        return accuracy_checks.run_accuracy_gate(
+            env,
+            reference=score,
+            workdir=workdir,
+            task_data=spec,
+            runner=runner,
+            unit=check.unit,
+            member=check.member,
+            relative=True,
+        )
+
+    def _gate_gpus(self, check: contract_mod.Check) -> str | None:
+        """The devices ``check``'s job asks for when it is not one member's worth."""
+        if check.gate != disagg.GATE_NAME:
+            return None
+        spec = disagg.DisaggSpec.from_task(self._spec_for(check.unit)[0])
+        count = spec.device_count(check.member) if spec else None
+        return str(count) if count else None
 
     def _gate(self, check: contract_mod.Check, log) -> Any:
         """Run ``check``'s gate on the target this workflow sees, journal it, and return its result."""
         call = self._gate_call(check)
-        if call is None:
-            return self._run_witness(check.unit, check.member, log)
-        runner = self._member_runner(check.member)
+        runner = self._member_runner(check.member, self._gate_gpus(check))
         result = self._gate_until_verdict(lambda: call(runner), log)
         self.gate_log.record(result)
         self.journal.event("gate", result.summary())
         if not result.passed:
             print_message(f"[bold yellow]↻ {escape_markup(result.summary())}[/bold yellow]", log)
+            if check.gate == disagg.GATE_NAME and result.stdout_tail.strip():
+                self.journal.section(
+                    f"`{check.key}` failed: the test's last lines",
+                    f"```\n{result.stdout_tail.rstrip()}\n```",
+                )
         return result
 
     def _note_shift(self, unit: str, member: str, result: Any, spec: Any = None) -> None:

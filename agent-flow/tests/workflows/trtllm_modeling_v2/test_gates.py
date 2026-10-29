@@ -96,16 +96,13 @@ def test_the_final_score_wins_over_partial_estimates():
 # -------------------------------------------------------------- boot gate
 
 
-def test_boot_gate_passes_on_clean_exit_with_output(tmp_path):
+def test_boot_gate_passes_on_clean_exit_with_output_and_fails_on_nonzero_exit(tmp_path):
     run = recorder(CommandResult(returncode=0, stdout=_PARIS))
     result = boot_checks.run_boot_gate(_env(), task_data=_TASK, runner=run, workdir=tmp_path)
     assert result.passed, result.detail
     assert "quickstart" not in result.command
     assert str(check_runtime.ENGINE_DRIVER) in result.command
     assert "TRTLLM_MODELING_V2=require" in result.command
-
-
-def test_boot_gate_fails_on_nonzero_exit(tmp_path):
     run = recorder(CommandResult(returncode=1, stderr="CUDA error"))
     result = boot_checks.run_boot_gate(_env(), task_data=_TASK, runner=run, workdir=tmp_path)
     assert not result.passed and "exited 1" in result.detail
@@ -146,21 +143,13 @@ def test_a_gate_lost_to_its_session_says_so_rather_than_timed_out(tmp_path):
 # ----------------------------------------------------------- accuracy gate
 
 
-def test_accuracy_gate_with_no_parsable_score_is_not_a_pass(tmp_path):
-    run = recorder(CommandResult(returncode=0, stdout="done\n"))
-    result = accuracy_checks.run_accuracy_gate(
-        _env(), task_data=_TASK, reference=89.99, runner=run, workdir=tmp_path
-    )
-    assert not result.passed and "no score" in result.detail
-
-
 def _options_named(command: str) -> dict:
     """The LLM-API options file a ``trtllm-eval`` command line names, loaded."""
     path = shlex.split(command.split("--config=", 1)[1])[0]
     return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
-def test_the_accuracy_gate_hands_require_to_the_engine(tmp_path):
+def test_the_accuracy_gate_hands_require_to_the_engine_and_needs_a_score(tmp_path):
     """Even when the run's environment does not export the switch itself."""
     unit_file = tmp_path / "core.llm_api.yaml"
     unit_file.write_text("max_num_tokens: 8192\n", encoding="utf-8")
@@ -180,6 +169,11 @@ def test_the_accuracy_gate_hands_require_to_the_engine(tmp_path):
         "score validation only" in result.detail and "engine observability UNKNOWN" in result.detail
     )
     assert "eval_shim" not in run.seen[0]
+    run = recorder(CommandResult(returncode=0, stdout="done\n"))
+    result = accuracy_checks.run_accuracy_gate(
+        _env(), task_data=_TASK, reference=89.99, runner=run, workdir=tmp_path
+    )
+    assert not result.passed and "no score" in result.detail
 
 
 # --------------------------------------------------------- acceptance gate
@@ -199,21 +193,12 @@ def test_no_declared_workload_takes_32_prompts_from_the_accuracy_dataset():
 
 def test_the_draft_depth_comes_from_the_options_yaml(tmp_path):
     """All three gates must ask for the depth the unit was built for."""
-    from agent_flow.workflows.trtllm_modeling_v2.checks.check_config import (
-        resolve_max_draft_len,
-        speculation_flags,
-    )
-
     options = tmp_path / "mtp_llm_api.yaml"
-    options.write_text(
-        yaml.safe_dump(
-            {"speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 3}}
-        )
-    )
+    speculative = {"decoding_type": "MTP", "num_nextn_predict_layers": 3}
+    options.write_text(yaml.safe_dump({"speculative_config": speculative}))
     accuracy = {"llm_api_options": {"mtp": str(options)}}
-
-    assert resolve_max_draft_len(accuracy, "mtp") == 3
-    assert speculation_flags(["mtp"], max_draft_len=3) == [
+    assert check_config.resolve_max_draft_len(accuracy, "mtp") == 3
+    assert check_config.speculation_flags(["mtp"], max_draft_len=3) == [
         "--spec_decode_algo=MTP",
         "--spec_decode_max_draft_len=3",
     ]

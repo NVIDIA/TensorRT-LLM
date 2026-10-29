@@ -18,6 +18,7 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
@@ -29,8 +30,8 @@ from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator as orchestr
 from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
 from agent_flow.workflows.trtllm_modeling_v2.run.records.state import (
     STAGE_EXECUTION,
-    STAGE_PREFLIGHT,
     load_state,
+    save_state,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
@@ -193,7 +194,38 @@ def test_the_run_puts_its_skills_where_each_agent_finds_them(tmp_path):
     workflow = _workflow(tmp_path)
     workflow._materialize_skills()
     for skills in (".claude/skills", ".agents/skills"):
-        assert (workflow.workspace / skills / "trtllm-modeling-v2-entry" / "SKILL.md").is_file()
+        for name in ("trtllm-modeling-v2-entry", "trtllm-modeling-v2-features"):
+            skill = workflow.workspace / skills / name / "SKILL.md"
+            assert skill.read_text().startswith(f"---\nname: {name}\n")
+    assert (
+        workflow.workspace / ".agents/skills/trtllm-modeling-v2-features/references/features.md"
+    ).is_file()
+
+
+def test_the_feature_skill_names_only_paths_the_tree_has():
+    """The skill and the workers' reuse rule are maps of paths: a path the tree lost is stale."""
+    from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common, worker
+    from agent_flow.workflows.trtllm_modeling_v2.agents.roles import PACKAGED_SKILLS_DIR
+
+    root = Path(__file__).resolve().parents[4]
+    if not (root / "tensorrt_llm").is_dir():
+        pytest.skip("not inside a TensorRT-LLM checkout")
+    skill = PACKAGED_SKILLS_DIR / "trtllm-modeling-v2-features"
+    text = "\n".join(
+        [
+            *(p.read_text() for p in skill.rglob("*.md")),
+            Path(worker.__file__).read_text(),
+            Path(_common.__file__).read_text(),
+        ]
+    )
+    named = set()
+    for found in re.findall(r"`((?:_torch|tensorrt_llm|tests|cpp|examples)/[^`\s]+)`", text):
+        path = found.split("::")[0].rstrip(".,;:)")
+        path = "tensorrt_llm/" + path if path.startswith("_torch/") else path
+        if not any(ch in path for ch in "*<{["):
+            named.add(path)
+    missing = sorted(p for p in named if not (root / p).exists())
+    assert not missing, f"the feature skill names paths this tree lacks: {missing}"
 
 
 def _write_vocabulary(workspace: Path, queue):
@@ -312,16 +344,6 @@ def test_preflight_failure_ends_the_run_before_any_agent(tmp_path, task_file, mo
     assert "preflight failed" in (tmp_path / "ws" / "journal.md").read_text()
 
 
-def test_dry_run_stops_before_the_first_agent_turn(tmp_path, task_file, monkeypatch):
-    """And it leaves the checkpoint at preflight, so the real run re-runs it."""
-    workflow = _workflow(tmp_path, dry_run=True)
-    calls = _install(monkeypatch, workflow, Script(None))
-    with workflow:
-        workflow.run(task_file)
-    assert calls == []
-    assert _state(tmp_path).stage == STAGE_PREFLIGHT
-
-
 def _substrate_boot(command: str) -> bool:
     return "TRTLLM_MODELING_V2=off" in command and "engine_driver" in command
 
@@ -417,7 +439,8 @@ def test_a_survey_that_writes_what_the_tree_has_is_sent_back_once(tmp_path, task
         workflow.run(task_file)
     assert [name for name, _ in calls].count("surveyor") == 2
     assert "Prior art and engine limits" in prompts[0] and "Survey review" not in prompts[0]
-    assert "## Survey review: re-draft" in prompts[1] and "qsa/kernels.py" in prompts[1]
+    assert "## Survey review: re-draft" in prompts[1] and "runs once" in prompts[1]
+    assert "qsa/kernels.py" in prompts[1]
     assert (workspace / "survey_review.md").is_file()
     assert "survey review: sent back with 1 finding(s)" in (workspace / "journal.md").read_text()
     assert _state(tmp_path).verdict == "delivered"
@@ -461,11 +484,13 @@ def test_a_new_run_starts_with_the_survey_beside_the_planners_first_turn(
 # ----------------------------------------------------------------- execution stage
 
 
-def test_a_planned_run_is_delivered_once_its_contract_holds(tmp_path, task_file, monkeypatch):
-    workflow = _workflow(tmp_path)
-    calls = _install(monkeypatch, workflow, Script(None))
-    with workflow:
-        workflow.run(task_file)
+def test_a_planned_run_is_delivered_once_its_contract_holds_and_a_resume_redoes_nothing(
+    tmp_path, task_file, monkeypatch
+):
+    first = _workflow(tmp_path)
+    calls = _install(monkeypatch, first, Script(None))
+    with first:
+        first.run(task_file)
     assert [name for name, _ in calls] == ["planner", "assembler"]
     state = _state(tmp_path)
     assert state.done and state.verdict == "delivered" and state.stage == STAGE_EXECUTION
@@ -477,6 +502,16 @@ def test_a_planned_run_is_delivered_once_its_contract_holds(tmp_path, task_file,
     }
     envelope = json.loads((tmp_path / "ws" / "tasks" / "core.json").read_text())
     assert envelope["satisfies"] == ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]
+
+    # Re-open the closed run as though it had crashed before closing.
+    state.done, state.verdict = False, ""
+    save_state(tmp_path / "ws" / _STATE, state)
+    second = _workflow(tmp_path)
+    calls = _install(monkeypatch, second, Script(None))
+    with second:
+        second.run(task_file)
+    assert calls == []
+    assert _state(tmp_path).verdict == "delivered"
 
 
 def test_the_planner_is_told_what_failed_and_can_escalate(tmp_path, task_file, monkeypatch):
@@ -495,27 +530,6 @@ def test_the_planner_is_told_what_failed_and_can_escalate(tmp_path, task_file, m
     assert _state(tmp_path).verdict == "escalated"
     assert "checks failed: core:accuracy[gsm8k]@tp1" in seen[1]
     assert "FAILED core:accuracy[gsm8k]@tp1" in seen[1]
-
-
-def test_a_resumed_run_does_not_redo_finished_work(tmp_path, task_file, monkeypatch):
-    first = _workflow(tmp_path)
-    _install(monkeypatch, first, Script(None))
-    with first:
-        first.run(task_file)
-    state = _state(tmp_path)
-    assert state.verdict == "delivered"
-
-    # Re-open the closed run as though it had crashed before closing.
-    from agent_flow.workflows.trtllm_modeling_v2.run.records.state import save_state
-
-    state.done, state.verdict = False, ""
-    save_state(tmp_path / "ws" / _STATE, state)
-    second = _workflow(tmp_path)
-    calls = _install(monkeypatch, second, Script(None))
-    with second:
-        second.run(task_file)
-    assert [name for name, _ in calls] == []
-    assert _state(tmp_path).verdict == "delivered"
 
 
 def test_a_shared_change_is_followed_by_a_regression_check_with_no_turn(
@@ -537,19 +551,20 @@ def test_a_shared_change_is_followed_by_a_regression_check_with_no_turn(
     monkeypatch.setattr(
         ExecutionStage,
         "_run_regression_check",
-        lambda self, task: checked.append(task.id) or [],
+        lambda self, task: checked.append((task.id, task.covers)) or [],
     )
     calls = _install(monkeypatch, workflow, Script(None, planner=planner))
     with workflow:
         workflow.run(task_file)
     assert _state(tmp_path).verdict == "delivered"
-    assert checked == ["regression"]
+    # It covered what core landed.
+    assert checked == [("regression", ["core@1"])]
     graph = yaml.safe_load((tmp_path / "ws" / "graph.yaml").read_text())
     check = next(t for t in graph["tasks"] if t["id"] == "regression")
     assert check["kind"] == "check" and check["regression"] and check["status"] == "done"
     assert check["depends_on"] == ["core"]
     # No agent turn ran for it, and the graph says who added it.
-    assert {name for name, _ in calls} <= {"planner", "surveyor", "kernel_writer", "assembler"}
+    assert [name for name, _ in calls] == ["planner", "assembler"]
     assert any(
         r["reason"].startswith("orchestrator: regression checks") for r in graph["revisions"]
     )

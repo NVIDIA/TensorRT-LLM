@@ -71,32 +71,30 @@ def test_wrapper_times_callables_not_claimed_numbers(tmp_path, monkeypatch):
 
 
 def test_local_keeps_stack_once_without_serving_or_stale_goal(tmp_path):
-    camp = _campaign(tmp_path, FakeRunner(["g"], "g", _effect), _keep_gate(tmp_path), [])
+    camp = _campaign(
+        tmp_path, FakeRunner(["g"], "g", _effect), [], keep_gate=_keep_gate(tmp_path),
+        checkpoint_gain=1.0,  # no checkpoint between them: each keeps on its micro-bench
+    )  # fmt: skip
     first = camp.state.candidates["fast-path"]
     # A second independent candidate is already ready while the first is verified.
-    tree = Path(first.worktree)
-    _git(tree, "checkout", "-q", "-b", "side", camp.state.best_commit)
-    (tree / "side.py").write_text("SIDE = True\n")
-    _git(tree, "add", "side.py")
-    _git(tree, "commit", "-q", "-m", "side")
+    side = tmp_path / "side-tree"
+    _git(
+        Path(first.worktree), "worktree", "add", "-q", "--detach", str(side), camp.state.best_commit
+    )
+    (side / "side.py").write_text("SIDE = True\n")
+    _git(side, "add", "side.py")
+    _git(side, "commit", "-q", "-m", "side")
     decision = tmp_path / "side.yaml"
     decision.write_text(
         yaml.safe_dump(
             {
                 "decision": "CANDIDATE",
-                "worktree": str(tree),
-                "commits": [_git(tree, "rev-parse", "HEAD")],
+                "worktree": str(side),
+                "commits": [_git(side, "rev-parse", "HEAD")],
                 "microbench": _microbench(tmp_path / "side-bench"),
             }
         )
     )
-    # Restore the first candidate's worktree before it is stacked.
-    side = tmp_path / "side-tree"
-    _git(tree, "worktree", "add", "-q", "--detach", str(side), "HEAD")
-    data = yaml.safe_load(decision.read_text())
-    data["worktree"] = str(side)
-    decision.write_text(yaml.safe_dump(data))
-    _git(tree, "checkout", "-q", first.commits[-1])
     camp.submit_candidate("side", decision)
     camp.perf.effect = lambda config, tree: (
         100.0
@@ -120,7 +118,7 @@ def test_local_keeps_stack_once_without_serving_or_stale_goal(tmp_path):
     "bad", ["missing", "nan", "cases", "commit", "harness", "receipt", "host", "import"]
 )
 def test_invalid_local_evidence_never_keeps_or_repeats(tmp_path, bad):
-    camp = _campaign(tmp_path, FakeRunner(["g"], "g", _effect), _keep_gate(tmp_path), [])
+    camp = _campaign(tmp_path, FakeRunner(["g"], "g", _effect), [], keep_gate=_keep_gate(tmp_path))
     original = camp.perf.poll
 
     def poll():
@@ -158,7 +156,7 @@ def test_invalid_local_evidence_never_keeps_or_repeats(tmp_path, bad):
 
 
 def test_system_candidate_is_single_serving_ab_and_scope_is_checked(tmp_path):
-    camp = _campaign(tmp_path, FakeRunner(["g"], "g", _effect), _keep_gate(tmp_path), [])
+    camp = _campaign(tmp_path, FakeRunner(["g"], "g", _effect), [], keep_gate=_keep_gate(tmp_path))
     decision = tmp_path / "fast-path.yaml"
     data = yaml.safe_load(decision.read_text())
     data["kind"] = "overlap"
@@ -174,8 +172,7 @@ def test_system_candidate_is_single_serving_ab_and_scope_is_checked(tmp_path):
     assert sum(label.startswith("e2e-") for label in camp.perf.submitted) == 1
 
 
-def test_baseline_repeats_are_explicit_opt_in(tmp_path):
-    spec = replace(_spec(tmp_path), noise_repeats=1)
+def _grounded(spec):
     stage = TuneStage(
         spec,
         {},
@@ -185,21 +182,18 @@ def test_baseline_repeats_are_explicit_opt_in(tmp_path):
         poll_s=0,
     )
     assert stage.ground()
-    assert stage.perf.submitted == ["t-baseline", "t-baseline-r1"]
+    return stage
+
+
+def test_the_baseline_is_measured_once_and_must_serve_the_target(tmp_path):
+    stage = _grounded(_spec(tmp_path))
+    assert stage.perf.submitted == ["t-baseline"]
 
 
 @pytest.mark.parametrize("outcome", ["missing", "stale", "regression"])
 def test_final_failure_is_not_reported_as_tuned(tmp_path, outcome):
     spec = _spec(tmp_path)
-    stage = TuneStage(
-        spec,
-        {},
-        dispatch=lambda *args: "",
-        checkpoint=lambda: None,
-        runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect),
-        poll_s=0,
-    )
-    assert stage.ground()
+    stage = _grounded(spec)
     original = stage._measure
 
     def measure(labels, tree=None, **kw):
@@ -216,6 +210,7 @@ def test_final_failure_is_not_reported_as_tuned(tmp_path, outcome):
         return result
 
     stage._measure = measure
+    stage.t["kept"] = ["fast-path"]  # nothing kept: the baseline stands, measured once
     assert stage.wrap() == "tune-failed:final"
     assert stage.t["phase"] != "done" and not stage.t["goal_reached"]
     assert stage.t["failure"]

@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Intake: from a request to `task.yaml`
 
 For the agent that receives the user's request and launches the workflow. Intake decides what
-every later hour costs: a spec that runs gates eager, gates disaggregation across two nodes or
+every later hour costs: a spec that runs gates eager, gates members a model does not fit or
 multiplies variants will be slow however good the roles are, and `notes` are the only thing every
 role reads about the model. Intake writes files and reads the tree; it starts no GPU job.
 
@@ -17,18 +17,28 @@ role reads about the model. Intake writes files and reads the tree; it starts no
 - The reference implementation the user names, enough to write the architecture brief below, and
   whether it can load this checkpoint's weights as stored (its quantization in particular).
 - `tensorrt_llm/_torch/_experimental/modeling_v2/README.md` and this workflow's README.
+- How other engines (vLLM, SGLang) serve this model, where they do: the kernels, the parallel
+  layouts and the deployment they use inform the members, features and notes below.
 
 ## 2. Start from a derived spec
 
 ```bash
 trtllm-modeling-v2 intake derive --checkpoint <ckpt> --repo <trtllm checkout> \
-    --goal "<members> <features> isl=<n> osl=<n> concurrency=<a>/<b>/<c>" --out <dir>
+    --goal "<members> <features> kv=bf16/fp8/nvfp4 isl=<n> osl=<n> concurrency=<a>/<b>/<c>" \
+    --out <dir>
 ```
 
 It writes `task.derived.yaml`, `derive.report.md` (every value the goal did not state and where
 it came from) and `intake.report.md` (the lint below, with prior art). With a `site.yaml` pass
 `--site` instead of `--repo`. Edit the derived spec; copy `task.example.yaml` only for what the
 goal words cannot say.
+
+- A goal that names features gets those: a drafter or vision tower the checkpoint carries and the
+  request does not ask for is left out (`derive.report.md` says so). Name it to build it.
+- `kv=` lists the KV dtypes in one word: the first is every gate's, each other one a variant
+  (`gates: [accuracy]`) judged against the unit's own score.
+- Derive asks rather than guesses (and stops until the spec answers): `model_key` when
+  `config.json` names no model. A tuning goal that names no concurrency tunes at 1/32/128.
 
 ## 3. Map the request
 
@@ -40,10 +50,10 @@ goal words cannot say.
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
 | a KV cache dtype list | base `kv_cache_config.dtype: auto`; one variant per other dtype (`llm_api_options.kv_cache_config.dtype`, `gates: [accuracy]`) | |
 | chunked prefill, block reuse | `runtime.chunked_prefill: true`, `kv_cache_reuse: true` in **every** gate; one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split; `no_reuse` only if asked | features that are on everywhere are proven together, which is how they serve |
-| disagg (or any feature whose witness runs two engines) | gated at the widest member whose legs fit **one** node (`dep2` on a 4-GPU node) | a wider member needs a cross-node allocation the sessions do not manage: check it outside the flow and list it in `coverage.accept` |
-| any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit and witness owe | the same one-variant-per-axis rule applies |
+| disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully, on **one node**: its context and generation workers share that node's devices (two engines of two on a 4-GPU node; `accuracy.disagg.devices` to say otherwise, never more than a node) | boot and accuracy run one aggregated engine and never cross the hop; the tree's launcher (`launch_disaggregated_llm`) starts every worker on one host; the lint's `disagg-placement` says whether two engines fit the node (`environment.gpu_memory_gib` lets it size them) |
+| any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
 | workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the per-rank concurrency (attention-DP ranks split it); `max_num_tokens` = isl (or 8192); `perf.workload` | |
-| "perf tune" | `perf.enabled: true`, concurrencies per member | |
+| "perf tune" | `perf.enabled: true`; `perf.workload.concurrency` 1/32/128 unless the goal names it; a `dep` member only the high point x its attention-DP ranks | it starts once the onboarding contract holds and measures one baseline (no stock reference, no repeats); a goal is `ratio_to_baseline` or `pct_of_sol` |
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
 large checkpoint), and every change to the target runs the stale checks again, so the contract's
@@ -57,17 +67,18 @@ states it:
   unit.
 - Members the request scopes to text-only or aggregate take core alone, not the variants.
 - A feature unit runs at one member (`members: {<feature>: [X]}`), and every variant stays on
-  `unit: core`. Each feature then has a check that exercises it (disagg its witness, multimodal
-  its boot), and each axis a variant; a variant on a feature unit (a KV dtype under disagg) is a
-  combination, added only when the request names it.
+  `unit: core`. Each feature then has a check that exercises it (disagg its test, multimodal
+  its boot), and each axis a variant; a variant on a feature unit (a KV dtype under MTP) is a
+  combination, added only when the request names it. A variant of disagg owes nothing.
 - Leave the boot boundaries off (section 5) and the profile at `standard` unless the request asks.
 
 The lint prints the checks per unit and variant; past ~30 deserves a second look.
 
-**Witness launchers.** A witness with a contrast leg (`accuracy.witness.<feature>.contrast_command`)
-runs a launcher the run itself writes. Point it at the path that launcher will have, say in
-`notes` which task writes it, and set every variable it reads in `contrast_env` (that leg) or
-`legs_env` (both legs). A stub that needs a variable the spec never sets fails the witness forever.
+**The disagg test.** The run writes it; the flow deploys nothing of its own. Name the node id it
+will have, say in `notes` which task writes it (the lint's `disagg-test-pending` notes it until
+it exists), and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
+devices, a missing model root) fails the gate: set `accuracy.disagg.devices` when it needs more
+than two engines at its member's width.
 
 ## 4. Runtime
 
@@ -83,13 +94,20 @@ you start by hand.
   `--apply_chat_template`) unless the model only works chat-formatted. A chat-template protocol on
   a model that reasons first needs `--max_output_length` >= 1024 and its stop strings, or it scores
   truncation.
-- **Anchors.** A placeholder is allowed only together with a measurement started now: the reference
-  implementation on the target hardware, under the gates' exact protocol, per KV dtype. If the
-  reference cannot load the checkpoint as stored, say which weights it measures instead. Until the
-  measurement lands, set the placeholder **a few points under the score you expect**: the floor is
-  anchor - 2 x SE (about anchor - 1.2 for 1319 questions at 95%), so a placeholder at the expected
-  score fails a working target, and one far below it (50 on GSM8K) passes a broken one. The lint
-  prints the floor each anchor implies.
+- **Anchors.** Each unit's anchor is a row of `reference_yaml` under `accuracy.model_key`, which
+  the spec states (`org/model`; the checkpoint path's last two components are no model's name).
+  Without a written or measured score, record a **low placeholder** (e.g. 10 on GSM8K, in
+  percent): it catches an engine that answers nothing and fails no working one. Commit the row to
+  the run's branch: each check measures a snapshot of a commit and reads its anchor table there,
+  and preflight refuses an uncommitted one. Replace the row (committed) when a measured anchor is
+  known, the user's, the reference implementation's on the target hardware, or one the onboarding
+  measures; every accuracy check then runs again.
+- **Variant anchors.** A configuration variant that names no row of its own (`discriminators`,
+  `reference_yaml`, `model_key`, `benchmark`) is judged against its unit's own score at the same
+  member, on the same target (`anchor: relative`): a KV dtype against `auto`, the chunked variant
+  against the unchunked engine. Its floor allows for the error of both scores. A variant that
+  names a row of its own is judged against that row (its `discriminators` are layered over the
+  unit's).
 - **Boot prompts.** One checked factual prompt and one checked arithmetic word problem (a
   benchmark-style question with its numeric answer as the keyword): cheap semantic signal at every
   boot.
@@ -124,8 +142,12 @@ what the roles need while they work:
   its `<dir>/<file>.py`: what it offers, or why it does not fit.
 - **Engine constraints** — from `intake.report.md` and the design they imply.
 - **Scope decisions** — what is gated where, what is checked outside the flow, and why.
-- **Embargo** — exact paths in `source_embargo`. Do not forbid in-tree kernels, attention backends
-  or other models' targets: reusing them is the cheapest rung of the sourcing ladder.
+- **References outside the tree** — where you know them: another engine's implementation of
+  this model (a checkout path, a package, a URL) and the kernels it uses.
+- **Embargo** — none, unless the request asks for one (an evaluation that must not see an existing
+  implementation of this model): then those exact paths in `source_embargo`. Everything else, in
+  the tree and outside it, is prior art; never forbid kernels, backends, other models' targets,
+  kernel libraries or other engines' implementations.
 
 Nothing about the intake itself: what intake may or may not do, launch blockers, evidence,
 provenance and questions for the user belong in your own summary beside the spec. Notes are read
@@ -142,4 +164,5 @@ Fix every `block` and every `warn`, or keep one on purpose with a line in `notes
 on (a requested cell no check covers, a KV-cache dtype the engine does not load), or an accuracy
 check that runs eager, and cannot be accepted. The report also prints the contract size; a contract past ~30 checks
 deserves a second look. Then `--dry-run`, then launch. Preflight journals the same lint, so the run's record shows
-what was accepted.
+what was accepted. Once it runs, steer it only through `feedback` (the README's "While it runs"):
+cancelling the run's own jobs proves nothing and costs them again.

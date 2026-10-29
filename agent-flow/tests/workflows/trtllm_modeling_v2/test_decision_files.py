@@ -22,14 +22,14 @@ from agent_flow.workflows.trtllm_modeling_v2.run.execution.handoff import (
 from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
 
 
-def _write(tmp_path: Path, agent: str, iteration: int, payload: dict) -> Path:
-    path = decision_path(tmp_path, agent, iteration)
+def _write(workspace: Path, agent: str, iteration: int, payload: dict) -> Path:
+    path = decision_path(workspace, agent, iteration)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
     return path
 
 
-def test_a_valid_decision_is_read_with_what_it_says(tmp_path):
+def test_a_decision_is_read_with_what_it_says_only_inside_the_enum(tmp_path):
     path = _write(
         tmp_path, "surveyor", 1, {"summary": "wrote both files", "decision": "DRAFT_READY"}
     )
@@ -37,54 +37,32 @@ def test_a_valid_decision_is_read_with_what_it_says(tmp_path):
         "summary": "wrote both files",
         "decision": "DRAFT_READY",
     }
-
-
-def test_a_decision_outside_the_enum_is_refused(tmp_path):
-    path = _write(tmp_path, "surveyor", 1, {"summary": "s", "decision": "LOOKS_GOOD_TO_ME"})
+    path = _write(tmp_path, "surveyor", 2, {"summary": "s", "decision": "LOOKS_GOOD_TO_ME"})
     assert read_decision(path, "surveyor") is None
-
-
-def test_role_specific_extra_keys_survive(tmp_path):
-    """The assembler's `blocked_reason` is control flow, not commentary."""
-    path = _write(
-        tmp_path,
-        "assembler",
-        1,
-        {
-            "summary": "no entry for the gated delta rule",
-            "decision": "BLOCKED",
-            "blocked_reason": "vocabulary_gap",
-            "missing_entry": "gdn_custom_op_inplace",
-        },
-    )
-    entry = read_decision(path, "assembler")
-    assert entry["decision"] == "BLOCKED"
-    assert entry["blocked_reason"] == "vocabulary_gap"
-    assert entry["missing_entry"] == "gdn_custom_op_inplace"
+    # The assembler's `blocked_reason` is control flow, not commentary: role extras survive.
+    blocked = {
+        "summary": "no entry for the gated delta rule",
+        "decision": "BLOCKED",
+        "blocked_reason": "vocabulary_gap",
+        "missing_entry": "gdn_custom_op_inplace",
+    }
+    assert read_decision(_write(tmp_path, "assembler", 1, blocked), "assembler") == blocked
 
 
 # ---------------------------------------------- a stale decision is not a decision
 
 
-def _write_decision(workspace: Path, agent: str, iteration: int, decision: str) -> Path:
-    target = decision_path(workspace, agent, iteration)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(f"summary: s\ndecision: {decision}\n", encoding="utf-8")
-    return target
-
-
 def test_a_decision_older_than_the_marker_is_refused(tmp_path):
-    stale = _write_decision(tmp_path, "assembler", 1, "BLOCKED")
+    stale = _write(tmp_path, "assembler", 1, {"summary": "s", "decision": "BLOCKED"})
     os.utime(stale, (1_000_000, 1_000_000))  # written long before this dispatch
-    marker = stale.with_name(f".{stale.stem}.dispatched")
-    marker.write_text("", encoding="utf-8")
-
+    stale.with_name(f".{stale.stem}.dispatched").write_text("", encoding="utf-8")
     assert read_decision(stale, "assembler") is None
 
 
 def test_a_previous_turns_decision_is_never_read_as_this_ones(tmp_path):
     """A new dispatch is reserved a new path: the earlier verdict is neither read nor overwritten."""
-    old = _write_decision(tmp_path, "assembler", 1, "BLOCKED")
+    old = _write(tmp_path, "assembler", 1, {"summary": "s", "decision": "BLOCKED"})
+    before = old.read_text()
     target = mark_decision_dispatch(tmp_path, "assembler", 1)
 
     assert target != old
@@ -92,7 +70,7 @@ def test_a_previous_turns_decision_is_never_read_as_this_ones(tmp_path):
     assert read_decision(target, "assembler") is None
     target.write_text("summary: s\ndecision: UNIT_READY\n", encoding="utf-8")
     assert read_decision(target, "assembler")["decision"] == "UNIT_READY"
-    assert old.read_text() == "summary: s\ndecision: BLOCKED\n"
+    assert old.read_text() == before
 
 
 # ------------------------------------------ named by unit, never overwritten

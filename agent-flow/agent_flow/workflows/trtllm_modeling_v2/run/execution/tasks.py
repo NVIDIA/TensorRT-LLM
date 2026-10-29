@@ -35,14 +35,15 @@ from agent_flow.console import print_message, print_rule
 from ...agents.decisions import DECISION_REMINDER
 from ...agents.prompts.survey import capture_lists_block
 from ...agents.prompts.tags import tag_section, task_tags
-from ...checks import gate_cli
+from ...checks import check_config, gate_cli
 from ...infra.compute.scheduler import WATCHER_STALE_S, watcher_records
 from ...infra.git import CommitPolicy
 from ...operators import promotion as promotion_mod
 from ...operators import survey_review
 from ...operators.coverage import QueueItem, VocabularyError, load_vocabulary, queue_item_from_ref
+from ...spec import lint as lint_mod
 from ...spec import variants as variants_mod
-from ...spec.task_schema import assembly_units
+from ...spec.task_schema import assembly_units, members_for, parse_parallel_segment
 from ...tune import stage as tune_stage
 from .. import graph as graph_mod
 from .. import inbox as inbox_mod
@@ -139,15 +140,16 @@ class ExecutionStage:
         self.state = state
         tune = self.workflow._tune_requested()
         units = assembly_units(self.workflow.task_data)
-        core_checks = [
-            c.key for c in contract.required() if units and c.unit == units[0] and c.tier == "inner"
+        # The campaign starts once onboarding is complete: every required check has passed.
+        onboarded = [c.key for c in contract.required()]
+        core_boots = [
+            c.key for c in contract.required() if units and c.unit == units[0] and c.gate == "boot"
         ]
+        feature_refs = [*units[1:], *variants_mod.variants(self.workflow.task_data)]
         total = max(len(state.devices), self.workflow._gate_env().world_size, 1)
         self._integration = self._make_integration(state)
         self.workflow._snapshots = self._make_snapshots()
         self.checks = CheckRunner(self.workflow)
-        # Set once full support holds: a running campaign wraps up.
-        self._campaign_stop = threading.Event()
         services = Services(
             plan=lambda turn: self._planner_turn(turn, contract),
             work=self._work_task,
@@ -168,7 +170,6 @@ class ExecutionStage:
                 keep=promotion_mod.keep_local(self.workflow.task_data),
             ),
             delivery_files=lambda: deliver.delivery_failures(self.workflow),
-            stop_campaign=lambda reason: self._campaign_stop.set(),
             stage_notes=self._take_stage_notes,
             narrow=getattr(self.workflow, "_narrowed", None),
             holds=getattr(self.workflow, "_verdict_holds", None),
@@ -193,7 +194,8 @@ class ExecutionStage:
             revision_cap=self.workflow.revision_cap,
             event_window_s=self.workflow.event_window_s,
             required_kinds=("tune",) if tune else (),
-            start_after={"tune": core_checks} if core_checks else {},
+            start_after={"tune": onboarded} if onboarded else {},
+            after_core=(feature_refs, core_boots),
             own_paths=self._own_paths,
             repo_root=self.workflow.task_data.get("trtllm_repo_path") or "",
         )
@@ -491,7 +493,7 @@ class ExecutionStage:
             f"`{self.workflow.workspace / DECISIONS_DIRNAME}` and their reports in "
             f"`{self.workflow.journal.reports_dir}`: build on them rather than starting over.\n\n"
             f"{self._gate_history_block()}"
-            f"Write the unit. To reproduce one gate or witness while debugging, run "
+            f"Write the unit. To reproduce one gate while debugging, run "
             f"the workflow's own entry point, never a reconstruction of its command: "
             f"`{command}`.\n\n" + DECISION_REMINDER
         )
@@ -530,6 +532,41 @@ class ExecutionStage:
             return ""
         return f"Gates so far:\n\n```\n{rendered}\n```\n\n"
 
+    def _start_member(self, contract: contract_mod.Contract) -> str:
+        """Where the core and each feature's first task work: the cheapest member one engine fits.
+
+        Sized as the intake lint sizes members (``spec.lint.engine_width``): the
+        checkpoint's weight bytes against ``environment.gpu_memory_gib``.
+        """
+        cached = getattr(self, "_start_line", None)
+        if cached:
+            return cached
+        task = self.workflow.task_data
+        first = assembly_units(task)[0]
+        members = check_config.order_members_by_cost(
+            list(dict.fromkeys(c.member for c in contract.checks if c.unit == first))
+            or members_for(task, first, self.workflow._gate_env().world_size)
+        )
+        weights = lint_mod.checkpoint_weight_bytes(task.get("checkpoint_path"))
+        memory = (task.get("environment") or {}).get("gpu_memory_gib")
+        width = lint_mod.engine_width(weights, memory)
+        if width is None:
+            line = (
+                f"`{members[0]}`: the cheapest member the contract checks the core at (the run "
+                "states no `environment.gpu_memory_gib`, so one engine is not sized)."
+            )
+        else:
+            fits = [m for m in members if (parse_parallel_segment(m)[1] or 1) >= width]
+            start = fits[0] if fits else members[-1]
+            line = (
+                f"`{start}`: one engine of the checkpoint takes {width} device(s) (its weights "
+                f"at most {lint_mod.ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device), "
+                f"and `{start}` is the cheapest member the contract checks the core at that "
+                "holds it. A narrower one cannot load the model."
+            )
+        self._start_line = line
+        return line
+
     def _planner_turn(self, turn: PlannerTurn, contract: contract_mod.Contract) -> PlannerAnswer:
         proposed = self.workflow.workspace / PROPOSED_GRAPH
         current = self.workflow.workspace / graph_mod.GRAPH_FILENAME
@@ -545,6 +582,10 @@ class ExecutionStage:
             "## Contract standing",
             "",
             contract_mod.standing(turn.evaluation, self.workflow.workspace, turn.marker),
+            "",
+            "## Start member",
+            "",
+            self._start_member(contract),
         ]
         facts = runtime_facts.render(self.workflow.workspace, changes=PLANNER_FACT_CHANGES)
         if facts:
@@ -743,13 +784,8 @@ class ExecutionStage:
         receipts = self._dependency_receipts(task)
         envelope = self._envelope(task, receipts)
         if task.kind == "tune":
-            stop = getattr(self, "_campaign_stop", None) or threading.Event()
             decision, note = tune_stage.run_tune_task(
-                self.workflow,
-                self.state,
-                self.workflow._head(),
-                attempt=task.attempts,
-                should_stop=stop.is_set,
+                self.workflow, self.state, self.workflow._head(), attempt=task.attempts
             )
             self.workflow._checkpoint(self.state)
             return TaskResult(decision, note)

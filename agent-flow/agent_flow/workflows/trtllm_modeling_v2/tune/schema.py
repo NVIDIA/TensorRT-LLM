@@ -7,13 +7,24 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .sol_consensus import METHODS
+
 PERF_KEYS = {
-    "enabled", "model", "target", "identity_configs", "workload", "reference", "spools", "dev_spools",
-    "env_script", "noise_repeats", "campaign", "source_embargo", "sister_engines", "wall",
-    "configs", "goal", "sol",
+    "enabled", "model", "target", "identity_configs", "workload", "spools", "dev_spools",
+    "env_script", "campaign", "source_embargo", "sister_engines", "wall", "configs", "goal", "sol",
 }  # fmt: skip
-SOL_KEYS = {"enabled", "gpu"}
-GOAL_KEYS = {"ratio_to_reference", "pct_of_sol"}
+#: Keys the campaign no longer reads: it starts once onboarding is complete and measures one
+#: baseline, with no stock reference beside it and no repeat of it.
+REMOVED_PERF_KEYS = {
+    "reference": "no stock reference is measured; a goal is a ratio to the baseline",
+    "noise_repeats": "the baseline is measured once",
+}
+SOL_KEYS = {"enabled", "gpu", "methods", "tolerance"}
+GOAL_KEYS = {"ratio_to_baseline", "pct_of_sol"}
+#: ``perf.campaign``'s projection and checkpoint thresholds, each a fraction (0.05 is 5 %).
+CAMPAIGN_FRACTIONS = ("min_projected_gain", "micro_noise", "module_tolerance", "checkpoint_gain")
+#: ``perf.campaign.logits``: the first-token check at each checkpoint (``tune/logits_check.py``).
+LOGITS_KEYS = {"prompts", "top_k", "max_kl", "min_top1", "tie_margin"}
 
 
 def validate_perf_block(data: Mapping[str, Any]) -> list[str]:
@@ -23,12 +34,13 @@ def validate_perf_block(data: Mapping[str, Any]) -> list[str]:
         return []
     if not isinstance(perf, Mapping):
         return ["perf: must be a mapping"]
-    errors = [f"perf.{k}: unknown key" for k in perf if k not in PERF_KEYS]
-    repeats = perf.get("noise_repeats", 0)
-    if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 0:
-        errors.append(
-            "perf.noise_repeats: a nonnegative integer (default 0; extra baseline runs only)"
-        )
+    errors = [
+        f"perf.{k}: removed: {REMOVED_PERF_KEYS[k]}"
+        if k in REMOVED_PERF_KEYS
+        else f"perf.{k}: unknown key"
+        for k in perf
+        if k not in PERF_KEYS
+    ]
     workload = perf.get("workload") or {}
     for key in ("isl", "osl"):
         if key in workload and (not isinstance(workload[key], int) or workload[key] <= 0):
@@ -36,8 +48,6 @@ def validate_perf_block(data: Mapping[str, Any]) -> list[str]:
     con = workload.get("concurrency", [1])
     if not (isinstance(con, list) and con and all(isinstance(c, int) and c > 0 for c in con)):
         errors.append("perf.workload.concurrency: a non-empty list of positive integers")
-    if perf.get("reference", "stock") not in ("stock", "none"):
-        errors.append("perf.reference: stock | none")
     for key in ("identity_configs", "spools"):
         if key in perf and not isinstance(perf[key], list):
             errors.append(f"perf.{key}: a list")
@@ -53,12 +63,25 @@ def validate_perf_block(data: Mapping[str, Any]) -> list[str]:
                 errors.append("perf.sol.enabled: true or false")
             if "gpu" in sol and not isinstance(sol["gpu"], str):
                 errors.append("perf.sol.gpu: a hardware label only; capacities need public sources")
+            methods = sol.get("methods", list(METHODS))
+            if (
+                not isinstance(methods, list)
+                or not methods
+                or len(set(map(str, methods))) != len(methods)
+                or any(m not in METHODS for m in methods)
+            ):
+                errors.append(f"perf.sol.methods: distinct analyses among {list(METHODS)}")
+            if not _fraction(sol.get("tolerance", 0.15), 1.0) or not sol.get("tolerance", 0.15):
+                errors.append(
+                    "perf.sol.tolerance: how far analyses may differ and agree, in (0, 1]"
+                )
     campaign = perf.get("campaign") or {}
     if campaign and not isinstance(campaign, Mapping):
         errors.append("perf.campaign: a mapping")
     elif campaign:
         errors += validate_campaign_accuracy(campaign.get("accuracy"))
         errors += _validate_max_hours(campaign.get("max_hours"))
+        errors += _validate_checkpoints(campaign)
         tolerance = campaign.get("ttft_tolerance", 0.1)
         if tolerance is not None and (
             isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or tolerance < 0
@@ -74,6 +97,42 @@ def campaign_max_hours(campaign: Mapping[str, Any]) -> float | None:
     """``perf.campaign.max_hours``: the campaign's wall budget in hours; None for no budget."""
     hours = campaign.get("max_hours")
     return None if hours is None else float(hours)
+
+
+def _fraction(value: Any, top: float = float("inf")) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and 0 <= value <= top
+
+
+def _validate_checkpoints(campaign: Mapping[str, Any]) -> list[str]:
+    """The projection's thresholds, how often a checkpoint comes, and its first-token check."""
+    errors = [
+        f"perf.campaign.{key}: a fraction >= 0 (0.05 is 5%)"
+        for key in CAMPAIGN_FRACTIONS
+        if key in campaign and not _fraction(campaign[key])
+    ]
+    keeps = campaign.get("checkpoint_keeps", 3)
+    if isinstance(keeps, bool) or not isinstance(keeps, int) or keeps < 1:
+        errors.append("perf.campaign.checkpoint_keeps: a positive number of keeps")
+    logits = campaign.get("logits")
+    if logits is None:
+        return errors
+    if not isinstance(logits, Mapping):
+        return errors + [f"perf.campaign.logits: a mapping of {sorted(LOGITS_KEYS)}"]
+    errors += [f"perf.campaign.logits.{k}: unknown key" for k in logits if k not in LOGITS_KEYS]
+    prompts = logits.get("prompts", ["x"])
+    if (
+        not isinstance(prompts, list)
+        or not prompts
+        or not all(isinstance(p, str) and p.strip() for p in prompts)
+    ):
+        errors.append("perf.campaign.logits.prompts: a non-empty list of prompts")
+    top_k = logits.get("top_k", 20)
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        errors.append("perf.campaign.logits.top_k: a positive integer")
+    for key, top in (("max_kl", float("inf")), ("min_top1", 1.0), ("tie_margin", float("inf"))):
+        if key in logits and not _fraction(logits[key], top):
+            errors.append(f"perf.campaign.logits.{key}: a number in [0, {top:g}]")
+    return errors
 
 
 def _validate_max_hours(hours: Any) -> list[str]:
@@ -139,19 +198,16 @@ def validate_campaign_accuracy(block: Any) -> list[str]:
 
 
 def _validate_goal(perf: Mapping[str, Any]) -> list[str]:
-    """``perf.goal``: a ratio to the stock reference, a fraction of SOL, or both."""
+    """``perf.goal``: a ratio to the baseline, a fraction of SOL, or both."""
     goal = perf.get("goal")
     if goal is None:
         return []
     if not isinstance(goal, Mapping) or not goal or set(goal) - GOAL_KEYS:
-        return ["perf.goal: a mapping with ratio_to_reference and/or pct_of_sol"]
+        return ["perf.goal: a mapping with ratio_to_baseline and/or pct_of_sol"]
     errors = []
-    ratio = goal.get("ratio_to_reference")
-    if "ratio_to_reference" in goal:
-        if not isinstance(ratio, (int, float)) or ratio <= 0:
-            errors.append("perf.goal.ratio_to_reference: a positive number")
-        if perf.get("reference", "stock") != "stock":
-            errors.append("perf.goal: needs reference: stock, the measurement it is a ratio of")
+    ratio = goal.get("ratio_to_baseline")
+    if "ratio_to_baseline" in goal and (not isinstance(ratio, (int, float)) or ratio <= 0):
+        errors.append("perf.goal.ratio_to_baseline: a positive number")
     if "pct_of_sol" in goal:
         pct = goal["pct_of_sol"]
         if not isinstance(pct, (int, float)) or not 0 < pct <= 1:

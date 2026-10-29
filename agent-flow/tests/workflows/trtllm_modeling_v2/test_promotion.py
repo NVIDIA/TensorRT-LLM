@@ -122,8 +122,9 @@ def test_delivery_refuses_a_target_that_still_holds_a_variant(tmp_path):
 # ------------------------------------------------------------ when it is due
 
 
-def test_an_entry_waits_while_a_variant_of_it_is_still_to_land(tmp_path):
+def test_an_entry_waits_while_a_variant_is_to_land_then_its_promote_is_added(tmp_path):
     _tree(tmp_path)
+    _write(tmp_path, f"{OTHER}/ops/attention/thop.py", ENTRY_HEAD)  # another target's own copy
     assert promo.plan([], tmp_path / "empty", TARGET) == promo.Promotion()
 
     running = promo.plan([_variant_task("k3-thop", "r3")], tmp_path, TARGET)
@@ -137,10 +138,7 @@ def test_an_entry_waits_while_a_variant_of_it_is_still_to_land(tmp_path):
     ready = [_task("core", "assemble", "done"), _task("mtp", "feature", deps=["core"])]
     assert promo.plan(ready, tmp_path, TARGET).task is not None
 
-
-def test_once_its_variants_landed_an_entrys_promote_is_added(tmp_path):
-    _tree(tmp_path)
-    _write(tmp_path, f"{OTHER}/ops/attention/thop.py", ENTRY_HEAD)  # another target's own copy
+    # Once its variants landed.
     tasks = [
         _variant_task("k3-thop", "r3", "done"),
         _variant_task("k4-thop", "r4", "done"),

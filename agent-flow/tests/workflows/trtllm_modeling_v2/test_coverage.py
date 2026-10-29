@@ -33,38 +33,43 @@ def _doc(**overrides):
     return doc
 
 
-def test_ok_row_without_contract_line_is_rejected():
-    doc = _doc(steps=[_ok_step(contract_line="")])
-    with pytest.raises(vocab.VocabularyError, match="contract_line"):
-        vocab.parse_vocabulary(doc)
-
-
-def test_a_writing_tier_must_say_what_it_rejected():
-    doc = _doc(
-        verdict=vocab.VERDICT_AFTER_ADDITIONS,
-        steps=[{"step": "exotic_norm", "state": vocab.STATE_GAP, "tier": vocab.TIER_TRITON}],
-        queue=[{"n": 1, "mode": vocab.MODE_ONBOARD, "target": "exotic_norm"}],
-    )
-    with pytest.raises(vocab.VocabularyError, match="tried"):
-        vocab.parse_vocabulary(doc)
-
-
-def test_a_ceiling_that_ignores_the_writing_tiers_is_rejected():
-    doc = _doc(
-        verdict=vocab.VERDICT_CEILING,
-        ceiling={
-            "step": "exotic_norm",
-            "searched": ["inventory"],
-            "exhausted": {1: "no trtllm op", 2: "nothing in modules/**"},
-        },
-    )
-    with pytest.raises(vocab.VocabularyError, match=r"tier\(s\) \[3, 4, 5\]"):
-        vocab.parse_vocabulary(doc)
-
-
-def test_assemblable_with_a_queue_is_contradictory():
-    doc = _doc(queue=[{"n": 1, "mode": vocab.MODE_ONBOARD, "target": "a"}])
-    with pytest.raises(vocab.VocabularyError, match="assemblable_after_additions"):
+@pytest.mark.parametrize(
+    "doc,match",
+    [
+        (_doc(steps=[_ok_step(contract_line="")]), "contract_line"),
+        # A writing tier must say what it rejected.
+        (
+            _doc(
+                verdict=vocab.VERDICT_AFTER_ADDITIONS,
+                steps=[
+                    {"step": "exotic_norm", "state": vocab.STATE_GAP, "tier": vocab.TIER_TRITON}
+                ],
+                queue=[{"n": 1, "mode": vocab.MODE_ONBOARD, "target": "exotic_norm"}],
+            ),
+            "tried",
+        ),
+        # A ceiling that ignores the writing tiers.
+        (
+            _doc(
+                verdict=vocab.VERDICT_CEILING,
+                ceiling={
+                    "step": "exotic_norm",
+                    "searched": ["inventory"],
+                    "exhausted": {1: "no trtllm op", 2: "nothing in modules/**"},
+                },
+            ),
+            r"tier\(s\) \[3, 4, 5\]",
+        ),
+        # Assemblable with a queue is contradictory.
+        (
+            _doc(queue=[{"n": 1, "mode": vocab.MODE_ONBOARD, "target": "a"}]),
+            "assemblable_after_additions",
+        ),
+    ],
+    ids=["ok-without-contract-line", "writing-tier-without-tried", "ceiling", "queue"],
+)
+def test_an_incoherent_vocabulary_is_rejected(doc, match):
+    with pytest.raises(vocab.VocabularyError, match=match):
         vocab.parse_vocabulary(doc)
 
 
@@ -123,25 +128,19 @@ def test_a_row_covers_each_axis_not_their_product():
 # ------------------------------------------------------------------ unit
 
 
-_UNITS = ("core", "dspark", "multimodal", "kv_quant")
+def test_a_queue_row_may_name_a_unit_the_run_builds_that_first_needs_it():
+    def queue(*rows):
+        return _doc(verdict=vocab.VERDICT_AFTER_ADDITIONS, queue=list(rows))
 
-
-def _queue_doc(*rows):
-    return _doc(verdict=vocab.VERDICT_AFTER_ADDITIONS, queue=list(rows))
-
-
-def test_a_queue_row_may_name_the_unit_that_first_needs_it():
+    units = ("core", "dspark", "multimodal", "kv_quant")
     parsed = vocab.parse_vocabulary(
-        _queue_doc(
+        queue(
             {"n": 1, "mode": vocab.MODE_ONBOARD, "target": "moe/drafter_moe", "unit": "dspark"},
             {"n": 2, "mode": vocab.MODE_ONBOARD, "target": "norm/core_only"},
         ),
-        units=_UNITS,
+        units=units,
     )
     assert [item.unit for item in parsed] == ["dspark", vocab.UNIT_CORE]
-
-
-def test_a_unit_the_run_does_not_build_is_rejected():
-    doc = _queue_doc({"n": 1, "mode": vocab.MODE_ONBOARD, "target": "x", "unit": "dspakr"})
+    typo = queue({"n": 1, "mode": vocab.MODE_ONBOARD, "target": "x", "unit": "dspakr"})
     with pytest.raises(vocab.VocabularyError, match="not one of this run's assembly units"):
-        vocab.parse_vocabulary(doc, units=_UNITS)
+        vocab.parse_vocabulary(typo, units=units)

@@ -36,6 +36,7 @@ from ..agents.slots import AgentGate, Priority, run_at, turn_priority
 from ..infra.files import write_text_atomic
 from ..operators import coverage as vocab_mod
 from . import graph as graph_mod
+from . import inbox as inbox_mod
 from .records import metrics as metrics_mod
 from .validation import contract as contract_mod
 from .validation.completion import Completion, assess
@@ -172,9 +173,6 @@ class Services:
     #: accuracy reference, the target's files and commits), as cheap as reading files:
     #: what fails, one line each; empty when all pass. ``None``: none are checked here.
     delivery_files: Callable[[], list[str]] | None = None
-    #: Tell a running campaign to wrap up: full support holds, so it dispatches nothing
-    #: new and ends with its best kept tree. Given why.
-    stop_campaign: Callable[[str], None] = lambda reason: None
     #: What the stage has for the planner outside any task since last asked (the
     #: operator's messages): each an event of the next turn.
     stage_notes: Callable[[], list[str]] | None = None
@@ -262,6 +260,7 @@ class GraphOrchestrator:
         max_gpus: int | None = None,
         required_kinds: Iterable[str] = (),
         start_after: Mapping[str, Sequence[str]] | None = None,
+        after_core: tuple[Iterable[str], Iterable[str]] = ((), ()),
         own_paths: Iterable[str] = (),
         repo_root: str | Path = "",
     ) -> None:
@@ -297,6 +296,10 @@ class GraphOrchestrator:
         #: Per kind, the checks that must have passed before a task of that
         #: kind may start.
         self.start_after = {k: tuple(v) for k, v in (start_after or {}).items()}
+        #: The feature units and variants (their ``ref``), and the core's boot checks: a
+        #: worker's task on one of them starts once any of those checks has passed.
+        refs, boots = after_core
+        self._feature_refs, self._core_boots = frozenset(refs), tuple(boots)
         self.revision_cap = revision_cap
         self.max_parallel = max_parallel
         #: Checks running at once, across every task and the re-checks of an idle run.
@@ -308,6 +311,9 @@ class GraphOrchestrator:
         self.event_window_s = event_window_s
         self._first_event_at: float | None = None
         self._status_lock = threading.Lock()
+        #: One lock per check key: the same check never runs twice at once.
+        self._check_locks: dict[str, threading.RLock] = {}
+        self._check_locks_guard = threading.Lock()
         #: The checkout a kernel task's files are named from: a multi-rank entry's op matrix.
         self.repo_root = str(repo_root)
         self.validation = {
@@ -372,8 +378,6 @@ class GraphOrchestrator:
         #: The delivery files that last kept a holding contract from full support, per
         #: marker, as the planner heard them.
         self._files_said: tuple[str, tuple[str, ...]] | None = None
-        #: A running campaign was told to wrap up: full support holds.
-        self._campaign_stopped = False
         #: The target's marker and the landing the last re-checks beside running work
         #: were chosen on.
         self._rechecked_at: tuple[str, str] | None = None
@@ -498,13 +502,32 @@ class GraphOrchestrator:
     def _delivery_keys(self) -> set[str]:
         return {c.key for c in self.contract.by_tier(contract_mod.TIER_DELIVERY)}
 
+    def _check_lock(self, key: str) -> threading.RLock:
+        with self._check_locks_guard:
+            return self._check_locks.setdefault(key, threading.RLock())
+
     def _run_check(self, check: contract_mod.Check) -> bool:
         """One check, in a pool thread, recorded under the target as it was when it started.
 
         A check the contract already counts as passed on this very target (its
         own verdict, or an equivalent check's) does not run again; that is
-        asked as the check starts, and the target is read then.
+        asked as the check starts, and the target is read then. A check that
+        needs another's verdict first (:attr:`Check.after`: a relative
+        variant's benchmark, judged against its unit's) has it on this target
+        before it starts, the other run here if it has none.
         """
+        first = self._check_by_key(check.after) if check.after else None
+        if first is not None:
+            with self._check_lock(first.key):
+                marker = self.s.marker()
+                with self._status_lock:
+                    had = contract_mod.verdict_on(self.status, first.key, marker, self.s.holds)
+                if had is None:
+                    self._run_check(first)
+        with self._check_lock(check.key):
+            return self._run_check_once(check)
+
+    def _run_check_once(self, check: contract_mod.Check) -> bool:
         marker = self.s.marker()
         if marker:
             with self._status_lock:
@@ -718,6 +741,27 @@ class GraphOrchestrator:
         }
         return {kind: keys for kind, keys in waiting.items() if keys}
 
+    def _waiting_for_core(self) -> set[str]:
+        """The pending feature-unit and variant tasks that wait for the core to boot once.
+
+        Until a boot of the core passes, a feature's own work builds on a target
+        nobody has seen run, and takes the slots the core's repair needs. Kernel
+        and investigate tasks are not held: the core's own work needs them.
+        """
+        if not self._feature_refs or not self._core_boots:
+            return set()
+        with self._status_lock:
+            latest = self.status.latest()
+        if any(latest[key].passed for key in self._core_boots if key in latest):
+            return set()
+        return {
+            t.id
+            for t in self.graph.tasks
+            if t.status == "pending"
+            and t.kind in ("assemble", "feature")
+            and t.ref in self._feature_refs
+        }
+
     def _required_open(self, *, campaign: bool = True) -> bool:
         """Whether a required task is pending or running.
 
@@ -757,25 +801,6 @@ class GraphOrchestrator:
         kinds = {t.id: t.kind for t in self.graph.tasks}
         return [task_id for task_id in running if kinds.get(task_id) not in BACKGROUND_KINDS]
 
-    def _stop_campaigns(self, running: Mapping[str, Future]) -> None:
-        """Full support holds: tell the running campaign to wrap up, once.
-
-        It dispatches nothing new and ends with its best kept tree, which is
-        reported as an artifact of the run; the run is delivered once it has.
-        """
-        if self._campaign_stopped:
-            return
-        kinds = {t.id: t.kind for t in self.graph.tasks}
-        campaigns = [tid for tid in running if kinds.get(tid) in BACKGROUND_KINDS]
-        if not campaigns:
-            return
-        self._campaign_stopped = True
-        reason = "full support holds on the target as it is"
-        self.s.log(
-            f"[support] {reason}: {', '.join(campaigns)} wraps up, then the run is delivered"
-        )
-        self.s.stop_campaign(reason)
-
     def _settle(self, busy: bool = False) -> None:
         """Keep the target verified as it changes; then, with no required task open, the delivery tier.
 
@@ -790,8 +815,7 @@ class GraphOrchestrator:
 
         A stale accuracy check runs again at a milestone only: once no required
         task is open, or for the bring-up before it was named. Until then the
-        cheaper checks of each landing (the logit gate, the boot's greedy
-        tokens) stand watch.
+        cheaper checks of each landing (the boots) stand watch.
         """
         claimed = {k for t in self.graph.tasks if t.status == "done" for k in t.satisfies}
         delivery = self._delivery_keys()
@@ -1041,6 +1065,10 @@ class GraphOrchestrator:
         if not running or self._settling is not None:
             return False
         return not self._foreground(running)
+
+    def _operator_waiting(self) -> bool:
+        """Whether a message from the operator waits for the planner's next turn."""
+        return any(inbox_mod.is_message(event.text) for event in self.events)
 
     def _loud(self) -> bool:
         """Whether an event waits that may wake a turn: any but a quiet one."""
@@ -1755,7 +1783,8 @@ class GraphOrchestrator:
             if self._settling is not None and all(f.done() for _, f in self._settling[1]):
                 self._settled()
             for note in self.s.stage_notes() if self.s.stage_notes is not None else ():
-                self._note(note, urgent=True)
+                # An operator's message rides with the next turn unless sent `--now`.
+                self._note(note, urgent=not inbox_mod.is_message(note) or inbox_mod.is_urgent(note))
             if self._planner is not None and self._planner.done():
                 verdict = self._planner_returned(planner)
                 if verdict:
@@ -1781,7 +1810,7 @@ class GraphOrchestrator:
             slots = max(AgentGate(self.max_parallel).task_slots - workers, 0)
             self._resumed &= {t.id for t in self.graph.tasks if t.status == "pending"}
             self._follow_shared_changes()
-            waiting = self._regression_step() | self._closing_holds()
+            waiting = self._regression_step() | self._closing_holds() | self._waiting_for_core()
             ready_now = {t.id for t in graph_mod.ready(self.graph, self._receipts_landed)}
             now = time.monotonic()
             self._ready_since = {tid: self._ready_since.get(tid, now) for tid in ready_now}
@@ -1829,7 +1858,7 @@ class GraphOrchestrator:
                 self._settle(busy=bool(self._foreground(running)))
             idle = not running and self._settling is None and self._planner is None
             # Nothing in flight but a campaign: what the graph owes is read as
-            # when idle, for the campaign gives way once full support holds.
+            # when idle; the run is delivered once the campaign ends.
             spent = idle or (
                 not self._foreground(running) and self._settling is None and self._planner is None
             )
@@ -1852,10 +1881,10 @@ class GraphOrchestrator:
                 )
                 self._correctness(marker, evaluation, completion)
                 unreviewed, gaps = completion.unreviewed, completion.gaps
-                if completion.ready:
-                    if idle:
-                        return "delivered"
-                    self._stop_campaigns(running)
+                # A message the operator left is read before the run is delivered.
+                # A campaign started once the contract held: the run waits for it to end.
+                if completion.ready and not self._operator_waiting() and idle:
+                    return "delivered"
                 # Standing complaints wake no turn while an escalation waits on the operator.
                 if unreviewed and not self._escalated:
                     self.revisions_since_progress += 1
@@ -1886,9 +1915,12 @@ class GraphOrchestrator:
                     blocked = graph_mod.ready(self.graph, self._receipts_landed)
                     if blocked and not self._escalated:
                         # Ready work that cannot start with nothing running never will.
+                        before_core = self._waiting_for_core()
                         reasons = ", ".join(
                             f"{t.id} (waits for {', '.join(gated[t.kind])})"
                             if t.kind in gated
+                            else f"{t.id} (waits for a core boot to pass)"
+                            if t.id in before_core
                             else f"{t.id} ({self._held(t)} GPUs)"
                             for t in blocked
                         )

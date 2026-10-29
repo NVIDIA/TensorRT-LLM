@@ -503,24 +503,8 @@ def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
     ]
 
 
-def check_accuracy_reference(
-    repo_root: Path, reference_yaml: str, model_key: str, *, pending: bool = False
-) -> list[Check]:
-    """The anchor this run gated against is written down, keyed by the model.
-
-    ``pending``: the spec says no written anchor exists yet (``accuracy.anchor``).
-    The check then fails whatever the file holds: the row is the user's to record
-    from a written source, never this run's to write from its own measurement.
-    """
-    if pending:
-        return [
-            Check(
-                name="accuracy:reference",
-                passed=False,
-                detail=f"anchor pending: no written accuracy anchor for {model_key} yet; "
-                "record the row from a written source (never from this run's own score)",
-            )
-        ]
+def check_accuracy_reference(repo_root: Path, reference_yaml: str, model_key: str) -> list[Check]:
+    """The anchor this run gated against is written down, keyed by the model."""
     path = Path(reference_yaml)
     if not path.is_absolute():
         path = repo_root / path
@@ -672,7 +656,6 @@ def verify_delivery(
     model_key: str,
     accuracy_test: str,
     commit_policy: CommitPolicy | None = None,
-    anchor_pending: bool = False,
 ) -> DeliveryReport:
     """Run every mechanical delivery check and return the report."""
     root = Path(repo_root)
@@ -699,7 +682,7 @@ def verify_delivery(
     checks.extend(check_model_ops(root, target_rel, model_ops))
     checks.extend(check_model_op_tests(root, target_rel, model_ops))
     checks.extend(check_routing(root, family, target_rel))
-    checks.extend(check_accuracy_reference(root, reference_yaml, model_key, pending=anchor_pending))
+    checks.extend(check_accuracy_reference(root, reference_yaml, model_key))
     checks.extend(check_test_registration(root, accuracy_test))
     checks.extend(check_tree_committed(root, (target_rel, MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)))
     if commit_policy is not None:

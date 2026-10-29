@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-r"""``trtllm-modeling-v2 gate <name>``: run one gate or witness exactly as the orchestrator does.
+r"""``trtllm-modeling-v2 gate <name>``: run one gate exactly as the orchestrator does.
 
 The workflow's own gate functions, with the environment, runner and flags
 resolved from the same task.yaml. Like the orchestrator's checks, it measures
@@ -46,29 +46,28 @@ from . import boot as boot_checks
 from . import check_config, check_runtime, gate_records
 from . import verdict as check_result
 
-#: The gates and witnesses this command runs, by the name it takes.
+#: The gates this command runs, by the name it takes.
 GATE_NAMES: tuple[str, ...] = (
     "boot",
     "accuracy",
     "acceptance",
-    "witness",
     "serve",
-    "logits",
+    "disagg",
 )
 
 
 def _parse(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2 gate",
-        description="Run one trtllm_modeling_v2 gate or witness standalone, as the orchestrator runs it.",
+        description="Run one trtllm_modeling_v2 gate standalone, as the orchestrator runs it.",
     )
-    parser.add_argument("name", choices=GATE_NAMES, help="the gate or witness to run")
+    parser.add_argument("name", choices=GATE_NAMES, help="the gate to run")
     parser.add_argument("--task", type=Path, required=True, help="the run's task.yaml")
     parser.add_argument(
         "--unit",
         default="core",
-        help="the assembly unit whose configuration to gate (default core); a witness "
-        "needs the unit whose feature it witnesses",
+        help="the assembly unit whose configuration to gate (default core); disagg "
+        "gates the disagg unit",
     )
     parser.add_argument(
         "--member",
@@ -126,7 +125,7 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         "the devices it hands the job)",
     )
     parser.add_argument("--world-size", type=int, default=None)
-    parser.add_argument("--timeout", type=int, default=None, help="seconds, per leg where legged")
+    parser.add_argument("--timeout", type=int, default=None, help="seconds")
     parser.add_argument(
         "--mode",
         choices=(check_runtime.MODE_REQUIRE, check_runtime.MODE_OFF),
@@ -180,9 +179,10 @@ def _snapshot(args: argparse.Namespace, task_data: Mapping[str, Any]) -> Iterato
 
 def run_gate(args: argparse.Namespace) -> check_result.GateResult:
     """Resolve everything from the task and run the named gate on the tree it measures."""
-    from . import witness as witness_mod
+    from . import disagg
 
     task_data = load_and_validate_task_yaml(args.task)
+    declared = task_data
     unit = args.unit
     world = args.world_size
     member = args.member
@@ -198,6 +198,10 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         member = check_config.order_members_by_cost(members)[0]
     if world is None:
         world = parse_parallel_segment(member)[1] or 1
+    # The disaggregated-serving test starts two engines, so it asks for both, as the
+    # orchestrator's run does.
+    spec = disagg.DisaggSpec.from_task(task_data) if args.name == "disagg" else None
+    gpus = (spec.device_count(member) if spec else None) or world
     if args.devices:
         devices = tuple(int(d) for d in args.devices.split(","))
     elif scheduler_owns_devices(str((task_data.get("environment") or {}).get("kind", "local"))):
@@ -205,28 +209,37 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         # mask the ones it assigned and stack concurrent jobs on the same cards.
         devices = ()
     else:
-        devices = tuple(range(world))
+        devices = tuple(range(gpus))
     environment = resolve_environment(task_data, devices=devices, world_size=world)
+    # The unit's own, without a variant's overlay: what a relative variant is judged against.
+    unit_environment = resolve_environment(declared, devices=devices, world_size=world)
     if args.python:
         environment = replace(environment, python=args.python)
+        unit_environment = replace(unit_environment, python=args.python)
     with _snapshot(args, task_data) as pin:
         tree = pin.tree if pin is not None else args.tree
         if pin is not None:
-            task_data = pin.spec(task_data, pin.snapshots.tracked(pin.commit))
+            tracked = pin.snapshots.tracked(pin.commit)
+            task_data, declared = pin.spec(task_data, tracked), pin.spec(declared, tracked)
         elif tree is not None:
             task_data = {**task_data, "trtllm_repo_path": str(tree.resolve())}
-        # An equivalence witness runs both legs' engines in one job (leg B is two engines of
-        # the member's width), so it asks for the node, as the orchestrator's run does.
-        witness_kind = witness_mod.WITNESS_KINDS.get(unit) if args.name == "witness" else None
-        gpus = "all" if witness_kind == "equivalence" else str(environment.world_size)
+            declared = {**declared, "trtllm_repo_path": str(tree.resolve())}
         # A worker's own gate run queues after the run's checks and before perf work.
         executor = select_command_executor(
-            environment, name_prefix=f"gate-{args.name}", gpus=gpus, tree=tree,
+            environment, name_prefix=f"gate-{args.name}", gpus=str(gpus), tree=tree,
             priority=FEATURE,
         )  # fmt: skip
         runner = shell_runner_for(executor)
         runner = pin.runner(runner) if pin is not None else check_runtime.in_tree(runner, tree)
-        result = _run_named(args, task_data, environment, runner, unit=unit, member=member)
+        result = _run_named(
+            args,
+            task_data,
+            environment,
+            runner,
+            unit=unit,
+            member=member,
+            declared=(declared, unit_environment),
+        )
         return pin.stamp(result) if pin is not None else result
 
 
@@ -238,11 +251,16 @@ def _run_named(
     *,
     unit: str,
     member: str,
+    declared: tuple[dict[str, Any], RunEnvironment] | None = None,
 ) -> check_result.GateResult:
-    """Run the gate ``args.name`` names, with everything already resolved."""
+    """Run the gate ``args.name`` names, with everything already resolved.
+
+    ``declared`` is the spec as written and its environment, before a variant's
+    overlay: a variant whose anchor is relative is judged against its unit's
+    benchmark, run here first under them.
+    """
     from ..checks.accuracy import resolve_model_key
-    from . import logit_agreement, serve
-    from . import witness as witness_mod
+    from . import disagg, serve
 
     features = (
         [f for f in args.features.split(",") if f]
@@ -261,6 +279,40 @@ def _run_named(
             features=features,
             workdir=workdir / unit,
             mode=args.mode,
+            **timeout,
+            **common,
+        )
+    spec, unit_environment = declared or (task_data, environment)
+    if args.name == "accuracy" and (
+        declared is not None
+        and variants_mod.anchor_state(spec, unit) == variants_mod.ANCHOR_RELATIVE
+    ):
+        base = variants_mod.base_unit(spec, unit)
+        try:
+            anchor = accuracy_checks.resolve_reference(
+                spec, model_key=resolve_model_key(spec, base), unit=base
+            )
+        except (KeyError, FileNotFoundError, TypeError, ValueError):
+            anchor = 0.0  # only the score it measures is used, as the variant's anchor
+        first = accuracy_checks.run_accuracy_gate(
+            unit_environment,
+            reference=anchor,
+            workdir=workdir / base,
+            **timeout,
+            **{**common, "task_data": spec, "unit": base},
+        )
+        if first.infrastructure or first.measured is None:
+            return replace(
+                first,
+                passed=False,
+                detail=f"{base}'s benchmark at {member} measured no score ({first.detail}), so "
+                f"{unit}, whose anchor is that score, has nothing to be judged against",
+            )
+        return accuracy_checks.run_accuracy_gate(
+            environment,
+            reference=first.measured,
+            workdir=workdir / unit,
+            relative=True,
             **timeout,
             **common,
         )
@@ -294,27 +346,10 @@ def _run_named(
             spec=replace(spec, timeout=args.timeout) if args.timeout else spec,
             **common,
         )
-    if args.name == "logits":
-        spec = logit_agreement.LogitsSpec.from_task(task_data)
-        return logit_agreement.run_logit_gate(
-            environment,
-            features=features,
-            workdir=workdir / unit,
-            spec=replace(spec, timeout=args.timeout) if args.timeout else spec,
-            **common,
-        )
-    if unit not in witness_mod.WITNESS_KINDS:
-        raise TaskSchemaError(
-            f"unit {unit!r} has no witness; the witnessed features are "
-            f"{sorted(witness_mod.WITNESS_KINDS)}"
-        )
-    return witness_mod.run_declared_witness(
-        environment,
-        features=features,
-        workdir=workdir / "witness" / unit,
-        boot=boot_checks.resolve_boot_spec(task_data, unit),
-        **common,
-    )
+    spec = disagg.DisaggSpec.from_task(task_data)
+    if spec is not None and args.timeout:
+        spec = replace(spec, timeout=args.timeout)
+    return disagg.run_disagg_gate(environment, workdir=workdir / unit, spec=spec, **common)
 
 
 #: The workflow's CLI as the run's agents call it: ``<workspace>/bin/<this>``.

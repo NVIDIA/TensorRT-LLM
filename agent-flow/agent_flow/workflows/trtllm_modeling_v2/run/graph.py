@@ -764,7 +764,11 @@ def apply_revision(
 
 
 def stalled(revisions_since_progress: int, cap: int) -> bool:
-    """The planner has revised ``cap`` times without a contract check turning green."""
+    """The planner has revised ``cap`` times without progress.
+
+    Progress is a task done, a change landed on the target or a contract check
+    turning green (``GraphOrchestrator._finish``).
+    """
     return revisions_since_progress >= cap
 
 

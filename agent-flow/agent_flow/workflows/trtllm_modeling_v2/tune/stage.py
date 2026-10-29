@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The tune campaign: perf smoke -> ground truth -> modeling campaign -> wrap-up.
+"""The tune campaign: one baseline -> modeling campaign -> wrap-up.
 
+It starts once onboarding is complete: the target serves and its contract holds, so nothing is
+measured before the baseline (no smoke, no stock reference) and the baseline once (no repeats).
 Runs as the execution stage's ``tune`` task, pinned to the commit the target is at when it starts
 (:func:`run_tune_task`), or as ``trtllm-modeling-v2 tune`` (:func:`run_tune_phase`). Every phase
 checkpoints into ``state.tune`` and is idempotent on resume: a label measured at the same
@@ -13,23 +15,25 @@ variant or roadmap is issued; those already issued are measured and judged.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
 from ..agents.slots import Priority, turn_priority
 from ..infra.git import git_checked
+from ..operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 from . import sol as sol_mod
-from .campaign import Campaign, CandidateState, read_decision
-from .harness.bench import resolve_config
-from .keep_gate import KeepGate, KeepGateError, resolve_keep_gate
+from .attempts import ATTEMPTS_FILE, digest, outcome
+from .campaign import Campaign, CandidateState, perf_points, read_decision, revisable
+from .harness.microbench import ROUGH_TOLERANCE
+from .keep_gate import FAIL, KeepGate, KeepGateError, resolve_keep_gate
+from .logits_check import LogitsCheck
 from .measure import (
     BenchSpec,
     MeasurementRunner,
@@ -46,72 +50,28 @@ from .records import (
     compare,
     format_table,
     goal_reached,
-    ground_floors,
 )
 from .requests import (
     CampaignContext,
     TuneRequests,
     render_rebase_request,
     render_request,
+    render_revise_request,
     render_split_request,
     turn_prompt,
 )
 from .schema import campaign_max_hours, validate_perf_block
-from .serving_config import write_serving_config
+from .sol_consensus import METHODS, TOLERANCE, read_rulings, reconcile
 from .spec import TuneSpec
 from .worktree import open_candidate
 
 PACKAGE = Path(__file__).resolve().parent.parent
-#: The perf smoke before the baseline: con 1, this many prompts of this many output tokens,
-#: one job per world size, each stopped at this wall (``perf.campaign.smoke_wall``).
-SMOKE_PROMPTS = 4
-SMOKE_OSL = 32
-SMOKE_WALL = "45m"
-
-
-def _world_size(configs: Sequence[Path]) -> int:
-    """The ranks one server of these configs runs, as ``bench.py`` launches it."""
-    config = resolve_config(list(configs), [])
-    world = 1
-    for key in ("tensor_parallel_size", "pipeline_parallel_size", "context_parallel_size"):
-        world *= int(config.get(key) or 1)
-    return world
-
-
-def _floor_line(same: NoiseFloor, cross: NoiseFloor) -> str:
-    """The ground floors in one journal line: the same-host floor, and the spread across hosts."""
-
-    def widest(floor: NoiseFloor) -> str:
-        metric = max(floor.spread, key=floor.spread.get)
-        return f"{floor.spread[metric]:.2%} ({metric})"
-
-    line = (
-        f"noise floor: same-host spread up to {widest(same)} over {same.samples} runs"
-        if same.spread
-        else "noise floor: not measured; using the conservative assumed band (no automatic repeats)"
-    )
-    if cross.spread:
-        line += (
-            f"; across hosts up to {widest(cross)}, not a floor: a keep is judged on its own host"
-        )
-    return line
 
 
 def _same_commit(a: str, b: str) -> bool:
     """Two spellings of one commit: one is a prefix (of at least 7) of the other."""
     short = min(len(a), len(b))
     return short >= 7 and a[:short] == b[:short]
-
-
-@contextlib.contextmanager
-def _tuner_pool(workers: int, stopped: Callable[[], bool]) -> Iterator[ThreadPoolExecutor]:
-    """The pool tuner turns run on; on leaving it, a stopped campaign does not wait for them."""
-    pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="tuner")
-    try:
-        yield pool
-    finally:
-        stop = stopped()
-        pool.shutdown(wait=not stop, cancel_futures=stop)
 
 
 def _ttft_tolerance(campaign: Mapping[str, Any]) -> float | None:
@@ -186,8 +146,7 @@ class TuneStage:
     """One campaign. ``dispatch(role, what, prompt)`` runs one agent turn and returns its text.
 
     ``attempt`` is the task's attempt (1, then +1 per retry). ``clock`` is the wall clock the
-    budget is read on. ``should_stop`` says the run no longer needs the campaign (full support
-    holds): it then wraps up as when its wall budget is spent, and drops what is not yet measuring.
+    budget is read on.
     """
 
     def __init__(
@@ -202,11 +161,9 @@ class TuneStage:
         log: Callable[[str], None] = print,
         attempt: int = 1,
         clock: Callable[[], float] = time.time,
-        should_stop: Callable[[], bool] = lambda: False,
     ) -> None:
         self.spec = spec
         self.requests = TuneRequests(spec, self._standings)
-        self.should_stop = should_stop
         self.t = tune_state
         self.dispatch = dispatch
         self.checkpoint = checkpoint
@@ -294,84 +251,16 @@ class TuneStage:
             prefix=self.branch_prefix,
         )
 
-    def _smoke_configs(self) -> dict[int, tuple[str, list[Path]]]:
-        """The first perf config of each world size served: ``{world: (name, configs)}``."""
-        s = self.spec
-        runs = [(p.name, list(p.configs)) for p in s.parts] or [("identity", s.identity_configs)]
-        out: dict[int, tuple[str, list[Path]]] = {}
-        for name, configs in runs:
-            out.setdefault(_world_size(configs), (name, list(configs)))
-        return dict(sorted(out.items()))
-
-    def smoke(self) -> bool:
-        """The perf preflight, before the baseline: one short serve per world size.
-
-        Con 1, ``SMOKE_PROMPTS`` prompts of ``SMOKE_OSL`` tokens, on the perf sessions and the
-        tree the baseline measures. No automatic reruns. Skipped
-        once the baseline is measured, and with ``perf.campaign.smoke: false``.
-        """
-        s = self.spec
-        if not s.campaign.get("smoke", True) or (self.data / "t-baseline" / "meta.json").exists():
-            return True
-        try:
-            runs = self._smoke_configs()
-        except (OSError, yaml.YAMLError) as exc:
-            self.t["failure"] = f"smoke: the perf configs do not read ({exc})"
-            self.log(f"[tune] the perf smoke cannot start: {self.t['failure']}")
-            self.checkpoint()
-            return False
-        labels = {f"t-smoke-w{world}": configs for world, (_, configs) in runs.items()}
-        bench = replace(
-            s.bench(),
-            isl=min([p.isl for p in s.parts] or [s.isl]),
-            osl=SMOKE_OSL,
-            concurrencies=[1],
-            parts=(),
-            wall=str(s.campaign.get("smoke_wall", SMOKE_WALL)),
-            extra_args=(
-                "--num-prompts", f"1:{SMOKE_PROMPTS}", "--warmup-concurrency", "1",
-                "--warmup-prompts", "1", "--warmup-osl", "8",
-            ),
-        )  # fmt: skip
-        tree = str(self._best_tree()) if s.base_commit else None
-        got = self._measure(labels, tree=tree, bench=bench, phase="smoke")
-        problems = []
-        for world, (name, _) in runs.items():
-            label = f"t-smoke-w{world}"
-            m = got.get(label)
-            if m is None:
-                problems.append(f"world size {world} (`{name}`): {self._failure(label)}")
-            elif (served := m.meta.get("modeling_v2", "require")) != "require":
-                problems.append(
-                    f"world size {world} (`{name}`) served `modeling_v2: {served}`: the perf "
-                    "config does not select the target (`modeling_v2: require`)"
-                )
-        self.ledger.append("smoke", passed=not problems, worlds=sorted(runs), problems=problems)
-        if problems:
-            self.t["failure"] = "smoke: " + "; ".join(problems)
-            self.log(
-                "[tune] the perf smoke failed; the baseline is not started: " + "; ".join(problems)
-            )
-        else:
-            self.log(f"[tune] the perf smoke passed at world sizes {sorted(runs)}")
-        self.checkpoint()
-        return not problems
-
     def ground(self) -> bool:
-        """The baseline, its noise repeats and the stock reference, over every perf node at once.
+        """The baseline: one measurement of the onboarded target at the perf configs.
 
-        A keep is judged against controls of its own host, so its floor is a same-host
-        spread (:func:`records.ground_floors`); the spread across hosts judges nothing.
+        Onboarding is complete when the campaign starts, so nothing else comes first. The
+        baseline must serve the target (``modeling_v2: require``); a keep is judged against
+        controls of its own host, the first of them this measurement.
         """
         s = self.spec
-        stock = write_serving_config(s.workdir / "configs" / "stock.yaml", {"modeling_v2": "off"})
-        ground = self._ground_labels()
-        labels: dict[str, Sequence[Path]] = {label: s.identity_configs for label in ground}
-        if s.reference == "stock":
-            labels["t-reference"] = [*s.identity_configs, stock]
         tree = str(self._best_tree())
-        got = self._measure(labels, tree=tree)
-        baseline = got.get("t-baseline")
+        baseline = self._measure({"t-baseline": s.identity_configs}, tree=tree).get("t-baseline")
         try:
             if baseline is None:
                 raise ValueError(self._failure("t-baseline"))
@@ -381,40 +270,48 @@ class TuneStage:
                 s.identity_configs,
                 git_checked(Path(tree), "rev-parse", "HEAD"),
             )
+            served = baseline.meta.get("modeling_v2", "require")
+            if served != "require":
+                raise ValueError(
+                    f"the perf config served `modeling_v2: {served}`: it does not select the "
+                    "target (`modeling_v2: require`)"
+                )
         except (KeyError, OSError, TypeError, ValueError) as exc:
             self.t["failure"] = f"baseline: {exc}"
             self.log(f"[tune] invalid or missing baseline; campaign cannot start ({exc})")
             return False
-        # The campaign's first floor, of the baseline tree; every later best tree is judged on
-        # a floor of its own (``Campaign._floor``).
-        same, cross = ground_floors([got[label] for label in ground if got.get(label)])
-        self.t.update(baseline="t-baseline", reference="t-reference" if s.reference == "stock" else "",
-                      noise_spread=same.spread, noise_samples=same.samples,
-                      cross_host_spread=cross.spread, phase="campaign")  # fmt: skip
-        self.ledger.append("noise_floor", phase="ground", spread=same.spread, samples=same.samples,
-                           cross_host=cross.spread)  # fmt: skip
-        self.log("[tune] " + _floor_line(same, cross))
+        self.t.update(baseline="t-baseline", phase="campaign")
+        self.ledger.append("baseline", label="t-baseline")
+        self.log(
+            "[tune] baseline measured once; keeps are judged on the assumed noise band against "
+            "controls of their own host"
+        )
         self.checkpoint()
         return True
 
     def _ground_labels(self) -> list[str]:
-        """The baseline and its noise repeats: one measurement of the base tree, taken again."""
-        return ["t-baseline", *(f"t-baseline-r{i}" for i in range(1, self.spec.noise_repeats + 1))]
+        """The measurements of the base tree: the baseline, once."""
+        return ["t-baseline"]
 
-    def _context(self, standings: str) -> CampaignContext:
+    def _context(self, standings: str, attempts: str = "") -> CampaignContext:
         s = self.spec
         return CampaignContext(
             repo=s.repo, package=PACKAGE, campaign_dir=s.workdir, perf_root=s.workdir, target_dir=s.target,
-            target_tests=s.target.replace("tensorrt_llm/_torch/_experimental/", "tests/unittest/_torch/"),
+            target_tests=s.target.replace(MODELING_V2_PACKAGE, CATALOG_TESTS_DIR),
             model=s.model, dev_spools=[Path(p) for p in s.dev_spools], env_script=s.env_script, embargo=s.embargo,
             workload=s.describe_workload(),
             standings_table=standings, sister_engines=s.sister_engines, notes=self.requests.sources_note(),
+            points=perf_points(s.bench()), attempts=attempts,
         )  # fmt: skip
+
+    def _attempts(self, camp: Campaign) -> str:
+        """What the finished candidates found, for a request (``attempts.md`` holds all of it)."""
+        return digest(list(camp.state.candidates.values()), self.spec.workdir / ATTEMPTS_FILE)
 
     def _standings(self) -> str:
         ms = [
             Measurement.load(self.data / label)
-            for label in (self.t.get("baseline"), self.t.get("reference"))
+            for label in (self.t.get("baseline"),)
             if label and (self.data / label / "meta.json").exists()
         ]
         if not ms:
@@ -427,11 +324,9 @@ class TuneStage:
         """The target's own suite and the modeling_v2 contract tests: run on every tree gated."""
         if not self.spec.campaign.get("gate_tests", True):
             return []
-        shared = "tests/unittest/_torch/modeling_v2/"
+        shared = f"{CATALOG_TESTS_DIR}/"
         return [
-            self.spec.target.replace(
-                "tensorrt_llm/_torch/_experimental/", "tests/unittest/_torch/"
-            ),
+            self.spec.target.replace(MODELING_V2_PACKAGE, CATALOG_TESTS_DIR),
             *(
                 shared + f"test_modeling_v2_{n}.py"
                 for n in ("claims", "no_stale_claims", "target_contract", "routing")
@@ -447,26 +342,42 @@ class TuneStage:
         return sol_mod.from_state(self.t.get("sol") or {})
 
     def _sol(self) -> None:
-        """Ask for the SOL ceilings once, after ground truth; one fix turn, then go on without.
+        """Ask for the SOL ceilings once, after ground truth: several analyses, one answer.
 
-        A turn answered across a restart is not asked again: a ``sol.yaml`` that loads, or the
-        turn's decision file, is its answer.
+        Each method of ``perf.sol.methods`` is its own turn, side by side, with one fix turn;
+        the analyses that load are reconciled (``sol_consensus``), and what they dispute is
+        ruled on once by an adjudication turn that chooses among them. What stays disputed is
+        unknown. A turn answered across a restart is not asked again: its output that loads, or
+        its decision file, is its answer.
         """
         if not self.spec.sol.get("enabled", True) or "sol" in self.t:
             return
         baseline = self._baseline()
         if baseline is None:
             return
-        path = self.spec.workdir / sol_mod.SOL_FILENAME
-        ceilings, errors = sol_mod.load_sol(path, baseline)
-        if ceilings is None and not self._answered("sol"):
-            self.dispatch("tuner", "sol", turn_prompt(self.requests.sol_request(baseline)))
-            ceilings, errors = sol_mod.load_sol(path, baseline)
-        if errors and path.exists() and not self._answered("sol-fix"):
-            self.dispatch(
-                "tuner", "sol-fix", turn_prompt(self.requests.sol_request(baseline, errors))
+        methods = [str(m) for m in self.spec.sol.get("methods") or METHODS]
+        tolerance = float(self.spec.sol.get("tolerance", TOLERANCE))
+        with ThreadPoolExecutor(max_workers=len(methods), thread_name_prefix="sol") as pool:
+            answers = dict(
+                zip(methods, pool.map(lambda m: self._sol_analysis(m, baseline), methods))
             )
+        analyses = {m: result for m, (result, _) in answers.items() if result is not None}
+        excluded = {m: errors for m, (result, errors) in answers.items() if result is None}
+        consensus = reconcile(analyses, baseline.headline(), tolerance=tolerance)
+        rulings: dict = {}
+        if consensus.disputes:
+            rulings = self._sol_rulings(consensus.disputes, list(analyses))
+            consensus = reconcile(
+                analyses, baseline.headline(), tolerance=tolerance, rulings=rulings
+            )
+        path = self.spec.workdir / sol_mod.SOL_FILENAME
+        ceilings, errors = None, [f"{m}: {e[0]}" for m, e in excluded.items()] or ["no analysis"]
+        if analyses:
+            path.write_text(yaml.safe_dump(sol_mod.calculate(consensus.inputs), sort_keys=False))
             ceilings, errors = sol_mod.load_sol(path, baseline)
+        report = {**consensus.report, "excluded": excluded, "rulings": rulings}
+        (self.spec.workdir / "sol").mkdir(parents=True, exist_ok=True)
+        (self.spec.workdir / "sol" / "consensus.json").write_text(json.dumps(report, indent=2))
         if ceilings is None:
             self.log(
                 f"[tune] no SOL ceilings; the campaign proceeds without them ({errors[0][:240]})"
@@ -474,15 +385,52 @@ class TuneStage:
             self.t["sol"] = {"status": "unavailable", "errors": errors}
             self.ledger.append("sol", status="unavailable", errors=errors)
         else:
+            ceilings = replace(ceilings, unknown={**ceilings.unknown, **consensus.unknown})
             self.t["sol"] = sol_mod.as_state(ceilings)
             pct = ceilings.pct_of_sol(baseline)
+            status = {k: v.get("status") for k, v in report.items() if k.startswith("headline.")}
             self.ledger.append(
-                "sol", status=ceilings.method, pct_of_sol=pct, unknown=dict(ceilings.unknown)
+                "sol", status=ceilings.method, pct_of_sol=pct, unknown=dict(ceilings.unknown),
+                analyses=list(analyses), excluded=excluded, headline=status, rulings=rulings,
+            )  # fmt: skip
+            self.log(
+                f"[tune] SOL from {len(analyses)} of {len(methods)} analyses ({status}): the "
+                f"baseline is at {pct} % of SOL"
             )
-            self.log(f"[tune] SOL ({ceilings.method}): the baseline is at {pct} % of SOL")
         self.checkpoint()
 
-    def _roadmap(self, n: int = 1, tried: Sequence[str] = (), ask: bool = True) -> list[dict]:
+    def _sol_analysis(self, method: str, baseline: Measurement) -> tuple[dict | None, list[str]]:
+        """One method's analysis, validated on its own: its turn, and one fix turn."""
+        path = self.spec.workdir / "sol" / method / sol_mod.SOL_FILENAME
+        result, errors = sol_mod.load_result(path, baseline)
+        what = f"sol-{method}"
+        if result is None and not self._answered(what):
+            request = self.requests.sol_request(baseline, method=method)
+            self.dispatch("tuner", what, turn_prompt(request))
+            result, errors = sol_mod.load_result(path, baseline)
+        if errors and path.exists() and not self._answered(f"{what}-fix"):
+            request = self.requests.sol_request(baseline, errors, method=method)
+            self.dispatch("tuner", f"{what}-fix", turn_prompt(request))
+            result, errors = sol_mod.load_result(path, baseline)
+        return result, errors
+
+    def _sol_rulings(self, disputes: list[dict], methods: list[str]) -> dict:
+        """The adjudication turn's rulings on ``disputes``; invalid ones are left out, and said."""
+        path = self.spec.workdir / "sol" / "rulings.yaml"
+        if not path.exists() and not self._answered("sol-adjudicate"):
+            request = self.requests.sol_adjudication_request(disputes, methods)
+            self.dispatch("tuner", "sol-adjudicate", turn_prompt(request))
+        try:
+            data = yaml.safe_load(path.read_text()) if path.exists() else None
+        except yaml.YAMLError as exc:
+            data = None
+            self.log(f"[tune] sol: unreadable rulings ({exc})")
+        rulings, problems = read_rulings(data, disputes)
+        for problem in problems:
+            self.log(f"[tune] sol: ruling left out: {problem}")
+        return rulings
+
+    def _roadmap(self, n: int = 1, attempts: str = "", ask: bool = True) -> list[dict]:
         """Roadmap ``n``: the first from the baseline profile, later ones from the moved best tree.
 
         With ``ask=False`` (the wall budget is spent) no turn is asked: it is what is on disk.
@@ -494,7 +442,7 @@ class TuneStage:
                 [dict(r) for r in yaml.safe_load(path.read_text()) or []] if path.exists() else []
             )
         if not path.exists() and not self._answered(what):
-            request = self.requests.roadmap(n, tried)
+            request = self.requests.roadmap(n, attempts)
             self.dispatch("tuner", what, turn_prompt(request))
         if not path.exists():
             return []
@@ -593,27 +541,10 @@ class TuneStage:
             self.checkpoint()
         return True
 
-    def _stop_requested(self) -> bool:
-        """The run asked the campaign to wrap up (``should_stop``); journaled the first time."""
-        if not self.should_stop():
-            return False
-        if not self.t.get("stopped"):
-            self.t["stopped"] = {"at": self.clock()}
-            self.ledger.append("stopped", reason="support-complete")
-            self.log(
-                "[tune] full support holds on the target: no new candidate, rebase, variant or "
-                "roadmap; candidates not yet measured are dropped, what is measuring finishes, "
-                "then the campaign ends with its best kept tree"
-            )
-            self.checkpoint()
-        return True
-
     def _ended(self, camp: Campaign, misses: int, max_misses: int, budget: int) -> None:
-        """Record why the campaign ended: goal, support, budget, misses, candidates, roadmaps."""
+        """Record why the campaign ended: goal, budget, misses, candidates, roadmaps."""
         if self.t.get("goal_reached"):
             by = "goal"
-        elif self.t.get("stopped"):
-            by = "support-complete"
         elif self.t.get("budget_spent"):
             by = "budget"
         elif misses >= max_misses:
@@ -634,10 +565,8 @@ class TuneStage:
         )
 
     def _end_text(self) -> str:
-        """What ended the campaign, when its wall budget or full support did; ``""`` otherwise."""
+        """What ended the campaign, when its wall budget did; ``""`` otherwise."""
         ended = self.t.get("ended") or {}
-        if ended.get("by") == "support-complete":
-            return "full support held on the target, so the campaign wrapped up"
         if ended.get("by") != "budget":
             return ""
         hours = campaign_max_hours(self.spec.campaign)
@@ -654,7 +583,6 @@ class TuneStage:
             # A campaign that ended and is entered again (an explicit `tune`) has a new budget.
             self.t["started_at"] = self.clock()
             self.t.pop("budget_spent", None)
-            self.t.pop("stopped", None)
         if not cfg.get("enabled", True):
             self.t["phase"] = "wrap"
             self.checkpoint()
@@ -665,27 +593,32 @@ class TuneStage:
             workdir=s.workdir, repo=s.repo, bench=s.bench(), base_configs=s.identity_configs,
             perf_runner=self.runners(s.spools, "tunec"), gate_runner=self.runners(s.dev_spools, "tuneg"),
             keep_gate=self.keep_gate,
-            noise=NoiseFloor(spread=dict(self.t.get("noise_spread") or {}),
-                             samples=int(self.t.get("noise_samples", 0))),
+            noise=NoiseFloor(),
             noise_commit=self._ground_commit(),
             min_gain=float(cfg.get("min_gain", 0.01)), noise_factor=float(cfg.get("noise_factor", 3.0)),
             ttft_tolerance=_ttft_tolerance(cfg),
             branch_prefix=self.branch_prefix, log=self.log,
             split_variants=bool(cfg.get("split_variants", True)),
+            min_projected_gain=float(cfg.get("min_projected_gain", 0.005)),
+            micro_noise=float(cfg.get("micro_noise", 0.02)),
+            module_tolerance=float(cfg.get("module_tolerance", ROUGH_TOLERANCE)),
+            logits=LogitsCheck.from_campaign(cfg),
+            checkpoint_keeps=int(cfg.get("checkpoint_keeps", 3)),
+            checkpoint_gain=float(cfg.get("checkpoint_gain", 0.05)),
         )  # fmt: skip
         worktrees = s.workdir / "worktrees"
         if not camp.state.best_tree:
             camp.state.best_tree = str(self._best_tree())
             camp.state.best_commit = git_checked(Path(camp.state.best_tree), "rev-parse", "HEAD")
         if not camp.state.control_label:
-            # The ground baseline and its repeats measured this tree at these configs: each
-            # time a node ran every member is one of its host's controls. Other hosts get
-            # theirs lazily, behind the first measurement that needs one.
+            # The baseline measured this tree at these configs: its host's control. Other
+            # hosts get theirs lazily, behind the first measurement that needs one.
             parts = [p.name for p in s.parts]
             for path in host_controls(self.data, self._ground_labels(), parts):
                 camp.set_control(path)
         self._sol()
         self._resume_rebases(camp)
+        self._resume_revises(camp)
         # The goal as the spec names it now: a best that already meets it (the baseline, or a
         # resumed campaign's keeps) asks for nothing new; a goal raised since goes on.
         self.t["goal_reached"] = False
@@ -694,10 +627,10 @@ class TuneStage:
             self._reach_goal(camp)
         else:
             n_road = int(self.t.get("roadmaps", 1))
-            tried = list(camp.state.candidates) if n_road > 1 else ()
+            attempts = self._attempts(camp) if n_road > 1 else ""
             roadmap = [
                 r
-                for r in self._roadmap(n_road, tried=tried, ask=not self._budget_spent())
+                for r in self._roadmap(n_road, attempts, ask=not self._budget_spent())
                 if r.get("slug") not in camp.state.candidates
             ]
         max_roadmaps = int(cfg.get("max_roadmaps", 2))
@@ -707,14 +640,10 @@ class TuneStage:
         futures: dict[str, Future] = {}
         #: Conflicts left without a rebase because the wall budget is spent, each journaled once.
         unrebased: set[str] = set()
-        with _tuner_pool(max_par, lambda: bool(self.t.get("stopped"))) as pool:
+        with ThreadPoolExecutor(max_workers=max(1, max_par), thread_name_prefix="tuner") as pool:
             while True:
-                stopping = self._stop_requested()
-                spent = self._budget_spent() or stopping
-                if stopping:
-                    # The run is fully supported: nothing not yet measuring is measured.
-                    roadmap = []
-                elif spent:
+                spent = self._budget_spent()
+                if spent:
                     # Issued already: a turn that answered before a restart is measured, no
                     # other item is asked for.
                     roadmap = [r for r in roadmap if self._answered_candidate(str(r["slug"]))]
@@ -738,13 +667,14 @@ class TuneStage:
                                 f"[tune] {slug}: unreadable decision on resume ({exc}); dispatching"
                             )
                     base = camp.state.best_commit or "HEAD"
-                    standings = self._standings()
+                    standings, attempts = self._standings(), self._attempts(camp)
 
                     def start(
                         slug: str = slug,
                         item: Mapping = item,
                         base: str = base,
                         standings: str = standings,
+                        attempts: str = attempts,
                     ) -> str:
                         # The worktree checkout (minutes on a parallel filesystem) runs in the
                         # turn's own thread, so turns start side by side.
@@ -752,43 +682,39 @@ class TuneStage:
                             s.repo, worktrees, slug, base, prefix=self.branch_prefix
                         )
                         req = render_request(
-                            self._context(standings), slug=slug, worktree=wt, base=base,
+                            self._context(standings, attempts), slug=slug, worktree=wt, base=base,
                             branch=f"{self.branch_prefix}/{slug}",
                             hypothesis=str(item.get("hypothesis", "")), job_prefix=slug[:12],
                             deliverables=str(
                                 item.get("deliverables", "Commits, entry tests, micro-bench, decision.yaml.")
                             ),
                             modeling_edits=bool(item.get("modeling_edits", True)),
+                            share=item.get("share"),
                         )  # fmt: skip
                         return self.dispatch("tuner", slug, turn_prompt(req))
 
                     futures[slug] = pool.submit(start)
                 for slug, fut in list(futures.items()):
-                    if fut.done() and stopping:
-                        del futures[slug]
-                        self.log(
-                            f"[tune] {slug}: answered after the run was fully supported; dropped"
-                        )
-                        continue
                     if fut.done():
                         del futures[slug]
                         decision = s.workdir / "candidates" / slug / "decision.yaml"
                         try:
                             if slug in camp.state.candidates and camp.state.candidates[
                                 slug
-                            ].status not in ("issued", "conflict", "blocked"):
+                            ].status not in ("issued", "conflict", "blocked", "revising"):
                                 continue
                             camp.submit_candidate(slug, decision)
                         except (OSError, ValueError) as exc:
                             self.log(f"[tune] {slug}: no valid decision ({exc}); counted as a miss")
                             misses += 1
                             variant = camp.state.candidates.get(slug)
-                            if (
-                                variant is not None
-                                and variant.variant_of
+                            if variant is not None and (
+                                variant.variant_of
                                 and variant.status == "issued"
+                                or variant.status == "revising"
                             ):
-                                # One variant per split: a turn that answered nothing is dropped.
+                                # One variant per split, one revise per candidate: a turn that
+                                # answered nothing is dropped.
                                 variant.status, variant.reason = (
                                     "dropped",
                                     f"no valid decision ({exc})",
@@ -819,7 +745,7 @@ class TuneStage:
                         self.t[key] = True
                         onto = f"{self.branch_prefix}/best"
                         req = render_rebase_request(
-                            self._context(self._standings()),
+                            self._context(self._standings(), self._attempts(camp)),
                             slug=st.slug,
                             worktree=Path(st.worktree),
                             best_branch=onto,
@@ -829,6 +755,7 @@ class TuneStage:
                             self.dispatch, "tuner", f"rebase-{st.slug}", turn_prompt(req)
                         )
                 self._split_turns(camp, pool, futures, budget, spent=spent)
+                self._revise_turns(camp, pool, futures, spent=spent)
                 for st in camp.state.candidates.values():
                     if st.status in ("kept",) and not self.t.get(f"counted-{st.slug}"):
                         self.t[f"counted-{st.slug}"] = True
@@ -856,13 +783,10 @@ class TuneStage:
                     self.checkpoint()
                     roadmap = [
                         r
-                        for r in self._roadmap(n + 1, tried=list(camp.state.candidates))
+                        for r in self._roadmap(n + 1, self._attempts(camp))
                         if r.get("slug") not in camp.state.candidates
                     ]
                     continue
-                if stopping and not busy:
-                    # Tuner turns still out are not waited for: nothing would measure them.
-                    break
                 if (
                     not futures
                     and not busy
@@ -872,6 +796,13 @@ class TuneStage:
                 ):
                     break
                 time.sleep(self.poll_s)
+        # What the campaign kept is scored once, on the tree it ends with.
+        final = camp.final_accuracy(lambda: time.sleep(self.poll_s))
+        if final is not None:
+            self.t["final_accuracy"] = {
+                k: final.get(k) for k in ("verdict", "score", "floor", "reason", "commit")
+            }
+            self.log(f"[tune] final tree's accuracy: {final['verdict']} {final['reason'][:300]}")
         self.t["best_tree"], self.t["best_commit"] = camp.state.best_tree, camp.state.best_commit
         self.t["kept"] = list(camp.state.kept)
         self._ended(camp, misses, max_misses, budget)
@@ -936,21 +867,74 @@ class TuneStage:
                         camp.close_split(st.slug, wall)
                         continue
                     self.log(f"[tune] {variant}: its turn was cut off by a restart; asked again")
-            futures[variant] = pool.submit(self._ask_variant, st, variant, self._standings())
+            futures[variant] = pool.submit(
+                self._ask_variant, st, variant, self._standings(), self._attempts(camp)
+            )
 
-    def _ask_variant(self, st: CandidateState, variant: str, standings: str) -> str:
+    def _ask_variant(self, st: CandidateState, variant: str, standings: str, attempts: str) -> str:
         """One tuner turn: ``st``'s change gated on the mode it lost in, at its measured tree."""
         s, base = self.spec, str(st.split["base"])
         wt = open_candidate(
             s.repo, s.workdir / "worktrees", variant, base, prefix=self.branch_prefix
         )
         req = render_split_request(
-            self._context(standings), slug=st.slug, variant=variant, worktree=wt, base=base,
+            self._context(standings, attempts), slug=st.slug, variant=variant, worktree=wt, base=base,
             branch=f"{self.branch_prefix}/{variant}", best_branch=f"{self.branch_prefix}/best",
             split=st.split, deltas=st.deltas,
             original=s.workdir / "candidates" / st.slug / "decision.yaml",
         )  # fmt: skip
         return self.dispatch("tuner", variant, turn_prompt(req))
+
+    def _revise_turns(
+        self, camp: Campaign, pool: ThreadPoolExecutor, futures: dict[str, Future], *, spent: bool
+    ) -> None:
+        """Ask a candidate's turn once more when it failed for a reason the code can fix.
+
+        Its verdict and numbers go with the request; its miss is counted once the revision is
+        measured. None is asked once the wall budget is spent or the goal reached.
+        """
+        if spent or self.t.get("goal_reached"):
+            return
+        asked = [
+            st
+            for st in camp.state.candidates.values()
+            if st.slug not in futures and st.worktree and revisable(st)
+        ]
+        for st in asked:
+            was = outcome(st)
+            st.revisions += 1
+            # Wall time, not the stage clock: a restart compares it to the decision file's mtime.
+            self.t[f"revise-{st.slug}"] = {"from": st.status, "at": time.time()}
+            st.status = "revising"
+            req = render_revise_request(
+                self._context(self._standings(), self._attempts(camp)), slug=st.slug,
+                worktree=Path(st.worktree), best_branch=f"{self.branch_prefix}/best", reason=st.reason,
+            )  # fmt: skip
+            camp.ledger.append("candidate_revise", slug=st.slug, outcome=was, reason=st.reason)
+            self.log(f"[tune] {st.slug}: {was} ({st.reason[:200]}); its turn revises it once")
+            futures[st.slug] = pool.submit(
+                self.dispatch, "tuner", f"revise-{st.slug}", turn_prompt(req)
+            )
+        if asked:
+            camp.state.save(camp.state_path)
+
+    def _resume_revises(self, camp: Campaign) -> None:
+        """A revise a restart cut off: its decision written since is submitted, else asked again."""
+        for st in camp.state.candidates.values():
+            asked = self.t.get(f"revise-{st.slug}") or {}
+            if st.status != "revising":
+                continue
+            decision = self.spec.workdir / "candidates" / st.slug / "decision.yaml"
+            try:
+                if decision.stat().st_mtime > float(asked.get("at", 0)):
+                    camp.submit_candidate(st.slug, decision)
+                    self.log(f"[tune] {st.slug}: its revise finished during a restart; submitted")
+                    continue
+            except (OSError, ValueError) as exc:
+                self.log(f"[tune] {st.slug}: no valid revise decision ({exc})")
+            st.status, st.revisions = str(asked.get("from") or "reverted"), 0
+            self.log(f"[tune] {st.slug}: its revise was cut off by a restart; asked again")
+        camp.state.save(camp.state_path)
 
     def _resume_rebases(self, camp: Campaign) -> None:
         """Settle the rebase turns a restart cut off: no future of this process waits on them.
@@ -1004,7 +988,7 @@ class TuneStage:
         s = self.spec
         goals = []
         if s.goal_ratio is not None:
-            goals.append(f"{s.goal_ratio}x the stock reference")
+            goals.append(f"{s.goal_ratio}x the baseline")
         if s.goal_pct_of_sol is not None:
             basis = self._goal_ceilings()[1]
             goals.append(f"{s.goal_pct_of_sol:.0%} of SOL" + (f" on {basis}" if basis else ""))
@@ -1013,7 +997,7 @@ class TuneStage:
     def _goal_met(self, camp: Campaign) -> bool:
         """The current best meets every goal the spec names, on every headline metric.
 
-        ``ratio_to_reference``: that multiple of the stock reference; ``pct_of_sol``: that fraction
+        ``ratio_to_baseline``: that multiple of the baseline; ``pct_of_sol``: that fraction
         of the SOL ceiling :meth:`_goal_ceilings` names.
         """
         s = self.spec
@@ -1026,8 +1010,8 @@ class TuneStage:
         if best is None or (s.goal_ratio is None and s.goal_pct_of_sol is None):
             return False
         if s.goal_ratio is not None:
-            reference = load_measurement(self.data, "t-reference")
-            if reference is None or not goal_reached(best, reference, s.goal_ratio):
+            baseline = self._baseline()
+            if baseline is None or not goal_reached(best, baseline, s.goal_ratio):
                 return False
         if s.goal_pct_of_sol is not None:
             ceilings, _ = self._goal_ceilings()
@@ -1059,9 +1043,10 @@ class TuneStage:
         tree = self.t.get("best_tree") or str(self._best_tree())
         commit = git_checked(Path(tree), "rev-parse", "HEAD")
         self.t.update(best_tree=tree, best_commit=commit, goal_reached=False)
-        if self.t.get("stopped") and not self.t.get("kept"):
+        if not self.t.get("kept"):
+            # The best tree is the baseline's, measured already: not measured again.
             self.log("[tune] nothing was kept: no final measurement, the baseline stands")
-            final_status = "not run: nothing kept before support completed"
+            final_status = "not run: nothing kept, the baseline stands"
         else:
             final = self._measure(labels, tree=tree).get("t-final")
             try:
@@ -1093,9 +1078,7 @@ class TuneStage:
         self.t["final_validation"] = {"commit": commit, "status": final_status}
         self.ledger.append("final_validation", **self.t["final_validation"])
         rows = [
-            m
-            for label in ("t-baseline", "t-reference")
-            if (m := load_measurement(self.data, label)) is not None
+            m for label in ("t-baseline",) if (m := load_measurement(self.data, label)) is not None
         ]
         if final is not None:
             rows.append(final)
@@ -1105,6 +1088,11 @@ class TuneStage:
             + format_table(rows, rows[0] if rows else None)
             + f"\n\nModeling kept (local gains are not e2e claims): {self.t.get('kept', [])}\n"
             + f"\nFinal cumulative validation: {final_status}\n"
+            + (
+                f"\nFinal tree's accuracy: {accuracy['verdict']}: {accuracy['reason']}\n"
+                if (accuracy := self.t.get("final_accuracy"))
+                else ""
+            )
             + (
                 f"\nGoal: {self._goal_text()}, "
                 f"{'reached' if self.t.get('goal_reached') else 'not reached'}\n"
@@ -1133,6 +1121,12 @@ class TuneStage:
             self.t["failure"] = failure
             self.checkpoint()
             return "tune-failed:final"
+        if (self.t.get("final_accuracy") or {}).get("verdict") == FAIL:
+            self.t["failure"] = "the final tree fails the accuracy gate: " + str(
+                self.t["final_accuracy"].get("reason")
+            )
+            self.checkpoint()
+            return "tune-failed:accuracy"
         self.t["phase"] = "done"
         self.checkpoint()
         return "tuned"
@@ -1143,17 +1137,6 @@ class TuneStage:
         self.t.setdefault("started_at", self.clock())
         if self.attempt > 1:
             self.log(f"[tune] attempt {self.attempt}: jobs queue as `{self.perf.prefix}-<label>`")
-        if self.t["phase"] in ("ground", "campaign") and self._stop_requested():
-            # Fully supported before or while the campaign ran: it ends with what it kept.
-            started = self.t.get("started_at")
-            after = (self.clock() - float(started)) / 3600 if started is not None else None
-            self.t["ended"] = {
-                "by": "support-complete",
-                "at": self.clock(),
-                "after_h": round(after, 2) if after is not None else None,
-            }
-            self.t["phase"] = "wrap"
-            self.checkpoint()
         # Before anything is measured: no keep gate (and no `gate: off`), no campaign.
         if (
             self.t["phase"] in ("ground", "campaign")
@@ -1161,8 +1144,6 @@ class TuneStage:
             and not self._resolve_keep_gate()
         ):
             return "tune-failed:accuracy"
-        if self.t["phase"] == "ground" and not self.smoke():
-            return "tune-failed:smoke"
         if self.t["phase"] == "ground" and not self.ground():
             return "tune-failed:baseline"
         if self.t["phase"] == "campaign":
@@ -1177,7 +1158,6 @@ def _stage_for(
     state: Any,
     base_commit: str = "",
     attempt: int = 1,
-    should_stop: Callable[[], bool] = lambda: False,
 ) -> "TuneStage | str":
     """The stage the task's perf block describes, or the verdict that it cannot start."""
     errors = validate_perf_block(wf.task_data)
@@ -1194,8 +1174,7 @@ def _stage_for(
             return wf._run_turn(role, what, prompt, unit="tune")
 
     return TuneStage(spec, state.tune, dispatch=dispatch, checkpoint=lambda: wf._checkpoint(state),
-                     log=lambda m: wf.journal.event("tune", m), attempt=attempt,
-                     should_stop=should_stop)  # fmt: skip
+                     log=lambda m: wf.journal.event("tune", m), attempt=attempt)  # fmt: skip
 
 
 def run_tune_phase(wf: Any, state: Any, log: Any) -> str | None:
@@ -1209,7 +1188,6 @@ def run_tune_task(
     state: Any,
     base_commit: str,
     attempt: int = 1,
-    should_stop: Callable[[], bool] = lambda: False,
 ) -> tuple[str, str]:
     """The execution stage's ``tune`` task: the campaign on ``base_commit``.
 
@@ -1217,7 +1195,7 @@ def run_tune_task(
     planner: the best tree and what was kept, or what failed. A resumed run keeps its first pin.
     """
     base = str(state.tune.setdefault("base_commit", base_commit))
-    stage = _stage_for(wf, state, base, attempt, should_stop)
+    stage = _stage_for(wf, state, base, attempt)
     verdict = stage if isinstance(stage, str) else stage.run()
     if verdict != "tuned":
         return f"TUNE_FAILED ({verdict or 'incomplete'})", str(state.tune.get("failure") or "")

@@ -234,17 +234,28 @@ def _disabled_skills_override(names: tuple[str, ...]) -> tuple[str, ...]:
     return (f"skills.config=[{entries}]",)
 
 
+#: The feature switches that keep a session's user-installed plugins and apps out of it.
+_NO_PLUGINS_OVERRIDES: tuple[str, ...] = ("features.plugins=false", "features.apps=false")
+
+
+def _config_overrides(disabled_skills: tuple[str, ...], plugins: bool) -> tuple[str, ...]:
+    """The app server's ``-c`` overrides: skills turned off, and plugins unless kept."""
+    return _disabled_skills_override(disabled_skills) + (() if plugins else _NO_PLUGINS_OVERRIDES)
+
+
 class CodexBackend(Backend):
     def __init__(
         self,
         reasoning_effort: str | None = None,
         disabled_skills: tuple[str, ...] = (),
         writable_roots: tuple[str, ...] = (),
+        plugins: bool = True,
     ) -> None:
         self._transport: CodexTransport | None = None
         self._reasoning_effort = reasoning_effort
         self._disabled_skills = disabled_skills
         self._writable_roots = writable_roots
+        self._plugins = plugins
         self._sandbox, self._approval = _SANDBOXES[0], _APPROVALS[0]
 
     def version(self) -> str:
@@ -259,7 +270,7 @@ class CodexBackend(Backend):
                 CodexConfig(
                     codex_bin=_resolve_codex_bin(),
                     experimental_api=True,
-                    config_overrides=_disabled_skills_override(self._disabled_skills),
+                    config_overrides=_config_overrides(self._disabled_skills, self._plugins),
                 )
             )
             try:

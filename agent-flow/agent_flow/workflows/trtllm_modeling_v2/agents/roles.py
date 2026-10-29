@@ -7,12 +7,24 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from agent_flow.agent_runtime import AGENTS_FIELD, AgentConfig, resolve_agent_config
 from agent_flow.config import BackendKind
 
 from .session_model import CODEX_SESSION_ENV, ModelSelectionError, session_model
+
+#: The skills this workflow ships, one directory each; the run materializes them.
+PACKAGED_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+
+
+def packaged_skills() -> tuple[str, ...]:
+    """The names of the skills the run materializes: the only ones its roles load."""
+    if not PACKAGED_SKILLS_DIR.is_dir():
+        return ()
+    return tuple(sorted(p.name for p in PACKAGED_SKILLS_DIR.iterdir() if p.is_dir()))
+
 
 ROLES: tuple[str, ...] = (
     "surveyor",
@@ -109,8 +121,10 @@ def _model_configured(task_data: Mapping[str, Any], role: str, default_backend: 
 
 __all__ = [
     "CODEX_SESSION_ENV",
+    "PACKAGED_SKILLS_DIR",
     "ROLES",
     "driving_backend",
+    "packaged_skills",
     "resolve_role_agent",
     "resolve_role_agents",
 ]

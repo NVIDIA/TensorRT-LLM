@@ -24,9 +24,12 @@ from typing import Any, Mapping
 
 import yaml
 
+from ..operators import tree_anchors
 from .schema_keys import reject_unknown_keys
 from .task_schema import (
-    EQUIVALENCE_WITNESS_FEATURES,
+    DEFAULT_PERF_CONCURRENCY,
+    DISAGG_FEATURE,
+    DISAGG_KEYS,
     FEATURE_FAMILIES,
     PARALLEL_PATTERN,
     PROFILE_CERTIFIED,
@@ -42,7 +45,6 @@ SPEC_FILENAME = "task.derived.yaml"
 REPORT_FILENAME = "derive.report.md"
 #: Where each unit's LLM-API options are written, beside the spec.
 LLM_API_DIRNAME = "llm_api"
-REFERENCES_DIR = "tests/integration/defs/accuracy/references"
 
 #: Members when neither the goal nor the site names any.
 DEFAULT_MEMBERS: tuple[str, ...] = ("tp1",)
@@ -82,18 +84,6 @@ DEPTH_WORDS: dict[str, str] = {
 #: Speculative algorithm -> its reference rows' ``spec_dec_algo`` and the LLM
 #: API's ``speculative_config.decoding_type`` (the two spell them alike).
 SPEC_DEC_ALGO = {"mtp": "MTP", "eagle3": "Eagle3", "dflash": "DFlash", "dspark": "DSpark"}
-#: Unit -> the witness keys it cannot be judged without, which nothing can
-#: derive from the checkpoint. A replay witness's ``window`` and prompt length
-#: are derived from ``sliding_window``.
-WITNESS_REQUIRED: dict[str, tuple[str, ...]] = {
-    "decoder_replay": ("contrast_env",),
-    "encoder_replay": ("contrast_env",),
-    "kv_quant": ("expected_bytes_per_token", "contrast_env"),
-    "host_offload": ("contrast_env",),
-    "disagg": ("contrast_command", "contrast_env"),
-}
-#: A replay witness's long prompt (or shared prefix), in multiples of the window.
-REPLAY_PROMPT_WINDOWS = 4
 #: Where a config states its multi-token-prediction layers.
 DRAFT_LAYER_KEYS: tuple[str, ...] = (
     "num_nextn_predict_layers",
@@ -113,7 +103,7 @@ SITE_KEYS = (
 )
 SITE_DEVICE_KEYS = ("arch", "gpus_per_node", "nodes")
 SITE_PERF_KEYS = ("spools", "dev_spools", "env_script")
-SITE_DEFAULTS_KEYS = ("members", "workload", "accuracy", "boot", "witness", "profile")
+SITE_DEFAULTS_KEYS = ("members", "workload", "accuracy", "boot", "disagg", "profile")
 #: ``reference`` (how the anchor was measured) is the operator's record; nothing reads it.
 SITE_ACCURACY_KEYS = ("benchmark", "protocol", "reference", "reference_yaml", "model_key")
 
@@ -132,6 +122,8 @@ _ACCURACY_WORDS = {
     "reference": "reference_yaml",
 }
 _KV_DTYPES = ("fp8", "nvfp4")
+#: KV dtypes a goal may name for the checkpoint's own KV format.
+_KV_AUTO = frozenset({"auto", "bf16", "bfloat16"})
 #: Weight formats a reference row states no ``quant_algo`` for.
 _UNQUANTIZED = frozenset({"", "none", "auto", "bf16", "bfloat16", "fp16", "float16", "fp32"})
 _REPO_NAME = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
@@ -230,13 +222,24 @@ def _key_value(goal: Goal, word: str, errors: list[str]) -> None:
             goal.arch = value.lower()
         elif key in _ACCURACY_WORDS:
             goal.accuracy[_ACCURACY_WORDS[key]] = value
+        elif key == "kv":
+            dtypes = ["auto" if v in _KV_AUTO else v for v in value.lower().split("/") if v]
+            wrong = [v for v in dtypes if v not in ("auto", *_KV_DTYPES)]
+            if wrong or not dtypes:
+                errors.append(f"goal: kv={value}: each of {['auto', 'bf16', *_KV_DTYPES]}")
+            elif "kv_dtype" in goal.params:
+                errors.append(
+                    f"goal: {word!r}: kv= is named once, its dtypes in one word "
+                    "(kv=bf16/fp8/nvfp4): the first is every gate's, each other a variant"
+                )
+            else:
+                goal.params["kv_dtype"] = dtypes[0]
+                goal.params["kv_variants"] = list(
+                    dict.fromkeys(d for d in dtypes[1:] if d != dtypes[0])
+                )
         elif key in _PARAM_WORDS:
             param, kind = _PARAM_WORDS[key]
-            parsed = kind(value.lower() if key == "kv" else value)
-            if key == "kv" and parsed not in (*_KV_DTYPES, "auto"):
-                errors.append(f"goal: kv={value} is not one of {['auto', *_KV_DTYPES]}")
-                return
-            goal.params[param] = parsed
+            goal.params[param] = kind(value)
         else:
             errors.append(f"goal: {key!r} in {word!r} is not a key the goal takes")
     except ValueError:
@@ -359,7 +362,7 @@ def validate_site(site: Any) -> list[str]:
         ("workload", WORKLOAD_KEYS),
         ("accuracy", SITE_ACCURACY_KEYS),
         ("boot", None),
-        ("witness", None),
+        ("disagg", DISAGG_KEYS),
     ):
         block = defaults.get(key)
         if block is not None and not isinstance(block, Mapping):
@@ -440,21 +443,32 @@ def derive_spec(
         if key not in goal.workload:
             note(f"workload.{key}", value, source)
     workload.update(goal.workload)
+    if goal.tune and not workload.get("concurrency"):
+        workload["concurrency"] = note(
+            "workload.concurrency", list(DEFAULT_PERF_CONCURRENCY), "default"
+        )
     concurrency = workload.get("concurrency") or []
     max_seq_len = workload.get("max_seq_len") or (
         workload["isl"] + workload["osl"] if "isl" in workload and "osl" in workload else None
     )
     max_batch_size = workload.get("max_batch_size") or (max(concurrency) if concurrency else None)
+    if concurrency and "max_batch_size" not in goal.workload:
+        # A default batch below the goal's concurrency would queue the perf points it names.
+        max_batch_size = max(int(max_batch_size or 0), max(concurrency))
 
-    # The units: the checkpoint's own drafter and towers unless the goal says otherwise.
+    # The units: the checkpoint's own drafter and towers unless the goal says otherwise. A
+    # goal that names its features asks for those: what else the checkpoint carries is left out.
     built: list[str] = []
+    listed = any(goal.units.values()) or goal.speculative is True
     speculator = next((u for u, on in goal.units.items() if on and u in SPECULATORS), None)
     if (
         speculator is None
         and goal.speculative is not False
         and not any(goal.units.get(u) is False for u in SPECULATORS)
     ):
-        if facts.speculator:
+        if facts.speculator and listed and not goal.speculative:
+            note("features (left out)", facts.speculator, "checkpoint carries it, goal names none")
+        elif facts.speculator:
             speculator = note("features (speculator)", facts.speculator, "checkpoint")
         elif goal.speculative:
             questions.append(
@@ -466,7 +480,10 @@ def derive_spec(
         if "draft_len" not in goal.params and facts.draft_len and speculator == facts.speculator:
             goal.params["draft_len"] = note("draft_len", facts.draft_len, "checkpoint")
     multimodal = goal.units.get("multimodal")
-    if multimodal is None and facts.towers:
+    if multimodal is None and facts.towers and listed:
+        multimodal = False
+        note("features (left out)", "multimodal", "checkpoint carries it, goal names none")
+    elif multimodal is None and facts.towers:
         multimodal = note("features (multimodal)", True, "checkpoint")
     if multimodal:
         built.append("multimodal")
@@ -484,7 +501,7 @@ def derive_spec(
         snapshot = note("snapshot_interval", DEFAULT_SNAPSHOT_INTERVAL, "default")
     kv_dtype = str(goal.params.get("kv_dtype") or "").lower()
     native_kv = str(facts.kv_cache_quant_algo or "").lower()
-    if not kv_dtype and native_kv in _KV_DTYPES:
+    if kv_dtype in ("", "auto") and native_kv in _KV_DTYPES:
         kv_dtype = note("kv_cache dtype", native_kv, "checkpoint")
     flags = []
     if max_seq_len:
@@ -508,13 +525,20 @@ def derive_spec(
     benchmark = anchor.get("benchmark") or note("accuracy.benchmark", DEFAULT_BENCHMARK, "default")
     accuracy: dict[str, Any] = {
         "benchmark": benchmark,
-        "reference_yaml": anchor.get("reference_yaml") or f"{REFERENCES_DIR}/{benchmark}.yaml",
+        "reference_yaml": anchor.get("reference_yaml")
+        or f"{_tree_path(site, 'accuracy_references')}/{benchmark}.yaml",
     }
     model_key = anchor.get("model_key") or (
         note("accuracy.model_key", facts.name, "checkpoint") if facts.name else None
     )
     if model_key:
         accuracy["model_key"] = model_key
+    else:
+        questions.append(
+            "accuracy.model_key: name the model's HuggingFace id (`org/model`, model_key= in "
+            "--goal): the reference rows are keyed by it, and config.json names none (the "
+            "fallback, the checkpoint path's last two components, is no model's name)"
+        )
     if (anchor.get("protocol") or {}).get("chat_template"):
         accuracy["benchmark_args"] = ["--apply_chat_template"]
     if max_seq_len:
@@ -528,14 +552,8 @@ def derive_spec(
         accuracy["boot"] = note("accuracy.boot", dict(defaults["boot"]), "site")
     else:
         accuracy["boot"] = note("accuracy.boot", json.loads(json.dumps(DEFAULT_BOOT)), "default")
-    witness = _witness(defaults, facts, built, note, questions)
-    if witness:
-        accuracy["witness"] = witness
-
-    for unit in (u for u in built if u in EQUIVALENCE_WITNESS_FEATURES):
-        on_one_node = _one_node(goal.unit_members.get(unit) or members, site)
-        if on_one_node:
-            goal.unit_members[unit] = note(f"members ({unit})", on_one_node, "site")
+    if DISAGG_FEATURE in built:
+        accuracy["disagg"] = _disagg(defaults, facts, site, note, questions)
 
     spec: dict[str, Any] = {
         "checkpoint_path": str(checkpoint),
@@ -548,6 +566,17 @@ def derive_spec(
         "environment": dict(site["environment"]),
         "accuracy": accuracy,
     }
+    kv_variants = {
+        f"kv_{dtype}": {
+            "unit": "core",
+            "gates": ["accuracy"],
+            "llm_api_options": {"kv_cache_config": {"dtype": dtype}},
+            "note": f"KV cache stored as {dtype}, judged against the unit's own score",
+        }
+        for dtype in goal.params.get("kv_variants") or ()
+    }
+    if kv_variants:
+        spec["variants"] = kv_variants
     if site.get("commit_policy"):
         spec["commit_policy"] = dict(site["commit_policy"])
     if site.get("agents"):
@@ -572,6 +601,13 @@ def derive_spec(
     if goal.tune:
         draft = options[built[-1]].get("speculative_config") if built else None
         spec["perf"] = _perf(site, workload, members, draft)
+        adp = [c["name"] for c in spec["perf"]["configs"] if c["name"].startswith("dep")]
+        if adp:
+            note(
+                f"perf ({', '.join(adp)})",
+                "the high concurrency point x attention-DP ranks",
+                "default",
+            )
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     derived = {
         "checkpoint": str(checkpoint),
@@ -581,23 +617,6 @@ def derive_spec(
         "at": stamp,
     }
     return Derivation(spec, options, unstated, questions, derived)
-
-
-def _one_node(members: list[str], site: Mapping[str, Any]) -> list[str] | None:
-    """Where a disaggregated unit's witness runs: members whose two legs fit one node.
-
-    Its context and generation legs each take a member's devices, so on a
-    node of ``device.gpus_per_node`` that is the members of at most half of
-    it, else ``dep<half>``; None when the site does not say, or ``members``
-    fit already. The units it builds on prove the wider members.
-    """
-    per_node = (site.get("device") or {}).get("gpus_per_node")
-    if not isinstance(per_node, int) or per_node < 2:
-        return None
-    fits = [m for m in members if (parse_parallel_segment(m)[1] or 1) * 2 <= per_node]
-    if fits == members:
-        return None
-    return fits or [f"dep{per_node // 2}"]
 
 
 def _parallel(
@@ -689,54 +708,45 @@ def _llm_api_options(
     return options
 
 
-def _witness(
+def _tree_path(site: Mapping[str, Any], key: str) -> str:
+    """Where anchor ``key`` is in the site's checkout (``operators/tree_anchors.py``), else its hint."""
+    found = tree_anchors.resolve(site.get("trtllm_repo_path"), key)
+    return found.paths[0] if found.found else tree_anchors.ANCHORS[key].hint
+
+
+def _disagg(
     defaults: Mapping[str, Any],
     facts: CheckpointFacts,
-    built: list[str],
+    site: Mapping[str, Any],
     note,
     questions: list[str],
 ) -> dict[str, Any]:
-    """Each built unit's witness declaration: the site's, the window, and questions for the rest.
+    """The disaggregated-serving test the run writes: the site's settings, and its node id.
 
-    For every unit when the site turns witnesses on (``defaults.witness.enabled``),
-    and always for a unit the equivalence witness alone proves (``disagg``).
+    The node id defaults to a class named for the architecture, in the file whose
+    tests share the tree's disaggregated launcher (``launch_disaggregated_llm``).
     """
-    site_witness = dict(defaults.get("witness") or {})
-    enabled = site_witness.get("enabled") is True
-    window = facts.config.get("sliding_window")
-    out: dict[str, Any] = {}
-    for unit in built:
-        if unit not in WITNESS_REQUIRED or not (enabled or unit in EQUIVALENCE_WITNESS_FEATURES):
-            continue
-        block = dict(site_witness.get(unit) or {})
-        if block:
-            note(f"accuracy.witness.{unit}", dict(block), "site")
-        replay = unit in ("decoder_replay", "encoder_replay")
-        if replay and isinstance(window, int) and window > 0:
-            length_key = "prompt_tokens" if unit == "decoder_replay" else "prefix_tokens"
-            block.setdefault(
-                "window", note(f"accuracy.witness.{unit}.window", window, "checkpoint")
-            )
-            if length_key not in block:
-                block[length_key] = note(
-                    f"accuracy.witness.{unit}.{length_key}",
-                    REPLAY_PROMPT_WINDOWS * int(block["window"]),
-                    "default",
-                )
-        missing = [key for key in WITNESS_REQUIRED[unit] if not block.get(key)]
-        if replay and "window" not in block:
-            missing.append("window")
-        if missing:
-            questions.append(
-                f"accuracy.witness.{unit}: declare {', '.join(missing)} (site.yaml "
-                f"`defaults.witness.{unit}`, or in the spec): without them the {unit} witness "
-                "cannot tell a working feature from an absent one"
-            )
-        if block:
-            out[unit] = block
-    if out and enabled:
-        out["enabled"] = True
-    return out
+    block = dict(defaults.get("disagg") or {})
+    if block:
+        note("accuracy.disagg", dict(block), "site")
+    if block.get("test"):
+        return block
+    launcher = tree_anchors.resolve(site.get("trtllm_repo_path"), "disagg_launcher")
+    if launcher.found:
+        name = re.sub(r"\W|For(?:CausalLM|ConditionalGeneration)$", "", facts.architecture)
+        name = name or "Model"
+        block["test"] = note(
+            "accuracy.disagg.test",
+            f"{launcher.paths[0]}::Test{name}::test_auto_dtype",
+            "default",
+        )
+    else:
+        questions.append(
+            "accuracy.disagg.test: name the node id of the disaggregated-serving accuracy test "
+            "the run will write, beside the tree's tests that serve through "
+            "`trtllm-serve disaggregated`"
+        )
+    return block
 
 
 def member_options(member: str) -> dict[str, Any]:
@@ -763,17 +773,21 @@ def _perf(
     shared = {
         "isl": workload.get("isl", 1024),
         "osl": workload.get("osl", 1024),
-        "concurrency": workload.get("concurrency") or [1],
+        "concurrency": workload.get("concurrency") or list(DEFAULT_PERF_CONCURRENCY),
     }
     configs = []
     for member in members:
         options = member_options(member)
         if draft:
             options["speculative_config"] = dict(draft)
-        configs.append({"name": member, "workload": dict(shared), "llm_api_options": options})
+        load = dict(shared)
+        kind, ranks = parse_parallel_segment(member)
+        if kind == "dep":
+            # Attention DP serves throughput: only its high point, each rank at that load.
+            load["concurrency"] = [max(shared["concurrency"]) * (ranks or 1)]
+        configs.append({"name": member, "workload": load, "llm_api_options": options})
     return {
         "enabled": True,
-        "reference": "stock",
         **dict(site.get("perf") or {}),
         "configs": configs,
     }
@@ -887,7 +901,6 @@ __all__ = [
     "REPORT_FILENAME",
     "SPEC_DEC_ALGO",
     "SPEC_FILENAME",
-    "WITNESS_REQUIRED",
     "CheckpointFacts",
     "DeriveError",
     "Derivation",

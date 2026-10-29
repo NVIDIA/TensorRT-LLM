@@ -56,11 +56,13 @@ def test_checks_of_one_commit_share_one_read_only_sparse_snapshot_until_none_nee
         # A file of the checkout the spec names by its path is the commit's; one it does not track is not.
         command = f"{repo}/.venv/bin/python {repo}/examples/llm-api/quickstart.py"
         spec = snapshots_mod.CheckTree(commit=head, tree=tree).spec(
-            {"trtllm_repo_path": str(repo), "accuracy": {"leg_b": command}},
+            {"trtllm_repo_path": str(repo), "accuracy": {"launcher": command}},
             snapshots.tracked(head),
         )
         assert spec["trtllm_repo_path"] == str(tree)
-        assert spec["accuracy"]["leg_b"] == command.replace(f"{repo}/examples", f"{tree}/examples")
+        assert spec["accuracy"]["launcher"] == command.replace(
+            f"{repo}/examples", f"{tree}/examples"
+        )
         _commit(repo, "tensorrt_llm/later.py", "y = 2\n")
         assert snapshots.prune() == []  # held by a running check
     assert not tree.exists()  # given back, and the checkout has moved past it

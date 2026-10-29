@@ -9,19 +9,23 @@ checks do not reach), one column per member, and per cell the checks that
 prove it:
 
 - ``certified``: a check that judges the feature's output runs at that member
-  (accuracy, logits, a witness, acceptance);
+  (accuracy, acceptance, the disaggregated-serving test);
 - ``sampled``: the feature boots at that member and its output is judged at
   others, named in the cell (accuracy is sampled at the members
   ``contract.benchmark_members`` picks);
 - ``not covered``: nothing runs there, or nothing judges the feature's output
   anywhere, with the reason.
 
-For the ``multimodal`` unit only a check that sends images judges its output.
+For the ``multimodal`` unit only a benchmark that sends images judges its output.
 A cell that is not covered stops the run at preflight until ``task.yaml``
 accepts it (``coverage.accept``, a list of ``<feature>@<member>``,
-``<feature>@*`` for a whole row). What the spec's profile leaves out (a
-``bringup`` unit's other members, a ``smoke`` unit's judged output) is its own
-choice and is accepted with the reason.
+``<feature>@*`` for a whole row). What the spec itself leaves out is its own
+choice and is accepted with the reason: a ``bringup`` unit's other members, a
+``smoke`` unit's judged output, the members ``disagg``'s test does not run at
+(it sets its engines' layout and runs once), a variant of ``disagg``, and a
+pair of features (each is proven on its own; a pair only where the request
+names it, by a check of its own). A member only ``disagg`` is gated at adds no
+cells to the other features.
 """
 
 from __future__ import annotations
@@ -29,19 +33,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Sequence
 
-from ...checks import feature_evidence, logit_agreement
-from ...checks.logit_reference import ReferenceError as LogitReferenceError
-from ...checks.logit_reference import load_reference
-from ...checks.witness import WITNESS_KINDS
+from ...checks import disagg, feature_evidence
 from ...spec import variants as variants_mod
 from ...spec.task_schema import (
     COVERAGE_FIELD,
+    DISAGG_FEATURE,
     PROFILE_BRINGUP,
     PROFILE_SMOKE,
     assembly_units,
     members_for,
     profile_of,
-    witness_owed,
 )
 from . import contract as contract_mod
 
@@ -50,11 +51,11 @@ COVERAGE_FILENAME = "coverage.yaml"
 
 CERTIFIED, SAMPLED, NOT_COVERED = "certified", "sampled", "not covered"
 #: Gates that judge a feature's output, as opposed to proving it starts.
-_JUDGING = ("accuracy[", "logits", "acceptance", "replay[", "equivalence", "residency", "kv_quant")
+_JUDGING = ("accuracy[", "acceptance", disagg.GATE_NAME)
 #: Pairs of units whose interaction no unit's own checks reach, and why.
 INTERACTIONS: dict[tuple[str, str], str] = {
     ("disagg", "multimodal"): (
-        "the disaggregated witness sends text prompts only: image inputs across the "
+        "the disaggregated-serving test scores a text benchmark: image inputs across the "
         "context/generation hand-over are proven by no check"
     ),
 }
@@ -82,8 +83,9 @@ class Matrix:
     workload: str = ""
     accepted: tuple[str, ...] = field(default_factory=tuple)
 
-    def cell(self, feature: str, member: str) -> Cell:
-        return next(c for c in self.cells if c.feature == feature and c.member == member)
+    def cell(self, feature: str, member: str) -> Cell | None:
+        """``feature`` at ``member``; ``None`` where the request has no such cell."""
+        return next((c for c in self.cells if c.feature == feature and c.member == member), None)
 
     def gaps(self) -> list[Cell]:
         """Cells nothing covers and ``task.yaml`` does not accept."""
@@ -98,6 +100,9 @@ class Matrix:
             row = []
             for member in self.members:
                 cell = self.cell(feature, member)
+                if cell is None:
+                    row.append("")
+                    continue
                 text = cell.status
                 if cell.status == NOT_COVERED and cell.accepted:
                     text += " (accepted)"
@@ -140,29 +145,15 @@ def _accepts(rules: Sequence[str], feature: str, member: str) -> bool:
 MULTIMODAL_UNIT = "multimodal"
 
 
-def _judges(gate: str, feature: str, images: bool) -> bool:
-    """Whether a check of ``gate`` judges ``feature``'s output; ``images``: the logit reference has image prompts."""
+def _judges(gate: str, feature: str) -> bool:
+    """Whether a check of ``gate`` judges ``feature``'s output."""
     if not gate.startswith(_JUDGING):
         return False
     if feature != MULTIMODAL_UNIT:
         return True
-    if gate == logit_agreement.GATE_NAME:
-        return images
     if gate.startswith("accuracy[") and gate.endswith("]"):
         return feature_evidence.judges_images(gate[len("accuracy[") : -1])
     return False
-
-
-def reference_has_images(task_data: Mapping[str, Any]) -> bool:
-    """Whether the logit gate's reference holds an image prompt; ``False`` without one."""
-    spec = logit_agreement.LogitsSpec.from_task(task_data)
-    if not spec.enabled:
-        return False
-    try:
-        reference = load_reference(spec.reference)
-    except (LogitReferenceError, OSError):
-        return False
-    return any(p.images for p in reference.prompts)
 
 
 def _workload(task_data: Mapping[str, Any]) -> str:
@@ -189,29 +180,31 @@ def requirements_matrix(
     for check in contract.checks:
         if check.member not in members:
             members.append(check.member)
+    # Members no unit but disagg is gated at: its test's place, not a column of the request.
+    hop_only = {
+        m
+        for m in members
+        if not any(m in declared[u] for u in units if u != DISAGG_FEATURE)
+        and not any(c.member == m and c.unit != DISAGG_FEATURE for c in contract.checks)
+    }
     rules = accepted(task_data)
-    images = reference_has_images(task_data)
     features: list[str] = [*units, *names]
     cells: list[Cell] = []
     for feature in features:
         at = by_feature.get(feature, {})
         level = profile_of(task_data, feature)
-        if feature in WITNESS_KINDS and not witness_owed(task_data, feature):
-            why = (
-                f"witnesses are off (`accuracy.witness.enabled`): boot and accuracy pass whether "
-                f"or not {feature} does anything, and only its witness can tell"
-            )
-            for member in members:
-                keys = tuple(c.key for c in at.get(member, []))
-                cells.append(Cell(feature, member, NOT_COVERED, keys, why, True))
-            continue
 
         def judges(checks: Sequence[contract_mod.Check], feature: str = feature) -> bool:
-            return any(_judges(c.gate, feature, images) for c in checks)
+            return any(_judges(c.gate, feature) for c in checks)
 
         judged = sorted(m for m, checks in at.items() if judges(checks))
         own = declared.get(feature) or sorted(at)
+        hop = feature == DISAGG_FEATURE or (
+            feature in names and variants_mod.base_unit(task_data, feature) == DISAGG_FEATURE
+        )
         for member in members:
+            if member in hop_only and not hop:
+                continue
             checks = at.get(member, [])
             keys = tuple(c.key for c in checks)
             if judges(checks):
@@ -222,9 +215,7 @@ def requirements_matrix(
             elif checks:
                 status = NOT_COVERED
                 reason = "boots here, and no check judges its output at any member" + (
-                    ": its oracle is "
-                    + feature_evidence.MULTIMODAL.oracle
-                    + " (checks/logit_reference.py --image, named in accuracy.logits.reference)"
+                    ": its oracle is " + feature_evidence.MULTIMODAL.oracle
                     if feature == MULTIMODAL_UNIT
                     else ""
                 )
@@ -233,9 +224,16 @@ def requirements_matrix(
                 reason = f"{feature} is gated at {', '.join(own) or 'no member'} only"
             # The spec's profile left it out: its own choice, written down as such.
             chosen = status == NOT_COVERED and (
-                (level == PROFILE_BRINGUP and not checks) or level == PROFILE_SMOKE
+                (level == PROFILE_BRINGUP and not checks) or level == PROFILE_SMOKE or hop
             )
-            if chosen and level == PROFILE_SMOKE:
+            if chosen and feature != DISAGG_FEATURE and hop:
+                reason = "a variant of disagg owes no check: its axis is proven on core"
+            elif chosen and hop:
+                reason = (
+                    f"the disaggregated-serving test sets its own engines' layout and runs once, "
+                    f"at {', '.join(judged) or 'no member'}"
+                )
+            elif chosen and level == PROFILE_SMOKE:
                 reason = f"the `smoke` profile proves {feature} boots, and judges no more"
             elif chosen:
                 gated = ", ".join(sorted(at)) or "no member"
@@ -255,8 +253,18 @@ def requirements_matrix(
             pair = f"{first}+{second}"
             features.append(pair)
             for member in members:
+                if member in hop_only:
+                    continue
                 cells.append(
-                    Cell(pair, member, NOT_COVERED, (), why, _accepts(rules, pair, member))
+                    Cell(
+                        pair,
+                        member,
+                        NOT_COVERED,
+                        (),
+                        f"{why}; features are proven one at a time, a pair only where the "
+                        "request names it",
+                        True,
+                    )
                 )
     return Matrix(
         features=tuple(features),
@@ -292,6 +300,5 @@ __all__ = [
     "Matrix",
     "accepted",
     "gap_message",
-    "reference_has_images",
     "requirements_matrix",
 ]

@@ -4,7 +4,16 @@
 import threading
 import time
 
+import pytest
+
+from agent_flow.workflows.trtllm_modeling_v2.agents import slots
 from agent_flow.workflows.trtllm_modeling_v2.agents.slots import AgentGate, Priority
+
+
+@pytest.fixture(autouse=True)
+def _quick_polls(monkeypatch):
+    """Background and side turns look again every 0.1s here, not every 5s."""
+    monkeypatch.setattr(slots, "_BACKGROUND_POLL_S", 0.1)
 
 
 class _Turns:
@@ -29,9 +38,8 @@ class _Turns:
         time.sleep(0.2)
 
 
-def test_the_planner_owns_the_reserved_slot():
-    gate = AgentGate(8)
-    turns = _Turns(gate)
+def test_the_planner_owns_the_reserved_slot_and_takes_no_other():
+    turns = _Turns(AgentGate(8))
     for i in range(8):
         turns.start(f"task{i}", Priority.REQUIRED)
     turns.settle()
@@ -43,6 +51,15 @@ def test_the_planner_owns_the_reserved_slot():
     turns.settle()
     assert "planner" in turns.admitted and len(turns.admitted) == 8
     turns.release.set()
+    # Arriving first, the planner still leaves every task slot to the tasks.
+    first = _Turns(AgentGate(4))
+    first.start("planner", Priority.PLANNER)
+    first.settle()
+    for i in range(3):
+        first.start(f"task{i}", Priority.REQUIRED)
+    first.settle()
+    assert len(first.admitted) == 4
+    first.release.set()
 
 
 def test_a_freed_slot_goes_to_the_highest_priority_waiting():
@@ -80,30 +97,18 @@ def test_background_turns_use_only_the_slots_the_foreground_leaves_idle():
     turns.settle()
     assert len(turns.admitted) == 1
     idle["slots"] = 3  # the foreground's work ended: more idle slots, seen on the next look
-    time.sleep(5.5)
+    time.sleep(0.5)
     assert len(turns.admitted) == 3
-    turns.release.set()
-
-
-def test_a_planner_turn_in_its_reserved_slot_takes_no_slot_from_the_tasks():
-    gate = AgentGate(4)
-    turns = _Turns(gate)
-    turns.start("planner", Priority.PLANNER)
-    turns.settle()
-    for i in range(3):
-        turns.start(f"task{i}", Priority.REQUIRED)
-    turns.settle()
-    assert len(turns.admitted) == 4
     turns.release.set()
 
 
 def test_a_side_turn_waits_for_idle_slots_and_takes_one_once_it_has_waited_long_enough():
     idle = {"slots": 0}
-    gate = AgentGate(8, side_limit=lambda: idle["slots"], side_max_wait_s=2.0)
+    gate = AgentGate(8, side_limit=lambda: idle["slots"], side_max_wait_s=1.0)
     turns = _Turns(gate)
     turns.start("primer", Priority.SIDE)
     turns.settle()
     assert "primer" not in turns.admitted, "the ready tasks the loop starts come first"
-    time.sleep(5.5)  # past its wait, seen on the next look
+    time.sleep(1.5)  # past its wait, seen on the next look
     assert "primer" in turns.admitted, "it is not starved for ever"
     turns.release.set()

@@ -54,13 +54,6 @@ def test_the_surface_lists_what_the_checkpoint_shares_first():
     assert ranked.index(wanted) < ranked.index("aaa_family/aaa_target/ops/moe/router_00")
 
 
-def test_the_survey_reads_the_leads_and_the_limits():
-    block = prior_art.survey_block(_FOUND, [_LIMIT])
-    assert block.startswith(prior_art.PRIOR_ART_HEADING)
-    assert "head dim 192" in block and "qsa/kernels.py" in block
-    assert prior_art.survey_block(None, []) == ""
-
-
 def _gap(**row):
     return {
         "step": "sparse GQA attention over the selected regions",
@@ -92,13 +85,8 @@ def test_a_plan_states_its_design_for_each_engine_limit():
     apart = "Attention head dim is 192.\nThe indexer proxy dim is 256."
     findings = survey_review.unaddressed_limits(apart, [_LIMIT])
     assert len(findings) == 1 and "192" in findings[0]
-
-
-def test_the_review_runs_once_and_says_what_to_redraft():
-    findings = survey_review.review_survey({"steps": [_gap()]}, "", _FOUND, [_LIMIT])
-    assert len(findings) == 2
-    review = survey_review.render_review(findings)
-    assert review.startswith("## Survey review: re-draft") and "runs once" in review
+    # The review holds the draft to both: the leads and the limits.
+    assert len(survey_review.review_survey({"steps": [_gap()]}, apart, _FOUND, [_LIMIT])) == 2
 
 
 def test_preflight_writes_the_prior_art_every_role_can_read(tmp_path):

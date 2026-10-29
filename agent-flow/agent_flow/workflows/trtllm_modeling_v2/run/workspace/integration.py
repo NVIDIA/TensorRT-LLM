@@ -162,15 +162,42 @@ class Integration:
         ``full`` or a touched path asks for it. Only registering the worktree
         holds the repository lock. A worktree opened again is widened to what
         ``touches`` asks now; one whose checkout was cut short is made again,
-        on the branch an earlier attempt left when there is one.
+        on the branch an earlier attempt left when there is one. A branch that holds
+        nothing the integration head lacks starts again at that head
+        (:meth:`_caught_up`), so a retry sees what other tasks landed since.
         """
         tree, dirs = self.tree(task_id), cone(touches, full)
         if _checked_out(tree):
             self._widen(tree, dirs)
+            self._catch_up(task_id, tree)
         else:
             self._create(task_id, tree, dirs)
         link_native(self.repo, tree)
         return tree
+
+    def _caught_up(self, task_id: str) -> str | None:
+        """The integration head, when the task's branch holds no commit it lacks; else ``None``.
+
+        An earlier attempt that committed nothing, or whose commits all landed,
+        has nothing to keep, and no rule lets its worker rebase onto the head.
+        """
+        ahead = git_output(self.repo, "rev-list", "--count", f"HEAD..{self.branch(task_id)}")
+        if (ahead or "").strip() != "0":
+            return None
+        return (git_output(self.repo, "rev-parse", "HEAD") or "").strip() or None
+
+    def _catch_up(self, task_id: str, tree: Path) -> None:
+        """Move a reopened worktree to the integration head when its branch has nothing else."""
+        head = self._caught_up(task_id)
+        if head is None or (git_output(tree, "rev-parse", "HEAD") or "").strip() == head:
+            return
+        flags = _sparse_flags(tree)
+        edits = git_output(tree, *flags, "status", "--porcelain", "--untracked-files=no")
+        if (edits or "").strip():
+            return  # edits an earlier attempt left uncommitted stay where they are
+        moved = self._git(tree, *_CHECKOUT, *flags, "reset", "--hard", "-q", head)
+        if moved.returncode == 0:
+            self.log(f"{tree.name}: moved to the integration head {head[:10]}")
 
     def changed_paths(self, task_id: str) -> tuple[str, ...]:
         """The files the task's branch changes since it left the integration head's history."""
@@ -237,6 +264,9 @@ class Integration:
                 exists = git_checked(
                     self.repo, "rev-parse", "--verify", "--quiet", branch, check=False
                 )
+                head = self._caught_up(task_id) if exists else None
+                if head is not None:
+                    self._git(self.repo, "branch", "-f", branch, head)
                 where = (str(tree), branch) if exists else ("-b", branch, str(tree), "HEAD")
                 added = self._git(self.repo, "worktree", "add", "--no-checkout", *where)
                 if added.returncode == 0:

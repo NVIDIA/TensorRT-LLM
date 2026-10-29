@@ -12,17 +12,15 @@ from agent_flow.workflows.trtllm_modeling_v2.checks.harness import serve_driver,
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
 
-_MEMBERS = ["tp1", "tp2", "tep2", "dep2", "tp4", "tep4", "dep4"]
 
-
-def _task(tmp_path):
+def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
     options = tmp_path / "core.llm_api.yaml"
     options.write_text("kv_cache_config: {free_gpu_memory_fraction: 0.6}\n", encoding="utf-8")
-    return {
+    task = {
         "checkpoint_path": "/ckpt/model",
         "trtllm_repo_path": str(tmp_path / "repo"),
         "parallel": "unified",
-        "members": list(_MEMBERS),
+        "members": ["tp1", "tp2", "tep2", "dep2", "tp4", "tep4", "dep4"],
         "features": ["mtp", "multimodal"],
         "accuracy": {
             "benchmark": "gsm8k",
@@ -32,39 +30,16 @@ def _task(tmp_path):
             "max_batch_size": 128,
         },
     }
-
-
-def _env(world_size):
+    answer = {"index": 0, "status": 200, "text": " Paris."}
+    stdout = (
+        f"{workload_io.RECORD_MARKER} {json.dumps(answer)}\n"
+        f"{serve_driver.SERVER_MARKER} {json.dumps({'healthy': True, 'boot_s': 3.0})}\n"
+    )
     block = {"kind": "local", "python": "/venv/bin/python", "env": {"HF_HUB_OFFLINE": "1"}}
-    return resolve_environment({"environment": block}, devices=(), world_size=world_size)
-
-
-def _server(healthy=True, **extra):
-    return f"{serve_driver.SERVER_MARKER} {json.dumps({'healthy': healthy, **extra})}\n"
-
-
-def _answer(index, text="Paris", status=200, **extra):
-    record = {"index": index, "status": status, "text": text, **extra}
-    return f"{workload_io.RECORD_MARKER} {json.dumps(record)}\n"
-
-
-def _recorder(output=""):
-    seen = []
-
-    def run(command, env=None, timeout=0):
-        seen.append((command, timeout))
-        return CommandResult(returncode=0, stdout=output)
-
-    run.seen = seen  # type: ignore[attr-defined]
-    return run
-
-
-def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
-    run = _recorder(_answer(0, " Paris.") + _server(boot_s=3.0))
     result = sg.run_serve_gate(
-        _env(1),
-        task_data=_task(tmp_path),
-        runner=run,
+        resolve_environment({"environment": block}, devices=(), world_size=1),
+        task_data=task,
+        runner=lambda command, env=None, timeout=0: CommandResult(returncode=0, stdout=stdout),
         features=[],
         unit="core",
         member="tp1",

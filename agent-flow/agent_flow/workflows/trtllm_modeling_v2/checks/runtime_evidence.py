@@ -272,7 +272,7 @@ def _holds_recurrent_state(slots: Sequence[int], config: Mapping[str, Any]) -> b
 class EngineAttestation:
     """What one engine a gate built ran, held against what the gate declared."""
 
-    #: Which of the gate's engines this is (``require`` or a witness leg);
+    #: Which of the gate's engines this is (``require``, or a control's mode);
     #: empty for a gate with one.
     leg: str
     #: Whether the harness printed a record for this engine.

@@ -22,23 +22,7 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.monitor.heartbeat import (
 from agent_flow.workflows.trtllm_modeling_v2.infra.monitor.status import load_config
 
 
-def test_wait_returns_when_the_orchestrator_exits(tmp_path):
-    """A closed run changes nothing else, so the waiter must notice the exit."""
-    workspace = tmp_path / "ws"
-    dispatch = workspace / "dispatch"
-    dispatch.mkdir(parents=True)
-    (workspace / "task.yaml").write_text("{}\n", encoding="utf-8")
-    cfg = load_config(workspace)
-    assert status.orchestrator_state(cfg)[0] == "unknown"
-    write_json_atomic(dispatch / ORCHESTRATOR_HEARTBEAT, {"pid": 1, "host": "h", "at": time.time()})
-    assert status.orchestrator_state(cfg)[0] == "running"
-    assert status.wait(cfg, timeout_s=0.1, poll_s=0.01, watch_sessions=False).kind == "TIMEOUT"
-    write_json_atomic(dispatch / ORCHESTRATOR_EXIT, {"pid": 1, "host": "h", "at": time.time() + 1})
-    event = status.wait(cfg, timeout_s=5, poll_s=0.01, watch_sessions=False)
-    assert event.kind == "ORCHESTRATOR_EXITED" and "pid 1" in event.detail
-
-
-def test_monitor_cli_reads_workspace_and_preserves_event_and_exit_contracts(
+def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(
     tmp_path, monkeypatch, capsys
 ):
     from agent_flow.workflows.trtllm_modeling_v2 import cli
@@ -60,13 +44,14 @@ def test_monitor_cli_reads_workspace_and_preserves_event_and_exit_contracts(
         "correctness": None,
         "sessions": [],
     }
+    dispatch = tmp_path / "dispatch"
+    dispatch.mkdir()
+    write_json_atomic(dispatch / ORCHESTRATOR_HEARTBEAT, {"pid": 1, "host": "h", "at": time.time()})
+    assert status.orchestrator_state(load_config(tmp_path))[0] == "running"
     assert monitor(["wait", "--timeout", "0", "--no-sessions"]) == 0
     assert capsys.readouterr().out.splitlines()[0] == "TIMEOUT  nothing new"
-    (tmp_path / "dispatch").mkdir()
-    write_json_atomic(
-        tmp_path / "dispatch" / ORCHESTRATOR_EXIT,
-        {"pid": 1, "host": "h", "at": time.time()},
-    )
+    # A closed run changes nothing else, so the waiter must notice the exit.
+    write_json_atomic(dispatch / ORCHESTRATOR_EXIT, {"pid": 1, "host": "h", "at": time.time() + 1})
     assert monitor(["--workspace", str(tmp_path), "wait", "--timeout", "0"]) == 0
     assert capsys.readouterr().out.splitlines()[0].startswith("ORCHESTRATOR_EXITED  pid 1")
 

@@ -684,7 +684,7 @@ def check_configuration(
     max_tokens: int,
     member: str | None,
 ) -> dict[str, Any]:
-    """One public API configuration for request, witness and eval checks.
+    """One public API configuration for request and eval checks.
 
     Runtime flags are an input spelling only. The complete options mapping,
     including nested KV and speculative settings, reaches every check intact.
@@ -816,9 +816,8 @@ UNKNOWN = "?"
 def subject_fields(task_data: Mapping[str, Any], unit: str | None) -> tuple[str, ...]:
     """The engine fields a configuration variant is about: those its overlay sets.
 
-    A setting no field expresses is listed as :data:`UNKNOWN`, so a variant
-    setting one is never taken for reference_compatible. A unit that is not a variant is
-    about none.
+    A setting no field expresses is listed as :data:`UNKNOWN`. A unit that is not a
+    variant is about none.
     """
     if not is_variant(task_data, unit):
         return ()
@@ -862,6 +861,16 @@ def _per_unit(key: str, value: Any, name: str, chosen: Any) -> dict[str, Any]:
     return out
 
 
+def _unit_discriminators(block: Any, unit: str) -> Mapping[str, Any]:
+    """``unit``'s discriminators in ``accuracy.discriminators``, flat or per unit; {} for none."""
+    if not isinstance(block, Mapping):
+        return {}
+    if any(isinstance(v, Mapping) for v in block.values()):
+        chosen = block.get(unit, block.get("default"))
+        return chosen if isinstance(chosen, Mapping) else {}
+    return block
+
+
 def variant_spec(
     data: Mapping[str, Any],
     name: str,
@@ -900,6 +909,10 @@ def variant_spec(
             "llm_api_options", accuracy.get("llm_api_options"), name, str(path)
         )
     for key, value in (entry.get("accuracy") or {}).items():
+        if key == "discriminators" and isinstance(value, Mapping):
+            # Over the unit's row: a KV-dtype variant adds `kv_cache_quant_algo` to the
+            # unit's `quant_algo`, it does not drop it.
+            value = {**dict(_unit_discriminators(accuracy.get(key), unit)), **value}
         accuracy[key] = _per_unit(key, accuracy.get(key), name, copy.deepcopy(value))
     out["accuracy"] = accuracy
 

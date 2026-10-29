@@ -48,13 +48,6 @@ _RUNTIME = {
 #: The 19 padded batches `CudaGraphConfig(enable_padding=True, max_batch_size=128)` captures.
 _PADDED = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]
 
-#: Four ranks' bind lines, as a tp4 boot logs them.
-_BINDS = "".join(
-    f"modeling_v2 newmodel: bound MambaHybridCacheManagerV2 #{n}: {slots} recurrent slots, "
-    f"32 states per slot; SSM torch.float32 ({slots}, 4, 32, 64)\n"
-    for n, slots in ((1, 96),) * 4 + ((2, 4096),) * 4
-)
-
 
 def _task(tmp_path: Path, **extra) -> dict:
     options = tmp_path / "core.llm_api.yaml"
@@ -71,8 +64,8 @@ def _task(tmp_path: Path, **extra) -> dict:
     return task
 
 
-def _env(world_size: int = 1, **env) -> RunEnvironment:
-    return RunEnvironment(kind="local", python="/py", world_size=world_size, env=dict(env))
+def _env() -> RunEnvironment:
+    return RunEnvironment(kind="local", python="/py", world_size=1, env={})
 
 
 def _engine_config(**changes) -> dict:
@@ -105,30 +98,19 @@ def _engine_config(**changes) -> dict:
     return config
 
 
-def _engine_line(
-    config: dict | None = None,
-    *,
-    worker: bool = True,
-    free_mib: float = 40960.0,
-    total_mib: float = 81920.0,
-    devices: int = 1,
-    argv: list[str] | None = None,
-    kv_max_tokens: int | None = 262144,
-) -> str:
+def _engine_line(config: dict | None = None) -> str:
+    """The engine record a worker-side observer logs for ``config``."""
     config = _engine_config() if config is None else config
     record = {
-        "argv": argv or [],
-        "worker": worker,
+        "argv": [],
+        "worker": True,
         "observer": True,
         "config": config,
-        "sources": {k: "worker" if worker else "llm.args" for k in config},
-        "pools": {"kv_max_tokens": kv_max_tokens} if worker else {},
+        "sources": dict.fromkeys(config, "worker"),
+        "pools": {"kv_max_tokens": 262144},
         "memory": {
             "source": "nvml",
-            "devices": [
-                {"device": str(d), "free_mib": free_mib, "total_mib": total_mib}
-                for d in range(devices)
-            ],
+            "devices": [{"device": "0", "free_mib": 40960.0, "total_mib": 81920.0}],
         },
         "errors": {},
     }
@@ -157,7 +139,7 @@ def test_a_boot_gate_fails_on_an_engine_that_ran_another_configuration(tmp_path)
     task = _task(tmp_path)
     good = boot_checks.run_boot_gate(
         _env(), task_data=task, unit="core", member="tp1", workdir=tmp_path,
-        runner=_boot_runner(_engine_line() + _BINDS[:0] + _records("Paris", "light")),
+        runner=_boot_runner(_engine_line() + _records("Paris", "light")),
     )  # fmt: skip
     assert good.passed, good.detail
     [record] = good.engine

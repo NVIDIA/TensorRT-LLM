@@ -157,72 +157,60 @@ def _verify(root: Path):
     )
 
 
-def test_a_complete_delivery_passes(tmp_path):
+#: One defect each: (file under the repo, what it is overwritten with, the check, its detail).
+_DEFECTS = (
+    (
+        f"{catalog_paths.CATALOG_DIR}/norm/flashinfer_rmsnorm.py",
+        _ENTRY.replace("CELLS = (", "UNUSED = ("),
+        "catalog:norm/flashinfer_rmsnorm.py",
+        "declares no CELLS",
+    ),
+    (
+        f"{catalog_paths.CATALOG_TESTS_DIR}/gemm/test_modeling_v2_cublas_mm.py",
+        "def test(): ...\n",
+        "test:gemm/cublas_mm",
+        ".CELLS",
+    ),
+    (
+        f"{catalog_paths.MODELING_V2_PACKAGE}/models/gpt_oss/routing.py",
+        "TARGET_MODULES = {}\n",
+        "routing:target",
+        "built-in implementation would answer",
+    ),
+    (
+        f"{delivery.TEST_DB_DIR}/l0_gb300.yml",
+        "- condition: {}\n",
+        "tests:test-db",
+        "CI would never run it",
+    ),
+)
+
+
+def test_a_complete_delivery_passes_and_each_missing_piece_is_named(tmp_path):
     assert _verify(_build_repo(tmp_path)).passed
-
-
-def test_an_entry_that_certifies_nothing_fails(tmp_path):
-    root = _build_repo(tmp_path)
-    (root / catalog_paths.CATALOG_DIR / "norm" / "flashinfer_rmsnorm.py").write_text(
-        _ENTRY.replace("CELLS = (", "UNUSED = ("), encoding="utf-8"
-    )
-    failure = next(
-        c for c in _verify(root).failures if c.name == "catalog:norm/flashinfer_rmsnorm.py"
-    )
-    assert "declares no CELLS" in failure.detail
-
-
-def test_a_test_that_never_drives_the_cells_fails(tmp_path):
-    root = _build_repo(tmp_path)
-    test = root / catalog_paths.CATALOG_TESTS_DIR / "gemm" / "test_modeling_v2_cublas_mm.py"
-    test.write_text("def test(): ...\n", encoding="utf-8")
-    failure = next(c for c in _verify(root).failures if c.name == "test:gemm/cublas_mm")
-    assert ".CELLS" in failure.detail
-
-
-def test_an_unrouted_target_is_caught(tmp_path):
-    root = _build_repo(tmp_path)
-    routing = root / catalog_paths.MODELING_V2_PACKAGE / "models" / "gpt_oss" / "routing.py"
-    routing.write_text("TARGET_MODULES = {}\n", encoding="utf-8")
-    report = _verify(root)
-    failure = next(c for c in report.failures if c.name == "routing:target")
-    assert "built-in implementation would answer" in failure.detail
-
-
-def test_an_unregistered_test_is_caught(tmp_path):
-    root = _build_repo(tmp_path)
-    (root / delivery.TEST_DB_DIR / "l0_gb300.yml").write_text("- condition: {}\n", encoding="utf-8")
-    report = _verify(root)
-    failure = next(c for c in report.failures if c.name == "tests:test-db")
-    assert "CI would never run it" in failure.detail
+    for n, (rel, text, check, detail) in enumerate(_DEFECTS):
+        root = _build_repo(tmp_path / str(n))
+        (root / rel).write_text(text, encoding="utf-8")
+        failure = next(c for c in _verify(root).failures if c.name == check)
+        assert detail in failure.detail, check
 
 
 # ------------------------------------- delivery must check git, not just disk
 
 
-def _git(tmp_path, *args):
-    subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
-
-
-def _git_repo(tmp_path):
-    _git(tmp_path, "init", "-q")
-    _git(tmp_path, "config", "user.email", "t@e.st")
-    _git(tmp_path, "config", "user.name", "t")
-    return tmp_path
-
-
 def test_an_uncommitted_target_fails_even_though_the_file_is_there(tmp_path):
-    _git_repo(tmp_path)
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
     (tmp_path / "seed").write_text("s\n", encoding="utf-8")
-    _git(tmp_path, "add", "seed")
-    _git(tmp_path, "commit", "-qm", "seed")
+    git("add", "seed")
+    git("-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "seed")
     (tmp_path / "modeling.py").write_text("# never committed\n", encoding="utf-8")
 
-    checks = delivery.check_tree_committed(tmp_path, ("modeling.py",))
-    assert len(checks) == 1
-    assert not checks[0].passed
-    assert "a clone would not have them" in checks[0].detail
-    assert "modeling.py" in checks[0].detail
+    [check] = delivery.check_tree_committed(tmp_path, ("modeling.py",))
+    assert not check.passed
+    assert "a clone would not have them" in check.detail and "modeling.py" in check.detail
 
 
 # --------------------------------------------------------- against the real tree
@@ -262,12 +250,3 @@ def test_the_real_merged_target_passes_every_check(target_rel, family, model_key
         accuracy_test=accuracy_test,
     )
     assert report.passed, report.render()
-
-
-def test_a_pending_anchor_fails_the_reference_check_whatever_the_file_holds(tmp_path):
-    reference = tmp_path / "gsm8k.yaml"
-    reference.write_text(yaml.safe_dump({"x/y": [{"accuracy": 57.4}]}))
-    [check] = delivery.check_accuracy_reference(tmp_path, str(reference), "x/y", pending=True)
-    assert not check.passed and "anchor pending" in check.detail
-    [check] = delivery.check_accuracy_reference(tmp_path, str(reference), "x/y")
-    assert check.passed

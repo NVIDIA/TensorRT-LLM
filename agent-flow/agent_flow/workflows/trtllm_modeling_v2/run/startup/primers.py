@@ -21,6 +21,7 @@ from pathlib import Path
 from agent_flow.agent_runtime import AgentConfig
 
 from ...infra.files import write_text_atomic
+from ...operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 
 #: The roles whose turns start from a primer.
 PRIMED_ROLES: tuple[str, ...] = ("planner", "kernel_writer", "assembler")
@@ -30,22 +31,23 @@ RECORD_FILENAME = "primers.json"
 #: The backends whose sessions a turn can start as a copy of.
 FORKING_BACKENDS: tuple[str, ...] = ("claude-code", "codex")
 
-_PACKAGE = "tensorrt_llm/_torch/_experimental/modeling_v2"
+_PACKAGE = MODELING_V2_PACKAGE
+_TESTS = CATALOG_TESTS_DIR
 
 _READING: dict[str, str] = {
     "planner": f"""\
 1. `{_PACKAGE}/README.md`, whole.
 2. The run's spec, `task.yaml`, and its contract, `contract.yaml`, in the workspace.
-3. `surface.md` and `prior_art.md` in the workspace, when they exist.
+3. `surface.md`, `prior_art.md` and `tree_map.md` in the workspace, when they exist.
 4. The existing targets under `{_PACKAGE}/models/`: how each is laid out, by
    listing, not reading every file.
 """,
     "kernel_writer": f"""\
 1. `{_PACKAGE}/README.md` and `{_PACKAGE}/catalog/_op.py`, whole.
-2. `tests/unittest/_torch/modeling_v2/_validating.py`, whole: the fixtures
+2. `{_TESTS}/_validating.py`, whole: the fixtures
    every entry test uses.
 3. Three entries of different categories in `{_PACKAGE}/catalog/`, each with
-   its GPU test under `tests/unittest/_torch/modeling_v2/`, whole.
+   its GPU test under `{_TESTS}/`, whole.
 4. One target's own `ops/`, to see an entry only one target calls and where
    its test sits.
 5. The `trtllm-modeling-v2-entry` skill.
@@ -54,7 +56,7 @@ _READING: dict[str, str] = {
 1. `{_PACKAGE}/README.md` and `{_PACKAGE}/catalog/_op.py`, whole.
 2. One existing target end to end: its `modeling.py`, `weights.py`, its
    family's `routing.py` and its tests.
-3. The source-level gates, `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py`:
+3. The source-level gates, `{_TESTS}/test_modeling_v2_*.py`:
    what each checks of a target.
 4. The run's spec, `task.yaml`, in the workspace.
 """,

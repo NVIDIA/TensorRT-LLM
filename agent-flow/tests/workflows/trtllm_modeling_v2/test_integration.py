@@ -65,23 +65,43 @@ def test_parallel_tasks_land_one_after_the_other_without_merge_commits(tmp_path)
     assert not first.exists() and _git(repo, "rev-parse", "--verify", "mv2/run/k1")
 
 
-def test_uncommitted_work_is_not_integrated(tmp_path):
+def test_a_retry_with_nothing_to_keep_starts_at_the_integration_head(tmp_path):
     repo = _repo(tmp_path)
     integration = Integration(repo, tmp_path / "ws", "mv2/run", _ENV)
-    tree = integration.open("k1")
-    (tree / "a.py").write_text("A = 9\n")
-    outcome = integration.integrate("k1")
-    assert not outcome.merged and "uncommitted changes" in outcome.detail
-    assert not outcome.base  # nothing for a rebase to resolve
+    idle, busy, other = integration.open("k1"), integration.open("k2"), integration.open("k3")
+    _commit(busy, "b.py", "B = 5\n", "unlanded")
+    _commit(other, "a.py", "A = 2\n", "a")
+    assert integration.integrate("k3").merged
+    head = _git(repo, "rev-parse", "HEAD")
+    # k1 committed nothing: reopened, it sees what k3 landed. k2 keeps its own commit.
+    assert integration.open("k1") == idle and _git(idle, "rev-parse", "HEAD") == head
+    assert (idle / "a.py").read_text() == "A = 2\n"
+    integration.open("k2")
+    assert (busy / "b.py").read_text() == "B = 5\n" and _git(busy, "rev-parse", "HEAD") != head
+    # A worktree a restart cut short is made again on the head, not on the old branch.
+    integration.close("k1")
+    _commit(other, "a.py", "A = 3\n", "a again")
+    assert integration.integrate("k3").merged
+    again = integration.open("k1")
+    assert _git(again, "rev-parse", "HEAD") == _git(repo, "rev-parse", "HEAD")
+    # Edits left uncommitted are not reset away.
+    (again / "b.py").write_text("B = 7\n")
+    _commit(other, "a.py", "A = 4\n", "a third")
+    assert integration.integrate("k3").merged
+    integration.open("k1")
+    assert (again / "b.py").read_text() == "B = 7\n"
 
 
-def test_a_commit_that_breaks_the_rules_goes_back_to_its_worker(tmp_path):
+def test_uncommitted_work_or_a_commit_that_breaks_the_rules_goes_back_to_its_worker(tmp_path):
     """A plain `git commit` in a worktree is audited once, before it can land."""
     repo = _repo(tmp_path)
     policy = CommitPolicy(identity=CommitIdentity("T", "t@example.com"), allowed_paths=("a.py",))
     integration = Integration(repo, tmp_path / "ws", "mv2/run", _ENV, policy=policy)
     tree = integration.open("k1")
     (tree / "a.py").write_text("A = 2\n")
+    outcome = integration.integrate("k1")
+    assert not outcome.merged and "uncommitted changes" in outcome.detail
+    assert not outcome.base  # nothing for a rebase to resolve
     _git(tree, "commit", "-q", "-am", "unsigned")
     outcome = integration.integrate("k1")
     assert not outcome.merged and outcome.repairable
@@ -162,12 +182,13 @@ def test_a_conflicting_task_goes_back_to_its_worker_and_then_integrates(tmp_path
     integration = Integration(repo, tmp_path / "ws", "mv2/run", _ENV)
     first, second = integration.open("k1"), integration.open("k2")
     _commit(first, "a.py", "A = 2\n", "a")
+    # k2's own change predates k1's landing, so its worktree keeps its base.
+    _commit(second, "a.py", "A = 3\n", "a again")
     assert integration.integrate("k1").merged
     head = _git(repo, "rev-parse", "HEAD")
 
     def worker(turn):
         if turn == 1:
-            _commit(second, "a.py", "A = 3\n", "a again")
             return "UNIT_READY"
         # What the note asks for: rebase onto the head, keep both changes, continue.
         rebased = subprocess.run(["git", "-C", str(second), "rebase", head], capture_output=True)

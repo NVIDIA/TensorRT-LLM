@@ -87,7 +87,9 @@ shares the checkpoint's words, and the limits the engine's kernels set for
 this geometry. A GAP row that writes new code names in `tried` each lead that
 shares its words and why it does not serve; `plan.md` states the design for
 each engine limit. A survey review holds the draft to both and sends it back
-once with what it left unconsidered.
+once with what it left unconsidered. Look outside the tree too: how another
+engine (vLLM, SGLang) implements this model is evidence for each step's rung,
+and a library call it makes may serve a step no trtllm op does.
 
 **The envelope.** `task.yaml`'s runtime block declares what the target serves
 at every member: `max_num_tokens`, `max_batch_size`, `max_seq_len` and the
@@ -173,6 +175,11 @@ certification and variant promotion. Native torch is not an entry (there is no
 `catalog/torch/`): report it and write nothing. Nor is a torch fallback
 inside the wrapper: it certifies nothing, so land the failure instead.
 
+A kernel this run writes starts from the closest existing implementation
+where there is one (FlashInfer, CUTLASS, vLLM, SGLang, another target's
+`ops/`): adapt it, keep its license header and name its origin in the
+entry's docstring.
+
 When your dispatch states the cells, certify exactly those, plus one at the
 envelope's largest row; a value you notice beyond them goes in the `note` as
 uncertified. Certify measured values, not estimates: `runtime_facts.yaml`
@@ -239,7 +246,10 @@ The target's core is built and its gates pass. Your task adds one feature
 serve one configuration variant as well. **Every check the target passed
 keeps passing**: with the feature off, the target runs as it did. Your task's
 checks say what the feature must pass. A feature that needs an entry the
-vocabulary lacks blocks as a `vocabulary_gap`, as the core would.
+vocabulary lacks blocks as a `vocabulary_gap`, as the core would. **Load the
+`trtllm-modeling-v2-features` skill first**: where the feature lives in the
+engine, what the target must honour for it, and how to prove it from a CPU
+check up to its gate.
 """
 
 _INTEGRATE = """\
@@ -261,6 +271,9 @@ worktree is a scratch copy nobody integrates and you change nothing that
 lands. Read the failing check's evidence first: its log, and the receipts of
 the tasks it covered.
 
+- Reproduce first where the tree already runs it: the in-tree test nearest
+  the failure (its configuration, one test through the spool) and the stock
+  path. A failure they share is the engine's or the site's, not the target's.
 - Bisect with cheap probes before full runs: the same prompts under
   `modeling_v2="off"` and `"require"`; one module in isolation against the HF
   module or the built-in one, with the checkpoint's real weights, at the
@@ -298,8 +311,9 @@ names it.
    against `reference`, the source-level gates pass, and the orchestrator's
    identical micro/module harness verifies the gain on both revisions. A
    claimed speedup is not evidence. Never claim an end-to-end number from a
-   local benchmark: e2e is reserved for serving/system-wide interactions and
-   final cumulative validation. The accuracy gate runs on every kept stack.
+   local benchmark: e2e is reserved for serving/system-wide interactions, the
+   campaign's checkpoints and the final tree. The accuracy benchmark runs once,
+   on the final tree.
 4. **Keep it only if it won.** A change that did not win lands nothing and is
    reported with its numbers: a measured "no" is a result.
 

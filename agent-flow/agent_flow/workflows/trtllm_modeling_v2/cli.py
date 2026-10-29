@@ -91,9 +91,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--revision-cap",
         type=int,
         default=DEFAULT_REVISION_CAP,
-        help="How many graph revisions the planner may make without a contract "
-        f"check turning green before the run closes planner-stalled. Default "
-        f"{DEFAULT_REVISION_CAP}.",
+        help="How many graph revisions the planner may make without progress (a task "
+        "done, a change landed on the target or a contract check turning green) before "
+        f"the run closes planner-stalled. Default {DEFAULT_REVISION_CAP}.",
     )
     parser.add_argument(
         "--event-window",
@@ -306,20 +306,26 @@ def _feedback(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2 feedback",
         description="Leave a message for the planner of the run in a workspace. The run "
-        "takes it within a loop and puts it first in the planner's next turn. A message "
-        "steers the work; it relaxes no check.",
+        "puts it first in the planner's next turn. A message steers the work in a few "
+        f"sentences (at most {inbox.MESSAGE_MAX_CHARS} characters; evidence in a file it "
+        "names); it relaxes no check, and is no place for status reports.",
     )
     parser.add_argument("--workspace", type=Path, required=True, help="The run's workspace.")
     text = parser.add_mutually_exclusive_group(required=True)
     text.add_argument("message", nargs="?", help="The message.")
     text.add_argument("--file", type=Path, help="Read the message from this file.")
+    parser.add_argument(
+        "--now",
+        action="store_true",
+        help="Wake the planner for it at once; otherwise it rides with the planner's next turn.",
+    )
     args = parser.parse_args(argv)
     message = args.file.read_text(encoding="utf-8") if args.file else args.message
     try:
-        path = inbox.post(args.workspace, message)
+        path = inbox.post(args.workspace, message, now=args.now)
     except ValueError as exc:
         parser.error(str(exc))
-    print(f"left for the planner's next turn: {path}")
+    print(f"left for the planner's {'turn, now' if args.now else 'next turn'}: {path}")
     return 0
 
 

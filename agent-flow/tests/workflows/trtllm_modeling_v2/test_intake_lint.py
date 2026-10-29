@@ -38,7 +38,7 @@ _GOOD = {
     "trtllm_repo_path": None,
     "arch": "sm_103",
     "parallel": "unified",
-    "members": {"default": ["tp4", "tep4", "dep4"], "disagg": ["dep2"]},
+    "members": {"default": ["tp4", "tep4", "dep4"]},
     "features": ["disagg"],
     "runtime": {
         "cuda_graph": True,
@@ -62,29 +62,14 @@ _GOOD = {
     "environment": {"kind": "session_spool", "gpus_per_node": 4},
     "accuracy": {"benchmark": "gsm8k"},
     "perf": {"enabled": True, "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]}},
-    # dep2 holds disagg alone; the wider disagg members are checked outside the flow, and tp4 /
-    # tep4 are text-only: core alone.
-    "coverage": {
-        "accept": [
-            "core@dep2",
-            "kv_fp8@dep2",
-            "kv_fp8@tp4",
-            "kv_fp8@tep4",
-            "chunked@dep2",
-            "chunked@tp4",
-            "chunked@tep4",
-            "disagg@tp4",
-            "disagg@tep4",
-            "disagg@dep4",
-        ]
-    },
+    # tp4 / tep4 are text-only: core alone. disagg's test runs once, at dep4.
+    "coverage": {"accept": ["kv_fp8@tp4", "kv_fp8@tep4", "chunked@tp4", "chunked@tep4"]},
     "notes": "Architecture: toy. Prior art in this tree worth surveying: the QSA sparse ops.",
 }
 
 
 def _slow():
     task = copy.deepcopy(_GOOD)
-    task["members"]["disagg"] = ["dep4"]
     task["runtime"]["cuda_graph"] = False
     task["runtime"]["extra_flags"] = [
         "--max_seq_len=16384",
@@ -104,6 +89,7 @@ def _slow():
         "benchmark": "gsm8k",
         "benchmark_args": ["--apply_chat_template"],
         "envelope": {"enabled": True},
+        "disagg": {"test": "tests/accuracy/test_disagg.py::TestToy::test_auto_dtype", "devices": 8},
     }
     task["notes"] = "Never inspect any preexisting implementation, including sibling checkouts."
     return task
@@ -111,6 +97,11 @@ def _slow():
 
 def _rules(report):
     return {f.rule for f in report.findings}
+
+
+def _finding(rule, task, **context):
+    """The finding of ``rule`` the lint makes of ``task``, or ``None``."""
+    return next((f for f in lint.lint_task(task, **context).findings if f.rule == rule), None)
 
 
 def test_a_spec_built_for_serving_passes():
@@ -125,7 +116,7 @@ def test_slow_and_stalling_choices_are_named():
         "runtime-batch-below-concurrency",
         "runtime-max-seq-len-oversized",
         "runtime-small-chunk",
-        "disagg-two-nodes",
+        "disagg-placement",
         "variants-cross-product",
         "accuracy-chat-template-short-output",
         "envelope-open-ended-probes",
@@ -155,30 +146,34 @@ def test_an_accuracy_check_never_runs_eager():
     task = copy.deepcopy(_GOOD)
     task["variants"]["kv_fp8"]["runtime"] = {"cuda_graph": False}
     task["variants"]["chunked"]["llm_api_options"] = {"cuda_graph_config": None}
-    finding = next(f for f in lint.lint_task(task).findings if f.rule == "accuracy-eager")
+    finding = _finding("accuracy-eager", task)
     assert finding.severity == lint.BLOCK
     assert "without CUDA graphs for kv_fp8, chunked:" in finding.message
     # A block stands whatever the notes accept.
     task["notes"] += "\nintake-accept: accuracy-eager -- capture is a planned task"
     assert "accuracy-eager" in {f.rule for f in lint.lint_task(task).open()}
-    # Off for the run: every unit and variant scored eager, and disagg's witness, which scores
-    # no benchmark, is a warn.
+    # Off for the run: every unit and variant scored eager, and a smoke unit, which scores no
+    # benchmark, is a warn; disagg's test configures its own engines.
     task = copy.deepcopy(_GOOD)
     task["runtime"]["cuda_graph"] = False
+    task["features"] = ["disagg", "multimodal"]
+    task["profile"] = {"multimodal": "smoke"}
     findings = {f.rule: f for f in lint.lint_task(task).findings}
     assert "for core, kv_fp8, chunked:" in findings["accuracy-eager"].message
-    assert "the checks of disagg run" in findings["runtime-cuda-graph-off"].message
+    assert "the checks of multimodal run" in findings["runtime-cuda-graph-off"].message
     assert not {"accuracy-eager", "runtime-cuda-graph-off"} & _rules(lint.lint_task(_GOOD))
 
 
-def test_a_placeholder_anchor_is_named(tmp_path):
+def test_a_placeholder_anchor_is_named_with_the_floor_it_implies(tmp_path):
     reference = tmp_path / "gsm8k.yaml"
     reference.write_text(yaml.safe_dump({"toy": [{"accuracy": 50.0}]}))
     task = copy.deepcopy(_GOOD)
     task["accuracy"].update(reference_yaml=str(reference), model_key="toy")
-    assert "accuracy-placeholder-anchor" in _rules(lint.lint_task(task))
+    assert _finding("accuracy-placeholder-anchor", task)
     reference.write_text(yaml.safe_dump({"toy": [{"accuracy": 93.1}]}))
-    assert "accuracy-placeholder-anchor" not in _rules(lint.lint_task(task))
+    assert _finding("accuracy-placeholder-anchor", task) is None
+    reference.write_text("# placeholder\n" + yaml.safe_dump({"toy": [{"accuracy": 95.0}]}))
+    assert "95 -> floor 93.80" in _finding("accuracy-placeholder-anchor", task).message
 
 
 def _tree(tmp_path):
@@ -200,7 +195,17 @@ def _tree(tmp_path):
     return repo
 
 
-def test_prior_art_ranks_what_shares_the_checkpoints_vocabulary(tmp_path):
+def _checkpoint(tmp_path, gib=None):
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir(parents=True)
+    (ckpt / "config.json").write_text(json.dumps(_CONFIG))
+    if gib is not None:
+        index = {"metadata": {"total_size": int(gib * 2**30)}, "weight_map": {}}
+        (ckpt / "model.safetensors.index.json").write_text(json.dumps(index))
+    return ckpt
+
+
+def test_prior_art_and_the_fmha_rule_are_read_from_the_tree(tmp_path):
     repo = _tree(tmp_path)
     found = prior_art.find_prior_art(repo, _CONFIG)
     paths = [c.path for c in found.candidates]
@@ -209,26 +214,25 @@ def test_prior_art_ranks_what_shares_the_checkpoints_vocabulary(tmp_path):
     assert not any(p.endswith("rms_norm_rows.py") for p in paths)
     kernels = next(c for c in found.candidates if c.path.endswith("kernels.py"))
     assert kernels.names == ("triton_qsa_paged_sparse_gqa",)
-
-
-def test_engine_constraints_read_the_fmha_rule_from_the_tree(tmp_path):
-    repo = _tree(tmp_path)
     notes = prior_art.engine_constraints(_CONFIG, repo)
     assert len(notes) == 1 and "head dim 192" in notes[0] and "256" in notes[0]
     assert f"{FMHA_HEADER}:1" in notes[0]
-    fits = {"text_config": {"head_dim": 128}}
-    assert prior_art.engine_constraints(fits, repo) == []
+    assert prior_art.engine_constraints({"text_config": {"head_dim": 128}}, repo) == []
 
 
-def test_lint_reports_constraints_and_prior_art_from_the_checkpoint(tmp_path):
-    repo = _tree(tmp_path)
-    checkpoint = tmp_path / "ckpt"
-    checkpoint.mkdir()
-    (checkpoint / "config.json").write_text(json.dumps(_CONFIG))
-    report = lint.lint_task(_GOOD, checkpoint=checkpoint, repo=repo)
+def test_lint_reports_constraints_and_prior_art_until_the_notes_name_the_leads(tmp_path):
+    repo, checkpoint = _tree(tmp_path), _checkpoint(tmp_path)
+    task = copy.deepcopy(_GOOD)
+    report = lint.lint_task(task, checkpoint=checkpoint, repo=repo)
     assert "engine-constraint" in _rules(report)
     text = report.render()
     assert "## Prior art in this tree" in text and "qsa_paged_sparse_gqa" in text
+    unnamed = next(f for f in report.findings if f.rule == "notes-prior-art-unnamed")
+    assert "qsa/kernels.py" in unnamed.message
+    task["notes"] += (
+        " qsa/kernels.py: paged sparse GQA. attention/qsa_paged_sparse_gqa.py: the op around it."
+    )
+    assert not _finding("notes-prior-art-unnamed", task, checkpoint=checkpoint, repo=repo)
 
 
 def test_intake_lint_cli_exits_one_while_a_finding_stands(tmp_path, capsys):
@@ -254,32 +258,14 @@ def test_notes_stay_the_runs_brief():
     assert "notes-intake-process" not in _rules(lint.lint_task(task))
 
 
-def test_a_placeholder_names_the_floor_it_implies(tmp_path):
-    reference = tmp_path / "anchor.yaml"
-    reference.write_text("# placeholder\n" + yaml.safe_dump({"toy": [{"accuracy": 95.0}]}))
+def test_a_disagg_test_not_yet_in_the_tree_is_named(tmp_path):
     task = copy.deepcopy(_GOOD)
-    task["accuracy"].update(reference_yaml=str(reference), model_key="toy")
-    finding = next(
-        f for f in lint.lint_task(task).findings if f.rule == "accuracy-placeholder-anchor"
-    )
-    assert "95 -> floor 93.80" in finding.message
-
-
-def test_a_witness_launcher_reads_only_what_the_spec_sets(tmp_path):
-    (tmp_path / "leg_b.py").write_text(
-        "import os\ndriver = os.environ.get('TOY_DRIVER')\nos.environ['MV2FLOW_WITNESS_MEMBER']\n"
-    )
-    task = copy.deepcopy(_GOOD)
-    block = {"contrast_command": "leg_b.py --fast", "contrast_env": {"TOY_LEG": "1"}}
-    task["accuracy"]["witness"] = {"enabled": True, "disagg": block}
-    findings = lint.lint_task(task, base=tmp_path).findings
-    unset = next(f for f in findings if f.rule == "witness-contrast-env")
-    assert "TOY_DRIVER" in unset.message and "MV2FLOW_" not in unset.message
-    block["contrast_env"]["TOY_DRIVER"] = "/path/to/driver.py"
-    assert "witness-contrast-env" not in _rules(lint.lint_task(task, base=tmp_path))
-    block["contrast_command"] = "not_written_yet.py"
-    pending = lint.lint_task(task, base=tmp_path)
-    assert "witness-contrast-pending" in _rules(pending) and not pending.open()
+    task["accuracy"]["disagg"] = {"test": "tests/accuracy/test_disagg.py::TestToy::test_auto_dtype"}
+    pending = lint.lint_task(task, repo=tmp_path)
+    assert "disagg-test-pending" in _rules(pending) and not pending.open()
+    (tmp_path / "tests/accuracy").mkdir(parents=True)
+    (tmp_path / "tests/accuracy/test_disagg.py").write_text("")
+    assert "disagg-test-pending" not in _rules(lint.lint_task(task, repo=tmp_path))
 
 
 def test_the_environment_can_start_the_run(tmp_path):
@@ -289,9 +275,7 @@ def test_the_environment_can_start_the_run(tmp_path):
     (zoo / "modeling_other.py").write_text(
         '@register_auto_model("OtherForCausalLM")\nclass M: ...\n'
     )
-    checkpoint = tmp_path / "ckpt"
-    checkpoint.mkdir()
-    (checkpoint / "config.json").write_text(json.dumps(_CONFIG))
+    checkpoint = _checkpoint(tmp_path)
     task = copy.deepcopy(_GOOD)
     task["environment"].update(
         container_image="/images/x.sqsh",
@@ -311,25 +295,6 @@ def test_the_environment_can_start_the_run(tmp_path):
     assert prior_art.stock_supports(repo, _CONFIG) is True
 
 
-def test_the_top_prior_art_leads_are_named_in_notes(tmp_path):
-    repo = _tree(tmp_path)
-    checkpoint = tmp_path / "ckpt"
-    checkpoint.mkdir()
-    (checkpoint / "config.json").write_text(json.dumps(_CONFIG))
-    task = copy.deepcopy(_GOOD)
-    unnamed = next(
-        f
-        for f in lint.lint_task(task, checkpoint=checkpoint, repo=repo).findings
-        if f.rule == "notes-prior-art-unnamed"
-    )
-    assert "qsa/kernels.py" in unnamed.message
-    task["notes"] += (
-        " qsa/kernels.py: paged sparse GQA. attention/qsa_paged_sparse_gqa.py: the op around it."
-    )
-    rules = _rules(lint.lint_task(task, checkpoint=checkpoint, repo=repo))
-    assert "notes-prior-art-unnamed" not in rules
-
-
 def test_rules_are_a_registry():
     def toy_rule(ctx):
         if ctx.task.get("features"):
@@ -337,7 +302,6 @@ def test_rules_are_a_registry():
 
     report = lint.lint_task(_GOOD, rules=(toy_rule,))
     assert [f.rule for f in report.findings] == ["toy-feature"]
-    assert lint.runtime_rules in lint.RULES and prior_art.fmha_head_dims in prior_art.ENGINE_RULES
 
 
 def test_planned_sessions_are_not_a_schema_block():
@@ -358,9 +322,7 @@ def test_a_kv_dtype_the_engine_refuses_is_a_block(tmp_path):
     loader.write_text('_KV_CACHE_MAP = {}\n_VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")\n')
     task = copy.deepcopy(_GOOD)
     task["variants"]["kv_bf16"] = {"llm_api_options": {"kv_cache_config": {"dtype": "bfloat16"}}}
-    finding = next(
-        f for f in lint.lint_task(task, repo=repo).findings if f.rule == "kv-cache-dtype"
-    )
+    finding = _finding("kv-cache-dtype", task, repo=repo)
     assert finding.severity == lint.BLOCK
     assert "'bfloat16' (kv_bf16)" in finding.message
     assert f"{KV_DTYPES_SOURCE}:2" in finding.message
@@ -372,17 +334,18 @@ def test_a_kv_dtype_the_engine_refuses_is_a_block(tmp_path):
 
 def test_a_requested_cell_no_check_covers_is_a_block_before_preflight_finds_it():
     task = copy.deepcopy(_GOOD)
-    task["coverage"]["accept"].remove("disagg@dep4")
-    finding = next(f for f in lint.lint_task(task).findings if f.rule == "coverage-gap")
-    assert finding.severity == lint.BLOCK and "disagg@dep4" in finding.message
-    assert "disagg@tp4" not in finding.message
+    task["coverage"]["accept"].remove("chunked@tep4")
+    finding = _finding("coverage-gap", task)
+    assert finding.severity == lint.BLOCK and "chunked@tep4" in finding.message
+    # disagg's test runs once, and a pair of features is proven only where the request names it.
+    assert "chunked@tp4" not in finding.message and "disagg@" not in finding.message
 
 
 def test_a_variant_that_boots_boots_at_every_member_of_its_unit():
     task = copy.deepcopy(_GOOD)
     for name in ("kv_fp8", "chunked"):
         del task["variants"][name]["gates"]
-    finding = next(f for f in lint.lint_task(task).findings if f.rule == "variant-boot-everywhere")
+    finding = _finding("variant-boot-everywhere", task)
     # Each variant boots at its own member and at every other member of core.
     assert "kv_fp8 (3)" in finding.message and "chunked (3)" in finding.message
     assert "6 boot checks" in finding.message
@@ -392,9 +355,9 @@ def test_a_variant_that_boots_boots_at_every_member_of_its_unit():
 def test_a_feature_is_proven_at_one_member():
     task = copy.deepcopy(_GOOD)
     task["features"] = ["disagg", "multimodal"]
-    finding = next(f for f in lint.lint_task(task).findings if f.rule == "feature-members")
+    finding = _finding("feature-members", task)
     assert "multimodal at tep4, dep4, tp4 (6 checks)" in finding.message
-    # disagg's one witness member is already one.
+    # disagg's one member is already one.
     assert "disagg" not in finding.message
     task["members"]["multimodal"] = ["dep4"]
     assert "feature-members" not in _rules(lint.lint_task(task))
@@ -405,17 +368,18 @@ def test_a_feature_is_proven_at_one_member():
 
 def test_a_feature_is_not_proven_again_under_another_axis():
     task = copy.deepcopy(_GOOD)
-    task["variants"]["disagg_kv_fp8"] = {
-        "unit": "disagg",
+    task["features"] = ["disagg", "mtp"]
+    task["members"]["mtp"] = ["dep4"]
+    task["variants"]["mtp_kv_fp8"] = {
+        "unit": "mtp",
         "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
     }
-    finding = next(f for f in lint.lint_task(task).findings if f.rule == "feature-combination")
-    assert "disagg_kv_fp8 (disagg x kv dtype: 1 check; core proves the axis in kv_fp8)" in (
-        finding.message
-    )
+    finding = _finding("feature-combination", task)
+    assert "mtp_kv_fp8 (mtp x kv dtype: " in finding.message
+    assert "core proves the axis in kv_fp8" in finding.message
     # A variant on a feature unit that changes none of the storage or scheduling axes is the
     # feature's own configuration, not a combination.
-    task["variants"]["disagg_kv_fp8"] = {"unit": "disagg", "env": {"TRTLLM_KV_TRANSFER": "1"}}
+    task["variants"]["mtp_kv_fp8"] = {"unit": "mtp", "env": {"TRTLLM_MTP_EAGER": "1"}}
     assert "feature-combination" not in _rules(lint.lint_task(task))
 
 
@@ -427,8 +391,52 @@ def test_one_variant_crossing_two_axes_is_named():
         "members": ["dep4"],
         "gates": ["accuracy"],
     }
-    finding = next(f for f in lint.lint_task(task).findings if f.rule == "variants-cross-product")
+    finding = _finding("variants-cross-product", task)
     assert "1 variant combines" in finding.message and "fp8_chunked" in finding.message
+
+
+def test_the_checkpoints_weights_are_read_from_its_index_or_its_files(tmp_path):
+    assert lint.checkpoint_weight_bytes(_checkpoint(tmp_path, 3)) == 3 * 2**30
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (bare / "model-00001.safetensors").write_bytes(b"x" * 10)
+    (bare / "model-00002.safetensors").write_bytes(b"x" * 5)
+    assert lint.checkpoint_weight_bytes(bare) == 15
+    assert lint.checkpoint_weight_bytes(tmp_path / "missing") is None
+
+
+def test_every_member_holds_one_engine_of_the_checkpoint(tmp_path):
+    task = copy.deepcopy(_GOOD)
+    task["environment"]["gpu_memory_gib"] = 80
+    # 300 GiB over 60 GiB a device (75% of 80): one engine needs 8 devices.
+    finding = _finding("member-too-narrow", task, checkpoint=_checkpoint(tmp_path, 300))
+    assert finding.message.startswith("dep4, tep4, tp4 hold one engine on fewer than 8")
+    # Unknown device memory: no estimate.
+    del task["environment"]["gpu_memory_gib"]
+    assert "member-too-narrow" not in _rules(lint.lint_task(task, checkpoint=tmp_path / "ckpt"))
+
+
+def test_the_disaggregated_test_runs_on_one_node(tmp_path):
+    task = copy.deepcopy(_GOOD)
+    task["environment"]["gpu_memory_gib"] = 288
+    # A small model: its two engines share dep4's node.
+    small = lint.lint_task(task, checkpoint=_checkpoint(tmp_path / "s", 100))
+    assert "disagg-placement" not in _rules(small)
+    # One engine of a large model takes the whole node: the test's two do not fit it.
+    finding = _finding("disagg-placement", task, checkpoint=_checkpoint(tmp_path / "l", 500))
+    assert finding.severity == lint.WARN and "runs on 4 devices of one node" in finding.message
+    assert "disagg@*" in finding.fix
+    # Past one node: the tree's launcher starts every worker on one host.
+    task["accuracy"]["disagg"] = {
+        "test": "tests/a/test_d.py::TestToy::test_auto_dtype",
+        "devices": 8,
+    }
+    finding = _finding("disagg-placement", task)
+    assert finding.severity == lint.BLOCK and "launch_disaggregated_llm" in finding.message
+    task["environment"]["sessions"] = [
+        {"name": "gates", "role": "gates", "spool": "/s/gates", "nodes": 2}
+    ]
+    assert "session-nodes-unneeded" in _rules(lint.lint_task(task))
 
 
 def test_boot_boundaries_say_where_they_run_unless_certified():
@@ -436,7 +444,7 @@ def test_boot_boundaries_say_where_they_run_unless_certified():
     task["accuracy"]["envelope"] = {"enabled": True, "probes": ["1, 2, 3, 4, 5, 6, 7,"]}
     report = lint.lint_task(task)
     finding = next(f for f in report.findings if f.rule == "envelope-on")
-    # One member of each unit the boot gates; disagg's witness boots none.
+    # One member of each unit the boot gates; disagg's test boots none.
     assert finding.severity == lint.INFO and "the boot at core@dep4 also runs" in finding.message
     assert not report.open()
     task["profile"] = "certified"

@@ -54,7 +54,9 @@ def _planned_writer(tmp_path, monkeypatch, decision="LANDED"):
 
 
 @pytest.mark.parametrize("decision", ["LANDED", "FAILED_RECEIPT"])
-def test_a_relaunch_adopts_completed_answer_from_the_same_attempt(tmp_path, monkeypatch, decision):
+def test_a_relaunch_adopts_the_same_attempts_answer_but_a_rebase_dispatches_anew(
+    tmp_path, monkeypatch, decision
+):
     task = Task(id="kernel-x", kind="kernel", goal="Verify norm/x", attempts=3, ref="7")
     wf, calls = _planned_writer(tmp_path, monkeypatch, decision)
     Graph(tasks=[replace(task, status="running")]).save(wf.workflow.workspace / "graph.yaml")
@@ -67,6 +69,12 @@ def test_a_relaunch_adopts_completed_answer_from_the_same_attempt(tmp_path, monk
     assert resumed._work_task_body(task).decision == decision
     assert not resumed_calls
     assert current_decision(wf.workflow.workspace, "kernel_writer", 7) == answer
+    # An explicit rebase requires a new dispatch, even for the same attempt.
+    rebased, rebased_calls = _planned_writer(tmp_path, monkeypatch, decision)
+    rebase = "Rebase onto the integrated dependency."
+    assert rebased._work_in_tree(task, "Worktree: test", rebase).decision == decision
+    assert len(rebased_calls) == 1 and rebase in rebased_calls[0][1]
+    assert current_decision(wf.workflow.workspace, "kernel_writer", 7) != answer
 
 
 def test_a_retry_is_told_so_and_never_handed_the_previous_attempts_decision(tmp_path, monkeypatch):
@@ -107,20 +115,3 @@ def test_failed_receipt_integrates_only_entry_changes(tmp_path, monkeypatch):
     assert "change more" in worker._land_failed_receipt(execution, item, task, "FAILED_RECEIPT")
     assert integrated == closed == [task.id]
     assert worker._land_failed_receipt(execution, item, task, "LANDED") == ""
-
-
-def test_explicit_rebase_requires_a_new_dispatch_even_for_the_same_attempt(tmp_path, monkeypatch):
-    task = Task(id="kernel-x", kind="kernel", goal="Verify norm/x", attempts=3, ref="7")
-    wf, calls = _planned_writer(tmp_path, monkeypatch)
-    Graph(tasks=[replace(task, status="running")]).save(wf.workflow.workspace / "graph.yaml")
-    assert wf._work_task_body(task).decision == "LANDED"
-    old = current_decision(wf.workflow.workspace, "kernel_writer", 7)
-    wf, calls = _planned_writer(tmp_path, monkeypatch)
-
-    assert (
-        wf._work_in_tree(task, "Worktree: test", "Rebase onto the integrated dependency.").decision
-        == "LANDED"
-    )
-    assert len(calls) == 1
-    assert "Rebase onto the integrated dependency." in calls[0][1]
-    assert current_decision(wf.workflow.workspace, "kernel_writer", 7) != old

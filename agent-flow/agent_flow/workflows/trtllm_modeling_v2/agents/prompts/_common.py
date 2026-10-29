@@ -12,22 +12,30 @@ from __future__ import annotations
 import re
 from typing import Sequence
 
+from ...operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
+
 
 def tidy(text: str) -> str:
     """Collapse the blank-line runs that composing blocks leaves behind."""
     return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
 
 
-MODELING_V2_LAYOUT = """\
+MODELING_V2_LAYOUT = f"""\
 ## ModelingV2: where things live
 
-**Read `tensorrt_llm/_torch/_experimental/modeling_v2/README.md` first**: it
+**Read `{MODELING_V2_PACKAGE}/README.md` first**: it
 is the authoritative description of routing, layout, entries and gates, and
 `catalog/_op.py` states the entry contract. The source-level gates (no GPU)
-are `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py`.
+are `{CATALOG_TESTS_DIR}/test_modeling_v2_*.py`.
 
-The existing targets are gate-verified exemplars: **copy patterns, never
-values**; every model-specific value is re-derived from this checkpoint.
+The existing targets (`{MODELING_V2_PACKAGE}/models/`,
+one directory per family) are gate-verified exemplars, and reading them is
+part of the work. Unless `source_embargo` names one, find the targets that
+already solved what your task needs (the same attention kind, MoE routing,
+sparse or recurrent state, a vision tower, the cache state that reuse,
+chunking and disaggregation depend on) before you write: call or promote
+their entries, and follow their structure and their tests. **Copy patterns,
+never values**: every model-specific value is re-derived from this checkpoint.
 """
 
 MODELING_V2_SWITCH = """\
@@ -41,16 +49,36 @@ accuracy oracle: same harness, same workload, one variable.
 """
 
 SOURCE_BOUNDARY = """\
-## Reading the engine
+## Prior art: read widely, then build on this engine
 
-TensorRT-LLM's source, the built-in model zoo included, is an ordinary read.
-**Read to understand an interface — what an op expects, what the runtime
-allocates, which metadata field a kernel reads — never to copy a structure**:
-the zoo's forward is a module tree built on helpers no entry wraps, so a copy
-of it breaks the closed vocabulary, in which every op the forward reaches
-goes through an entry. A missing op is a missing entry. The HuggingFace
-reference is the ground truth of the **math**, never the shape of target
-code. Other inference engines' code is never a source.
+Most of what a task needs has been done somewhere. Before you write it, find
+how others did it, and say in your report what you used:
+
+- **TensorRT-LLM's tests**: the unit, accuracy and perf tests show working
+  configurations, how each feature is deployed and tested, and the scores
+  they reach (the reuse rule under How you work).
+- **TensorRT-LLM's models**: the ModelingV2 targets and the built-in models
+  (the modules that call `register_auto_model`): how a model of this family
+  is wired, loads its weights, binds its cache state, takes multimodal input
+  and speculates.
+- **Kernel libraries**: the engine's own ops, FlashInfer, CUTLASS: the kernels
+  the sourcing ladder reuses before anything is written.
+
+`tree_map.md` in the workspace says where each part of this tree is in the
+checkout under test. A path you were given that is not there has moved: find
+what it defined by name (`git grep`), and trust the tree over any prompt.
+- **Other inference engines** (vLLM, SGLang, ...), from a checkout, an
+  installed package or the web where you have one: often the first to serve
+  a new architecture, so their model, kernel and deployment code is a map of
+  its ops, layouts and feature choices.
+
+What you take lands on this engine's terms. The target's forward calls
+catalog entries, so an op another implementation calls is an entry to reuse,
+wrap or write (the sourcing ladder), not code pasted into the forward. Code
+you adapt keeps its license header and names its origin. Values come from
+this checkpoint. The HuggingFace reference stays the ground truth of the
+math the gates judge: another implementation shows how, never what is
+correct. Paths in `source_embargo` stay unread.
 """
 
 EVIDENCE_DISCIPLINE = """\
@@ -163,9 +191,10 @@ def source_embargo_block(paths: Sequence[str]) -> str:
         "from them would prove nothing about whether this pipeline can derive one.\n"
         "\n" + "\n\n".join(running) + "\n"
         "\n"
-        "Your references are the checkpoint itself (`config.json`, the weight index, "
-        "the quantization config) and the HuggingFace `transformers` implementation of "
-        "this architecture. Both are outside the embargo.\n"
+        "Everything not listed stays open, and you are expected to use it: the "
+        "checkpoint itself, the HuggingFace `transformers` implementation of this "
+        "architecture, this tree's targets, models and tests, kernel libraries and other "
+        "engines' implementations (Prior art).\n"
     )
 
 

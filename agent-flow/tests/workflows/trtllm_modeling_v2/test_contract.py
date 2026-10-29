@@ -31,43 +31,38 @@ def test_reference_table_at_checkout_root_is_a_whole_file_gate_input(tmp_path):
     assert "x.yaml" in gate_inputs(_TASK, tmp_path)
 
 
-def test_every_unit_owes_boot_and_accuracy_at_every_member():
+def test_every_unit_owes_boot_and_accuracy_at_every_member_and_features_their_proof():
     contract = c.compile_contract(_TASK, world_size=4)
     inner = _keys(contract, c.TIER_INNER)
     for unit in ("core", "mtp", "host_offload"):
         for member in ("tp4", "dep4"):
             assert f"{unit}:boot@{member}" in inner
             assert f"{unit}:accuracy[gsm8k]@{member}" in inner
-
-
-def _with_accuracy(**blocks):
-    return {**_TASK, "accuracy": {**_TASK["accuracy"], **blocks}}
-
-
-def test_feature_proofs_follow_the_units_that_need_them():
-    proof = _keys(c.compile_contract(_TASK, world_size=4), c.TIER_PROOF)
+    proof = _keys(contract, c.TIER_PROOF)
     # The speculator's acceptance gate runs from its own unit on, never in core.
     assert "mtp:acceptance@tp4" in proof
     assert "host_offload:acceptance@tp4" in proof
     assert not [k for k in proof if k.startswith("core:acceptance")]
-    # Witnesses are off by default; on, the unit that needs one owes it.
-    assert not [k for k in proof if "residency" in k]
-    on = _with_accuracy(witness={"enabled": True})
-    assert "host_offload:residency@dep4" in _keys(
-        c.compile_contract(on, world_size=4), c.TIER_PROOF
-    )
 
 
-def test_with_the_logit_gate_a_units_benchmark_runs_at_one_member():
+def test_a_benchmark_runs_where_the_spec_names_and_a_variants_at_one_member():
     task = {
-        **_with_accuracy(logits={"reference": "/refs/logits.reference.json.gz"}),
+        **_TASK,
+        "accuracy": {**_TASK["accuracy"], "benchmark_members": "tep4"},
         "members": ["tp4", "tep4", "dep4"],
         "features": [],
     }
     keys = _keys(c.compile_contract(task, world_size=4))
-    # Attention DP is what the logit gate sees least; it proves the other members.
-    assert [k for k in keys if "accuracy" in k] == ["core:accuracy[gsm8k]@dep4"]
-    assert {"core:logits@tp4", "core:logits@tep4", "core:boot@tp4", "core:boot@tep4"} <= set(keys)
+    assert [k for k in keys if "accuracy" in k] == ["core:accuracy[gsm8k]@tep4"]
+    assert {"core:boot@tp4", "core:boot@tep4", "core:boot@dep4"} <= set(keys)
+    # A variant boots everywhere; its benchmark prefers attention DP, the most paths.
+    task = {**_TASK, "features": [], "variants": {"kv_fp8": {"unit": "core"}}}
+    keys = _keys(c.compile_contract(task, world_size=4))
+    assert [k for k in keys if k.startswith("kv_fp8:")] == [
+        "kv_fp8:boot@dep4",
+        "kv_fp8:boot@tp4",
+        "kv_fp8:accuracy[gsm8k]@dep4",
+    ]
 
 
 def test_the_profile_and_the_hop_decide_what_a_unit_owes():
@@ -82,28 +77,16 @@ def test_the_profile_and_the_hop_decide_what_a_unit_owes():
         "multimodal:boot@dep4",
         "multimodal:boot@tp4",
     ]
-    # Disaggregation's boot and accuracy would run an aggregated engine: the witness proves it.
-    assert sorted(k for k in keys if k.startswith("disagg")) == [
-        "disagg:equivalence@dep4",
-        "disagg:equivalence@tp4",
-        "disagg_kv_fp8:equivalence@dep4",
-        "disagg_kv_fp8:equivalence@tp4",
-    ]
+    # Disaggregation's boot and accuracy would run an aggregated engine: its own
+    # test proves it, once; a variant of it owes nothing, its axis proven on core.
+    assert [k for k in keys if k.startswith("disagg")] == ["disagg:disagg@dep4"]
 
 
 def _result(name, member, passed=True):
     return SimpleNamespace(name=name, member=member, passed=passed, detail="d", tree_state="t")
 
 
-def test_status_survives_a_new_process_and_the_latest_verdict_counts(tmp_path):
-    status = c.ContractStatus.load(tmp_path)
-    status.record("core", _result("boot", "tp1", passed=False))
-    status.record("core", _result("boot", "tp1", passed=True))
-    reloaded = c.ContractStatus.load(tmp_path)
-    assert reloaded.latest()["core:boot@tp1"].passed
-
-
-def test_evaluation_names_what_failed_and_what_never_ran(tmp_path):
+def test_evaluation_names_what_failed_never_ran_or_ran_on_an_earlier_target(tmp_path):
     task = {
         "checkpoint_path": "/ckpt/m",
         "parallel": "tp1",
@@ -117,22 +100,17 @@ def test_evaluation_names_what_failed_and_what_never_ran(tmp_path):
     contract = c.compile_contract(task, world_size=1)
     assert _keys(contract) == ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]
     status = c.ContractStatus.load(tmp_path)
-    status.record("core", _result("boot", "tp1"))
-    evaluation = c.evaluate(contract, status)
+    status.record("core", _result("boot", "tp1"), marker="v1")
+    evaluation = c.evaluate(contract, status, marker="v1")
     assert not evaluation.holds
     assert "MISSING core:accuracy[gsm8k]@tp1" in evaluation.render()
-    status.record("core", _result("accuracy[gsm8k]", "tp1", passed=False))
-    assert "FAILED core:accuracy[gsm8k]@tp1" in c.evaluate(contract, status).render()
-    status.record("core", _result("accuracy[gsm8k]", "tp1"))
-    assert c.evaluate(contract, status).holds
-
-
-def test_a_verdict_on_an_earlier_target_is_stale(tmp_path):
-    contract = c.Contract(checks=(c.Check("core", "boot", "tp1", c.TIER_INNER),))
-    status = c.ContractStatus.load(tmp_path)
-    status.record("core", _result("boot", "tp1"), marker="v1")
-    assert c.evaluate(contract, status, marker="v1").holds
-    assert "MISSING core:boot@tp1" in c.evaluate(contract, status, marker="v2").render()
+    status.record("core", _result("accuracy[gsm8k]", "tp1", passed=False), marker="v1")
+    assert "FAILED core:accuracy[gsm8k]@tp1" in c.evaluate(contract, status, marker="v1").render()
+    status.record("core", _result("accuracy[gsm8k]", "tp1"), marker="v1")
+    # The latest verdict counts, and survives a new process.
+    reloaded = c.ContractStatus.load(tmp_path)
+    assert c.evaluate(contract, reloaded, marker="v1").holds
+    assert "MISSING core:boot@tp1" in c.evaluate(contract, reloaded, marker="v2").render()
 
 
 #: Three units; mtp and multimodal are gated on the same MTP options file and
@@ -156,7 +134,7 @@ _SHARED = {
 }
 
 
-def test_a_pass_on_this_target_holds_for_every_equivalent_check(tmp_path):
+def test_a_pass_on_this_target_holds_for_every_equivalent_check_and_a_failure_for_none(tmp_path):
     contract = c.compile_contract(_SHARED, world_size=4)
     status = c.ContractStatus.load(tmp_path)
     status.record("mtp", _result("accuracy[gsm8k]", "tp1"), marker="tree:1")
@@ -177,15 +155,29 @@ def test_a_pass_on_this_target_holds_for_every_equivalent_check(tmp_path):
     assert "multimodal:accuracy[gsm8k]@tp1" in {check.key for check in later.missing}
     assert not later.shared
 
-
-def test_a_failure_is_not_shared_and_a_check_that_failed_here_stays_failed(tmp_path):
-    contract = c.compile_contract(_SHARED, world_size=4)
-    status = c.ContractStatus.load(tmp_path)
-    status.record("mtp", _result("accuracy[gsm8k]", "tp1", passed=False), marker="tree:1")
-    evaluation = c.evaluate(contract, status, marker="tree:1")
+    # A failure is not shared, and a check that failed here stays failed.
+    status.record("mtp", _result("accuracy[gsm8k]", "tp1", passed=False), marker="tree:3")
+    evaluation = c.evaluate(contract, status, marker="tree:3")
     assert "multimodal:accuracy[gsm8k]@tp1" in {check.key for check in evaluation.missing}
-
-    status.record("multimodal", _result("accuracy[gsm8k]", "tp1"), marker="tree:1")
-    evaluation = c.evaluate(contract, status, marker="tree:1")
+    status.record("multimodal", _result("accuracy[gsm8k]", "tp1"), marker="tree:3")
+    evaluation = c.evaluate(contract, status, marker="tree:3")
     assert "mtp:accuracy[gsm8k]@tp1" in {check.key for check, _ in evaluation.failed}
     assert not evaluation.shared
+
+
+def test_a_relative_variants_benchmark_comes_after_its_units_whose_score_is_kept(tmp_path):
+    fp8 = {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}, "gates": ["accuracy"]}
+    task = {
+        **_TASK,
+        "features": [],
+        "variants": {"kv_fp8": fp8, "kv_row": {**fp8, "accuracy": {"discriminators": {"x": 1}}}},
+    }
+    checks = {k.key: k for k in c.compile_contract(task, world_size=4).checks}
+    assert checks["kv_fp8:accuracy[gsm8k]@dep4"].after == "core:accuracy[gsm8k]@dep4"
+    assert checks["kv_row:accuracy[gsm8k]@dep4"].after == ""
+    status = c.ContractStatus.load(tmp_path)
+    result = SimpleNamespace(name="accuracy[gsm8k]", member="dep4", passed=False, detail="d")
+    status.record("core", SimpleNamespace(**vars(result), measured=88.5), marker="m1")
+    again = c.ContractStatus.load(tmp_path)
+    assert c.verdict_on(again, "core:accuracy[gsm8k]@dep4", "m1").measured == 88.5
+    assert c.verdict_on(again, "core:accuracy[gsm8k]@dep4", "m2") is None

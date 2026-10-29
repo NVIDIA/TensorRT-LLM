@@ -32,7 +32,7 @@ MODE_OFF = "off"
 #: Turns on each target's first-forward step-contract check
 #: (each target's ``_check_step_contract``, which calls its ``step_args``):
 #: a renamed metadata field then fails the gate loudly instead of computing a
-#: wrong answer. Off in a served engine; every gate and witness run sets it, as
+#: wrong answer. Off in a served engine; every gate run sets it, as
 #: the in-tree modeling_v2 accuracy tests do.
 STEP_CONTRACT_ENV = "TRTLLM_MODELING_V2_VALIDATE"
 

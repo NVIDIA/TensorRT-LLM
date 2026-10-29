@@ -15,11 +15,11 @@ from agent_flow.workflows.trtllm_modeling_v2.tune.records import (
     NoiseFloor,
     compare,
 )
-from agent_flow.workflows.trtllm_modeling_v2.tune.spec import TuneSpec
 from agent_flow.workflows.trtllm_modeling_v2.tune.split import SPLIT, classify, judge_variant
 from agent_flow.workflows.trtllm_modeling_v2.tune.stage import TuneStage
 
-from .test_tune_stage import FakeRunner, _contract, _git, _repo
+from .test_tune_stage import FakeRunner, _git
+from .test_tune_wall_budget import _campaign as _spec
 
 #: The members of a campaign over parallel modes: their LLM-API config and concurrencies.
 MEMBERS = {
@@ -112,26 +112,8 @@ def _effect(config, tree):
     return lat, thr
 
 
-def _campaign(tmp_path: Path, variant_text: str, **campaign):
-    repo = _repo(tmp_path)
-    identity = tmp_path / "identity.yaml"
-    identity.write_text(yaml.safe_dump({"modeling_v2": "require"}))
-    task = {
-        "trtllm_repo_path": str(repo),
-        "checkpoint_path": "/ckpt",
-        **_contract(tmp_path),
-        "perf": {
-            "identity_configs": [str(identity)],
-            "workload": {"isl": 8192, "osl": 1024, "concurrency": [1, 128]},
-            "spools": ["s1"],
-            "env_script": "/env.sh",
-            "reference": "none",
-            "sol": {"enabled": False},
-            "campaign": {"max_parallel_tuners": 1, "kernel_ledger": "off", "max_roadmaps": 1,
-                         **campaign},
-        },
-    }  # fmt: skip
-    spec = TuneSpec.from_task(task, tmp_path / "ws", target="t/")
+def _campaign(tmp_path: Path, variant_text: str):
+    spec = _spec(tmp_path, max_roadmaps=1)
     turns: list[str] = []
 
     def dispatch(role, what, prompt):
@@ -159,7 +141,7 @@ def _campaign(tmp_path: Path, variant_text: str, **campaign):
         return ""
 
     log: list[str] = []
-    state: dict = {"phase": "campaign", "noise_spread": {}, "noise_samples": 0}
+    state: dict = {"phase": "campaign"}
     stage = TuneStage(spec, state, dispatch=dispatch, checkpoint=lambda: None,
                       runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect),
                       poll_s=0, log=log.append)  # fmt: skip

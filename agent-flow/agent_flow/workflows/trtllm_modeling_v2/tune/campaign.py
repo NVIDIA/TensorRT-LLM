@@ -1,10 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One measured A/B verification, then the correctness keep gate.
+"""One measured A/B verification per candidate; correctness and e2e every few keeps.
 
 Isolated changes use a micro/module harness; system-wide changes use serving.
 Verification and keeps are serialized while tuner turns remain parallel, avoiding
-stale-stack remeasurements. The stage validates cumulative e2e at wrap-up.
+stale-stack remeasurements. The campaign is built to move fast, its accuracy watch loose.
+
+An isolated change is judged on the e2e gain its micro-bench projects: each case's local
+speedup scaled by the share of each perf point's step its kernels take (``microbench.share``,
+from the roadmap's profile; :func:`project`). Its outputs must stay roughly with the
+control's (``microbench.diverged``). A win keeps at once, with no gate.
+
+Every few keeps (or once the projected gain since the last piles up) a checkpoint measures
+the best tree against the last one that held: e2e on one perf host, the first output
+token's distribution (``logits_check``) and the target's suite. A loss on any of them rolls
+the keeps since back; a gain under the projection scales the projections that follow. The
+stage validates cumulative e2e at wrap-up and runs the accuracy gate once, on the final tree.
+
+Every finished candidate is a result for the turns after it: its verdict, the numbers the
+stage measured and the turn's own ``findings`` go into the attempts digest (``attempts.py``),
+and a failure its turn can fix (:func:`revisable`) is asked of that turn once more.
 """
 
 from __future__ import annotations
@@ -15,22 +30,33 @@ import shlex
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 import yaml
 
 from ..agents.decisions import names as decision_names
 from ..infra.compute.spoolctl import SpoolError
 from ..infra.git import add_worktree, git_checked, link_native
+from . import logits_check
 from .harness import microbench
 from .inert import inert_members
-from .keep_gate import ERROR, FAIL, KEEP_FILE, PART_FILE, PASS, KeepGate
+from .keep_gate import ERROR, FAIL, KEEP_FILE, PART_FILE, PASS, UNMEASURED_RCS, KeepGate
 from .measure import BenchSpec, SpoolRunner, load_measurement, spool_host, validate_measurement
-from .records import TTFT_TOLERANCE, Comparison, Measurement, NoiseFloor, PerfLedger, compare
+from .records import (
+    TTFT_TOLERANCE,
+    Comparison,
+    Measurement,
+    NoiseFloor,
+    PerfLedger,
+    compare,
+    site_of,
+)
 from .split import MIXED, SPLIT, classify, judge_variant
 
 TUNER_DECISIONS = decision_names("tuner")
 SYSTEM_KINDS = {"host", "overlap", "serving", "communication", "collective"}
+#: A failure no turn can fix: the hosts, not the change.
+_NOT_THE_CHANGE = ("different hosts", "host left", "best tree moved", "wrong-tree receipt")
 
 
 @dataclass
@@ -55,9 +81,17 @@ class CandidateState:
     split: dict = field(default_factory=dict)
     variant_of: str = ""
     changed_members: list[str] = field(default_factory=list)
+    #: Perf point -> the e2e gain the micro-bench projects there (:func:`project`).
+    projected: dict = field(default_factory=dict)
     path_marker: str = ""
     controls: list[str] = field(default_factory=list)
     inert: dict = field(default_factory=dict)
+    kind: str = ""
+    hypothesis: str = ""
+    #: The turn's ``findings``: ``[{what, evidence, next}]``, what it learned for the turns after it.
+    findings: list = field(default_factory=list)
+    #: Revise turns asked of it (:func:`revisable`): one at most.
+    revisions: int = 0
 
 
 @dataclass
@@ -69,6 +103,12 @@ class CampaignState:
     kept: list[str] = field(default_factory=list)
     # One reusable serving control per best revision and host.
     controls: dict[str, str] = field(default_factory=dict)
+    #: The cumulative e2e checkpoint: ``good`` (the last commit that held), ``since`` (the keeps
+    #: after it), ``projected`` (their compounded projection per point), and while it measures
+    #: ``spool``, ``control`` and ``label``.
+    checkpoint: dict = field(default_factory=dict)
+    #: Measured over projected gain at the last checkpoint (at most 1): scales projections.
+    calibration: float = 1.0
 
     @classmethod
     def load(cls, path: Path) -> "CampaignState":
@@ -93,6 +133,86 @@ class CampaignState:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(asdict(self), indent=2) + "\n")
         tmp.replace(path)
+
+
+def perf_points(bench: BenchSpec) -> list[str]:
+    """The perf points a measurement reports: ``con<c>``, or ``<config>.con<c>`` over several."""
+    if bench.parts:
+        return [f"{part.name}.con{c}" for part in bench.parts for c in part.concurrencies]
+    return [f"con{c}" for c in bench.concurrencies]
+
+
+def project(
+    speedups: Mapping[str, float],
+    share: Mapping[str, Mapping[str, float]],
+    calibration: float = 1.0,
+) -> dict[str, float]:
+    """Each perf point's projected e2e gain from the cases' local speedups and their step shares.
+
+    A case whose kernels take ``f`` of a point's step and run ``1 + s`` times as fast saves
+    ``f * (1 - 1/(1 + s))`` of that step; the point then runs ``1/(1 - saved) - 1`` faster.
+    The shares are of the exposed (critical-path) time: overlapped work saves nothing.
+    """
+    saved: dict[str, float] = {}
+    for case, points in share.items():
+        s = float(speedups.get(case, 0.0))
+        for point, fraction in points.items():
+            saved[point] = saved.get(point, 0.0) + float(fraction) * (1 - 1 / (1 + s))
+    return {point: calibration * (1 / (1 - v) - 1) for point, v in saved.items()}
+
+
+def _compound(a: Mapping[str, float], b: Mapping[str, float]) -> dict[str, float]:
+    """Two gains per point, one after the other."""
+    return {p: (1 + a.get(p, 0.0)) * (1 + b.get(p, 0.0)) - 1 for p in {*a, *b}}
+
+
+def _share_problems(share: object, cases: Sequence[str], points: Sequence[str]) -> str:
+    """Why ``microbench.share`` cannot scale the micro-bench to e2e; ``""`` when it can."""
+    if not isinstance(share, Mapping) or not share:
+        return "microbench.share names no case's share of a perf point's step"
+    totals: dict[str, float] = {}
+    for case, row in share.items():
+        if case not in cases or not isinstance(row, Mapping) or not row:
+            return f"microbench.share: {case!r} is no declared case with a share per perf point"
+        for point, fraction in row.items():
+            if point not in points:
+                return f"microbench.share.{case}: {point!r} is not one of {list(points)}"
+            if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                return f"microbench.share.{case}.{point}: a fraction"
+            if not 0 <= fraction <= 1:
+                return f"microbench.share.{case}.{point}: a fraction in [0, 1]"
+            totals[point] = totals.get(point, 0.0) + float(fraction)
+    over = [p for p, total in totals.items() if total > 1]
+    if over:
+        return f"microbench.share: the cases take more than the whole step at {', '.join(over)}"
+    if not any(totals.values()):
+        return "microbench.share: every share is 0, so no gain can be projected"
+    return ""
+
+
+def read_findings(value: object) -> list[dict]:
+    """A decision's ``findings``, as text: at most eight, each field at most 400 characters."""
+    rows = value if isinstance(value, list) else []
+    return [
+        {k: str(row.get(k) or "").strip()[:400] for k in ("what", "evidence", "next")}
+        for row in rows[:8]
+        if isinstance(row, Mapping) and str(row.get("what") or "").strip()
+    ]
+
+
+def revisable(st: CandidateState) -> bool:
+    """A failure the candidate's own turn can fix, given the stage's verdict.
+
+    A local A/B that lost (slower somewhere, or outputs off the control's), or a candidate
+    the stage could not run (its share, scope, commits or harness). Not a measured "no gain",
+    a checkpoint's rollback (no single cause), a serving loss (that is a split), the turn's
+    own DROPPED/BLOCKED, or the hosts' failure.
+    """
+    if st.revisions or st.variant_of or st.scope == "e2e" or st.decision != "CANDIDATE":
+        return False
+    if st.status == "reverted":
+        return st.verdict == "LOSS" and not st.reason.startswith("the checkpoint at")
+    return st.status == "blocked" and not any(s in st.reason for s in _NOT_THE_CHANGE)
 
 
 def read_decision(path: Path) -> dict:
@@ -123,6 +243,12 @@ class Campaign:
         branch_prefix: str = "tune",
         log: Callable[[str], None] = print,
         split_variants: bool = True,
+        min_projected_gain: float = 0.005,
+        micro_noise: float = 0.02,
+        module_tolerance: float = microbench.ROUGH_TOLERANCE,
+        logits: logits_check.LogitsCheck | None = None,
+        checkpoint_keeps: int = 3,
+        checkpoint_gain: float = 0.05,
     ) -> None:
         self.workdir, self.repo, self.bp = workdir, repo, branch_prefix
         self.bench, self.base_configs = bench, list(base_configs)
@@ -134,6 +260,11 @@ class Campaign:
             ttft_tolerance,
         )
         self.split_variants, self.log = split_variants, log
+        self.min_projected_gain, self.micro_noise = min_projected_gain, micro_noise
+        self.module_tolerance = module_tolerance
+        self.logits = logits or logits_check.LogitsCheck()
+        self.checkpoint_keeps, self.checkpoint_gain = checkpoint_keeps, checkpoint_gain
+        self.points = perf_points(bench)
         self.data = workdir / "data"
         self.data.mkdir(parents=True, exist_ok=True)
         self.state_path = workdir / "campaign_state.json"
@@ -148,8 +279,13 @@ class Campaign:
             elif st.status == "micro":
                 for side in ("control", "candidate"):
                     self.perf.adopt(self._micro_label(st, side))
-            elif st.status == "gate" and st.eval_tree:
-                self._adopt_gate(self._gate_key(st))
+        ck = self.state.checkpoint
+        if ck.get("label"):
+            for label in (ck.get("control"), ck["label"]):
+                self.perf.adopt(label)
+            for commit in (ck["good"], self.state.best_commit):
+                self.gates.adopt(f"logits-{commit[:10]}")
+            self._adopt_gate(f"ckpt-{self.state.best_commit[:10]}", self.keep_gate.tests_only())
 
     def _control_key(self, host: str) -> str:
         return f"{self.state.best_commit}|{host}"
@@ -180,6 +316,10 @@ class Campaign:
         st.path_marker = str(data.get("path_marker") or "").strip()
         st.scope = str(data.get("perf_scope") or "micro")
         st.microbench = dict(data.get("microbench") or {})
+        st.kind = str(data.get("kind") or "")
+        st.hypothesis = str(data.get("hypothesis") or "").strip()[:600]
+        st.findings = read_findings(data.get("findings"))
+        st.verdict = ""
         self.ledger.append(
             "tuner_decision",
             slug=slug,
@@ -190,6 +330,7 @@ class Campaign:
             projection=data.get("projection"),
             sources=data.get("sources"),
             perf_scope=st.scope,
+            findings=st.findings,
         )
         if st.decision != "CANDIDATE":
             st.status = {"DROPPED": "dropped", "BLOCKED": "blocked"}[st.decision]
@@ -229,6 +370,9 @@ class Campaign:
                         raise ValueError(
                             "microbench requires an absolute script and unique nonempty case names"
                         )
+                    problem = _share_problems(st.microbench.get("share"), cases, self.points)
+                    if problem:
+                        raise ValueError(f"{problem}: the micro-bench cannot be scaled to e2e")
                     st.microbench["sha256"] = hashlib.sha256(script.read_bytes()).hexdigest()
                     st.status = "ready"
                 except (KeyError, OSError, TypeError, ValueError) as exc:
@@ -297,13 +441,13 @@ class Campaign:
     def _gate_dir(self, key: str) -> Path:
         return self.workdir / "gates" / key
 
-    def _adopt_gate(self, key: str) -> None:
-        for part in self.keep_gate.parts():
+    def _adopt_gate(self, key: str, gate: KeepGate) -> None:
+        for part in gate.parts():
             if not (self._gate_dir(key) / part / PART_FILE).exists():
                 self.gates.adopt(f"gate-{key}-{part}")
 
-    def _cancel_gate(self, key: str) -> bool:
-        return any([self.gates.cancel(f"gate-{key}-{part}") for part in self.keep_gate.parts()])
+    def _cancel_gate(self, key: str, gate: KeepGate) -> bool:
+        return any([self.gates.cancel(f"gate-{key}-{part}") for part in gate.parts()])
 
     @staticmethod
     def _write(path: Path, data: dict) -> dict:
@@ -323,12 +467,11 @@ class Campaign:
         )
         return True
 
-    def _gate(self, key: str, tree: Path) -> dict | None:
-        """Run every correctness part on the stacked tree; only all PASS permits a keep."""
+    def _gate(self, key: str, tree: Path, gate: KeepGate) -> dict | None:
+        """Run every correctness part of ``gate`` on the tree; only all PASS permits a keep."""
         out = self._gate_dir(key)
         if (out / KEEP_FILE).exists():
             return json.loads((out / KEEP_FILE).read_text())
-        gate = self.keep_gate
         parts: dict[str, dict] = {}
         todo: list[str] = []
         running = False
@@ -387,7 +530,7 @@ class Campaign:
         if running and not failed:
             return None
         if running:
-            self._cancel_gate(key)
+            self._cancel_gate(key, gate)
         verdict = self._write(out / KEEP_FILE, gate.verdict(parts, tree))
         self.log(f"[campaign] gate {key}: {verdict['verdict']} {verdict['reason'][:400]}")
         return verdict
@@ -399,6 +542,11 @@ class Campaign:
             (st for st in self.state.candidates.values() if st.status in ("micro", "e2e", "gate")),
             None,
         )
+        if active is None and self._checkpoint_due():
+            # Verification is serialized: the checkpoint measures before the next candidate.
+            self._checkpoint(done)
+            self.state.save(self.state_path)
+            return True
         if active is None:
             active = next(
                 (st for st in self.state.candidates.values() if st.status == "ready"), None
@@ -413,19 +561,10 @@ class Campaign:
             elif active.status == "e2e":
                 self._e2e(active, done)
             if active.status == "gate":
-                gate = self._gate(self._gate_key(active), Path(active.eval_tree))
-                if gate is not None:
-                    active.gate = gate
-                    self.ledger.append("candidate_gate", slug=active.slug, **gate)
-                    if gate["verdict"] == PASS:
-                        self._keep(active)
-                    else:
-                        active.status, active.reason = (
-                            "reverted",
-                            f"keep gate {gate['verdict']}: {gate['reason']}",
-                        )
+                # Correctness is the next checkpoint's: a win keeps at once.
+                self._keep(active)
         self.state.save(self.state_path)
-        return any(
+        return self._checkpoint_due() or any(
             st.status in ("ready", "micro", "e2e", "gate") for st in self.state.candidates.values()
         )
 
@@ -440,6 +579,7 @@ class Campaign:
         ):
             label = self._micro_label(st, side)
             path = self.data / label / "result.json"
+            outputs = self.data / label / "outputs.pt"
             if self.perf.queued(label):
                 return
             receipt = self.data / label / "receipt.json"
@@ -495,7 +635,12 @@ class Campaign:
                 commit,
                 "--harness-sha256",
                 st.microbench["sha256"],
+                "--outputs",
+                str(outputs),
             ]
+            if side == "candidate":
+                control = self.data / self._micro_label(st, "control") / "outputs.pt"
+                args += ["--reference", str(control)]
             command = f"source {shlex.quote(self.bench.env_script)}\n" + shlex.join(args)
             self.perf.submit(spool, label, command, tree=tree, wall=self.bench.wall)
             return
@@ -505,20 +650,37 @@ class Campaign:
         st.deltas = microbench.deltas(
             results["candidate"]["latency_us"], results["control"]["latency_us"]
         )
-        threshold = max(self.min_gain, self.noise_factor * NoiseFloor().default)
-        st.verdict = (
-            "LOSS"
-            if any(v <= -threshold for v in st.deltas.values())
-            else "WIN"
-            if any(v >= threshold for v in st.deltas.values())
-            else "NEUTRAL"
+        # A local speedup inside the micro-bench's own noise counts as none.
+        speedups = {
+            key.removesuffix(".speedup"): (v if abs(v) >= self.micro_noise else 0.0)
+            for key, v in st.deltas.items()
+        }
+        st.projected = project(speedups, st.microbench["share"], self.state.calibration)
+        wrong = microbench.diverged(
+            results["candidate"].get("numerics") or {}, self.module_tolerance
         )
-        st.reason = f"{st.scope} A/B, assumed noise band {threshold:.1%}; no e2e claim"
+        floor = self.min_projected_gain
+        if wrong:
+            st.verdict, st.reason = "LOSS", f"its outputs left the control's: {wrong}"
+        else:
+            st.verdict = (
+                "LOSS"
+                if any(v <= -floor for v in st.projected.values())
+                else "WIN"
+                if any(v >= floor for v in st.projected.values())
+                else "NEUTRAL"
+            )
+            shown = ", ".join(f"{p} {v:+.2%}" for p, v in sorted(st.projected.items()))
+            st.reason = (
+                f"{st.scope} A/B projects {shown} e2e (keep at {floor:.1%}; micro noise "
+                f"{self.micro_noise:.0%}, calibration {self.state.calibration:.2f})"
+            )
         self.ledger.append(
             "candidate_microbench",
             slug=st.slug,
             verdict=st.verdict,
             deltas=st.deltas,
+            projected=st.projected,
             evidence=results,
             reason=st.reason,
         )
@@ -708,6 +870,13 @@ class Campaign:
         st.status = "kept"
         self.state.best_commit = self._best_head()
         self.state.kept.append(st.slug)
+        ck = self.state.checkpoint
+        ck.setdefault("good", before)
+        ck["since"] = [*ck.get("since", []), st.slug]
+        if st.scope == "e2e":
+            ck["measured"] = True  # served already: the checkpoint calibrates nothing on it
+        else:
+            ck["projected"] = _compound(ck.get("projected") or {}, st.projected)
         if st.scope == "e2e":
             self.set_control(self.data / st.e2e_label)
         self.ledger.append(
@@ -717,8 +886,235 @@ class Campaign:
             best=self.state.best_commit,
             deltas=st.deltas,
             perf_scope=st.scope,
-            gate=st.gate,
-            ungated=bool(st.gate.get("ungated")),
+            projected=st.projected,
         )
-        ungated = " (UNGATED: perf.campaign.accuracy.gate is off)" if st.gate.get("ungated") else ""
-        self.log(f"[campaign] KEEP {st.slug} -> tune/best {self.state.best_commit[:10]}{ungated}")
+        self.log(
+            f"[campaign] KEEP {st.slug} -> tune/best {self.state.best_commit[:10]} "
+            "(correctness and e2e at the next checkpoint)"
+        )
+
+    # -------------------------------------------------------- cumulative e2e
+    def _checkpoint_due(self) -> bool:
+        """A checkpoint is measuring, or enough keeps (or projected gain) piled up since one."""
+        ck = self.state.checkpoint
+        if ck.get("label"):
+            return True
+        since = len(ck.get("since") or ())
+        if "retry_after" in ck:  # the last one measured nothing: after more keeps
+            return since >= ck["retry_after"]
+        projected = max((ck.get("projected") or {}).values(), default=0.0)
+        return since > 0 and (since >= self.checkpoint_keeps or projected >= self.checkpoint_gain)
+
+    def _tree_at(self, commit: str) -> Path:
+        """A worktree at ``commit``: the best tree when it is there, else the checkpoint's own."""
+        if commit == self.state.best_commit:
+            return Path(self.state.best_tree)
+        tree = Path(self.state.best_tree).parent / "checkpoint-good"
+        branch = f"{self.bp}/checkpoint-good"
+        if (tree / ".git").exists():
+            git_checked(tree, "checkout", "-q", "-f", "-B", branch, commit)
+        else:
+            add_worktree(self.repo, tree, "-B", branch, str(tree), commit)
+        link_native(self.repo, tree)
+        return tree
+
+    def _logits(self, commit: str) -> dict | str | None:
+        """``commit``'s first-token top-k per prompt; an error; ``None`` while it is served."""
+        job = f"logits-{commit[:10]}"
+        cached = self.data / job / "first_tokens.json"
+        if cached.exists():
+            rows = json.loads(cached.read_text())
+            return {key: {int(tok): lp for tok, lp in row.items()} for key, row in rows.items()}
+        if self.gates.queued(job):
+            return None
+        if job in self._gate_done:
+            rc = self._gate_done.pop(job)
+            output, _ = self.gates.output(job)
+            rows = logits_check.first_tokens(output)
+            if rc != 0 or not rows:
+                why = f"{job}: rc {rc}, {len(rows)} of {len(self.logits.prompts)} prompts answered"
+                return f"{'ERROR' if rc in UNMEASURED_RCS else 'FAIL'} {why}"
+            self._write(
+                cached, {key: {str(t): lp for t, lp in row.items()} for key, row in rows.items()}
+            )
+            return rows
+        tree = self._tree_at(commit)
+        script = self.keep_gate.logits_job(self.logits, tree, self.data / job)
+        spool = self.gates.place(script.gpus, script.wall)
+        if spool is not None:
+            self.gates.submit(
+                spool, job, script.script, wall=script.wall, tree=str(tree), gpus=str(script.gpus)
+            )
+        return None
+
+    def _correct(self, good: str, best: str) -> tuple[str, str] | None:
+        """The best tree's correctness at a checkpoint, ``(PASS|FAIL|ERROR, why)``; ``None`` meanwhile.
+
+        The target's suite, and its first output tokens held to the last tree that held.
+        """
+        tests = self._gate(
+            f"ckpt-{best[:10]}", Path(self.state.best_tree), self.keep_gate.tests_only()
+        )
+        if self.keep_gate.ungated:
+            logits = (PASS, "no logits check (perf.campaign.accuracy.gate: off)")
+        else:
+            control, candidate = self._logits(good), self._logits(best)
+            if control is None or candidate is None:
+                logits = None
+            elif isinstance(control, str) or isinstance(candidate, str):
+                text = control if isinstance(control, str) else str(candidate)
+                if isinstance(control, str):  # the last tree that held: never the best's fault
+                    text = "ERROR " + text.split(" ", 1)[1]
+                verdict, why = text.split(" ", 1)
+                logits = (verdict, why)
+            else:
+                ok, why, _ = logits_check.compare(control, candidate, self.logits)
+                logits = (PASS if ok else FAIL, why)
+        if tests is None or logits is None:
+            return None
+        found = [(tests["verdict"], f"suite: {tests['reason']}"), logits]
+        for verdict in (FAIL, ERROR):
+            bad = [why for v, why in found if v == verdict]
+            if bad:
+                return verdict, "; ".join(bad)
+        return PASS, "; ".join(why for _, why in found)
+
+    def _checkpoint(self, done: dict[str, int]) -> None:
+        """Measure the best tree against the last checkpoint that held: e2e and correctness."""
+        ck = self.state.checkpoint
+        good, best = str(ck["good"]), self.state.best_commit
+        free = self.perf.free_spools()
+        if not ck.get("label"):
+            if not free:
+                return
+            spool = next(
+                (sp for sp in free if f"{good}|{spool_host(sp)}" in self.state.controls), free[0]
+            )
+            host = spool_host(spool) or Path(spool).name
+            ck.update(
+                spool=spool,
+                control=self.state.controls.get(f"{good}|{spool_host(spool)}")
+                or f"ctl-{good[:10]}-{host}",
+                label=f"ckpt-{best[:10]}",
+            )
+        correct = self._correct(good, best)
+        spool = ck["spool"]
+        for label, commit in ((ck["control"], good), (ck["label"], best)):
+            if self.perf.queued(label):
+                return
+            failed = label in done and done[label] != 0
+            try:
+                measured = None if failed else load_measurement(self.data, label)
+                if measured is not None:
+                    validate_measurement(measured, self.bench, self.base_configs, commit)
+                    continue
+            except (KeyError, OSError, TypeError, ValueError) as exc:
+                failed, label = True, f"{label}: {exc}"
+            if failed or label in done:
+                self._no_verdict(f"{label}: no serving measurement")
+                return
+            if spool not in free:
+                if not self.perf.alive(spool):
+                    ck.pop("label", None)  # the host left: pick another next time
+                return
+            tree = self._tree_at(commit)
+            self.perf.submit(
+                spool,
+                label,
+                self.bench.command(label, self.data, self.base_configs),
+                wall=self.bench.wall,
+                tree=str(tree),
+            )
+            return
+        if correct is None:
+            return
+        if correct[0] == ERROR:
+            self._no_verdict(correct[1])
+            return
+        m, ctrl = (
+            load_measurement(self.data, ck["label"]),
+            load_measurement(self.data, ck["control"]),
+        )
+        cmp = compare(
+            m,
+            ctrl,
+            NoiseFloor(),
+            min_gain=self.min_gain,
+            noise_factor=self.noise_factor,
+            ttft_tolerance=self.ttft_tolerance,
+        )
+        by_point: dict[str, list[float]] = {}
+        for metric, delta in cmp.deltas.items():
+            by_point.setdefault(site_of(metric), []).append(float(delta))
+        measured = {p: sum(v) / len(v) for p, v in by_point.items()}
+        projected = dict(ck.get("projected") or {})
+        since = list(ck.get("since") or ())
+        lost = cmp.verdict == "LOSS" or correct[0] == FAIL
+        record = dict(
+            verdict="LOSS" if lost else cmp.verdict, e2e=cmp.verdict, correctness=correct[0],
+            best=best, good=good, since=since, measured=measured, projected=projected,
+            reason=f"e2e: {cmp.reason}; {correct[1]}",
+        )  # fmt: skip
+        if lost:
+            git_checked(Path(self.state.best_tree), "reset", "-q", "--hard", good)
+            self.state.best_commit = good
+            why = cmp.reason if cmp.verdict == "LOSS" else correct[1]
+            if len(since) > 1:
+                why += (
+                    f" ({', '.join(since)} rolled back together: which one caused it is not known)"
+                )
+            for slug in since:
+                cs = self.state.candidates[slug]
+                cs.status = "reverted"
+                cs.reason = f"the checkpoint at {best[:10]} failed against {good[:10]}: {why}"
+                if slug in self.state.kept:
+                    self.state.kept.remove(slug)
+            self.log(
+                f"[campaign] checkpoint FAILED at {best[:10]} ({why[:200]}): back to "
+                f"{good[:10]}, {since} reverted"
+            )
+        else:
+            self.state.controls[f"{best}|{spool_host(spool)}"] = ck["label"]
+            ratios = sorted(
+                measured[p] / v for p, v in projected.items() if v > 0.002 and p in measured
+            )
+            if ratios and not ck.get("measured"):
+                ratio = ratios[len(ratios) // 2]
+                self.state.calibration = min(1.0, max(0.25, self.state.calibration * ratio))
+                record["calibration"] = self.state.calibration
+                if ratio < 0.5:
+                    self.log(
+                        f"[campaign] checkpoint at {best[:10]}: measured {ratio:.0%} of the "
+                        f"projection; projections are scaled by {self.state.calibration:.2f}"
+                    )
+            self.log(f"[campaign] checkpoint held at {best[:10]}: {record['reason'][:200]}")
+            good = best
+        self.ledger.append("checkpoint", **record)
+        self.state.checkpoint = {"good": good}
+
+    def _no_verdict(self, why: str) -> None:
+        """A checkpoint that measured nothing to act on: the keeps stand; more keeps, then again."""
+        ck = self.state.checkpoint
+        self.ledger.append("checkpoint", verdict=ERROR, reason=why, since=ck.get("since"))
+        self.log(f"[campaign] checkpoint: {why}; the keeps stand")
+        for key in ("spool", "control", "label"):
+            ck.pop(key, None)
+        ck["retry_after"] = len(ck.get("since") or ()) + self.checkpoint_keeps
+
+    def final_accuracy(self, wait: Callable[[], None]) -> dict | None:
+        """The accuracy gate, once, on the final best tree: what the campaign kept, scored.
+
+        Keeps since the last checkpoint have not met the suite yet: it runs beside.
+        """
+        if not self.state.kept or self.keep_gate.ungated:
+            return None
+        since = self.state.checkpoint.get("since")
+        gate = self.keep_gate if since else self.keep_gate.accuracy_only()
+        key = f"final-{self.state.best_commit[:10]}"
+        while True:
+            self._gate_done = {label: rc for label, _, rc in self.gates.poll()}
+            verdict = self._gate(key, Path(self.state.best_tree), gate)
+            if verdict is not None:
+                self.ledger.append("final_accuracy", kept=list(self.state.kept), **verdict)
+                return verdict
+            wait()

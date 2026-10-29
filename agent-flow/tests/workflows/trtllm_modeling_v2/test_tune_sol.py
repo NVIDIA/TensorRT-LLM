@@ -73,29 +73,29 @@ def test_request_command_produces_valid_output_and_goal(tmp_path):
 
 
 def test_missing_inputs_never_fabricate_bounds_or_stop(tmp_path):
+    output = tmp_path / "sol.yaml"
+
+    def never_reached(result):
+        output.write_text(yaml.safe_dump(result))
+        ceilings, errors = sol.load_sol(output, _baseline())
+        assert not errors and not ceilings.reached(_baseline(), 0.01)
+        return ceilings
+
     inputs = _inputs()
     inputs["hardware"].pop("compute_flops_s")
     result = sol.calculate(inputs)
     assert not result["ceilings"] and result["regions"][0]["headroom_ms"] is None
-    output = tmp_path / "sol.yaml"
-    output.write_text(yaml.safe_dump(result))
-    ceilings, errors = sol.load_sol(output, _baseline())
-    assert not errors and not ceilings.reached(_baseline(), 0.01)
-    assert "unknown" in sol.render_table(ceilings, [_baseline()])
+    assert "unknown" in sol.render_table(never_reached(result), [_baseline()])
     inputs = _inputs()
     inputs["headline"].pop("con1.output_tok_s_gpu")
-    output.write_text(yaml.safe_dump(sol.calculate(inputs)))
-    ceilings, errors = sol.load_sol(output, _baseline())
-    assert not errors and not ceilings.reached(_baseline(), 0.01)
+    never_reached(sol.calculate(inputs))
     inputs = _inputs()
     inputs["headline"]["con1.tok_s_user"]["overhead"] = {
         "ms": 1,
         "source": "synthetic trace",
         "assumption": "exposed and unchanged",
     }
-    output.write_text(yaml.safe_dump(sol.calculate(inputs)))
-    ceilings, errors = sol.load_sol(output, _baseline())
-    assert not errors and not ceilings.reached(_baseline(), 0.01)
+    ceilings = never_reached(sol.calculate(inputs))
     assert "conditional" in ceilings.unknown["con1.tok_s_user"]
 
 
@@ -142,3 +142,103 @@ def test_invalid_or_impossible_inputs_are_rejected(location, value):
     item[location[-1]] = value
     with pytest.raises(ValueError):
         sol.calculate(inputs)
+
+
+def _analysis(user=4.0, gpu=4.0, memory=1000, region_bytes=1, counted=None):
+    """``_inputs`` with each headline's FLOPs, the memory capacity and the region's bytes set."""
+    inputs = deepcopy(_inputs())
+    inputs["headline"]["con1.tok_s_user"]["flops"] = user
+    inputs["headline"]["con1.output_tok_s_gpu"]["flops"] = gpu
+    inputs["hardware"]["memory_bytes_s"]["value"] = memory
+    inputs["regions"][0]["bytes"] = region_bytes
+    if counted is not None:
+        inputs["regions"][0]["measured_bytes"] = counted
+    return sol.calculate(inputs)
+
+
+def test_analyses_that_agree_give_the_highest_ceiling_and_the_rest_is_ruled_or_unknown():
+    from agent_flow.workflows.trtllm_modeling_v2.tune.sol_consensus import read_rulings, reconcile
+
+    base = _baseline().headline()  # 400 tok/s at both
+    # 2 ms (500 tok/s) and 2.2 ms agree; 3.5 ms is below what the baseline measured.
+    analyses = {"analytic": _analysis(4), "code": _analysis(4.4, 8), "profile": _analysis(7, 8)}
+    c = reconcile(analyses, base)
+    user = c.report["headline.con1.tok_s_user"]
+    assert user["status"] == "agreed" and user["chosen"] == "analytic"
+    assert user["below_baseline"] == ["profile"]
+    assert c.inputs["headline"]["con1.tok_s_user"]["assumptions"].startswith("analytic: ")
+    assert c.disputes == [{"item": "headline.con1.output_tok_s_gpu", "values": {"analytic": 500.0},
+                           "why": "unconfirmed: only analytic models it"}]  # fmt: skip
+    assert c.report["regions"]["agreed"] == 1 and len(c.inputs["regions"]) == 1
+    rulings, problems = read_rulings({"rulings": [
+        {"item": "headline.con1.output_tok_s_gpu", "analysis": "analytic", "evidence": "recounted"},
+        {"item": "headline.con1.tok_s_user", "analysis": "code", "evidence": "x"},
+        {"item": "headline.con1.output_tok_s_gpu", "analysis": "code", "evidence": "x"},
+    ]}, c.disputes)  # fmt: skip
+    assert rulings == {"headline.con1.output_tok_s_gpu": "analytic"} and len(problems) == 2
+    ruled = reconcile(analyses, base, rulings=rulings)
+    assert sol.calculate(ruled.inputs)["ceilings"]["con1.output_tok_s_gpu"]["value"] == 500
+    # Ceilings 33 % apart are a dispute; an unresolved one is unknown, never a goal.
+    apart = reconcile({"analytic": _analysis(4), "code": _analysis(3)}, base)
+    assert [d["item"] for d in apart.disputes] == ["headline.con1.tok_s_user"]
+    assert "differ by 33%" in apart.unknown["con1.tok_s_user"]
+    assert "con1.tok_s_user" not in apart.inputs["headline"]
+
+
+def test_capacities_must_agree_and_counted_traffic_bounds_every_analysis():
+    from agent_flow.workflows.trtllm_modeling_v2.tune.sol_consensus import reconcile
+
+    base = _baseline().headline()
+    analyses = {"analytic": _analysis(), "code": _analysis(memory=1100)}
+    c = reconcile(analyses, base)
+    assert c.disputes[0]["item"] == "hardware.memory_bytes_s" and c.inputs["regions"] == []
+    c = reconcile(analyses, base, rulings={"hardware.memory_bytes_s": "analytic"})
+    assert not c.disputes and c.inputs["hardware"]["memory_bytes_s"]["value"] == 1000
+    # A profiler counted 1.2 bytes in the region: 2 bytes of necessary work is impossible.
+    counted = {
+        "analytic": _analysis(region_bytes=2),
+        "profile": _analysis(region_bytes=1, counted=1.2),
+    }
+    c = reconcile({**counted, "code": _analysis()}, base)
+    assert c.report["regions"]["over_counted"] == [
+        {"id": "layer/decode/shape/rank0", "analyses": ["analytic"]}
+    ]
+    assert c.inputs["regions"][0]["bytes"] == 1
+    with pytest.raises(ValueError, match="exceed what the profiler counted"):
+        _analysis(region_bytes=2, counted=1.2)
+
+
+def test_the_stage_asks_each_method_once_and_one_adjudication_for_what_they_dispute(tmp_path):
+    from dataclasses import replace
+
+    from .test_tune_stage import FakeRunner, _effect, _write_sol
+    from .test_tune_wall_budget import _campaign
+
+    spec = replace(_campaign(tmp_path), sol={"enabled": True})
+    turns = []
+
+    def dispatch(role, what, prompt):
+        turns.append(what)
+        if what == "sol-adjudicate":
+            rulings = [{"item": "headline.con1.tok_s_user", "analysis": "code", "evidence": "re-counted"},
+                       {"item": "headline.con128.tok_s_user", "analysis": None, "evidence": "none holds"}]  # fmt: skip
+            (spec.workdir / "sol" / "rulings.yaml").write_text(yaml.safe_dump({"rulings": rulings}))
+        else:  # the profile counts twice the work the other two do
+            method = what.removeprefix("sol-")
+            _write_sol(spec.workdir / "sol" / method, work=20 if method == "profile" else 10)
+        return "done"
+
+    stage = TuneStage(spec, {}, dispatch=dispatch, checkpoint=lambda: None, poll_s=0,
+                      runner_factory=lambda spools, prefix: FakeRunner(spools, prefix, _effect))  # fmt: skip
+    assert stage.ground()
+    stage._sol()
+    assert sorted(turns) == ["sol-adjudicate", "sol-analytic", "sol-code", "sol-profile"]
+    ceilings = stage._ceilings()
+    assert set(ceilings.ceilings) == {"con1.tok_s_user"}  # ruled; the others stay unknown
+    assert "no analysis's work model holds" in ceilings.unknown["con128.tok_s_user"]
+    assert "differ by 100%" in ceilings.unknown["con128.output_tok_s_gpu"]
+    report = json.loads((spec.workdir / "sol" / "consensus.json").read_text())
+    assert report["headline.con1.tok_s_user"]["status"] == "ruled"
+    stage.t.pop("sol")
+    stage._sol()  # answered on disk: no turn is asked again
+    assert len(turns) == 4

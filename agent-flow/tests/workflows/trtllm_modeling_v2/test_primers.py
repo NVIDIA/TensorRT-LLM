@@ -49,24 +49,26 @@ class _Layer:
         self.closed = True
 
 
-def test_a_primed_roles_turn_starts_as_a_fork_and_is_told_the_commit(tmp_path, monkeypatch):
-    executor = _Executor()
+def _primed(tmp_path, monkeypatch, primer):
+    """A workflow whose kernel_writer has ``primer`` ready, its executor, and the forks it made."""
+    executor, made = _Executor(), []
     workflow = _workflow(tmp_path, primers=True)
     workflow._turns = executor
-    made = []
+    workflow._primers["kernel_writer"] = primer
+    workflow._primer_ready["kernel_writer"] = threading.Event()
+    workflow._primer_ready["kernel_writer"].set()
 
-    def make_agent(name, system_prompt, *, requires_decision=True, session_mode="stateless",
-                   fork_from=None):  # fmt: skip
+    def make_agent(*args, fork_from=None, **kwargs):
         made.append(fork_from)
         return _Layer(fork_from)
 
     monkeypatch.setattr(workflow, "_make_agent", make_agent)
-    workflow._primers = {
-        "kernel_writer": primers.Primer("kernel_writer", "sess-1", "c" * 40, "v", "")
-    }
-    workflow._primer_ready = {"kernel_writer": threading.Event()}
-    workflow._primer_ready["kernel_writer"].set()
+    return workflow, executor, made
 
+
+def test_a_primed_roles_turn_starts_as_a_fork_and_is_told_the_commit(tmp_path, monkeypatch):
+    primer = primers.Primer("kernel_writer", "sess-1", "c" * 40, "v", "")
+    workflow, executor, made = _primed(tmp_path, monkeypatch, primer)
     assert workflow._run_turn("kernel_writer", "onboard norm/x", "Do the entry.") == "ok"
     assert made == ["sess-1"]
     assert executor.prompts[-1].startswith("**You are now working your own turn")
@@ -114,20 +116,10 @@ def test_changing_the_routed_backend_model_or_effort_invalidates_a_primer():
 
 
 def test_a_failed_fork_keeps_the_summary_fallback_across_restart(tmp_path, monkeypatch):
-    workflow = _workflow(tmp_path, primers=True)
-    executor = _Executor()
-    workflow._turns = executor
     summary = tmp_path / "briefing.md"
     summary.write_text("saved source reading")
-    workflow._primers["kernel_writer"] = primers.Primer(
-        "kernel_writer", "old-thread", "a" * 40, "v", str(summary)
-    )
-    ready = threading.Event()
-    ready.set()
-    workflow._primer_ready["kernel_writer"] = ready
-    monkeypatch.setattr(
-        workflow, "_make_agent", lambda *args, **kwargs: _Layer(kwargs.get("fork_from"))
-    )
+    primer = primers.Primer("kernel_writer", "old-thread", "a" * 40, "v", str(summary))
+    workflow, executor, _ = _primed(tmp_path, monkeypatch, primer)
     original = executor.run
 
     def run(request):

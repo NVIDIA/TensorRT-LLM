@@ -100,6 +100,8 @@ class ProbeOutcome:
     files: str = ""
     #: The sandbox and approval policy the session ran under, when its backend says.
     settings: str = ""
+    #: The skills the session loaded, when its backend says: the run's own and the user's.
+    skills: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -307,6 +309,9 @@ def make_probe_layer(agent: AgentConfig, workspace: Path) -> AgentLayer:
                 reasoning_effort=agent.reasoning_effort,
                 extra_mcp_servers=agent.extra_mcp_servers,
                 cwd=workspace,
+                # As the roles run: without the user's plugins. Its skills stay on, so the
+                # probe reports what a session would load (ProbeOutcome.skills).
+                plugins=False,
             ),
             print_activity=False,
         )
@@ -365,8 +370,15 @@ def _probe_one(
             f"the session ran read-only ({settings}): every file a role writes would wait on an "
             "approval"
         )
+    skills = session.get("skills")
     return ProbeOutcome(
-        probed, problem, said=said, stderr=stderr, files=_latest_turn(directory), settings=settings
+        probed,
+        problem,
+        said=said,
+        stderr=stderr,
+        files=_latest_turn(directory),
+        settings=settings,
+        skills=tuple(str(s) for s in skills) if isinstance(skills, list) else (),
     )
 
 
@@ -429,6 +441,18 @@ def probe_agents(
         return [future.result() for future in futures]
 
 
+def foreign_skills(
+    outcomes: Sequence[ProbeOutcome], own: Sequence[str]
+) -> dict[str, tuple[str, ...]]:
+    """Backend kind -> the skills its probe session loaded that the run does not ship."""
+    found: dict[str, set[str]] = {}
+    for outcome in outcomes:
+        found.setdefault(outcome.probed.agent.backend, set()).update(
+            s for s in outcome.skills if s not in own
+        )
+    return {backend: tuple(sorted(names)) for backend, names in found.items()}
+
+
 def _excerpt(text: str) -> str:
     text = text.strip()
     if len(text) > _EXCERPT_CHARS:
@@ -468,6 +492,7 @@ __all__ = [
     "ProbeOutcome",
     "ProbedAgent",
     "distinct_agents",
+    "foreign_skills",
     "format_failures",
     "hint_for",
     "make_probe_layer",

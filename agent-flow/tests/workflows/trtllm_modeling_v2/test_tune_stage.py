@@ -64,9 +64,11 @@ class FakeRunner:
     :func:`_contract`'s anchor); its suite passes.
     """
 
-    def __init__(self, spools, prefix, effect, score=None):
+    def __init__(self, spools, prefix, effect, score=None, first_token=None):
         self.spools, self.prefix, self.effect = list(spools), prefix, effect
         self.score = score or (lambda label, tree: 96.0)
+        #: A tree's first-token log-probs, the same on every tree unless a test says otherwise.
+        self.first_token = first_token or (lambda tree: {7: -0.1, 9: -2.5})
         self.inflight: dict[str, tuple[str, str]] = {}
         self.jobs: dict[str, tuple[str, str | None]] = {}
         self.outputs: dict[str, str] = {}
@@ -130,6 +132,13 @@ class FakeRunner:
                             "latency_us": {"decode-b1-bf16-graph": latency},
                         }
                     )
+                )
+            elif "engine_driver.py" in command:
+                spec = json.loads(Path(tokens[tokens.index("--spec") + 1]).read_text())
+                row = [[tok, lp, None] for tok, lp in self.first_token(tree).items()]
+                self.outputs[label] = "".join(
+                    f"MV2FLOW_RECORD {json.dumps({'index': i, 'id': r['id'], 'top_logprobs': [row]})}\n"
+                    for i, r in enumerate(spec["requests"])
                 )
             elif "trtllm-eval " in command:
                 score = self.score(label, tree)
@@ -243,7 +252,8 @@ def _microbench(path: Path) -> dict:
     script = path / "bench.py"
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("def benchmark():\n    return {'decode-b1-bf16-graph': lambda: None}\n")
-    return {"script": str(script), "cases": ["decode-b1-bf16-graph"]}
+    share = {"decode-b1-bf16-graph": {"con1": 0.5, "con128": 0.5}}
+    return {"script": str(script), "cases": ["decode-b1-bf16-graph"], "share": share}
 
 
 def _effect(config, tree):
@@ -257,7 +267,7 @@ def _effect(config, tree):
     return lat, thr
 
 
-def _write_sol(workdir: Path) -> None:
+def _write_sol(workdir: Path, work: float = 10) -> None:
     """Synthetic work/capacity inputs, not device specifications or fitted ceilings."""
     from agent_flow.workflows.trtllm_modeling_v2.tune.sol import calculate
 
@@ -270,8 +280,8 @@ def _write_sol(workdir: Path) -> None:
         },
         "headline": {
             k: {
-                "flops": 10,
-                "bytes": 10,
+                "flops": work,
+                "bytes": work,
                 "output_tokens": 1,
                 "gpu_count": 1,
                 "assumptions": "synthetic whole-interval work",
@@ -279,6 +289,7 @@ def _write_sol(workdir: Path) -> None:
             for k in keys
         },
     }
+    workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "sol.yaml").write_text(yaml.safe_dump(calculate(inputs)))
 
 
@@ -306,15 +317,14 @@ def test_the_stage_runs_ground_campaign_and_wrap(tmp_path):
 
     def dispatch(role, what, prompt):
         turns.append(what)
-        if what == "sol":
-            _write_sol(spec.workdir)
+        if what.startswith("sol-"):  # three analyses that agree: no adjudication
+            _write_sol(spec.workdir / "sol" / what.removeprefix("sol-"))
             return "ceilings written"
-        if what == "roadmap":
-            asks["roadmap"] = (spec.workdir / "roadmap-request.md").read_text()
         if what == "roadmap-2":
             (spec.workdir / "roadmap-2.yaml").write_text("[]")
             return "nothing left"
         if what == "roadmap":
+            asks["roadmap"] = (spec.workdir / "roadmap-request.md").read_text()
             (spec.workdir / "roadmap.yaml").write_text(
                 yaml.safe_dump(
                     [
@@ -374,8 +384,14 @@ def test_the_stage_runs_ground_campaign_and_wrap(tmp_path):
     assert stage.run() == "tuned"
     submitted = [label for runner in runners for label in runner.submitted]
     assert submitted.count("t-baseline") == submitted.count("t-final") == 1
-    assert not any(label.startswith(("t-baseline-r", "e2e-", "ctl-")) for label in submitted)
+    assert not any(label.startswith(("t-baseline-r", "e2e-")) for label in submitted)
     assert len([label for label in submitted if label.startswith("micro-")]) == 2
+    # The keep projected past the checkpoint's gain: e2e against the tree before it, its suite,
+    # the first tokens of both; GSM8K once, on the final tree, at one member.
+    assert sorted(label.split("-")[0] for label in submitted[4:-1]) == [
+        "ckpt", "ctl", "gate", "logits", "logits"
+    ]  # fmt: skip
+    assert submitted[-1].startswith("gate-final-") and submitted[-1].endswith("-tp1")
     records = [
         json.loads(line) for line in (spec.workdir / "perf_ledger.jsonl").read_text().splitlines()
     ]
@@ -394,13 +410,16 @@ def test_the_stage_runs_ground_campaign_and_wrap(tmp_path):
     assert state["phase"] == "done"
     assert state["kept"] == ["fast-path"]
     assert set(turns) == {
-        "sol",
+        "sol-analytic",
+        "sol-code",
+        "sol-profile",
         "roadmap",
         "fast-path",
         "no-op",
         "roadmap-2",
     }  # the spent roadmap is refreshed once
-    assert turns[0] == "sol" and state["sol"]["method"] == "roofline"
+    assert set(turns[:3]) == {"sol-analytic", "sol-code", "sol-profile"}
+    assert state["sol"]["method"] == "roofline"
     assert "Rank by headroom" in asks["roadmap"] and "## Speed of light" in asks["roadmap"]
     best = Path(state["best_tree"])
     assert (best / "modeling.py").read_text() == "FAST = True\n"
@@ -410,17 +429,17 @@ def test_the_stage_runs_ground_campaign_and_wrap(tmp_path):
     unmerged = (spec.workdir.parent / "UNMERGED_OPTIMIZATIONS.md").read_text()
     assert "## `fast-path`" in unmerged and "- accuracy gate:" in unmerged
     assert f"`{stage.branch_prefix}/best`" in unmerged
-    kinds = [
-        json.loads(line)["kind"]
-        for line in (spec.workdir / "perf_ledger.jsonl").read_text().splitlines()
-    ]
     assert {
-        "noise_floor",
+        "baseline",
         "tuner_decision",
         "candidate_microbench",
-        "candidate_gate",
         "candidate_kept",
-    } <= set(kinds)
+        "checkpoint",
+        "final_accuracy",
+    } <= {r["kind"] for r in records}
+    (ck,) = [r for r in records if r["kind"] == "checkpoint"]
+    assert ck["verdict"] == "WIN" and ck["correctness"] == "PASS" and ck["since"] == ["fast-path"]
+    assert round(ck["projected"]["con1"], 4) == 0.0909 and round(ck["measured"]["con1"], 2) == 0.2
     # resume after completion re-measures nothing
     again = TuneStage(
         spec,

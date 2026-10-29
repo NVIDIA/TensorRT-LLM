@@ -16,17 +16,12 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import survey
 from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import resolve_environment
 from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import _surveyor_prompt
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
 
+from .test_gates import _env
+
 PADDED_19 = (1, 2, 4, *range(8, 129, 8))
-
-
-def _options(tmp_path: Path, name: str, data: dict) -> Path:
-    path = tmp_path / f"{name}.llm_api.yaml"
-    path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    return path
 
 
 def _task(tmp_path: Path, *, options: dict | None = None, runtime: dict | None = None):
@@ -40,32 +35,20 @@ def _task(tmp_path: Path, *, options: dict | None = None, runtime: dict | None =
         else {"cuda_graph": True, "extra_flags": ["--max_batch_size=128"]},
         "accuracy": {"benchmark": "gsm8k"},
     }
-    if options is not None:
-        task["accuracy"]["llm_api_options"] = {
-            unit: str(_options(tmp_path, unit, data)) for unit, data in options.items()
-        }
+    for unit, data in (options or {}).items():
+        path = tmp_path / f"{unit}.llm_api.yaml"
+        path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        task["accuracy"].setdefault("llm_api_options", {})[unit] = str(path)
     return task
 
 
 _PADDED_128 = {"cuda_graph_config": {"enable_padding": True, "max_batch_size": 128}}
 
 
-def _env():
-    return resolve_environment(
-        {"environment": {"kind": "local", "python": "/opt/venv/bin/python", "env": {}}},
-        devices=(0,),
-        world_size=1,
-    )
-
-
 def test_boot_acceptance_and_accuracy_capture_the_same_list(tmp_path):
     """The live defect: a padded options file, and a runtime block that says nothing of it."""
     options = {**_PADDED_128, "speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}}
-    task = _task(
-        tmp_path,
-        options={"mtp": options},
-        runtime={"cuda_graph": True, "extra_flags": ["--max_batch_size=128"]},
-    )
+    task = _task(tmp_path, options={"mtp": options})
     config = check_config.check_configuration(
         task, _env(), unit="mtp", features=["mtp"], max_tokens=16, member=None
     )

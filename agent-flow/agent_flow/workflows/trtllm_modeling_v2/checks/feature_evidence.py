@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Feature coverage policy: required observations, accepted sources and reference eligibility."""
+"""Feature coverage policy: required observations and accepted sources."""
 
 from __future__ import annotations
 
@@ -29,8 +29,6 @@ class FeatureEvidence:
     oracle: str
     #: Where an observation of a field may be read; never ``llm.args``.
     sources: tuple[str, ...] = ()
-    #: The HF reference measures a configuration that changes only these fields.
-    reference_compatible: bool = False
 
 
 _ENGINE = (SOURCE_WORKER, SOURCE_RANKS)
@@ -59,9 +57,8 @@ CHUNKED = FeatureEvidence(
     ("chunked_prefill", "max_num_tokens"),
     "a request whose prompt, less what the KV cache resumed, is longer than max_num_tokens, "
     "served whole: the engine computed it in two or more context chunks",
-    "the HF reference's greedy tokens on such a prompt, where the logit reference has one",
+    "the variant's accuracy, whose benchmark prompts the engine splits",
     _ENGINE,
-    reference_compatible=True,
 )
 
 
@@ -71,7 +68,6 @@ BLOCK_REUSE = FeatureEvidence(
     "requests the engine resumed from its KV cache",
     "the reuse probe: one prompt sent twice",
     (*_ENGINE, SOURCE_LOG, SOURCE_PROBE, SOURCE_CACHED),
-    reference_compatible=True,
 )
 
 
@@ -91,7 +87,6 @@ CUDA_GRAPHS = FeatureEvidence(
     "the batches each rank's worker captured",
     "the declared capture list",
     _ENGINE,
-    reference_compatible=True,
 )
 
 
@@ -107,20 +102,12 @@ FEATURES: tuple[FeatureEvidence, ...] = (
 )
 
 
-#: The engine fields a reference_compatible change is made of: a variant changing only
-#: these is compared with the HF reference's greedy tokens.
-REFERENCE_COMPATIBLE_FIELDS: frozenset[str] = frozenset(
-    f for o in FEATURES if o.reference_compatible for f in o.fields
-) | {"max_batch_size", "overlap_scheduler"}
-
-
 #: What a feature the engine fields do not express is judged by.
 MULTIMODAL = FeatureEvidence(
     "multimodal",
     (),
     "the engine's output on prompts that send an image",
-    "the HF reference's logits on its image prompts (the logit gate), or a benchmark that "
-    "sends images",
+    "the boot's image prompts, or a benchmark that sends images",
 )
 
 
@@ -133,15 +120,6 @@ IMAGE_BENCHMARKS: frozenset[str] = frozenset(
 def feature_for(field_name: str) -> FeatureEvidence | None:
     """The registered feature ``field_name`` belongs to, if any."""
     return next((o for o in FEATURES if field_name in o.fields), None)
-
-
-def reference_compatible(subjects: Sequence[str]) -> bool:
-    """Whether the HF reference is eligible to judge a variant about ``subjects``.
-
-    Eligibility is a coverage policy, not a promise of bitwise-identical execution:
-    the selected comparison still applies its own numerical tolerance.
-    """
-    return bool(subjects) and all(f in REFERENCE_COMPATIBLE_FIELDS for f in subjects)
 
 
 def about(subjects: Sequence[str], feature: FeatureEvidence) -> bool:
@@ -204,13 +182,11 @@ __all__ = [
     "IMAGE_BENCHMARKS",
     "KV_DTYPE",
     "MULTIMODAL",
-    "REFERENCE_COMPATIBLE_FIELDS",
     "SPECULATIVE",
     "SSM_DTYPE",
     "about",
     "feature_for",
     "judges_images",
-    "reference_compatible",
     "unobserved",
     "unobserved_detail",
 ]

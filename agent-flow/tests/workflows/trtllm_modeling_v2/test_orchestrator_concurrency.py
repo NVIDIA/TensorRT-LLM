@@ -141,17 +141,8 @@ def test_nonblocking_task_events_are_batched(tmp_path, decision):
     assert orchestrator._events_due()
 
 
-def test_default_slots_reserve_one_planner_and_allow_eight_workers():
-    from agent_flow.workflows.trtllm_modeling_v2.agents.slots import AgentGate, Priority
-
-    gate = AgentGate(orchestrator_mod.DEFAULT_MAX_PARALLEL_TASKS)
-    assert gate.task_slots == 8
-    gate._active[Priority.REQUIRED] = 8
-    assert gate._admissible(Priority.PLANNER)
-    assert not gate._admissible(Priority.REQUIRED)
-
-
-def test_ctrl_c_ends_the_run_at_once_without_waiting_for_the_turns_in_flight(tmp_path):
+def _slow_run(tmp_path):
+    """One planner turn, then one task that runs until released."""
     release, started, turns = threading.Event(), threading.Event(), []
 
     def plan(turn):
@@ -167,12 +158,12 @@ def test_ctrl_c_ends_the_run_at_once_without_waiting_for_the_turns_in_flight(tmp
         release.wait(_WAIT)
         return "UNIT_READY"
 
-    def interrupt():
-        if started.wait(_WAIT):
-            _thread.interrupt_main()
+    return _orchestrator(tmp_path, plan, work), started, release, turns
 
-    orchestrator = _orchestrator(tmp_path, plan, work)
-    threading.Thread(target=interrupt).start()
+
+def test_ctrl_c_ends_the_run_at_once_without_waiting_for_the_turns_in_flight(tmp_path):
+    orchestrator, started, release, turns = _slow_run(tmp_path)
+    threading.Thread(target=lambda: started.wait(_WAIT) and _thread.interrupt_main()).start()
     begun = time.monotonic()
     with pytest.raises(KeyboardInterrupt):
         orchestrator.run()
@@ -181,21 +172,69 @@ def test_ctrl_c_ends_the_run_at_once_without_waiting_for_the_turns_in_flight(tmp
     assert len(turns) == 1
 
 
-def test_a_burst_of_operator_messages_reaches_the_planner_as_one(tmp_path):
-    first = inbox.post(tmp_path, "focus on dep4")
-    inbox.post(tmp_path, "and drop the vision work")
-    stamp = first.stat().st_mtime
-    assert inbox.take(tmp_path, now=stamp + inbox.SETTLE_S / 2) == []
-    taken = inbox.take(tmp_path, now=stamp + inbox.SETTLE_S + 1)
+def test_a_features_own_work_waits_for_the_core_to_boot(tmp_path):
+    started, seen = [], {}
+
+    def task(tid, kind, ref, satisfies=()):
+        return g.Task(
+            id=tid,
+            kind=kind,
+            ref=ref,
+            goal=f"do {tid}",
+            touches=[f"models/{tid}.py"],
+            gpus=1,
+            est_minutes=10,
+            satisfies=list(satisfies),
+        )
+
+    def plan(turn):
+        if not started:
+            graph = g.Graph(
+                tasks=[
+                    task("core", "assemble", "core", satisfies=_KEYS),
+                    task("mtp", "feature", "mtp"),
+                    task("k1-draft-head", "kernel", "gemm/draft_head"),
+                ]
+            )
+            return PlannerAnswer("GRAPH_UPDATED", "plan", graph)
+        return PlannerAnswer("DONE", "all green")
+
+    def work(t):
+        started.append(t.id)
+        if t.id == "core":
+            time.sleep(0.3)  # long enough for the loop to start whatever it would
+            seen["beside the core"] = set(started) - {"core"}
+        return "UNIT_READY"
+
+    orchestrator = _orchestrator(tmp_path, plan, work, after_core=(["mtp"], [_KEYS[0]]))
+    assert orchestrator.run() == "delivered"
+    # The kernel the feature needs starts beside the core; the feature waits for its boot.
+    assert seen["beside the core"] == {"k1-draft-head"}
+    assert started.index("mtp") > started.index("core")
+
+
+def test_a_burst_of_short_operator_steers_reaches_the_planner_as_one(tmp_path):
+    with pytest.raises(ValueError, match="more than 1200"):
+        inbox.post(tmp_path, "x" * (inbox.MESSAGE_MAX_CHARS + 1))
+    inbox.post(tmp_path, "drop the vision work")
+    last = inbox.post(tmp_path, "stop the dep4 boot loop", now=True)
+    assert inbox.take(tmp_path, now=last.stat().st_mtime + inbox.SETTLE_S / 2) == []
+    taken = inbox.take(tmp_path, now=last.stat().st_mtime + inbox.SETTLE_S + 1)
     assert [text.rsplit(": ", 1)[-1] for text in taken] == [
-        "focus on dep4",
-        "and drop the vision work",
+        "drop the vision work",
+        "stop the dep4 boot loop",
     ]
+    assert [inbox.is_urgent(e) for e in taken] == [False, True]
+    assert all(inbox.is_message(e) for e in taken) and ".now" not in taken[1]
 
 
-def test_an_operator_message_reaches_the_planner_while_a_long_task_runs(tmp_path, monkeypatch):
-    started, waiting, note, read = (threading.Event() for _ in range(4))
-    turns, seen = [], {}
+@pytest.mark.parametrize("now", [False, True])
+def test_an_operator_message_wakes_the_planner_only_when_sent_now(tmp_path, monkeypatch, now):
+    """The loop looks for messages while a long task runs, not only once it ends."""
+    started, waiting, read = (threading.Event() for _ in range(3))
+    prefix = inbox.URGENT_PREFIX if now else inbox.OPERATOR_PREFIX
+    message = f"{prefix} (m): drop the vision work"
+    turns, seen, sent = [], {}, []
     original_wait = orchestrator_mod.wait
 
     def wait(*args, **kwargs):
@@ -211,54 +250,34 @@ def test_an_operator_message_reaches_the_planner_while_a_long_task_runs(tmp_path
             return PlannerAnswer(
                 "GRAPH_UPDATED", "plan", g.Graph(tasks=[_task("slow", satisfies=_KEYS)])
             )
-        if "late operator evidence" in turn.events:
+        if message in turn.events:
             read.set()
         return PlannerAnswer("DONE", "all green")
 
     def work(task):
         started.set()
-        seen["read before the task ended"] = read.wait(_WAIT)
+        seen["read before the task ended"] = read.wait(_WAIT if now else 0.5)
         return "UNIT_READY"
 
     def stage_notes():
-        if note.is_set():
-            note.clear()
-            return ["late operator evidence"]
+        # Only once the loop waits on the running task: the message ends no future.
+        if waiting.is_set() and not sent:
+            sent.append(message)
+            return [message]
         return []
 
-    def operator():
-        assert waiting.wait(_WAIT)
-        note.set()
-
-    orchestrator = _orchestrator(tmp_path, plan, work)
+    # The run's event window: a message that is not urgent waits for it while work runs.
+    orchestrator = _orchestrator(tmp_path, plan, work, event_window_s=900.0)
     orchestrator.s.stage_notes = stage_notes
-    writer = threading.Thread(target=operator)
-    writer.start()
-    try:
-        assert orchestrator.run() == "delivered"
-    finally:
-        writer.join(_WAIT)
-    assert seen["read before the task ended"]
+    assert orchestrator.run() == "delivered"
+    # Sent `--now`, it wakes a turn while the task runs; otherwise the next turn reads it.
+    assert seen["read before the task ended"] is now
+    assert any(message in turn.events for turn in turns[1:])
 
 
 def test_a_stop_ends_the_run_at_once_without_waiting_for_the_turns_in_flight(tmp_path):
-    release, started, turns = threading.Event(), threading.Event(), []
-
-    def plan(turn):
-        turns.append(turn)
-        if len(turns) == 1:
-            return PlannerAnswer(
-                "GRAPH_UPDATED", "plan", g.Graph(tasks=[_task("a", satisfies=_KEYS)])
-            )
-        return PlannerAnswer("DONE", "all green")
-
-    def work(task):
-        started.set()
-        release.wait(_WAIT)
-        return "UNIT_READY"
-
     with orchestrator_mod.stoppable(tmp_path) as stop:
-        orchestrator = _orchestrator(tmp_path, plan, work)
+        orchestrator, started, release, turns = _slow_run(tmp_path)
         threading.Thread(target=lambda: started.wait(_WAIT) and stop("the host failed")).start()
         begun = time.monotonic()
         assert orchestrator.run() == "stopped: the host failed"
