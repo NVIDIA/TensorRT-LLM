@@ -195,7 +195,6 @@ unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_kv_events
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[None] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[cuda_graph_config0] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_llm_disagg_streaming_gen_cancelled[PYTHON] SKIP (https://nvbugs/6903683)
-unittest/llmapi/test_mpi_session.py::test_remote_mpi_session[submit_sync] SKIP (https://nvbugs/6988813)
 unittest/others/test_web_dependency_security.py::test_web_framework_security_floors SKIP (https://nvbugs/6930053)
 verl/test_verl_cases.py::test_async_generate SKIP (https://nvbugs/6683838)
 verl/test_verl_cases.py::test_async_memory_management SKIP (https://nvbugs/6683838)
