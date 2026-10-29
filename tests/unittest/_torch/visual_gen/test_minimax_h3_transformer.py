@@ -1820,11 +1820,19 @@ def _export_style_checkpoint(
     gets packed weights and scales in the export's layout: NVFP4 stores ``uint8`` weights
     ``[N, K/2]``, ``float8_e4m3fn`` block scales ``[N, K/16]``, a per-tensor
     ``weight_scale_2`` and ``input_scale``; per-tensor FP8 stores ``float8_e4m3fn`` weights
-    ``[N, K]`` with a scalar ``weight_scale`` and ``input_scale``.
+    ``[N, K]`` with a scalar ``weight_scale`` and ``input_scale``. Scales follow the export's
+    recipe: ``amax / 448`` for FP8 and ``amax / (448 * 6)`` for NVFP4's per-tensor scales,
+    with the activation amax taken as 4.
     """
     from tensorrt_llm._torch.modules.linear import Linear
 
     generator = torch.Generator().manual_seed(0)
+    e4m3_max = torch.finfo(torch.float8_e4m3fn).max
+    activation_amax = 4.0
+    if quant_algo == QuantAlgo.NVFP4:
+        input_scale = torch.tensor(activation_amax / (6.0 * e4m3_max))
+    else:
+        input_scale = torch.tensor(activation_amax / e4m3_max)
 
     def to_diffusers(name: str) -> str:
         return name.replace(".ff.gate_up_proj", ".ff.net.0.proj").replace(".ff.down_proj", ".ff.net.2")
@@ -1840,23 +1848,35 @@ def _export_style_checkpoint(
             ]
         else:
             targets = [(to_diffusers(name), out_features)]
+        # One high-precision weight per module, so the per-tensor scales agree across the
+        # q / k / v shards that the loader fuses (it requires equal ``input_scale`` and
+        # ``weight_scale_2``).
+        weight = torch.randn(out_features, in_features, generator=generator) * 0.05
+        if quant_algo == QuantAlgo.NVFP4:
+            # Block scales are e4m3 values of amax(block) / 6 over the global scale.
+            blocks = weight.reshape(out_features, in_features // 16, 16).abs().amax(dim=-1)
+            weight_scale_2 = blocks.max() / (6.0 * e4m3_max)
+            block_scales = (blocks / (6.0 * weight_scale_2)).to(torch.float8_e4m3fn)
+            packed = torch.randint(
+                0, 256, (out_features, in_features // 2), dtype=torch.uint8, generator=generator
+            )
+        else:
+            weight_scale = weight.abs().max() / e4m3_max
+            fp8_weight = (weight / weight_scale).to(torch.float8_e4m3fn)
+        row = 0
         for target, n in targets:
             for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
                 checkpoint.pop(f"{target}.{suffix}", None)
+            rows = slice(row, row + n)
+            row += n
             if quant_algo == QuantAlgo.NVFP4:
-                checkpoint[f"{target}.weight"] = torch.randint(
-                    0, 256, (n, in_features // 2), dtype=torch.uint8, generator=generator
-                )
-                checkpoint[f"{target}.weight_scale"] = (
-                    torch.rand(n, in_features // 16, generator=generator) + 0.5
-                ).to(torch.float8_e4m3fn)
-                checkpoint[f"{target}.weight_scale_2"] = torch.tensor(0.01)
+                checkpoint[f"{target}.weight"] = packed[rows].clone()
+                checkpoint[f"{target}.weight_scale"] = block_scales[rows].clone()
+                checkpoint[f"{target}.weight_scale_2"] = weight_scale_2.clone()
             else:
-                checkpoint[f"{target}.weight"] = (
-                    torch.randn(n, in_features, generator=generator) * 0.05
-                ).to(torch.float8_e4m3fn)
-                checkpoint[f"{target}.weight_scale"] = torch.tensor(0.02)
-            checkpoint[f"{target}.input_scale"] = torch.tensor(0.5)
+                checkpoint[f"{target}.weight"] = fp8_weight[rows].clone()
+                checkpoint[f"{target}.weight_scale"] = weight_scale.clone()
+            checkpoint[f"{target}.input_scale"] = input_scale.clone()
             if module.bias is not None:
                 checkpoint[f"{target}.bias"] = torch.randn(n, generator=generator) * 0.01
     return checkpoint
@@ -1891,6 +1911,26 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
         assert not getattr(model, name).has_any_quant
         assert getattr(model, name).weight.dtype == torch.float32
 
+    # The loaded scales must give finite dequantised weights, and every quantized Linear must
+    # produce a finite output, so a failure names the first GEMM that does not.
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    non_finite: list[str] = []
+    handles = []
+    for name, module in model.named_modules():
+        if not isinstance(module, Linear) or not module.has_any_quant:
+            continue
+        assert torch.isfinite(module.weight_scale.float()).all(), name
+        assert torch.isfinite(module.input_scale.float()).all(), name
+        if quant_algo == QuantAlgo.FP8:
+            assert torch.isfinite(module.weight.float() * module.weight_scale.float()).all(), name
+
+        def record(_module, _inputs, output, name=name) -> None:
+            if not torch.isfinite(output).all():
+                non_finite.append(f"{name} {tuple(_inputs[0].shape)} -> {tuple(output.shape)}")
+
+        handles.append(module.register_forward_hook(record))
+
     # Rows: two text tokens, two video tokens, one audio token.
     device = "cuda"
     with torch.inference_mode():
@@ -1912,6 +1952,9 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
             text_indices=torch.tensor([0, 1], device=device),
             return_dict=False,
         )
+    for handle in handles:
+        handle.remove()
     assert video.shape == (1, 2, shapes["in_channels"])
     assert audio.shape == (1, 1, shapes["audio_in_channels"])
+    assert not non_finite, f"non-finite Linear outputs (first: {non_finite[0]})"
     assert torch.isfinite(video).all() and torch.isfinite(audio).all()
