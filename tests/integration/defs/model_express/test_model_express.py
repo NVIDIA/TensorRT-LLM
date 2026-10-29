@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from defs.conftest import skip_no_hopper
 from defs.model_express.mx_harness import (
     ROLES,
     MxE2ECase,
@@ -107,6 +108,26 @@ _MX_CASES = (
         ),
         id="qwen3-bf16-tp2",
         marks=pytest.mark.skip_less_device(4),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_FP8_MODEL",
+            default_model_subdir="Qwen3/Qwen3-8B-FP8",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-fp8-block-tp1",
+            tp_size=1,
+        ),
+        id="qwen3-fp8-block-tp1",
+        marks=(pytest.mark.skip_less_device(2), skip_no_hopper),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_FP8_MODEL",
+            default_model_subdir="Qwen3/Qwen3-8B-FP8",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-fp8-block-tp2",
+            tp_size=2,
+        ),
+        id="qwen3-fp8-block-tp2",
+        marks=(pytest.mark.skip_less_device(4), skip_no_hopper),
     ),
     pytest.param(
         MxE2ECase(

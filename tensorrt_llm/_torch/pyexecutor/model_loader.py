@@ -22,6 +22,7 @@ from tensorrt_llm._torch.weight_sharing import (
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
@@ -111,6 +112,44 @@ _MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     sliding_windows=frozenset({"none"}),
 )
+
+
+def _with_fp8_block_scale_weights(
+    constraints: PostTransformRuntimeConstraints,
+    sm_versions: frozenset[int] | set[int],
+) -> PostTransformRuntimeConstraints:
+    """Admit FP8 block-scale (128x128) weights to an unquantized dense row.
+
+    FP8BlockScalesLinearMethod realizes a different weight and scale layout
+    per GPU architecture: SM90 keeps checkpoint-layout E4M3 weights and FP32
+    block scales, while other architectures can resmooth the weights and
+    repack the scales in transform_weights(). Each FP8 row therefore pins the
+    SM versions whose layout its transform-layout ABI describes. It also
+    requires the checkpoint to declare 128x128 weight blocks in its Hugging
+    Face quantization config, so a source that declares no block size or
+    another one falls back. The KV cache, activation dtype, and every other
+    dimension keep the base row's constraints, so `force_dynamic_quantization`
+    stays excluded.
+
+    Args:
+        constraints: An unquantized dense row's runtime constraints.
+        sm_versions: SM versions that realize the row's FP8 layout.
+
+    Returns:
+        The same constraints with declared 128x128 FP8 block-scale weights on
+        `sm_versions`.
+    """
+    return replace(
+        constraints,
+        quant_algorithms=frozenset({QuantAlgo.FP8_BLOCK_SCALES.value}),
+        sm_versions=frozenset(sm_versions),
+        weight_block_sizes=frozenset({(128, 128)}),
+    )
+
+
+_MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS = (
+    _with_fp8_block_scale_weights(_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
+                                  {90}))
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -794,6 +833,24 @@ class ModelLoader:
             transform_abi_id=QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        # Ahead of the BF16 Qwen3 row: when both rows miss by one dimension,
+        # qualify() reports the first, so an FP8 load on another SM reports
+        # `sm_version` rather than `quant_algorithm`.
+        PostTransformProfile(
+            profile_id="qwen3-for-causal-lm-fp8-block-sm90-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3",
+                "Qwen3ForCausalLM"),
+            architecture="Qwen3ForCausalLM",
+            model_type="qwen3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=
+            QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=
+            _MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS,
         ),
         PostTransformProfile(
             profile_id="qwen3-for-causal-lm-bf16-target-v1",
@@ -1761,7 +1818,7 @@ class ModelLoader:
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             enabled_features=frozenset(enabled_features),
             runtime_config=PostTransformRuntimeConfig.from_model_config(
-                model.model_config, model=model),
+                model.model_config, model=model, sm_version=get_sm_version()),
         )
 
     def _dump_final_weight_manifest(

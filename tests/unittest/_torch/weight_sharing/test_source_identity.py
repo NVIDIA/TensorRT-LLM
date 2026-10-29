@@ -33,17 +33,22 @@ from _source_identity_fakes import (
     make_artifact_identity,
 )
 
+from tensorrt_llm import _utils as utils_mod
+from tensorrt_llm._torch import model_config as model_config_mod
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
     check_weight_sharing_compatibility,
 )
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -83,6 +88,7 @@ def test_from_model_config_requires_one_artifact_source() -> None:
         PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+        QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     ],
 )
 def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:
@@ -433,3 +439,82 @@ def test_format_version_mismatch_never_matches():
     assert not result.matched
     assert "format_version" in result.mismatched_fields
     assert enforce_decision.should_share is False
+
+
+def _fp8_block_config(**kwargs: object) -> FakeModelConfig:
+    return FakeModelConfig(quant_config=FakeQuantConfig("FP8_BLOCK_SCALES"), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [IdentityCheckPolicy.WARN_FALLBACK, IdentityCheckPolicy.ENFORCE],
+)
+@pytest.mark.parametrize(
+    "source_abi, shares",
+    [
+        pytest.param(
+            QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1, True, id="same"
+        ),
+        pytest.param(None, False, id="missing"),
+        pytest.param(QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="qwen3-bf16"),
+        pytest.param(LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="llama"),
+        pytest.param(QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="qwen2"),
+        pytest.param(MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="mistral"),
+        pytest.param(PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="phi3"),
+    ],
+)
+def test_qwen3_fp8_block_transform_abi_shares_only_with_the_same_abi(
+    source_abi: str | None,
+    shares: bool,
+    policy: IdentityCheckPolicy,
+) -> None:
+    local = identity_from(
+        _fp8_block_config(),
+        transform_abi_id=QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+    source = identity_from(_fp8_block_config(), transform_abi_id=source_abi)
+
+    decision = check_weight_sharing_compatibility(local, source, policy)
+
+    assert decision.should_share is shares
+
+
+def _fp8_block_identity_on_device(
+    monkeypatch: pytest.MonkeyPatch, sm_version: int
+) -> tuple[str, SourceIdentity]:
+    """Resolve the AUTO MoE backend and build an FP8 block-scale identity on `sm_version`."""
+
+    def _is_sm_100f(*_args: object, **_kwargs: object) -> bool:
+        return 100 <= sm_version < 110
+
+    for module in (utils_mod, model_config_mod):
+        monkeypatch.setattr(module, "get_sm_version", lambda: sm_version)
+        monkeypatch.setattr(module, "is_sm_100f", _is_sm_100f)
+    moe_backend = model_config_mod.ModelConfig.resolve_moe_backend(
+        "AUTO",
+        "Qwen3ForCausalLM",
+        QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    )
+    identity = identity_from(
+        _fp8_block_config(moe_backend=moe_backend),
+        transform_abi_id=QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+    return moe_backend, identity
+
+
+def test_fp8_block_identity_does_not_record_the_device_sm(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SM90 and SM120 resolve the same backends, so their identities must
+    # serialize identically: SourceIdentity records no SM version.
+    sm90_backend, sm90 = _fp8_block_identity_on_device(monkeypatch, 90)
+    sm120_backend, sm120 = _fp8_block_identity_on_device(monkeypatch, 120)
+    sm100_backend, sm100 = _fp8_block_identity_on_device(monkeypatch, 100)
+
+    assert (sm90_backend, sm120_backend, sm100_backend) == ("CUTLASS", "CUTLASS", "TRTLLM")
+    assert sm90.to_dict() == sm120.to_dict()
+    assert not any("sm" in key.split("_") for key in sm90.to_dict())
+    assert sm90.matches(sm120).matched
+    # A default SM100-family device differs only through the MoE backend that
+    # AUTO resolves for FP8 block scales.
+    sm100_result = sm90.matches(sm100)
+    assert not sm100_result.matched
+    assert sm100_result.mismatched_fields == ["backend_fingerprint"]
