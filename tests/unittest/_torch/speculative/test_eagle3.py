@@ -106,7 +106,7 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
             worker,
             {"position_ids": torch.tensor([0], dtype=torch.int32)},
             metadata,
-            SimpleNamespace(runtime_draft_len=1),
+            SimpleNamespace(runtime_draft_len=1, is_cuda_graph=False),
             draft_model=object(),
             draft_kv_cache_manager=draft_manager,
             num_contexts=0,
