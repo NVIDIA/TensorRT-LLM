@@ -3593,6 +3593,9 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     stub._cancel_queued_context_requests = types.MethodType(
         PyExecutor._cancel_queued_context_requests, stub
     )
+    stub._take_cancelled_context_requests = types.MethodType(
+        PyExecutor._take_cancelled_context_requests, stub
+    )
     stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
 
     def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
@@ -3683,6 +3686,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         "_get_request_admission_capacity",
         "_pop_from_waiting_queue",
         "_cancel_queued_context_requests",
+        "_take_cancelled_context_requests",
     ):
         setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
     live = []
@@ -4786,6 +4790,7 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.speculation_permanently_disabled = False
         ex.active_requests = active_requests
         ex.waiting_queue = []
+        ex.canceled_req_ids = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._pad_attention_dp_dummy_request = Mock()
