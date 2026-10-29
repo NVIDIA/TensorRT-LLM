@@ -17,6 +17,7 @@ import sys
 
 import pytest
 import torch
+from _torch.helpers import calc_diff
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
@@ -1018,6 +1019,44 @@ def test_nvfp4_gemm_cutedsl(m, with_bias, monkeypatch, tmp_path):
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, cached, rtol=0, atol=0)
     tuner.clear_cache()
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE
+                    or get_sm_version() not in (100, 103),
+                    reason="Requires SM100/SM103 CuTe DSL")
+@pytest.mark.parametrize("m", [64, 256])
+@pytest.mark.parametrize("split_k", [2, 4, 8])
+def test_nvfp4_gemm_cutedsl_split_k(m, split_k):
+    """The full sweep splits long K for small N with and without swapping A
+    and B, and every split launch computes the product, also on graph replay."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    n, k = 512, 7168
+    x = torch.randn(m, k, dtype=dtype, device="cuda")
+    w = torch.randn(n, k, dtype=dtype, device="cuda")
+    x_scale = 2688 / x.abs().max().float()
+    w_scale = 2688 / w.abs().max().float()
+    x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(x, x_scale, 16, False)
+    w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w, w_scale, 16, False)
+    alpha = (1 / (x_scale * w_scale)).reshape(1)
+    inputs = [x_fp4, w_fp4, x_sf, w_sf, alpha]
+    reference = torch.ops.trtllm.nvfp4_gemm_cutlass(*inputs, dtype)
+
+    runner = cute_dsl_custom_ops.CuteDSLNVFP4BlackwellRunner(dtype)
+    swap_ab = m <= 128
+    tactic = ((128, 128), (1, 1), swap_ab, False, 1, True, split_k)
+    assert tactic in runner.get_valid_tactics(inputs, None)
+    with torch.inference_mode():
+        assert calc_diff(runner(inputs, tactic=tactic), reference) < 1e-4
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = runner(inputs, tactic=tactic)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert calc_diff(output, reference) < 1e-4
 
 
 def _skip_if_no_locality_domain():
