@@ -1911,6 +1911,9 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
     """A ModelOpt-style export goes through ``load_weights`` and one forward on the static path."""
     shapes = _STATIC_QUANT_SHAPES | {"num_layers": 1, "num_refiner_layers": 1}
     reference = h3.MiniMaxH3Transformer3DModel(_make_model_config(**shapes))
+    # TRT-LLM Linears allocate their parameters uninitialised; the non-quantized tensors
+    # (the FP32 media projections among them) reach the checkpoint from this state.
+    _initialize_diffusers_golden_weights(reference)
     reference_state = {k: v.detach().cpu() for k, v in reference.state_dict().items()}
     del reference
 
