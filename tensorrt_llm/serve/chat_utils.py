@@ -19,8 +19,7 @@ from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  MultimodalData, MultimodalDataTracker,
                                  load_base64_image_embeds)
 from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, BaseMediaIO,
-                                          is_local_media_url,
-                                          resolve_allowed_local_media_path)
+                                          is_local_media_url)
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
@@ -117,12 +116,14 @@ async def _load_request_media(media_io: BaseMediaIO, url: str) -> Any:
     """Load one media URL taken from a request.
 
     A local reference (`file://` URI or bare path) is read only from the
-    directory allowed by `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`; see
-    `resolve_allowed_local_media_path`. The check runs when the load is
-    awaited, so a request whose media is discarded unread is unaffected.
+    directory allowed by `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`, through
+    `BaseMediaIO.async_load_allowed_local_file`: the file is read once on the
+    media executor and decoded from its bytes like remote media. The check
+    runs when the load is awaited, so a request whose media is discarded
+    unread is unaffected.
     """
     if is_local_media_url(url):
-        url = resolve_allowed_local_media_path(url)
+        return await media_io.async_load_allowed_local_file(url)
     return await media_io.async_load(url)
 
 

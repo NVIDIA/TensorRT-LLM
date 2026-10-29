@@ -4,6 +4,7 @@
 
 import asyncio
 import base64
+import errno
 import functools
 import ipaddress
 import math
@@ -915,20 +916,32 @@ def _normalize_file_uri(uri: str) -> str:
 # offline Python API does not go through this check.
 _ALLOWED_LOCAL_MEDIA_PATH_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
 
+# Flags for the single open of a request-supplied local file. Each is left
+# out on a platform that lacks it; the fstat checks on the open descriptor
+# apply either way.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
 
 def is_local_media_url(url: str) -> bool:
     """Whether *url* names a server-side file (a `file://` URI or a bare path)."""
     return urlparse(url).scheme in ("", "file")
 
 
-def resolve_allowed_local_media_path(url: str) -> str:
-    """Return the resolved path of a request-supplied local media reference.
+def read_allowed_local_media(url: str) -> bytes:
+    """Read a request-supplied local media reference and return its bytes.
 
     Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` names a
     directory, the reference resolves (symlinks and ``..`` included) to a path
     inside it, and that path is a regular file within the media size limit. A
     reference refused for its location gets the same message whether or not it
     exists.
+
+    The file is opened once, without following a symlink in its final
+    component, and the regular-file and size checks run on the open descriptor.
+    An entry swapped for a symlink, FIFO or device after the path was resolved
+    is therefore refused instead of read. Blocking; call it on an executor.
     """
     refused = ValueError(
         "Local media paths are not accepted by this server. Send the media as "
@@ -948,14 +961,38 @@ def resolve_allowed_local_media_path(url: str) -> str:
     resolved = os.path.realpath(_normalize_file_uri(url))
     if os.path.commonpath([root, resolved]) != root:
         raise refused
+    # `resolved` has no symlink left, so one met here appeared after resolution.
+    # O_NONBLOCK keeps a FIFO from blocking the open; the fstat below rejects it.
     try:
-        stat = os.stat(resolved)
+        fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise refused from exc
+        raise ValueError(f"Local media file could not be read: {url!r}") from exc
+    try:
+        stat = os.fstat(fd)
+        if not S_ISREG(stat.st_mode):
+            raise ValueError(f"Local media path is not a regular file: {url!r}")
+        _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
+        # Read the reported size plus one byte, so a file that grew since the
+        # fstat is noticed; only then spend the remaining budget on it.
+        budget = _MAX_RESPONSE_BYTES + 1
+        chunk_size = stat.st_size + 1
+        chunks: list[bytes] = []
+        while budget > 0:
+            chunk = os.read(fd, min(chunk_size, budget))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            budget -= len(chunk)
+            chunk_size = 1 << 20
     except OSError as exc:
         raise ValueError(f"Local media file could not be read: {url!r}") from exc
-    if not S_ISREG(stat.st_mode):
-        raise ValueError(f"Local media path is not a regular file: {url!r}")
-    _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
-    return resolved
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    _check_media_size(len(data), _MAX_RESPONSE_BYTES)
+    return data
 
 
 def _check_media_size(size: int, max_bytes: int) -> None:
@@ -1140,6 +1177,17 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     async def async_load_bytes(self, data: bytes) -> _MediaT:
         """Decode in-memory media without blocking the event loop."""
         return await self._run_in_executor(self.load_bytes, data)
+
+    async def async_load_allowed_local_file(self, url: str) -> _MediaT:
+        """Decode a request-supplied local file under the allowed-directory policy.
+
+        Reads the file with `read_allowed_local_media` and decodes its bytes in
+        the same executor step, so the decoder never reopens a path.
+        """
+        return await self._run_in_executor(self._load_allowed_local_file, url)
+
+    def _load_allowed_local_file(self, url: str) -> _MediaT:
+        return self.load_bytes(read_allowed_local_media(url))
 
     @staticmethod
     async def _run_in_executor(fn, *args, **kwargs):
