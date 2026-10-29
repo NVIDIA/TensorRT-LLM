@@ -57,6 +57,8 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -2333,3 +2335,148 @@ def test_profiling_failure_releases_resources_and_restores_response_state():
     warmup_scope.__exit__.assert_called_once()
     assert executor.enable_iter_perf_stats is True
     assert executor.set_gather_responses.call_args.args == (False,)
+
+
+@pytest.mark.parametrize(
+    ("is_disagg", "kv_cache_quant_algo", "rejected"),
+    [
+        (False, QuantAlgo.NVFP4, True),
+        (False, QuantAlgo.FP8, False),
+        (True, QuantAlgo.NVFP4, False),
+    ],
+)
+def test_agg_helix_rejects_fp4_kv_cache(is_disagg, kv_cache_quant_algo, rejected) -> None:
+    """FP4 MLA decode reads the prompt length, which agg helix keeps global."""
+    model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                quant_config=QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+            )
+        ),
+        attn_runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
+    )
+
+    def build() -> KvCacheCreator:
+        return KvCacheCreator(
+            model_engine=model_engine,
+            mapping=Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+            net_max_seq_len=1,
+            kv_connector_manager=None,
+            max_num_tokens=1,
+            max_beam_width=1,
+            tokens_per_block=1,
+            max_seq_len=1,
+            max_batch_size=1,
+            kv_cache_config=KvCacheConfig(),
+            llm_args=TorchLlmArgs(model="dummy", checkpoint_format="HF"),
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=is_disagg,
+            skip_est=True,
+        )
+
+    with patch.object(
+        KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
+    ):
+        if rejected:
+            with pytest.raises(ValueError, match="does not support an FP4 KV cache"):
+                build()
+        else:
+            build()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_agg_helix_estimation_counts_ledger_blocks(is_disagg):
+    """Aggregated helix sizes the estimation cache in global tokens: requests
+    round up to whole ledger blocks (tokens_per_block x cp)."""
+    tpb, cp = 4, 2
+    # Each request is 3 prompt tokens + 1 generated token = 4 tokens: one
+    # 8-token ledger block (8 tokens), where physical pages would give 4.
+    c = _make_creator(
+        tpb, [_make_mock_request(3) for _ in range(2)], enable_attention_dp=False, tp_size=1
+    )
+    c._mapping = Mock(
+        enable_attention_dp=False, tp_size=1, cp_size=cp, cp_config={"cp_type": CpType.HELIX}
+    )
+    c._is_disagg = is_disagg
+    if is_disagg:
+        with pytest.raises(ValueError, match="only for aggregated Helix"):
+            c._get_token_num_for_estimation()
+    else:
+        assert c._get_token_num_for_estimation() == 2 * tpb * cp
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_helix_estimation_profiles_agg_and_keeps_fraction_for_disagg(is_disagg) -> None:
+    """Aggregated helix sizes the KV budget from the measured peak, like a
+    model without CP; disaggregated helix keeps fraction sizing."""
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    model_engine = Mock()
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    model_engine.model.model_config.is_encoder_decoder = False
+    model_engine.model.model_config.quant_config = None
+    model_engine.attn_runtime_features = AttentionRuntimeFeatures(chunked_prefill=True)
+    model_engine.mm_encoder_output_budget_bytes = None
+    model_engine.mm_encoder_cache = None
+    with patch.object(
+        KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            mapping=Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+            net_max_seq_len=4096,
+            kv_connector_manager=None,
+            max_num_tokens=256,
+            max_beam_width=1,
+            tokens_per_block=128,
+            max_seq_len=4096,
+            max_batch_size=8,
+            kv_cache_config=kv_cache_config,
+            llm_args=Mock(cache_transceiver_config=None, enable_chunked_prefill=True),
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=is_disagg,
+        )
+    creator._mla_chunked_profile_length = None
+    py_executor = Mock()
+    py_executor.warmup_scope.return_value = nullcontext()
+    py_executor.dist.mapping.rank = 0
+    py_executor.dist.broadcast.side_effect = lambda value, root: value
+    py_executor.enqueue_requests.return_value = [1]
+    py_executor.await_responses.return_value = []
+    kv_manager = Mock()
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
+    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+
+    with (
+        patch.object(creator, "_get_token_num_for_estimation", return_value=256),
+        patch.object(creator, "_cal_max_memory", return_value=512),
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(
+            torch.cuda,
+            "memory_stats",
+            return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 256},
+        ),
+        patch.object(creator, "_encode_dummy_inputs", return_value=None),
+        patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=3)),
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
+            return_value=0,
+        ),
+    ):
+        estimating = creator.try_prepare_estimation()
+        creator.configure_kv_cache_capacity(py_executor if estimating else None)
+
+    if is_disagg:
+        assert not estimating
+        py_executor.start_worker.assert_not_called()
+        assert kv_cache_config.max_gpu_total_bytes == int(768 * 0.9)  # fraction of free
+    else:
+        assert estimating
+        py_executor.start_worker.assert_called_once()  # dummy prefill ran
+        assert kv_cache_config.max_gpu_total_bytes == 512  # measured, per GPU
+        assert kv_cache_config.max_tokens is None  # temporary estimation size not kept

@@ -403,8 +403,8 @@ def test_host_tier_allowed_under_agg_helix(host_cache_size: Optional[int]) -> No
 
 
 def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
-    """Helix disables estimation; with a V2 manager it must also promote
-    _skip_est so build_managers() calls configure_kv_cache_capacity().
+    """Disaggregated helix disables estimation; with a V2 manager it must also
+    promote _skip_est so build_managers() calls configure_kv_cache_capacity().
     Other CP types must NOT be promoted: configure_kv_cache_capacity has no
     sizing path for them."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
@@ -413,6 +413,7 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     def creator(is_v2, cp_type=CpType.HELIX):
         return SimpleNamespace(
             _skip_est=False,
+            _is_disagg=True,
             _mapping=SimpleNamespace(cp_config={"cp_type": cp_type}),
             _is_kv_cache_manager_v2=is_v2,
             _model_engine=SimpleNamespace(
