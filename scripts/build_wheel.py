@@ -698,9 +698,10 @@ def sync_tree(src: Path,
 
     With ``hard_link``, files are hard-linked to their source instead of
     copied when src and dst are on the same filesystem (see
-    `link_or_copy_file`). A file that already is a hard link to its source is
-    always current and is skipped. After one failed link, the rest of the
-    tree is copied.
+    `link_or_copy_file`). A file that already shares its source's inode has
+    the source's current content, so it is skipped. Once the source is
+    replaced by a new file, the inodes differ and the file is linked again.
+    After one failed link, the rest of the tree is copied.
     """
     import fnmatch
 
