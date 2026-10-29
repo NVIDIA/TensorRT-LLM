@@ -567,6 +567,65 @@ def test_unconstrained_sm_version_admits_every_architecture(sm_version: int | No
     assert constraints.unsupported_dimensions(_runtime_config(sm_version=sm_version)) == frozenset()
 
 
+@pytest.mark.parametrize(
+    "quantization_config, expected",
+    [
+        pytest.param(
+            {"quant_method": "fp8", "weight_block_size": [128, 128]}, (128, 128), id="hf-dict"
+        ),
+        pytest.param(SimpleNamespace(weight_block_size=(128, 128)), (128, 128), id="parsed-config"),
+        pytest.param({"quant_method": "fp8", "weight_block_size": [1, 128]}, (1, 128), id="1x128"),
+        pytest.param({"quant_method": "fp8", "activation_scheme": "static"}, None, id="undeclared"),
+        pytest.param({"weight_block_size": []}, None, id="empty"),
+        pytest.param({"weight_block_size": ["128", 128]}, None, id="string-entry"),
+        pytest.param({"weight_block_size": [True, 128]}, None, id="bool-entry"),
+        pytest.param({"weight_block_size": 128}, None, id="scalar"),
+        pytest.param(None, None, id="unquantized"),
+    ],
+)
+def test_runtime_config_records_declared_weight_block_size(
+    quantization_config: object,
+    expected: tuple[int, ...] | None,
+) -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=SimpleNamespace(quantization_config=quantization_config))
+    )
+
+    assert runtime_config.weight_block_size == expected
+
+
+def test_runtime_config_leaves_weight_block_size_unknown_by_default() -> None:
+    assert PostTransformRuntimeConfig.from_model_config(SimpleNamespace()).weight_block_size is None
+    assert _runtime_config().weight_block_size is None
+
+
+@pytest.mark.parametrize("weight_block_size", [None, (1, 128), (64, 64), (128,), (128, 128, 1)])
+def test_weight_block_size_constraint_rejects_other_block_sizes(
+    weight_block_size: tuple[int, ...] | None,
+) -> None:
+    constraints = PostTransformRuntimeConstraints(weight_block_sizes=frozenset({(128, 128)}))
+
+    assert (
+        constraints.unsupported_dimensions(_runtime_config(weight_block_size=(128, 128)))
+        == frozenset()
+    )
+    assert constraints.unsupported_dimensions(
+        _runtime_config(weight_block_size=weight_block_size)
+    ) == frozenset({"weight_block_size"})
+
+
+@pytest.mark.parametrize("weight_block_size", [None, (1, 128), (128, 128)])
+def test_unconstrained_weight_block_size_admits_every_block_size(
+    weight_block_size: tuple[int, ...] | None,
+) -> None:
+    constraints = PostTransformRuntimeConstraints(dtypes=frozenset({"bfloat16"}))
+
+    assert (
+        constraints.unsupported_dimensions(_runtime_config(weight_block_size=weight_block_size))
+        == frozenset()
+    )
+
+
 def test_rows_pinned_to_different_sm_versions_do_not_overlap() -> None:
     sm90 = PostTransformRuntimeConstraints(sm_versions=frozenset({90}))
     sm100 = PostTransformRuntimeConstraints(sm_versions=frozenset({100, 103}))

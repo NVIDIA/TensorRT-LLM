@@ -135,6 +135,26 @@ def _canonical_optional_string(container: object, attribute: str) -> str | None:
     return "none" if value is None else _canonical_string(value)
 
 
+def _declared_weight_block_size(pretrained_config: object) -> tuple[int, ...] | None:
+    """Return the weight block size a checkpoint's quantization config declares.
+
+    Hugging Face FP8 checkpoints declare `weight_block_size` in
+    `quantization_config`, either as a dict entry or as an attribute of a parsed
+    config. The result is `None` when no block size is declared or the value is
+    not a non-empty sequence of `int`, so a row that constrains
+    `weight_block_sizes` rejects it.
+    """
+    quantization_config = getattr(pretrained_config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        block_size = quantization_config.get("weight_block_size")
+    else:
+        block_size = getattr(quantization_config, "weight_block_size", None)
+    if not isinstance(block_size, (list, tuple)) or not block_size:
+        return None
+    canonical_block_size = tuple(_canonical_int(value) for value in block_size)
+    return None if None in canonical_block_size else canonical_block_size
+
+
 @dataclass(frozen=True)
 class PostTransformConfigIdentity:
     """Canonical model identity captured before constructor normalization."""
@@ -193,6 +213,10 @@ class PostTransformRuntimeConfig:
     # different tensor layout per architecture. A row that constrains
     # `sm_versions` rejects an unknown SM, so the default fails closed.
     sm_version: int | None = None
+    # Weight block size declared by the checkpoint's Hugging Face quantization
+    # config, or `None` when it declares none. A row that constrains
+    # `weight_block_sizes` rejects an undeclared block size.
+    weight_block_size: tuple[int, ...] | None = None
 
     @classmethod
     def from_model_config(
@@ -275,6 +299,7 @@ class PostTransformRuntimeConfig:
             rope_fusion=rope_fusion,
             sliding_window=sliding_window,
             sm_version=_canonical_int(sm_version),
+            weight_block_size=_declared_weight_block_size(pretrained_config),
         )
 
 
@@ -306,6 +331,7 @@ class PostTransformRuntimeConstraints:
         ("rope_fusion", "rope_fusion"),
         ("sliding_windows", "sliding_window"),
         ("sm_versions", "sm_version"),
+        ("weight_block_sizes", "weight_block_size"),
     )
 
     dtypes: frozenset[str | None] | None = None
@@ -331,6 +357,7 @@ class PostTransformRuntimeConstraints:
     rope_fusion: frozenset[bool | None] | None = None
     sliding_windows: frozenset[str | None] | None = None
     sm_versions: frozenset[int | None] | None = None
+    weight_block_sizes: frozenset[tuple[int, ...] | None] | None = None
 
     def __post_init__(self) -> None:
         for constraint_name, _runtime_name in self._DIMENSIONS:

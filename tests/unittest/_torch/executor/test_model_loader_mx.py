@@ -430,6 +430,13 @@ def _tiny_qwen3_fp8_block_model(
         num_attention_heads=4,
         num_hidden_layers=2,
         num_key_value_heads=2,
+        # The quantization config the Qwen3 FP8 checkpoints declare.
+        quantization_config={
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [_FP8_BLOCK_SIZE, _FP8_BLOCK_SIZE],
+        },
         rms_norm_eps=1e-6,
         rope_scaling=None,
         tie_word_embeddings=False,
@@ -681,6 +688,7 @@ def _fp8_block_runtime_config(**overrides: object) -> PostTransformRuntimeConfig
         "quant_algorithm": QuantAlgo.FP8_BLOCK_SCALES.value,
         "rope_fusion": False,
         "sm_version": 90,
+        "weight_block_size": (_FP8_BLOCK_SIZE, _FP8_BLOCK_SIZE),
     }
     values.update(overrides)
     return _bf16_dense_runtime_config(**values)
@@ -895,14 +903,15 @@ def _format_documented_values(
     return " or ".join(labels.get(value, str(value)) for value in sorted(values, key=str))
 
 
-# Documented weight-quantization envelopes, keyed by the quant_algorithms and
-# sm_versions constraints of a dense row. A row with any other combination needs
-# its own description here and in the support table.
+# Documented weight-quantization envelopes, keyed by the quant_algorithms,
+# sm_versions, and weight_block_sizes constraints of a dense row. A row with any
+# other combination needs its own description here and in the support table.
 _DOCUMENTED_DENSE_QUANTIZATION = {
-    (frozenset({"none"}), None): "unquantized weights and KV cache",
+    (frozenset({"none"}), None, None): "unquantized weights and KV cache",
     (
         frozenset({QuantAlgo.FP8_BLOCK_SCALES.value}),
         frozenset({90}),
+        frozenset({(128, 128)}),
     ): "FP8 block-scale (128x128) weights and unquantized KV cache, SM90 only",
 }
 
@@ -910,7 +919,7 @@ _DOCUMENTED_DENSE_QUANTIZATION = {
 def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     constraints = profile.runtime_constraints
     quantization = _DOCUMENTED_DENSE_QUANTIZATION[
-        (constraints.quant_algorithms, constraints.sm_versions)
+        (constraints.quant_algorithms, constraints.sm_versions, constraints.weight_block_sizes)
     ]
     assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
     assert constraints.layerwise_quantization == frozenset({False})
@@ -2623,6 +2632,7 @@ def test_qwen3_fp8_block_profile_is_the_sm90_variant_of_the_bf16_row() -> None:
         bf16_profile.runtime_constraints,
         quant_algorithms=frozenset({"FP8_BLOCK_SCALES"}),
         sm_versions=frozenset({90}),
+        weight_block_sizes=frozenset({(128, 128)}),
     )
     assert not fp8_profile.runtime_constraints.overlaps(bf16_profile.runtime_constraints)
     assert fp8_profile.supported_features == bf16_profile.supported_features == frozenset()
@@ -2732,6 +2742,21 @@ def test_qwen3_fp8_block_profile_rejects_other_sm_versions(sm_version: int | Non
         ),
         pytest.param({"rope_type": "yarn"}, {"rope_type"}, id="yarn"),
         pytest.param({"rope_fusion": True}, {"rope_fusion"}, id="fused-rope"),
+        pytest.param(
+            {"weight_block_size": None},
+            {"weight_block_size"},
+            id="undeclared-weight-block-size",
+        ),
+        pytest.param(
+            {"weight_block_size": (1, 128)},
+            {"weight_block_size"},
+            id="1x128-weight-blocks",
+        ),
+        pytest.param(
+            {"weight_block_size": (64, 64)},
+            {"weight_block_size"},
+            id="64x64-weight-blocks",
+        ),
     ],
 )
 def test_qwen3_fp8_block_profile_rejects_unqualified_runtime_variants(

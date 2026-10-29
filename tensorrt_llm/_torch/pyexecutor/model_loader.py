@@ -124,21 +124,26 @@ def _with_fp8_block_scale_weights(
     per GPU architecture: SM90 keeps checkpoint-layout E4M3 weights and FP32
     block scales, while other architectures can resmooth the weights and
     repack the scales in transform_weights(). Each FP8 row therefore pins the
-    SM versions whose layout its transform-layout ABI describes. The KV cache,
-    activation dtype, and every other dimension keep the base row's
-    constraints, so `force_dynamic_quantization` stays excluded.
+    SM versions whose layout its transform-layout ABI describes. It also
+    requires the checkpoint to declare 128x128 weight blocks in its Hugging
+    Face quantization config, so a source that declares no block size or
+    another one falls back. The KV cache, activation dtype, and every other
+    dimension keep the base row's constraints, so `force_dynamic_quantization`
+    stays excluded.
 
     Args:
         constraints: An unquantized dense row's runtime constraints.
         sm_versions: SM versions that realize the row's FP8 layout.
 
     Returns:
-        The same constraints with FP8 block-scale weights on `sm_versions`.
+        The same constraints with declared 128x128 FP8 block-scale weights on
+        `sm_versions`.
     """
     return replace(
         constraints,
         quant_algorithms=frozenset({QuantAlgo.FP8_BLOCK_SCALES.value}),
         sm_versions=frozenset(sm_versions),
+        weight_block_sizes=frozenset({(128, 128)}),
     )
 
 

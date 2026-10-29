@@ -85,15 +85,14 @@ value. Until the model code stops recording it, run both sides with the same
 `max_seq_len`.
 
 The Qwen3 FP8 block-scale identity covers `Qwen3ForCausalLM` / `qwen3`
-checkpoints whose quantization resolves to `FP8_BLOCK_SCALES` with 128x128
-weight blocks and an unquantized KV cache; Qwen3-8B-FP8 (`quant_method: fp8`,
-`weight_block_size: [128, 128]`, dynamic activations) is the qualified canary.
-Other sources that resolve to the same algorithm, such as static-activation FP8
-checkpoints or ModelOpt and compressed-tensors block FP8 exports, meet the same
-constraints, and any calibrated activation scale they load is transferred byte
-for byte; only the canary has end-to-end evidence. Per-tensor FP8 checkpoints
-(ModelOpt `FP8`), an FP8 KV cache, and every GPU other than SM90 do not match
-this profile. On SM100-family GPUs (by default) and SM120 GPUs,
+checkpoints whose quantization resolves to `FP8_BLOCK_SCALES`, whose Hugging
+Face quantization config declares `weight_block_size: [128, 128]`, and that run
+with an unquantized KV cache; Qwen3-8B-FP8 (`quant_method: fp8`, dynamic
+activations) is the qualified canary. Sources that resolve to the same algorithm
+without declaring that block size, such as static-activation FP8 checkpoints or
+ModelOpt and compressed-tensors block FP8 exports, do not match this profile,
+and neither do per-tensor FP8 checkpoints (ModelOpt `FP8`), an FP8 KV cache, or
+any GPU other than SM90. On SM100-family GPUs (by default) and SM120 GPUs,
 `transform_weights()` resmooths the weights to power-of-two scales and repacks
 the scales for DeepGEMM, and SM107 can use a CuTe DSL scale layout, so the SM90
 tensors are not valid there. Such loads fall back to the Hugging Face path.
