@@ -1135,6 +1135,66 @@ TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStor
     return result;
 }
 
+namespace
+{
+SlotCount arenaMinSlotsOf(TypedVec<PoolGroupIndex, SlotCount> const& minSlots, PoolGroupIndex pgIdx)
+{
+    return std::max(minSlots[pgIdx], SlotCount{1});
+}
+
+// computeArenaWindows: smallest share that still yields minSlots after its step 2. Each boundary snaps
+// by up to half the larger neighbouring slot size (a full one is reserved), and rounding to whole
+// blocks at the two ends loses under one block each.
+double singlePoolArenaFloorBytes(TypedVec<PoolGroupIndex, size_t> const& slotSizes,
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, PoolGroupIndex pgIdx)
+{
+    PoolGroupIndex const numPg = slotSizes.size();
+    size_t const s = slotSizes[pgIdx];
+    size_t margin = 2 * s;
+    if (pgIdx > PoolGroupIndex{0})
+        margin += std::max(s, slotSizes[pgIdx - 1]);
+    if (pgIdx + 1 < numPg)
+        margin += std::max(s, slotSizes[pgIdx + 1]);
+    return static_cast<double>(slotCountToSizeT(arenaMinSlotsOf(minSlots, pgIdx)) * s + margin);
+}
+
+// computeArenaPoolWindows: a pool loses under one of its blocks where its share begins (rounding up
+// to a whole block) and under one where it ends; the group then keeps the count every pool reaches.
+double multiPoolArenaFloorBytes(
+    size_t perSlot, TypedVec<PoolGroupIndex, SlotCount> const& minSlots, PoolGroupIndex pgIdx)
+{
+    return static_cast<double>((slotCountToSizeT(arenaMinSlotsOf(minSlots, pgIdx)) + 2) * perSlot);
+}
+} // namespace
+
+size_t ArenaGpuCacheLevelStorage::minArenaBytes(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizes,
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
+{
+    PoolGroupIndex const numPg = slotSizes.size();
+    TLLM_CHECK_WITH_INFO(minSlots.size() == numPg, "minArenaBytes: min slots must have one entry per pool group");
+    bool const singlePools = std::all_of(
+        slotSizes.begin(), slotSizes.end(), [](auto const& sizes) { return sizes.size() == PoolIndex{1}; });
+    double total = 0.0;
+    TypedVec<PoolGroupIndex, size_t> groupSizes;
+    for (auto const& sizes : slotSizes)
+        groupSizes.push_back(sizes[PoolIndex{0}]);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        if (singlePools)
+        {
+            total += singlePoolArenaFloorBytes(groupSizes, minSlots, pgIdx);
+        }
+        else
+        {
+            size_t perSlot = 0;
+            for (size_t const s : slotSizes[pgIdx])
+                perSlot += s;
+            total += multiPoolArenaFloorBytes(perSlot, minSlots, pgIdx);
+        }
+    }
+    return static_cast<size_t>(std::ceil(total));
+}
+
 TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStorage::computePoolWindows(
     TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
@@ -1178,11 +1238,8 @@ TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStor
             perSlot[pgIdx] += s;
         }
     }
-    auto minSlotsOf = [&](PoolGroupIndex pgIdx) { return std::max(minSlots[pgIdx], SlotCount{1}); };
-    // A pool loses under one of its blocks where its share begins (rounding up to a whole block) and
-    // under one where it ends; the group then keeps the count every pool reaches.
-    auto floorBytesOf = [&](PoolGroupIndex pgIdx)
-    { return static_cast<double>((slotCountToSizeT(minSlotsOf(pgIdx)) + 2) * perSlot[pgIdx]); };
+    auto minSlotsOf = [&](PoolGroupIndex pgIdx) { return arenaMinSlotsOf(minSlots, pgIdx); };
+    auto floorBytesOf = [&](PoolGroupIndex pgIdx) { return multiPoolArenaFloorBytes(perSlot[pgIdx], minSlots, pgIdx); };
 
     // 1. Byte share per group, pinning groups below their floor as computeArenaWindows does.
     TypedVec<PoolGroupIndex, double> share(numPg, 0.0);
@@ -1272,20 +1329,8 @@ TypedVec<PoolGroupIndex, SlotWindow> ArenaGpuCacheLevelStorage::computeArenaWind
         TLLM_CHECK_WITH_INFO(slotSizes[pgIdx] > 0 && ratioList[pgIdx] > 0.f,
             "computeArenaWindows: slot sizes and ratios must be positive");
     }
-    auto minSlotsOf = [&](PoolGroupIndex pgIdx) { return std::max(minSlots[pgIdx], SlotCount{1}); };
-    // Smallest share that still yields minSlots after step 2: each boundary snaps by up to half the
-    // larger neighbouring slot size (a full one is reserved), and rounding to whole blocks at the two
-    // ends loses under one block each.
-    auto floorBytesOf = [&](PoolGroupIndex pgIdx)
-    {
-        size_t const s = slotSizes[pgIdx];
-        size_t margin = 2 * s;
-        if (pgIdx > PoolGroupIndex{0})
-            margin += std::max(s, slotSizes[pgIdx - 1]);
-        if (pgIdx + 1 < numPg)
-            margin += std::max(s, slotSizes[pgIdx + 1]);
-        return static_cast<double>(slotCountToSizeT(minSlotsOf(pgIdx)) * s + margin);
-    };
+    auto minSlotsOf = [&](PoolGroupIndex pgIdx) { return arenaMinSlotsOf(minSlots, pgIdx); };
+    auto floorBytesOf = [&](PoolGroupIndex pgIdx) { return singlePoolArenaFloorBytes(slotSizes, minSlots, pgIdx); };
 
     // 1. Byte share per group. A group whose share would not hold its minimum is pinned to its floor
     //    and the rest is shared out again, as in ratioToSlotCountList.

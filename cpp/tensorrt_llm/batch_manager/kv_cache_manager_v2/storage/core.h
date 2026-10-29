@@ -1324,6 +1324,11 @@ public:
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizes,
         TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
 
+    //! Smallest arena for which computeArenaPoolWindows can give every group minSlots slots, for any
+    //! ratios (the sum of the per-group floors both layouts pin groups to).
+    static size_t minArenaBytes(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizes,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+
     //! Growth direction for the group at pgIdx: away from the boundary that moves.
     static SlotAllocator::Growth growthFor(PoolGroupIndex pgIdx, PoolGroupIndex numPoolGroups) noexcept;
 
