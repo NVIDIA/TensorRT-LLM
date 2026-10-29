@@ -24,7 +24,7 @@ import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
@@ -209,7 +209,7 @@ def fp8_block_scaling_bmm_out(
             mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, output
         )
         out.copy_(output)
-    elif sm_version == 120:
+    elif is_sm_120f(sm_version):
         mat1_fp8, mat1_scale = fp8_utils.per_token_quant_and_transform(mat1, need_permute102=True)
         output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
         torch.ops.trtllm.fp8_block_scaling_bmm_out(
@@ -1654,7 +1654,7 @@ class MLA(nn.Module):
             )
             bf16_bmm_op(a, b_no_transpose, output)
         else:
-            if get_sm_version() in (120, 121):
+            if is_sm_120f():
                 # `a` is a head-major transpose of a [tokens, heads, dim] buffer, so its
                 # batch stride is the token count rather than the tile extent. cuBLAS picks
                 # a TMA-based nvjet kernel for that layout on SM120/121, and
@@ -2356,7 +2356,7 @@ class MLA(nn.Module):
             self.kv_b_proj.quant_config
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
         )
-        if get_sm_version() == 120 and has_fp8_block_scales:
+        if is_sm_120f() and has_fp8_block_scales:
             self.k_b_proj_trans, self.k_b_proj_trans_scale = self.resmooth_parameters(
                 self.k_b_proj_trans, self.k_b_proj_trans_scale, recipe=(1, 128, 128)
             )
