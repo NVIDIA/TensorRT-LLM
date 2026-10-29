@@ -54,6 +54,7 @@ class _Req:
         self.context_current_position = 0
         self.context_chunk_size = 8
         self.py_draft_tokens = None
+        self.is_disagg_generation_init_state = False
 
 
 class _Batch:
@@ -78,10 +79,12 @@ def _manager(resume_ok):
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = False
     manager.num_extra_kv_tokens = 0
+    manager._mirror_uses_draft_view = False  # one-engine external drafter: target view
     manager._allocated_draft_lens = set()
     cache = MagicMock(name="kv_cache")
     cache.resize.return_value = True
     cache.capacity = 0
+    cache.history_length = 0
     manager._mirror_draft_kv_cache = MagicMock(return_value=cache)
     manager._resume_and_restore = MagicMock(return_value=resume_ok)
     manager._required_gen_capacity = MagicMock(return_value=1)
@@ -123,6 +126,39 @@ def test_context_request_is_prepared_normally_when_resume_succeeds():
 
     manager._resume_and_restore.assert_called_once()
     cache.resize.assert_called_once()
+
+
+def test_disagg_generation_init_sizes_the_mirror_from_history_and_chunk() -> None:
+    """A transferred prompt is history for the drafter's mirror, not a chunk to hold.
+
+    On a disaggregated generation worker the prompt KV arrives over the wire
+    and the one-engine drafter starts the request on a fresh slot, so the
+    mirror never holds drafter K/V for that prompt. The resize therefore
+    carries the whole prompt as history, which lets the attention window trim
+    the mirror to its tail plus the generation headroom; a history of 0 asks
+    a windowed draft pool for one prompt-sized chunk instead.
+    """
+    manager, cache = _manager(resume_ok=True)
+    req = _Req(9)
+    req.is_disagg_generation_init_state = True
+    req.context_current_position = 0
+    req.context_chunk_size = 200_000
+
+    manager._prepare_draft_resources(_Batch(context_requests=[req]))
+
+    cache.resize.assert_called_once_with(200_000, 200_000)
+
+
+def test_ordinary_context_chunk_keeps_its_start_as_history() -> None:
+    """The aggregated chunked path: history is the chunk start, not its end."""
+    manager, cache = _manager(resume_ok=True)
+    req = _Req(10)
+    req.context_current_position = 64
+    req.context_chunk_size = 8
+
+    manager._prepare_draft_resources(_Batch(context_requests=[req]))
+
+    cache.resize.assert_called_once_with(72, 64)
 
 
 def test_generation_request_still_raises_on_a_resume_refusal():
