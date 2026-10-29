@@ -165,22 +165,38 @@ def test_k3_uses_modeling_v2_selection(rule, relative):
     assert _apply(rule, path).scope == "modelingv2only"
 
 
-def test_k3_native_change_keeps_existing_kernel_and_collective_tests(rule):
+@pytest.mark.parametrize("relative", ["csrc/k3MnnvlAllreduce.cu", "target/modeling.py"])
+def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative):
     family = rule._src_root / "models/kimi_k3_vl"
     (family / "target").mkdir(parents=True)
     (family / "target/modeling.py").touch()
     (family / "routing.py").write_text("from .target.modeling import KimiK3\n")
+    prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl"
     kernel_tests = {
-        "unittest/_torch/kernels/kimi_k3/test_k3_mnnvl_comm.py",
-        "unittest/_torch/kernels/kimi_k3/test_k3_sandwich.py",
+        f"{prefix}/test_k3_mnnvl_comm.py",
+        f"{prefix}/test_k3_sandwich.py",
     }
-    matrix = "unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_allgather_split_op_matrix.py"
+    matrix = f"{prefix}/test_modeling_v2_mnnvl_allgather_split_op_matrix.py"
+    norm = f"{prefix}/test_modeling_v2_attn_res_rmsnorm_fwd.py"
+    native = f"{prefix}/test_modeling_v2_k3_native.py"
+    host = f"{prefix}/test_modeling_v2_kimi_k3_decode_step.py"
+    accuracy = "accuracy/modeling_v2/test_kimi_k3_vl.py::TestKimiK3::test_gsm8k"
+    # The broad single-GPU entry excludes the flat family directory; its
+    # single-GPU tests and collective tests have separate stage entries.
+    rule.yaml_index.blocks[0].tests.remove(_UNIT)
+    rule.yaml_index.blocks[0].tests.extend([f"{_UNIT} --ignore={prefix}", native, accuracy])
     rule.yaml_index.blocks[1].tests.extend([*sorted(kernel_tests), matrix])
-    norm = "unittest/_torch/modeling_v2/norm/test_modeling_v2_attn_res_rmsnorm_fwd.py"
     rule.yaml_index.blocks[2].tests.append(norm)
-    result = _apply(rule, f"{_PY}/models/kimi_k3_vl/csrc/k3MnnvlAllreduce.cu")
-    assert _selected(result) == kernel_tests | {matrix, norm, _COMM, _UNIT, _CLAIMS}
-    assert "B200-PyTorch-1" in result.affected_stages
+    rule.yaml_index.blocks[3].tests.append(host)
+    result = _apply(rule, f"{_PY}/models/kimi_k3_vl/{relative}")
+    selected = kernel_tests | {matrix, norm, native, host, accuracy, _CLAIMS}
+    assert _selected(result) == selected
+    assert result.affected_stages == {
+        "B300-PyTorch-1",
+        "B200-PyTorch-1",
+        "GB300-4_GPUs-PyTorch-1",
+        "CPU-Generic-x86-1",
+    }
     assert result.scope == "modelingv2only"
     other = _selected(_apply(rule, f"{_PY}/models/gpt_oss/csrc/kernel.cu"))
-    assert not (kernel_tests | {matrix, norm}) & other
+    assert not (selected - {_CLAIMS}) & other

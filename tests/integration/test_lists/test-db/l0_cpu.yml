@@ -45,9 +45,9 @@ l0_cpu:
   # The GPU lists' attention/ entries run -m "not cpu_only", so hw_agnostic/ runs only here.
   - unittest/_torch/attention
   # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
-  - unittest/_torch/kernels/kimi_k3/test_k3_mla_decode_view.py
-  - unittest/_torch/kernels/kimi_k3/test_k3_mla_launch.py
-  - unittest/_torch/kernels/kimi_k3/test_k3_kda_pool_layout.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_decode_view.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_launch.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_pool_layout.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
@@ -79,7 +79,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
   # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
-  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_step.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
