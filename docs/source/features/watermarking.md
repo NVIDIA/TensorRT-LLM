@@ -71,9 +71,13 @@ before relying on a decision. Detection outputs can help an attacker imitate or 
 ## Compatibility
 
 Watermarking works with CUDA graphs, the overlap scheduler, chunked prefill, tensor, pipeline, expert and
-attention data parallelism, disaggregated serving (configure both workers identically), guided decoding, and
-the one-model speculative modes described above. KV cache reuse, sliding window attention, logits
-post-processors, LoRA and Helix parallelism are untested. See the
+attention data parallelism, disaggregated serving (configure both workers identically), and the one-model
+speculative modes described above. A logits post-processor edits the logits before the watermark draw, so
+tokens it bans are never sampled and the mark steers among the rest (not combinable with speculative
+decoding, which the executor already rejects). With KV cache reuse, the first request matches an engine
+without reuse; a later request that hits the cache can differ in its sampled text through bf16 numerics, as
+it does without the watermark, and is still detected. Guided decoding, sliding window attention, LoRA and
+Helix parallelism are untested. See the
 [feature combination matrix](feature-combination-matrix.md).
 
 ## Limitations
@@ -82,7 +86,8 @@ post-processors, LoRA and Helix parallelism are untested. See the
 - Sampling becomes deterministic given the context. Requests with `n > 1` and the same prompt produce
   the same text until their contexts diverge, and repeated contexts are not watermarked.
 - Low-entropy output (code, short answers) and heavily edited text carry little signal.
-- A restrictive guided-decoding grammar leaves few choices and weakens the signal.
+- Guided decoding with the watermark is untested. The grammar mask is applied before the watermark draw, so
+  the mark can only steer among the tokens the grammar allows.
 - Not supported: NGram and user-provided drafts (verified in the sampler), tree (dynamic tree)
   speculation, relaxed acceptance for thinking, and ragged verification. The engine rejects these
   combinations: at startup for NGram and user-provided drafts, at admission for the others.
