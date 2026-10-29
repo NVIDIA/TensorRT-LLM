@@ -46,12 +46,27 @@ BUILDER_ID=""
 STATUS=""
 actualFatBuildLogPath=""
 FAT_BUILD_JOB_NAME="fat_build_${fatHash}"
-EXISTING=$(squeue -h -n "$FAT_BUILD_JOB_NAME" -o "%i" 2>/dev/null | head -1 || true)
+
+runningFatBuilder() {
+    squeue -h -n "$FAT_BUILD_JOB_NAME" -t RUNNING -o "%i" 2>/dev/null | head -1 || true
+}
+
+# Log file of a builder submitted by another Jenkins run (different jobUID).
+fatBuilderLogPath() {
+    scontrol show job "$1" 2>/dev/null | grep -oP '(?<=StdOut=)\S+' || true
+}
+
+# Concurrent stages can each submit a builder for the same hash; --dependency=singleton
+# then holds the extras in PENDING (Dependency) until the running one ends, so wait on
+# the running builder when there is one.
+EXISTING=$(runningFatBuilder)
+if [ -z "$EXISTING" ]; then
+    EXISTING=$(squeue -h -n "$FAT_BUILD_JOB_NAME" -o "%i" 2>/dev/null | head -1 || true)
+fi
 if [ -n "$EXISTING" ]; then
     echo "Fat sqsh builder already running as job $EXISTING, will wait for it"
     BUILDER_ID="$EXISTING"
-    # Locate the log file of the existing job (submitted by a different Jenkins run with a different jobUID)
-    actualFatBuildLogPath=$(scontrol show job "$BUILDER_ID" 2>/dev/null | grep -oP '(?<=StdOut=)\S+' || true)
+    actualFatBuildLogPath=$(fatBuilderLogPath "$BUILDER_ID")
 else
     # Submit the CPU builder. Best-effort: any submission failure is non-fatal;
     # the GPU job will fall back to base sqsh + full install.
@@ -77,13 +92,18 @@ fi
 # Poll until the builder job finishes (success or failure); tail the builder log live.
 echo "Waiting for fat sqsh builder job $BUILDER_ID to complete..."
 FAT_TAIL_PID=""
-if [ -n "$actualFatBuildLogPath" ]; then
-    touch "$actualFatBuildLogPath" 2>/dev/null || true
-    tail -F -n +1 "$actualFatBuildLogPath" &
-    FAT_TAIL_PID=$!
-else
-    echo "Warning: could not determine fat build log path; builder output will not be shown here"
-fi
+tailFatBuildLog() {
+    [ -n "$FAT_TAIL_PID" ] && kill "$FAT_TAIL_PID" 2>/dev/null || true
+    FAT_TAIL_PID=""
+    if [ -n "$actualFatBuildLogPath" ]; then
+        touch "$actualFatBuildLogPath" 2>/dev/null || true
+        tail -F -n +1 "$actualFatBuildLogPath" &
+        FAT_TAIL_PID=$!
+    else
+        echo "Warning: could not determine fat build log path; builder output will not be shown here"
+    fi
+}
+tailFatBuildLog
 trap '[ -n "$FAT_TAIL_PID" ] && kill "$FAT_TAIL_PID" 2>/dev/null || true' EXIT
 MAX_WAIT_ITERS="${FAT_BUILD_MAX_WAIT_ITERS:-30}"   # 30 * 60s = 30min
 # A builder stuck in the CPU queue falls back sooner than one that is building, so
@@ -94,6 +114,12 @@ iters=0
 pendingIters=0
 gaveUp=false
 while true; do
+    # Any builder for this hash may publish the sqsh, not only the one being polled.
+    if [ -f "$fatSqshPath" ]; then
+        echo "Fat sqsh published while waiting on builder $BUILDER_ID"
+        STATUS="PUBLISHED"
+        break
+    fi
     STATUS=$(sacct -j "$BUILDER_ID" --format=State -Pn --allocations 2>/dev/null | head -1 || true)
     # sacct prints "CANCELLED by <uid>" for cancelled jobs; strip the trailing words.
     STATUS="${STATUS%% *}"
@@ -115,6 +141,16 @@ while true; do
             ;;
         PENDING)
             REASON=$(squeue -h -j "$BUILDER_ID" -o "%r" 2>/dev/null | head -1 || true)
+            if [ "$REASON" = "Dependency" ]; then
+                RUNNING_ID=$(runningFatBuilder)
+                if [ -n "$RUNNING_ID" ] && [ "$RUNNING_ID" != "$BUILDER_ID" ]; then
+                    echo "Fat sqsh builder job $BUILDER_ID is queued behind running builder $RUNNING_ID; following it instead"
+                    BUILDER_ID="$RUNNING_ID"
+                    actualFatBuildLogPath=$(fatBuilderLogPath "$BUILDER_ID")
+                    tailFatBuildLog
+                    continue
+                fi
+            fi
             echo "Fat sqsh builder job $BUILDER_ID state: PENDING (reason=${REASON:-unknown}), waiting..."
             iters=$((iters + 1))
             pendingIters=$((pendingIters + 1))
