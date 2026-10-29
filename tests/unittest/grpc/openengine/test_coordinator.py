@@ -165,6 +165,47 @@ async def test_forwarded_shutdown_rejections_do_not_fail_group():
 
 
 @pytest.mark.asyncio
+async def test_forwarded_shutdown_deadline_includes_peer_fanout(monkeypatch):
+    """A slow but timely peer must not exhaust the forwarding deadline."""
+
+    class SlowCoordinator(Coordinator):
+        async def _dispatch(self, message, context):
+            if message["operation"] == "shutdown":
+                await asyncio.sleep(0.4)
+            return await super()._dispatch(message, context)
+
+    class SlowFrontend(FrontendClient):
+        async def _dispatch(self, message, context):
+            if message.get("operation") == "shutdown":
+                await asyncio.sleep(0.8)
+            return await super()._dispatch(message, context)
+
+    async with group(SlowCoordinator, SlowFrontend) as (coordinator, (first, _), failures):
+        monkeypatch.setattr(coordination, "_RPC_TIMEOUT", 1.0)
+        coordinator._request_shutdown = lambda: False
+        result = await first.request("shutdown", expected_instance_id="shared-engine")
+        assert result["matched"] and not result["already_stopping"]
+        assert not failures
+
+
+@pytest.mark.asyncio
+async def test_shutdown_peer_failure_returns_unavailable_on_retry():
+    """A failed publication reports failure while still committing owner shutdown."""
+    async with group() as (coordinator, (first, _), failures):
+        stopped = asyncio.Event()
+        coordinator._request_shutdown = lambda: stopped.set() or False
+        await first._server.stop(0)
+        for _ in range(2):
+            with pytest.raises(grpc.aio.AioRpcError) as rejected:
+                await first._connection.request(
+                    {"operation": "shutdown", "expected_instance_id": "shared-engine"}
+                )
+            assert rejected.value.code() == grpc.StatusCode.UNAVAILABLE
+        assert stopped.is_set()
+        assert failures
+
+
+@pytest.mark.asyncio
 async def test_cancelled_shutdown_keeps_launcher_commit():
     """Losing the forwarding reply must not undo the launcher's stop event."""
     committed, release_reply = asyncio.Event(), asyncio.Event()

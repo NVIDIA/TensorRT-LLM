@@ -91,7 +91,14 @@ class _Connection:
         )
 
     async def request(self, message: dict) -> dict:
-        timeout = _ABORT_TIMEOUT if message.get("operation") == "abort" else _RPC_TIMEOUT
+        operation = message.get("operation")
+        if operation == "abort":
+            timeout = _ABORT_TIMEOUT
+        elif operation == "shutdown" and "expected_instance_id" in message:
+            # The coordinator must finish its peer fan-out before replying.
+            timeout = 2 * _RPC_TIMEOUT
+        else:
+            timeout = _RPC_TIMEOUT
         return await self.call(message, timeout=timeout)
 
     async def close(self) -> None:
