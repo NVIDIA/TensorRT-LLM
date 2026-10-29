@@ -9,14 +9,11 @@ so one job, not independent cases); see ``_rank_job`` for why that is left intac
 import path to reach ``_rank_job``.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "comm"))
-import _rank_job  # noqa: E402
+__extra_import_path__ = ["../comm"]
+import _rank_job
 
 
 def _is_sm100() -> bool:

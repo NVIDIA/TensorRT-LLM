@@ -5,7 +5,6 @@
 import zlib
 from typing import Dict, List
 
-import _kda_reference as kr
 import pytest
 import torch
 
@@ -17,7 +16,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda
 )
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["..", "."]
+import _kda_reference as kr
 from _validating import validating
 
 assert torch.cuda.is_available(), "chunk_kda requires a CUDA device"

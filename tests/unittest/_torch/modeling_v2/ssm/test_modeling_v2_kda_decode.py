@@ -12,7 +12,6 @@ legacy compact-heads kernel (the one #19830 fixes).
 
 import zlib
 
-import _kda_cells as kc
 import pytest
 import torch
 
@@ -20,7 +19,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda
     kda_decode,
 )
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["..", "."]
+import _kda_cells as kc
 from _validating import validating
 
 pytestmark = pytest.mark.skipif(not kc.sm100(), reason="certified on SM100 only")
