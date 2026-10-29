@@ -21,20 +21,17 @@
 #                               unexpectedly, rerun none of them. null: no limit.
 #                               Counted per run: the stage's regular tests
 #                               together, and each isolated test on its own.
-#   rerun_timeout_tests         Rerun tests that timed out, i.e. were still running
-#                               when the pytest process ended (CI runs pytest-timeout
-#                               with --timeout-method=thread, which ends the process
-#                               on a timeout). Each is rerun once.
 #
-# Tests that never started because an earlier test ended the pytest process are
-# rerun once whenever rerun_enabled is true.
+# Tests that timed out, i.e. were still running when the pytest process ended
+# (CI runs pytest-timeout with --timeout-method=thread, which ends the process on a
+# timeout), are not rerun. Tests that never started because of that are rerun once
+# whenever rerun_enabled is true.
 
 default:
   rerun_enabled: true
   rerun_twice_max_duration_s: 300
   rerun_once_max_duration_s: 600
   max_failed_tests: null
-  rerun_timeout_tests: false
 
 stages:
   # TEMPORARY (rerun policy validation): exercises this rule with deliberate
@@ -42,17 +39,14 @@ stages:
   #   unittest/utils/test_logger.py         fails once  -> rerun twice, passes
   #   unittest/utils/test_llm_data.py       always fails -> rerun twice, fails
   #   unittest/visual_gen/test_output.py    fails after 150 s -> not rerun
-  #   unittest/executor/test_base_worker.py hangs once, TIMEOUT (1) -> rerun once, passes
+  #   unittest/executor/test_base_worker.py hangs once, TIMEOUT (1) -> not rerun
   # Remove this rule and revert those tests before merging.
   - match: "CPU-Generic-*"
     rerun_twice_max_duration_s: 60
     rerun_once_max_duration_s: 120
-    rerun_timeout_tests: true
 # Example:
 # stages:
 #   - match: "*-PerfSanity-*"
 #     rerun_enabled: false
 #   - match: "DGX_B200-8_GPUs-PyTorch-*"
 #     max_failed_tests: 10
-#   - match: "GB200-4_GPUs-PyTorch-1"
-#     rerun_timeout_tests: true
