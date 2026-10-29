@@ -131,9 +131,8 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
                 MoERejectReason.DEP_MISSING,
                 f"{cls.__name__} requires FlashInfer fused MoE with trtllm_bf16_moe support.",
             )
-        # The same per-rank shard rule the quantized FlashInfer leaves run.
-        # These kernels constrain only the intermediate dimension, which is
-        # what passing no ``input_hidden_alignment`` says.
+        # ``trtllm_bf16_moe`` constrains only the intermediate dimension: each
+        # rank's shard has to be a multiple of 128.
         return check_flashinfer_shard_alignment(cls, p, d, weight_alignment=128)
 
     def _get_quant_method(self) -> object:
