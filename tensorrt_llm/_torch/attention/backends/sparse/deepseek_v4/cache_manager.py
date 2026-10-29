@@ -27,7 +27,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
-    Role,
     _fill_kv_pages,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
@@ -49,7 +48,6 @@ from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     BatchDesc,
     BufferConfig,
     BufferId,
@@ -1070,58 +1068,19 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     _mixed_precision_native_pool = True
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
-        return False
+        return super()._is_mixed_precision_layer(local_layer_idx) and compress_ratio_has_attention(
+            self._compress_ratios[self.pp_layers[local_layer_idx]], DeepseekV4AttentionType.COMPRESS
+        )
+
+    def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
+        # A compressed page holds tokens_per_block // ratio rows.
+        return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
 
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        if self.low_precision_dtype is None:
-            return config
-        layers = list(config.layers)
-        for local, layer in enumerate(self.pp_layers):
-            if self._first_spec_layer_id is not None and layer >= self._first_spec_layer_id:
-                continue
-            if not compress_ratio_has_attention(
-                self._compress_ratios[layer], DeepseekV4AttentionType.COMPRESS
-            ):
-                continue
-            rows_per_page = self.compressed_block_sizes[layer]
-            self.high_layers[local] = len(layers)
-            layers.append(
-                AttentionLayerConfig(
-                    layer_id=LayerId(len(layers)),
-                    buffers=[
-                        BufferConfig(
-                            role=Role.KEY,
-                            size=get_size_in_bytes(
-                                rows_per_page * self.head_dim, self.high_precision_dtype
-                            ),
-                        )
-                    ],
-                    # Windows count raw tokens; a page holds tokens_per_block // ratio rows.
-                    sliding_window_size=self.last_n + 1 + self._max_draft_len,
-                    num_sink_tokens=self.first_n,
-                    reuse_policy=AttentionReusePolicy.REQUIRED,
-                )
-            )
-        if not self.high_layers:
-            return config
-        self._num_manager_layers = len(layers)
-        return replace(config, layers=layers)
-
-    def _get_mixed_precision_buffers(
-        self, layer_offset: int, kv_layout: str, mixed_precision_pool: str
-    ) -> torch.Tensor:
-        if mixed_precision_pool != "high":
-            raise ValueError("DeepSeek-V4 keeps its history in the native compressed pools")
-        layer = self.high_layers[layer_offset]
-        address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
-        shape = [
-            self.impl.get_page_index_upper_bound(layer, Role.KEY),
-            1,
-            self.compressed_block_sizes[self.pp_layers[layer_offset]],
-            1,
-            self.head_dim,
-        ]
-        return convert_to_torch_tensor(TensorWrapper(address, self.high_precision_dtype, shape))
+        config = super()._add_mixed_precision_layers(config)
+        if self.high_layers:
+            self._num_manager_layers = len(config.layers)
+        return config
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
