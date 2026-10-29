@@ -12,18 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The boundary for sharing's V2 operations, runtime metadata and private lifecycle hooks.
-
-Manager and runtime operations, including layout declarations, prefix resize and fresh-page fill,
-go through this facade, as do reads of runtime layer configs, layer grouping and pool descriptors.
-The layout builder reads the manager's head counts and other structural fields directly. Manager
-and runtime imports stay inside the functions; the private hook protocol is checked before a
-lender is installed.
-"""
+"""Facade for V2 operations, runtime metadata and lifecycle hooks; heavy imports stay local.
+Layout also reads structural manager fields directly."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Protocol, Sequence, runtime_checkable
+from typing import TYPE_CHECKING, NamedTuple, Sequence
 
 import numpy as np
 
@@ -39,34 +33,21 @@ if TYPE_CHECKING:
     )
 
     from ...llm_request import LlmRequest
+    from .._lender_hooks import _ManagerHooks
     from ..kv_cache_manager_v2 import KVCacheManagerV2
 
 # The largest 32-bit count: the manager's window ranges compute in 32-bit token counts.
 _MAX_TOKENS = 2**31 - 1
+# ``BlockReusePolicy.ALL_REUSABLE``, imported at the first call that needs it.
+_all_reusable = None
 
 
 class CacheState(NamedTuple):
-    """A request's runtime cache as the lender reads it: tokens committed, the history length its
-    sliding windows keep, and whether it is active (not suspended)."""
+    """Committed tokens, retained history and activity (not suspended) of a runtime cache."""
 
     committed: int
     history: int
     active: bool
-
-
-@runtime_checkable
-class _ManagerHooks(Protocol):
-    """Callbacks a lender supplies for its manager's cache lifecycle."""
-
-    def _on_free(self, request_id: int, kv_cache: _KVCache) -> None: ...
-
-    def _on_shrink(self, request_id: int, kv_cache: _KVCache) -> None: ...
-
-    def _on_reset(self) -> None: ...
-
-    def _on_shutdown(self) -> None: ...
-
-    def _on_caches_closed(self) -> None: ...
 
 
 def mapping(manager: KVCacheManagerV2) -> Mapping:
@@ -84,12 +65,54 @@ def has_lossy_cold_page_codec(manager: KVCacheManagerV2) -> bool:
 
 def require_v2(manager: object) -> None:
     """Raise ``TypeError`` unless ``manager`` is a ``KVCacheManagerV2`` (subclasses included)."""
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+
     from ..kv_cache_manager_v2 import KVCacheManagerV2
 
     if not isinstance(manager, KVCacheManagerV2):
         raise TypeError(
             f"the KV cache lender needs a KVCacheManagerV2, got {type(manager).__name__}"
         )
+    if getattr(manager, "kv_cache_type", None) == CacheType.CROSS:
+        raise ValueError(
+            "the KV cache lender does not support CROSS caches or encoder-decoder models"
+        )
+
+
+def model_has_recurrent_state(manager: KVCacheManagerV2) -> bool:
+    """Whether the manager serves a model with recurrent state: a hybrid manager, on every pipeline
+    stage, whichever layers this stage holds."""
+    from ..mamba_cache_manager import MambaHybridCacheManagerV2
+
+    return isinstance(manager, MambaHybridCacheManagerV2)
+
+
+def model_has_attention_window(manager: KVCacheManagerV2) -> bool:
+    """Whether any pipeline stage retains a configured or backend-defined window."""
+    pattern = manager._model_attention_window_pattern
+    return manager._model_has_attention_window or any(
+        0 < window < manager.max_seq_len for window in pattern[: manager.num_layers]
+    )
+
+
+def model_has_sparse_buffers(manager: KVCacheManagerV2) -> bool:
+    """Whether any pipeline stage holds sparse buffers."""
+    return manager._model_has_sparse_buffers
+
+
+def kv_dtype(manager: KVCacheManagerV2) -> str | None:
+    """The element type of the manager's KV data by name, such as ``"BF16"`` or ``"NVFP4"``;
+    ``None`` for a manager declaring none."""
+    dtype = getattr(manager, "dtype", None)
+    return None if dtype is None else str(getattr(dtype, "name", dtype))
+
+
+def kv_quant_mode(manager: KVCacheManagerV2) -> str | None:
+    """How the manager quantizes its KV data: ``None`` unquantized, else ``"fp8"``, ``"nvfp4"``, or
+    ``"fp8_ds_mla"``, DeepSeek-V4's FP8 pages carrying their scales."""
+    if getattr(manager, "use_fp8_ds_mla", False):
+        return "fp8_ds_mla"
+    return {"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype(manager))
 
 
 def commits_blocks(manager: KVCacheManagerV2) -> bool:
@@ -98,40 +121,42 @@ def commits_blocks(manager: KVCacheManagerV2) -> bool:
     return bool(manager.enable_block_reuse) and bool(manager._can_publish_block_reuse)
 
 
-def kv_connector(manager: KVCacheManagerV2) -> object | None:
-    """The manager's KV cache connector, or ``None`` without one."""
-    return manager.kv_connector_manager
+def connector_loads(manager: KVCacheManagerV2) -> bool:
+    """Whether a connector loads KV; capacity-only connectors transfer nothing."""
+    connector = manager.kv_connector_manager
+    return connector is not None and not connector.capacity_only
 
 
 def context_moves_history(manager: KVCacheManagerV2) -> bool:
-    """Whether the manager's context update moves a request's history to the end of each chunk,
-    raising where that would move it back: under a block reuse policy other than all-reusable, or
-    when the manager commits no blocks; otherwise the update only commits."""
-    from ..kv_cache_manager_v2 import BlockReusePolicy
-
+    """Whether the context update moves the history to each chunk's end, raising where that moves it
+    back: when no blocks commit or the reuse policy is not all-reusable; else it only commits."""
     if not commits_blocks(manager):
         return True
-    return manager.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
+    global _all_reusable
+    if _all_reusable is None:
+        from ..kv_cache_manager_v2 import BlockReusePolicy
+
+        _all_reusable = BlockReusePolicy.ALL_REUSABLE
+    return manager.block_reuse_policy != _all_reusable
 
 
 def resize_ends_at_chunk(manager: KVCacheManagerV2) -> bool:
-    """Whether the manager's context resize sets a cache's capacity from the chunk it runs, as a
-    draft manager's does, so a chunk resumed below the history may leave the capacity below it and
-    raise there."""
+    """Whether the context resize sets capacity from the chunk it runs, as a draft manager's does,
+    so a chunk resumed below the history may leave the capacity below it and raise."""
     return bool(manager.is_draft)
 
 
 def keeps_stale_pages(manager: KVCacheManagerV2) -> bool:
-    """Whether a block a window leaves behind before the manager commits it keeps its page, which
-    the commit then stores whole under the block's key: the manager commits blocks without the
-    minimal snapshot, as under the all-reusable policy."""
+    """Whether a block a window leaves behind before its commit keeps its page, which the commit
+    then stores whole under the block's key: the manager commits blocks without the minimal
+    snapshot, as under the all-reusable policy."""
     return commits_blocks(manager) and not bool(manager.impl.commit_min_snapshot)
 
 
 def prompt_lookahead(manager: KVCacheManagerV2) -> int:
-    """Prompt tokens past a position the one-model draft the manager was built for reads (Eagle 1,
-    vanilla MTP its draft length), wherever its layers live, also where reuse matches are not backed
-    off by them; 0 for a draft reading none or whose read-ahead upstream has not established."""
+    """Prompt tokens past a position the manager's one-model draft reads (Eagle 1, vanilla MTP its
+    draft length), wherever its layers live, also where reuse matches are not backed off by them; 0
+    for a draft reading none or whose read-ahead upstream has not established."""
     return max(int(manager.draft_prompt_lookahead), int(manager.reuse_match_backoff))
 
 
@@ -141,14 +166,30 @@ def attached_lender(manager: KVCacheManagerV2) -> object | None:
 
 
 def install_lender(manager: KVCacheManagerV2, lender: _ManagerHooks) -> None:
-    """Attach ``lender`` for the manager's life: its free, in-place shrinks, reuse reset and
-    shutdown then call the lender's ``_on_free``, ``_on_shrink``, ``_on_reset``, ``_on_shutdown``
-    and, once the runtime's shutdown has returned, ``_on_caches_closed``."""
-    hooks = ("_on_free", "_on_shrink", "_on_reset", "_on_shutdown", "_on_caches_closed")
+    """Install ``lender``'s hooks (``_lender_hooks._ManagerHooks``) for the manager's lifetime;
+    ``TypeError`` unless it implements them all."""
+    from .._lender_hooks import _ManagerHooks
+
+    hooks = (
+        "_on_free",
+        "_on_shrink",
+        "_on_resume",
+        "_parking_row",
+        "_parked_row",
+        "_before_reset",
+        "_on_reset",
+        "_on_shutdown",
+        "_on_caches_closed",
+        "_is_locked",
+        "_defer_close",
+        "_keeps_pools",
+        "_history_cap",
+        "_page_lock_state",
+    )
     if not isinstance(lender, _ManagerHooks) or any(
         not callable(getattr(lender, name, None)) for name in hooks
     ):
-        raise TypeError("the KV cache lender must implement all five manager lifecycle hooks")
+        raise TypeError("the KV cache lender must implement all manager hooks")
     manager._sharing = lender
 
 
@@ -190,7 +231,25 @@ def declared_global_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | Non
     return table
 
 
-def disagg_declaration(manager: KVCacheManagerV2, name: str) -> dict[str, object]:
+def declared_model_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | None:
+    """Internal layer id -> the model layer it belongs to, or ``None`` without the manager's
+    declaration."""
+    getter = getattr(manager, "get_model_layer_ids", None)
+    if getter is None:
+        return None
+    table: dict[int, int] = {}
+    for layer_group, layer_ids in enumerate(manager.impl.layer_grouping):
+        ids = [int(value) for value in getter(layer_group)]
+        if len(ids) != len(layer_ids):
+            raise ValueError(
+                f"layer group {layer_group}: {len(ids)} declared model layers for {len(layer_ids)} "
+                "layers"
+            )
+        table.update(zip((int(layer_id) for layer_id in layer_ids), ids))
+    return table
+
+
+def role_declaration(manager: KVCacheManagerV2, name: str) -> dict[str, object]:
     """Role-keyed layout declarations from the named manager getter."""
     getter = getattr(manager, name, None)
     if getter is None:
@@ -199,17 +258,19 @@ def disagg_declaration(manager: KVCacheManagerV2, name: str) -> dict[str, object
 
 
 def role_mapper_kinds(manager: KVCacheManagerV2) -> dict[str, object]:
-    """The manager's per-role disaggregation mapper declarations."""
-    return disagg_declaration(manager, "get_disagg_role_mapper_kinds")
+    """The manager's per-role mapper declarations."""
+    return role_declaration(manager, "get_disagg_role_mapper_kinds")
 
 
 def role_layouts(manager: KVCacheManagerV2) -> dict[str, object]:
-    """The manager's per-role disaggregation layout declarations."""
-    return disagg_declaration(manager, "get_disagg_role_layouts")
+    """The manager's per-role layout declarations."""
+    return role_declaration(manager, "get_disagg_role_layouts")
 
 
 def ignored_roles(manager: KVCacheManagerV2) -> frozenset[str]:
-    """Roles omitted by the manager's disaggregation declaration."""
+    """Roles omitted without a receive-time rebuild, which lending does not invoke."""
+    if callable(getattr(manager, "rebuild_disagg_imported_cache", None)):
+        return frozenset()
     getter = getattr(manager, "get_disagg_ignored_roles", None)
     return frozenset(str(role) for role in (getter() if getter else ()))
 
@@ -225,63 +286,262 @@ def index_buffer(manager: KVCacheManagerV2) -> torch.Tensor:
     return manager.host_kv_cache_block_offsets
 
 
+def index_row(manager: KVCacheManagerV2, request_id: int) -> int | None:
+    """The row of ``index_buffer``, ``[layer group, row, 0, block]``, into which the request's
+    active cache writes its beam-0 page indices itself at each page change, on the thread making it;
+    ``None`` where the manager released the row before the free, to the next request it admits."""
+    if request_id in manager._early_freed_index_requests:
+        return None
+    return int(manager.index_mapper.get_index(request_id)) * int(manager.max_beam_width)
+
+
 def virtual_layers(manager: KVCacheManagerV2) -> tuple[dict[int, tuple[int, int]], int] | None:
-    """Virtual layers (DeepSeek-V4): internal layer id -> (model layer, attention type value), and
-    the number of attention types the enum defines. ``None`` for a manager without them."""
+    """(internal id -> (model layer, attention type), type count), or None without virtual layers;
+    a shared internal id takes its first declared type, as native's page table does."""
+    # TODO: Layer ids come from the manager's private _layer_attn_to_layer_id; KVCacheManagerV2
+    # does not publish each internal layer's model layer and kind.
     virtual = getattr(manager, "_layer_attn_to_layer_id", None)
     if not virtual:
         return None
     inverse: dict[int, tuple[int, int]] = {}
     for (model_layer, attn_type), layer_id in virtual.items():
-        inverse[int(layer_id)] = (int(model_layer), int(attn_type.value))
+        inverse.setdefault(int(layer_id), (int(model_layer), int(attn_type.value)))
     # Every member of the enum counts, so stages holding different attention types agree.
     attn_type_class = type(next(iter(virtual))[1])
     return inverse, max(int(member.value) for member in attn_type_class) + 1
 
 
+def global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
+    """Each internal layer's global id, the same under any pipeline split: the declared id, else for
+    virtual layers ``model_layer * num_types + attention_type``, else the model layer."""
+    # One declared id per internal layer of each layer group, in order (FP4 MLA's tail layers).
+    declared = declared_global_layer_ids(manager)
+    if declared is not None:
+        return [declared[int(lid)] for lid in internal_ids]
+    virtual = virtual_layers(manager)
+    if virtual is None:
+        return [int(manager.pp_layers[int(lid)]) for lid in internal_ids]
+    inverse, num_types = virtual
+    return [inverse[int(lid)][0] * num_types + inverse[int(lid)][1] for lid in internal_ids]
+
+
+def model_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
+    """The model layer each internal layer belongs to: the declared one, else for virtual layers
+    the model layer they number, else the model layer itself. ``ValueError`` for a manager that
+    declares global layer ids without declaring their model layers."""
+    declared = declared_model_layer_ids(manager)
+    if declared is not None:
+        return [declared[int(lid)] for lid in internal_ids]
+    if declared_global_layer_ids(manager) is not None:
+        raise ValueError("the manager declares global layer ids without their model layers")
+    virtual = virtual_layers(manager)
+    if virtual is None:
+        return [int(manager.pp_layers[int(lid)]) for lid in internal_ids]
+    inverse, _ = virtual
+    return [inverse[int(lid)][0] for lid in internal_ids]
+
+
+def runtime(manager: KVCacheManagerV2) -> object:
+    """Runtime owning the device pools and freeing them on destruction."""
+    return manager.impl
+
+
+def context_computed(request: LlmRequest) -> int:
+    """The prompt tokens the request's context steps computed: its context position, which the
+    executor moves past each context step once it ran."""
+    return int(request.context_current_position)
+
+
+def connector_load_pending(manager: KVCacheManagerV2, request: LlmRequest) -> bool:
+    """Whether the connector has unfinished off-stream prefix writes into ``request``."""
+    connector = manager.kv_connector_manager
+    return connector is not None and bool(connector.has_pending_load(request))
+
+
+def connector_reserved(manager: KVCacheManagerV2, request: LlmRequest) -> bool:
+    """Whether the connector reserved a prefix already in history but not yet loading."""
+    connector = manager.kv_connector_manager
+    return connector is not None and connector.get_prefix_reservation(request) is not None
+
+
+def connector_state(manager: KVCacheManagerV2, request: LlmRequest) -> tuple[bool, bool]:
+    """``(connector_reserved, connector_load_pending)`` of the request in one call."""
+    connector = manager.kv_connector_manager
+    if connector is None:
+        return False, False
+    return (
+        connector.get_prefix_reservation(request) is not None,
+        bool(connector.has_pending_load(request)),
+    )
+
+
+def served_prefix_end(request: LlmRequest) -> int:
+    """End of the prefix served by a connector or a fetch the request resumed from."""
+    return int(request.py_served_prefix_end)
+
+
 def stream(manager: KVCacheManagerV2) -> torch.cuda.Stream:
-    """The manager's execution stream: a copy queued on it runs after the forward passes that wrote
-    the pages and before later work on the stream, which a page's new owner waits for; a writer
-    off the stream is not ordered after it."""
+    """Execution stream ordering copies after forward writes and before later work, which new page
+    owners wait for; writers on other streams need explicit ordering. A cache still on the
+    allocation side stream is ordered behind ``allocation_fence`` instead, until adopted."""
     return manager._stream
 
 
+def cache_stream(manager: KVCacheManagerV2, request_id: int) -> torch.cuda.Stream | None:
+    """The stream that orders operations on a request's cache during a named grow."""
+    import torch
+
+    cache_stream_for = getattr(manager, "_cache_stream", None)
+    if cache_stream_for is not None:
+        return torch.cuda.ExternalStream(
+            cache_stream_for(request_id), device=manager._stream.device
+        )
+    return getattr(manager, "_stream", None)
+
+
+def allocation_fence(manager: KVCacheManagerV2, request_id: int) -> torch.cuda.Event | None:
+    """The manager's event after the allocation work queued for the request's cache while that
+    cache is still on the allocation side stream; ``None`` once the execution stream adopted it."""
+    # A cache off the side stream, the common case, costs one set lookup.
+    if request_id not in manager._on_allocation_stream:
+        return None
+    return manager._allocation_fence(request_id)
+
+
 def kv_of(manager: KVCacheManagerV2, request_id: int) -> _KVCache | None:
-    """The request's runtime cache, or ``None`` when it has none (never had one, freed, shut down).
-    Caches are compared by identity to see a free or a replaced cache."""
+    """Request cache, or ``None`` when absent/freed/shut down; compare identity to detect replacement."""
     return manager.kv_cache_map.get(request_id)
+
+
+_new_tuple = tuple.__new__
 
 
 def cache_state(kv: _KVCache) -> CacheState:
     """Committed tokens, history length and activity of runtime cache ``kv``, as plain values."""
-    return CacheState(int(kv.num_committed_tokens), int(kv.history_length), bool(kv.is_active))
+    # Built as the tuple it is, without the NamedTuple's Python-level constructor.
+    return _new_tuple(
+        CacheState, (int(kv.num_committed_tokens), int(kv.history_length), bool(kv.is_active))
+    )
+
+
+def cache_extent(kv: _KVCache) -> tuple[CacheState, int]:
+    """``(cache_state(kv), num_blocks(kv))`` in one call."""
+    return _new_tuple(
+        CacheState, (int(kv.num_committed_tokens), int(kv.history_length), bool(kv.is_active))
+    ), int(kv.num_blocks)
 
 
 def has_scratch_reuse(kv: _KVCache) -> bool:
-    """Whether runtime cache ``kv`` has SWA scratch reuse on: each capacity change then keeps its
-    history within the scratch rewind of the old capacity, and its window blocks may sit in scratch
-    slots, which the next chunk overwrites."""
+    """Whether ``kv`` has SWA scratch reuse on: capacity changes keep its history within the old
+    capacity's scratch rewind, and its window blocks may sit in slots the next chunk overwrites."""
     return bool(kv.enable_swa_scratch_reuse)
 
 
 def pages(kv: _KVCache, layer_group: int) -> np.ndarray:
-    """``int64`` page (pool-group slot) of each block ordinal of ``layer_group``, -1 where the block
-    has no page."""
-    return np.fromiter(
-        kv.get_aggregated_page_indices(layer_group, valid_only=False), dtype=np.int64
-    )
+    """Read-only view of the page (pool-group slot) each block of an active cache locks, -1 for
+    none, read on the manager's thread, valid until the cache next changes: copy what must outlive
+    it. A window block behind the history, its held page maybe on another tier, counts as none."""
+    return np.asarray(kv.get_base_page_indices(layer_group))[: kv.num_blocks]
+
+
+def page_list(kv: _KVCache, layer_group: int) -> list[int]:
+    """The page each block of ``layer_group`` holds, -1 where none, as a list: for an active cache
+    ``pages``'s, except at window blocks behind the history, whose held pages it gives though it
+    does not lock them. For few blocks cheaper than that view."""
+    return kv.get_aggregated_page_indices(layer_group)
+
+
+def held_pages(kv: _KVCache, layer_group: int, *, recurrent: bool = False) -> int:
+    """Distinct ordinary, active STATE or scratch slots held by this group, across beams."""
+    slots = set()
+    for beam in range(int(kv.beam_width)):
+        if recurrent:
+            slots.add(int(kv.get_ssm_block_base_index(layer_group, beam_id=beam)))
+        else:
+            slots.update(kv.get_aggregated_page_indices(layer_group, beam_id=beam, valid_only=True))
+    scratch = kv.get_scratch_desc(layer_group)
+    if scratch is not None:
+        slots.update(scratch.slot_ids)
+    slots.discard(-1)
+    return len(slots)
+
+
+def state_slot(kv: _KVCache, layer_group: int) -> int:
+    """Active cache's in-place recurrent-state slot for this group, or -1."""
+    return int(kv.get_ssm_block_base_index(layer_group))
+
+
+def prepared_state_slots(manager: KVCacheManagerV2) -> tuple[int, dict[int, int]] | None:
+    """The layer group of the manager's recurrent state and its record of each request's slot,
+    written from the cache at each preparation of its resources and dropped at its free, left stale
+    by a resume that moves the state until the next; ``None`` without one."""
+    layer_group = getattr(manager, "ssm_layer_group_id", None)
+    record = getattr(manager, "_request_id_to_state_index", None)
+    if layer_group is None or not isinstance(record, dict):
+        return None
+    return int(layer_group), record
 
 
 def locked_pages(kv: _KVCache, layer_group: int) -> np.ndarray:
-    """``int64`` page of each block of an active cache from its locked base page indices, -1 where
-    the block has none: a window block behind the history keeps at most a held page, which may be
-    on another tier."""
-    return np.array(kv.get_base_page_indices(layer_group)[: kv.num_blocks], dtype=np.int64)
+    """The same read-only view as ``pages``."""
+    return np.asarray(kv.get_base_page_indices(layer_group))[: kv.num_blocks]
+
+
+def committed_by_group(kv: _KVCache, num_layer_groups: int) -> tuple[int, ...]:
+    """Count a claimed prefix only in groups whose reuse status is complete; a group also counts
+    tokens committed past its claim endpoint, OPTIONAL/PRIVATE groups included."""
+    committed = int(kv.num_committed_tokens)
+    if committed == 0:
+        return (0,) * num_layer_groups
+    statuses = kv.reuse_status  # one per layer group, indexed by its id
+    return tuple(
+        committed if statuses[lg].complete or committed > int(statuses[lg].endpoint) else 0
+        for lg in range(num_layer_groups)
+    )
+
+
+def committed_blocks(
+    kv: _KVCache, num_layer_groups: int, committed: Sequence[int] | None = None
+) -> tuple[int, ...]:
+    """Per layer group, its whole committed blocks (``committed_by_group``, rounded down);
+    ``committed``: ``committed_by_group``'s tokens, if read."""
+    tpb = int(kv.tokens_per_block)
+    if committed is None:
+        committed = committed_by_group(kv, num_layer_groups)
+    return tuple(tokens // tpb for tokens in committed)
+
+
+def close_cache(kv: _KVCache) -> None:
+    """Close the cache, returning its pages to the manager's pools."""
+    kv.close()
+
+
+def commit_held_back(manager: KVCacheManagerV2, kv: _KVCache) -> None:
+    """Retry a deferred commit; remaining overlapping locks defer it again."""
+    manager._commit_held_back(kv)
+
+
+def has_held_commit(manager: KVCacheManagerV2, kv: _KVCache) -> bool:
+    """Whether the manager holds back a commit of ``kv`` for ``commit_held_back`` to retry; true
+    for a manager that keeps no record of the commits it holds back."""
+    held = getattr(manager, "_held_commits", None)
+    return held is None or id(kv) in held
+
+
+def drop_held_commit(manager: KVCacheManagerV2, kv: _KVCache, start: int) -> None:
+    """Drop a commit held back for ``kv`` that would commit computed tokens from ``start`` on, which
+    a fetch from ``start`` may overwrite; nothing where none is held back."""
+    if getattr(manager, "_held_commits", None):
+        manager._drop_held_commit(kv, start)
+
+
+def is_closed(kv: _KVCache) -> bool:
+    """Whether runtime cache ``kv`` has closed, after which it writes no page index anywhere."""
+    return kv.status == kv.Status.CLOSED
 
 
 def num_blocks(kv: _KVCache) -> int:
-    """Block ordinals of runtime cache ``kv``: a shrink drops those past its capacity, with their
-    pages."""
+    """Block ordinals of ``kv``: a shrink drops those past its capacity, with their pages."""
     return int(kv.num_blocks)
 
 
@@ -292,10 +552,33 @@ def is_recurrent_layer(layer_config: AttentionLayerConfig | SsmLayerConfig) -> b
     return isinstance(layer_config, runtime.SsmLayerConfig)
 
 
+def is_private_layer(layer_config: AttentionLayerConfig | SsmLayerConfig) -> bool:
+    """Whether the native lifecycle excludes this layer from prefix reuse."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+
+    return getattr(layer_config, "reuse_policy", None) == AttentionReusePolicy.PRIVATE
+
+
+def is_non_required_layer(layer_config: AttentionLayerConfig | SsmLayerConfig) -> bool:
+    """Whether prefix coverage is optional or private for this layer."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+
+    return (
+        getattr(layer_config, "reuse_policy", AttentionReusePolicy.REQUIRED)
+        != AttentionReusePolicy.REQUIRED
+    )
+
+
+def read_window(manager: KVCacheManagerV2, layer_group: int, kept: int | None) -> int | None:
+    """Tokens of the window ``layer_group``'s attention reads, as the manager declares it; the
+    window it keeps, ``kept``, for a manager declaring none."""
+    declared = getattr(manager, "_attention_read_window", None)
+    return kept if declared is None else declared(layer_group)
+
+
 def stale_range(manager: KVCacheManagerV2, layer_group: int, history: int) -> tuple[int, int]:
-    """Block ordinals ``[beg, end)`` behind a windowed group's window at ``history``, sinks
-    excepted. The range adds a block's tokens to the history in 32 bits, so a longer history is read
-    as ``_MAX_TOKENS`` less one block, which lowers only ``end``."""
+    """Block ordinals ``[beg, end)`` behind a windowed group's window at ``history``, sinks aside;
+    in 32 bits a longer history reads as ``_MAX_TOKENS`` less a block, lowering only ``end``."""
     # TODO: with a window near ``_MAX_TOKENS``, a history past that bound lowers ``end`` below
     # blocks the window has passed, which then count as inside it.
     longest = _MAX_TOKENS - int(manager.tokens_per_block)
@@ -319,9 +602,8 @@ def has_encoder_input(request: LlmRequest) -> bool:
 
 
 def bidirectional_runs(request: LlmRequest) -> list[tuple[int, int]]:
-    """The runs ``[b, e)`` of multimodal tokens the scheduler keeps within one context chunk: none
-    unless the request's multimodal data sets ``mm_bidirectional_blocks`` and holds a
-    ``multimodal_embed_mask_cumsum``, the gate the scheduler uses."""
+    """Runs ``[b, e)`` of multimodal tokens the scheduler keeps in one context chunk, by its gate:
+    none without ``mm_bidirectional_blocks`` set and a ``multimodal_embed_mask_cumsum``."""
     data = request.py_multimodal_data
     if not isinstance(data, dict) or not data.get("mm_bidirectional_blocks", False):
         return []
@@ -339,9 +621,31 @@ def returns_context_outputs(request: LlmRequest) -> bool:
     return bool(request.py_return_context_logits) or bool(request.py_additional_outputs)
 
 
-def prompt_length(request: LlmRequest) -> int:
-    """The request's prompt length."""
+def prompt_length(
+    request: LlmRequest, manager: KVCacheManagerV2 | None = None, *, cp_size: int = 1
+) -> int:
+    """Prompt tokens, using whole-rank ``total_input_len_cp`` under Helix."""
+    if cp_size > 1 or (manager is not None and helix(manager)[1] > 1):
+        return int(request.total_input_len_cp)
     return int(request.prompt_len)
+
+
+def context_end(request: LlmRequest, manager: KVCacheManagerV2 | None = None) -> int:
+    """Where this worker's context ends, at most the prompt, or all of it under ``manager``'s Helix;
+    a request leaving the prompt's tail to another worker reports the tail's start."""
+    prompt = prompt_length(request, manager)
+    if manager is not None and helix(manager)[1] > 1:
+        return prompt
+    end = int(request.context_current_position) + int(request.context_remaining_length)
+    return min(prompt, end)
+
+
+def helix(manager: KVCacheManagerV2) -> tuple[int, int]:
+    """Helix ``(rank, size)``, or ``(0, 1)``: block ``b`` spans ``size`` pages of the manager's
+    ``tokens_per_block`` tokens, rank ``j``'s from ``(b * size + j) * tokens_per_block``."""
+    if not getattr(manager, "_has_cp_helix", False):
+        return 0, 1
+    return int(manager._helix_cp_rank), int(manager._helix_cp_size)
 
 
 def block_keys(
@@ -389,28 +693,14 @@ def grow(
     manager: KVCacheManagerV2, request: LlmRequest, kv: _KVCache, position: int, end: int
 ) -> bool:
     """Cover ``[0, end)`` and move the history to ``position`` with the manager's own resize, then
-    run its fresh-page fill (a diagnostic, off unless set) on the pages the resize added alone.
+    run its fresh-page fill (a diagnostic, off unless set) on the pages the resize added alone;
     ``False``, the cache unchanged, when pages run out."""
-    before = _pages_by_pool(manager, kv)
+    from .._lender_hooks import fill_fresh_pages_past, fresh_page_record
+
+    before = fresh_page_record(manager, kv)
     if not manager._resize_for_served_prefix(request, kv, position, end):
         return False
-    # TODO: grow writes the fresh-page fill's private record (``_fresh_pages_filled``) in the
-    # fill's own keying: per request, one int32 page array per pool.
-    if before is not None:
-        # The fill takes as fresh the pages its record lacks, and a joint draft pool's own resizes
-        # keep no record: the pages before the grow become it, so the fill leaves them alone.
-        manager._fresh_pages_filled[int(request.py_request_id)] = before
-        manager._fill_fresh_kv_pages(request.py_request_id)
+    # A joint draft pool's own resizes keep no fill record: the pages before the grow stand for
+    # it, so the fill leaves them alone.
+    fill_fresh_pages_past(manager, request.py_request_id, before)
     return True
-
-
-def _pages_by_pool(manager: KVCacheManagerV2, kv: _KVCache) -> dict[int, np.ndarray] | None:
-    """Runtime cache ``kv``'s base page of each block, per pool, as the fresh-page fill records
-    them; ``None`` with the fill off."""
-    if manager._fresh_page_fill is None:
-        return None
-    count = int(kv.num_blocks)
-    return {
-        pool: np.frombuffer(kv.get_base_page_indices(pool), dtype=np.int32, count=count).copy()
-        for pool in range(int(manager.num_pools))
-    }

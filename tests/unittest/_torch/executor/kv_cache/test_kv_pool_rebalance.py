@@ -61,6 +61,7 @@ def _make_executor(
     enable_attention_dp: bool = False,
     disable_overlap_scheduler: bool = False,
     kv_cache_transceiver=None,
+    attached_lender=None,
     kv_connector_manager=None,
     is_warmup: bool = False,
     is_shutdown: bool = False,
@@ -130,6 +131,7 @@ def _make_executor(
     # KV cache manager (resource-manager wrapper).
     exe.kv_cache_manager = MagicMock()
     exe.kv_cache_manager.max_beam_width = max_beam_width
+    exe.kv_cache_manager._sharing = attached_lender
     exe.kv_cache_manager.impl = MagicMock()
     exe.kv_cache_manager.impl.need_adjustment = need_adjustment
 
@@ -242,6 +244,10 @@ class TestCanPauseForRebalance:
 
     def test_transceiver_present_returns_false(self):
         exe = _make_executor(kv_cache_transceiver=MagicMock())
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_attached_lender_prevents_rebalance(self):
+        exe = _make_executor(attached_lender=MagicMock())
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
     def test_connector_present_returns_false(self):
