@@ -445,6 +445,21 @@ def _read_fused_attn_res_max_tokens() -> int:
 _ATTN_RES_TOPOLOGY = _read_attn_res_topology()
 _FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
 
+KIMI_K3_SHARED_EXPERT_AT_DISPATCH_MAX_TOKENS_ENV = "KIMI_K3_SHARED_EXPERT_AT_DISPATCH_MAX_TOKENS"
+"""Largest per-rank token count at which the shared expert is held back until
+the routed MoE issues its expert-parallel dispatch, so its GEMMs fill the
+low-occupancy dispatch/routing window instead of contending with the router
+and latent-down GEMMs. Above it (default 32) the shared expert starts right
+after the router as before, because at larger batches its GEMMs would then
+contend with the expert GEMMs instead. ``0`` disables the hold.
+
+Read at import, so CUDA-graph capture and replay cannot disagree about it.
+"""
+
+_SHARED_EXPERT_AT_DISPATCH_MAX_TOKENS = int(
+    os.environ.get(KIMI_K3_SHARED_EXPERT_AT_DISPATCH_MAX_TOKENS_ENV, "32")
+)
+
 
 def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
     """Shape gate for the persistent kernel: H == 7168 and 2 <= N <= 9.
@@ -1449,6 +1464,7 @@ class KimiK3MoERuntime(nn.Module):
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
+        self.moe_dispatch_start_event = torch.cuda.Event()
         # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream;
         # the latent down-projection runs there too, beside the routing chain.
         self.latent_down_stream = (
@@ -1776,6 +1792,15 @@ class KimiK3MoERuntime(nn.Module):
             and self.shared_expert_stream is not None
             and not torch.compiler.is_compiling()
         )
+        # Only meaningful with an external dispatch to overlap; fused-comm
+        # backends have no ``comm``.
+        hold_shared_until_dispatch = (
+            self.routed_experts.comm is not None
+            and hidden_states.shape[0] <= _SHARED_EXPERT_AT_DISPATCH_MAX_TOKENS
+            and do_multi_stream()
+            and self.shared_expert_stream is not None
+            and not torch.compiler.is_compiling()
+        )
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
@@ -1797,6 +1822,8 @@ class KimiK3MoERuntime(nn.Module):
                 moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
             else:
                 routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+            if hold_shared_until_dispatch:
+                moe_kwargs["dispatch_start_event"] = self.moe_dispatch_start_event
             y = self.routed_experts(
                 routed_in,
                 router_logits,
@@ -1812,6 +1839,10 @@ class KimiK3MoERuntime(nn.Module):
             return self._routed_projection(y, self.routed_expert_up_proj)
 
         def _shared_output():
+            # The routed branch is issued first by maybe_execute_in_parallel,
+            # so the record precedes this wait in both eager and graph capture.
+            if hold_shared_until_dispatch:
+                self.moe_dispatch_start_event.wait()
             shared_out = self.shared_experts(
                 identity,
                 final_all_reduce_params=(

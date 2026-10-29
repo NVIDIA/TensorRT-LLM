@@ -398,6 +398,8 @@ def test_kimi_k3_shared_allreduce_ordering(
         calls.append(("routed_moe", current_stream))
         return value * 2
 
+    routed_experts.comm = None
+
     def shared_allreduce(value: torch.Tensor) -> torch.Tensor:
         calls.append(("shared_allreduce", current_stream))
         return value + 5
@@ -522,6 +524,8 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
         received.update(kwargs)
         return value
 
+    routed_experts.comm = None
+
     def compute_logits(value: torch.Tensor) -> torch.Tensor:
         calls.append(("router_gemm", current_stream))
         return value
@@ -566,6 +570,120 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
     else:
         assert ("routed_down", "main") in calls
         assert "input_ready_event" not in received
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "num_tokens,has_comm,multi_stream,expected",
+    [
+        (2, True, True, True),
+        (33, True, True, False),
+        (2, False, True, False),
+        (2, True, False, False),
+    ],
+    ids=["small_batch", "above_token_cap", "fused_comm", "serial"],
+)
+def test_kimi_k3_shared_expert_waits_for_routed_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    has_comm: bool,
+    multi_stream: bool,
+    expected: bool,
+) -> None:
+    """At small batches with an external comm strategy, the routed MoE
+    receives ``dispatch_start_event`` and the shared expert waits on it on the
+    aux stream after the routed branch recorded it; otherwise neither side
+    touches the event."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    monkeypatch.setattr(modeling_kimi_linear, "_SHARED_EXPERT_AT_DISPATCH_MAX_TOKENS", 32)
+
+    calls = []
+    current_stream = "main"
+    aux_stream = object()
+
+    class _Event:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def record(self) -> None:
+            calls.append((f"{self.name}_record", current_stream))
+
+        def wait(self) -> None:
+            calls.append((f"{self.name}_wait", current_stream))
+
+    @contextmanager
+    def use_stream(stream: object) -> Iterator[None]:
+        nonlocal current_stream
+        assert stream is aux_stream
+        previous_stream = current_stream
+        current_stream = "aux"
+        try:
+            yield
+        finally:
+            current_stream = previous_stream
+
+    class _Projection(nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            calls.append((self.name, current_stream))
+            return value + 1
+
+    def routed_experts(value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
+        calls.append(("routed_moe", current_stream))
+        event = kwargs.get("dispatch_start_event")
+        if event is not None:
+            # ExternalCommMoEScheduler records it right before comm.dispatch.
+            event.record()
+        return value
+
+    routed_experts.comm = object() if has_comm else None
+
+    def shared_experts(value: torch.Tensor, final_all_reduce_params=None) -> torch.Tensor:
+        calls.append(("shared_local", current_stream))
+        return value * 0
+
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
+    runtime.routed_experts = routed_experts
+    runtime.routed_expert_down_proj = _Projection("routed_down")
+    runtime.routed_expert_norm = _Projection("routed_norm")
+    runtime.routed_expert_up_proj = _Projection("routed_up")
+    runtime.shared_experts = shared_experts
+    runtime._reduce_routed_output = False
+    runtime._defer_shared_allreduce = False
+    runtime.shared_expert_stream = aux_stream
+    runtime.moe_main_event = _Event("fork")
+    runtime.moe_shared_event = _Event("shared_done")
+    runtime.moe_routed_event = None
+    runtime.moe_dispatch_start_event = _Event("dispatch_start")
+    runtime.latent_down_stream = None
+    runtime.moe_latent_fork_event = None
+    runtime.moe_latent_ready_event = None
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+
+    with with_multi_stream(multi_stream):
+        output = runtime(torch.zeros(num_tokens, 4))
+
+    # down (+1), norm (+1), up (+1); the shared branch contributes zero.
+    torch.testing.assert_close(output, torch.full((num_tokens, 4), 3.0))
+    if expected:
+        assert (
+            calls.index(("dispatch_start_record", "main"))
+            < calls.index(("dispatch_start_wait", "aux"))
+            < calls.index(("shared_local", "aux"))
+        )
+    else:
+        assert not any(name.startswith("dispatch_start") for name, _ in calls)
 
 
 def _make_kimi_k3_moe_weights(config):
