@@ -261,7 +261,7 @@ def getShortenedJenkinsInstanceName() {
 }
 
 def isCbtsStage(String stageName) {
-    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    // The pipeline-level kill switch is propagated by L0_MergeRequest.groovy.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
@@ -273,8 +273,16 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
-    // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.
-    if (stageName.contains("_GPUs") || stageName.contains("_Nodes")) {
+    // Collect single-GPU post-merge coverage and trial multi-GPU pre-merge coverage.
+    // Multi-node stages remain excluded from this experiment.
+    if (stageName.contains("_Nodes")) {
+        return false
+    }
+    if (testFilter[(IS_POST_MERGE)]) {
+        if (stageName.contains("_GPUs")) {
+            return false
+        }
+    } else if (!stageName.contains("_GPUs") || stageName.contains("Post-Merge")) {
         return false
     }
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
@@ -1689,7 +1697,7 @@ def getPytestBaseCommandLine(
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
         "-o junit_logging=${jUnitLogging}",
-        // Coverage capture: only CBTS (post-merge) stages instrument, via cbts_plugin / sitecustomize.
+        // Coverage capture: eligible CBTS stages instrument via cbts_plugin / sitecustomize.
         cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
         "--periodic-junit-xmlpath ${outputPath}/results.xml",

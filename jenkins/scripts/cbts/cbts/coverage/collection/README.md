@@ -49,13 +49,13 @@ top-level directories when the configured include patterns name literal top-leve
 ## When it runs
 
 `jenkins/L0_MergeRequest.groovy` decides pipeline-level eligibility and propagates it through
-`testFilter[cbts_coverage]`: the `ENABLE_CBTS_COVERAGE` kill switch plus the post-merge gate, so
-coverage runs on the official post-merge pipeline only.
+`testFilter[cbts_coverage]`: the `ENABLE_CBTS_COVERAGE` kill switch.
 
 `isCbtsStage()` in `jenkins/L0_Test.groovy` gates each stage on that flag plus:
 
 - not a perf stage, and not a TensorRT / CPP stage
-- single-GPU only — stages named with `-<N>_GPUs` or `-<N>_Nodes` are out of scope for phase 1
+- post-merge: single-GPU stages only; pre-merge: single-node multi-GPU stages only (collection experiment)
+- multi-node stages remain excluded
 - not listed in `CBTS_EXCLUDE_STAGES`
 
 Non-CBTS stages get an empty `.coveragerc` and run uninstrumented.
@@ -255,9 +255,9 @@ Per-process `.cbtscov.<stage>.<host>.X<rand>.pid<N>.sqlite` files ride back insi
 product paths away from the publish-artifacts guardword scanner, which byte-matches raw files and
 does not recurse into archives.
 
-`L0_MergeRequest.groovy` uploads SQLite-only x86 and SBSA tarballs once their single-GPU stages
-finish; the coverage selector requires both and merges their compact databases. The later Test
-Coverage stage merges every stage's files through `pystart_report.py` and uploads
+On post-merge runs, `L0_MergeRequest.groovy` uploads SQLite-only x86 and SBSA tarballs once their
+single-GPU stages finish; the coverage selector requires both and merges their compact databases.
+The later Test Coverage stage merges every stage's files through `pystart_report.py` and uploads
 `cbts_pystart_report.tar.gz`, holding `cbts_touchmap.sqlite` (the indexed selector artifact, with a
 `meta` table carrying the coverage rate) and `cbts_report/` (the split HTML report; open
 `cbts_report/index.html` after extracting).
@@ -284,7 +284,7 @@ c.execute("SELECT DISTINCT test FROM touch_rows WHERE file = ?",
 # function-level (phase 2): tests that entered a specific function/method
 c.execute("SELECT DISTINCT test FROM touch_rows WHERE file = ? AND qualname = ?",
           ("tensorrt_llm/_torch/pyexecutor/py_executor.py", "PyExecutor.forward")).fetchall()
-# per-stage: coverage is attributed to the single-GPU stage it came from
+# per-stage: coverage is attributed to the stage it came from
 c.execute("SELECT DISTINCT test FROM touch_rows WHERE file = ? AND stage = ?",
           ("tensorrt_llm/_torch/pyexecutor/py_executor.py", "RTXPro6000D-PyTorch-1")).fetchall()
 # coverage rate + schema version
