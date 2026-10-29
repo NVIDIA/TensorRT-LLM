@@ -526,10 +526,13 @@ def test_out_of_scope_rule_removes_ruff_config_preflight_blockers(tmp_path: Path
             "[tool.autoflake]\nremove_unused_variables = false\n",
             "[tool.autoflake]\nremove_unused_variables = true\n",
         ),
-        ('[tool.mypy]\nfiles = ["old"]\n', '[tool.mypy]\nfiles = ["new"]\n'),
         (
-            '[[tool.mypy.overrides]]\nmodule = "old"\n',
-            '[[tool.mypy.overrides]]\nmodule = "new"\n',
+            '[tool.pyrefly]\nproject-includes = ["old"]\n',
+            '[tool.pyrefly]\nproject-includes = ["new"]\n',
+        ),
+        (
+            '[[tool.pyrefly.sub-config]]\nmatches = "old"\n',
+            '[[tool.pyrefly.sub-config]]\nmatches = "new"\n',
         ),
     ),
 )

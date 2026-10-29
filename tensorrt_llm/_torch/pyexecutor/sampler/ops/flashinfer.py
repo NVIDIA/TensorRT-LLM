@@ -41,7 +41,7 @@ _OpT = TypeVar("_OpT", bound=Callable[..., Any])
 
 def _compiler_disable(fn: _OpT) -> _OpT:
     """``torch.compiler.disable``, typed: the torch stub is untyped and would
-    fail mypy strict (untyped-decorator) if applied directly."""
+    fail strict static analysis if applied directly."""
     return cast(_OpT, torch.compiler.disable(fn))
 
 

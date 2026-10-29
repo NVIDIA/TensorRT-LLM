@@ -1460,7 +1460,7 @@ legacy-files: &legacy_files |
     )$
 # <<<< END AUTO-GENERATED >>>>
 
-# Full-project mypy scans use the file set in pyproject.toml. The pre-commit
+# Full-project Pyrefly scans use the file set in pyproject.toml. The pre-commit
 # hook passes changed paths to the script's default changed-file mode.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
@@ -1613,11 +1613,11 @@ repos:
         files: >-
           ^(\.claude/skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
     -   id:  type-check
-        name: Record advisory mypy type-check report
-        entry: scripts/run_mypy.sh
+        name: Record advisory Pyrefly type-check report
+        entry: scripts/run_pyrefly.sh
         language: script
         verbose: true
-        require_serial: true  # because of install_types=true
+        require_serial: true
         # Pass changed paths; the wrapper skips non-product Python inputs.
         pass_filenames: true
-        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(mypy_exclusion\.json|mypy_baseline\.txt|run_mypy\.sh|mypy_exclusion\.py)$|\.pre-commit-config\.yaml$)
+        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(pyrefly_exclusion\.json|pyrefly_baseline\.json|run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)

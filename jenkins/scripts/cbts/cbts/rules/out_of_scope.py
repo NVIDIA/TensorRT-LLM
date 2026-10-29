@@ -72,7 +72,7 @@ OUT_OF_SCOPE_DIRECTORY_FILENAMES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 _STATIC_CHECK_TABLES = frozenset(
-    {"tool.ruff", "tool.isort", "tool.yapf", "tool.codespell", "tool.autoflake", "tool.mypy"}
+    {"tool.ruff", "tool.isort", "tool.yapf", "tool.codespell", "tool.autoflake", "tool.pyrefly"}
 )
 _TABLE_RE = re.compile(r"^\s*(\[\[?)([\w.-]+)(\]\]?)\s*(?:#.*)?$")
 

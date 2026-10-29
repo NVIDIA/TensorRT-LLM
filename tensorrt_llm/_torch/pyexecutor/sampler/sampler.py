@@ -1601,7 +1601,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 ] = req.py_num_accepted_draft_tokens
             # req.state can become GENERATION_COMPLETE within this loop iteration
             # (e.g. process_draft_tokens -> _handle_stop_criteria -> finish_by),
-            # so the comparison is valid at runtime; mypy narrowed it away via the
+            # so the comparison is valid at runtime; the type checker narrowed it away via the
             # `continue` at the top of the loop and cannot see the mutating calls.
             if req.state == LlmRequestState.GENERATION_COMPLETE:  # type: ignore[comparison-overlap]
                 self._top_p_decay.retire_slot(req)
