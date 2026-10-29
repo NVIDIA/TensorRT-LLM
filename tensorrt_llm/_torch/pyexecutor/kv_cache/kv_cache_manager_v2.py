@@ -157,6 +157,7 @@ from .page_table import (
     is_recurrent_layer,
     layer_configs_by_id,
     rank_topology,
+    virtual_layers,
 )
 
 if TYPE_CHECKING:
@@ -3682,8 +3683,19 @@ class KVCacheManagerV2(BaseResourceManager):
         internal = sorted({int(lid) for group in self.impl.layer_grouping for lid in group})
         virtual = self._virtual_layers()
         if virtual is None:
+            unnamed = [lid for lid in internal if not 0 <= lid < len(self.pp_layers)]
+            if unnamed:
+                raise ValueError(
+                    f"internal layers {unnamed} are no local layers, and the manager names no "
+                    "model layer for them (_virtual_layers, _page_layer_ids)"
+                )
             return {lid: (int(self.pp_layers[lid]),) * 2 for lid in internal}
         types_of, num_types = virtual
+        unnamed = [lid for lid in internal if lid not in types_of]
+        if unnamed:
+            raise ValueError(
+                f"internal layers {unnamed} have no (model layer, type) in _virtual_layers"
+            )
         return {
             lid: (types_of[lid][0] * num_types + types_of[lid][1], types_of[lid][0])
             for lid in internal
@@ -3801,9 +3813,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _virtual_layers(self) -> tuple[dict[int, tuple[int, int]], int] | None:
         """(internal id -> (model layer, attention type), type count) of a manager keeping several
-        caches per model layer, which overrides this (``page_table.virtual_layers``); None: one
-        cache per model layer."""
-        return None
+        caches per model layer, read from its (model layer, type) -> internal id map
+        ``_layer_attn_to_layer_id`` (``page_table.virtual_layers``): the base manager's retained
+        precision twins keep one, as DeepSeek-V4 and CSA2 do. None: one cache per model layer."""
+        return virtual_layers(getattr(self, "_layer_attn_to_layer_id", None))
 
     # -- what a disaggregated transfer of one request moves ------------------------------------------
     # The transceiver asks these of every request; a manager whose caches move differently for some

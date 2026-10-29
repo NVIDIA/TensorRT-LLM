@@ -387,9 +387,7 @@ class Manager:
     _page_dtype = KVCacheManagerV2._page_dtype
     _page_quant_mode = KVCacheManagerV2._page_quant_mode
 
-    def _virtual_layers(self):
-        """The model layers and attention types a test names in ``_layer_attn_to_layer_id``."""
-        return page_table.virtual_layers(getattr(self, "_layer_attn_to_layer_id", None))
+    _virtual_layers = KVCacheManagerV2._virtual_layers
 
     _model_has_attention_window = False
     _model_has_sparse_buffers = False
@@ -1109,6 +1107,30 @@ def test_virtual_layers_are_numbered_by_model_layer_and_attention_type():
     }
     assert manager._page_layer_ids() == {0: (12, 4), 1: (13, 4), 2: (15, 5)}
     assert derive_layout(manager).layers == ((12, 13, 15),)
+
+
+@pytest.mark.cpu_only
+def test_retained_precision_twins_past_the_local_layers_are_named_by_their_model_layer():
+    """The base manager's mixed-precision layers append twins after the local layers and name
+    both pools of model layer ``m`` in ``_layer_attn_to_layer_id``: global layers ``2 m`` and
+    ``2 m + 1``. Without that map such twins are refused rather than misnamed."""
+
+    class Kind(enum.IntEnum):
+        PRIMARY = 0
+        HIGH_PRECISION = 1
+
+    manager = Manager([kv_group(lids=(0, 1)), kv_group(lids=(2, 3))], pp_layers=[6, 7])
+    manager._layer_attn_to_layer_id = {
+        (6, Kind.PRIMARY): 0,
+        (7, Kind.PRIMARY): 1,
+        (6, Kind.HIGH_PRECISION): 2,
+        (7, Kind.HIGH_PRECISION): 3,
+    }
+    assert manager._page_layer_ids() == {0: (12, 6), 1: (14, 7), 2: (13, 6), 3: (15, 7)}
+    assert derive_layout(manager).layers == ((12, 14), (13, 15))
+    del manager._layer_attn_to_layer_id
+    with pytest.raises(ValueError, match=r"internal layers \[2, 3\] are no local layers"):
+        manager.get_page_table()
 
 
 @pytest.mark.cpu_only

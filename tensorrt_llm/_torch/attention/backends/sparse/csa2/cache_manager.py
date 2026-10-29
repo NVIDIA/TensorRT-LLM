@@ -24,7 +24,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _fill_kv_pages,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import virtual_layers
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -1102,10 +1101,6 @@ class CSA2CacheManager(KVCacheManagerV2):
     ) -> tuple[Tensor, ...]:
         """Every CSA2 cache holds the same bytes on every rank."""
         return replicated(size)
-
-    def _virtual_layers(self):
-        """Each model layer keeps a cache per CSA2 attention type."""
-        return virtual_layers(self._layer_attn_to_layer_id)
 
     def disagg_transfer_length(self, request) -> int:
         """Under remote-tail replay the generation worker recomputes the prompt from the remote

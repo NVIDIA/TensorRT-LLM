@@ -30,7 +30,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _fill_kv_pages,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import virtual_layers
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1489,10 +1488,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if role == COMPRESS_BLOCK_SCALE_ROLE or role in _ATTENTION_TYPE_ROLES:
             return self._page_head_split(layer_id, size, tokens, state)
         return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
-
-    def _virtual_layers(self):
-        """Each model layer keeps a cache per DeepSeek-V4 attention type."""
-        return virtual_layers(self._layer_attn_to_layer_id)
 
     def _page_untransferred_roles(self) -> frozenset[str]:
         """Storage-only NVFP4 alignment pages, which hold no state a peer needs."""
