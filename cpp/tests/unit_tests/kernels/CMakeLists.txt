@@ -229,6 +229,19 @@ add_tllm_gtest(
   "unit;kernels;attention-mask;gpu")
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
 
+if(NOT WIN32)
+  # CPU-only: checks the CudaArch numbering against the prebuilt trtllm-gen
+  # archive, so it links that archive directly instead of libtensorrt_llm.
+  add_gtest(trtllmGenCudaArchAbiTest trtllmGenCudaArchAbiTest.cpp
+            NO_TLLM_LINKAGE)
+  target_link_libraries(
+    trtllmGenCudaArchAbiTest
+    PRIVATE
+      trtllm_gen_fmha_interface
+      ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/trtllmGenKernels/fmha/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu/libTrtLlmGen.a
+  )
+endif()
+
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest
   OWNER
