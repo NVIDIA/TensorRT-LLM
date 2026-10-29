@@ -4257,12 +4257,6 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
     ).trim()
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
-    // unfinished_test.txt is the current record: a rerun that completes a test drops
-    // it from the file, so rebuild the XML from it instead of keeping one written
-    // earlier (the first run's final snapshot writes one before any rerun).
-    if (fileExists("${stageName}/unfinished_test.txt")) {
-        sh "rm -f '${outputFilePath}'"
-    }
     sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}'"""
     if (fileExists(outputFilePath)) {
         return true
@@ -5526,9 +5520,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             rerunFailed = true
                             rerunInfraFailure = rerunResult.infraFailure ?: rerunInfraFailure
                         } else if (hadUnfinishedTests) {
-                            // Rerun passed but a test is still unfinished: the stage's
-                            // rerun policy did not rerun it (a timed-out test that a
-                            // rerun completes leaves unfinished_test.txt). Mark this
+                            // Rerun passed but the first run had a timeout: mark this
                             // stage FAILURE so "[${stageName}] Run Pytest" turns red,
                             // not just the enclosing parent stage.
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
