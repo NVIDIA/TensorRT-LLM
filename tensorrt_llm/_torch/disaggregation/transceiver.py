@@ -494,18 +494,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # besides the per-iteration poll the executor also enters it from
             # receive_gen_init, only on ranks that admitted gen-init requests.
             # The CP ranks of one DP group must therefore admit the same requests
-            # in the same iteration. Equal KV capacity is not enough: a client
-            # cancel or transfer timeout retires a request rank-locally, so one
-            # CP rank can have room before its peer. The pp=1 loops intersect
-            # the admitted ids over CP first
-            # (DisaggTransferCoordinator.align_gen_admission_across_cp).
+            # in the same iteration. Equal KV capacity is not enough: a request
+            # retired on one CP rank only (e.g. a rank-local error) gives that
+            # rank room before its peer. The pp=1 loops intersect the admitted
+            # ids over CP first (DisaggTransferCoordinator.align_gen_admission_across_cp).
             # The PP loop does not, so _check_compatible rejects attention-DP
             # with both helix CP and pp_size > 1.
             #
             # Non-DP tp x cp gathers over the world behind the same predicate and
             # goes through the same step, which lines up its CP ranks but not its
-            # TP ranks; a rank-local cancel or timeout can still skew those, as it
-            # can without CP.
+            # TP ranks; a request retired on one rank only can still skew those,
+            # as it can without CP.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
@@ -523,6 +522,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if m.pp_size > 1:
             gathered = [x for part in self._dist.pp_allgather(gathered) for x in part]
         return gathered
+
+    @property
+    def cancels_timed_out_gen_receives(self) -> bool:
+        # Under gen sync a timeout passes on each rank at its own time, so
+        # _cancel_timed_out_receives hands it to the consensus.
+        return self._gen_need_sync
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
@@ -1400,6 +1405,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         need_progress = wait_num > 0
         if need_progress:
             self._poll_gen_sessions_for_poll_interval(wait_num)
+        if self.cancels_timed_out_gen_receives:
+            self._cancel_timed_out_receives()
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
         to_process = self._build_to_process(
@@ -1416,10 +1423,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if session.status == SessionStatus.CANCELLED:
                 if self._ownership_blocks_retirement(session):
                     continue
-                # Session cancelled — either by local cancel_request() (user
-                # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
-                # server timeout).  Return the req objects so the caller can
-                # distinguish the two cases and set the appropriate state.
+                # Session cancelled — by cancel_request() while its writes
+                # drain (no gen sync), by this rank's transfer timeout under gen
+                # sync (_cancel_timed_out_receives), or by a remote
+                # CANCEL_SESSION message (e.g. CTX server timeout). Return the
+                # req objects so the caller can distinguish a user cancel from
+                # the rest and set the appropriate state.
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
@@ -1496,6 +1505,41 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
         return GenTransferStatus(completed, failed, cancelled_reqs)
+
+    def _cancel_timed_out_receives(self) -> None:
+        """Cancel this rank's receive sessions that ran past kv_transfer_timeout_ms.
+
+        Under gen sync a timeout passes on each rank at its own time, so it must
+        not retire the request here. The cancelled session joins the consensus
+        that follows, which retires the request on every rank in the same call
+        once each rank's session has ended. A session that already ended is left
+        alone, so a receive that completed is not failed by its timeout.
+        """
+        now = time.monotonic()
+        for rid, session in self._recv_sessions.items():
+            if session.is_completed() or session.has_failed():
+                continue
+            req = self._recv_reqs[rid]
+            start = req.py_kv_transfer_start_time
+            if start is None:
+                continue
+            elapsed_ms = (now - start) * 1000
+            if elapsed_ms <= self.kv_transfer_timeout_ms:
+                continue
+            logger.warning(
+                f"Cancelling generation request {req.py_request_id} due to KV cache "
+                f"transfer timeout: elapsed {elapsed_ms:.0f}ms > "
+                f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}ms"
+            )
+            try:
+                session.cancel()
+            except Exception as error:
+                # Logged, not raised: this rank must still enter the consensus
+                # gather. A cancel that raised before marking the session is
+                # retried next poll; one that raised later, e.g. notifying the
+                # senders, still retires through the consensus, but the senders
+                # are not asked again.
+                logger.error(f"Cancelling timed-out receive {rid} failed: {error}")
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
         self._poll_sessions_for_interval(
@@ -1574,6 +1618,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         Returns False if any task is mid-write (TRANSFERRING); caller must
         retry next iteration. Returns True when safe to free KV memory.
+
+        Under gen sync a receive is retired at once instead: every rank of the
+        group cancels it in the same iteration, and a rank-local drain wait
+        would retire it on one rank before another. Not waiting for its writes
+        adds no exposure: without physical ownership, which no gen sync group
+        enables, the consensus already retires a cancelled receive undrained.
         """
         rid = get_unique_rid(req)
 
@@ -1598,7 +1648,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if rid in self._recv_sessions:
             self._recv_sessions[rid].cancel()
-            if self._recv_sessions[rid].has_transferring_tasks():
+            if not self._gen_need_sync and self._recv_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             elif self._recv_sessions[rid].close() is False:
                 has_transferring = True

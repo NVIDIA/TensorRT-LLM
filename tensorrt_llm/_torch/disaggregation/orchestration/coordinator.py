@@ -271,6 +271,10 @@ class DisaggTransferCoordinator:
         # context side.
         for req in self._transfers.requests_in_transfer().values():
             flag_if_timed_out(req, "context")
+        if self._transceiver.cancels_timed_out_gen_receives:
+            # The transceiver cancels these itself; a flag would fail the
+            # request on this rank alone.
+            return
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_timed_out(req, "generation")
@@ -339,15 +343,17 @@ class DisaggTransferCoordinator:
         so the CP ranks must admit the same requests in the same iteration. Equal
         KV capacity does not guarantee that: KV cache manager V1 deals helix
         blocks round-robin from CP rank 0, so that rank can hold one more block
-        per request, and a client cancel or a transfer timeout retires a request
-        rank-locally, so one CP rank can have room before its peer. The pp=1
-        loops call this on every rank every iteration; the dropped requests give
-        back their V2 KV and are retried on a later iteration. Under
-        attention-DP, a request passes the intersection only if every CP rank
-        routed it to the same DP rank. ``ADPRouter.gather_all_rank_states``
-        gives the CP ranks the same loads. ``ADPRouter.create`` does not build
-        ``KVCacheAwareADPRouter`` under helix CP, because each CP rank probes
-        its own prefix matches and they can differ.
+        per request, and a request retired on one CP rank only frees room there
+        first: a rank-local error, or under the C++ transceiver a client cancel
+        or a transfer timeout (``KvCacheTransceiverV2`` retires those on every
+        rank in the same iteration). The pp=1 loops call this on every rank
+        every iteration; the dropped requests give back their V2 KV and are
+        retried on a later iteration. Under attention-DP, a request passes the
+        intersection only if every CP rank routed it to the same DP rank.
+        ``ADPRouter.gather_all_rank_states`` gives the CP ranks the same loads.
+        ``ADPRouter.create`` does not build ``KVCacheAwareADPRouter`` under
+        helix CP, because each CP rank probes its own prefix matches and they
+        can differ.
         """
         if self._dist.cp_size == 1:
             return admitted

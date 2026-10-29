@@ -663,6 +663,7 @@ def test_cpp_capability_is_config_scoped(
 
     assert transceiver.consumes_transfer_buffer
     assert transceiver.supports_inflight_request_cancellation() is expected
+    assert not transceiver.cancels_timed_out_gen_receives
     constructor.assert_called_once()
 
 

@@ -50,9 +50,12 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         kv_transfer_timeout_ms: Optional[int] = None,
         supports_inflight_cancellation: bool = False,
         consumes_transfer_buffer: bool = True,
+        cancels_timed_out_gen_receives: bool = False,
     ) -> None:
         self.kv_transfer_timeout_ms = kv_transfer_timeout_ms
         self._supports_inflight_cancellation = supports_inflight_cancellation
+        # Only advertised: the fake has no receive timeout of its own.
+        self._cancels_timed_out_gen_receives = cancels_timed_out_gen_receives
         # C++-style transceivers consume the CacheTransBuffer budget; the
         # asynchronous Python transceiver does not.
         self._consumes_transfer_buffer = consumes_transfer_buffer
@@ -108,6 +111,10 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
     @property
     def consumes_transfer_buffer(self) -> bool:
         return self._consumes_transfer_buffer
+
+    @property
+    def cancels_timed_out_gen_receives(self) -> bool:
+        return self._cancels_timed_out_gen_receives
 
     def respond_and_send_async(self, req: LlmRequest) -> None:
         self._assert_alive("respond_and_send_async")

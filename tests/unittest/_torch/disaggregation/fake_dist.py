@@ -113,10 +113,10 @@ class FakeDistRank:
     """The ``dist`` object one rank hands to its coordinator.
 
     Models only what the coordinator uses: a single pipeline / context-parallel
-    stage, TP collectives over the rank's TP group and ``allreduce`` over the
-    world. Every call is appended to ``calls`` as ``(collective, payload)``
-    with the payload as the caller passed it, including calls a single-rank
-    group answers locally.
+    stage, TP collectives over the rank's TP group and ``allgather`` /
+    ``allreduce`` over the world. Every call is appended to ``calls`` as
+    ``(collective, payload)`` with the payload as the caller passed it,
+    including calls a single-rank group answers locally.
     """
 
     pp_size = 1
@@ -145,6 +145,9 @@ class FakeDistRank:
 
     def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         return self._reduce(self._group.tp_rendezvous(self.rank), "tp_allreduce", obj, op)
+
+    def allgather(self, obj) -> list:
+        return self._gather(self._group.world_rendezvous(), "allgather", obj)
 
     def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         return self._reduce(self._group.world_rendezvous(), "allreduce", obj, op)

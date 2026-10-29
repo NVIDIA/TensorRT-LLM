@@ -62,7 +62,9 @@ class CoordinatorHarness:
     ``dist`` defaults to a ``Mock`` carrying ``rank`` / ``tp_size`` /
     ``world_size`` / ``pp_size`` / ``cp_size`` for single-rank tests;
     multi-rank tests pass one FakeDist rank (or a stub of one CP rank) per
-    harness instead, and that object then defines those sizes.
+    harness instead, and that object then defines those sizes. ``transceiver``
+    replaces the contract fake, e.g. with a real ``KvCacheTransceiverV2``; the
+    fake's options are ignored then.
     """
 
     def __init__(
@@ -80,12 +82,19 @@ class CoordinatorHarness:
         admission_controller=None,
         is_kv_manager_v2=False,
         defer_unready_gen_receives=False,
+        cancels_timed_out_gen_receives=False,
         dist=None,
+        transceiver=None,
     ) -> None:
-        self.transceiver = FakeKvCacheTransceiver(
-            kv_transfer_timeout_ms=kv_transfer_timeout_ms,
-            supports_inflight_cancellation=supports_inflight_cancellation,
-            consumes_transfer_buffer=consumes_transfer_buffer,
+        self.transceiver = (
+            transceiver
+            if transceiver is not None
+            else FakeKvCacheTransceiver(
+                kv_transfer_timeout_ms=kv_transfer_timeout_ms,
+                supports_inflight_cancellation=supports_inflight_cancellation,
+                consumes_transfer_buffer=consumes_transfer_buffer,
+                cancels_timed_out_gen_receives=cancels_timed_out_gen_receives,
+            )
         )
         self.transceiver.has_retired_send_session = lambda req: False
         self.kv_cache_manager = Mock(spec=["store_blocks_for_reuse", "unpin_blocks_by_id"])
