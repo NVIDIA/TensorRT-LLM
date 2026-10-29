@@ -1141,6 +1141,9 @@ class AllReduce(nn.Module):
                 - RESIDUAL_RMS_NORM_QUANT_NVFP4
                 - RESIDUAL_RMS_NORM_OUT_QUANT_FP8
                 - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+                - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF (not UB or MNNVL)
+                - RESIDUAL_RMS_NORM_QUANT_MXFP8 (not UB or MNNVL)
+                - RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 (not UB or MNNVL)
 
             Note: NCCL, UB, and LOWPRECISION strategies only support consequent kernel calls
         instead of fused operations.
@@ -1297,6 +1300,9 @@ class AllReduce(nn.Module):
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
             RESIDUAL_RMS_NORM_QUANT_NVFP4: [norm_quant_fp4, scale_factor, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: [norm, norm_quant_fp4, scale_factor, residual]
+            RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF: [norm, norm_quant_fp4, linear_scale_factor, residual]
+            RESIDUAL_RMS_NORM_QUANT_MXFP8: [norm_quant_mxfp8, swizzled_scale_factor, residual]
+            RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8: [norm, norm_quant_mxfp8, swizzled_scale_factor, residual]
         '''
         if self.mapping.tp_size == 1 or (all_reduce_params is not None
                                          and all_reduce_params.enable_allreduce
