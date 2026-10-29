@@ -175,7 +175,19 @@ def create_dataset_from_stream(
 
         # Parse LoRA request if present
         lora_data = data.get("lora_request", None)
-        if lora_data:
+        if lora_data is not None:
+            if not isinstance(lora_data, dict):
+                raise DatasetFormatError(
+                    f"'lora_request' must be a JSON object, got "
+                    f"{type(lora_data).__name__} in request: {data}")
+            missing = [
+                key for key in ("lora_name", "lora_int_id")
+                if key not in lora_data
+            ]
+            if missing:
+                raise DatasetFormatError(
+                    f"'lora_request' entry is missing required key(s) "
+                    f"{missing} in request: {data}")
             lora_request = LoRARequest(lora_name=lora_data["lora_name"],
                                        lora_int_id=lora_data["lora_int_id"],
                                        lora_path=lora_data.get("lora_path", ""))

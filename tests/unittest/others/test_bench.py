@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+import json
 from typing import get_args
 from unittest import mock
 
@@ -110,6 +111,39 @@ def test_empty_stream_raises_dataset_format_error():
 
     with pytest.raises(DatasetFormatError, match="No data was read from the dataset stream"):
         create_dataset_from_stream(tokenizer, empty_stream)
+
+
+def _lora_dataset_stream(lora_request) -> io.StringIO:
+    line = {"task_id": 1, "prompt": "hello world", "output_tokens": 8, "lora_request": lora_request}
+    return io.StringIO(json.dumps(line) + "\n")
+
+
+@pytest.mark.parametrize(
+    "lora_request, message",
+    [
+        ({}, "missing required key(s) ['lora_name', 'lora_int_id']"),
+        ({"lora_path": "/tmp/a"}, "missing required key(s) ['lora_name', 'lora_int_id']"),
+        ({"lora_name": "adapter"}, "missing required key(s) ['lora_int_id']"),
+        ({"lora_int_id": 1}, "missing required key(s) ['lora_name']"),
+        ("adapter", "must be a JSON object, got str"),
+        (["adapter", 1], "must be a JSON object, got list"),
+    ],
+)
+def test_malformed_lora_request_raises_dataset_format_error(lora_request, message):
+    with pytest.raises(DatasetFormatError) as exc_info:
+        create_dataset_from_stream(_FakeTokenizer(), _lora_dataset_stream(lora_request))
+    assert message in str(exc_info.value)
+    # The offending request is named so it can be found in a large dataset.
+    assert "'task_id': 1" in str(exc_info.value)
+    assert f"'lora_request': {lora_request!r}" in str(exc_info.value)
+
+
+def test_lora_request_is_parsed():
+    _, requests = create_dataset_from_stream(
+        _FakeTokenizer(), _lora_dataset_stream({"lora_name": "adapter", "lora_int_id": 3})
+    )
+    assert requests[0].lora_request.lora_name == "adapter"
+    assert requests[0].lora_request.lora_int_id == 3
 
 
 def test_initialize_tokenizer_routes_through_transformers_tokenizer():
