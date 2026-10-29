@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import functools
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -456,6 +457,53 @@ _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 _RNG_SLOT_SPAN = 32
 
 
+@functools.lru_cache(maxsize=4096)
+def _normalize_one_model_sampling_params(
+    *,
+    temperature: Optional[float],
+    top_k: Optional[int],
+    top_p: Optional[float],
+    min_p: Optional[float],
+) -> tuple[float, int, float, float, bool]:
+    """Convert request sampling params into normalized per-request scalars.
+
+    Interpreted as TorchSampler does (resolve_row_params); greedy rows take
+    DISABLE_TEMP_VAL, and a disabled top_k takes DISABLE_TOPK_VAL rather than 0.
+    A pure function of its arguments, so batches re-scanned every step look the
+    distinct parameter sets up instead of resolving them again.
+    """
+    from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
+        GREEDY_TEMPERATURE_THRESHOLD
+    from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
+        SamplingMode, resolve_row_params)
+
+    # Sentinel temperature for greedy / temperature-disabled rows. Must stay
+    # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
+    # recognize these rows as greedy; small enough that even if a row were
+    # (incorrectly) sampled, softmax(logits / val) is effectively one-hot,
+    # and non-zero to avoid division by 0.
+    DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
+    # Very large values disable topk.
+    DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
+
+    row = resolve_row_params(temperature=temperature,
+                             top_k=top_k,
+                             top_p=top_p,
+                             min_p=min_p)
+    is_greedy = row.mode is SamplingMode.GREEDY
+    # The sentinel is one-hot under softmax, so it must not reach a non-greedy
+    # row.
+    normalized_temperature = DISABLE_TEMP_VAL if is_greedy else row.temperature
+    normalized_top_k = row.top_k if row.top_k > 0 else DISABLE_TOPK_VAL
+    return (
+        normalized_temperature,
+        normalized_top_k,
+        row.top_p,
+        row.min_p,
+        is_greedy,
+    )
+
+
 @dataclass
 class SpecMetadata:
     """
@@ -880,21 +928,24 @@ class SpecMetadata:
                                        dtype=torch.int64,
                                        device='cuda')
 
-        def _upload(dst: torch.Tensor, values: list[int]) -> None:
-            dst[:len(values)].copy_(torch.tensor(values,
-                                                 dtype=torch.int64,
-                                                 pin_memory=prefer_pinned()),
-                                    non_blocking=True)
-
         # An all-greedy batch runs the argmax graph, which reads none of these
         # buffers. The offset windows above still advance, so skipping the
         # copies changes no later batch's streams.
         if self.is_all_greedy_sample:
             return
-        _upload(self.request_seeds, request_seeds)
-        _upload(self.request_offsets, request_offsets)
-        _upload(self.seeds, flat_seeds)
-        _upload(self.offsets, flat_offsets)
+        # One pinned staging tensor holds all four lists; each buffer is
+        # filled from its own slice.
+        dsts = (self.request_seeds, self.request_offsets, self.seeds,
+                self.offsets)
+        lists = (request_seeds, request_offsets, flat_seeds, flat_offsets)
+        staging = torch.tensor(sum(lists, []),
+                               dtype=torch.int64,
+                               pin_memory=prefer_pinned())
+        start = 0
+        for dst, values in zip(dsts, lists):
+            end = start + len(values)
+            dst[:len(values)].copy_(staging[start:end], non_blocking=True)
+            start = end
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -1207,53 +1258,6 @@ class SpecMetadata:
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import (
             LlmRequestState, get_request_tokens_per_gen_step)
-        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
-            GREEDY_TEMPERATURE_THRESHOLD
-        from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
-            SamplingMode, resolve_row_params)
-
-        # Sentinel temperature for greedy / temperature-disabled rows. Must stay
-        # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
-        # recognize these rows as greedy; small enough that even if a row were
-        # (incorrectly) sampled, softmax(logits / val) is effectively one-hot,
-        # and non-zero to avoid division by 0.
-        DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
-        # Very large values disable topk.
-        DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
-
-        def _normalize_request_sampling_params(
-            *,
-            temperature: Optional[float],
-            top_k: Optional[int],
-            top_p: Optional[float],
-            min_p: Optional[float],
-        ) -> tuple[float, int, float, float, bool]:
-            """Convert request sampling params into normalized per-request scalars.
-
-            Interpreted as TorchSampler does (resolve_row_params); greedy rows
-            take the sentinels above, and a disabled top_k takes
-            DISABLE_TOPK_VAL rather than 0.
-            """
-            row = resolve_row_params(temperature=temperature,
-                                     top_k=top_k,
-                                     top_p=top_p,
-                                     min_p=min_p)
-            is_greedy = row.mode is SamplingMode.GREEDY
-            # The sentinel is one-hot under softmax, so it must not reach a
-            # non-greedy row.
-            normalized_temperature = (DISABLE_TEMP_VAL
-                                      if is_greedy else row.temperature)
-            normalized_top_k = row.top_k if row.top_k > 0 else DISABLE_TOPK_VAL
-            normalized_top_p = row.top_p
-            normalized_min_p = row.min_p
-
-            return (
-                normalized_temperature,
-                normalized_top_k,
-                normalized_top_p,
-                normalized_min_p,
-                is_greedy,
-            )
 
         # Phase 1: collect per-request flags and normalized values.
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
@@ -1286,7 +1290,7 @@ class SpecMetadata:
                 tp_val,
                 mp_val,
                 is_greedy,
-            ) = _normalize_request_sampling_params(
+            ) = _normalize_one_model_sampling_params(
                 temperature=temp_val,
                 top_k=tk_val,
                 top_p=tp_val,
