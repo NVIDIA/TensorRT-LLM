@@ -708,6 +708,32 @@ def test_derived_buffers_need_a_rebuild_and_the_lender_moves_them():
 
 
 @pytest.mark.cpu_only
+def test_a_share_covers_the_derived_buffers_the_lender_lends():
+    """The lender lends derived buffers with the rest, so a group whose transferred buffers every
+    rank holds alike but whose derived buffer is each rank's own is a share per rank."""
+
+    class PerRankScales(Manager):
+        def _page_buffer_tensors(self, layer_id, role, size, tokens, state):
+            if role == "v_scale":
+                return page_layout.owned(size, 2)
+            return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
+
+        def _page_derived_roles(self):
+            return frozenset({"v_scale"})
+
+        def rebuild_disagg_imported_cache(self, requests):
+            pass
+
+    groups = [kv_group(lids=(0,), extra=[("v_scale", 32, None)])]
+    lent = [
+        derive_layout(PerRankScales(groups, tp_size=2, tp_rank=r, num_kv_heads=1)).page_layout
+        for r in range(2)
+    ]
+    assert [layout.layer_groups[0].shard for layout in lent] == [ShardDesc(2, 0), ShardDesc(2, 1)]
+    assert page_layout.replica_ranks(lent, 0, 0) == (0,)
+
+
+@pytest.mark.cpu_only
 def test_groups_of_one_manager_are_judged_one_by_one():
     manager = Manager(
         [

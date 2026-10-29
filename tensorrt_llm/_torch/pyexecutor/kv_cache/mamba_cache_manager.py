@@ -3586,8 +3586,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         each split by byte over the ranks recurrent state splits over. SSM
         state is split by head. Both name their element types, which their
         dtypes configure apart from the KV cache's. PLE state is computed from
-        replicated inputs, so every rank holds identical bytes; so do the
-        generation-local KDA replay buffers.
+        replicated inputs, so every rank holds identical bytes, as it does the
+        accepted-draft count. The generation-local KDA replay caches follow the
+        rank's heads; as derived roles they are this rank's own (the base
+        declaration).
         """
         if role == MambaRole.CONV_STATE:
             d_conv_m1 = int(self.conv_state_shape[1])
@@ -3611,8 +3613,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 head_bytes=int(head_dim) * int(d_state) *
                 self.ssm_state_dtype.itemsize,
                 dtype=_dtype_name(self.ssm_state_dtype))
-        if role in (MambaRole.PLE_CONV_STATE, MambaRole.PLE_NGRAM_CONTEXT
-                    ) or role in self._kda_replay_roles():
+        if role in (MambaRole.PLE_CONV_STATE, MambaRole.PLE_NGRAM_CONTEXT,
+                    str(_KDA_REPLAY_COUNT_ROLE)):
             return replicated(size)
         return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 

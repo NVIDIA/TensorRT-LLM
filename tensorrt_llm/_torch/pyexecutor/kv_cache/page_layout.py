@@ -723,8 +723,9 @@ class PageLayout:
             lender stages nothing.
         rebuilds_untransferred: Whether some buffers peers do not transfer derive from the others,
             which the manager rebuilds after the native transfer imports a request's pages
-            (``KVCacheManagerV2._page_derived_roles``); a reader that invokes no rebuild, such as
-            the lender, moves every untransferred buffer then.
+            (``KVCacheManagerV2._page_derived_roles``). The lender, which invokes no rebuild, then
+            lends every buffer, and where the source holds none of the derived ones, the importer
+            invokes the rebuild (``attach_lender``).
 
     Raises:
         ValueError: If tokens_per_page, a slot width or a KV head count is not a positive integer; a

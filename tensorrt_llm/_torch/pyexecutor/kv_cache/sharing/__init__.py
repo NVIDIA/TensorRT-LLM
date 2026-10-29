@@ -110,7 +110,11 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
         - ALL arrivals need every transferred buffer's bytes this request will read. See
           ``Lender.return_writes`` for permitted omissions; return a partially filled receive
           with ``reusable=False``, and the lender keeps its cache out of reuse, as it does one
-          missing window margins. NAMED always transfers the whole object.
+          missing window margins. NAMED always transfers the whole object. Buffers the manager
+          derives from the others (``PageLayout.rebuilds_untransferred``) that the source holds
+          none of, such as KDA replay caches a context rank does not allocate, are filled by
+          calling the manager's ``rebuild_disagg_imported_cache`` on the request before its
+          first forward.
         - Treat failed leases and empty bounds as request-level outcomes, including permanent local
           states such as reuse reset. Validation ``ValueError``/``TypeError`` from lends and
           returns and misuse-related ``RuntimeError`` from lease methods and returns are caller

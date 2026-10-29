@@ -3626,7 +3626,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     num_sink_blocks=-(-sink_tokens // tokens_per_block),
                     pool_group=g,
                     layers=tuple(layer for layer, _ in named),
-                    shard=content_shard(group_buffers[lg], topology),
+                    # The lender lends derived buffers too, so its names cover their bytes.
+                    shard=content_shard(
+                        [
+                            replace(b, transferred=True) if b.role in derived else b
+                            for b in group_buffers[lg]
+                        ],
+                        topology,
+                    ),
                     read_window=read,
                     model_layers=tuple(model_layer for _, model_layer in named),
                 )
@@ -3790,9 +3797,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _page_derived_roles(self) -> frozenset[str]:
         """Roles whose buffers derive from the transferred ones: a transfer leaves them for
-        ``rebuild_disagg_imported_cache`` to rebuild after the import, and a reader that rebuilds
-        nothing, such as the lender, moves them instead. None by default; a manager naming any
-        overrides that rebuild, or its page table is refused."""
+        ``rebuild_disagg_imported_cache`` to rebuild after the import. The lender, which rebuilds
+        nothing, lends them with the rest; where the source holds none of them, the importer
+        rebuilds them. None by default; a manager naming any overrides that rebuild, or its page
+        table is refused."""
         return frozenset()
 
     def _page_dtype(self) -> str | None:
