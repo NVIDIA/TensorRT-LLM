@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -21,17 +22,34 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
     MambaStateLayout,
+    _get_local_mamba_cache_layout,
+    _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
+    ReplayLayout,
 )
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 MIN_REPLAY_HISTORY_SIZE = 16
+# Per-layer replay history roles, in ReplayHistory attribute order.
+_REPLAY_HISTORY_ROLES = {
+    "old_x": DataRole("mamba2_old_x"),
+    "old_B": DataRole("mamba2_old_B"),
+    "old_dt": DataRole("mamba2_old_dt"),
+    "old_dA_cumsum": DataRole("mamba2_old_dA_cumsum"),
+}
+# Held by the first local layer. KVCM copies 16-byte payloads; a row holds
+# [prev_num_accepted_tokens, cache_buf_idx, padding, padding] as int32.
+_REPLAY_META_ROLE = DataRole("mamba2_replay_meta")
+_REPLAY_META_BYTES = 16
+_REPLAY_META_PNAT = 0
+_REPLAY_META_CACHE_BUF_IDX = 1
 
 
 class ReplayStateUpdateMetadata(NamedTuple):
@@ -45,12 +63,12 @@ class ReplayStateUpdateMetadata(NamedTuple):
 
 def _advance_replay_state(
     replay_metadata: ReplayStateUpdateMetadata,
-    state_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
     accepted_tokens: torch.Tensor,
     is_dummy_request: torch.Tensor | None = None,
 ) -> None:
-    """Advance double-buffered replay bookkeeping after a verify step."""
-    slots = state_indices.long()
+    """Advance double-buffered replay bookkeeping of ``replay_indices`` after a verify step."""
+    slots = replay_indices.long()
     accepted_tokens = accepted_tokens.to(replay_metadata.prev_num_accepted_tokens.dtype)
     previous = replay_metadata.prev_num_accepted_tokens[slots]
     wrote_checkpoint = (
@@ -283,14 +301,53 @@ class ReplayHistory:
         self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
         self.prev_num_accepted_tokens: torch.Tensor | None = None
         self.cache_buf_idx: torch.Tensor | None = None
-        self.old_x: torch.Tensor | None = None
-        self.old_B: torch.Tensor | None = None
-        self.old_dt: torch.Tensor | None = None
-        self.old_dA_cumsum: torch.Tensor | None = None
+        # Stacked [layer, slot, ...] tensors, or per-layer views of PRIVATE
+        # pool buffers that are not evenly spaced across layers.
+        self.old_x: torch.Tensor | list[torch.Tensor] | None = None
+        self.old_B: torch.Tensor | list[torch.Tensor] | None = None
+        self.old_dt: torch.Tensor | list[torch.Tensor] | None = None
+        self.old_dA_cumsum: torch.Tensor | list[torch.Tensor] | None = None
+        self._replay_meta: torch.Tensor | None = None
+        self._pool_layers: list[dict[DataRole, torch.Tensor]] | None = None
 
     @property
     def uses_replay(self) -> bool:
         return True
+
+    def pool_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
+        """Per-slot shapes of one layer's replay history.
+
+        The first local layer also holds the replay metadata row.
+        """
+        if not context.mamba_pp_layers:
+            return {}
+        num_heads, head_dim, d_state = context.ssm_state_shape
+        history = self.replay_history_size
+        layout = {
+            _REPLAY_HISTORY_ROLES["old_x"]: (
+                context.conv_state_dtype,
+                [2, history, num_heads, head_dim],
+            ),
+            _REPLAY_HISTORY_ROLES["old_B"]: (
+                context.conv_state_dtype,
+                [2, history, context.n_groups_per_rank, d_state],
+            ),
+            _REPLAY_HISTORY_ROLES["old_dt"]: (torch.float32, [2, num_heads, history]),
+            _REPLAY_HISTORY_ROLES["old_dA_cumsum"]: (torch.float32, [2, num_heads, history]),
+        }
+        if layer_id == context.mamba_pp_layers[0]:
+            layout[_REPLAY_META_ROLE] = (
+                torch.int32,
+                [_REPLAY_META_BYTES // torch.int32.itemsize],
+            )
+        return layout
+
+    def bind_replay_pool(self, layers: list[dict[DataRole, torch.Tensor]]) -> None:
+        """Use the manager's per-layer pool views instead of allocating history.
+
+        Each view's first dimension is a replay slot.
+        """
+        self._pool_layers = layers
 
     def validate(self, context: MambaStateLayout) -> None:
         if context.spec_config is None:
@@ -334,6 +391,10 @@ class ReplayHistory:
         )
         self.rand_seed = allocate_mamba_seed_buffer(cache_size, self._seed_rank_offset, device)
 
+        if self._pool_layers is not None:
+            self._bind_pool_history()
+            return
+
         num_heads, head_dim, d_state = context.ssm_state_shape
         common_replay_shape = [len(context.mamba_pp_layers), cache_size, 2]
         self.prev_num_accepted_tokens = torch.zeros(cache_size, dtype=torch.int32, device=device)
@@ -354,6 +415,16 @@ class ReplayHistory:
             device=device,
         )
         self.old_dA_cumsum = torch.zeros_like(self.old_dt)
+
+    def _bind_pool_history(self) -> None:
+        layers = self._pool_layers
+        self._replay_meta = layers[0][_REPLAY_META_ROLE]
+        self.prev_num_accepted_tokens = self._replay_meta[:, _REPLAY_META_PNAT]
+        self.cache_buf_idx = self._replay_meta[:, _REPLAY_META_CACHE_BUF_IDX]
+        for name, role in _REPLAY_HISTORY_ROLES.items():
+            views = [layer[role] for layer in layers]
+            stacked = _stack_state_views(views)
+            setattr(self, name, stacked if stacked is not None else views)
 
     def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
         return {
@@ -379,13 +450,32 @@ class ReplayHistory:
             **self._layer_cache_fields(layer_offset),
         )
 
-    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+    def reset_replay_slots(self, replay_slots: torch.Tensor) -> None:
+        """Clear the replay history and bookkeeping of ``replay_slots``."""
         if self.prev_num_accepted_tokens is None:
             return
-        self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
-        self.cache_buf_idx.index_fill_(0, slots, 0)
+        if self._replay_meta is not None:
+            self._replay_meta.index_fill_(0, replay_slots, 0)
+        else:
+            self.prev_num_accepted_tokens.index_fill_(0, replay_slots, 0)
+            self.cache_buf_idx.index_fill_(0, replay_slots, 0)
         for buffer in (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum):
-            buffer.index_fill_(1, slots, 0)
+            if isinstance(buffer, torch.Tensor):
+                buffer.index_fill_(1, replay_slots, 0)
+            else:
+                for layer_buffer in buffer:
+                    layer_buffer.index_fill_(0, replay_slots, 0)
+
+    def reset_slots(
+        self,
+        slots: torch.Tensor,
+        host_slots: list[int],
+        replay_slots: torch.Tensor | None = None,
+    ) -> None:
+        """Reset context requests' replay history and refresh their state-slot seeds."""
+        if self.prev_num_accepted_tokens is None:
+            return
+        self.reset_replay_slots(slots if replay_slots is None else replay_slots)
         if self.rand_seed is not None:
             self._seed_request_counter += 1
             _reset_mamba_seed_buffer(
@@ -402,7 +492,11 @@ class ReplayHistory:
             raise RuntimeError("Mamba2 replay buffers are not bound")
         _advance_replay_state(
             metadata,
-            batch.destination_state_indices,
+            (
+                batch.destination_state_indices
+                if batch.replay_indices is None
+                else batch.replay_indices
+            ),
             batch.num_accepted_tokens,
             batch.is_dummy_request,
         )
@@ -433,6 +527,8 @@ class ReplayHistory:
         self.old_B = None
         self.old_dt = None
         self.old_dA_cumsum = None
+        self._replay_meta = None
+        self._pool_layers = None
 
 
 def create_mamba2_state(
@@ -446,6 +542,30 @@ def create_mamba2_state(
     return Mamba2State(stochastic_rounding=stochastic_rounding)
 
 
+def _mamba2_replay_gate(
+    spec_config: object | None, ssm_cache_dtype: torch.dtype, stochastic_rounding: bool
+) -> tuple[bool, list[str]]:
+    """Return whether Mamba2 replay is selected, with the reasons it is not."""
+    sm = get_sm_version()
+    use_replay = spec_config is not None and sm >= 80
+    reasons = []
+    if spec_config is None:
+        reasons.append("Replay kernel requires speculative decoding; using non-replay path")
+    if spec_config is not None and (getattr(spec_config, "use_dynamic_tree", False)):
+        reasons.append("Replay kernel incompatible with tree attention; using legacy MTP path")
+        use_replay = False
+    if stochastic_rounding and ssm_cache_dtype == torch.float16 and (sm < 100 or sm in (120, 121)):
+        reasons.append(
+            "Replay kernel Philox requires 100 <= sm < 120; "
+            "using legacy MTP path for stochastic rounding support"
+        )
+        use_replay = False
+    if os.environ.get("TRTLLM_USE_MAMBA_REPLAY", "1") == "0":
+        reasons.append("Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
+        use_replay = False
+    return use_replay, reasons
+
+
 def select_mamba2_state(
     *,
     spec_config: object | None,
@@ -453,23 +573,10 @@ def select_mamba2_state(
     stochastic_rounding: bool,
 ) -> Mamba2State | ReplayHistory:
     """Apply Mamba2 replay gates and return its selected update policy."""
-    sm = get_sm_version()
-    use_replay = spec_config is not None and sm >= 80
-    if spec_config is None:
-        logger.info("Replay kernel requires speculative decoding; using non-replay path")
-    if spec_config is not None and (getattr(spec_config, "use_dynamic_tree", False)):
-        logger.info("Replay kernel incompatible with tree attention; using legacy MTP path")
-        use_replay = False
-    if stochastic_rounding and ssm_cache_dtype == torch.float16 and (sm < 100 or sm in (120, 121)):
-        logger.info(
-            "Replay kernel Philox requires 100 <= sm < 120; "
-            "using legacy MTP path for stochastic rounding support"
-        )
-        use_replay = False
-    if os.environ.get("TRTLLM_USE_MAMBA_REPLAY", "1") == "0":
-        logger.info("Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
-        use_replay = False
-    else:
+    use_replay, reasons = _mamba2_replay_gate(spec_config, ssm_cache_dtype, stochastic_rounding)
+    for reason in reasons:
+        logger.info(reason)
+    if os.environ.get("TRTLLM_USE_MAMBA_REPLAY", "1") != "0":
         logger.info("Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
     return create_mamba2_state(
         spec_config=spec_config, use_replay=use_replay, stochastic_rounding=stochastic_rounding
@@ -514,6 +621,64 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
                 raise ValueError("Replay state groups must be divisible by the effective TP size")
             state.validate(self._state_layout)
         return state
+
+    @override
+    def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
+        state = self._speculative_state
+        if not isinstance(state, ReplayHistory):
+            return {}
+        return state.pool_layout(self._state_layout, global_layer_id)
+
+    @classmethod
+    @override
+    def _estimate_private_replay_bytes_per_slot(
+        cls, model_config, mapping: Mapping, **kwargs
+    ) -> int:
+        spec_config = kwargs.get("spec_config")
+        if spec_config is None:
+            return 0
+        params, local_layers, _ = _get_local_mamba_cache_layout(
+            model_config,
+            mapping,
+            spec_config=spec_config,
+            is_draft=kwargs.get("is_draft", False),
+            use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+        )
+        if not local_layers:
+            return 0
+        ssm_cache_dtype = params.mamba_ssm_cache_dtype or params.dtype
+        quant_config = getattr(model_config, "quant_config", None)
+        stochastic_rounding = kwargs.get(
+            "mamba_ssm_stochastic_rounding",
+            getattr(quant_config, "mamba_ssm_stochastic_rounding", False)
+            and ssm_cache_dtype == torch.float16,
+        )
+        use_replay, _ = _mamba2_replay_gate(spec_config, ssm_cache_dtype, stochastic_rounding)
+        if not use_replay:
+            return 0
+        tp_size = _mamba_effective_tp_size(mapping)
+        layer_ids = list(range(local_layers))
+        context = MambaStateLayout(
+            layer_mask=(True,) * local_layers,
+            pp_layers=tuple(layer_ids),
+            mamba_pp_layers=tuple(layer_ids),
+            mapping=mapping,
+            conv_state_shape=(),
+            ssm_state_shape=(params.num_heads // tp_size, params.head_dim, params.state_size),
+            conv_state_dtype=params.dtype,
+            ssm_state_dtype=ssm_cache_dtype,
+            n_groups_per_rank=params.n_groups // tp_size,
+            max_batch_size=0,
+            state_index_capacity=0,
+            slot_capacity=None,
+            spec_config=spec_config,
+        )
+        state = ReplayHistory(spec_config.tokens_per_gen_step)
+        return sum(
+            dtype.itemsize * math.prod(shape)
+            for layer_id in layer_ids
+            for dtype, shape in state.pool_layout(context, layer_id).values()
+        )
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
         state = self._speculative_state

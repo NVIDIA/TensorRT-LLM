@@ -398,6 +398,7 @@ def _cached_replay_layered_commit_kernel(
     old_G,
     replay_work_items,
     n_writes,
+    work_item_stride,
     pool_stride_layer,
     pool_stride_slot,
     old_u_stride_layer,
@@ -438,7 +439,7 @@ def _cached_replay_layered_commit_kernel(
         work_idx = tile_id // NUM_LAYERS
         i_h = i_hv // (HV // H)
 
-        work_base = replay_work_items + work_idx * 4
+        work_base = replay_work_items + work_idx * work_item_stride
         slot = tl.load(work_base + 1).to(tl.int64)
         b_pnat = tl.load(work_base + 2)
         b_buf = tl.load(work_base + 3)
@@ -593,7 +594,10 @@ def commit_gdn_cached_replay_history_layers(
     assert old_k.shape[0] == num_layers and old_k.shape[-1] == K
     assert old_G.shape[0] == num_layers and old_G.shape[-2:] == (HV, history_size)
     assert old_u.is_contiguous() and old_k.is_contiguous() and old_G.is_contiguous()
-    assert replay_work_items.ndim == 2 and replay_work_items.shape[1] == 4
+    # Rows start with (position, slot, PNAT, active buffer); wider rows carry
+    # fields this kernel does not read.
+    assert replay_work_items.ndim == 2 and replay_work_items.shape[1] >= 4
+    assert replay_work_items.stride(1) == 1
     assert replay_work_items.dtype == torch.int32
     assert n_writes.dtype == torch.int32 and n_writes.numel() == 1
     assert persistent_waves > 0
@@ -655,6 +659,7 @@ def commit_gdn_cached_replay_history_layers(
         old_G=old_G,
         replay_work_items=replay_work_items,
         n_writes=n_writes,
+        work_item_stride=replay_work_items.stride(0),
         pool_stride_layer=pool_stride_layer,
         pool_stride_slot=pool_stride_slot,
         old_u_stride_layer=old_u.stride(0),
@@ -825,7 +830,7 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     if (replay_work_items is None) != (n_writes is None):
         raise ValueError("replay_work_items and n_writes must either both be set or both be None")
     if replay_work_items is not None:
-        assert replay_work_items.shape == (N, 4)
+        assert replay_work_items.shape[0] == N and replay_work_items.shape[1] >= 4
         assert replay_work_items.dtype == torch.int32
         assert replay_work_items.is_contiguous()
         assert n_writes is not None and n_writes.dtype == torch.int32

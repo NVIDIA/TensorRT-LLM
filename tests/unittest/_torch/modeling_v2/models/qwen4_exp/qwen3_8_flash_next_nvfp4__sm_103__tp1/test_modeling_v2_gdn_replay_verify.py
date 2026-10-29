@@ -37,7 +37,10 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     commit_gdn_cached_replay_history_layers,
 )
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import _build_replay_work_items_torch
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    REPLAY_WORK_ITEM_WIDTH,
+    _build_replay_work_items_torch,
+)
 
 assert torch.cuda.is_available(), "the GDN verify test requires a CUDA device"
 
@@ -108,7 +111,9 @@ class _Mode:
             )
             self.meta = ReplayStateUpdateMetadata(self.pnat, self.buf, t, HIST)
             self.mm = SimpleNamespace(
-                replay_work_items=torch.zeros(max_batch, 4, dtype=torch.int32, device=DEV),
+                replay_work_items=torch.zeros(
+                    max_batch, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device=DEV
+                ),
                 replay_n_writes=torch.zeros(1, dtype=torch.int32, device=DEV),
             )
         else:

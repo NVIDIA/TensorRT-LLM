@@ -29,8 +29,10 @@ from tensorrt_llm._torch.modules.mamba.cache_manager import (
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     REPLAY_WORK_CACHE_BUF_IDX,
     REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
     REPLAY_WORK_PNAT,
     REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+    REPLAY_WORK_REPLAY_SLOT,
     Mamba2Metadata,
     _build_replay_work_items_torch,
     _build_replay_work_items_triton,
@@ -80,6 +82,7 @@ def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
     manager = Manager()
     metadata = object.__new__(Mamba2Metadata)
     metadata.state_indices = [7, 2, 9]
+    metadata.replay_state_indices = [8, 3, 10]
     metadata.replay_work_items = object()
     metadata.replay_n_writes = object()
     build = Mock()
@@ -96,6 +99,7 @@ def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
             metadata.replay_n_writes,
             replay.replay_step_width,
             replay.replay_history_size,
+            [3, 10],
         )
     else:
         build.assert_not_called()
@@ -132,6 +136,39 @@ def _decode_attn_metadata(kv_cache_manager):
     )
 
 
+@skip_no_cuda
+def test_prepare_fills_static_replay_slots_for_private_replay():
+    """A manager with PRIVATE replay buffers gets its replay slots copied into one static buffer, so CUDA graphs keep
+    reading the same address; otherwise the replay slots alias the state slots."""
+
+    class PrivateReplayCacheManager(_StateIndexCacheManager):
+        replay_layer_group_id = 1
+
+        def __init__(self, state_indices, replay_indices):
+            super().__init__(state_indices)
+            self.replay_indices = replay_indices
+
+        def get_replay_state_indices(self, request_ids):
+            return self.replay_indices[: len(request_ids)]
+
+    manager = PrivateReplayCacheManager([4, 1], [6, 0])
+    metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+    metadata.prepare(_decode_attn_metadata(manager))
+    address = metadata.replay_state_indices.data_ptr()
+    assert address != metadata.state_indices.data_ptr()
+    torch.cuda.synchronize()
+    assert metadata.replay_state_indices.tolist() == [6, 0]
+    manager.replay_indices = [3, 5]
+    metadata.prepare(_decode_attn_metadata(manager))
+    torch.cuda.synchronize()
+    assert metadata.replay_state_indices.data_ptr() == address
+    assert metadata.replay_state_indices.tolist() == [3, 5]
+
+    coupled = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+    coupled.prepare(_decode_attn_metadata(_StateIndexCacheManager([4, 1])))
+    assert coupled.replay_state_indices is coupled.state_indices
+
+
 def _torch_reference_work_items(state_indices, prev_num_accepted_tokens, cache_buf_idx):
     """Run the production ATen path into fresh buffers.
 
@@ -139,7 +176,7 @@ def _torch_reference_work_items(state_indices, prev_num_accepted_tokens, cache_b
     this path -- not a third hand-written copy -- is what it is compared to.
     """
     num_decodes = state_indices.numel()
-    work_items = torch.zeros(num_decodes, 4, dtype=torch.int32, device="cuda")
+    work_items = torch.zeros(num_decodes, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device="cuda")
     n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
     _build_replay_work_items_torch(
         state_indices,
@@ -348,12 +385,13 @@ class TestMamba2Metadata:
 
         metadata.prepare(attn_metadata)
 
+        # Without separate replay slots, the replay slot is the state slot.
         expected = torch.tensor(
             [
-                [0, 3, 11, 1],
-                [2, 4, 20, 0],
-                [1, 1, 4, 1],
-                [3, 2, 10, 0],
+                [0, 3, 11, 1, 3],
+                [2, 4, 20, 0, 4],
+                [1, 1, 4, 1, 1],
+                [3, 2, 10, 0, 2],
             ],
             dtype=torch.int32,
             device="cuda",
@@ -367,6 +405,7 @@ class TestMamba2Metadata:
         assert actual[0, REPLAY_WORK_CACHE_SLOT] == 3
         assert actual[0, REPLAY_WORK_PNAT] == 11
         assert actual[0, REPLAY_WORK_CACHE_BUF_IDX] == 1
+        assert actual[0, REPLAY_WORK_REPLAY_SLOT] == 3
 
     @pytest.mark.parametrize("num_decodes", [16, 17, 40, 255, 256])
     def test_replay_work_items_triton_matches_torch(self, num_decodes):
@@ -381,7 +420,9 @@ class TestMamba2Metadata:
         cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
         state_indices = torch.randperm(num_slots, device="cuda")[:num_decodes].to(torch.int32)
 
-        triton_items = torch.zeros(num_decodes, 4, dtype=torch.int32, device="cuda")
+        triton_items = torch.zeros(
+            num_decodes, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device="cuda"
+        )
         triton_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
         _build_replay_work_items_triton(
             state_indices,

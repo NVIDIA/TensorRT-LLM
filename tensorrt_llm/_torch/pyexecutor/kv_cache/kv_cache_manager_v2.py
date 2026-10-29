@@ -201,6 +201,39 @@ class _MixedPrecisionLayerKind(IntEnum):
     HIGH_PRECISION = 1
 
 
+def _compute_index_mapper_capacity(
+    max_batch_size: int,
+    mapping: Mapping,
+    *,
+    is_disagg: bool,
+    disable_overlap_scheduler: bool,
+    num_reserved_index_slots: int,
+    has_guard_page: bool,
+) -> tuple[int, int]:
+    """Return ``(max_admissible_sequences, IndexMapper capacity)``.
+
+    With pipeline parallelism, multiple microbatches can be in-flight
+    simultaneously, so the scheduler needs slots for all concurrent sequences.
+    In disaggregated mode, use a coefficient of 2: at any moment up to
+    ``max_num_sequences`` requests can be actively generating while another up
+    to ``max_num_sequences`` requests are still in KV transfer
+    (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x capacity
+    lets the next batch of active requests acquire slots without waiting for
+    the previous batch's transfers to finish. With the overlap scheduler on
+    (non-PP), a retiring request holds its lease one extra iteration and needs
+    the same coefficient. Persistent request IDs such as CUDA-graph padding
+    requests get reserved slots, and the guard page, held by a permanent
+    sequence, gets a slot of its own so that it does not change which requests
+    the scheduler admits.
+    """
+    assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
+    max_num_sequences = max_batch_size * mapping.pp_size
+    needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
+    max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
+    capacity = max_admissible_sequences + num_reserved_index_slots + int(has_guard_page)
+    return max_admissible_sequences, capacity
+
+
 def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
     """``1``/``on``/``true``/``zero`` -> 0.0, ``nan`` -> NaN, a number ->
     itself, empty -> off (the default for every caller).
@@ -1768,6 +1801,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
+    # KVCacheManagerConfig.max_live_kv_caches; None leaves living caches
+    # bounded only by the IndexMapper.
+    _live_kv_cache_limit: Optional[int] = None
     # Mixed-precision state as seen by instances built without __init__;
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
@@ -1855,6 +1891,19 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
+        # Both diagnostics below are off unless their environment variable is
+        # set; with neither set nothing here changes any allocation, any page
+        # content or any reported count.
+        self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
+        self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
+        self.max_admissible_sequences, self._index_mapper_capacity = _compute_index_mapper_capacity(
+            max_batch_size,
+            mapping,
+            is_disagg=is_disagg,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            num_reserved_index_slots=num_reserved_index_slots,
+            has_guard_page=self._guard_page_value is not None,
+        )
         self.kv_connector_manager = kv_connector_manager
         codec_config = getattr(cold_page_codec_provider, "config", None)
         self._has_lossy_cold_page_codec = (
@@ -2388,6 +2437,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 ],
             )
         self.kv_cache_manager_py_config = config
+        self._live_kv_cache_limit = config.max_live_kv_caches
         self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
@@ -2520,26 +2570,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and not self._has_cp_helix
         )
 
-        # With pipeline parallelism, multiple microbatches can be in-flight
-        # simultaneously, so we need slots for all concurrent sequences.
-        # Reserve stable slots for persistent request IDs such as CUDA-graph
-        # padding requests. The default preserves the main-branch allocation.
-        # In disaggregated mode, use a coefficient of 2: at any moment up to
-        # `max_num_sequences` requests can be actively generating while another
-        # up to `max_num_sequences` requests are still in KV transfer
-        # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
-        # capacity lets the next batch of active requests acquire slots without
-        # waiting for the previous batch's transfers to finish. With the overlap
-        # scheduler on (non-PP), a retiring request holds its lease one extra
-        # iteration and needs the same coefficient.
         max_num_sequences = max_batch_size * mapping.pp_size
-        needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
-        assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
-        # Both diagnostics below are off unless their environment variable is
-        # set; with neither set nothing here changes any allocation, any page
-        # content or any reported count.
-        self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
-        self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
         self._guard_page_by_layer: dict[int, int] = {}
         self._fresh_page_fill = _parse_kv_fill_value(
             os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
@@ -2552,16 +2583,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
-        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
-        # The guard page is held by a permanent sequence, so it needs an index
-        # slot of its own. Taking one of the scheduler's would change which
-        # requests get admitted, so a run with the diagnostic on would no
-        # longer be comparable with the run it is being read against.
-        index_mapper_capacity = (
-            self.max_admissible_sequences
-            + num_reserved_index_slots
-            + (1 if self._guard_page_value is not None else 0)
-        )
+        index_mapper_capacity = self._index_mapper_capacity
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
             f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
@@ -8109,6 +8131,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 request_id,
                 self.index_mapper.size(),
                 self.index_mapper.size(),
+            )
+            return None
+        if (
+            self._live_kv_cache_limit is not None
+            and len(self.kv_cache_map) >= self._live_kv_cache_limit
+        ):
+            # The native manager raises beyond this bound; callers retry a
+            # request whose cache cannot be created yet, as for a full IndexMapper.
+            logger.warning(
+                "Request %s would exceed max_live_kv_caches=%d living KV caches. "
+                "Skipping KV cache creation; request will retry next iteration.",
+                request_id,
+                self._live_kv_cache_limit,
             )
             return None
         # Synthetic requests must neither claim real prefixes nor publish reusable blocks.

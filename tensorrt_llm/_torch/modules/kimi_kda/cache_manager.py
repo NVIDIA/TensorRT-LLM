@@ -6,14 +6,11 @@
 from __future__ import annotations
 
 import math
-import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
-
-from tensorrt_llm._utils import prefer_pinned
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -26,6 +23,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaRole,
     MambaStateLayout,
     _get_local_mamba_cache_layout,
+    _host_slots_to_device,
+    _is_disagg_context_server,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
@@ -119,11 +118,6 @@ _KDA_REPLAY_CONV_ROLES = ("kda_conv_q", "kda_conv_k", "kda_conv_v")
 _KDA_DRAFT_RECORDS_ROLE = "kda_state_tok"
 
 
-def _is_disagg_context_server(is_disagg: bool) -> bool:
-    """Whether this worker only serves the context phase of disagg requests."""
-    return is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
-
-
 def _kda_replay_layout(
     num_spec: int, num_heads: int, head_dim: int, conv_window: int, draft_records: bool = False
 ) -> dict[str, tuple[torch.dtype, list[int]]]:
@@ -171,16 +165,6 @@ def _kda_replay_bytes_per_slot(
         return 0
     layer_bytes = sum(dtype.itemsize * math.prod(shape) for dtype, shape in layout.values())
     return num_local_layers * layer_bytes + _KDA_REPLAY_COUNT_BYTES
-
-
-def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:
-    """Copy host slot IDs without synchronizing queued GPU work.
-
-    Each copy uses fresh pinned storage so later host writes cannot race it.
-    """
-    return torch.tensor(
-        slots, dtype=torch.long, pin_memory=device.type == "cuda" and prefer_pinned()
-    ).to(device, non_blocking=True)
 
 
 def _kda_beta_cache_padded_heads(num_heads: int) -> int:

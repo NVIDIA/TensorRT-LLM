@@ -89,7 +89,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     get_pp_layers,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
@@ -136,7 +136,7 @@ def test_advance_replay_state_uses_checkpoint_predicate_and_skips_dummies():
 
     _advance_replay_state(
         metadata,
-        state_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+        replay_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
         accepted_tokens=torch.tensor([2, 3, 4], dtype=torch.int32),
         is_dummy_request=torch.tensor([False, False, True]),
     )
@@ -2992,13 +2992,13 @@ def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):
     assert layer_cache.cache_buf_idx is not None
     assert layer_cache.prev_num_accepted_tokens is not None
     assert layer_cache.old_x.dim() == 5
-    cache_size = layer_cache.temporal.shape[0]
-    assert layer_cache.old_x.shape[0] == cache_size
-    assert layer_cache.old_B.shape[0] == cache_size
-    assert layer_cache.old_dt.shape[0] == cache_size
-    assert layer_cache.old_dA_cumsum.shape[0] == cache_size
-    assert layer_cache.cache_buf_idx.shape[0] == cache_size
-    assert layer_cache.prev_num_accepted_tokens.shape[0] == cache_size
+    # Replay history has a slot per replay index, which can differ from the state slots.
+    replay_cache_size = layer_cache.prev_num_accepted_tokens.shape[0]
+    assert layer_cache.old_x.shape[0] == replay_cache_size
+    assert layer_cache.old_B.shape[0] == replay_cache_size
+    assert layer_cache.old_dt.shape[0] == replay_cache_size
+    assert layer_cache.old_dA_cumsum.shape[0] == replay_cache_size
+    assert layer_cache.cache_buf_idx.shape[0] == replay_cache_size
     assert layer_cache.old_x.shape[1] == 2
     assert layer_cache.old_B.shape[1] == 2
     assert layer_cache.old_dt.shape[1] == 2
@@ -4918,9 +4918,14 @@ def _v2_kda_replay_manager_with_large_slots():
 
 def _take_ssm_slot(mgr, slot, others):
     """Create caches until the V2 runtime gives one of them ``slot``, moving the suspended owner's SSM page to the host
-    tier; keep that one and close the rest."""
+    tier; keep that one and close the rest. The native manager refuses caches beyond max_live_kv_caches, so the
+    attempts stay within it."""
     holder = None
-    for _ in range(mgr._kda_replay.prev_num_accepted_tokens.shape[0] + 1):
+    attempts = mgr._state_layout.slot_capacity + 1
+    max_live_kv_caches = mgr.kv_cache_manager_py_config.max_live_kv_caches
+    if max_live_kv_caches is not None:
+        attempts = min(attempts, max_live_kv_caches - len(mgr.kv_cache_map))
+    for _ in range(attempts):
         cache = mgr.impl.create_kv_cache()
         assert cache.resume(mgr._stream.cuda_stream)
         others.append(cache)
@@ -5091,6 +5096,471 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
                 actual, expected, atol=2e-2, rtol=2e-2, msg=f"verify round {round_idx}"
             )
     torch.testing.assert_close(states, expected_states, atol=1e-3, rtol=1e-3)
+
+
+def _build_v2_mamba2_replay_manager(**kwargs):
+    """A V2 Nemotron manager with Mamba2 replay on two layers."""
+    kwargs.setdefault("num_mamba_layers", 2)
+    return _build_v2_hybrid_with_mamba_layer(
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        use_replay_state_update=True,
+        **kwargs,
+    )
+
+
+def _replay_history_rows(mgr, replay_slot):
+    """Clones of one replay slot's PNAT, active buffer and per-layer history."""
+    state = mgr._speculative_state
+    history = [
+        getattr(state, name)[layer][replay_slot].clone()
+        for name in ("old_x", "old_B", "old_dt", "old_dA_cumsum")
+        for layer in range(mgr.local_num_mamba_layers)
+    ]
+    return (
+        int(state.prev_num_accepted_tokens[replay_slot]),
+        int(state.cache_buf_idx[replay_slot]),
+        history,
+    )
+
+
+def _fill_replay_slot(mgr, replay_slot, accepted, active_buffer, value):
+    state = mgr._speculative_state
+    state.prev_num_accepted_tokens[replay_slot] = accepted
+    state.cache_buf_idx[replay_slot] = active_buffer
+    for name in ("old_x", "old_B", "old_dt", "old_dA_cumsum"):
+        for layer in range(mgr.local_num_mamba_layers):
+            getattr(state, name)[layer][replay_slot].fill_(value)
+
+
+def _assert_replay_slot_reset(mgr, replay_slot):
+    accepted, active_buffer, history = _replay_history_rows(mgr, replay_slot)
+    assert (accepted, active_buffer) == (0, 0)
+    assert all(torch.count_nonzero(rows) == 0 for rows in history)
+
+
+@skip_no_cuda
+def test_v2_mamba2_replay_history_uses_private_kvcm_buffers():
+    """Mamba2 replay history lives in PRIVATE buffers of the SSM layers: its own group and slots, a fixed pool of one
+    slot per IndexMapper slot, local to the worker in disaggregated serving, and not counted as recurrent cache."""
+    mgr = _build_v2_mamba2_replay_manager(max_batch_size=2)
+    try:
+        replay_group = mgr.replay_layer_group_id
+        assert replay_group is not None
+        assert replay_group != mgr.ssm_layer_group_id
+        assert isinstance(mgr._speculative_state, ReplayHistory)
+        # One slot per living cache: 2 * max_batch_size with overlap + 1 CUDA-graph padding dummy.
+        assert mgr._index_mapper_capacity == 2 * 2 + 1
+        assert mgr.kv_cache_manager_py_config.max_live_kv_caches == mgr._index_mapper_capacity
+        pools = mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        private_stats = mgr.impl.get_storage_statistics(GPU_LEVEL)[pools[replay_group]]
+        assert private_stats.total == math.ceil(
+            mgr._index_mapper_capacity / mgr.kv_cache_config.max_util_for_resume
+        )
+        replay_slots = mgr._speculative_state.prev_num_accepted_tokens.shape[0]
+        assert replay_slots == private_stats.total
+        layer_cache = mgr.mamba_layer_cache(0)
+        assert layer_cache.old_x.shape[0] == replay_slots
+        # PNAT and the active buffer share one 16-byte row per slot.
+        assert layer_cache.prev_num_accepted_tokens.stride(0) == 4
+        assert layer_cache.cache_buf_idx.stride(0) == 4
+        assert set(mgr._replay_layouts[0]) <= mgr.get_disagg_ignored_roles()
+        page_table = build_page_table_from_manager(mgr)
+        assert not page_table.layer_groups[replay_group].pool_views
+        # The PRIVATE group is still listed as SSM storage, but not as recurrent cache.
+        assert mgr._stats_life_cycle_metadata()[replay_group][2] == "ssm"
+
+        mgr.add_dummy_requests([7], token_nums=[8], is_gen=False)
+        kv_cache = mgr.kv_cache_map[7]
+        assert mgr.get_state_indices([7], [False]) == [
+            kv_cache.get_ssm_block_base_index(mgr.ssm_layer_group_id)
+        ]
+        assert mgr.get_replay_state_indices([7]) == [
+            kv_cache.get_ssm_block_base_index(replay_group)
+        ]
+        assert mgr.cuda_replay_state_indices[0].item() == mgr.get_replay_state_indices([7])[0]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_mamba2_replay_without_speculative_replay_declares_no_private_buffers(monkeypatch):
+    """Managers without Mamba2 replay, and disaggregated context servers, keep replay slots equal to state slots and
+    leave living caches unbounded."""
+    plain = _build_v2_hybrid_with_mamba_layer(num_mamba_layers=2)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    context_server = _build_v2_mamba2_replay_manager(is_disagg=True)
+    try:
+        for mgr in (plain, context_server):
+            assert mgr.replay_layer_group_id is None
+            assert mgr.kv_cache_manager_py_config.max_live_kv_caches is None
+            assert mgr.cuda_replay_state_indices is mgr.cuda_state_indices
+            mgr.add_dummy_requests([3], token_nums=[8], is_gen=False)
+            assert mgr.get_replay_state_indices([3]) == mgr.get_state_indices([3], [False])
+        # The context server's replay history is standalone and indexed by state slot.
+        replay = context_server._speculative_state
+        assert isinstance(replay, ReplayHistory)
+        assert replay.old_x.shape[1] == context_server.all_ssm_states[0].shape[0]
+    finally:
+        plain.shutdown()
+        context_server.shutdown()
+
+
+@skip_no_cuda
+def test_v2_replay_buffers_can_share_the_recurrent_state_slot():
+    """A manager can declare its replay buffers with the layer's REQUIRED policy instead: they join the recurrent-state
+    group and slot, use the state index, count in every state slot, and bound no living caches."""
+
+    class CoupledReplayManager(NemotronHybridCacheManager):
+        def _replay_reuse_policy(self):
+            return None
+
+    mgr = _build_v2_mamba2_replay_manager(model_manager_cls=CoupledReplayManager)
+    try:
+        assert mgr.replay_layer_group_id is None
+        assert mgr.kv_cache_manager_py_config.max_live_kv_caches is None
+        layout = mgr._replay_layouts[0]
+        for role in layout:
+            assert mgr.impl.get_buffer_group_id(LayerId(0), role) == mgr.ssm_layer_group_id
+        assert mgr._mamba_state_bytes_per_slot() == sum(
+            buffer.size
+            for layer_id in mgr.mamba_pp_layers
+            for buffer in mgr._get_recurrent_buffer_configs(layer_id)
+        ) + mgr._replay_bytes_per_slot(mgr._replay_layouts)
+        state = mgr._speculative_state
+        assert state.prev_num_accepted_tokens.shape[0] == mgr.all_ssm_states[0].shape[0]
+        assert set(layout) <= mgr.get_disagg_ignored_roles()
+        assert mgr.cuda_replay_state_indices is mgr.cuda_state_indices
+
+        for slot in range(state.prev_num_accepted_tokens.shape[0]):
+            _fill_replay_slot(mgr, slot, accepted=13, active_buffer=1, value=float("nan"))
+        mgr.add_dummy_requests([5], token_nums=[8], is_gen=True, max_num_draft_tokens=2)
+        replay_slot = mgr.get_replay_state_indices([5])[0]
+        assert replay_slot == mgr.get_state_indices([5], [False])[0]
+        _assert_replay_slot_reset(mgr, replay_slot)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_mamba2_private_replay_resets_fresh_pages_of_generation_dummies():
+    """A PRIVATE page holds its previous owner's bytes. Requests that start in generation, such as CUDA-graph padding
+    and attention-DP dummies, get their replay slot reset once; later steps keep their history, and the slot of a freed
+    request is reset again for its next owner."""
+    mgr = _build_v2_mamba2_replay_manager()
+    try:
+        state = mgr._speculative_state
+        num_replay_slots = state.prev_num_accepted_tokens.shape[0]
+        for slot in range(num_replay_slots):
+            _fill_replay_slot(mgr, slot, accepted=13, active_buffer=1, value=float("nan"))
+
+        requests = mgr.add_dummy_requests(
+            [11, 12], token_nums=[8, 8], is_gen=True, max_num_draft_tokens=2
+        )
+        replay_slots = mgr.get_replay_state_indices([11, 12])
+        assert len(set(replay_slots)) == 2
+        for slot in replay_slots:
+            _assert_replay_slot_reset(mgr, slot)
+        untouched = [slot for slot in range(num_replay_slots) if slot not in replay_slots]
+        assert all(int(state.prev_num_accepted_tokens[slot]) == 13 for slot in untouched)
+
+        _fill_replay_slot(mgr, replay_slots[0], accepted=3, active_buffer=1, value=2.0)
+        mgr._setup_state_indices(requests, num_contexts=0)
+        assert _replay_history_rows(mgr, replay_slots[0])[:2] == (3, 1)
+
+        mgr.free_resources(requests[0])
+        (again,) = mgr.add_dummy_requests([11], token_nums=[8], is_gen=True, max_num_draft_tokens=2)
+        _assert_replay_slot_reset(mgr, mgr.get_replay_state_indices([11])[0])
+        assert _replay_history_rows(mgr, replay_slots[1])[:2] == (0, 0)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_mamba2_private_replay_bounds_living_caches():
+    """max_live_kv_caches equals the IndexMapper capacity. When a cache keeps living after releasing its IndexMapper
+    slot, the manager declines one more cache instead of letting the native bound raise."""
+    mgr = _build_v2_mamba2_replay_manager(max_batch_size=2)
+    try:
+        bound = mgr.kv_cache_manager_py_config.max_live_kv_caches
+        assert bound == mgr._index_mapper_capacity == 5
+        request_ids = list(range(100, 100 + bound))
+        for request_id in request_ids:
+            mgr.add_dummy_requests([request_id], token_nums=[8], is_gen=False)
+        assert len(mgr.kv_cache_map) == bound
+        assert mgr._create_kv_cache(200, None, []) is None
+        mgr.release_index_slot(request_ids[0])
+        assert mgr.index_mapper.num_free_slots() == 1
+        assert mgr._create_kv_cache(200, None, []) is None
+        assert 200 not in mgr.kv_cache_map
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_mamba2_replay_history_is_not_committed_for_reuse():
+    """A finished request commits its recurrent snapshot for prefix reuse but not its replay history. The PRIVATE pool
+    is empty once the request is freed, a request reusing the prefix matches only the recurrent snapshot, and its
+    replay bookkeeping starts from reset values."""
+    mgr = _build_v2_mamba2_replay_manager(
+        enable_block_reuse=True,
+        additional_snapshot_offsets_from_end=[0],
+    )
+    source = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=list(range(64)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    reader = LlmRequest(
+        request_id=2,
+        max_new_tokens=1,
+        input_tokens=list(range(65)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    try:
+        replay_group = mgr.replay_layer_group_id
+        _run_v2_hybrid_context(mgr, source, state_value=1)
+        source_slot = mgr.get_replay_state_indices([1])[0]
+        _fill_replay_slot(mgr, source_slot, accepted=5, active_buffer=1, value=7.0)
+        mgr.free_resources(source)
+
+        pools = mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        private_stats = mgr.impl.get_storage_statistics(GPU_LEVEL)[pools[replay_group]]
+        assert private_stats.free == private_stats.total
+
+        mgr.prepare_expect_snapshot_points([reader])
+        assert mgr.prepare_context(reader)
+        reader_cache = mgr.kv_cache_map[2]
+        assert reader_cache.reuse_status[mgr.ssm_layer_group_id].complete
+        assert not reader_cache.reuse_status[replay_group].complete
+        batch = ScheduledRequests()
+        batch.append_context_request(reader)
+        mgr.prepare_resources(batch)
+        assert reader.prepopulated_prompt_len == 64
+        state_index = mgr.get_state_indices([2], [False])[0]
+        for buffer in (*mgr.all_ssm_states, *mgr.all_conv_states):
+            assert torch.all(buffer[state_index] == 1)
+        _assert_replay_slot_reset(mgr, mgr.get_replay_state_indices([2])[0])
+    finally:
+        for request in (source, reader):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
+def _v2_mamba2_replay_manager_with_large_slots():
+    """A real V2 Nemotron manager with Mamba2 replay at a TP-split Nemotron-H layer shape (16 heads, head_dim 64,
+    d_state 128, one group) on 6 layers with fp32 states. An SSM slot (~3 MiB) is larger than the 2 MiB allocation
+    grain, so the SSM pool holds a handful of slots, fewer than the living caches max_live_kv_caches allows, and runs
+    out before the attention pages do. max_util_for_resume 1.0 lets resume admit caches until the pool is full."""
+    num_mamba_layers = 6
+    return NemotronHybridCacheManager(
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_num_heads=16,
+        mamba_n_groups=1,
+        mamba_head_dim=64,
+        mamba_num_layers=num_mamba_layers,
+        mamba_layer_mask=[True] * num_mamba_layers + [False],
+        mamba_cache_dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.float32,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=1,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        layer_mask=[False] * num_mamba_layers + [True],
+        vocab_size=1024,
+        use_replay_state_update=True,
+    )
+
+
+def _mamba2_verify_round(mgr, request_id, layer_weights, round_idx):
+    """One verify of the request's three tokens on every Mamba2 layer, as the mixer runs the replay kernel; the inputs
+    depend only on the round. Returns the outputs."""
+    from einops import repeat
+
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+        REPLAY_WORK_ITEM_WIDTH,
+        _build_replay_work_items_torch,
+    )
+    from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (
+        replay_selective_state_update,
+    )
+
+    state_slots = torch.tensor(
+        mgr.get_state_indices([request_id], [False]), dtype=torch.int32, device="cuda"
+    )
+    replay_slots = torch.tensor(
+        mgr.get_replay_state_indices([request_id]), dtype=torch.int32, device="cuda"
+    )
+    metadata = mgr.get_replay_state_update_metadata()
+    tokens = metadata.replay_step_width
+    work_items = torch.zeros(1, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device="cuda")
+    n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
+    _build_replay_work_items_torch(
+        state_slots,
+        metadata.prev_num_accepted_tokens,
+        metadata.cache_buf_idx,
+        work_items,
+        n_writes,
+        metadata.replay_step_width,
+        metadata.replay_history_size,
+        replay_slots,
+    )
+    num_heads, head_dim, d_state = mgr.ssm_state_shape
+    outputs = []
+    for layer_offset, weights in enumerate(layer_weights):
+        layer_cache = mgr.mamba_layer_cache(mgr.mamba_pp_layers[layer_offset])
+        generator = torch.Generator(device="cuda").manual_seed(1000 * round_idx + layer_offset)
+
+        def inputs(*shape):
+            return torch.randn(shape, generator=generator, device="cuda").bfloat16()
+
+        out = torch.empty(1, tokens, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        replay_selective_state_update(
+            layer_cache.temporal,
+            layer_cache.old_x,
+            layer_cache.old_B,
+            layer_cache.old_dt,
+            layer_cache.old_dA_cumsum,
+            layer_cache.cache_buf_idx,
+            layer_cache.prev_num_accepted_tokens,
+            inputs(1, tokens, num_heads, head_dim),
+            repeat(inputs(1, tokens, num_heads), "b t h -> b t h p", p=head_dim),
+            weights["A"],
+            inputs(1, tokens, 1, d_state),
+            inputs(1, tokens, 1, d_state),
+            D=weights["D"],
+            dt_bias=weights["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=state_slots,
+            replay_batch_indices=replay_slots,
+            out=out,
+            n_writes=n_writes,
+            replay_work_items=work_items,
+        )
+        outputs.append(out)
+    return torch.stack(outputs)
+
+
+def _run_mamba2_verify_rounds(accepted_per_round, suspend_after=None, slot_taken=False):
+    """Verify rounds of one request on a V2 manager with Mamba2 replay, each accepting the given number of tokens. With
+    ``suspend_after``, the request is suspended after that round's acceptance and resumed, its SSM slot taken and
+    overwritten by another cache meanwhile when ``slot_taken``. Returns every round's outputs and the request's final
+    SSM states."""
+    from einops import repeat
+
+    mgr = _v2_mamba2_replay_manager_with_large_slots()
+    others = []
+    request = None
+    try:
+        (request,) = mgr.add_dummy_requests(
+            [1], token_nums=[8], is_gen=True, max_num_draft_tokens=2
+        )
+        generator = torch.Generator(device="cuda").manual_seed(7)
+        num_heads, head_dim, d_state = mgr.ssm_state_shape
+        layer_weights = []
+        for _ in mgr.all_ssm_states:
+            A = -torch.rand(num_heads, generator=generator, device="cuda") - 0.5
+            layer_weights.append(
+                {
+                    "A": repeat(A, "h -> h p n", p=head_dim, n=d_state),
+                    "D": repeat(
+                        torch.randn(num_heads, generator=generator, device="cuda").bfloat16(),
+                        "h -> h p",
+                        p=head_dim,
+                    ),
+                    "dt_bias": repeat(
+                        torch.randn(num_heads, generator=generator, device="cuda").bfloat16(),
+                        "h -> h p",
+                        p=head_dim,
+                    ),
+                }
+            )
+        # The state a prefill leaves; the replay history starts empty.
+        slot = mgr.get_state_indices([1], [False])[0]
+        for ssm_states in mgr.all_ssm_states:
+            ssm_states[slot] = 0.1 * torch.randn(
+                ssm_states.shape[1:], generator=generator, device="cuda"
+            )
+        _assert_replay_slot_reset(mgr, mgr.get_replay_state_indices([1])[0])
+
+        metadata = mgr.get_replay_state_update_metadata()
+        outputs = []
+        for round_idx, accepted in enumerate(accepted_per_round):
+            outputs.append(_mamba2_verify_round(mgr, 1, layer_weights, round_idx))
+            replay_slot = mgr.get_replay_state_indices([1])[0]
+            _advance_replay_state(
+                metadata,
+                torch.tensor([replay_slot], dtype=torch.int32, device="cuda"),
+                torch.tensor([accepted], dtype=torch.int32, device="cuda"),
+            )
+            if round_idx == suspend_after:
+                slot = mgr.get_state_indices([1], [False])[0]
+                history = _replay_history_rows(mgr, replay_slot)
+                mgr.suspend_request(request)
+                if slot_taken:
+                    _take_ssm_slot(mgr, slot, others)
+                    holder = others[0]
+                    holder_replay_slot = holder.get_ssm_block_base_index(mgr.replay_layer_group_id)
+                    for ssm_states in mgr.all_ssm_states:
+                        ssm_states[slot] = torch.randn(
+                            ssm_states.shape[1:], generator=generator, device="cuda"
+                        )
+                    _fill_replay_slot(
+                        mgr, holder_replay_slot, accepted=9, active_buffer=1, value=3.0
+                    )
+                assert mgr.resume_request(request)
+                mgr._setup_state_indices([request], num_contexts=0)
+                if slot_taken:
+                    assert mgr.get_state_indices([1], [False])[0] != slot
+                # The PRIVATE pages, and with them PNAT, the active buffer and the history, follow the request.
+                resumed = _replay_history_rows(mgr, mgr.get_replay_state_indices([1])[0])
+                assert resumed[:2] == history[:2]
+                assert all(torch.equal(a, b) for a, b in zip(resumed[2], history[2], strict=True))
+        slot = mgr.get_state_indices([1], [False])[0]
+        states = torch.stack([ssm_states[slot] for ssm_states in mgr.all_ssm_states])
+        torch.cuda.synchronize()
+        return outputs, states
+    finally:
+        for cache in others:
+            cache.close()
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("slot_taken", [True, False], ids=["slot_taken", "slot_kept"])
+def test_v2_mamba2_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
+    """A request is suspended with accepted tokens in its replay history and resumes; every verify gives, bit for bit,
+    the outputs and leaves the states of the same request never suspended.
+
+    slot_taken: while the request is suspended, new caches fill the SSM pool, so the V2 runtime moves its SSM page to
+    the host tier and gives its slot to one of them, which overwrites the slot's state and its own replay history; the
+    request resumes in another SSM slot. slot_kept: nothing else runs while it is suspended."""
+    if get_sm_version() < 90:
+        pytest.skip("the replay kernel's main path needs sm_90+")
+    accepted_per_round = [2, 1, 3, 3, 2, 1, 3, 2]
+    suspend_after = 3
+    expected_outputs, expected_states = _run_mamba2_verify_rounds(accepted_per_round)
+    outputs, states = _run_mamba2_verify_rounds(
+        accepted_per_round, suspend_after=suspend_after, slot_taken=slot_taken
+    )
+    for round_idx, (actual, expected) in enumerate(zip(outputs, expected_outputs, strict=True)):
+        assert torch.equal(actual, expected), f"verify round {round_idx}"
+    assert torch.equal(states, expected_states)
 
 
 def test_v2_kda_replay_policy_seeds_disaggregated_generation_slots():
