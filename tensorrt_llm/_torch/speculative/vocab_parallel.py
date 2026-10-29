@@ -617,12 +617,11 @@ class VocabParallelHead:
         # The pairs carry token indices as float32 and must sum exactly, so the
         # exchange picks its own exact strategy rather than the model's
         # allreduce_strategy, which may be lossy (LOWPRECISION) or need user
-        # buffers (UB).
-        self._exchange = _PairExchange(
-            AllReduce(mapping, strategy=AllReduceStrategy.AUTO, dtype=torch.float32),
-            mapping.tp_size,
-            mapping.tp_rank,
-        )
+        # buffers (UB). NCCL keeps it off the Lamport workspace that the model's
+        # bf16 all-reduces share per mapping: that workspace's clear size is
+        # counted in elements of the previous call, so mixing dtypes on it
+        # hangs or returns stale data.
+        self._exchange = tp_pair_exchange(mapping, AllReduceStrategy.NCCL)
         logger.info(
             f"Vocab-parallel LM-head token selection: tp={mapping.tp_size}, "
             f"shard={self.shard_width}, vocab={self.vocab_size}"
