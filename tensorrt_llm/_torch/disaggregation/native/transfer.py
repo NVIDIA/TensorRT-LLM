@@ -367,13 +367,7 @@ _AGENT_RESULT_BY_CODE = {
 
 
 def _make_kv_result_msg(
-    instance_rank,
-    unique_rid,
-    slice_id,
-    is_last_slice,
-    agent_result,
-    transfer_size=0,
-    tail=None,
+    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0, tail=None
 ):
     """Build a KV_AGENT_RESULT message. ALL result sends (success AND failed/cancelled) must go
     through this single binary frame so the receiver's _KV_RESULT_PREFIX.unpack never hits a stale
@@ -969,9 +963,7 @@ class Sender(SenderBase):
                     pending.send_slot_id = None
                 if meta.meta_type == WriteMetaType.AUX:
                     message = _make_aux_result_msg(
-                        self._instance_rank,
-                        meta.unique_rid,
-                        AgentResult.FAILED_QUIESCED,
+                        self._instance_rank, meta.unique_rid, AgentResult.FAILED_QUIESCED
                     )
                 else:
                     message = _make_kv_result_msg(
@@ -1015,11 +1007,7 @@ class Sender(SenderBase):
                     f"_make_agent_request: dst_device_id is None for KV transfer "
                     f"unique_rid={write_meta.unique_rid}"
                 )
-            src_dev, dst_dev, mem_type = (
-                device_id,
-                write_meta.dst_device_id,
-                MemoryType.VRAM,
-            )
+            src_dev, dst_dev, mem_type = device_id, write_meta.dst_device_id, MemoryType.VRAM
 
         if n == 0:
             src_memory_descs = MemoryDescs(mem_type, [])
@@ -1036,11 +1024,7 @@ class Sender(SenderBase):
         # After this call, src_memory_descs and dst_memory_descs are in a moved-from
         # state and must NOT be accessed again.
         return TransferRequest(
-            TransferOp.WRITE,
-            src_memory_descs,
-            dst_memory_descs,
-            write_meta.peer_name,
-            None,
+            TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, None
         )
 
     @nvtx_range("_deliver_kv_to_agent")
@@ -1428,6 +1412,7 @@ class Sender(SenderBase):
             lg_info = extractor.page_table.layer_groups[self_lg]
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
+
             # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
             if lg_info.kind == CacheKind.STATE:
                 if src_block_ids.size == 0 or dst_block_ids.size == 0:
@@ -1439,11 +1424,7 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if (
-                    peer_ri.cp_size > 1
-                    and self_ri.cp_size == 1
-                    and not getattr(extractor.page_table.layer_groups[self_lg], "cp_as_tp", False)
-                ):
+                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
@@ -1542,9 +1523,7 @@ class Sender(SenderBase):
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
             timer.record_transfer_sizes(
-                peer_ri.instance_rank,
-                int(sizes.sum()) if sizes.size > 0 else 0,
-                src_ptrs.size,
+                peer_ri.instance_rank, int(sizes.sum()) if sizes.size > 0 else 0, src_ptrs.size
             )
 
         return WriteMeta(
@@ -2018,9 +1997,7 @@ class TxSession(TxSessionBase):
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or (
-            aux_buffer is not None and aux_buffer.has_draft_history
-        )
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._enforce_physical_ownership = getattr(sender, "_enforce_physical_ownership", False)
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
@@ -3105,10 +3082,7 @@ class Receiver(ReceiverBase):
         if self._enforce_physical_ownership:
             rank_info = self._registrar.self_rank_info
             message.extend(
-                [
-                    rank_info.instance_name.encode(),
-                    str(rank_info.instance_rank).encode("ascii"),
-                ]
+                [rank_info.instance_name.encode(), str(rank_info.instance_rank).encode("ascii")]
             )
         sent = set()
         for endpoint in sender_endpoints:
@@ -3183,14 +3157,9 @@ class Receiver(ReceiverBase):
                 f"_process_kv_agent_result: unexpected msg_type={message[0]!r}, expected KV_AGENT_RESULT"
             )
             return
-        (
-            peer_rank,
-            unique_rid,
-            receiver_slice_id,
-            is_last_slice,
-            status_code,
-            transfer_size,
-        ) = _KV_RESULT_PREFIX.unpack(message[1])
+        peer_rank, unique_rid, receiver_slice_id, is_last_slice, status_code, transfer_size = (
+            _KV_RESULT_PREFIX.unpack(message[1])
+        )
         from .bounce import decode_result_tail
 
         dst_ptrs, sizes, src_base = decode_result_tail(message)
@@ -3259,9 +3228,7 @@ class RxSession(RxSessionBase):
     ):
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or (
-            aux_buffer is not None and aux_buffer.has_draft_history
-        )
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
@@ -3838,8 +3805,6 @@ class RxSession(RxSessionBase):
         """Read token data from the aux buffer slot into the given request."""
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
         assert self.aux_slot is not None, "No aux_slot set for this session"
-        if self._aux_buffer.has_draft_history:
-            self.unpack_draft_history(request)
         first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens) = (
             self._aux_buffer.get_slot_data(self.aux_slot)
         )
@@ -4084,20 +4049,9 @@ class RxSession(RxSessionBase):
         except Exception as e:
             logger.warning(f"RxSession.__del__: exception during close: {e}")
 
-    def unpack_draft_history(self, request: LlmRequest) -> None:
-        """Read standalone history without changing context-first token fields."""
-        if self._aux_buffer is None or self.aux_slot is None:
-            raise ValueError("Standalone draft transfer requires an auxiliary buffer slot")
-        request.py_draft_transfer_history = self._aux_buffer.get_slot_draft_history(self.aux_slot)
-
 
 class RankInfoServer:
-    def __init__(
-        self,
-        rank_info: RankInfo,
-        addr: Optional[str] = None,
-        port: Optional[int] = None,
-    ):
+    def __init__(self, rank_info: RankInfo, addr: Optional[str] = None, port: Optional[int] = None):
         self._rank_info = rank_info
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
@@ -4178,10 +4132,7 @@ def _create_nixl_agent(
 def _make_aux_buffer(
     kvm: KVCacheManagerV2, max_slots: int, max_draft_len: Optional[int] = None
 ) -> Optional[AuxBuffer]:
-    draft_history = bool(getattr(kvm, "_draft_layer_sizes", ()))
     if max_slots <= 0:
-        if draft_history:
-            raise ValueError("Standalone draft transfer requires auxiliary buffer slots")
         return None
     if max_draft_len is None:
         max_draft_len = max(0, int(getattr(kvm, "max_draft_len", 0)))
@@ -4190,7 +4141,6 @@ def _make_aux_buffer(
         beam_width=max(1, int(getattr(kvm, "max_beam_width", 1))),
         max_draft_len=max_draft_len,
         device="cpu",
-        draft_history=draft_history,
     )
 
 

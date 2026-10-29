@@ -1364,3 +1364,111 @@ def test_zero_argument_post_load_transforms_non_attention_linears(monkeypatch):
 
     assert draft.main_proj.transforms == 1
     assert stage.self_attn[0].transforms == 0
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_rolling_attention_uses_projection_modules(monkeypatch, batched):
+    monkeypatch.setattr(modeling_dspark, "IS_CUTLASS_DSL_AVAILABLE", False)
+    g = _make_attn_inputs()
+    weights = dict(
+        wq_a=g["wq_a"],
+        q_norm_w=g["q_norm"],
+        wq_b=g["wq_b"],
+        wkv=g["wkv"],
+        kv_norm_w=g["kv_norm"],
+        wo_a=g["wo_a"],
+        wo_b=g["wo_b"],
+        attn_sink=g["attn_sink"],
+        n_heads=g["n_heads"],
+        head_dim=g["head_dim"],
+        rope_head_dim=g["rope_head_dim"],
+        n_groups=g["n_groups"],
+        o_lora_rank=g["o_lora"],
+        window_size=g["window"],
+        eps=g["eps"],
+        softmax_scale=g["softmax_scale"],
+        freqs_cis=g["freqs"],
+        persist=True,
+    )
+    expected_cache = g["kv_cache0"].clone()
+    actual_cache = g["kv_cache0"].clone()
+    if batched:
+        fn = modeling_dspark.dspark_attention_forward_batched
+        args = (torch.full((g["b"],), g["start_pos"]),)
+        tail = (torch.arange(g["b"]),)
+    else:
+        fn = dspark_attention_forward
+        args = (g["start_pos"],)
+        tail = ()
+    expected = fn(g["x"], g["main_x"], *args, expected_cache, *tail, **weights)
+    qkv_weight = torch.cat((g["wq_a"], g["wkv"]), dim=0)
+    weights.update(
+        wq_a=None,
+        wkv=None,
+        wo_a=None,
+        qkv_proj=lambda x: F.linear(x, qkv_weight),
+        wq_b=lambda x: F.linear(x, g["wq_b"]),
+        wo_b=lambda x: F.linear(x, g["wo_b"]),
+        o_a_proj=g["wo_a"].view(g["n_groups"], g["o_lora"], -1),
+        o_a_scale=None,
+        o_a_dequant=None,
+        use_fused_output_projection=False,
+        use_fused_qkv_input_projection=False,
+        use_fused_q_input_projection=False,
+    )
+    actual = fn(g["x"], g["main_x"], *args, actual_cache, *tail, **weights)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_cache, expected_cache)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("stacked", [False, True])
+def test_context_window_writes_use_projection_modules(batched, stacked):
+    g = _make_attn_inputs()
+
+    def make_model(use_modules):
+        model = object.__new__(DSv4DSparkDraftModel)
+        torch.nn.Module.__init__(model)
+        model._attn_params = dict(
+            window_size=g["window"],
+            rope_head_dim=g["rope_head_dim"],
+            head_dim=g["head_dim"],
+            eps=g["eps"],
+        )
+        model._context_wkv_fp8 = None
+        model._dspark_freqs_table = lambda device: g["freqs"].to(device)
+        qkv_weight = torch.cat((g["wq_a"], g["wkv"]), dim=0)
+        model.mtp_layers = [
+            types.SimpleNamespace(
+                main_proj=torch.nn.Identity(),
+                main_norm=torch.nn.Identity(),
+                _dspark_attn=dict(
+                    wkv=None if use_modules else g["wkv"],
+                    kv_norm_w=g["kv_norm"],
+                    qkv_proj=(lambda x: F.linear(x, qkv_weight)) if use_modules else None,
+                ),
+            )
+            for _ in range(2)
+        ]
+        if use_modules and stacked:
+            model._project_context_wkv = lambda x: torch.stack([F.linear(x, g["wkv"])] * 2, dim=-2)
+        return model
+
+    reference, model = make_model(False), make_model(True)
+    if batched:
+        hidden = g["x"]
+        positions = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        slots = torch.tensor([1, 0])
+        mask = torch.tensor([[True, False, True], [False, True, True]])
+        expected = torch.randn(3, 2, g["window"], g["head_dim"], dtype=torch.bfloat16)
+        actual = expected.clone()
+        reference.write_context_windows_batched(hidden, positions, slots, mask, expected)
+        model.write_context_windows_batched(hidden, positions, slots, mask, actual)
+    else:
+        hidden = g["x"][0]
+        positions = torch.tensor([1, 4, 6])
+        expected = torch.randn(2, g["window"], g["head_dim"], dtype=torch.bfloat16)
+        actual = expected.clone()
+        reference.write_context_windows(hidden, positions, expected)
+        model.write_context_windows(hidden, positions, actual)
+    torch.testing.assert_close(actual, expected)

@@ -75,10 +75,6 @@ def take_poison() -> str | None:
 def num_live_managers() -> int:
     """Number of constructed, not-yet-destroyed managers."""
 
-class CacheDomain(enum.Enum):
-    STANDALONE_DRAFT = 0
-    TARGET = 1
-
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
@@ -105,7 +101,6 @@ class AttnLifeCycle:
         num_sink_blocks: int,
         is_sparse: bool = False,
         reuse_policy: AttentionReusePolicy = ...,
-        cache_domain: CacheDomain = CacheDomain.TARGET,
     ) -> None: ...
     @staticmethod
     def make(
@@ -114,7 +109,6 @@ class AttnLifeCycle:
         tokens_per_block: int,
         is_sparse: bool = False,
         reuse_policy: AttentionReusePolicy = ...,
-        cache_domain: CacheDomain = CacheDomain.TARGET,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
@@ -124,8 +118,6 @@ class AttnLifeCycle:
     def is_sparse(self) -> bool: ...
     @property
     def reuse_policy(self) -> AttentionReusePolicy: ...
-    @property
-    def cache_domain(self) -> CacheDomain: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -285,7 +277,6 @@ class AttentionLayerConfig:
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
     reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
-    cache_domain: CacheDomain = CacheDomain.TARGET
     @property
     def window_size(self) -> int | None: ...
 

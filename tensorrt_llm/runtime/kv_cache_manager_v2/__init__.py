@@ -117,8 +117,6 @@ create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page
 # field), matching the binding's constructor.
 import dataclasses as _dataclasses  # noqa: E402
 
-CacheDomain = _cpp.CacheDomain
-
 
 @_dataclasses.dataclass
 class _KVCacheManagerConfigFieldSpec:
@@ -309,5 +307,3 @@ __all__ = [
     "take_poison",
     "typed_range",
 ]
-
-__all__.append("CacheDomain")

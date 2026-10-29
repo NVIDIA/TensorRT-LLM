@@ -214,12 +214,14 @@ def test_batched_topk_respects_partial_window_valid_len():
 
 @pytest.mark.parametrize("ndim", [3, 4])
 def test_batched_rotary_matches_scalar_per_row(ndim):
+    """apply_dspark_rotary_batched (per-row freqs) == scalar applied row by row."""
     torch.manual_seed(0)
     G, s, h, rd = 3, 4, 2, 8
     x = torch.randn(G, s, h, rd) if ndim == 4 else torch.randn(G, s, rd)
     table = precompute_dspark_freqs_cis(rd, 64)
+    # Per-row absolute start positions -> per-row freq windows.
     starts = [1, 9, 30]
-    per_row = torch.stack([table[sp : sp + s] for sp in starts], dim=0)
+    per_row = torch.stack([table[sp : sp + s] for sp in starts], dim=0)  # [G, s, rd/2]
     got = apply_dspark_rotary_batched(x, per_row)
     for i, sp in enumerate(starts):
         ref_i = apply_dspark_rotary(x[i : i + 1], table[sp : sp + s])

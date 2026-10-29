@@ -229,7 +229,6 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         # rewind falls back to the reserve width.
         _allocated_draft_lens={},
         _inflight_draft_lens={},
-        _standalone_draft_layer_ids=(),
         kv_cache_map={7: kv},
         kv_compression_manages_history=False,
         _has_cp_helix=True,
@@ -388,7 +387,6 @@ def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:
         is_disagg=is_disagg,
         kv_cache_map={7: kv},
         num_extra_kv_tokens=0,
-        _standalone_draft_reserve=0,
         _connector_reservations_enabled=lambda: False,
         _fill_fresh_kv_pages=lambda req_id: None,
         _log_window_crossing=lambda *args: None,

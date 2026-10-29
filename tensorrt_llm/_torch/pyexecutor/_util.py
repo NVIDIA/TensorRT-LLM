@@ -24,9 +24,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_binding,
-                                 torch_dtype_to_str)
-from tensorrt_llm.bindings import DataType
+                                 str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -998,7 +996,6 @@ class KvCacheCreator:
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
-        self._validate_standalone_draft_cache()
         # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
@@ -1250,15 +1247,11 @@ class KvCacheCreator:
         model_config = self._model_engine.model.model_config
         use_separate_draft_kv_cache = (
             self._should_create_separate_draft_kv_cache())
-        draft_kwargs = {}
-        if self._uses_unified_standalone_draft_cache():
-            draft_kwargs = self._get_unified_draft_cache_kwargs()
         total = self._per_manager_cache_cost(
             self._kv_cache_manager_cls,
             model_config,
             kv_cache_config,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
-            **draft_kwargs)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
         draft_cost = self._get_draft_cache_cost(
@@ -1290,6 +1283,11 @@ class KvCacheCreator:
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
+            # Rescale only the slope: every other cost component (e.g. the
+            # fixed intercept) is per-request rank-local bytes and stays
+            # unscaled. dataclasses.replace keeps any component the rescale
+            # does not touch, where rebuilding the CacheCost from named
+            # fields would silently drop it.
             return dataclasses.replace(cost, slope=cost.slope * helix_cp_scale)
 
         if use_separate_draft_kv_cache:
@@ -1602,8 +1600,6 @@ class KvCacheCreator:
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
-            if self._uses_unified_standalone_draft_cache():
-                num_extra_tokens_per_seq += self._get_draft_scratch_tokens()
 
         if self._dummy_reqs is None:
             self._dummy_reqs = self._create_dummy_context_requests(
@@ -1648,8 +1644,6 @@ class KvCacheCreator:
                 self._model_engine.max_seq_len,
                 self._kv_cache_config,
             )
-            if self._uses_unified_standalone_draft_cache():
-                num_pool_groups += 1
         num_cache_blocks *= num_pool_groups
 
         # Dummy context requests use the configured maximum beam width. Scale
@@ -2091,14 +2085,12 @@ class KvCacheCreator:
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             kv_cache_config)
 
-        # The target and draft layers have independent storage properties.
-        # spec_config also determines the target's extra-token capacity.
+        # When using separate draft KV cache in one-model speculative decoding,
+        # use layer_mask to include only target layers. The draft layers should
+        # only be in the separate draft KV cache manager.
+        # We still pass spec_config so that num_extra_kv_tokens is calculated.
         spec_dec_layer_mask = None
-        draft_cache_kwargs = (self._get_unified_draft_cache_kwargs()
-                              if self._uses_unified_standalone_draft_cache()
-                              else {})
-        if (self._should_create_separate_draft_kv_cache()
-                or draft_cache_kwargs):
+        if self._should_create_separate_draft_kv_cache():
             num_target_layers = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
@@ -2127,7 +2119,6 @@ class KvCacheCreator:
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
-            **draft_cache_kwargs,
         )
 
         if not self._skip_est:
@@ -2145,101 +2136,6 @@ class KvCacheCreator:
 
         return kv_cache_manager
 
-    def _is_standalone_dspark(self) -> bool:
-        spec_config = self._speculative_config
-        return (spec_config is not None
-                and spec_config.spec_dec_mode.is_dspark()
-                and not spec_config.draft_is_embedded_in_target
-                and not spec_config._use_shared_kv_cache)
-
-    def _is_embedded_dspark(self) -> bool:
-        spec_config = self._speculative_config
-        return (spec_config is not None
-                and spec_config.spec_dec_mode.is_dspark()
-                and spec_config.draft_is_embedded_in_target)
-
-    def _uses_unified_standalone_draft_cache(self) -> bool:
-        if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
-                or not self._is_kv_cache_manager_v2):
-            return False
-        # Disaggregation validates unified support; aggregate may use legacy state.
-        return (self._is_disagg
-                or self._unified_draft_cache_unsupported_reason() is None)
-
-    def _validate_standalone_draft_cache(self) -> None:
-        """Validate manager-owned DSpark history for disaggregated serving."""
-        if (not (self._is_standalone_dspark() or self._is_embedded_dspark())
-                or not self._is_disagg):
-            return
-        if not self._is_kv_cache_manager_v2:
-            raise ValueError("DSpark disaggregation requires "
-                             "kv_cache_config.use_kv_cache_manager_v2=True "
-                             "on both workers.")
-        reason = self._unified_draft_cache_unsupported_reason()
-        if reason is not None:
-            raise ValueError(reason)
-
-    def _unified_draft_cache_unsupported_reason(self) -> Optional[str]:
-        """Shared admission requirements for unified aggregate and disagg KV."""
-        if (self._is_standalone_dspark()
-                and is_mla(self._draft_config.pretrained_config)):
-            return "Unified DSpark KV cache does not yet support MLA drafters."
-        return None
-
-    def _get_draft_scratch_tokens(self) -> int:
-        return 0 if self._is_embedded_dspark(
-        ) else self._speculative_config.max_draft_len + 1
-
-    def _get_unified_draft_cache_kwargs(self) -> dict:
-        """Pass draft storage properties separately from its history requirements."""
-        draft = self._model_engine.model.draft_model
-        if self._is_embedded_dspark():
-            return dict(
-                draft_num_layers=draft.num_stages,
-                draft_num_kv_heads=1,
-                draft_head_dim=int(draft._attn_params["head_dim"]),
-                draft_dtype=torch_dtype_to_binding(torch.bfloat16),
-                draft_kv_factor=1,
-                draft_scratch_tokens=0,
-                draft_attention_backend="DSv4",
-                draft_window_size=int(draft._attn_params["window_size"]),
-            )
-        config = self._draft_config.pretrained_config
-        num_heads = config.num_attention_heads
-        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-        head_dim = getattr(config, "head_dim", None)
-        if head_dim is None:
-            head_dim = config.hidden_size // num_heads
-        draft_mapping = self._get_draft_mapping()
-        attention_tp_size = (1 if draft_mapping.enable_attention_dp else
-                             draft_mapping.tp_size)
-        attention_backend = self._speculative_config.attention_backend
-        if attention_backend == "AUTO":
-            attention_backend = draft.dflash_attention_backend
-        draft_model_config = getattr(draft, "config", None)
-        dtype = draft.fc.weight.dtype if hasattr(draft,
-                                                 "fc") else torch.bfloat16
-        if dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError(
-                "Standalone draft KV supports FP16 and BF16 storage")
-        if attention_backend == "TRTLLM":
-            # The TRTLLM drafter attention reads FP8 pages with FP8 queries;
-            # the drafter's history is stored at half the BF16 footprint.
-            dtype = torch.float8_e4m3fn
-        return dict(
-            draft_num_layers=config.num_hidden_layers,
-            draft_num_kv_heads=(num_kv_heads + attention_tp_size - 1) //
-            attention_tp_size,
-            draft_head_dim=head_dim,
-            draft_dtype=torch_dtype_to_binding(dtype),
-            draft_total_num_kv_heads=num_kv_heads,
-            draft_scratch_tokens=self._get_draft_scratch_tokens(),
-            draft_attention_backend=attention_backend,
-            draft_max_position_embeddings=(getattr(
-                draft_model_config, "max_position_embeddings", None)
-                                           if draft_model_config else None),
-        )
-
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
         Check if we need a separate draft KV cache manager for one-model mode.
@@ -2251,8 +2147,6 @@ class KvCacheCreator:
         """
         if self._speculative_config is None:
             # No drafter at all, so there is nothing to give a manager to.
-            return False
-        if self._uses_unified_standalone_draft_cache():
             return False
         # Narrower than is_external_drafter(): PARD and DRAFT_TARGET_ONE_MODEL
         # never reach the arena this carve-out exists for.
@@ -3410,16 +3304,6 @@ def _create_kv_cache_manager(
         disable_overlap_scheduler: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
-        draft_num_layers: int = 0,
-        draft_num_kv_heads: int = 0,
-        draft_head_dim: int = 0,
-        draft_dtype: DataType = DataType.BF16,
-        draft_kv_factor: int = 2,
-        draft_total_num_kv_heads: Optional[int] = None,
-        draft_scratch_tokens: int = 0,
-        draft_window_size: Optional[int] = None,
-        draft_attention_backend: Optional[str] = None,
-        draft_max_position_embeddings: Optional[int] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
     """
@@ -3432,9 +3316,6 @@ def _create_kv_cache_manager(
             "Cold-page quantization requires the resolved KV cache manager "
             f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
 
-    if draft_num_layers and not issubclass(kv_cache_manager_cls,
-                                           KVCacheManagerV2):
-        raise ValueError("Unified draft cache layers require KVCacheManagerV2.")
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
             and kv_cache_config.pool_ratio is None
@@ -3591,18 +3472,6 @@ def _create_kv_cache_manager(
                 "Could not resolve vocab_size from the model config; "
                 "multimodal requests will fail when block reuse is on. "
                 "Disable block reuse to serve them.")
-        manager_extra_kwargs.update(
-            draft_num_layers=draft_num_layers,
-            draft_num_kv_heads=draft_num_kv_heads,
-            draft_head_dim=draft_head_dim,
-            draft_dtype=draft_dtype,
-            draft_kv_factor=draft_kv_factor,
-            draft_total_num_kv_heads=draft_total_num_kv_heads,
-            draft_scratch_tokens=draft_scratch_tokens,
-            draft_window_size=draft_window_size,
-            draft_attention_backend=draft_attention_backend,
-            draft_max_position_embeddings=draft_max_position_embeddings,
-        )
     elif kv_events_config is not None and kv_events_config.enable_kv_cache_events:
         logger.warning(
             "kv_cache_config.kv_events_config is set but streaming KV event "

@@ -370,10 +370,6 @@ def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch):
         1,
         torch.empty(0),
         torch.zeros(2),
-        kv_cache=torch.empty(0),
-        block_tables=torch.empty(0, dtype=torch.int32),
-        capacities=torch.empty(0, dtype=torch.long),
-        valid_len=torch.empty(0, dtype=torch.long),
         pre_mix=previous_pre,
     )
     assert attention_mixer.pre_mapping_lagged.call_args.args[1] is previous_pre

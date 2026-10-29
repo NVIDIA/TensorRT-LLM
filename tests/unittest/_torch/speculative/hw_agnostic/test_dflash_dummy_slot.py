@@ -40,7 +40,6 @@ FLOOR = 1 << 40  # request ids from here on are CUDA-graph padding dummies
 def _worker(lengths):
     w = SimpleNamespace(
         _ctx_buf_inited=True,
-        _has_unified_draft_cache=lambda: False,
         _req_to_slot={11: 0, 12: 1, 13: 2},
         _req_ctx_pos={},
         _free_slots=[3],

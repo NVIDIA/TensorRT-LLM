@@ -33,7 +33,6 @@ from tensorrt_llm.mapping import Mapping
 from ..distributed import AllReduceStrategy
 from ..modules.linear import Linear, TensorParallelMode
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
-from ..pyexecutor.resource_manager import ResourceManagerType
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
@@ -80,7 +79,7 @@ def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) 
     """Return the number of RoPE entries needed by the DSv4 block drafter.
 
     ``start_pos`` is a FRAME index, one above the absolute token position: the
-    prompt token at position p occupies frame p+1 (``_seed_context_pages``), so a
+    prompt token at position p occupies frame p+1 (``_seed_context_windows``), so a
     request served to ``max_ctx`` bootstraps at ``max_ctx + 1``. A verification then
     accepts up to ``max_draft_len + 1`` tokens and the block drafter indexes
     ``block_size`` further positions, making the largest index
@@ -227,6 +226,62 @@ class DSparkSpecMetadata(SpecMetadata):
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
+        # CUDA-graph-safe path: maintain the request->slot mapping on the host
+        # (outside the captured region) and mirror it into ``_batch_to_slot`` so the
+        # captured gen forward can index the rolling windows by tensor. Mirrors
+        # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
+        worker = getattr(self, "_dspark_worker", None)
+        if worker is not None and worker._win_inited:
+            current = set(self.request_ids)
+            for rid in list(worker._req_to_slot.keys()):
+                if rid not in current:
+                    slot = worker._req_to_slot.pop(rid)
+                    worker._ctx_len[slot].zero_()
+                    worker._valid_len[slot].zero_()
+                    worker._position_initialized[slot].zero_()
+                    worker._kv_windows[slot].zero_()
+                    worker._free_slots.append(slot)
+            # Assign a persistent rolling-window slot to every real generation
+            # request that never ran a context/seed forward on this worker. In
+            # disaggregated serving the prompt is prefilled (and the window
+            # seeded) on the *context* server, so ``_seed_context_windows`` never
+            # runs on the generation server and ``_req_to_slot`` stays empty;
+            # without this, all concurrent gen requests fall through to the shared
+            # scratch row below and corrupt each other's draft window at batch
+            # size > 1 (GitHub #16767). Context-prefix entries are left to
+            # ``_seed_context_windows``. CUDA-graph capture dummies and real
+            # generation requests acquire a persistent slot only once; prepare()
+            # runs before every replay, so it must never reset a live slot.
+            # ADP-idle (id 0) and high-ID CUDA-graph padding dummies use scratch.
+            num_contexts = max(0, len(self.request_ids) - self.num_generations)
+            for rid in self.request_ids[num_contexts:]:
+                if (
+                    rid != ATTENTION_DP_DUMMY_REQUEST_ID
+                    and rid < worker._graph_dummy_id_floor
+                    and rid not in worker._req_to_slot
+                ):
+                    worker._assign_slot(rid, reset=False)
+            # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
+            # requests, or disagg seed forwards without a real id) map to the
+            # dedicated throwaway scratch row so they cannot overwrite a live
+            # request's rolling window (they previously aliased to slot 0).
+            scratch = worker._scratch_slot
+            # Reset every iteration. The scratch row has no prefill to seed it
+            # and no completion to free it, so _advance_generation_state's
+            # unconditional advance would leave its ABSOLUTE position climbing
+            # across graph shapes and iterations until it indexes past the RoPE
+            # table. A real slot is bounded instead by its request's lifetime.
+            worker._ctx_len[scratch].zero_()
+            worker._valid_len[scratch].zero_()
+            worker._position_initialized[scratch].zero_()
+            mapping = torch.tensor(
+                [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+            worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
+
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
 
@@ -330,16 +385,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._win_inited = False
         self._output_verify_lens: Optional[torch.Tensor] = None
         self._attention_warmup_attempted = False
+        self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
         self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
+        self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
         self._win = 0
-        self._draft_kv_manager = None
-        self._draft_kv_buffers = ()
-        self._draft_block_tables = None
-        self._draft_capacities = None
-        self._draft_page_indices: dict[int, tuple[int, ...]] = {}
-        self._draft_metadata_host_buffers: list[dict] = []
-        self._managed_residency = {}
         # Set in _lazy_init from the RoPE table the drafter will build; None
         # leaves positions unbounded (direct construction in tests).
         self._position_cap: Optional[int] = None
@@ -348,11 +398,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # source of truth, updated in prepare()/forward(); ``_batch_to_slot`` is the
         # CUDA mirror (request-order -> slot) read by the CUDA-graph-safe batched
         # gen path (set on the host in prepare(), so the captured forward indexes
-        # request progress through a tensor instead of a python dict lookup).
+        # the rolling windows through a tensor instead of a python dict lookup).
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
-        # Index of the throwaway "scratch" progress row that absorbs padded /
+        # Index of the throwaway "scratch" window row that absorbs padded /
         # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
         # never handed out through ``_free_slots``.
         self._scratch_slot = 0
@@ -373,8 +423,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self.verify_planner = None
 
         # The generation draft path is the batched, host-sync-free
-        # ``_draft_gen_block_batched`` + ``DSv4DSparkDraftModel.forward`` +
-        # ``dspark_attention_forward``: it is correct in eager mode AND safe
+        # ``_draft_gen_block_batched`` + ``DSv4DSparkDraftModel.forward_batched`` +
+        # ``dspark_attention_forward_batched``: it is correct in eager mode AND safe
         # to capture into the target's CUDA graph (DSpark is a one-engine drafter —
         # its worker forward runs inside that graph, so the draft path MUST be
         # capture-safe whenever ``cuda_graph_config`` is set).
@@ -479,7 +529,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             draft_model._runtime_position_ceiling = ceiling
             if inner_model is not draft_model:
                 inner_model._runtime_position_ceiling = ceiling
-        # Largest absolute position the block drafter may hold: forward
+        # Largest absolute position the block drafter may hold: forward_batched
         # gathers ``freqs[start_pos + block_size]`` and the interim back-fill
         # ``freqs[old + block_size]``, so keep one block of headroom.
         table_len = int(getattr(inner_model, "_runtime_position_ceiling", 0) or config_cap)
@@ -495,15 +545,20 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         self._publish_position_ceiling(draft_model, attn_metadata, block_size)
 
-        if self._ctx_len is None:
+        if not self._win_inited:
             max_batch = spec_metadata.max_num_requests
             self._output_verify_lens = torch.empty(max_batch, dtype=torch.int32, device="cuda")
-            draft_model.configure_generation_autotuner(max_batch)
-            self._num_stages = draft_model.num_stages
+            num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
-            self._head_dim = int(draft_model._attn_params["head_dim"])
+            head_dim = int(draft_model._attn_params["head_dim"])
 
-            # Padding requests share an extra progress slot, never a real request slot.
+            # Real requests occupy slots ``[0, max_batch)``; one extra "scratch" row
+            # at index ``max_batch`` absorbs padded / unknown request IDs (CUDA-graph
+            # padding, ADP idle requests, or disagg seed forwards that arrive without
+            # a real request id) so they can never overwrite a live request's rolling
+            # window. Previously such IDs aliased to slot 0 and corrupted whichever
+            # real request occupied it. The scratch row is never handed out through
+            # ``_free_slots`` and its contents are throwaway.
             self._scratch_slot = max_batch
             num_rows = max_batch + 1
 
@@ -518,14 +573,17 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
             self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
 
+            self._kv_windows = torch.zeros(
+                (num_rows, num_stages, self._win, head_dim),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
             self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
             self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+            self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
             self._batch_to_slot = torch.full(
                 (max_batch,), self._scratch_slot, dtype=torch.long, device="cuda"
             )
-            self._free_slots = deque(range(max_batch))
-            self._req_to_slot = {}
-            self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
             if self.return_confidence:
                 # Neutral fill = large positive logit (sigmoid ~ 1.0):
                 # unscored slots fail safe by verifying the full block. The
@@ -547,7 +605,43 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 with torch.inference_mode(False):
                     self._draft_seq_cuda = torch.zeros((), dtype=torch.int32, device="cuda")
                 self._build_verify_planner(draft_model, block_size)
+            self._free_slots = deque(range(max_batch))
+            self._req_to_slot = {}
+            logger.info(
+                f"DSpark: allocated rolling KV windows "
+                f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
+                f"({max_batch} request slots + 1 scratch row)"
+            )
+            # Buffer state is complete independently of CuTe DSL prewarming.
+            # A failed prewarm must not cause the next forward to recreate the
+            # windows or reset the live slot maps.
             self._win_inited = True
+
+        if self._attention_warmup_attempted:
+            return
+
+        # Prewarm the same self-JIT ops used by production before CUDA graph
+        # capture. This is best-effort inside the named warmup entry; the ops
+        # remain able to compile themselves on a later eager first use.
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if IS_CUTLASS_DSL_AVAILABLE:
+            from ..custom_ops.dspark_attention_custom_op import (
+                is_dsv4_dspark_attention_config_supported,
+                warmup_fused_dsv4_dspark_attention,
+            )
+
+            if is_dsv4_dspark_attention_config_supported(
+                block_size,
+                int(draft_model._attn_params["n_heads"]),
+                int(draft_model._attn_params["head_dim"]),
+                int(draft_model._attn_params["window_size"]),
+            ):
+                warmup_fused_dsv4_dspark_attention(
+                    block_size,
+                    eps=float(draft_model._attn_params["eps"]),
+                )
+        self._attention_warmup_attempted = True
 
     def _build_verify_planner(self, draft_model, block_size: int) -> None:
         """Construct the host-side verify planner (once, at lazy init).
@@ -602,16 +696,19 @@ class DSv4DSparkWorker(SpecWorkerBase):
             f"device_windows={self.verify_planner.device_windows}"
         )
 
-    def _assign_slot(self, req_id: int, reset: bool = False) -> int:
-        """Get the persistent progress slot for a request."""
+    def _assign_slot(self, req_id: int, reset: bool) -> int:
+        """Get (or refresh) the slot for a request; reset clears its window."""
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
-            self._managed_residency.pop(req_id, None)
+            self._ctx_len[old].zero_()
+            self._valid_len[old].zero_()
+            self._position_initialized[old].zero_()
+            self._kv_windows[old].zero_()
             self._free_slots.append(old)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
                 raise RuntimeError(
-                    "DSpark has no free progress slots for request "
+                    "DSpark has no free rolling-window slots for request "
                     f"{req_id}; increase max_num_requests"
                 )
             slot = self._free_slots.popleft()
@@ -619,12 +716,61 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._ctx_len[slot].zero_()
             self._valid_len[slot].zero_()
             self._position_initialized[slot].zero_()
+            self._kv_windows[slot].zero_()
             if self._confidence_logits is not None:
                 # A recycled slot still holds the previous occupant's scores;
                 # reset to neutral so the first scheduling decision verifies
                 # the full block.
                 self._confidence_logits[slot].fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         return self._req_to_slot[req_id]
+
+    def _seed_context_windows(
+        self,
+        draft_model,
+        spec_metadata: "DSparkSpecMetadata",
+        attn_metadata,
+        position_ids: torch.Tensor,
+        total_target_tokens: int,
+    ) -> None:
+        """Seed context chunks using their absolute positions.
+
+        A request can arrive in multiple prefill chunks. Only its first chunk
+        starts at position zero and resets the persistent rolling window;
+        continuation chunks append to the same request slot.
+        """
+        captured = spec_metadata.get_hidden_states(total_target_tokens)
+        capture_lens = getattr(spec_metadata, "context_capture_lens", None)
+        if capture_lens is not None and len(capture_lens) != attn_metadata.num_contexts:
+            raise ValueError("DSpark capture lengths must match the context requests")
+        flat_position_ids = position_ids.reshape(-1)
+        context_offset = 0
+        for i in range(attn_metadata.num_contexts):
+            chunk_len = int(attn_metadata._seq_lens[i])
+            capture_len = chunk_len if capture_lens is None else capture_lens[i]
+            if not 0 <= capture_len <= chunk_len:
+                raise ValueError("DSpark capture length must be a suffix of its context chunk")
+            chunk_positions = flat_position_ids[context_offset : context_offset + chunk_len].long()
+            if chunk_len == 0:
+                context_offset += chunk_len
+                continue
+
+            req_id = spec_metadata.request_ids[i]
+            first_position = int(chunk_positions[0].item())
+            slot = self._assign_slot(req_id, reset=first_position == 0)
+            self._ctx_len[slot] = chunk_positions[-1] + 1
+            self._position_initialized[slot] = True
+
+            if captured is not None and capture_len:
+                self._valid_len[slot] = torch.clamp(
+                    self._valid_len[slot] + capture_len, max=self._win
+                )
+                keep = min(self._win, capture_len)
+                hidden = captured[context_offset + chunk_len - keep : context_offset + chunk_len]
+                # A prompt token at absolute position p is stored in frame p+1,
+                # matching the generation path's start_pos convention.
+                window_positions = chunk_positions[-keep:] + 1
+                draft_model.write_context_windows(hidden, window_positions, self._kv_windows[slot])
+            context_offset += chunk_len
 
     def _advance_generation_state(
         self,
@@ -652,10 +798,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
             old = torch.clamp(old, max=self._position_cap)
             start_pos = torch.clamp(start_pos, max=self._position_cap)
         self._ctx_len[slots] = start_pos
-        self._position_initialized[slots] = True
         self._valid_len[slots] = torch.clamp(
             self._valid_len[slots] + num_accepted_tokens, max=self._win
         )
+        self._position_initialized[slots] = torch.ones_like(slots, dtype=torch.bool)
         return old, start_pos
 
     def _draft_gen_block_batched(
@@ -677,7 +823,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         (``nacc``, the bonus, ``main_hidden``, ``start_pos``, the multi-accept
         back-fill) are gathered as tensors, slots come from the host-built
         ``_batch_to_slot`` mirror, and the backbone runs once via
-        ``DSv4DSparkDraftModel.forward``. Returns the per-position corrected
+        ``DSv4DSparkDraftModel.forward_batched``. Returns the per-position corrected
         block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
         draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
         Confidence truncation stays disabled — the full block is proposed. When
@@ -752,27 +898,19 @@ class DSv4DSparkWorker(SpecWorkerBase):
             min=0, max=captured.shape[0] - 1
         )  # [G, K] (clamped; invalid entries are masked out anyway)
         interim_hidden = captured[interim_base]  # [G, K, ncap*hidden]
-        tables = self._draft_block_tables[num_contexts:batch_size]
-        capacities = self._draft_capacities[num_contexts:batch_size]
-        draft_model.write_context_pages(
-            interim_hidden,
-            interim_pos,
-            interim_valid,
-            self._draft_kv_buffers,
-            tables,
-            capacities,
+        draft_model.write_context_windows_batched(
+            interim_hidden, interim_pos, slots, interim_valid, self._kv_windows
         )
 
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
         # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
         # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
-        _toks, confidence, block_logits = draft_model.forward(
+        _toks, confidence, block_logits = draft_model.forward_batched(
             main_hidden,
             bonus,
             start_pos,
-            kv_pages=self._draft_kv_buffers,
-            block_tables=tables,
-            capacities=capacities,
+            kv_windows=self._kv_windows,
+            slots=slots,
             valid_len=self._valid_len[slots],
             temperature=0.0,
             return_confidence=self.return_confidence,
@@ -846,9 +984,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         raw_logits = logits
         K = self.max_draft_len
 
-        if self._draft_kv_manager is None:
-            raise RuntimeError("DSpark KV pages must be prepared before worker forward")
-
+        self._lazy_init(draft_model, spec_metadata, attn_metadata)
+        # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
+        # and mirror it into _batch_to_slot for the CUDA-graph-safe gen path.
+        spec_metadata._dspark_worker = self
         self._execute_guided_decoder_if_present(logits)
 
         # Target-verify acceptance via the unified SpecWorkerBase entry: it
@@ -878,6 +1017,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             saved_ctx_len = self._ctx_len.clone()
             saved_valid_len = self._valid_len.clone()
             saved_position_initialized = self._position_initialized.clone()
+            saved_windows = self._kv_windows.clone()
             # The confidence buffer is persistent state too; warmup scores
             # must not reach the verification planner.
             saved_confidence = (
@@ -890,7 +1030,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # first generation step drafts against real context instead of an all-zero
         # window (acceptance-rate only; verified decoding keeps output correct).
         if num_contexts > 0:
-            self._seed_context_pages(
+            self._seed_context_windows(
                 draft_model,
                 spec_metadata,
                 attn_metadata,
@@ -997,6 +1137,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._ctx_len.copy_(saved_ctx_len)
             self._valid_len.copy_(saved_valid_len)
             self._position_initialized.copy_(saved_position_initialized)
+            self._kv_windows.copy_(saved_windows)
             if saved_confidence is not None:
                 self._confidence_logits.copy_(saved_confidence)
             if saved_stamp is not None:
@@ -1017,210 +1158,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
             output_verify_lens=self._output_verify_lens,
         )
         return outputs
-
-    def _release_inactive_slots(self, request_ids: list[int]) -> None:
-        current = set(request_ids)
-        for request_id in list(self._req_to_slot):
-            if request_id not in current:
-                slot = self._req_to_slot.pop(request_id)
-                self._managed_residency.pop(request_id, None)
-                self._ctx_len[slot] = 0
-                self._valid_len[slot] = 0
-                self._position_initialized[slot] = False
-                self._free_slots.append(slot)
-
-    def _is_managed_request(self, request_id: int) -> bool:
-        return (
-            request_id != ATTENTION_DP_DUMMY_REQUEST_ID
-            and request_id < self._graph_dummy_id_floor
-            and request_id not in self._draft_kv_manager._draft_dummy_request_ids
-        )
-
-    def _bind_managed_history(self, resource_manager) -> None:
-        manager = (
-            resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
-            if resource_manager is not None
-            else None
-        )
-        if not getattr(manager, "draft_layer_ids", ()):
-            raise ValueError("Embedded DSpark requires manager-owned draft KV pages")
-        if manager is self._draft_kv_manager:
-            return
-        if (
-            manager.draft_window_size != self._win
-            or len(manager.draft_layer_ids) != self._num_stages
-            or any(
-                manager.kv_factor_per_layer[manager.layer_offsets[layer_id]] != 1
-                or manager.head_dim_per_layer[manager.layer_offsets[layer_id]] != self._head_dim
-                for layer_id in manager.draft_layer_ids
-            )
-        ):
-            raise ValueError("Embedded DSpark draft cache does not match its attention dimensions")
-        buffers = tuple(
-            manager.get_draft_buffers(stage) for stage in range(len(manager.draft_layer_ids))
-        )
-        self._draft_kv_manager = manager
-        self._draft_kv_buffers = buffers
-        self._managed_residency.clear()
-        self._draft_page_indices.clear()
-        self._draft_block_tables = torch.zeros(
-            (self._batch_to_slot.shape[0], manager.draft_max_blocks_per_seq),
-            dtype=torch.int32,
-            device=self._ctx_len.device,
-        )
-        self._draft_capacities = torch.zeros(
-            self._batch_to_slot.shape[0], dtype=torch.long, device=self._ctx_len.device
-        )
-
-    def prepare_managed_draft_cache(
-        self, draft_model, spec_metadata, attn_metadata, resource_manager
-    ) -> None:
-        """Refresh persistent draft inputs before eager execution or graph replay."""
-        self._lazy_init(draft_model, spec_metadata, attn_metadata)
-        self._bind_managed_history(resource_manager)
-        self._prepare_managed_history(spec_metadata.request_ids, attn_metadata.num_contexts)
-
-    def _prepare_managed_history(self, request_ids: list[int], num_contexts: int) -> None:
-        """Bind live page tables and initialize progress for newly resident histories."""
-        # Startup probes and graph/ADP padding never publish synthetic history.
-        real_rows = [
-            row
-            for row, request_id in enumerate(request_ids)
-            if self._is_managed_request(request_id)
-        ]
-        real_ids = [request_ids[row] for row in real_rows]
-        self._release_inactive_slots(real_ids)
-        batch_indices = self._draft_kv_manager.get_draft_block_indices(real_ids)
-        mappings = {row: tuple(indices) for row, indices in zip(real_rows, batch_indices)}
-        updates = []
-        for row in sorted(self._draft_page_indices.keys() | mappings.keys()):
-            previous = self._draft_page_indices.get(row, ())
-            current = mappings.get(row, ())
-            if current == previous:
-                continue
-            # Clear removed mappings as well as uploading new/reassigned pages.
-            width = max(len(previous), len(current))
-            old = previous + (0,) * (width - len(previous))
-            new = current + (0,) * (width - len(current))
-            first = next((i for i in range(width) if old[i] != new[i]), width)
-            if first == width:
-                continue
-            last = width
-            while old[last - 1] == new[last - 1]:
-                last -= 1
-            updates.append((row, first, new[first:last]))
-        self._draft_page_indices = mappings
-        self._ctx_len[self._scratch_slot] = 0
-        self._valid_len[self._scratch_slot] = 0
-        self._position_initialized[self._scratch_slot] = False
-        batch_slots = [self._scratch_slot] * len(request_ids)
-        for row in real_rows:
-            request_id = request_ids[row]
-            cache = self._draft_kv_manager.kv_cache_map[request_id]
-            slot = self._assign_slot(request_id)
-            batch_slots[row] = slot
-            if self._managed_residency.get(request_id) is cache:
-                continue
-            position = cache.history_length
-            if row >= num_contexts and position == 0:
-                raise ValueError(
-                    f"Embedded DSpark generation request {request_id} has no committed KV history"
-                )
-            self._ctx_len[slot] = position
-            self._valid_len[slot] = min(self._win, position)
-            self._position_initialized[slot] = True
-            self._managed_residency[request_id] = cache
-        # Staging may still be read by an earlier asynchronous H2D. Reuse it
-        # only after its copy event, independently of overlapped model execution.
-        count = sum(len(indices) for _, _, indices in updates)
-        host = next(
-            (buffers for buffers in self._draft_metadata_host_buffers if buffers["event"].query()),
-            None,
-        )
-        if host is None:
-            host = {
-                "tables": torch.empty(count, dtype=torch.int32, pin_memory=prefer_pinned()),
-                "capacities": torch.empty(
-                    self._draft_capacities.shape, dtype=torch.long, pin_memory=prefer_pinned()
-                ),
-                "slots": torch.empty(
-                    self._batch_to_slot.shape, dtype=torch.long, pin_memory=prefer_pinned()
-                ),
-                "event": torch.cuda.Event(),
-            }
-            self._draft_metadata_host_buffers.append(host)
-        elif host["tables"].numel() < count:
-            host["tables"] = torch.empty(count, dtype=torch.int32, pin_memory=prefer_pinned())
-        offset = 0
-        for row, first, indices in updates:
-            size = len(indices)
-            source = host["tables"][offset : offset + size]
-            source.copy_(torch.tensor(indices, dtype=torch.int32))
-            self._draft_block_tables[row, first : first + size].copy_(source, non_blocking=True)
-            offset += size
-        host["capacities"].zero_()
-        for row, request_id in zip(real_rows, real_ids):
-            host["capacities"][row] = self._draft_kv_manager.kv_cache_map[request_id].capacity
-        self._draft_capacities.copy_(host["capacities"], non_blocking=True)
-        host["slots"].fill_(self._scratch_slot)
-        host["slots"][: len(batch_slots)] = torch.tensor(batch_slots, dtype=torch.long)
-        self._batch_to_slot.copy_(host["slots"], non_blocking=True)
-        host["event"].record()
-
-    def _seed_context_pages(
-        self,
-        draft_model,
-        spec_metadata: "DSparkSpecMetadata",
-        attn_metadata,
-        position_ids: torch.Tensor,
-        total_target_tokens: int,
-    ) -> None:
-        """Seed context chunks using their absolute positions.
-
-        A request can arrive in multiple prefill chunks; continuation chunks
-        append to the same request's pages.
-        """
-        captured = spec_metadata.get_hidden_states(total_target_tokens)
-        capture_lens = getattr(spec_metadata, "context_capture_lens", None)
-        if capture_lens is not None and len(capture_lens) != attn_metadata.num_contexts:
-            raise ValueError("DSpark capture lengths must match the context requests")
-        flat_position_ids = position_ids.reshape(-1)
-        context_offset = 0
-        for i in range(attn_metadata.num_contexts):
-            chunk_len = int(attn_metadata._seq_lens[i])
-            capture_len = chunk_len if capture_lens is None else capture_lens[i]
-            if not 0 <= capture_len <= chunk_len:
-                raise ValueError("DSpark capture length must be a suffix of its context chunk")
-            chunk_positions = flat_position_ids[context_offset : context_offset + chunk_len].long()
-            if chunk_len == 0:
-                context_offset += chunk_len
-                continue
-
-            req_id = spec_metadata.request_ids[i]
-            slot = self._req_to_slot.get(req_id, self._scratch_slot)
-            if captured is None and slot != self._scratch_slot:
-                raise RuntimeError(
-                    "Embedded DSpark requires captured context to initialize KV history"
-                )
-            if captured is not None and capture_len:
-                keep = min(self._win, capture_len)
-                # Prefix reuse can publish any complete page in this chunk.
-                count = capture_len if self._draft_kv_manager.enable_block_reuse else keep
-                positions = (chunk_positions[-count:] + 1).unsqueeze(0)
-                draft_model.write_context_pages(
-                    captured[
-                        context_offset + chunk_len - count : context_offset + chunk_len
-                    ].unsqueeze(0),
-                    positions,
-                    torch.ones_like(positions, dtype=torch.bool),
-                    self._draft_kv_buffers,
-                    self._draft_block_tables[i : i + 1],
-                    self._draft_capacities[i : i + 1],
-                )
-                self._valid_len[slot] = torch.clamp(self._valid_len[slot] + keep, max=self._win)
-            self._ctx_len[slot] = chunk_positions[-1] + 1
-            self._position_initialized[slot] = True
-            context_offset += chunk_len
 
 
 class DSparkWorker(DFlashWorker):
@@ -1300,16 +1237,6 @@ class DSparkWorker(DFlashWorker):
         ):
             self._markov_tp_exchange = tp_pair_exchange(mapping, AllReduceStrategy.NCCL)
 
-    @staticmethod
-    def block_width_for(spec_config) -> int:
-        """Block slots a DSpark worker computes for ``spec_config``.
-
-        The ``shift_label`` convention, which the DSpark drafter defaults to,
-        reads slots 0..K-1; a checkpoint that turns it off needs K+1 and is
-        caught by the block-within-allocation check.
-        """
-        return spec_config.max_draft_len
-
     def _draft_block_width(self, draft_model) -> int:
         """Block width under the dspark ``shift_label`` convention.
 
@@ -1319,8 +1246,8 @@ class DSparkWorker(DFlashWorker):
         drafters are meant to run.
         """
         if getattr(draft_model, "_dspark_shift_label", False):
-            return self.block_width_for(self.spec_config)
-        return DFlashWorker.block_width_for(self.spec_config)
+            return self.max_draft_len
+        return super()._draft_block_width(draft_model)
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int

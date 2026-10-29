@@ -24,11 +24,6 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Protocol, Tuple
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
-    _estimate_draft_cache_size_components,
-    _get_draft_layer_sizes,
-)
-
 if sys.version_info[:2] >= (3, 12):
     from typing import override
 else:
@@ -598,7 +593,6 @@ def _estimate_mamba_hybrid_cache_cost(
     include_explicit_snapshots: bool,
     cap_partial_attention_snapshots: bool,
     extra_state_bytes_per_rank: int = 0,
-    draft_scratch_tokens: int = 0,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
     **kwargs,
@@ -657,22 +651,6 @@ def _estimate_mamba_hybrid_cache_cost(
         regular_slope = math.ceil(state_bytes_per_rank / interval)
         if has_unaligned_periodic_snapshot and not cap_partial_attention_snapshots:
             regular_slope += math.ceil(attention_block_bytes / interval)
-    draft_layer_sizes = _get_draft_layer_sizes(**kwargs)
-    if draft_layer_sizes:
-        # Hybrid target attention is full attention. Reserve capture/noise
-        # capacity only in its attention pools and the distinct draft pools;
-        # recurrent state retains the fixed/snapshot accounting above.
-        # Hybrid profiling bounds draft storage by full-history attention.
-        _, draft_slope, draft_fixed = _estimate_draft_cache_size_components(
-            draft_layer_sizes,
-            tokens_per_block,
-            generation_capacity_headroom=1,
-            scratch_tokens=draft_scratch_tokens,
-            helix_cp_size=mapping.cp_size if mapping.has_cp_helix() else 1,
-        )
-        draft_fixed += draft_scratch_tokens * attention_slope
-        attention_slope += draft_slope
-        intercept += max_batch_size * draft_fixed
     return attention_slope + regular_slope, intercept
 
 

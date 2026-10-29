@@ -92,7 +92,6 @@ def _make_creator(
         )
     )
     c._should_create_separate_draft_kv_cache = Mock(return_value=True)
-    c._uses_unified_standalone_draft_cache = Mock(return_value=False)
     c._get_draft_cache_cost = Mock(
         return_value=CacheCost(
             slope=total_kv_per_token - target_kv_per_token,
@@ -256,7 +255,6 @@ class TestSplitGpuBudgetForDraft:
         creator._kv_cache_manager_cls = DraftCostKVCacheManager
         creator._is_disagg = False
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
-        creator._uses_unified_standalone_draft_cache = Mock(return_value=False)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
         get_manager_cls = mocker.patch(
@@ -376,7 +374,6 @@ class TestSplitGpuBudgetForDraft:
         creator._is_disagg = False
         creator._cache_transceiver_config = None
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
-        creator._uses_unified_standalone_draft_cache = Mock(return_value=False)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
 
@@ -505,7 +502,6 @@ class TestSplitGpuBudgetForDraft:
         c._enable_kv_cache_stats = Mock(return_value=False)
         c._fp8_ctx_mla_kv_len_cap = None
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
-        c._uses_unified_standalone_draft_cache = Mock(return_value=False)
         c._speculative_config = Mock()
         c._speculative_config.spec_dec_mode.is_external_drafter.return_value = True
 
@@ -723,7 +719,6 @@ def test_helix_attention_dp_draft_cost_uses_the_drafter_shard(mocker):
     c._is_disagg = True
     c._is_encoder_decoder = Mock(return_value=False)
     c._should_create_separate_draft_kv_cache = Mock(return_value=True)
-    c._uses_unified_standalone_draft_cache = Mock(return_value=False)
     c._get_num_draft_layers = Mock(return_value=5)
     mocker.patch(
         "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
@@ -1046,7 +1041,6 @@ class TestBuildManagersBudgetGates:
         c._fp8_ctx_mla_kv_len_cap = None
         c._model_engine.model.model_config.is_encoder_decoder = False
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
-        c._uses_unified_standalone_draft_cache = Mock(return_value=False)
         c._needs_gpu_kv_cache_budget_split = Mock(return_value=True)
         c._create_kv_cache_manager = Mock(return_value=Mock())
         c._create_one_model_draft_kv_cache_manager = Mock(return_value=Mock())
@@ -1197,7 +1191,6 @@ class TestExternalDrafterKvDtype:
         c._cache_transceiver_config = None
         c._is_encoder_decoder = Mock(return_value=False)
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
-        c._uses_unified_standalone_draft_cache = Mock(return_value=False)
         c._get_num_draft_layers = Mock(return_value=self.DRAFT_LAYERS)
         mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",

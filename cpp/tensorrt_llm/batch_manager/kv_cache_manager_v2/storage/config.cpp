@@ -212,12 +212,11 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         bool isSparse = false;
-        CacheDomain cacheDomain = CacheDomain::kTarget;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(reusePolicy, slotSizes, isSparse, cacheDomain)
-                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse, other.cacheDomain);
+            return std::tie(reusePolicy, slotSizes, isSparse)
+                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse);
         }
     };
 
@@ -228,9 +227,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
         bool const isSparse = attn != nullptr && attn->isSparse;
         auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
-        CacheDomain const domain = attn ? attn->cacheDomain : CacheDomain::kTarget;
-        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse, .cacheDomain = domain}]
-            .push_back(std::move(sg));
+        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
     }
 
     StorageConfig out;

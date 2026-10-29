@@ -492,13 +492,13 @@ def _dspark_attention_forward_legacy(
     start_pos: int,
     kv_cache: torch.Tensor,
     *,
-    wq_a: torch.Tensor,
+    wq_a: Optional[torch.Tensor],
     q_norm_w: torch.Tensor,
-    wq_b: torch.Tensor,
-    wkv: torch.Tensor,
+    wq_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    wkv: Optional[torch.Tensor],
     kv_norm_w: torch.Tensor,
-    wo_a: torch.Tensor,
-    wo_b: torch.Tensor,
+    wo_a: Optional[torch.Tensor],
+    wo_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
     attn_sink: torch.Tensor,
     n_heads: int,
     head_dim: int,
@@ -511,6 +511,13 @@ def _dspark_attention_forward_legacy(
     freqs_cis: torch.Tensor,
     persist: bool = False,
     q_b_norm_enabled: bool = True,
+    qkv_proj: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    o_a_proj: Optional[torch.Tensor] = None,
+    o_a_scale: Optional[torch.Tensor] = None,
+    o_a_dequant: Optional[torch.Tensor] = None,
+    use_fused_output_projection: Optional[bool] = None,
+    use_fused_qkv_input_projection: bool = False,
+    use_fused_q_input_projection: bool = False,
 ) -> torch.Tensor:
     """Captured-context DSpark draft attention (generation path, ``start_pos > 0``).
 
@@ -522,8 +529,7 @@ def _dspark_attention_forward_legacy(
     block's own positions, attention-sink softmax, inverse-RoPE on the output, and a
     grouped low-rank O projection (``wo_a`` einsum + ``wo_b``).
 
-    Weights are plain tensors for ``F.linear`` (the caller supplies the loaded /
-    dequantized projection weights); ``wo_a`` is the raw grouped weight matrix
+    Projections accept tensor weights or loaded projection modules; ``wo_a`` is the raw grouped weight matrix
     ``[n_groups * o_lora_rank, n_heads * head_dim // n_groups]``. ``kv_cache`` is
     ``[b, window_size, head_dim]`` and is updated functionally (cloned).
 
@@ -543,13 +549,24 @@ def _dspark_attention_forward_legacy(
     main_freqs = freqs_cis[start_pos : start_pos + 1]
     blk_freqs = freqs_cis[start_pos + 1 : start_pos + 1 + block]
 
+    q_latent, block_kv_input, main_kv_input = _qkv_projections(
+        x,
+        main_x,
+        wq_a=wq_a,
+        wkv=wkv,
+        q_norm_w=q_norm_w,
+        qkv_proj=qkv_proj,
+        use_fused_fp8_input=use_fused_qkv_input_projection,
+    )
+
     # Captured-context K/V from main_x (MQA, shared across heads).
-    main_kv = _rmsnorm(F.linear(main_x, wkv), kv_norm_w, eps)  # [b, 1, head_dim]
+    main_kv = _rmsnorm(main_kv_input, kv_norm_w, eps)  # [b, 1, head_dim]
     main_kv = _rope_last_dims(main_kv, rd, main_freqs)
 
     # Query: low-rank + per-head RMS + RoPE.
-    q = _rmsnorm(F.linear(x, wq_a), q_norm_w, eps)
-    q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [b, block, h, head_dim]
+    q = _q_projection(q_latent, q_norm_w, eps, wq_b, use_fused_q_input_projection).unflatten(
+        -1, (n_heads, head_dim)
+    )
     # Per-head RMS in the query dtype (matches the reference inline normalization,
     # which is NOT the fp32 RMSNorm path).
     if q_b_norm_enabled:
@@ -557,7 +574,7 @@ def _dspark_attention_forward_legacy(
     q = _rope_last_dims(q, rd, blk_freqs)
 
     # Block K/V.
-    kv = _rmsnorm(F.linear(x, wkv), kv_norm_w, eps)  # [b, block, head_dim]
+    kv = _rmsnorm(block_kv_input, kv_norm_w, eps)  # [b, block, head_dim]
     kv = _rope_last_dims(kv, rd, blk_freqs)
 
     # Write the context K/V into the rolling window, then attend over
@@ -572,10 +589,17 @@ def _dspark_attention_forward_legacy(
     o = _rope_last_dims(o, rd, blk_freqs, inverse=True)
 
     # Grouped low-rank O projection.
-    o = o.reshape(b, block, n_groups, -1)
-    wo_a_v = wo_a.view(n_groups, o_lora_rank, -1)
-    o = torch.einsum("bsgd,grd->bsgr", o, wo_a_v)
-    return F.linear(o.flatten(2), wo_b)
+    return _output_projection(
+        o,
+        wo_a=wo_a,
+        wo_b=wo_b,
+        n_groups=n_groups,
+        o_lora_rank=o_lora_rank,
+        o_a_proj=o_a_proj,
+        o_a_scale=o_a_scale,
+        o_a_dequant=o_a_dequant,
+        use_fused_output_projection=use_fused_output_projection,
+    )
 
 
 def dspark_attention_forward(
@@ -647,6 +671,13 @@ def dspark_attention_forward(
             freqs_cis=freqs_cis,
             q_b_norm_enabled=q_b_norm_enabled,
             persist=persist,
+            qkv_proj=qkv_proj,
+            o_a_proj=o_a_proj,
+            o_a_scale=o_a_scale,
+            o_a_dequant=o_a_dequant,
+            use_fused_output_projection=use_fused_output_projection,
+            use_fused_qkv_input_projection=use_fused_qkv_input_projection,
+            use_fused_q_input_projection=use_fused_q_input_projection,
         )
     if capacities is None or valid_len is None:
         raise ValueError("Paged DSpark attention requires capacities and valid lengths")
@@ -800,13 +831,13 @@ def dspark_attention_forward_batched(
     slots: torch.Tensor,
     valid_len: torch.Tensor | None = None,
     *,
-    wq_a: torch.Tensor,
+    wq_a: Optional[torch.Tensor],
     q_norm_w: torch.Tensor,
-    wq_b: torch.Tensor,
-    wkv: torch.Tensor,
+    wq_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    wkv: Optional[torch.Tensor],
     kv_norm_w: torch.Tensor,
-    wo_a: torch.Tensor,
-    wo_b: torch.Tensor,
+    wo_a: Optional[torch.Tensor],
+    wo_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
     attn_sink: torch.Tensor,
     n_heads: int,
     head_dim: int,
@@ -819,6 +850,13 @@ def dspark_attention_forward_batched(
     freqs_cis: torch.Tensor,
     persist: bool = False,
     q_b_norm_enabled: bool = True,
+    qkv_proj: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    o_a_proj: Optional[torch.Tensor] = None,
+    o_a_scale: Optional[torch.Tensor] = None,
+    o_a_dequant: Optional[torch.Tensor] = None,
+    use_fused_output_projection: Optional[bool] = None,
+    use_fused_qkv_input_projection: bool = False,
+    use_fused_q_input_projection: bool = False,
 ) -> torch.Tensor:
     """Batched, CUDA-graph-safe captured-context DSpark draft attention.
 
@@ -869,11 +907,25 @@ def dspark_attention_forward_batched(
 
     # Keep the two GEMM outputs live until dispatch: the fused path lets
     # their RMSNorm/RoPE kernels store directly into attention's physical inputs.
-    main_kv_input = F.linear(main_x, wkv)
+    q_latent, block_kv_input, main_kv_input = _qkv_projections(
+        x,
+        main_x,
+        wq_a=wq_a,
+        wkv=wkv,
+        q_norm_w=q_norm_w,
+        qkv_proj=qkv_proj,
+        use_fused_fp8_input=use_fused_qkv_input_projection,
+    )
 
     # Query: low-rank + per-head RMS + RoPE.
-    q = _rmsnorm_rope_batched(F.linear(x, wq_a), q_norm_w, eps, 0, blk_freqs)
-    q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [G, block, h, head_dim]
+    q = _q_projection(
+        q_latent,
+        q_norm_w,
+        eps,
+        wq_b,
+        use_fused_q_input_projection,
+        batched_freqs_cis=blk_freqs,
+    ).unflatten(-1, (n_heads, head_dim))
     q = _rmsnorm_rope_batched(
         q,
         None,
@@ -884,8 +936,6 @@ def dspark_attention_forward_batched(
         apply_weight=False,
         apply_rmsnorm=q_b_norm_enabled,
     )
-
-    block_kv_input = F.linear(x, wkv)
 
     # ``persist=True`` writes through to the worker-owned rolling window;
     # single-shot callers keep the original functional clone behavior.
@@ -969,10 +1019,17 @@ def dspark_attention_forward_batched(
         )
 
     # Grouped low-rank O projection.
-    o = o.reshape(g, block, n_groups, -1)
-    wo_a_v = wo_a.view(n_groups, o_lora_rank, -1)
-    o = torch.einsum("bsgd,grd->bsgr", o, wo_a_v)
-    return F.linear(o.flatten(2), wo_b)
+    return _output_projection(
+        o,
+        wo_a=wo_a,
+        wo_b=wo_b,
+        n_groups=n_groups,
+        o_lora_rank=o_lora_rank,
+        o_a_proj=o_a_proj,
+        o_a_scale=o_a_scale,
+        o_a_dequant=o_a_dequant,
+        use_fused_output_projection=use_fused_output_projection,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -1812,9 +1869,20 @@ class DSv4DSparkDraftModel(nn.Module):
         freqs = self._dspark_freqs_table(main_x.device)[positions]
         slots = positions % win  # [M]
         mx = main_x.unsqueeze(0)  # [1, M, hidden] for the per-position RoPE layout
+        projected_wkv = self._project_context_wkv(mx)
+        head_dim = int(self._attn_params["head_dim"])
         for s, stage in enumerate(self.mtp_layers):
             a = stage._dspark_attn
-            kv = _rmsnorm(F.linear(mx, a["wkv"]), a["kv_norm_w"], eps)  # [1, M, head_dim]
+            kv = (
+                projected_wkv[..., s, :]
+                if projected_wkv is not None
+                else (
+                    a["qkv_proj"](mx)[..., -head_dim:]
+                    if a.get("qkv_proj") is not None
+                    else F.linear(mx, a["wkv"])
+                )
+            )
+            kv = _rmsnorm(kv, a["kv_norm_w"], eps)
             kv = _rope_last_dims(kv, rd, freqs)  # [1, M, head_dim]
             stage_windows[s, slots] = kv[0].to(stage_windows.dtype)
 
@@ -1862,9 +1930,20 @@ class DSv4DSparkDraftModel(nn.Module):
         mask3 = mask.unsqueeze(-1)  # [G, M, 1]
         stage0 = self.mtp_layers[0]
         main_x = stage0.main_norm(stage0.main_proj(main_hidden))  # [G, M, hidden]
+        projected_wkv = self._project_context_wkv(main_x)
+        head_dim = int(self._attn_params["head_dim"])
         for s, stage in enumerate(self.mtp_layers):
             a = stage._dspark_attn
-            kv = _rmsnorm(F.linear(main_x, a["wkv"]), a["kv_norm_w"], eps)  # [G, M, head_dim]
+            kv = (
+                projected_wkv[..., s, :]
+                if projected_wkv is not None
+                else (
+                    a["qkv_proj"](main_x)[..., -head_dim:]
+                    if a.get("qkv_proj") is not None
+                    else F.linear(main_x, a["wkv"])
+                )
+            )
+            kv = _rmsnorm(kv, a["kv_norm_w"], eps)
             kv = _rope_last_dims_batched(kv, rd, freqs)  # [G, M, head_dim]
             win_s = kv_windows[:, s]  # [N, win, head_dim] view onto the base buffer
             # Read-modify-write so masked-out (g, m) entries keep their current

@@ -18,8 +18,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -636,22 +634,6 @@ class DecoderRunner(ScheduledModelRunner):
                     is_dummy=is_dummy,
                     gather_context_logits=gather_context_logits,
                 )
-            spec_worker = None
-            if enable_spec_decode:
-                speculative_model = self._model
-                if isinstance(speculative_model, MultimodalModelMixin):
-                    speculative_model = speculative_model.language_model
-                if not isinstance(speculative_model, SpecDecOneEngineForCausalLM):
-                    speculative_model = getattr(speculative_model, "llm", None)
-                if isinstance(speculative_model, SpecDecOneEngineForCausalLM):
-                    spec_worker = speculative_model.spec_worker
-                    if spec_worker is not None:
-                        spec_worker.prepare_managed_draft_cache(
-                            speculative_model.draft_model,
-                            spec_metadata,
-                            attn_metadata,
-                            resource_manager,
-                        )
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
             if execution_promoted_context_ids:
@@ -699,18 +681,6 @@ class DecoderRunner(ScheduledModelRunner):
             )
             if captures_model_body:
                 return outputs
-
-            if (
-                spec_worker is not None
-                and not is_dummy
-                and not getattr(self._graphs.cuda_graph_runner, "is_warmup_only", False)
-            ):
-                history_update = spec_worker.snapshot_managed_draft_history()
-                if history_update is not None:
-                    # Graph dictionaries are reused; each overlapped step owns
-                    # its own readback until sampling commits the history.
-                    outputs = dict(outputs)
-                    outputs["draft_history_update"] = history_update
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

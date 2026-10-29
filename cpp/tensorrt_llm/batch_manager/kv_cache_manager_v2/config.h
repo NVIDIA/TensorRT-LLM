@@ -207,8 +207,6 @@ struct AttentionLayerConfig
     // Private working pages never constrain prefix matching or enter the tree.
     AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
 
-    CacheDomain cacheDomain = CacheDomain::kTarget;
-
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;
