@@ -161,16 +161,15 @@ _SKIP_RESULTS = {
     # put: another put of this driver is writing the key now; no session is started
     "held_by_own_put": _NOT_READY,
     "uncommitted": _NOT_READY,  # put start -705, and the master shows no readable complete object
-    # put: a session this driver left open holds the key and the master shows no complete object.
-    # The driver never writes such a key again (class docstring), so it refuses the row; the put
-    # that left the session open already concluded FAULT.
-    "held_by_session_left_open": _DECLINED,
+    # put: an earlier put of this driver left the key open (class docstring, step 3) and the
+    # master shows no complete object. The driver starts no session of such a key again, so it
+    # refuses the row.
+    "left_open_by_own_put": _DECLINED,
     "pool_full": _DECLINED,  # put start -200: no space for the object
 }
 
-# Session-end answers after which the end may still reach the master, even if the retry is refused.
-# Such a session is left for close and its key is never put again: the master matches an end by key
-# and client only, so a late end would mark complete this client's next object of the key.
+# Session-end answers after which the end may still reach the master, so its key is left open
+# (class docstring, step 3), even when a retry ends the session.
 _END_OUTCOME_UNKNOWN = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT, _Code.METADATA_CALL_FAILED)
 # Session-end answers retried once, as the master ends a session idempotently; an end call that
 # raised or miscounted is not retried.
@@ -178,9 +177,9 @@ _END_RETRIED = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT)
 
 
 class _LeftOpen(enum.Enum):
-    """Who ends a put session this driver left open."""
+    """Who frees the session a key left open may still have: close, or the master alone."""
 
-    FOR_CLOSE = "for_close"  # close revokes it, as the owner's last step
+    FOR_CLOSE = "for_close"  # close revokes the session the SDK may hold, as the owner's last step
     TO_MASTER = "to_master"  # the target may still write into its object: the master frees it
 
 
@@ -295,21 +294,32 @@ class MooncakeDriver:
 
     A put of a part's rows:
 
-    1. Reserves each key that no put of this driver is writing and no session it left open holds.
-       A key another put is writing is NOT_READY at once. A key whose session it left open is
-       READY when the master shows its object complete, DECLINED when it shows none, and FAULT
-       when the existence check fails; it is never put again.
+    1. Reserves each key that no put of this driver is writing or left open. A key another put
+       is writing is NOT_READY at once. A key a put left open is READY when the master shows its
+       object complete, DECLINED when it shows none, and FAULT when the existence check fails;
+       it is never put again.
     2. Starts a session per reserved key, writes every started row in one scatter, ends the
        session of each row written whole (its object becomes readable) and revokes the rest.
-    3. Leaves open each session it may have started and did not see ended or revoked:
+    3. Resolves each reserved key whose start the SDK refused, or whose session calls all had a
+       known outcome and left no session; every other key it leaves open for good. The master
+       matches an end or a revoke to an object by key and client alone, so one that may still
+       reach it would act on the next put of the key: a late end makes its object readable
+       before it is written, a late revoke frees its space mid-write. A start refused with
+       RPC_FAIL or RPC_TIMEOUT may have reached the master, or may still reach it: on a key with
+       no object it reserves one, so the key's next put is NOT_READY until
+       ``put_start_discard_timeout_sec``, and it replaces a put of the key unfinished past that
+       timeout with an unwritten object, which that put's end makes readable when the put is
+       this driver's. Leaving these keys open would instead bar every key whose start met a
+       master outage from ever being put again. A key is left open:
 
        - to the master, never revoked here, since the target may still write into the object: a
          scatter that raised or miscounted, a row answered TRANSFER_FAIL. The master frees them
          after ``put_start_release_timeout_sec``.
        - for ``close`` to revoke, once no put runs: any other, such as a start that raised or
-         miscounted, an end whose outcome is unknown (``_END_OUTCOME_UNKNOWN``), a revoke that
-         failed, or a put stopped by a raise. A put stopped by a raise is unprovable, so no drain
-         returns True and ``close`` never comes: the master frees its sessions.
+         miscounted, an end whose outcome is unknown (``_END_OUTCOME_UNKNOWN``) even when a
+         retried end succeeded, a revoke that failed, or a put stopped by a raise. A put stopped
+         by a raise is unprovable, so no drain returns True and ``close`` never comes: the
+         master frees its sessions.
 
     Args:
         store: An SDK store whose ``setup`` returned 0. The driver takes it over: ``close``
@@ -364,10 +374,9 @@ class MooncakeDriver:
         # Keys a running put part reserved, until that part ends: no two puts of this driver hold
         # a session of one key at once, so a -600 is never this driver's own.
         self._keys_being_put: set[str] = set()
-        # The put sessions this driver left open (class docstring, step 3), by key. No key is in
-        # both: a reserved key is left open only as its reservation ends, and is never reserved
-        # again.
-        self._sessions_left_open: dict[str, _LeftOpen] = {}
+        # The keys a put left open (class docstring, step 3). No key is in both: a reserved key is
+        # left open only as its reservation ends, and is never reserved again.
+        self._keys_left_open: dict[str, _LeftOpen] = {}
         self._in_flight_op_count = 0  # operations with rows queued or parts running
         self._unprovable_op_count = 0  # operations whose access can never be proven ended
         self._skipped_rows: Counter[str] = Counter()  # by reason
@@ -479,8 +488,8 @@ class MooncakeDriver:
         """Refuses new work for good, cancels the rows no worker took, ends the worker threads,
         and waits up to ``budget_s`` for the running parts to end and every worker thread to exit.
         Returns False at once while an operation is unprovable. Makes no SDK call, so it returns
-        within ``budget_s``: the sessions left for close hold no lender memory, and ``close``
-        revokes them."""
+        within ``budget_s``: the sessions of the keys left open for close hold no lender memory,
+        and ``close`` revokes them."""
         with self._lock:
             self._require_open()
             self._draining = True
@@ -503,11 +512,12 @@ class MooncakeDriver:
 
     def close(self) -> None:
         """The owner's last step, once a drain returned True and every region is unregistered:
-        tries once to revoke the sessions left for close, then closes the SDK client, which takes
-        no call after that. The revocation waits on the master, and closing holds the GIL through
-        the unmount, so the owner calls it off the executor loop's thread. A session whose
-        revocation fails is freed by the master after ``put_start_release_timeout_sec``; sessions
-        left to the master are never revoked here."""
+        tries once to revoke the sessions of the keys left open for close, then closes the SDK
+        client, which takes no call after that. The SDK revokes the sessions it holds and answers
+        INVALID_PARAMS for the others. The revocation waits on the master, and closing holds the
+        GIL through the unmount, so the owner calls it off the executor loop's thread. A session
+        whose revocation fails is freed by the master after ``put_start_release_timeout_sec``;
+        the sessions of keys left to the master are never revoked here."""
         with self._lock:
             if self._closed:
                 return
@@ -516,7 +526,7 @@ class MooncakeDriver:
             if any(r.live for r in self._registrations):
                 raise DriverRejected("close needs every registration unregistered")
             self._closed = True
-            left = self._sessions_left_open.items()
+            left = self._keys_left_open.items()
             to_revoke = [key for key, by in left if by is _LeftOpen.FOR_CLOSE]
         try:
             if to_revoke:  # no put runs any more, so none of them is in use
@@ -524,22 +534,22 @@ class MooncakeDriver:
                 with self._lock:
                     for key, code in zip(to_revoke, codes):
                         if _session_gone(code):
-                            del self._sessions_left_open[key]
+                            del self._keys_left_open[key]
         finally:
             self._store.close()
 
     def stats(self) -> dict[str, int]:
         """A snapshot for logs and tests; not part of the driver protocol."""
         with self._lock:
-            left = list(self._sessions_left_open.values())
+            left = list(self._keys_left_open.values())
             return {
                 **{
                     f"rows_{r.status.value}_{reason}": self._skipped_rows[reason]
                     for reason, r in _SKIP_RESULTS.items()
                 },
                 "ops_unprovable": self._unprovable_op_count,
-                "put_sessions_left_for_close": left.count(_LeftOpen.FOR_CLOSE),
-                "put_sessions_left_to_master": left.count(_LeftOpen.TO_MASTER),
+                "put_keys_left_for_close": left.count(_LeftOpen.FOR_CLOSE),
+                "put_keys_left_to_master": left.count(_LeftOpen.TO_MASTER),
             }
 
     # Admission, on the caller's thread.
@@ -753,68 +763,65 @@ class MooncakeDriver:
 
     def _put_part(self, rows: _Rows) -> tuple[_PartResults, bool]:
         """Returns the part's results and whether access ended. Whatever stops the calls, each
-        reserved key whose session they did not see closed is left open (class docstring,
-        step 3)."""
+        reserved key they did not resolve is left open (class docstring, step 3)."""
         results = _PartResults()
-        reserved, held_by_left_session = self._reserve_keys(rows.keys, results)
-        # Reserved keys known to hold no session (never opened, or ended or revoked), and those
-        # whose object the target may still write into.
-        closed: set[str] = set()
+        reserved, already_left_open = self._reserve_keys(rows.keys, results)
+        # Reserved keys a later put may reserve again (class docstring, step 3), and those whose
+        # object the target may still write into.
+        resolved: set[str] = set()
         to_master: set[str] = set()
         try:
-            # Never put again, but a late end of its own or another client may have completed it.
-            if held_by_left_session:
-                self._confirm_existing(held_by_left_session, results, "held_by_session_left_open")
+            # Never put again: READY only while the master shows its object complete.
+            if already_left_open:
+                self._confirm_existing(already_left_open, results, "left_open_by_own_put")
             if not reserved:
                 return results, True
-            access_ended = self._put_reserved(rows.only(reserved), results, closed, to_master)
+            access_ended = self._put_reserved(rows.only(reserved), results, resolved, to_master)
             return results, access_ended
         finally:
-            self._release_keys_and_record_left_open(reserved, closed, to_master)
+            self._release_keys_and_record_left_open(reserved, resolved, to_master)
 
     def _reserve_keys(self, keys: list[str], results: _PartResults) -> tuple[list[str], list[str]]:
-        """Reserves every key that no put of this driver is writing and no session it left open
-        holds, and returns them, then the keys a left-open session holds. A key another put of
-        this driver is writing is NOT_READY."""
+        """Reserves every key that no put of this driver is writing or left open, and returns
+        them, then the keys left open. A key another put of this driver is writing is
+        NOT_READY."""
         with self._lock:
-            being_put, left_open = self._keys_being_put, self._sessions_left_open.keys()
+            being_put, left_open = self._keys_being_put, self._keys_left_open.keys()
             if being_put.isdisjoint(keys) and left_open.isdisjoint(keys):  # usually
-                reserved, held_by_left_session = keys, []
+                reserved, already_left_open = keys, []
             else:
-                reserved, held_by_left_session = [], []
+                reserved, already_left_open = [], []
                 for key in keys:
                     if key in being_put:
                         results.skip(key, "held_by_own_put")
                     elif key in left_open:
-                        held_by_left_session.append(key)
+                        already_left_open.append(key)
                     else:
                         reserved.append(key)
             self._keys_being_put.update(reserved)
-        return reserved, held_by_left_session
+        return reserved, already_left_open
 
     def _release_keys_and_record_left_open(
-        self, reserved: list[str], closed: set[str], to_master: set[str]
+        self, reserved: list[str], resolved: set[str], to_master: set[str]
     ) -> None:
-        """Ends the reservation of ``reserved`` and records each session not ``closed`` as left
-        open: for the master when its key is in ``to_master``, otherwise for ``close``."""
+        """Ends the reservation of ``reserved`` and records each key not ``resolved`` as left
+        open: for the master when it is in ``to_master``, otherwise for ``close``."""
         left: dict[str, _LeftOpen] = {}
-        if not closed.issuperset(reserved):  # usually every session ended
+        if not resolved.issuperset(reserved):  # usually every key resolved
             left = {
                 key: _LeftOpen.TO_MASTER if key in to_master else _LeftOpen.FOR_CLOSE
                 for key in reserved
-                if key not in closed
+                if key not in resolved
             }
         with self._lock:
             self._keys_being_put.difference_update(reserved)
-            self._sessions_left_open.update(left)
+            self._keys_left_open.update(left)
         if left:
             first, why = next(iter(left.items()))
-            logger.warning(
-                f"mooncake: {len(left)} put sessions left open, first {first} {why.value}"
-            )
+            logger.warning(f"mooncake: {len(left)} put keys left open, first {first} {why.value}")
 
     def _put_reserved(
-        self, rows: _Rows, results: _PartResults, closed: set[str], to_master: set[str]
+        self, rows: _Rows, results: _PartResults, resolved: set[str], to_master: set[str]
     ) -> bool:
         """Starts a session per row, writes and finishes the started ones, and confirms the rows
         whose object exists already. Returns whether access ended."""
@@ -826,8 +833,8 @@ class MooncakeDriver:
                 if code == _Code.OK:
                     started.append(key)
                     continue
-                if code != _Code.METADATA_CALL_FAILED:  # the SDK answered: no session opened
-                    closed.add(key)
+                if code != _Code.METADATA_CALL_FAILED:  # the SDK answered and holds no session
+                    resolved.add(key)
                 if code == _Code.OBJECT_ALREADY_EXISTS:
                     existing.append(key)
                 elif code == _Code.NO_AVAILABLE_HANDLE:
@@ -840,13 +847,13 @@ class MooncakeDriver:
                     results.fault([key], f"put session start: {_describe(code)}")
         access_ended = True
         if started:
-            access_ended = self._write_and_finish(rows.only(started), results, closed, to_master)
+            access_ended = self._write_and_finish(rows.only(started), results, resolved, to_master)
         if existing:  # readable only once the master shows it committed
             self._confirm_existing(existing, results, "uncommitted")
         return access_ended
 
     def _write_and_finish(
-        self, rows: _Rows, results: _PartResults, closed: set[str], to_master: set[str]
+        self, rows: _Rows, results: _PartResults, resolved: set[str], to_master: set[str]
     ) -> bool:
         """Writes the rows whose put session started in one scatter, then ends the session of each
         row written whole and revokes the rest, except those the target may still write into.
@@ -884,20 +891,22 @@ class MooncakeDriver:
                 else:
                     to_revoke.append(key)
         if written:
-            to_revoke += self._end_sessions(written, results, closed)
+            to_revoke += self._end_sessions(written, results, resolved)
         if to_revoke:
             codes = self._metadata_call(self._store.batch_put_session_revoke, to_revoke)
-            closed.update(key for key, code in zip(to_revoke, codes) if _session_gone(code))
+            resolved.update(key for key, code in zip(to_revoke, codes) if _session_gone(code))
         return True
 
-    def _end_sessions(self, keys: list[str], results: _PartResults, closed: set[str]) -> list[str]:
+    def _end_sessions(
+        self, keys: list[str], results: _PartResults, resolved: set[str]
+    ) -> list[str]:
         """Ends the sessions of rows written whole. Returns the keys whose end was refused, to
-        revoke; a session whose end may still reach the master, answered ``_END_OUTCOME_UNKNOWN``
-        first, stays open even when the retry was refused."""
+        revoke. A key whose first end answered ``_END_OUTCOME_UNKNOWN`` stays open, as that end may
+        still reach the master; its row is READY when the retry ended the session."""
         end = self._store.batch_put_session_end
         codes = self._metadata_call(end, keys)
         if not any(codes):  # every session ended (OK is 0)
-            closed.update(keys)
+            resolved.update(keys)
             return []
         final = dict(zip(keys, codes))
         retry = [key for key, code in final.items() if code in _END_RETRIED]
@@ -905,12 +914,11 @@ class MooncakeDriver:
             final.update(zip(retry, self._metadata_call(end, retry)))
         refused = []
         for key, first in zip(keys, codes):
-            code = final[key]
-            if code == _Code.OK:
-                closed.add(key)
-                continue
-            results.fault([key], f"put session end: {_describe(code)}")
-            if first not in _END_OUTCOME_UNKNOWN:
+            if final[key] != _Code.OK:
+                results.fault([key], f"put session end: {_describe(final[key])}")
+            if first == _Code.OK:
+                resolved.add(key)
+            elif first not in _END_OUTCOME_UNKNOWN:
                 refused.append(key)
         return refused
 
