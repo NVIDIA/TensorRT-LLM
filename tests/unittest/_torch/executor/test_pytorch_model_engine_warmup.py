@@ -496,6 +496,7 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
     expect_skip: bool,
 ) -> None:
     """A repeated warmup with an already tuned token shape must not re-run tuning."""
+    post_autotune = Mock()
     engine = SimpleNamespace(
         _config=SimpleNamespace(
             enable_autotuner=True,
@@ -512,7 +513,13 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
         ),
         _completed_autotuner_warmup_num_tokens=completed_num_tokens,
         _warmup_timer=_WarmupTimer(rank=0),
-        model=SimpleNamespace(modules=lambda: []),
+        model=SimpleNamespace(
+            modules=lambda: [
+                SimpleNamespace(resolve_post_autotune=post_autotune.first),
+                torch.nn.Identity(),
+                SimpleNamespace(resolve_post_autotune=post_autotune.second),
+            ]
+        ),
         mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
         dist=object(),
         guided_decoder=None,
@@ -535,6 +542,7 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
         else None
     )
     tuner = Mock(profiling_cache={})
+    post_autotune.attach_mock(tuner.print_profiling_cache, "cache_ready")
     get_tuner = Mock(return_value=tuner)
     monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
     monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", get_tuner)
@@ -551,11 +559,13 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
     # Every rank votes with its local decision, skip or not.
     engine._agreement.agree_flag.assert_called_once_with(completed_num_tokens == 16)
     if expect_skip:
+        assert post_autotune.mock_calls == []
         get_tuner.assert_not_called()
         engine._dummy_requests.create_warmup_request.assert_not_called()
         engine._forward_warmup.assert_not_called()
     else:
         assert engine._forward_warmup.call_count == 2
+        assert post_autotune.mock_calls == [call.cache_ready(), call.first(), call.second()]
     # Buffers cached by earlier warmup phases are released on both paths.
     clear_buffers.assert_called_once_with()
     assert engine._completed_autotuner_warmup_num_tokens == 16

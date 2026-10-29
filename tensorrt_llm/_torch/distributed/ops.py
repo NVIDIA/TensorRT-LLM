@@ -17,6 +17,7 @@ import os
 import platform
 import threading
 import typing
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 
 import torch
@@ -29,7 +30,8 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (HelixCpMnnvlMemory,
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
-from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_pybind11_abi
+from tensorrt_llm._utils import (get_sm_version, mpi_comm, mpi_disabled,
+                                 torch_pybind11_abi)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -1425,6 +1427,111 @@ class AllReduce(nn.Module):
         return output if len(output) > 1 else output[0]
 
 
+@dataclass(frozen=True)
+class MoEFinalizeProfile:
+    """Geometry and runtime facts that pick the fused MoE finalize cutoff.
+
+    The key has no model name, so every model that pairs a fused MoE with
+    ``MoEAllReduce`` shares one table. ``activation_dtype`` is the MoE input
+    dtype, not the weight format; the weight format is part of
+    ``moe_impl_id`` (for example ``flashinfer.trtllm_gen.fused_moe.nvfp4``).
+    """
+
+    sm_version: int
+    tp_size: int
+    moe_ep_size: int
+    hidden_size: int
+    num_experts: int
+    top_k: int
+    intermediate_size: int
+    activation_dtype: torch.dtype
+    allreduce_strategy: AllReduceStrategy
+    moe_impl_id: str
+
+
+# Measured profiles where a local MoE finalize followed by the regular fused
+# all-reduce + residual + RMSNorm is faster than MoEAllReduce below its
+# capacity. A value is the largest padded row count that keeps the fused path.
+# Any profile that is not listed keeps MoEAllReduce.max_token.
+_MOE_FINALIZE_MAX_TOKENS: Dict[MoEFinalizeProfile, int] = {
+    # GB200, TP4/EP4, NVFP4 experts with BF16 activations, one-shot all-reduce.
+    # The local path was within 2% at 24 and 32 rows and at least 2% faster
+    # from 48 rows; 33-47 rows were not measured.
+    MoEFinalizeProfile(
+        sm_version=100,
+        tp_size=4,
+        moe_ep_size=4,
+        hidden_size=4096,
+        num_experts=128,
+        top_k=8,
+        intermediate_size=1536,
+        activation_dtype=torch.bfloat16,
+        allreduce_strategy=AllReduceStrategy.ONESHOT,
+        moe_impl_id="flashinfer.trtllm_gen.fused_moe.nvfp4",
+    ):
+    47,
+}
+
+
+def _moe_impl_id(experts: nn.Module) -> Optional[str]:
+    """Return the resolved MoE implementation id, or None if it has none."""
+    # ConfigurableMoE exposes its resolved implementation as ``backend``; a
+    # registered implementation publishes its identity on ``descriptor``.
+    impl = getattr(experts, "backend", experts)
+    descriptor = getattr(type(impl), "descriptor", None)
+    return getattr(descriptor, "impl_id", None)
+
+
+def _resolve_tuned_allreduce_strategy(allreduce: AllReduce,
+                                      fusion_op: AllReduceFusionOp,
+                                      hidden_size: int, dtype: torch.dtype,
+                                      max_tokens: int) -> AllReduceStrategy:
+    """Return the strategy the autotuner chose for all buckets up to max_tokens.
+
+    Returns ``allreduce.strategy`` unchanged unless it is AUTO and every tuned
+    bucket up to ``max_tokens`` picked the same strategy. Only reads the tactic
+    cache; the all-reduce policy itself is not changed.
+    """
+    strategy = allreduce.strategy
+    if strategy != AllReduceStrategy.AUTO:
+        return strategy
+    if (os.environ.get("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
+            or allreduce._disable_mpi or allreduce.mnnvl_allreduce is not None):
+        return strategy
+    from ..autotuner import AutoTuner
+    from ..custom_ops.torch_custom_ops import AllReduceRunner
+
+    tuner = AutoTuner.get()
+    # Must match the key that AllReduce.forward tunes with
+    # (trtllm::tunable_allreduce) for an input outside an NCCL window buffer;
+    # a mismatch is a cache miss, which keeps AUTO.
+    runner = AllReduceRunner(allreduce.mapping.tp_size,
+                             allreduce.mapping.tp_group, dtype, int(fusion_op),
+                             0.0, True)
+    tactics = set()
+    buckets = runner.tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets
+    for tokens in buckets:
+        if tokens > max_tokens:
+            break
+        shape = torch.Size((tokens, hidden_size))
+        shapes = (shape, shape, torch.Size((hidden_size, )), torch.Size(
+            (0, )), torch.Size((0, )), allreduce.workspace.size())
+        hit, _, tactic, _ = tuner.profiling_cache.search_cache(
+            "trtllm::tunable_allreduce::allreduce", [runner], shapes,
+            runner.tuning_config)
+        if not hit:
+            return strategy
+        tactics.add(tactic)
+    return AllReduceStrategy(tactics.pop()) if len(tactics) == 1 else strategy
+
+
+@dataclass(frozen=True)
+class _MoEFinalizeSelection:
+    # A plain holder, so nn.Module does not register these as submodules.
+    experts: nn.Module
+    allreduce: AllReduce
+
+
 class MoEAllReduce(nn.Module):
 
     def __init__(self, mapping: Mapping):
@@ -1459,6 +1566,79 @@ class MoEAllReduce(nn.Module):
         self.workspace = get_allreduce_workspace(self.mapping)
         # Pls keep this value in sync with the kOneShotMaxToken in moeAllReduceFusionKernels.h
         self.max_token = 128
+        # Largest row count for which a caller should skip the local MoE
+        # finalize and use this module. It equals max_token unless
+        # select_finalize_max_tokens() finds a measured profile.
+        self.finalize_max_tokens = self.max_token
+        self._finalize_selection: Optional[_MoEFinalizeSelection] = None
+
+    def select_finalize_max_tokens(self, experts: nn.Module,
+                                   allreduce: Optional[AllReduce]) -> int:
+        """Set finalize_max_tokens from the measured profile table.
+
+        Args:
+            experts: The fused MoE whose output this module finalizes.
+            allreduce: The all-reduce with residual + RMSNorm fusion that the
+                caller uses when it finalizes locally.
+
+        Returns:
+            The new finalize_max_tokens. It is max_token for every profile
+            that is not in the table.
+
+        With the AUTO strategy the table is looked up again by
+        resolve_post_autotune(), once the all-reduce tactics are tuned.
+        """
+        self._finalize_selection = (None if allreduce is None else
+                                    _MoEFinalizeSelection(experts, allreduce))
+        strategy = None if allreduce is None else allreduce.strategy
+        self.finalize_max_tokens = self._lookup_finalize_max_tokens(strategy)
+        return self.finalize_max_tokens
+
+    def resolve_post_autotune(self) -> None:
+        """Look up the profile again with the tuned AUTO all-reduce strategy.
+
+        Implements ``PostAutotuneHook``. If the tuned tactics are missing or
+        mixed, finalize_max_tokens stays max_token.
+        """
+        selection = self._finalize_selection
+        if (selection is None
+                or selection.allreduce.strategy != AllReduceStrategy.AUTO):
+            return
+        # Paths A (this module) and B (local finalize + all-reduce) are
+        # different collectives, so every TP rank must pick the same cutoff.
+        # The row count and the profile are the same on all TP ranks, and the
+        # all-reduce tactics come from the autotuner cache, which is merged
+        # across ranks (DistributedTuningStrategy.MERGE), so all ranks resolve
+        # the same strategy.
+        strategy = _resolve_tuned_allreduce_strategy(
+            selection.allreduce, AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            selection.experts.hidden_size, selection.experts.dtype,
+            self.max_token)
+        self.finalize_max_tokens = self._lookup_finalize_max_tokens(strategy)
+
+    def _lookup_finalize_max_tokens(
+            self, strategy: Optional[AllReduceStrategy]) -> int:
+        selection = self._finalize_selection
+        if selection is None or self.mapping.is_multi_node():
+            return self.max_token
+        impl_id = _moe_impl_id(selection.experts)
+        if impl_id is None:
+            return self.max_token
+        experts = selection.experts
+        profile = MoEFinalizeProfile(
+            sm_version=get_sm_version(),
+            tp_size=self.mapping.tp_size,
+            moe_ep_size=self.mapping.moe_ep_size,
+            hidden_size=experts.hidden_size,
+            num_experts=experts.num_experts,
+            top_k=experts.routing_method.experts_per_token,
+            intermediate_size=experts.intermediate_size,
+            activation_dtype=experts.dtype,
+            allreduce_strategy=strategy,
+            moe_impl_id=impl_id,
+        )
+        return min(self.max_token,
+                   _MOE_FINALIZE_MAX_TOKENS.get(profile, self.max_token))
 
     def forward(
         self,

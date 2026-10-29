@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, PostAutotuneHook, autotune
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
@@ -1202,6 +1202,10 @@ class DecoderWarmup:
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
         )
         AutoTuner.get().print_profiling_cache()
+
+        for module in self.model.modules():
+            if isinstance(module, PostAutotuneHook):
+                module.resolve_post_autotune()
 
         self._release_megamoe_profiling_scratch()
 

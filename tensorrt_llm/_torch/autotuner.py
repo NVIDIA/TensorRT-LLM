@@ -26,7 +26,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (Any, Callable, Dict, List, Optional, Protocol, Set, Tuple,
+                    Union, runtime_checkable)
 
 import torch
 from cuda.bindings import driver
@@ -275,6 +276,21 @@ class TunableRunner(ABC):
             Any: The unique id of the runner, which can be converted to a string for the cache key.
         """
         return tuple(self.__dict__.values())
+
+
+@runtime_checkable
+class PostAutotuneHook(Protocol):
+    """A model module that reads tuned tactics once autotuning is done.
+
+    The decoder warmup calls ``resolve_post_autotune()`` on every model module
+    that implements it, after the autotuner warmup and before CUDA graph
+    capture. It is not called when that warmup does not run, so a module must
+    keep a safe choice until it is called. The hook runs on every rank, must
+    not launch work on the GPU, and must make the same choice on every rank.
+    """
+
+    def resolve_post_autotune(self) -> None:
+        ...
 
 
 @contextlib.contextmanager
