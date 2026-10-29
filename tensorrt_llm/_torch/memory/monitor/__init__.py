@@ -84,6 +84,9 @@ class MonitorCapture:
     suggestion: str = ""
     #: Whether to list memory taken by each startup step.
     startup_steps: bool = False
+    #: Untagged PyTorch memory by allocating code; empty unless stack
+    #: recording (``TLLM_MEM_MONITOR_STACKS=1``) is on.
+    unattributed_sites: "dict | None" = None
 
 
 def current_rank() -> int | None:
@@ -337,13 +340,14 @@ def capture(
 
     torch_reading = _read_torch(device_index)
     checks: tuple = ()
+    sites: dict = {}
     if entries is None:
         from .providers import collect_all
-        from .tagging import get_frozen_map, live_bytes_by_tag
+        from .tagging import get_frozen_map, live_attribution
 
-        # One tag reading feeds both the entries and check B; reading twice
-        # would let the allocator move between them.
-        by_tag = live_bytes_by_tag(get_frozen_map())
+        # One tag reading feeds the entries, check B and the stack breakdown;
+        # reading twice would let the allocator move between them.
+        by_tag, sites = live_attribution(get_frozen_map())
         entries = collect_all() + _tag_entries(by_tag)
         checks = _run_checks(by_tag, torch_reading.live)
 
@@ -368,6 +372,7 @@ def capture(
         baseline=baseline,
         suggestion=suggestion,
         startup_steps=startup_steps,
+        unattributed_sites=sites or None,
     )
 
 
@@ -393,6 +398,7 @@ def render_capture(snapshot: MonitorCapture) -> str:
         advice=_advice(),
         suggestion=snapshot.suggestion,
         startup_steps=snapshot.startup_steps,
+        unattributed_sites=snapshot.unattributed_sites,
     )
 
 

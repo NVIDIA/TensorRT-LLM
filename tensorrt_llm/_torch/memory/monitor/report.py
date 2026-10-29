@@ -80,6 +80,7 @@ def render(
     advice: "dict | None" = None,
     suggestion: str = "",
     startup_steps: bool = False,
+    unattributed_sites: "dict | None" = None,
 ) -> str:
     """Render a human-readable report: a summary first, allocator detail after."""
     from .summary import group_totals, render_summary
@@ -113,6 +114,7 @@ def render(
             advice=advice,
             suggestion=suggestion,
             startup_steps=startup_steps,
+            unattributed_sites=unattributed_sites,
         )
     )
 

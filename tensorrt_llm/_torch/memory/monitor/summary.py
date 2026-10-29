@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .frame import Frame
-from .schema import Category
+from .schema import Category, Source
 
 __all__ = ["GROUP_OF", "Group", "GroupTotals", "group_totals", "render_summary"]
 
@@ -125,6 +125,10 @@ def group_totals(frame: Frame) -> GroupTotals:
             unmeasured.append(entry.owner or str(entry.category))
             continue
         sizes[group] = (sizes.get(group) or 0) + entry.size_bytes
+        if entry.source in (Source.DERIVED, Source.RESIDUAL):
+            # These rows are subtractions with no owners of their own; their
+            # members come only from an explicit breakdown.
+            continue
         name = entry.owner or str(entry.category)
         by_owner = members.setdefault(group, {})
         by_owner[name] = by_owner.get(name, 0) + entry.size_bytes
@@ -188,6 +192,7 @@ def render_summary(
     advice: dict[Group, str] | None = None,
     suggestion: str = "",
     startup_steps: bool = False,
+    unattributed_sites: dict[str, int] | None = None,
 ) -> list[str]:
     """Lines for the summary section, largest group first.
 
@@ -195,6 +200,22 @@ def render_summary(
     group, for when the cause is already known (a startup step that failed).
     """
     from . import startup
+
+    if unattributed_sites:
+        # Parts sum to the row: whatever no recorded stack covers -- blocks
+        # allocated before recording began -- is listed as such.
+        row = totals.sizes.get(Group.TORCH_UNATTRIBUTED) or 0
+        parts = dict(unattributed_sites)
+        parts["no stack recorded"] = row - sum(parts.values())
+        members = dict(totals.members or {})
+        members[Group.TORCH_UNATTRIBUTED] = sorted(parts.items(), key=lambda kv: -abs(kv[1]))
+        totals = GroupTotals(
+            sizes=totals.sizes,
+            unmeasured=totals.unmeasured,
+            process_total=totals.process_total,
+            process_total_is_upper_bound=totals.process_total_is_upper_bound,
+            members=members,
+        )
 
     out: list[str] = []
     device = frame.device
@@ -244,7 +265,9 @@ def render_summary(
             note = "NEGATIVE: readings disagree; see details"
         out.append(f"{line}   {note}")
         parts = [(n, b) for n, b in (totals.members or {}).get(group, []) if abs(b) >= _SHOWN]
-        if len(parts) > 1:
+        # A single owner usually just restates the row, but for the two
+        # residual rows the name of the only part is the information.
+        if len(parts) > 1 or (parts and group in (Group.TORCH_UNATTRIBUTED, Group.OVERHEAD)):
             listed = ", ".join(f"{n} {b / _GIB:.2f}" for n, b in parts[:5])
             more = f", +{len(parts) - 5} more" if len(parts) > 5 else ""
             out.append(f"  {'':<28s}  of which (GiB): {listed}{more}")
