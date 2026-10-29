@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -201,7 +202,7 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
 
     order = Mock()
 
-    def decoder_init(self, *args, **kwargs) -> None:
+    def decoder_init(self: EncoderDecoderRunner, *args: object, **kwargs: object) -> None:
         order.decoder(self._encoder_graph_shapes, *args, **kwargs)
 
     with (
