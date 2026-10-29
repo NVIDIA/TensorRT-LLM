@@ -1049,19 +1049,28 @@ class TPGroupExchange:
 
         self._pdl = get_env_enable_pdl()
 
+    @staticmethod
+    def is_supported(mapping, group_size: int) -> bool:
+        """Whether ``create`` can build the exchange for these groups (it still returns None without peer memory):
+        TP groups of 2, 4 or 8 consecutive ranks, no attention DP, PP or CP, MPI (not Ray)."""
+        from tensorrt_llm._utils import mpi_disabled
+
+        return (
+            mapping.tp_size % group_size == 0
+            and group_size in (2, 4, 8)
+            and not mapping.enable_attention_dp
+            and not mapping.has_pp()
+            and mapping.cp_size == 1
+            and not mpi_disabled()
+        )
+
     @classmethod
     def create(
         cls, mapping, group_size: int, max_bytes: int, max_merge_rows: int, num_channels: int = 4
     ) -> Optional["TPGroupExchange"]:
         """Collective over the whole TP group. ``max_bytes``: largest per-(source, destination) payload;
         ``max_merge_rows``: largest ``rows x P`` of one alltoall_merge (its LSE words share that payload)."""
-        if (
-            mapping.tp_size % group_size
-            or group_size not in (2, 4, 8)
-            or mapping.enable_attention_dp
-            or mapping.has_pp()
-            or mapping.cp_size > 1
-        ):
+        if not cls.is_supported(mapping, group_size):
             return None
         max_words = max_bytes // 4
         buffers = _PeerBuffers.create(mapping, num_channels * 2 * group_size * max_words * 8)

@@ -652,6 +652,13 @@ class Attention(nn.Module):
                            (cp_size == 1 and dp_size == 1
                             and tp_size > total_kv_heads
                             and tp_size % total_kv_heads == 0) else 1)
+            if kv_replicas > 1:
+                from ..distributed.ll_exchange import TPGroupExchange
+
+                # The split needs the TP group exchange (e.g. not with PP or
+                # Ray); without it the rank decodes its whole KV head.
+                if not TPGroupExchange.is_supported(self.mapping, kv_replicas):
+                    kv_replicas = 1
             gqa_decode = GqaDecodeSetup(
                 kv_replicas=kv_replicas,
                 mapping=self.mapping,
