@@ -343,12 +343,6 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
     return out
 
 
-def group_kinds(layout: PageLayout) -> dict[tuple[int, int], str]:
-    """(pool group, global layer) -> the kind of the layer group the layer's buffers there belong
-    to ("attention" or "state")."""
-    return {(g.pool_group, layer): g.kind for g in layout.layer_groups for layer in g.layers}
-
-
 def layer_group_of(layout: PageLayout) -> dict[tuple[int, int], int]:
     """(pool group, global layer) -> index of the layer group holding that layer's buffers there.
 
@@ -370,39 +364,82 @@ def _transferred(layout: PageLayout) -> dict[tuple[int, str], BufferDesc]:
     return {(b.layer, b.role): b for b in layout.buffers if b.transferred}
 
 
+def _reads_within(read: int | None, kept: int | None) -> bool:
+    """Whether a window of ``read`` tokens lies within one of ``kept`` tokens; None is unbounded."""
+    return kept is None or (read is not None and read <= kept)
+
+
 def check_compatible(a: PageLayout, b: PageLayout) -> None:
     """Check that two ranks' pages correspond, whichever sends.
 
     On the layers both hold, every buffer either rank transfers the other transfers too, as the
-    same tensors: the same names, axes and extents over all ranks, however each splits them. Pages
-    pair one to one, so where both transfer attention buffers their pages hold as many tokens.
+    same tensors: the same names, axes and extents over all ranks, however each splits them, and
+    elements of the same type where the tensors state one, in pages of as many sub-pages. The KV
+    data is of one element type and quantization. Pages pair one to one, so where both transfer
+    attention buffers their pages hold as many tokens; a layer group keeps what the other's reads
+    (its read window within the other's kept window), with as many sink blocks, and is of the same
+    kind.
 
     Raises:
         ValueError: Naming every difference found.
     """
     problems = []
+    if a.dtype != b.dtype:
+        problems.append(f"KV elements of type {a.dtype} against {b.dtype}")
+    if a.quant_mode != b.quant_mode:
+        problems.append(f"KV quantization {a.quant_mode} against {b.quant_mode}")
     layers = {x.layer for x in a.buffers} & {x.layer for x in b.buffers}
     ta, tb = _transferred(a), _transferred(b)
+    group_a, group_b = layer_group_of(a), layer_group_of(b)
+    paged = False
+    groups_compared = set()
     for key in sorted(k for k in set(ta) | set(tb) if k[0] in layers):
         x, y = ta.get(key), tb.get(key)
         if x is None or y is None:
             problems.append(f"buffer {key} is transferred by one rank only")
             continue
+        if x.expansion != y.expansion:
+            problems.append(f"buffer {key}: {x.expansion} sub-pages against {y.expansion}")
         xs, ys = {t.name: t for t in x.tensors}, {t.name: t for t in y.tensors}
         if set(xs) != set(ys):
             problems.append(f"buffer {key}: tensors {sorted(xs)} against {sorted(ys)}")
-            continue
-        for name, tx in xs.items():
+        for name in sorted(set(xs) & set(ys)):
+            tx, ty = xs[name], ys[name]
             ex = {axis.name: axis.extent for axis in tx.axes}
-            ey = {axis.name: axis.extent for axis in ys[name].axes}
+            ey = {axis.name: axis.extent for axis in ty.axes}
             if ex != ey:
                 problems.append(f"buffer {key} tensor {name!r}: axes {ex} against {ey}")
-    kinds_a, kinds_b = group_kinds(a), group_kinds(b)
-    paged = any(
-        kinds_a.get((ta[k].pool_group, k[0])) == "attention"
-        and kinds_b.get((tb[k].pool_group, k[0])) == "attention"
-        for k in set(ta) & set(tb)
-    )
+            if tx.dtype != ty.dtype:
+                problems.append(
+                    f"buffer {key} tensor {name!r}: elements of type {tx.dtype} against {ty.dtype}"
+                )
+        index_a, index_b = (
+            group_a.get((x.pool_group, x.layer)),
+            group_b.get((y.pool_group, y.layer)),
+        )
+        if index_a is None or index_b is None:
+            problems.append(f"buffer {key} lies in no layer group of one rank")
+            continue
+        ga, gb = a.layer_groups[index_a], b.layer_groups[index_b]
+        paged |= ga.kind == "attention" and gb.kind == "attention"
+        if (ga, gb) in groups_compared:
+            continue
+        groups_compared.add((ga, gb))
+        where = f"layer {key[0]}"
+        if ga.kind != gb.kind:
+            problems.append(f"{where}: a layer group of {ga.kind} against one of {gb.kind}")
+        elif not (
+            _reads_within(ga.read_window, gb.kept_window)
+            and _reads_within(gb.read_window, ga.kept_window)
+        ):
+            problems.append(
+                f"{where}: reads {ga.read_window} of {ga.kept_window} kept tokens against "
+                f"{gb.read_window} of {gb.kept_window}"
+            )
+        if ga.num_sink_blocks != gb.num_sink_blocks:
+            problems.append(
+                f"{where}: {ga.num_sink_blocks} sink blocks against {gb.num_sink_blocks}"
+            )
     if paged and a.tokens_per_page != b.tokens_per_page:
         problems.append(f"pages of {a.tokens_per_page} tokens against {b.tokens_per_page}")
     if problems:

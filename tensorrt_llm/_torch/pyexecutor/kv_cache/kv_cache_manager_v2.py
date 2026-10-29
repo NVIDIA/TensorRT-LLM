@@ -3737,11 +3737,12 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         head_bytes: Optional[int] = None,
         token_major_: bool = False,
+        dtype: Optional[str] = None,
     ) -> tuple[Tensor, ...]:
         """A buffer split by head over the ranks attention splits over (tensor ranks) or recurrent
         state does (``_page_state_split``): ``size // head_bytes`` heads, by default the layer's KV
-        heads on this rank, head-major or, with ``token_major_``, token-major. A buffer whose heads
-        are unknown is this rank's own share."""
+        heads on this rank, head-major or, with ``token_major_``, token-major, of elements of type
+        ``dtype``. A buffer whose heads are unknown is this rank's own share."""
         split = self._page_state_split() if state else ("tp",)
         ranks, _ = grid_place(rank_topology(self.mapping), split)
         heads, total = self._page_kv_heads(layer_id)
@@ -3752,8 +3753,8 @@ class KVCacheManagerV2(BaseResourceManager):
         heads = size // head_bytes
         total = total if total and not state else heads * ranks
         if token_major_:
-            return token_major(size, tokens, heads, total, split)
-        return head_major(size, heads, total, split)
+            return token_major(size, tokens, heads, total, split, dtype=dtype)
+        return head_major(size, heads, total, split, dtype=dtype)
 
     def _page_state_split(self) -> tuple[str, ...]:
         """The parallel dimensions recurrent state splits over, as its pools are sized

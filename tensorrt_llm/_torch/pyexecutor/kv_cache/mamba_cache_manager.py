@@ -110,6 +110,11 @@ def _is_disagg_context_server(is_disagg: bool) -> bool:
     return is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
 
 
+def _dtype_name(dtype: torch.dtype) -> str:
+    """A torch element type by name, such as ``"bfloat16"``, as a page layout states it."""
+    return str(dtype).removeprefix("torch.")
+
+
 def _kda_replay_layout(
         num_spec: int,
         num_heads: int,
@@ -3579,9 +3584,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Convolution state is sectioned: its flat per-layer buffer is a
         concatenation of sections (Mamba2 ``[x | B | C]``, GDN ``[Q | K | V]``)
         each split by byte over the ranks recurrent state splits over. SSM
-        state is split by head. PLE state is computed from replicated inputs,
-        so every rank holds identical bytes; so do the generation-local KDA
-        replay buffers.
+        state is split by head. Both name their element types, which their
+        dtypes configure apart from the KV cache's. PLE state is computed from
+        replicated inputs, so every rank holds identical bytes; so do the
+        generation-local KDA replay buffers.
         """
         if role == MambaRole.CONV_STATE:
             d_conv_m1 = int(self.conv_state_shape[1])
@@ -3591,16 +3597,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return sectioned([
                 int(dim) * d_conv_m1 * conv_elem_size
                 for dim in self.conv_section_dims
-            ], ranks, split)
+            ],
+                             ranks,
+                             split,
+                             dtype=_dtype_name(self.conv_state_dtype))
         if role == MambaRole.SSM_STATE:
             _, head_dim, d_state = self.ssm_state_shape
-            return self._page_head_split(layer_id,
-                                         size,
-                                         tokens,
-                                         state,
-                                         head_bytes=int(head_dim) *
-                                         int(d_state) *
-                                         self.ssm_state_dtype.itemsize)
+            return self._page_head_split(
+                layer_id,
+                size,
+                tokens,
+                state,
+                head_bytes=int(head_dim) * int(d_state) *
+                self.ssm_state_dtype.itemsize,
+                dtype=_dtype_name(self.ssm_state_dtype))
         if role in (MambaRole.PLE_CONV_STATE, MambaRole.PLE_NGRAM_CONTEXT
                     ) or role in self._kda_replay_roles():
             return replicated(size)

@@ -233,6 +233,9 @@ class Tensor:
             in, not the order of their bytes, which their strides give.
         offset: Non-negative byte offset of the local piece within its buffer.
         name: Tells the tensors of one buffer apart; peers match tensors on it.
+        dtype: The type of the tensor's elements by name, such as ``"bfloat16"``, or None where
+            the layout states none; peers whose elements differ in type do not correspond
+            however their bytes line up.
 
     Raises:
         ValueError: If there is no axis, two axes share a name, a parallel dimension splits two
@@ -242,6 +245,7 @@ class Tensor:
     axes: tuple[Axis, ...]
     offset: int = 0
     name: str = ""
+    dtype: str | None = None
 
     def __post_init__(self) -> None:
         axes = tuple(self.axes)
@@ -256,6 +260,8 @@ class Tensor:
         object.__setattr__(self, "axes", axes)
         object.__setattr__(self, "offset", _integer(self.offset, "tensor offset"))
         object.__setattr__(self, "name", str(self.name))
+        if self.dtype is not None:
+            object.__setattr__(self, "dtype", str(self.dtype))
 
     @property
     def split(self) -> bool:
@@ -263,11 +269,13 @@ class Tensor:
         return any(a.split for a in self.axes)
 
     @classmethod
-    def unchecked(cls, axes: tuple[Axis, ...], offset: int = 0, name: str = "") -> Tensor:
+    def unchecked(
+        cls, axes: tuple[Axis, ...], offset: int = 0, name: str = "", dtype: str | None = None
+    ) -> Tensor:
         """The constructor's tensor of these values, without its checks and conversions; see
         ``PageLayout.unchecked``."""
         tensor = object.__new__(cls)
-        tensor.__dict__.update(axes=tuple(axes), offset=offset, name=name)
+        tensor.__dict__.update(axes=tuple(axes), offset=offset, name=name, dtype=dtype)
         return tensor
 
 
@@ -312,25 +320,37 @@ def owned(size: int, ranks: int, split: Sequence[str] = ("tp",)) -> tuple[Tensor
 
 
 def head_major(
-    size: int, heads: int, total_heads: int, split: Sequence[str] = ("tp",)
+    size: int,
+    heads: int,
+    total_heads: int,
+    split: Sequence[str] = ("tp",),
+    *,
+    dtype: str | None = None,
 ) -> tuple[Tensor, ...]:
     """A buffer of ``heads`` heads of ``size // heads`` bytes each ([head, ...], HND), of
-    ``total_heads`` split contiguously over ``split``."""
+    ``total_heads`` split contiguously over ``split``, of elements of type ``dtype``."""
     if heads <= 0 or size % heads:
         raise ValueError(f"{size} bytes is not a whole number of {heads} heads")
     head = size // heads
     return (
         Tensor(
             (Axis("head", total_heads, head, tuple(split), heads), Axis("byte", head, 1)),
+            dtype=dtype,
         ),
     )
 
 
 def token_major(
-    size: int, tokens: int, heads: int, total_heads: int, split: Sequence[str] = ("tp",)
+    size: int,
+    tokens: int,
+    heads: int,
+    total_heads: int,
+    split: Sequence[str] = ("tp",),
+    *,
+    dtype: str | None = None,
 ) -> tuple[Tensor, ...]:
     """A buffer of ``tokens`` tokens, each ``heads`` heads of equal bytes ([token, head, ...],
-    NHD), of ``total_heads`` split contiguously over ``split``."""
+    NHD), of ``total_heads`` split contiguously over ``split``, of elements of type ``dtype``."""
     if tokens <= 0 or heads <= 0 or size % (tokens * heads):
         raise ValueError(f"{size} bytes is not a whole number of {tokens} x {heads} token heads")
     head = size // (tokens * heads)
@@ -340,21 +360,31 @@ def token_major(
                 Axis("token", tokens, heads * head),
                 Axis("head", total_heads, head, tuple(split), heads),
                 Axis("byte", head, 1),
-            )
+            ),
+            dtype=dtype,
         ),
     )
 
 
 def sectioned(
-    section_bytes: Sequence[int], ranks: int, split: Sequence[str] = ("tp",)
+    section_bytes: Sequence[int],
+    ranks: int,
+    split: Sequence[str] = ("tp",),
+    *,
+    dtype: str | None = None,
 ) -> tuple[Tensor, ...]:
     """Consecutive sections of a buffer, each the local ``1 / ranks`` of its own tensor, split
     contiguously by byte over the ``ranks`` ranks of ``split`` (Mamba2 conv state ``[x | B | C]``,
-    GDN ``[Q | K | V]``)."""
+    GDN ``[Q | K | V]``), of elements of type ``dtype``."""
     out, offset = [], 0
     for i, n in enumerate(section_bytes):
         out.append(
-            Tensor((Axis("byte", n * ranks, 1, tuple(split), n),), offset=offset, name=f"s{i}")
+            Tensor(
+                (Axis("byte", n * ranks, 1, tuple(split), n),),
+                offset=offset,
+                name=f"s{i}",
+                dtype=dtype,
+            )
         )
         offset += n
     return tuple(out)
@@ -973,6 +1003,7 @@ def layout_to_dict(layout: PageLayout) -> dict:
                         "axes": [_axis_to_dict(a) for a in t.axes],
                         "offset": t.offset,
                         "name": t.name,
+                        "dtype": t.dtype,
                     }
                     for t in b.tensors
                 ],
@@ -1030,6 +1061,7 @@ def layout_from_dict(data: Mapping) -> PageLayout:
                         ),
                         t["offset"],
                         t["name"],
+                        t.get("dtype"),
                     )
                     for t in b["tensors"]
                 ),

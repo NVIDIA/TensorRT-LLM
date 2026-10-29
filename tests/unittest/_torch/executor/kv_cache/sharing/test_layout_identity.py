@@ -2392,7 +2392,7 @@ def test_the_layout_types_keep_their_module_fields_and_members():
     assert pinned_fields(BufferDesc) == (
         "layer role pool_group pool_index slot_offset size tensors=() transferred=True expansion=1"
     )
-    assert pinned_fields(Tensor) == "axes offset=0 name=''"
+    assert pinned_fields(Tensor) == "axes offset=0 name='' dtype=None"
     assert pinned_fields(Axis) == "name extent stride split=() held=None cyclic=False"
     assert pinned_fields(RankTopology) == (
         "tp_size=1 tp_rank=0 pp_size=1 pp_rank=0 cp_size=1 cp_rank=0 dp_size=1 dp_rank=0 "
@@ -2615,7 +2615,7 @@ def every_field_set():
             LayerGroupDesc("state", None, 0, 1, (1,)),
         ),
         buffers=(
-            BufferDesc(0, "key", 0, 0, 0, 64, token_major(64, 4, 2, 8)),
+            BufferDesc(0, "key", 0, 0, 0, 64, token_major(64, 4, 2, 8, dtype="float8_e4m3fn")),
             BufferDesc(2, "scale", 0, 1, 8, 8, transferred=False),
             BufferDesc(1, "conv", 1, 0, 0, 48, sectioned((16, 32), 2), expansion=2),
             BufferDesc(
