@@ -37,6 +37,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
+from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
@@ -3285,7 +3286,8 @@ def _mxfp8_dequant(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tenso
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _has_cuda(), reason="MXFP8 index projection needs CUDA")
+@skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank(
     use_cuda_graph: bool, monkeypatch: pytest.MonkeyPatch
@@ -3401,7 +3403,7 @@ def _nvfp4_activation(x: torch.Tensor, global_scale: float = 1.0) -> torch.Tenso
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _has_cuda(), reason="CUTLASS NVFP4 MoE needs CUDA")
+@skip_pre_blackwell
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize("tune", [False, True])
 def test_packaged_nvfp4_experts_load_and_run_on_cutlass(use_cuda_graph: bool, tune: bool) -> None:
