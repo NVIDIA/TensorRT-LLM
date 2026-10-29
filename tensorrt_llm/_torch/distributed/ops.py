@@ -28,6 +28,7 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (HelixCpMnnvlMemory,
                                                           MnnvlMemory)
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
+from tensorrt_llm._torch.memory.monitor.startup import region as monitor_region
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_pybind11_abi
 from tensorrt_llm.bindings import internal as _tllm_internal
@@ -160,11 +161,14 @@ def warmup_named_allreduce_topologies(model: nn.Module) -> None:
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     with _get_allreduce_workspace_lock(mapping):
         if mapping not in _allreduce_workspaces:
-            ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
-                mapping,
-                CustomAllReduceHelper.max_workspace_size_auto(
-                    mapping.tp_size, support_deterministic=False),
-            )
+            # The IPC buffers are allocated outside PyTorch, so the memory
+            # monitor names them by measuring.
+            with monitor_region("custom allreduce workspace"):
+                ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
+                    mapping,
+                    CustomAllReduceHelper.max_workspace_size_auto(
+                        mapping.tp_size, support_deterministic=False),
+                )
             _allreduce_workspaces[mapping] = (ipc_buffers, workspace)
         return _allreduce_workspaces[mapping][1]
 
@@ -172,11 +176,12 @@ def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
 def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     with _get_allreduce_workspace_lock(mapping):
         if mapping not in _lowprecision_allreduce_workspaces:
-            ipc_buffers, workspace = CustomAllReduceHelper.allocate_lowprecision_workspace(
-                mapping,
-                CustomAllReduceHelper.max_workspace_size_lowprecision(
-                    mapping.tp_size),
-            )
+            with monitor_region("low-precision allreduce workspace"):
+                ipc_buffers, workspace = CustomAllReduceHelper.allocate_lowprecision_workspace(
+                    mapping,
+                    CustomAllReduceHelper.max_workspace_size_lowprecision(
+                        mapping.tp_size),
+                )
             _lowprecision_allreduce_workspaces[mapping] = (ipc_buffers,
                                                            workspace)
             CustomAllReduceHelper.initialize_lowprecision_buffers(
