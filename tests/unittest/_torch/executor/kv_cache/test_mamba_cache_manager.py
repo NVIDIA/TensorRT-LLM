@@ -4724,7 +4724,7 @@ class _SlotCache:
 def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager, draft_records=False):
     """A V2 hybrid manager stub with CPU KDA replay buffers and one layer's V2 conv states ([Q | K | V] sections of 2
     channels, a committed window of 3), for the state-index setup that prepare_resources runs. Its replay slots are the
-    state slots. Committing pending drafts is recorded instead of run (it needs the GPU kernels)."""
+    state slots."""
     mgr = object.__new__(manager_cls)
     mgr.local_num_mamba_layers = 1
     mgr._kda_replay = KDAReplayState(2, draft_records=draft_records)
@@ -4755,8 +4755,6 @@ def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager, draft
     mgr._kda_replay._conv_states = tuple(mgr.all_conv_states)
     mgr._kda_replay._committed_window = 3
     mgr._kda_replay._conv_section_dims = (2, 2, 2)
-    mgr.committed_slots = []
-    mgr._kda_replay.commit_pending_drafts = mgr.committed_slots.append
     mgr._kda_replay.on_cache_stream = lambda stream: contextlib.nullcontext()
     return mgr
 
@@ -4783,8 +4781,8 @@ def _kda_replay_slot(mgr, slot):
     ],
 )
 def test_v2_kda_replay_suspend_leaves_the_replay_state_to_the_request(manager_cls, draft_records):
-    """A suspend neither commits the request's pending drafts nor forgets its slots, and the resume seeds nothing: the
-    replay state, pending drafts included, stays in the request's replay pages, which follow it."""
+    """A suspend does not forget the request's slots, and the resume seeds nothing: the replay state, pending drafts
+    included, stays in the request's replay pages, which follow it."""
     mgr = _v2_kda_replay_stub(manager_cls=manager_cls, draft_records=draft_records)
     request = SimpleNamespace(py_request_id=1, is_dummy=False)
     mgr.kv_cache_map[1] = _SlotCache(0)
@@ -4793,7 +4791,6 @@ def test_v2_kda_replay_suspend_leaves_the_replay_state_to_the_request(manager_cl
     mgr.all_conv_states[0][0] = torch.arange(18.0).view(6, 3)
 
     mgr.suspend_request(request)
-    assert not mgr.committed_slots
     assert mgr._request_id_to_state_index[1] == 0
     assert not mgr.kv_cache_map[1].is_active
     assert not mgr._kda_replay.seed_on_resume
@@ -4801,7 +4798,6 @@ def test_v2_kda_replay_suspend_leaves_the_replay_state_to_the_request(manager_cl
     mgr.kv_cache_map[1].is_active = True
     mgr._setup_state_indices([request], num_contexts=0)
     assert _kda_replay_slot(mgr, 0) == (2, [1.0] * len(mgr._kda_replay._layer_replay_buffers()))
-    assert not mgr.committed_slots
 
 
 @pytest.mark.parametrize("recorded_by", ["update_resources", "revert_allocate_generation"])
@@ -4812,7 +4808,7 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
     """With a host drafter, update_resources records the acceptance of a batch's verify in the request's replay
     state, which must happen before the request's pages can move. A suspend between the batch's prepare_resources and
     its update_resources raises. Once update_resources has recorded it, or the batch is reverted without running, the
-    request suspends, and nothing is committed."""
+    request suspends."""
     mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
     mgr.spec_config = SimpleNamespace(decoding_type="NGram")
     for method in ("prepare_resources", "update_resources", "revert_allocate_generation"):
@@ -4826,7 +4822,6 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
 
     with pytest.raises(RuntimeError, match="acceptance"):
         mgr.suspend_request(request)
-    assert not mgr.committed_slots
     assert mgr.kv_cache_map[1].is_active
 
     if recorded_by == "update_resources":
@@ -4835,7 +4830,6 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
     else:
         mgr.revert_allocate_generation(request)
     mgr.suspend_request(request)
-    assert not mgr.committed_slots
     assert not mgr.kv_cache_map[1].is_active
 
 
@@ -4846,7 +4840,7 @@ def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
 ):
     """A disaggregated generation request whose transferred state has not seeded its replay caches yet is seeded when
     it resumes, in the slot it resumes in; a transfer completion while it is suspended seeds nothing. A seeded request
-    keeps its replay state across the suspend, and the resume seeds nothing. Nothing is committed either way."""
+    keeps its replay state across the suspend, and the resume seeds nothing."""
     mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
     monkeypatch.setattr(KVCacheManagerV2, "prepare_resources", MagicMock())
     request = SimpleNamespace(py_request_id=1, is_dummy=False, is_disagg_generation_init_state=True)
@@ -4861,7 +4855,6 @@ def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
         _write_kda_replay_slot(mgr, 0, accepted=1, value=3.0)
 
     mgr.suspend_request(request)
-    assert not mgr.committed_slots
     assert (1 in mgr._request_id_to_state_index) == seeded
     assert mgr._kda_replay.seed_on_resume == (set() if seeded else {1})
     assert not mgr.kv_cache_map[1].is_active
@@ -4888,7 +4881,6 @@ def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
     assert not mgr._kda_replay.seed_on_resume
 
     mgr.suspend_request(request)
-    assert not mgr.committed_slots
 
 
 def _v2_kda_replay_manager_with_large_slots(manager_cls=KimiK3HybridCacheManager, **kwargs):
@@ -5148,15 +5140,12 @@ def test_v2_kda_replay_state_follows_a_suspended_request(monkeypatch, manager_cl
     """While a request is suspended, another cache takes its SSM slot and the runtime moves its SSM page to the host
     tier. Its KDA replay state, pending drafts included, lives in PRIVATE pages that follow it: after the resume its
     states, replay buffers and accepted-draft count are bit for bit those it was suspended with, and nothing was
-    committed or seeded on the way."""
+    seeded on the way."""
     mgr = _v2_kda_replay_manager_with_large_slots(manager_cls, **kwargs)
     others = []
     request = None
     try:
         assert mgr.replay_layer_group_id not in (None, mgr.ssm_layer_group_id)
-        monkeypatch.setattr(
-            mgr._kda_replay, "commit_pending_drafts", MagicMock(side_effect=AssertionError)
-        )
         monkeypatch.setattr(
             mgr._kda_replay, "seed_transferred_slots", MagicMock(side_effect=AssertionError)
         )
@@ -6869,76 +6858,6 @@ def test_v2_kda_draft_records_leave_the_quota_to_the_pools(enable_block_reuse):
     finally:
         runtime_manager.shutdown()
     assert 128 << 20 <= pool_bytes < (128 << 20) + (2 << 20)
-
-
-@skip_no_cuda
-def test_v2_kda_replay_commit_without_the_replay_caches():
-    """With the verify kernels' draft records (``kda_state_tok``) in place of the per-draft replay caches, the
-    suspend-time commit replays a slot's records onto its V2 SSM state and stores its conv window, bit for bit as the
-    records' replay and the conv store do on their own, and clears only that slot's draft count."""
-    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
-        replay_kda_token_records,
-        store_kda_replay_conv_window,
-    )
-
-    num_layers, num_slots, num_spec, num_heads, head_dim, width = 2, 4, 2, 6, 128, 4
-    section_dim = num_heads * head_dim
-    generator = torch.Generator(device="cuda").manual_seed(13)
-
-    def randn(*shape):
-        return 0.1 * torch.randn(*shape, generator=generator, device="cuda")
-
-    mgr = object.__new__(KimiK3HybridCacheManager)
-    mgr._kda_replay = KDAReplayState(num_spec, draft_records=True)
-    mgr._stream = torch.cuda.Stream()
-    mgr.all_ssm_states = [
-        randn(num_slots, num_heads, head_dim, head_dim) for _ in range(num_layers)
-    ]
-    mgr.all_conv_states = [randn(num_slots, 3 * section_dim, width - 1) for _ in range(num_layers)]
-    mgr._kda_replay.pool_layers = [
-        {
-            **{
-                name: randn(num_slots, width - 1 + num_spec, section_dim).transpose(-1, -2)
-                for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v")
-            },
-            "kda_state_tok": randn(num_slots, 3, num_spec, num_heads, head_dim),
-        }
-        for _ in range(num_layers)
-    ]
-    mgr._kda_replay.prev_num_accepted_tokens = torch.tensor(
-        [0, 2, 1, 0], dtype=torch.int32, device="cuda"
-    )
-    assert mgr.keeps_kda_draft_records
-
-    mgr._kda_replay._ssm_states = tuple(mgr.all_ssm_states)
-    mgr._kda_replay._conv_states = tuple(mgr.all_conv_states)
-    slot = 1
-    slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
-    num_accepted = mgr._kda_replay.prev_num_accepted_tokens[slots.long()].clone()
-    expected_ssm, expected_conv = [], []
-    for layer_offset, replay in enumerate(mgr._kda_replay.pool_layers):
-        ssm = mgr.all_ssm_states[layer_offset].clone()
-        conv = mgr.all_conv_states[layer_offset].clone()
-        replay_kda_token_records(ssm, replay["kda_state_tok"], slots, num_accepted)
-        store_kda_replay_conv_window(
-            conv,
-            replay["kda_conv_q"],
-            replay["kda_conv_k"],
-            replay["kda_conv_v"],
-            slots,
-            num_accepted,
-        )
-        expected_ssm.append(ssm)
-        expected_conv.append(conv)
-
-    mgr._kda_replay.commit_pending_drafts(slot)
-    torch.cuda.synchronize()
-
-    assert mgr._kda_replay.prev_num_accepted_tokens.tolist() == [0, 0, 1, 0]
-    for actual, expected in zip(mgr.all_ssm_states, expected_ssm):
-        assert torch.equal(actual, expected)
-    for actual, expected in zip(mgr.all_conv_states, expected_conv):
-        assert torch.equal(actual, expected)
 
 
 def _build_kda_replay_manager(**kwargs):

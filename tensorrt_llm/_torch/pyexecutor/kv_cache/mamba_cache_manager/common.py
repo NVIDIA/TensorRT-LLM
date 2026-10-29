@@ -133,8 +133,7 @@ class MambaState(Protocol):
     ) -> None: ...
 
     def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
-        """Reset context slots. States with PRIVATE replay buffers also take
-        ``replay_slots``, the requests' replay-history slots."""
+        """Reset the state of the context requests in recurrent-state ``slots``."""
 
     def update(self, batch: MambaAcceptanceBatch) -> None: ...
 
@@ -143,6 +142,35 @@ class MambaState(Protocol):
     def make_layer_cache(
         self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
     ) -> MambaLayerCache: ...
+
+
+class MambaReplayState(MambaState, Protocol):
+    """Recurrent state whose replay history lives in manager-declared buffers.
+
+    A manager whose ``_get_replay_layout()`` declares replay buffers uses a
+    state of this kind.
+    """
+
+    def bind_replay_pool(self, layers: list[dict[DataRole, torch.Tensor]]) -> None:
+        """Bind the per-local-layer replay views before ``bind()``.
+
+        Each view's first dimension is a replay slot.
+        """
+
+    def reset_replay_slots(self, replay_slots: torch.Tensor) -> None:
+        """Reset the replay history and bookkeeping of ``replay_slots``."""
+
+    def reset_slots(
+        self,
+        slots: torch.Tensor,
+        host_slots: list[int],
+        replay_slots: torch.Tensor | None = None,
+    ) -> None:
+        """Reset the context requests in recurrent-state ``slots``.
+
+        ``replay_slots`` are the requests' replay slots; ``None`` means
+        ``slots``. The manager passes them only for a PRIVATE replay group.
+        """
 
 
 class BaseMambaCacheManager(ABC):

@@ -139,7 +139,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         PROFILE_STAGES: cutlass.Constexpr[bool],
         SPLIT_V: cutlass.Constexpr[int],
         BF16_MMA: cutlass.Constexpr[bool],
-        REPLAY_ONLY: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(USE_ZERO_ACCEPTED):
@@ -373,7 +372,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             SPLIT_V,
             BF16_MMA,
             tiled_mma_f32a,
-            REPLAY_ONLY,
         )
         if cutlass.const_expr(SPLIT_V == 2):
             # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
@@ -699,7 +697,6 @@ def kda_mtp_decode_impl(
     onorm_eps: float = 1e-5,
     fuse_output_norm: bool = False,
     quantize_output: bool = False,
-    replay_only: bool = False,
     replay_state_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
@@ -741,12 +738,6 @@ def kda_mtp_decode_impl(
             epilogue using section-strided ``onorm_g`` and ``onorm_weight``.
         quantize_output: return the normalized activation directly as MXFP8
             E4M3 plus packed UE8M0 1x128 scales for a prequantized projection.
-        replay_only: run only the replay steps and commit the state after them
-            (see ``kda_mtp_commit_pending_drafts``); ``num_accepted_tokens``
-            is indexed by request, and the token inputs, conv weights, gate
-            constants, conv caches, ``cu_seqlens`` and ``out`` are not
-            accessed. Takes the shifted-metadata layout without hints, output
-            norm or quantization.
         replay_state_indices: per-request replay-pool slots ``[N]`` addressing
             the conv caches, the replay caches and, on the packed path, the
             accepted counts. ``None`` uses ``ssm_state_indices``: the replay
@@ -771,17 +762,6 @@ def kda_mtp_decode_impl(
 
     if packed_token_layout and regular_metadata_hint:
         raise ValueError("packed_token_layout and regular_metadata_hint are mutually exclusive.")
-    if replay_only and (
-        packed_token_layout
-        or zero_accepted_hint
-        or regular_metadata_hint
-        or fuse_output_norm
-        or quantize_output
-    ):
-        raise ValueError(
-            "replay_only takes neither the packed layout, the metadata hints, "
-            "the output norm nor quantization"
-        )
     if packed_token_layout:
         N = ssm_state_indices.shape[0]
     elif cu_seqlens is None:
@@ -951,7 +931,6 @@ def kda_mtp_decode_impl(
         bool(quantize_output),
         split_v,
         bf16_math,
-        bool(replay_only),
     )
 
     if key not in _compiled_cache:
@@ -960,8 +939,7 @@ def kda_mtp_decode_impl(
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
             f"fuse_output_norm={fuse_output_norm} "
-            f"quantize_output={quantize_output} split_v={split_v} bf16_math={bf16_math} "
-            f"replay_only={replay_only}"
+            f"quantize_output={quantize_output} split_v={split_v} bf16_math={bf16_math}"
         )
         _compiled_cache[key] = cute.compile(
             _run_kda_decode_mtp,
@@ -1016,7 +994,6 @@ def kda_mtp_decode_impl(
             PROFILE_STAGES=profile_stages,
             SPLIT_V=split_v,
             BF16_MMA=bf16_math,
-            REPLAY_ONLY=bool(replay_only),
             stream=stream,
         )
 
@@ -1063,107 +1040,6 @@ def kda_mtp_decode_impl(
     if quantize_output:
         return out, output_scale
     return out
-
-
-# (device_index, N, H, K, V, W) -> stand-ins for the inputs the replay-only
-# variant never reads. Keys are plain values, like _precompute_control_cache.
-_replay_only_inputs_cache = {}
-
-
-def _replay_only_inputs(device: torch.device, N: int, H: int, K: int, V: int, W: int) -> dict:
-    dev = torch.device(device)
-    key = (dev.index if dev.index is not None else torch.cuda.current_device(), N, H, K, V, W)
-    if key not in _replay_only_inputs_cache:
-
-        def unused(*shape, dtype=torch.bfloat16):
-            return torch.empty(shape, dtype=dtype, device=dev)
-
-        _replay_only_inputs_cache[key] = {
-            "x_q": unused(1, N, H, K),
-            "x_k": unused(1, N, H, K),
-            "x_v": unused(1, N, H, V),
-            "g": unused(1, N, H, K),
-            "beta": unused(1, N, H),
-            "w_q": unused(H * K, W, dtype=torch.float32),
-            "w_k": unused(H * K, W, dtype=torch.float32),
-            "w_v": unused(H * V, W, dtype=torch.float32),
-            "A_log": unused(H, dtype=torch.float32),
-            "dt_bias": unused(H * K, dtype=torch.float32),
-            "out": unused(1, N, H, V),
-            # One row per request keeps the shifted-metadata validation's [bos, eos) non-empty;
-            # the replay-only kernel itself does not read it.
-            "cu_seqlens": torch.arange(N + 1, dtype=torch.int32, device=dev),
-        }
-    return _replay_only_inputs_cache[key]
-
-
-def kda_mtp_commit_pending_drafts(
-    recurrent_state: torch.Tensor,
-    cs_q: torch.Tensor,
-    cs_k: torch.Tensor,
-    cs_v: torch.Tensor,
-    k_cache: torch.Tensor,
-    g_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    beta_cache: torch.Tensor,
-    ssm_state_indices: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    num_spec: int,
-    conv_width: int,
-    replay_state_indices: Optional[torch.Tensor] = None,
-) -> None:
-    """Commit the pending accepted drafts of the selected slots in place.
-
-    For request ``n`` this runs the first ``num_accepted_tokens[n]`` rows of a
-    ``kda_mtp_decode`` verify chunk of state slot ``ssm_state_indices[n]``:
-    the replay of the drafts cached in replay slot ``replay_state_indices[n]``
-    (``ssm_state_indices[n]`` when it is ``None``), with the same kernel code.
-    It then commits the recurrent state after them. The slot then holds the state the next verify
-    would reach just before its golden token, with nothing left pending; the
-    caller commits the conv window after the drafts and sets the slot's
-    accepted-draft count to 0. The tensors are those of ``kda_mtp_decode``
-    (``k_cache`` / ``v_cache`` / ``beta_cache`` bf16 or fp32, ``g_cache``
-    fp32); the conv and replay caches are only read.
-
-    The tensor-core verify computes each chunk in one WY-form pass, so the
-    verify that follows this commit (a chunk of the new tokens only) rounds
-    differently from one that replays the drafts itself: the two agree to the
-    kernel's accuracy, not bit for bit.
-    """
-    N = ssm_state_indices.shape[0]
-    if N == 0:
-        return
-    _, H, V, K = recurrent_state.shape
-    inputs = _replay_only_inputs(recurrent_state.device, N, H, K, V, conv_width)
-    kda_mtp_decode_impl(
-        x_q=inputs["x_q"],
-        x_k=inputs["x_k"],
-        x_v=inputs["x_v"],
-        w_q=inputs["w_q"],
-        w_k=inputs["w_k"],
-        w_v=inputs["w_v"],
-        cs_q=cs_q,
-        cs_k=cs_k,
-        cs_v=cs_v,
-        g=inputs["g"],
-        beta=inputs["beta"],
-        A_log=inputs["A_log"],
-        dt_bias=inputs["dt_bias"],
-        recurrent_state=recurrent_state,
-        k_cache=k_cache,
-        g_cache=g_cache,
-        v_cache=v_cache,
-        beta_cache=beta_cache,
-        ssm_state_indices=ssm_state_indices,
-        cu_seqlens=inputs["cu_seqlens"],
-        num_spec=num_spec,
-        num_accepted_tokens=num_accepted_tokens,
-        # Only the new-token steps use the gate bound and the q scale.
-        lower_bound=0.0,
-        out=inputs["out"],
-        replay_only=True,
-        replay_state_indices=replay_state_indices,
-    )
 
 
 if IS_CUTLASS_DSL_AVAILABLE:

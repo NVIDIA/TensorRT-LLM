@@ -411,7 +411,6 @@ class KDAReplayState:
         self.seed_on_resume: set[int] = set()
         self.acceptance_pending: set[int] = set()
         self.unseeded_requests: set[int] = set()
-        self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
         self._committed_window = 0
         self.prev_num_accepted_tokens: torch.Tensor | None = None
@@ -592,7 +591,6 @@ class KDAReplayState:
             + context.mapping.rank * 1_009
         )
         self._conv_section_dims = context.conv_section_dims
-        self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
         self._committed_window = context.conv_state_shape[1] if conv_states else 0
         states = ssm_states
@@ -852,41 +850,6 @@ class KDAReplayState:
             yield
         current.wait_stream(stream)
 
-    def commit_pending_drafts(self, slot: int, replay_slot: int | None = None) -> None:
-        """Fold accepted drafts and the replay conv window into the persistent states.
-
-        Args:
-            slot: Recurrent-state slot whose SSM and conv states take the drafts.
-            replay_slot: Replay slot holding the drafts and their count; ``slot``
-                when ``None``.
-        """
-        from ._kda_kernels import commit_kda_pending_drafts
-
-        assert self.prev_num_accepted_tokens is not None
-        device = self.prev_num_accepted_tokens.device
-        slots = torch.full((1,), slot, dtype=torch.int32, device=device)
-        replay_slot = slot if replay_slot is None else replay_slot
-        replay_slots = torch.full((1,), replay_slot, dtype=torch.int32, device=device)
-        num_accepted = self.prev_num_accepted_tokens.index_select(0, replay_slots)
-        for layer, (ssm_states, conv_states) in enumerate(zip(self._ssm_states, self._conv_states)):
-            replay = self._layer_cache_fields(layer)
-            commit_kda_pending_drafts(
-                ssm_states,
-                conv_states,
-                replay["kda_conv_q"],
-                replay["kda_conv_k"],
-                replay["kda_conv_v"],
-                replay.get("kda_k_cache"),
-                replay.get("kda_g_cache"),
-                replay.get("kda_v_cache"),
-                replay.get("kda_beta_cache"),
-                slots,
-                num_accepted,
-                state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
-                replay_indices=replay_slots,
-            )
-        self.prev_num_accepted_tokens[replay_slot] = 0
-
     def _layer_replay_buffers(self) -> tuple[torch.Tensor, ...]:
         buffers = (
             self.kda_conv_q,
@@ -905,7 +868,6 @@ class KDAReplayState:
     def shutdown(self) -> None:
         self.pool_layers = None
         self._pool_views = None
-        self._ssm_states = ()
         self._conv_states = ()
         self.seed_on_resume.clear()
         self.acceptance_pending.clear()

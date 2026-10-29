@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import math
-import os
 import sys
 from dataclasses import replace
 from types import MappingProxyType
@@ -49,6 +48,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
     _compute_index_mapper_capacity,
+    _read_guard_page_setting,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -414,7 +414,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 is_disagg=kwargs.get("is_disagg", False),
                 disable_overlap_scheduler=kwargs.get("disable_overlap_scheduler", False),
                 num_reserved_index_slots=num_reserved_dummy_slots,
-                has_guard_page=bool(os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip()),
+                has_guard_page=_read_guard_page_setting()[1] is not None,
             )
             intercept += max_live_kv_caches * private_replay_bytes
         return slope, intercept
@@ -480,10 +480,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
         """Declare one local recurrent layer's per-request replay buffers.
 
-        The manager adds them to the layer with the policy from
-        ``_replay_reuse_policy()``, binds their views through the model state's
-        ``bind_replay_pool()``, excludes them from disaggregated transfer and
-        resets a request's replay slot the first time the request gets one.
+        The model state must then be a ``MambaReplayState``. The manager adds
+        the buffers to the layer with the policy from ``_replay_reuse_policy()``,
+        binds their views through the state's ``bind_replay_pool()``, excludes
+        them from disaggregated transfer and resets a request's replay slot the
+        first time the request gets one.
         """
         return {}
 
@@ -731,8 +732,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @override
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
-        cache_tiers = config.cache_tiers
-        gpu_quota = cache_tiers[0].quota
+        gpu_quota = config.cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
         if minimum_live_quota > gpu_quota:
             raise ValueError(
@@ -807,7 +807,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             ]
         return replace(
             config,
-            cache_tiers=cache_tiers,
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,

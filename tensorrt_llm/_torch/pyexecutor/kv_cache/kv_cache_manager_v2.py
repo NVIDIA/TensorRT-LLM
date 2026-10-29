@@ -18,6 +18,7 @@ import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
+from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -253,6 +254,15 @@ def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
     except ValueError:
         logger.warning(f"{name}={setting!r} is not 1, zero, nan or a number; ignoring")
         return None
+
+
+def _read_guard_page_setting() -> tuple[str, Optional[float]]:
+    """Return the normalized ``TRTLLM_KV_GUARD_PAGE`` setting and its fill value.
+
+    The fill value is ``None`` when no guard page is requested.
+    """
+    setting = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
+    return setting, _parse_kv_fill_value(setting, "TRTLLM_KV_GUARD_PAGE")
 
 
 def _fill_kv_pages(buffer: torch.Tensor, pages: Sequence[int], value: float) -> bool:
@@ -1894,8 +1904,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Both diagnostics below are off unless their environment variable is
         # set; with neither set nothing here changes any allocation, any page
         # content or any reported count.
-        self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
-        self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
+        self._guard_page_fill, self._guard_page_value = _read_guard_page_setting()
         self.max_admissible_sequences, self._index_mapper_capacity = _compute_index_mapper_capacity(
             max_batch_size,
             mapping,
@@ -2465,11 +2474,9 @@ class KVCacheManagerV2(BaseResourceManager):
                             (pool_id, buffer_id.role), buffer_id.layer_id
                         )
         groups_by_layer: dict[int, set[int]] = defaultdict(set)
-        self.buffer_to_pool_mapping_dict: dict[tuple[int, DataRole], int] = {}
         for group_id, buffers in enumerate(self.impl.buffer_grouping):
             for buffer in buffers:
                 groups_by_layer[int(buffer.layer_id)].add(group_id)
-                self.buffer_to_pool_mapping_dict[(int(buffer.layer_id), buffer.role)] = group_id
         self.layer_to_pool_mapping_dict = {
             layer_id: next(iter(groups))
             for layer_id, groups in groups_by_layer.items()
@@ -2601,20 +2608,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
         self._use_per_layer_page_tables = False
-        if self.enable_swa_scratch_reuse:
-            for layer in config.layers:
-                if not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is None:
-                    continue
-                for buffer in layer.buffers:
-                    if buffer.is_sparse:
-                        continue
-                    converter = self.impl.get_page_index_converter(layer.layer_id, buffer.role)
-                    if converter.scale % converter.scratch_pages_per_block:
-                        raise ValueError(
-                            "The attention scratch-table kernels require whole layer blocks per slot; "
-                            f"layer {layer.layer_id}, role {buffer.role} has an unequal coalesced share. "
-                            "Use separate coalescing groups or disable SWA scratch reuse."
-                        )
         self._prepare_page_table_tensor(index_mapper_capacity)
         self._sparse_layer_group_ids = tuple(
             sorted(
@@ -2934,10 +2927,11 @@ class KVCacheManagerV2(BaseResourceManager):
             return self.layer_specs[local_layer_id].kv_factor
         return self.kv_factor
 
-    @property
+    @cached_property
     def _layer_ids_by_group(self) -> list[list[int]]:
         # A split layer can occur in several groups. This is membership metadata,
-        # not the partition promised by the deprecated layer_grouping API.
+        # not the partition promised by the deprecated layer_grouping API. The
+        # grouping is fixed once `impl` is constructed, so it is built once.
         return [
             list(dict.fromkeys(int(buffer.layer_id) for buffer in buffers))
             for buffers in self.impl.buffer_grouping
