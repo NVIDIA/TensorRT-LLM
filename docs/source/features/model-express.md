@@ -94,10 +94,10 @@ value. Until the model code stops recording it, run both sides with the same
 The Qwen3.5 dense vision-language identity covers Hugging Face-format
 checkpoints that resolve to the exact `Qwen3_5ForConditionalGeneration` /
 `qwen3_5` pair, served with the vision encoder in the same instance.
-Qwen3.5-9B is the qualified canary; Qwen3.5-27B, Qwen3.6-27B, and Qwen3.8-27B
-resolve to the same root, identity, and constraints. Checkpoints with tied
-embeddings, such as Qwen3.5-0.8B, 2B, and 4B, quantized checkpoints such as the
-FP8 and NVFP4 variants, the Qwen3.5 MoE vision-language root, the text-only
+Qwen3.5-9B is the qualified canary and the only checkpoint that the
+donor/receiver rows cover. Checkpoints with tied embeddings, such as
+Qwen3.5-0.8B, 2B, and 4B, quantized checkpoints such as the FP8 and NVFP4
+variants, the Qwen3.5 MoE vision-language root, the text-only
 `Qwen3_5ForCausalLM` root, and the Qwen3-VL roots do not match this profile.
 The root sizes its M-RoPE buffers by `max_num_tokens` (and the PP size), and
 `SourceIdentity` hashes every realized buffer shape, so a donor and a receiver
