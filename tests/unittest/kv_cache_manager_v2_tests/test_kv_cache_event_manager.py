@@ -482,8 +482,10 @@ def test_streaming_reset_failure_flushes_pending_events(failure_stage):
 
 @pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("populated", [False, True])
-def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
+@pytest.mark.parametrize("operation", ["reset", "release"])
+def test_streaming_cache_clear_is_published_while_idle_and_replayed(populated, operation):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.virtual_memory import RestoreMode
 
     init_cuda_once()
     endpoint = f"inproc://kv-reset-{uuid.uuid4().hex}"
@@ -506,6 +508,8 @@ def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
     wrapper.event_manager = events
     wrapper.conversation_manager = None
     wrapper._sharing = None
+    if operation == "release":
+        wrapper = _make_sleep_event_wrapper(manager, events)
     stream_holder = CachedCudaStream()
     stream = cast(CudaStream, stream_holder.handle)
     replay = zmq.Context.instance().socket(zmq.DEALER)
@@ -530,14 +534,24 @@ def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
                 batches.append((int.from_bytes(seq, "big"), msgspec.msgpack.decode(payload)))
             if len(batches) >= expected_batches:
                 return batches
-        pytest.fail("Reset was not published without another inference iteration")
+        pytest.fail("Cache clear was not published without another inference iteration")
+
+    def clear_cache():
+        if operation == "reset":
+            wrapper.reset_reuse_state()
+        else:
+            wrapper.release_memory(RestoreMode.NONE)
+            enqueued = events.enqueued_batches
+            wrapper.release_memory(RestoreMode.NONE)
+            assert events.enqueued_batches == enqueued
+            wrapper.materialize_memory()
 
     try:
-        # Establish the SUB subscription using real resets, without relying on a
+        # Establish the SUB subscription using real clears, without relying on a
         # sleep or on future inference traffic to make the connection usable.
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            wrapper.reset_reuse_state()
+            clear_cache()
             if subscriber.poll(100):
                 _, seq, payload = subscriber.recv_multipart()
                 # A subscription may become ready after an earlier reset was
@@ -548,13 +562,13 @@ def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
                 start_seq = int.from_bytes(seq, "big") + 1
                 break
         else:
-            pytest.fail("Idle reset did not reach the live subscriber")
+            pytest.fail("Idle cache clear did not reach the live subscriber")
 
         if populated:
             _commit_and_close(manager, stream, _token_ids(1, 5))
-        # Reset must flush both pending cache changes and the reset itself. No
-        # executor iteration or explicit flush is allowed between reset and replay.
-        wrapper.reset_reuse_state()
+        # Flush pending cache changes and the clear without an executor iteration
+        # or explicit flush between the operation and replay.
+        clear_cache()
         _, seq, payload = subscriber.recv_multipart()
         assert int.from_bytes(seq, "big") == start_seq
         assert msgspec.msgpack.decode(payload)[1][-1] == {"type": "AllBlocksCleared"}
@@ -568,7 +582,7 @@ def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
         # Reusing the same tokens after reset must emit fresh stored data.
         _commit_and_close(manager, stream, _token_ids(1, 5))
         events.flush_iteration_events()
-        wrapper.reset_reuse_state()
+        clear_cache()
         batches = replay_through(3, start_seq)
         assert [seq for seq, _ in batches] == list(range(start_seq, start_seq + 3))
         assert batches[1][1][1][0]["type"] == "BlockStored"
@@ -579,6 +593,197 @@ def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
         replay.close(linger=0)
         subscriber.close(linger=0)
         manager.shutdown()
+        events.shutdown()
+
+
+def _make_sleep_event_wrapper(native, events):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = native
+    wrapper.event_manager = events
+    wrapper._sleep_restore_mode = None
+    wrapper.kv_cache_map = {}
+    wrapper._fresh_pages_filled = {}
+    wrapper.conversation_manager = None
+    wrapper._sharing = None
+    wrapper.validate_sleep_config = Mock()
+    wrapper._restore_memory_bindings = Mock()
+    return wrapper
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("outcome", ["released", "recovered", "failed"])
+def test_buffered_sleep_does_not_start_event_gather(outcome):
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError, RestoreMode
+
+    gather = Mock(return_value=[[], []])
+    events = KVCacheEventManager(
+        max_kv_event_entries=128,
+        window_size=128,
+        attention_dp_rank=1,
+        attention_dp_gather=gather,
+    )
+    native = Mock()
+    native.is_memory_ready.return_value = outcome == "recovered"
+    wrapper = _make_sleep_event_wrapper(native, events)
+    if outcome == "released":
+        wrapper.release_memory(RestoreMode.CPU)
+    else:
+        native.release_gpu_memory.side_effect = MemoryError("release failed")
+        error = MemoryReleaseAbortedError if outcome == "recovered" else MemoryError
+        with pytest.raises(error):
+            wrapper.release_memory(RestoreMode.CPU)
+    gather.assert_not_called()
+    wrapper.flush_iteration_events()
+    gather.assert_called_once()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mode_name", ["NONE", "MEMSET", "CPU", "PINNED"])
+@pytest.mark.parametrize("outcome", ["released", "recovered", "failed", "bindings", "cleanup"])
+def test_streaming_sleep_flushes_events_after_native_release(mode_name, outcome):
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError, RestoreMode
+
+    init_cuda_once()
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    events.set_layer_group_window_sizes({0: 128})
+    published = []
+    events._publisher.publish = lambda batch: published.append(batch) or True
+    native = _create_test_manager(events.event_sink, host_quota=16 << 20)
+    wrapper = _make_sleep_event_wrapper(native, events)
+    stream_holder = CachedCudaStream()
+    _commit_and_close(native, cast(CudaStream, stream_holder.handle), _token_ids(1, 5))
+    mode = getattr(RestoreMode, mode_name)
+    discard = mode_name in ("NONE", "MEMSET")
+    error = MemoryError("release failed after native cache changes")
+
+    def fail_release(*, discard):
+        native.release_gpu_memory(discard=discard)
+        if outcome != "failed":
+            native.materialize_gpu_memory()
+        raise error
+
+    if outcome in ("recovered", "failed", "bindings"):
+        # Inject the failure boundary around real native state changes and events.
+        wrapper.impl = SimpleNamespace(
+            release_gpu_memory=fail_release,
+            is_memory_ready=native.is_memory_ready,
+            get_reuse_state_version=native.get_reuse_state_version,
+        )
+    if outcome == "bindings":
+        wrapper._restore_memory_bindings.side_effect = RuntimeError("binding restore failed")
+    if outcome == "cleanup":
+        wrapper.conversation_manager = Mock()
+        wrapper.conversation_manager.clear.side_effect = RuntimeError("conversation clear failed")
+    try:
+        if outcome == "released" or (outcome == "cleanup" and not discard):
+            wrapper.release_memory(mode)
+            assert wrapper._sleep_restore_mode == mode
+        else:
+            expected_error = {
+                "recovered": MemoryReleaseAbortedError,
+                "failed": MemoryError,
+                "bindings": RuntimeError,
+                "cleanup": RuntimeError,
+            }[outcome]
+            with pytest.raises(expected_error) as caught:
+                wrapper.release_memory(mode)
+            assert isinstance(caught.value, MemoryReleaseAbortedError) == (outcome == "recovered")
+            assert wrapper._sleep_restore_mode == (mode if outcome == "cleanup" else None)
+        assert len(published) == 1
+        wire_events = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))[1]
+        assert wire_events[0]["type"] == "BlockStored"
+        assert (wire_events[-1]["type"] == "AllBlocksCleared") == discard
+        events.flush_iteration_events()
+        assert len(published) == 1
+    finally:
+        native.materialize_gpu_memory()
+        native.shutdown()
+        events.shutdown()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("outcome", ["released", "recovered", "failed"])
+@pytest.mark.parametrize("publish_failure", ["reject", "raise"])
+def test_sleep_event_enqueue_failure_preserves_release_outcome(outcome, publish_failure):
+    from tensorrt_llm._torch.pyexecutor.kv_cache_events import AllBlocksCleared
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError, RestoreMode
+
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    events._event_source = Mock()
+    events._event_source.drain_events.side_effect = [[AllBlocksCleared()], []]
+    events._publisher.publish = Mock(return_value=False)
+    if publish_failure == "raise":
+        events._publisher.publish.side_effect = RuntimeError("publisher failed")
+    native = Mock()
+    native.is_memory_ready.return_value = outcome == "recovered"
+    if outcome != "released":
+        native.release_gpu_memory.side_effect = MemoryError("release failed")
+    wrapper = _make_sleep_event_wrapper(native, events)
+    try:
+        if outcome == "released":
+            wrapper.release_memory(RestoreMode.NONE)
+        else:
+            error = MemoryReleaseAbortedError if outcome == "recovered" else MemoryError
+            with pytest.raises(error):
+                wrapper.release_memory(RestoreMode.NONE)
+        assert wrapper._sleep_restore_mode == (RestoreMode.NONE if outcome == "released" else None)
+        assert events.dropped_batches == 1
+        assert events.enqueued_batches == 0
+    finally:
+        events.shutdown()
+
+
+@pytest.mark.cpu_only
+def test_dropped_sleep_events_do_not_skip_other_manager_rollback(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache_events import AllBlocksCleared
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    monkeypatch.setattr("torch.cuda.synchronize", lambda: None)
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    events._event_source = Mock()
+    events._event_source.drain_events.side_effect = [[AllBlocksCleared()], []]
+    events._publisher.publish = Mock(return_value=False)
+    native = Mock()
+    native.is_memory_ready.return_value = True
+    native.release_gpu_memory.side_effect = MemoryError("release failed")
+    wrapper = _make_sleep_event_wrapper(native, events)
+    earlier = Mock(spec=KVCacheManagerV2)
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor._sleeping_memory_tags = {ExecutorMemoryType.MODEL_ENGINE_MAIN}
+    executor.llm_args = SimpleNamespace(sleep_config=SleepConfig())
+    executor.resource_manager = SimpleNamespace(
+        resource_managers={"main": earlier, "draft": wrapper}
+    )
+    try:
+        with pytest.raises(MemoryReleaseAbortedError):
+            executor.release_memory((ExecutorMemoryType.KV_CACHE,))
+        earlier.materialize_memory.assert_called_once_with()
+        wrapper._restore_memory_bindings.assert_called_once_with()
+        assert wrapper._sleep_restore_mode is None
+        assert executor._sleeping_memory_tags == {ExecutorMemoryType.MODEL_ENGINE_MAIN}
+        assert events.dropped_batches == 1
+    finally:
         events.shutdown()
 
 

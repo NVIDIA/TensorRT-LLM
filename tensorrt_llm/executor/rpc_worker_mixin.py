@@ -24,6 +24,7 @@ from ..llmapi.utils import logger_debug
 from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
+from .utils import ErrorResponse
 
 
 class RpcWorkerMixin:
@@ -41,6 +42,9 @@ class RpcWorkerMixin:
     # Default number of RPC server workers
     # This can be overridden by setting num_workers in the inheriting class
     NUM_WORKERS = 6
+
+    # IPC workers can reuse stats RPC without initializing a response stream.
+    _response_queue: Optional[Queue] = None
 
     def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: bytes):
         if rpc_addr is None:
@@ -219,7 +223,14 @@ class RpcWorkerMixin:
         """Submits a request to the worker."""
         with nvtx_range_debug("RpcWorker.submit", color="blue", category="Worker"):
             logger_debug(f"[worker] Submitting request {request.id}", color="green")
-            result = super().submit(request)
+            try:
+                result = super().submit(request)
+            except Exception as error:
+                # Fire-and-forget submissions cannot return RPC errors. Send
+                # admission failures through the same stream as request output.
+                if self._response_queue is not None:
+                    self._response_queue.put([ErrorResponse(request.id, str(error), -1)])
+                raise
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
             return result
 
@@ -236,6 +247,7 @@ class RpcWorkerMixin:
             responses = self._await_response_helper.process_and_handle_responses(responses)
             logger_debug(f"[worker] Fetched {len(responses)} responses", color="green")
 
+        assert self._response_queue is not None
         qsize = self._response_queue.qsize()
         logger_debug(f"[worker] RpcWorker returning {qsize} responses", color="yellow")
 

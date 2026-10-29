@@ -129,6 +129,8 @@ public:
     }
 
 private:
+    friend class KvCacheIntrospection;
+
     //! Sentinel stored in the watermark when the worker failed. Distinct from
     //! every reachable byte count, so a waiter cannot mistake it for progress.
     static constexpr size_t kFillFailed = SIZE_MAX;

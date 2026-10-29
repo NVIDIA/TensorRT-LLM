@@ -1004,7 +1004,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")
                              .value("ACTIVE", kv::KvCache::Status::ACTIVE)
                              .value("SUSPENDED", kv::KvCache::Status::SUSPENDED)
-                             .value("CLOSED", kv::KvCache::Status::CLOSED);
+                             .value("CLOSED", kv::KvCache::Status::CLOSED)
+                             .value("UNMATERIALIZED", kv::KvCache::Status::UNMATERIALIZED);
 
     nb::class_<kv::MmItemContext>(m, "MmItemContext")
         .def(
@@ -2900,6 +2901,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("manager"), nb::arg("stream"), nb::arg("index_tables"), nb::arg("max_batch_size") = nb::none(),
             nb::arg("max_blocks_per_seq") = nb::none(), nb::arg("mode") = nb::none(),
             nb::arg("max_total_input_tokens") = nb::none(), nb::keep_alive<1, 2>(),
+            nb::call_guard<nb::gil_scoped_release>(),
             "The KV caches stepped together, and their device-side page tables.\n\n"
             "index_tables names what a consumer needs addressable together, and is required: pass [] "
             "to convert no indices, which is a choice about what the consumer reads rather than an "
@@ -3429,6 +3431,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     });
             },
             nb::arg("reuse_scope"), nb::arg("input_tokens"), nb::arg("target"))
+        .def("release_gpu_memory", &kv::KvCacheManager::releaseGpuMemory, nb::arg("discard") = false,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("validate_memory_release", &kv::KvCacheManager::validateMemoryRelease, nb::arg("discard") = false,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_memory_ready", &kv::KvCacheManager::isMemoryReady, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_reuse_state_version", &kv::KvCacheManager::getReuseStateVersion,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("materialize_gpu_memory", &kv::KvCacheManager::materializeGpuMemory, nb::arg("zero") = false,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def(

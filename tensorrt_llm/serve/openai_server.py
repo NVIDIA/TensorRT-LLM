@@ -3859,14 +3859,20 @@ class OpenAIServer(_VideoRoutesMixin):
         assert isinstance(
             self.generator, AsyncLLM
         ), "/release_memory endpoint is only supported with AsyncLLM()"
-        await self.generator.collective_rpc('sleep', args=(request.tags, ))
+        try:
+            await self.generator.release(request.tags)
+        except Exception as error:
+            return self._runtime_control_error_response(error)
         return JSONResponse(content={"status": "success"})
 
     async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
         assert isinstance(
             self.generator, AsyncLLM
         ), "/resume_memory endpoint is only supported with AsyncLLM()"
-        await self.generator.collective_rpc('wakeup', args=(request.tags, ))
+        try:
+            await self.generator.resume(request.tags)
+        except Exception as error:
+            return self._runtime_control_error_response(error)
         return JSONResponse(content={"status": "success"})
 
     async def update_weights(self,

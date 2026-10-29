@@ -26,6 +26,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3KVCacheManagerV2,
 )
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import (
@@ -34,6 +35,17 @@ from tensorrt_llm.llmapi.llm_args import (
     MiniMaxM3SparseAttentionConfig,
 )
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_rejects_sleep_with_index_value_buffers() -> None:
+    """Reject index-V buffers that have no native sleep lifecycle."""
+    manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager._index_v_buffers = {3: torch.zeros(1)}
+    with pytest.raises(ValueError, match="index-V buffers"):
+        manager.validate_sleep_config(RestoreMode.NONE)
+    manager._index_v_buffers = {}
+    manager.validate_sleep_config(RestoreMode.NONE)
 
 
 def _nonzero_bytes(view: torch.Tensor) -> int:

@@ -81,6 +81,68 @@ async with AsyncLLM(model="Qwen/Qwen3-8B",
     await llm.resume()
 ```
 
+For Ray workers, use `LLM.release(tags)` or `await AsyncLLM.release(tags)`
+instead of `collective_rpc("sleep", ...)` or
+`collective_rpc_async("sleep", ...)`. The generic RPC calls now raise
+`ValueError` because they bypass group-wide sleep configuration validation.
+`release()` coordinates the operation across all workers; it does not support
+selecting individual ranks.
+
+The MPI executor still supports blocking, all-rank
+`collective_rpc("sleep", args=(["kv_cache"],))` and the corresponding wakeup RPC.
+These calls reach the same worker drain and memory-transition protocol as
+`LLM.release()` and `LLM.resume()`. Existing MPI callers need not migrate for this
+change. New integrations should use the public release/resume APIs to work with
+both MPI and Ray. This API compatibility does not enable V2 sleep with a KV
+transceiver or other unsupported external owner.
+
+Ray wakeup also requires whole-group completion. Use `LLM.resume(tags)` or
+`await AsyncLLM.resume(tags)`. A blocking, all-worker `collective_rpc("wakeup")`
+uses the same group gate; rank-selected and non-blocking wakeup calls are rejected.
+Outside a memory transition, other RPCs retain their normal rank-selection and
+non-blocking behavior. During a transition, only `get_memory_status` is allowed.
+It reports the driver's group gate (`parking` or `waking`) and the last confirmed
+parked tags without waiting for actors. This is not a per-rank completion report.
+After the transition, status queries read the workers again.
+Private worker methods and recursive `call_worker_method` dispatch are rejected
+so they cannot bypass the group gate.
+
+Ray rejects request submission while a memory operation is in progress.
+Before validation, Ray waits for earlier calls on each serial worker actor to
+complete. This queue wait has no deadline and does not consume the validation
+deadline. A slow non-blocking weight update does not by itself terminate the group.
+Cancellation during this queue wait, before memory-operation dispatch, leaves
+the worker group running. Resuming already-active tags does not drain requests.
+Configuration validation and recovery-status checks have a 300-second deadline.
+Actual sleep and wakeup execution have no fixed completion deadline: request
+draining and reconstruction of large HOST tiers can take longer. Admission stays
+closed until all workers complete. A stalled drain or reconstruction requires
+operator action; elapsed time alone does not terminate a healthy worker group.
+MPI similarly leaves wake COMMIT acknowledgement waits unbounded, while PREPARE,
+ABORT, and shutdown acknowledgement waits retain their 30-second deadline.
+Sleep and wakeup validate every worker before dispatching the memory operation.
+Invalid wakeup arguments or a disabled sleep feature return a validation error
+without changing memory or terminating the worker group.
+Timeouts, actor loss, execution cancellation, and multi-rank execution failure keep
+admission closed and request termination of every actor without automatic restart.
+After other single-worker execution errors, the driver checks the worker's memory
+status with the same deadline while admission stays closed. A consistent `running`
+or `parked` reply restores the corresponding driver admission state; a failed,
+transitional, invalid, or unavailable status closes admission permanently.
+When admission is permanently closed, `get_memory_status()` reports `failed`;
+health checks fail and pending generation results receive an engine-dead error.
+Create a new worker group to resume service.
+Actor termination is asynchronous and is not proof of remote KV-transfer fencing.
+Group-wide post-drain capacity validation and automatic rollback are not supported.
+`CPU` and `PINNED` KV release reject a configuration with no nonzero HOST or DISK
+tier below all GPU levels before memory-operation dispatch. This validation error
+does not terminate the worker group. A valid tier layout does not guarantee enough
+capacity. For example, a `CPU` or `PINNED` KV release can fail when retained pages
+do not fit in the configured cold tiers. In a multi-rank Ray group, this failure requires a new worker
+group even if the failing rank has not changed memory. Other ranks may already
+have released memory, and the driver does not establish a safe group-wide abort.
+Configuration preflight does not reserve capacity or replace post-drain checks.
+
 `release()` first closes request admission and drains work already in flight.
 Generation remains rejected until all parked tags have been restored. The
 synchronous MPI/local and asynchronous Ray paths use the same admission states:
@@ -103,16 +165,13 @@ first. New operations are also rejected during transitional and failed states.
 
 ## Memory tags
 
-Only allocations captured by the TensorRT-LLM virtual-memory allocator and
-registered with a requested tag are affected.
-
 | `ExecutorMemoryType` | Tag value | Contents |
 | --- | --- | --- |
 | `MODEL_WEIGHTS_MAIN` | `model_weights` | Main-model parameters |
 | `MODEL_ENGINE_MAIN` | `model` | Other main-model engine allocations |
 | `MODEL_WEIGHTS_DRAFT` | `draft_model_weights` | Draft-model parameters |
 | `MODEL_ENGINE_DRAFT` | `draft_model` | Other draft-model engine allocations |
-| `KV_CACHE` | `kv_cache` | KV-cache allocations; KV-cache sleep is rejected when KV-cache manager V2 is enabled |
+| `KV_CACHE` | `kv_cache` | KV-cache allocations, including native V2 pools; see [V2 Compatibility](#v2-compatibility). |
 | `SAMPLER` | `sampler` | Sampling resources |
 | `DRAFTER` | `drafter` | Drafting resources |
 | `GUIDED_DECODER` | `guided_decoder` | Guided-decoding resources |
@@ -127,6 +186,96 @@ not useful sleep targets.
 
 Selecting `model` does not imply `model_weights`. Select both to release model
 parameters and the other main-model engine allocations.
+
+### V2 Compatibility
+
+Enabling `SleepConfig` no longer automatically changes a selected V2 manager to
+V1. Unsupported V2 KV sleep configurations fail explicitly instead. This changes
+behavior for configurations that previously used the automatic V1 fallback.
+There is no new automatic fallback for sleep.
+
+Cache transceivers, KV-moving connectors, attached KV lenders, and MiniMax-M3
+index-V buffers currently prevent V2 KV release. Exclude `KV_CACHE` when releasing
+other supported tags, such as model weights. A release with no explicit tags
+includes KV cache and is therefore rejected for these configurations.
+Capacity-only connectors do not prevent V2 KV release. These restrictions apply
+to the sleep operation, not to V2 serving without KV sleep.
+Mixed V1/V2 target and draft managers also reject KV sleep before draining;
+weights-only release remains available. Mixed-precision KV with `SleepConfig`
+remains rejected during configuration validation until that combination is qualified.
+
+### Allocation Ownership
+
+Release affects allocations captured by the TensorRT-LLM virtual-memory allocator
+and registered with a requested tag, plus native KV-cache manager V2 pools under
+the `KV_CACHE` tag. The executor releases its padding and diagnostic guard caches
+before native KV release and recreates them after the final parked tag is restored,
+or after a recovered release. Partial KV wake does not recreate padding while
+other tagged speculative buffers remain unavailable.
+Recreation uses the normal model initialization path, not the old cache identity.
+Captured graphs and their stable backing interfaces remain intact. Every prior
+padding variant and guard reservation must be rebuilt before the rank reports
+completion; failure keeps admission closed. This does not enable live user-request
+preservation. Native callers can still retain supported cache/Batch state, and
+capacity preflight conservatively includes internal caches before their release.
+`NONE` and `MEMSET` discard KV contents and reusable prefixes
+and release HOST pool backing; `CPU` and
+`PINNED` place held pages in the configured HOST/DISK tiers first, then offload
+reusable pages into the remaining capacity. Existing held cold pages are not
+displaced by reusable pages. Reusable pages may be dropped under capacity pressure.
+This held-first policy applies only to sleep, not normal inference eviction.
+These modes require a nonzero HOST or DISK tier below all GPU levels. KV release in `CPU` or
+`PINNED` mode warns when the host tier below all GPU levels is smaller than their
+combined GPU quota. Weights-only release and KV discard modes do not use native
+KV host-tier backup capacity. Tagged Torch buffers can still require separate
+host backups, including in KV discard modes. See
+[V2 sleep and wakeup](kvcache.md#sleep-and-wakeup-with-v2).
+
+V2 flushes streaming KV events after native release, including a failed release.
+Event delivery remains best effort. Dropped batches are counted and logged; they
+do not replace the memory-operation result or prevent rollback of earlier managers.
+A completed sleep is not proof that an external router received the invalidation.
+When discard clears native reuse state, it also clears dependent route and
+conversation metadata. Preserve-mode eviction can also drop reusable pages.
+A recovered release invalidates dependent metadata if its native reuse epoch
+changed. This check is conservative: entering preserve-mode eviction advances
+the epoch even if no page is ultimately dropped.
+An MPI rank-0 abort after a reuse epoch change stops the group: peers cannot
+continue with potentially different reusable prefixes. An earlier abort preserves the
+pipeline-rebalance drain countdown and can release the prepared peer barriers.
+
+After a successful tagged release, the CUDA virtual-memory manager logs
+`retained_host_backup_bytes` for each tag. This is the retained CPU/PINNED backup
+size for tagged allocations, including allocator slabs, not just live tensor
+payload. Repeated release reports the retained total without copying again.
+It excludes native KV tiers, sparse-arena backups, other host allocations, and
+checkpoint overhead; it does not measure checkpoint size.
+
+The V2 construction scope preserves tagged Torch buffers even with `NONE` or
+`MEMSET`. Native KV/SSM pools follow the selected mode, but Torch metadata and
+scratch buffers do not. In particular, enabled in-forward Mamba snapshot staging
+can be large: its 512 MiB sizing target is not a hard cap when one row exceeds
+that size. Do not assume that discard leaves only small host metadata.
+
+### V2 Wake Latency
+
+Discard removes native GPU and HOST pool backing, including host registrations.
+Wake restores their saved capacities and waits for HOST backing to be populated
+and registered before reporting success. Refill failure is a wake failure, not
+a latent serving error. The native manager retains saved capacities on failure;
+a failed host-fill latch requires a new manager. Python serving controls fail
+closed after a wake failure and require a new worker group.
+
+Fresh GPU pools are zeroed in every mode before preserved pages are copied back.
+This initializes masked attention tails and internal replay counters without
+discarding preserved live pages.
+
+Preserving sleep retains native host-tier backing, so wake does not recreate
+that entire tier. Neither mode has a constant-latency guarantee. Measure release,
+wake, first-request latency and host residency across repeated cycles when
+varying `host_cache_size`. Large-tier refill and GPU zeroing costs remain
+performance-validation work; no latency target has been established here.
+Process restore and transport re-registration are separate capabilities.
 
 ## Restore modes
 
@@ -346,6 +495,14 @@ storage, unmaps them, and calls `cuMemRelease` on their CUDA physical allocation
 handles. Wakeup calls `cuMemCreate`, remaps new handles at the reserved virtual
 addresses, and restores or initializes contents according to `SleepConfig`.
 
+Native V2 KV pools use the cache manager's own storage lifecycle. Preserving
+modes migrate live pages through its cache tiers; destructive modes retain the
+native cache objects with unmaterialized pages. Wakeup restores pool capacity
+and resumes the caches through normal allocation without reconstructing logical
+request state in Python. GPU pool virtual addresses and metadata buffer addresses
+stay stable; page and scratch slot IDs may change. KV and SSM indices are refreshed
+before graph replay so kernels address the restored pages.
+
 Principal implementation locations are:
 
 - Synchronous API: `tensorrt_llm/llmapi/llm.py`
@@ -357,6 +514,7 @@ Principal implementation locations are:
 - Allocation tagging: `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py`
   and `tensorrt_llm/_torch/pyexecutor/model_loader.py`
 - Python VMM wrapper: `tensorrt_llm/_torch/virtual_memory.py`
+- Native V2 KV pools: `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/`
 - CUDA VMM: `cpp/tensorrt_llm/runtime/virtualMemory.cpp` and
   `cpp/include/tensorrt_llm/runtime/virtualMemory.h`
 - GMS adapter: `tensorrt_llm/_torch/memory/gpu_memory_backend.py`

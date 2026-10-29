@@ -153,6 +153,7 @@ KvCacheStatus = _cpp.KvCacheStatus
 LogicError = _cpp.LogicError
 OutOfMemoryError = _cpp.OutOfMemoryError
 OutOfPagesError = _cpp.OutOfPagesError
+ResourceBusyError = _cpp.ResourceBusyError
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
@@ -269,6 +270,7 @@ __all__ = [
     "MmItemContext",
     "NDEBUG",
     "OutOfPagesError",
+    "ResourceBusyError",
     "PageIndexConverter",
     "PlannedDropHandle",
     "PoolGroupPeakBlockStats",

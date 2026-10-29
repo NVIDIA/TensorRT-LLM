@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import dataclasses
 import os
 from contextlib import ExitStack
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -58,6 +59,7 @@ from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
                            get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..speculative.spec_sampler_base import SpecSampler
+from ..virtual_memory import preserve_contents
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
@@ -157,9 +159,7 @@ def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,
 
 
 def kv_cache_manager_v2_incompatible_features(
-        max_beam_width: Optional[int],
-        *,
-        enable_sleep: bool = False) -> List[str]:
+        max_beam_width: Optional[int]) -> List[str]:
     """Runtime features a V2 manager cannot serve.
 
     ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
@@ -175,14 +175,11 @@ def kv_cache_manager_v2_incompatible_features(
     """
     # The C++ backend supports beam search. Model-specific restrictions are
     # validated by KvCacheCreator before constructing the manager.
-    # V2's native allocations are not tracked by release_with_tag.
-    return ["SleepConfig"] if enable_sleep else []
+    return []
 
 
 def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
-                                    max_beam_width: Optional[int],
-                                    *,
-                                    enable_sleep: bool = False) -> bool:
+                                    max_beam_width: Optional[int]) -> bool:
     """Whether the executor will actually hold a V2 manager.
 
     ``use_kv_cache_manager_v2`` is a request, not the outcome: model loading has
@@ -191,8 +188,7 @@ def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
     a pool from the request would leave V2 geometry on a V1 executor.
     """
     return (kv_cache_config.use_kv_cache_manager_v2 is True
-            and not kv_cache_manager_v2_incompatible_features(
-                max_beam_width, enable_sleep=enable_sleep))
+            and not kv_cache_manager_v2_incompatible_features(max_beam_width))
 
 
 def _resolve_disagg_transceiver_route(
@@ -1149,8 +1145,7 @@ class KvCacheCreator:
                        and quant_config is not None
                        and quant_config.quant_mode.has_fp4_kv_cache())
             incompat = kv_cache_manager_v2_incompatible_features(
-                self._max_beam_width,
-                enable_sleep=self._llm_args.sleep_config is not None)
+                self._max_beam_width)
             # Sparse attention: ModelEngine only forwards cache_indirection when
             # the metadata type is exactly TrtllmAttentionMetadata, and every
             # sparse backend uses a subclass, so beams would read beam 0's
@@ -3901,6 +3896,14 @@ def _create_kv_cache_manager(
             "Cold-page quantization requires the resolved KV cache manager "
             f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
 
+    def construct_manager(*args: Any,
+                          **kwargs: Any) -> KVCacheManager | KVCacheManagerV2:
+        """Preserve auxiliary allocations only for the selected native V2 manager."""
+        with (preserve_contents()
+              if issubclass(kv_cache_manager_cls, KVCacheManagerV2) else
+              contextlib.nullcontext()):
+            return kv_cache_manager_cls(*args, **kwargs)
+
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
             and kv_cache_config.pool_ratio is None
@@ -4134,7 +4137,7 @@ def _create_kv_cache_manager(
                 glm_kpool_cache_row_dim
             kda_extra_kwargs["index_state_dim"] = glm_kpool_cache_row_dim(
                 int(text_config.index_head_dim))
-        kv_cache_manager = kv_cache_manager_cls(
+        kv_cache_manager = construct_manager(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
             mamba_params.conv_kernel,
@@ -4176,7 +4179,7 @@ def _create_kv_cache_manager(
             manager_extra_kwargs["bounded_replay_on_generation"] = (
                 _model_config.extra_attrs.get("bounded_replay_on_generation",
                                               False))
-        kv_cache_manager = kv_cache_manager_cls(
+        kv_cache_manager = construct_manager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=num_hidden_layers,
@@ -4246,7 +4249,7 @@ def _create_kv_cache_manager(
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
             # The manager tells its draft layers apart by the model's layer count.
             mamba_manager_extra_kwargs["pretrained_config"] = config
-        kv_cache_manager = kv_cache_manager_cls(
+        kv_cache_manager = construct_manager(
             # mamba cache parameters
             mamba_params.state_size,
             mamba_params.conv_kernel,
@@ -4319,7 +4322,7 @@ def _create_kv_cache_manager(
             mamba_manager_extra_kwargs.update(
                 pretrained_config=config,
                 sparse_attention_config=sparse_attention_config)
-        kv_cache_manager = kv_cache_manager_cls(
+        kv_cache_manager = construct_manager(
             # mamba cache parameters
             mamba_params.state_size,
             mamba_params.conv_kernel,
@@ -4367,7 +4370,7 @@ def _create_kv_cache_manager(
         effective_head_dim = (
             max(head_dim) if isinstance(head_dim, list)
             and kv_cache_manager_cls.__name__ == "KVCacheManager" else head_dim)
-        kv_cache_manager = kv_cache_manager_cls(
+        kv_cache_manager = construct_manager(
             kv_cache_config,
             kv_cache_type,
             num_layers=num_hidden_layers,

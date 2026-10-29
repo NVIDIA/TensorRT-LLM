@@ -18,6 +18,7 @@
 #include "kvCacheManagerV2TestUtils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/config.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/introspection.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
@@ -31,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -756,6 +758,363 @@ TEST(KvCacheManagerV2ColdPageTest, ColdGpuTierSupportsSingleSlotRoundTrip)
 
     storage.releaseSlot(lifeCycle, coldLevel, std::move(coldSlot));
     storage.releaseSlot(lifeCycle, kHotLevel, std::move(hotSlot));
+}
+
+TEST(KvCacheManagerV2ColdPageTest, SleepCapacityFailureLeavesActiveCachesUnchanged)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+    auto config = makeTieredConfig();
+    config.cacheTiers[0] = GpuCacheTierConfig{8 << 20};
+    config.cacheTiers[1] = HostCacheTierConfig{2 << 20};
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(cache->resize(8, 0));
+    auto const page = blockPageGetPage(cache->blocks()[BlockOrdinal{0}].pages[kDefaultBeamIndex][LifeCycleId{0}]);
+    auto const originalSlot = page->slotId();
+    EXPECT_THROW(manager->validateMemoryRelease(false), OutOfPagesError);
+    EXPECT_THROW(manager->releaseGpuMemory(false), OutOfPagesError);
+    EXPECT_TRUE(manager->isMemoryReady());
+    EXPECT_TRUE(cache->isActive());
+    EXPECT_EQ(page->slotId(), originalSlot);
+    EXPECT_TRUE(cache->resize(12, 0));
+}
+
+TEST(KvCacheManagerV2ColdPageTest, SleepRecoversAfterEvictionButBeforeUnmapping)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+    auto config = makeConfig();
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    auto reserved = storage.newSlots(kHotLevel, TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 1));
+    auto releaseReserved = FuncGuard(
+        [&]()
+        {
+            if (!reserved[lifeCycle].empty())
+            {
+                storage.releaseSlot(lifeCycle, kHotLevel, std::move(reserved[lifeCycle].front()));
+            }
+        });
+    auto cache = manager->createKvCache();
+    auto closeCache = FuncGuard([&]() { cache->close(); });
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(cache->resize(4, 0));
+    auto const page = blockPageGetPage(cache->blocks()[BlockOrdinal{0}].pages[kDefaultBeamIndex][lifeCycle]);
+    auto const group = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
+    auto address = [&]()
+    {
+        return reinterpret_cast<void*>(
+            std::get<MemAddress>(storage.slotAddress(kHotLevel, group, page->slotId(), PoolIndex{0})));
+    };
+    size_t const bytes = storage.slotSize(kHotLevel, group)[PoolIndex{0}];
+    ASSERT_EQ(cudaMemset(address(), 0xA7, bytes), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    // A non-cache slot prevents unmapping after the cache's pages have been evicted.
+    EXPECT_NO_THROW(manager->validateMemoryRelease(false));
+    EXPECT_THROW(manager->releaseGpuMemory(false), ResourceBusyError);
+    ASSERT_TRUE(manager->isMemoryReady());
+    ASSERT_TRUE(cache->isActive());
+    std::vector<uint8_t> payload(bytes);
+    ASSERT_EQ(cudaMemcpy(payload.data(), address(), bytes, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_TRUE(std::all_of(payload.begin(), payload.end(), [](uint8_t byte) { return byte == 0xA7; }));
+
+    storage.releaseSlot(lifeCycle, kHotLevel, std::move(reserved[lifeCycle].front()));
+    reserved[lifeCycle].clear();
+    for (int cycle = 0; cycle != 2; ++cycle)
+    {
+        manager->releaseGpuMemory(false);
+        EXPECT_FALSE(manager->isMemoryReady());
+        EXPECT_NO_THROW(manager->releaseGpuMemory(false));
+        EXPECT_THROW(manager->releaseGpuMemory(true), TllmException);
+        manager->materializeGpuMemory(false);
+        EXPECT_NO_THROW(manager->materializeGpuMemory(false));
+        EXPECT_TRUE(manager->isMemoryReady());
+        EXPECT_TRUE(cache->isActive());
+        ASSERT_EQ(cudaMemcpy(payload.data(), address(), bytes, cudaMemcpyDeviceToHost), cudaSuccess);
+        EXPECT_TRUE(std::all_of(payload.begin(), payload.end(), [](uint8_t byte) { return byte == 0xA7; }));
+    }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, DiscardedColdPagesRestoreTierAndDecodeToZero)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+    for (auto config : {makeGpuTieredConfig(), makeTieredConfig(), makeDiskTieredConfig()})
+    {
+        SCOPED_TRACE(config.cacheTiers.back().index());
+        auto codec = std::make_unique<OptionalTestColdPageCodec>();
+        auto* observer = codec.get();
+        auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
+        auto cache = manager->createKvCache({}, {}, RequestIdType{1});
+        auto closeCache = FuncGuard([&]() { cache->close(); });
+        manager->markStatsExcluded(cache->id);
+        ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+        cache->stopCommitting();
+        ASSERT_TRUE(cache->resize(4, 0));
+        auto page = blockPageGetPage(cache->blocks()[BlockOrdinal{0}].pages[kDefaultBeamIndex][LifeCycleId{0}]);
+        auto& storage = manager->storage();
+        auto const hotGroup = storage.getPoolGroupIndex(kHotLevel, page->lifeCycle);
+        auto const pageBytes = storage.slotSize(kHotLevel, hotGroup)[PoolIndex{0}];
+        auto const originalAddress
+            = std::get<MemAddress>(storage.slotAddress(kHotLevel, hotGroup, page->slotId(), PoolIndex{0}));
+        ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(originalAddress), 0xA7, pageBytes, stream), cudaSuccess);
+        cache->suspend();
+        storage.excludeFromEviction(*page);
+        storage.batchedMigrate(CacheLevel{1}, {page}, {});
+        storage.scheduleForEviction(*page);
+        page.reset();
+        manager->releaseGpuMemory(/*discard=*/true);
+        manager->materializeGpuMemory(/*zero=*/true);
+        auto restored = blockPageGetPage(cache->blocks()[BlockOrdinal{0}].pages[kDefaultBeamIndex][LifeCycleId{0}]);
+        EXPECT_EQ(restored->cacheLevel, CacheLevel{1});
+        EXPECT_EQ(observer->encodeCalls, 2);
+        ASSERT_TRUE(cache->resume());
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        auto const address
+            = std::get<MemAddress>(storage.slotAddress(kHotLevel, hotGroup, restored->slotId(), PoolIndex{0}));
+        std::vector<uint8_t> payload(pageBytes);
+        ASSERT_EQ(cudaMemcpy(payload.data(), reinterpret_cast<void const*>(address), pageBytes, cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        EXPECT_TRUE(std::all_of(payload.begin(), payload.end(), [](uint8_t byte) { return byte == 0; }));
+    }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, DiscardSleepRestoresFullHotAndColdTiers)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+    for (bool sparse : {false, true})
+    {
+        SCOPED_TRACE(sparse ? "mixed host/GPU pools" : "dense GPU pools");
+        auto config = makeTieredConfig();
+        config.maxUtilForResume = 1.0f;
+        std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().isSparse = sparse;
+        if (sparse)
+        {
+            // A mixed pool group has host-backed sparse data and a device-backed index.
+            std::get<AttentionLayerConfig>(config.layers.front())
+                .buffers.push_back(BufferConfig{"index", 2 << 20, std::nullopt});
+            std::get<HostCacheTierConfig>(config.cacheTiers[1]).quota = 8 << 20;
+        }
+        auto manager = std::make_shared<KvCacheManager>(std::move(config));
+        auto const apiLock = manager->lockExclusive();
+        auto hot = manager->createKvCache({}, {}, RequestIdType{1});
+        auto cold = manager->createKvCache({}, {}, RequestIdType{2});
+        // Exercise hot-first cache traversal even though cold initialization needs a temporary hot slot.
+        if (std::less<KvCache*>{}(cold.get(), hot.get()))
+        {
+            std::swap(hot, cold);
+        }
+        auto closeCaches = FuncGuard(
+            [&]()
+            {
+                hot->close();
+                cold->close();
+            });
+        manager->markStatsExcluded(hot->id);
+        manager->markStatsExcluded(cold->id);
+        ASSERT_TRUE(cold->resume(reinterpret_cast<CUstream>(stream)));
+        cold->stopCommitting();
+        ASSERT_TRUE(cold->resize(8, 8));
+        cold->suspend();
+        auto& storage = manager->storage();
+        storage.forceEvict(kHotLevel, TypedVec<PoolGroupIndex, SlotCount>{2});
+        ASSERT_TRUE(hot->resume(reinterpret_cast<CUstream>(stream)));
+        hot->stopCommitting();
+        ASSERT_TRUE(hot->resize(8, 0));
+        ASSERT_EQ(storage.getStatistics(kHotLevel).free, 0);
+        ASSERT_EQ(storage.getStatistics(CacheLevel{1}).free, 0);
+
+        for (int cycle = 0; cycle < 3; ++cycle)
+        {
+            SCOPED_TRACE(cycle);
+            manager->releaseGpuMemory(/*discard=*/true);
+            auto const backing = KvCacheIntrospection::discardBackingBytes(*manager);
+            EXPECT_EQ(backing.gpuPhysical, 0U);
+            EXPECT_EQ(backing.hostCommitted, 0U);
+            EXPECT_EQ(backing.hostRegistered, 0U);
+            manager->materializeGpuMemory(/*zero=*/true);
+            EXPECT_EQ(storage.getStatistics(kHotLevel).free, 0);
+            EXPECT_EQ(storage.getStatistics(CacheLevel{1}).free, 0);
+            ASSERT_TRUE(hot->isActive());
+            ASSERT_EQ(cold->status(), KvCache::Status::SUSPENDED);
+        }
+        // Both dense and mixed sparse groups activate at the hot level.
+        hot->close();
+        ASSERT_TRUE(cold->resume());
+    }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, SleepPreflightMatchesHeldFirstHostDiskPlacement)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    struct Case
+    {
+        int gpuHeld;
+        int hostHeld;
+        int hostReusable;
+        int coldGpuHeld;
+        Priority reusablePriority;
+        bool fits;
+    };
+
+    constexpr size_t pageBytes = 2 << 20;
+    constexpr int gpuReusable = 2;
+    constexpr int hostSlots = 2;
+    constexpr int diskSlots = 1;
+    for (auto const test : {Case{2, 0, 0, 0, 70, true}, Case{2, 0, 0, 0, 35, true}, Case{3, 0, 0, 0, 70, true},
+             Case{4, 0, 0, 0, 70, false}, Case{2, 1, 0, 0, 70, true}, Case{2, 0, 2, 0, 70, true},
+             Case{2, 1, 1, 0, 70, true}, Case{3, 1, 0, 0, 70, false}, Case{1, 0, 0, 1, 70, true}})
+    {
+        SCOPED_TRACE(::testing::Message()
+            << "gpu held=" << test.gpuHeld << ", host held=" << test.hostHeld << ", host reusable=" << test.hostReusable
+            << ", cold GPU held=" << test.coldGpuHeld << ", reusable priority=" << test.reusablePriority);
+        auto config = makeTieredConfig();
+        std::get<GpuCacheTierConfig>(config.cacheTiers[0]).quota = 6 * pageBytes;
+        config.cacheTiers.resize(1);
+        if (test.coldGpuHeld != 0)
+        {
+            config.cacheTiers.emplace_back(GpuCacheTierConfig{2 * pageBytes});
+        }
+        CacheLevel const hostLevel{static_cast<int>(config.cacheTiers.size())};
+        config.cacheTiers.emplace_back(HostCacheTierConfig{hostSlots * pageBytes});
+        config.cacheTiers.emplace_back(DiskCacheTierConfig{diskSlots * pageBytes, "/tmp"});
+        auto manager = std::make_shared<KvCacheManager>(std::move(config));
+        auto const apiLock = manager->lockExclusive();
+        auto& storage = manager->storage();
+        ASSERT_EQ(storage.getStatistics(hostLevel).total, hostSlots);
+        ASSERT_EQ(storage.getStatistics(hostLevel + 1).total, diskSlots);
+        std::vector<SharedPtr<PageHolder>> held;
+        std::vector<WeakPtr<Page>> reusable;
+        int tokenBase = 0;
+        auto addPages = [&](CacheLevel level, int count, bool keep)
+        {
+            auto slots = storage.newSlots(level, TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, count));
+            for (auto& slot : slots[LifeCycleId{0}])
+            {
+                auto page = makeCommittedPage(*manager, storage, level, slot, LifeCycleId{0},
+                    keep ? kPriorityDefault : test.reusablePriority, tokenBase);
+                tokenBase += manager->tokensPerBlock();
+                if (keep)
+                {
+                    held.push_back(page->hold());
+                    page->readyEvent.synchronize();
+                    auto const address = std::get<MemAddress>(
+                        storage.slotAddress(level, PoolGroupIndex{0}, page->slotId(), PoolIndex{0}));
+                    if (storage.cacheTier(level) == CacheTier::GPU_MEM)
+                    {
+                        ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(address), 0x2a, pageBytes), cudaSuccess);
+                    }
+                    else
+                    {
+                        std::fill_n(reinterpret_cast<std::byte*>(address), pageBytes, std::byte{0x2a});
+                    }
+                }
+                else
+                {
+                    reusable.push_back(page);
+                }
+            }
+        };
+        addPages(kHotLevel, test.gpuHeld, true);
+        addPages(kHotLevel, gpuReusable, false);
+        addPages(hostLevel, test.hostHeld, true);
+        addPages(hostLevel, test.hostReusable, false);
+        if (test.coldGpuHeld != 0)
+        {
+            addPages(CacheLevel{1}, test.coldGpuHeld, true);
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        auto const version = manager->getReuseStateVersion();
+        if (!test.fits)
+        {
+            EXPECT_THROW(manager->validateMemoryRelease(/*discard=*/false), OutOfPagesError);
+            EXPECT_THROW(manager->releaseGpuMemory(/*discard=*/false), OutOfPagesError);
+            EXPECT_TRUE(manager->isMemoryReady());
+            EXPECT_EQ(manager->getReuseStateVersion(), version);
+            continue;
+        }
+        ASSERT_NO_THROW(manager->validateMemoryRelease(/*discard=*/false));
+        EXPECT_EQ(manager->getReuseStateVersion(), version);
+        ASSERT_NO_THROW(manager->releaseGpuMemory(/*discard=*/false));
+        for (CacheLevel level{0}; level < storage.numCacheLevels(); ++level)
+        {
+            EXPECT_EQ(storage.getNumBytes(level, CacheTier::GPU_MEM), 0U);
+        }
+        for (auto const& holder : held)
+        {
+            EXPECT_NE(storage.cacheTier(holder->page->cacheLevel), CacheTier::GPU_MEM);
+            EXPECT_EQ(holder->page->status(), PageStatus::HELD);
+        }
+        auto const survivors
+            = std::count_if(reusable.begin(), reusable.end(), [](auto const& page) { return !page.expired(); });
+        EXPECT_EQ(survivors,
+            std::min(gpuReusable + test.hostReusable,
+                hostSlots + diskSlots - test.gpuHeld - test.hostHeld - test.coldGpuHeld));
+
+        ASSERT_NO_THROW(manager->materializeGpuMemory(/*zero=*/true));
+        TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> pages(
+            LifeCycleId{1}, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(storage.numCacheLevels()));
+        for (auto const& holder : held)
+        {
+            pages[LifeCycleId{0}][holder->page->cacheLevel].push_back(holder->page);
+        }
+        storage.prefetch(kHotLevel, pages);
+        std::vector<uint8_t> payload(pageBytes);
+        for (auto const& holder : held)
+        {
+            auto const& page = holder->page;
+            ASSERT_EQ(page->cacheLevel, kHotLevel);
+            page->readyEvent.synchronize();
+            auto const address
+                = std::get<MemAddress>(storage.slotAddress(kHotLevel, PoolGroupIndex{0}, page->slotId(), PoolIndex{0}));
+            ASSERT_EQ(
+                cudaMemcpy(payload.data(), reinterpret_cast<void const*>(address), pageBytes, cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            EXPECT_TRUE(std::all_of(payload.begin(), payload.end(), [](uint8_t byte) { return byte == 0x2a; }));
+        }
+    }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FailedSleepOffloadReschedulesProtectedHeldPages)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<AsyncRejectingColdPageCodec>(AsyncRejectingColdPageCodec::Operation::kEncode);
+    auto* codecPtr = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeTieredConfig(), nullptr, std::move(codec));
+    auto releaseCodec = FuncGuard([codecPtr]() { codecPtr->release(); });
+    auto const apiLock = manager->lockExclusive();
+    auto& storage = manager->storage();
+    auto slots = storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 1));
+    auto page = makeCommittedPage(*manager, storage, kHotLevel, slots[LifeCycleId{0}].front());
+    auto holder = page->hold();
+    SlotId const slot = page->slotId();
+
+    ASSERT_NO_THROW(storage.validateReleaseMemory({}));
+    EXPECT_THROW(storage.releaseMemory(/*discard=*/false), TllmException);
+    ASSERT_TRUE(codecPtr->launched());
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+    EXPECT_EQ(page->slotId(), slot);
+    EXPECT_TRUE(page->scheduledForEviction());
+    EXPECT_FALSE(storage.hasSavedPoolCapacities());
+    EXPECT_FALSE(page->queryReady());
+    codecPtr->release();
+    page->readyEvent.synchronize();
 }
 
 TEST(KvCacheManagerV2ColdPageTest, AsyncEncodeRejectionFencesRecycledColdSlotAndReschedulesSource)

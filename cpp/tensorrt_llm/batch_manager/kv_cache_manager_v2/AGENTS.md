@@ -200,6 +200,31 @@ types/config/exceptions
 - `ACTIVE`: pages required by the request are locked at their intended storage
   levels and use the cache's CUDA stream.
 - `CLOSED`: resources are released; further use is invalid.
+- `UNMATERIALIZED`: discard sleep has released a suspended cache's pages while
+  preserving its logical state and block/beam layout. Only materialization or
+  disposal may change its storage; materialization returns it to `SUSPENDED`.
+  The manager permits discard only for stats-excluded caches with no committed
+  tokens, after user requests have drained. Reusable blocks are invalidated in
+  the same native transition. Ordinary suspend/resume preserves page contents.
+  Discard releases both GPU and HOST pool backing without migrating discarded
+  pages. HOST and GPU virtual addresses remain reserved throughout sleep.
+  Storage restores HOST pools before materializing cache pages and retains saved
+  capacities until every pool has been restored and host refill has completed.
+  Native callers can retry recoverable allocations with the same zero policy;
+  a failed host-fill latch or failed cache recovery requires a new manager.
+  Python serving controls do not expose native retries after a failed wake.
+  Wakeup uses ordinary page allocation and codec migration, with scratch slots
+  acquired by resume. Slot IDs may change. Consumers must refresh their KV and SSM
+  indices before execution; CUDA graphs read updated indices through stable
+  metadata buffers while GPU pool virtual addresses remain reserved.
+
+Manager-level sleep also suspends Batch members without ending their row or lease
+ownership. Only that internal transition permits suspended members; public
+per-cache lifecycle calls still reject membership. Batch restores the members'
+page-index and scratch bindings before publishing. Its sparse arenas use stable
+virtual mappings; preserving sleep saves their bounded working sets, including
+unflushed units, to temporary host storage. Discard sleep resets arena residency.
+Do not use normal Batch removal during sleep: it clears the lease's metadata.
 
 `commit()` finalizes full blocks. Its `isEnd=true` form is a terminal-memory
 contract: later writes to the request's KV memory are invalid, because final
@@ -241,7 +266,8 @@ KvCacheManager
 |- LifeCycleRegistry (value)
 |- StorageManager (shared)
 |- BlockRadixTree (shared)
-`- living KvCache registry (non-owning pointers)
+|- living KvCache registry (non-owning pointers)
+`- living Batch registry (non-owning pointers)
 
 KvCache
 |- KvCacheManager (shared; cache keeps manager alive)
@@ -263,6 +289,13 @@ Eviction controller
   `std::shared_ptr` for process-wide resources or references released outside
   that lock (for example, from Python). This overrides the generic `shared_ptr`
   advice in `CODING_GUIDELINES.md`.
+- Memory transitions and the living-Batch registry use the exclusive manager
+  API lock. Release preflight also takes it: page status checks temporarily
+  acquire non-atomic holder references. Python Batch bindings keep the manager
+  alive; native C++ callers must keep the manager alive until the Batch is destroyed.
+  The registry must not retain owning Batch references. Stop owner-thread cache
+  and Batch work before a memory transition; the API lock does not serialize all
+  owner-thread operations or GPU work.
 - Treat every ownership edge as intentional; do not replace weak edges with
   strong ones merely to simplify access.
 - `KvCache` keeps its `KvCacheManager` alive. The manager's registry of living

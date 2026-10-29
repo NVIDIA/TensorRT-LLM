@@ -58,6 +58,17 @@ public:
 
     static ActivePageStats activePageStats(KvCache const& kvCache);
 
+    //! Native pool backing after discard sleep, excluding metadata and Torch backups.
+    struct DiscardBackingBytes
+    {
+        size_t gpuPhysical = 0;
+        size_t hostCommitted = 0;
+        size_t hostRegistered = 0;
+    };
+
+    //! Only valid after completed discard release, when host fill workers have joined.
+    static DiscardBackingBytes discardBackingBytes(KvCacheManager& manager);
+
     // Whether the sequence's page at (ordinal, lcId) still points at a tree block;
     // nullopt when the slot is empty or holds an uncommitted page. Test hook for the
     // back-pointer invariant Block::replacePage() maintains.

@@ -660,12 +660,22 @@ class BaseWorker(GenerationExecutor):
         if validator is not None:
             validator(tags)
 
+    def _validate_sleep_config(self, tags: list[ExecutorMemoryType]) -> None:
+        validator = getattr(self.engine, "validate_sleep_config", None)
+        if validator is not None:
+            validator(tags)
+
     def _invalidate_v1_prefix_cache_for_sleep(
             self, tags: list[ExecutorMemoryType]) -> None:
         invalidator = getattr(self.engine,
                               "invalidate_v1_prefix_cache_for_sleep", None)
         if invalidator is not None:
             invalidator(tags)
+
+    def _validate_memory_release(self, tags: list[ExecutorMemoryType]) -> None:
+        validator = getattr(self.engine, "validate_memory_release", None)
+        if validator is not None:
+            validator(tags)
 
     def _multi_rank_sleep_wakeup(
         self,
@@ -686,9 +696,10 @@ class BaseWorker(GenerationExecutor):
         3. When native MNNVL MoE resources are selected, send COMMIT to every
            prepared peer before rank-0 enters the subgroup checkpoint
            collectives. Otherwise execute the local VMM operation first.
-        4. Execute the selected VMM and MNNVL operations and collect bounded
-           COMMIT ACKs. If PREPARE or the initial rank-0 synchronization fails,
-           send ABORT before any rank changes VMM state. Once COMMIT or local
+        4. Execute the selected VMM and MNNVL operations and collect COMMIT ACKs.
+           Wake reconstruction has no fixed deadline. If PREPARE or the initial
+           rank-0 synchronization fails, send ABORT before any rank changes VMM
+           state. Once COMMIT or local
            mutation starts, any error fail-stops the distributed worker because
            rank state can no longer be reconciled safely.
         5. Exit ``control_action()`` only after a successful operation or a
@@ -703,8 +714,8 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm._torch.pyexecutor.py_executor import (
             _SLEEP_WAKEUP_ACK_TIMEOUT_S, _recv_sleep_wakeup_ack_until,
             _SleepWakeupAction, _SleepWakeupTag)
-        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
-                                                        release_with_tag)
+        from tensorrt_llm._torch.virtual_memory import (
+            MemoryReleaseAbortedError, materialize_with_tag, release_with_tag)
 
         if self.rank != 0:
             raise RuntimeError(
@@ -791,7 +802,11 @@ class BaseWorker(GenerationExecutor):
                            phase: _SleepWakeupAction) -> list[dict]:
                 nonlocal abort_incomplete
                 received_acks = []
-                ack_deadline = time.monotonic() + _SLEEP_WAKEUP_ACK_TIMEOUT_S
+                ack_deadline: Optional[float] = time.monotonic(
+                ) + _SLEEP_WAKEUP_ACK_TIMEOUT_S
+                if target_action == _SleepWakeupAction.WAKEUP and phase == _SleepWakeupAction.COMMIT:
+                    # Rebuilding large host tiers has no fixed completion bound.
+                    ack_deadline = None
                 for src in ranks:
                     try:
                         ack = _recv_sleep_wakeup_ack_until(sleep_wakeup_comm,
@@ -876,6 +891,10 @@ class BaseWorker(GenerationExecutor):
                         ack.get("has_mnnvl_resources", False)
                         for ack in prepare_acks)
 
+                if not errors and action == _SleepWakeupAction.SLEEP:
+                    self._validate_sleep_config(tags)
+                    self._validate_memory_release(tags)
+
                 if not errors:
                     # MNNVL resource hooks contain subgroup handle exchange,
                     # so peers must enter COMMIT before rank 0 executes them.
@@ -895,12 +914,12 @@ class BaseWorker(GenerationExecutor):
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
                         self._invalidate_v1_prefix_cache_for_sleep(tags)
-                        release_with_tag(*tags)
+                        release_with_tag(*tags, resource=self.engine)
                         torch.cuda.synchronize()
                         gc.collect()
                         torch.cuda.empty_cache()
                     else:
-                        materialize_with_tag(*tags)
+                        materialize_with_tag(*tags, resource=self.engine)
                         torch.cuda.synchronize()
                         run_mnnvl = (getattr(
                             self.engine, "_run_mnnvl_checkpoint_resources",
@@ -908,6 +927,10 @@ class BaseWorker(GenerationExecutor):
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
             except Exception as exc:
+                if isinstance(
+                        exc, MemoryReleaseAbortedError
+                ) and not has_mnnvl_resources and not exc.reuse_state_changed:
+                    local_commit_started = False
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
                 logger.error(f"_multi_rank_sleep_wakeup: {local_error}")
@@ -1007,7 +1030,7 @@ class BaseWorker(GenerationExecutor):
         return [tag for tag in tags if tag in parked_tags]
 
     def sleep(self, sleep_tags: list[str]) -> None:
-        """Release GPU virtual memory for the specified memory type tags.
+        """Release GPU memory for the specified memory type tags.
 
         Supports both single-rank (``world_size == 1``) and multi-rank
         (TP/PP > 1) MPI executor deployments.  For multi-rank, a lightweight
@@ -1019,11 +1042,11 @@ class BaseWorker(GenerationExecutor):
         pause rank-0's event loop, matching the ``@control_action_decorator``
         behaviour used in the Ray executor.
 
-        Only allocations backed by virtual memory (VMM) and registered under
-        the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
-        released.  Components using alternative memory management (e.g.
-        ``LoadFormat.GMS``-managed weights) are not VMM-tagged and will be
-        silently skipped by ``release_with_tag``.
+        Releases runtime virtual-memory allocations and native KV cache V2
+        pools registered under the active
+        :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig`. Components without
+        tagged sleep support (e.g. ``LoadFormat.GMS``-managed weights) are
+        skipped by ``release_with_tag``.
 
         Args:
             sleep_tags: List of
@@ -1032,7 +1055,7 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None. The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been released on every rank and request
+            tagged allocations have been released on every rank and request
             admission remains closed until ``wakeup()`` succeeds.
 
         Raises:
@@ -1041,13 +1064,15 @@ class BaseWorker(GenerationExecutor):
         """
         self._check_sleep_wakeup_preconditions("sleep")
 
-        from tensorrt_llm._torch.virtual_memory import release_with_tag
+        from tensorrt_llm._torch.virtual_memory import (
+            MemoryReleaseAbortedError, release_with_tag)
 
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
         tags = self._prepare_sleep_tags(tags)
         if not tags:
             return
         self._validate_sleep_tags(tags)
+        self._validate_sleep_config(tags)
         logger.info(f"Sleep: {tags}")
         self.engine.begin_sleep_transition(tags)
         local_mutation_started = False
@@ -1058,14 +1083,17 @@ class BaseWorker(GenerationExecutor):
                 with self.engine._sleep_wakeup_lock, self.engine.control_action(
                 ):
                     torch.cuda.synchronize()
+                    self._validate_sleep_config(tags)
+                    self._validate_memory_release(tags)
                     local_mutation_started = True
                     self._invalidate_v1_prefix_cache_for_sleep(tags)
-                    release_with_tag(*tags)
+                    release_with_tag(*tags, resource=self.engine)
                     torch.cuda.synchronize()
                     gc.collect()
                     torch.cuda.empty_cache()
-        except Exception:
-            if local_mutation_started:
+        except Exception as error:
+            if local_mutation_started and not isinstance(
+                    error, MemoryReleaseAbortedError):
                 self.engine.fail_sleep_wakeup_transition()
             self.engine.abort_sleep_transition()
             raise
@@ -1076,11 +1104,11 @@ class BaseWorker(GenerationExecutor):
             raise
 
     def wakeup(self, wakeup_tags: list[str]) -> None:
-        """Materialize GPU virtual memory for the specified memory type tags.
+        """Materialize GPU memory for the specified memory type tags.
 
         Supports both single-rank (``world_size == 1``) and multi-rank
         (TP/PP > 1) MPI executor deployments.  See :meth:`sleep` for details
-        on VMM scope restrictions, backend prerequisites, and multi-rank
+        on supported allocations, backend prerequisites, and multi-rank
         coordination.
 
         Args:
@@ -1090,7 +1118,7 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None. The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been materialized on every rank.
+            tagged allocations have been materialized on every rank.
             Request admission reopens once every tag from the corresponding
             sleep transition has been restored.
 
@@ -1117,7 +1145,7 @@ class BaseWorker(GenerationExecutor):
                 ):
                     torch.cuda.synchronize()
                     local_mutation_started = True
-                    materialize_with_tag(*tags)
+                    materialize_with_tag(*tags, resource=self.engine)
                     torch.cuda.synchronize()
         except Exception:
             if local_mutation_started:

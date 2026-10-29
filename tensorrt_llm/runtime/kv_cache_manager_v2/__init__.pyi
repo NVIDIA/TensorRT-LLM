@@ -66,6 +66,7 @@ class LogicError(Exception):
     """A caller broke a precondition the API states, such as seating a cache twice."""
 
 class OutOfPagesError(Exception): ...
+class ResourceBusyError(Exception): ...
 
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
@@ -716,6 +717,7 @@ class _Status(enum.Enum):
     ACTIVE = enum.auto()
     SUSPENDED = enum.auto()
     CLOSED = enum.auto()
+    UNMATERIALIZED = enum.auto()
 
 KvCacheStatus: TypeAlias = _Status
 
@@ -782,8 +784,8 @@ class _KVCache:
         """Row this cache occupies in its :class:`Batch`, or ``None`` when it belongs to none.
 
         Also the answer to who owns its page index buffers: a member's are the batch's
-        rows, so :meth:`set_base_page_index_buf` refuses and ``suspend()`` leaves them
-        bound rather than copying them back out.
+        rows. Both :meth:`set_base_page_index_buf` and :meth:`suspend` reject a
+        seated cache; remove it from the Batch before those operations.
         """
     def commit_pending_stats(self) -> KVCacheStatsDelta: ...
     def discard_pending_stats(self) -> None: ...
@@ -1267,12 +1269,12 @@ class Batch:
 
     @property
     def sparse_arena_bytes(self) -> int:
-        """Device bytes every life cycle's sparse arena holds, ``0`` without sparse offload.
+        """Logical bytes of every life cycle's sparse arena, ``0`` without sparse offload.
 
         The arenas sit outside the cache tiers' quota, so a caller budgeting device memory
         accounts for them separately and otherwise has to predict the layout to do so. This
-        reports what was actually allocated, which makes that prediction checkable rather
-        than something only a profiler disagrees with.
+        excludes VMM chunk rounding and remains nonzero while backing is released.
+        It does not measure current physical residency.
         """
 
     @property
@@ -1732,7 +1734,53 @@ class KVCacheManager:
     ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
-    def clear_reusable_blocks(self) -> None: ...
+    def clear_reusable_blocks(self) -> None:
+        """Clear prefixes after draining users; private noncommitting padding may remain.
+
+        Raises RuntimeError if any other cache is open. Does not free pool backing.
+        """
+        ...
+    def release_gpu_memory(self, discard: bool = False) -> None:
+        """Release native backing after owner-thread and GPU work is quiescent.
+
+        Args:
+            discard: Drop KV contents and HOST backing as well as GPU backing.
+                Only stats-excluded, uncommitted internal caches may survive.
+                Otherwise preserve held pages through configured cold tiers;
+                reusable pages are best effort.
+
+        Repeating the same released mode is a no-op. Changing that mode raises
+        RuntimeError. Capacity or allocation failure may require recovery; check
+        is_memory_ready before reusing resources. A recovered release need not
+        preserve the prior reuse epoch. No remote registration fencing is provided.
+        """
+        ...
+    def validate_memory_release(self, discard: bool = False) -> None:
+        """Check ownership and held-page capacity without suspending caches.
+
+        This does not reserve capacity or guarantee later allocations succeed.
+        Requires quiescent owners. Raises OutOfPagesError for insufficient cold
+        capacity and RuntimeError for invalid ownership or a pending transition.
+        """
+        ...
+    def is_memory_ready(self) -> bool:
+        """Whether native backing and bindings are active, not serving readiness."""
+        ...
+    def get_reuse_state_version(self) -> int:
+        """Reuse epoch; advances on reset and before preserve-mode sleep eviction."""
+        ...
+    def materialize_gpu_memory(self, zero: bool = False) -> None:
+        """Rebuild backing and graph-visible bindings while admission stays closed.
+
+        Args:
+            zero: Initialize fresh GPU backing before restoring preserved pages.
+
+        Active memory is a no-op. A retry must keep the same zero mode. Slot
+        indices may change even though reserved virtual addresses remain stable.
+        Allocation failures propagate; this call establishes no distributed
+        serving or external-registration validity.
+        """
+        ...
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
     ) -> MemAddress: ...

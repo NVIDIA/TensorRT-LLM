@@ -4505,6 +4505,329 @@ def test_reset_prefix_cache_preserves_routes_only_if_native_clear_fails(failure_
     assert bool(route_capture._shared) == (failure_stage == "native_clear")
 
 
+@pytest.mark.parametrize("estimating", [False, True])
+def test_sleep_routes_native_kv_memory_around_runtime_vmm(monkeypatch, estimating):
+    from tensorrt_llm._torch import virtual_memory
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    stub = object.__new__(PyExecutor)
+    stub._is_kv_manager_v2 = True
+    stub._sleeping_memory_tags = set()
+    stub.llm_args = types.SimpleNamespace(
+        sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: "CPU"})
+    )
+    main = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
+    draft = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=estimating)
+    # Aliased managers are released once.
+    managers = {"main": main, "alias": main, "draft": draft, "spec": Mock()}
+    stub.resource_manager = types.SimpleNamespace(resource_managers=managers)
+    events = []
+    for manager in (main, draft):
+        manager.release_memory.side_effect = lambda _: events.append("native_release")
+        manager.materialize_memory.side_effect = lambda: events.append("native_materialize")
+    runtime = Mock()
+    runtime.release_with_tag.side_effect = lambda _: events.append("runtime_release") or 1
+    runtime.materialize_with_tag.side_effect = lambda _: events.append("runtime_materialize") or 1
+    monkeypatch.setattr(virtual_memory, "get_virtual_memory_manager", lambda: runtime)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    tags = [ExecutorMemoryType.KV_CACHE]
+
+    stub.validate_sleep_config(tags)
+    stub.validate_memory_release(tags)
+    for manager in (main, draft):
+        manager.validate_sleep_config.assert_called_once_with(virtual_memory.RestoreMode.CPU)
+        manager.validate_memory_release.assert_called_once_with(virtual_memory.RestoreMode.CPU)
+    virtual_memory.release_with_tag(*tags, resource=stub)
+    virtual_memory.materialize_with_tag(*tags, resource=stub)
+
+    # Native pools are released before, and restored after, the tagged runtime allocations.
+    assert events == [
+        "native_release",
+        "native_release",
+        "runtime_release",
+        "runtime_materialize",
+        "native_materialize",
+        "native_materialize",
+    ]
+    assert not stub._sleeping_memory_tags
+
+
+@pytest.mark.parametrize("main_is_v2", [False, True])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_mixed_kv_managers_reject_kv_sleep_but_allow_weight_sleep(
+    main_is_v2: bool, hybrid: bool
+) -> None:
+    """Neither target/draft ordering can bypass the mixed-manager safety check."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        CppMambaHybridCacheManager,
+    )
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = main_is_v2
+    legacy_class = CppMambaHybridCacheManager if hybrid else KVCacheManager
+    classes = [KVCacheManagerV2, legacy_class] if main_is_v2 else [legacy_class, KVCacheManagerV2]
+    executor.resource_manager = types.SimpleNamespace(
+        resource_managers={name: Mock(spec=cls) for name, cls in zip(("main", "draft"), classes)}
+    )
+    executor.validate_sleep_tags([ExecutorMemoryType.MODEL_ENGINE_MAIN])
+    with pytest.raises(ValueError, match="mixed V1/V2"):
+        executor.validate_sleep_tags([ExecutorMemoryType.KV_CACHE])
+
+
+def test_native_hybrid_manager_is_not_misclassified_as_v1() -> None:
+    """Common Mamba inheritance does not make a native V2 manager a V1 resource."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        MambaHybridCacheManagerV2,
+    )
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+    executor = object.__new__(PyExecutor)
+    executor.resource_manager = types.SimpleNamespace(
+        resource_managers={"main": Mock(spec=MambaHybridCacheManagerV2)}
+    )
+    executor.kv_cache_transceiver = None
+    executor.kv_connector_manager = None
+    executor.validate_sleep_tags([ExecutorMemoryType.KV_CACHE])
+
+
+def test_sleep_validation_collects_errors_from_all_unique_managers() -> None:
+    """Preflight reports every manager error, including retained estimators, once."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor.llm_args = types.SimpleNamespace(sleep_config=SleepConfig())
+    managers = {
+        name: Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=name == "estimate")
+        for name in ("main", "draft", "estimate")
+    }
+    for name, manager in managers.items():
+        manager.validate_sleep_config.side_effect = ValueError(f"{name} rejected")
+    executor.resource_manager = types.SimpleNamespace(
+        resource_managers={**managers, "main_alias": managers["main"]}
+    )
+
+    with pytest.raises(ValueError) as caught:
+        executor.validate_sleep_config([ExecutorMemoryType.KV_CACHE])
+
+    assert str(caught.value) == (
+        "Invalid sleep configuration: main rejected; draft rejected; estimate rejected"
+    )
+    mode = executor.llm_args.sleep_config.restore_modes[ExecutorMemoryType.KV_CACHE]
+    for manager in managers.values():
+        manager.validate_sleep_config.assert_called_once_with(mode)
+        manager.release_memory.assert_not_called()
+
+
+@pytest.mark.parametrize("validation", ["validate_sleep_config", "validate_memory_release"])
+def test_estimation_manager_cannot_bypass_sleep_preflight(validation):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor.llm_args = types.SimpleNamespace(sleep_config=SleepConfig())
+    manager = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=True)
+    executor.resource_manager = types.SimpleNamespace(resource_managers={"estimate": manager})
+    getattr(manager, validation).side_effect = ValueError("capacity or ownership check failed")
+    with pytest.raises(ValueError, match="capacity or ownership check failed"):
+        getattr(executor, validation)([ExecutorMemoryType.KV_CACHE])
+    manager.release_memory.assert_not_called()
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+@pytest.mark.parametrize("mode", ["CPU", "NONE"])
+def test_native_release_abort_restores_earlier_resources(monkeypatch, rollback_fails, mode):
+    from tensorrt_llm._torch import virtual_memory
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor._sleeping_memory_tags = {ExecutorMemoryType.MODEL_ENGINE_MAIN}
+    executor.llm_args = types.SimpleNamespace(
+        sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: mode})
+    )
+    main = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
+    draft = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
+    executor.resource_manager = types.SimpleNamespace(
+        resource_managers={"main": main, "draft": draft}
+    )
+    executor._pp_rebalance_drain_iters = 3
+    draft.release_memory.side_effect = virtual_memory.MemoryReleaseAbortedError("release recovered")
+    if rollback_fails:
+        main.materialize_memory.side_effect = RuntimeError("restore failed")
+    runtime = Mock()
+    monkeypatch.setattr(virtual_memory, "get_virtual_memory_manager", lambda: runtime)
+
+    with pytest.raises(RuntimeError) as caught:
+        virtual_memory.release_with_tag(ExecutorMemoryType.KV_CACHE, resource=executor)
+
+    main.materialize_memory.assert_called_once_with()
+    runtime.release_with_tag.assert_not_called()
+    assert isinstance(caught.value, virtual_memory.MemoryReleaseAbortedError) != rollback_fails
+    assert (ExecutorMemoryType.KV_CACHE in executor._sleeping_memory_tags) == rollback_fails
+    assert ExecutorMemoryType.MODEL_ENGINE_MAIN in executor._sleeping_memory_tags
+    assert executor._pp_rebalance_drain_iters == 3
+    if not rollback_fails:
+        assert caught.value.reuse_state_changed
+
+
+def test_native_release_wires_route_reset_to_main_manager_only(monkeypatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor._sleeping_memory_tags = set()
+    executor.llm_args = types.SimpleNamespace(sleep_config=SleepConfig())
+    main = Mock(spec=KVCacheManagerV2)
+    draft = Mock(spec=KVCacheManagerV2)
+    executor.kv_cache_manager = main
+    executor.resource_manager = types.SimpleNamespace(
+        resource_managers={"main": main, "draft": draft}
+    )
+    routes = Mock()
+    executor.model_engine = types.SimpleNamespace(route_capture=routes)
+
+    executor.release_memory((ExecutorMemoryType.KV_CACHE,))
+
+    mode = executor.llm_args.sleep_config.restore_modes[ExecutorMemoryType.KV_CACHE]
+    main.release_memory.assert_called_once_with(mode, on_cleared=routes.clear_shared)
+    draft.release_memory.assert_called_once_with(mode)
+
+
+@pytest.mark.parametrize("mode", ["NONE", "MEMSET", "CPU", "PINNED"])
+@pytest.mark.parametrize("outcome", ["wake", "recovered_release", "failed_release"])
+def test_sleep_recreates_internal_caches_in_order(
+    monkeypatch: pytest.MonkeyPatch, mode: str, outcome: str
+) -> None:
+    """Exercise executor ordering with native storage and GPU calls isolated."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    executor = object.__new__(PyExecutor)
+    executor._sleeping_memory_tags = set()
+    executor.llm_args = types.SimpleNamespace(
+        sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: mode})
+    )
+    manager = Mock(spec=KVCacheManagerV2)
+    manager.release_guard_page_for_sleep.side_effect = (
+        lambda: events.append("guard_release") or True
+    )
+    manager.restore_guard_page_after_sleep.side_effect = lambda: events.append("guard_restore")
+    manager.materialize_memory.side_effect = lambda: events.append("native_restore")
+    runner = Mock(spec=CUDAGraphRunner)
+    variants = ((0, 0), (2, 0), (2, 1))
+    runner.release_padding_dummies.side_effect = (
+        lambda _: events.append("dummy_release") or variants
+    )
+    runner.restore_padding_dummies.side_effect = lambda *_: events.append("dummy_restore")
+    executor.model_engine = types.SimpleNamespace(cuda_graph_runner=runner)
+    executor.draft_model_engine = executor.model_engine
+    executor.resource_manager = types.SimpleNamespace(resource_managers={"main": manager})
+
+    def release(_mode: object) -> None:
+        events.append("native_release")
+        if outcome == "recovered_release":
+            raise MemoryReleaseAbortedError("recovered")
+        if outcome == "failed_release":
+            raise RuntimeError("native failure")
+
+    manager.release_memory.side_effect = release
+    tags = (ExecutorMemoryType.KV_CACHE,)
+    if outcome == "wake":
+        executor.release_memory(tags)
+        executor.release_memory(tags)
+        executor.materialize_memory(tags)
+        executor.materialize_memory(tags)
+    else:
+        with pytest.raises(RuntimeError):
+            executor.release_memory(tags)
+
+    expected = ["sync", "dummy_release", "guard_release", "native_release"]
+    if outcome == "wake":
+        expected.append("native_restore")
+    if outcome != "failed_release":
+        expected += ["guard_restore", "dummy_restore", "sync"]
+        runner.restore_padding_dummies.assert_called_once_with(executor.resource_manager, variants)
+    else:
+        runner.restore_padding_dummies.assert_not_called()
+    assert events == expected
+    assert bool(executor._sleeping_memory_tags) == (outcome == "failed_release")
+
+
+@pytest.mark.parametrize("failure", ["guard", "dummy"])
+def test_internal_cache_rebuild_failure_does_not_complete_wake(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Rank completion remains unavailable when an internal resource is missing."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    executor = object.__new__(PyExecutor)
+    executor._sleeping_memory_tags = {ExecutorMemoryType.KV_CACHE}
+    manager = Mock(spec=KVCacheManagerV2)
+    runner = Mock(spec=CUDAGraphRunner)
+    executor.resource_manager = types.SimpleNamespace(resource_managers={"main": manager})
+    executor._sleep_guard_managers = [manager]
+    executor._sleep_padding_dummies = [(runner, ((0, 0),))]
+    target = (
+        manager.restore_guard_page_after_sleep
+        if failure == "guard"
+        else runner.restore_padding_dummies
+    )
+    target.side_effect = RuntimeError("rebuild failed")
+    with pytest.raises(RuntimeError, match="rebuild failed"):
+        executor.materialize_memory((ExecutorMemoryType.KV_CACHE,))
+    assert executor._sleeping_memory_tags == {ExecutorMemoryType.KV_CACHE}
+    assert executor._sleep_padding_dummies
+    manager.materialize_memory.assert_called_once()
+
+
+@pytest.mark.parametrize("kv_first", [False, True])
+def test_sleep_rebuild_waits_for_all_tagged_dependencies(
+    monkeypatch: pytest.MonkeyPatch, kv_first: bool
+) -> None:
+    """Padding may use speculative buffers outside the KV tag."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    executor = object.__new__(PyExecutor)
+    kv = ExecutorMemoryType.KV_CACHE
+    engine = ExecutorMemoryType.MODEL_ENGINE_MAIN
+    executor._sleeping_memory_tags = {kv, engine}
+    manager = Mock(spec=KVCacheManagerV2)
+    runner = Mock(spec=CUDAGraphRunner)
+    executor.resource_manager = types.SimpleNamespace(resource_managers={"main": manager})
+    executor._sleep_guard_managers = [manager]
+    executor._sleep_padding_dummies = [(runner, ((0, 0),))]
+    first, last = (kv, engine) if kv_first else (engine, kv)
+    executor.materialize_memory((first,))
+    assert executor._sleeping_memory_tags == {last}
+    runner.restore_padding_dummies.assert_not_called()
+    manager.restore_guard_page_after_sleep.assert_not_called()
+    executor.materialize_memory((last,))
+    manager.materialize_memory.assert_called_once()
+    runner.restore_padding_dummies.assert_called_once()
+    assert not executor._sleeping_memory_tags
+
+
 class TestPendingTransferResponseFlush:
     def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
         """A lone fatal rank must fail locally rather than desynchronize TP."""

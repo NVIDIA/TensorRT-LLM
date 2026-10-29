@@ -31,6 +31,8 @@ def _make_server(enabled: bool) -> OpenAIServer:
     server.app = FastAPI()
     server.generator = object.__new__(AsyncLLM)
     server.generator.collective_rpc = AsyncMock()
+    server.generator.release = AsyncMock()
+    server.generator.resume = AsyncMock()
     server._enable_rl_control_endpoints = enabled
     server._rl_control_api_key = "secret"
     server._register_rl_control_routes()
@@ -94,6 +96,7 @@ def test_rl_control_routes_require_auth(endpoint):
 
     assert response.status_code == 401
     server.generator.collective_rpc.assert_not_awaited()
+    server.generator.release.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -112,6 +115,7 @@ def test_rl_control_routes_reject_wrong_key(endpoint):
 
     assert response.status_code == 401
     server.generator.collective_rpc.assert_not_awaited()
+    server.generator.release.assert_not_awaited()
 
 
 def test_rl_control_routes_reject_non_ascii_signature():
@@ -129,6 +133,7 @@ def test_rl_control_routes_reject_non_ascii_signature():
 
     assert response.status_code == 401
     server.generator.collective_rpc.assert_not_awaited()
+    server.generator.release.assert_not_awaited()
 
 
 def test_rl_control_routes_reject_signature_for_different_body():
@@ -146,13 +151,12 @@ def test_rl_control_routes_reject_signature_for_different_body():
 
     assert response.status_code == 401
     server.generator.collective_rpc.assert_not_awaited()
+    server.generator.release.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
     ("endpoint", "payload", "rpc_name", "rpc_args"),
     [
-        ("/release_memory", {"tags": ["kv_cache"]}, "sleep", (["kv_cache"],)),
-        ("/resume_memory", {"tags": ["model"]}, "wakeup", (["model"],)),
         ("/update_weights", {"weights": None}, "update_weights", (None,)),
     ],
 )
@@ -166,6 +170,16 @@ def test_rl_control_routes_accept_valid_signature(endpoint, payload, rpc_name, r
     server.generator.collective_rpc.assert_awaited_once_with(rpc_name, args=rpc_args)
 
 
+@pytest.mark.parametrize("method", ["release", "resume"])
+def test_memory_control_uses_normalized_api_with_valid_signature(method: str):
+    server = _make_server(enabled=True)
+    with TestClient(server.app) as client:
+        response = _post_signed(client, f"/{method}_memory", {"tags": ["kv_cache"]})
+    assert response.status_code == 200
+    getattr(server.generator, method).assert_awaited_once_with(["kv_cache"])
+    server.generator.collective_rpc.assert_not_awaited()
+
+
 def test_release_memory_requires_tags():
     server = _make_server(enabled=True)
 
@@ -174,3 +188,4 @@ def test_release_memory_requires_tags():
 
     assert response.status_code == 422
     server.generator.collective_rpc.assert_not_awaited()
+    server.generator.release.assert_not_awaited()

@@ -17,11 +17,13 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/utils/typedIndex.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -274,8 +276,8 @@ public:
         return mShape.pools.at(static_cast<size_t>(pool.value())).second * mShape.cellsPerBuffer;
     }
 
-    //! Device bytes this arena holds: every pool's cell region and over-read tail, the state
-    //! its leases share, and one metadata block per lease -- the whole allocation.
+    //! Logical arena bytes: pool cells and over-read tails, shared lease state, and per-lease metadata.
+    //! Excludes VMM chunk rounding and does not report current physical residency.
     [[nodiscard]] size_t numBytes() const noexcept
     {
         return mNumBytes;
@@ -285,6 +287,16 @@ public:
     //! becomes free. The slot is the Batch row's own, and one row's slot serves every life
     //! cycle.
     void initialiseLease(SparseLeaseIndex slot, CUstream stream);
+
+    //! Release physical cells at their stable virtual address. Preserving sleep retains
+    //! the bounded working set, including units not yet written to the host pages.
+    void releaseMemory(bool discard);
+
+    //! Save the working set while the original backing remains intact.
+    void prepareMemoryRelease(bool discard);
+    void cancelMemoryRelease() noexcept;
+    //! Remap cells and restore their contents, or reset discarded residency metadata.
+    void materializeMemory(bool zero);
 
     //! Copy a slot's resident ordinals back to the host, for debugging and introspection
     //! only. Not on any serving path: it synchronises the device to pick up whatever a
@@ -302,7 +314,19 @@ public:
     }
 
 private:
-    CudaUniqPtr<> mMemory;
+    void _initializeMetadata();
+
+    // Keep the allocator and its borrowing mapping together across moves.
+    struct ArenaMemory
+    {
+        explicit ArenaMemory(size_t bytes);
+        PooledPhysMemAllocator allocator;
+        VirtMem mapping;
+    };
+
+    std::unique_ptr<ArenaMemory> mMemory;
+    std::vector<std::byte> mSleepContents;
+    bool mSleeping = false;
     SparseCacheInit mShape;
     //! Slots this arena was sized for, which every lease index must fall inside.
     int mMaxLeases = 0;
