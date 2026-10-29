@@ -219,6 +219,7 @@ l0_cpu:
   - unittest/grpc/openengine/test_multimodal.py
   - unittest/grpc/openengine/test_node.py
   - unittest/grpc/openengine/test_openengine.py
+  - unittest/grpc/openengine/test_metrics.py
   - unittest/grpc/openengine/test_servicer.py
   - unittest/grpc/smg/test_smg.py::test_streaming_deltas_preserve_sequences_logprobs_and_final_tokens
   - unittest/grpc/smg/test_smg.py::test_streaming_empty_token_history
