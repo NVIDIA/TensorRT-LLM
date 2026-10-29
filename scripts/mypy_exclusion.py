@@ -51,13 +51,13 @@ def use_explicit_sources_only(config_path: Path) -> None:
 
 def load_exclusions(
     config_path: Path,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Load the exclusion sections and reject malformed entries."""
     try:
         config = json.loads(config_path.read_text())
     except json.JSONDecodeError as error:
         raise ValueError(f"{config_path}: invalid JSON: {error}") from error
-    section_names = ("paths", "third_party_symbols", "imported_symbols")
+    section_names = ("paths", "symbols")
     if not isinstance(config, dict) or set(config) != set(section_names):
         raise ValueError(f"{config_path}: expected {', '.join(section_names)} sections")
     sections: list[tuple[str, ...]] = []
@@ -70,17 +70,12 @@ def load_exclusions(
         if len(entries) != len(set(entries)):
             raise ValueError(f"{config_path}: duplicate entry in {section}")
         sections.append(tuple(entries))
-    return sections[0], sections[1], sections[2]
+    return sections[0], sections[1]
 
 
-def load_symbol_excludes(
-    config_path: Path, section: str = "third_party_symbols"
-) -> tuple[str, ...]:
+def load_symbol_excludes(config_path: Path) -> tuple[str, ...]:
     """Return validated exact qualified names and module.* patterns."""
-    if section not in ("third_party_symbols", "imported_symbols"):
-        raise ValueError(f"{config_path}: invalid symbol section: {section}")
-    _, raw_patterns, imported_patterns = load_exclusions(config_path)
-    patterns = raw_patterns if section == "third_party_symbols" else imported_patterns
+    _, patterns = load_exclusions(config_path)
     for pattern in patterns:
         if SYMBOL_PATTERN.fullmatch(pattern) is None:
             raise ValueError(f"{config_path}: invalid symbol pattern: {pattern}")
@@ -90,7 +85,7 @@ def load_symbol_excludes(
 def build_exclude_regex(config_path: Path, project_root: Path | None = None) -> str:
     """Return a mypy regex for exact files and recursively excluded directories."""
     patterns: list[str] = []
-    paths, _, _ = load_exclusions(config_path)
+    paths, _ = load_exclusions(config_path)
     for entry in paths:
         is_directory = entry.endswith("/")
         path = entry.rstrip("/")
@@ -124,16 +119,14 @@ def is_excluded_path(
         relative_path = source_path.resolve().relative_to(root.resolve())
     except ValueError:
         return False
-    return (
-        re.search(build_exclude_regex(config_path, root), relative_path.as_posix()) is not None
-    )
+    return re.search(build_exclude_regex(config_path, root), relative_path.as_posix()) is not None
 
 
 def build_import_overrides(config_path: Path, project_root: Path | None = None) -> str:
     """Keep imported excluded sources available for types without reporting errors."""
     build_exclude_regex(config_path, project_root)
     modules: list[str] = []
-    paths, _, _ = load_exclusions(config_path)
+    paths, _ = load_exclusions(config_path)
     for entry in paths:
         is_directory = entry.endswith("/")
         path = entry.rstrip("/")
@@ -426,25 +419,20 @@ def main() -> int:
         current = parse_output(output)
         if args.mypy_exit_code == 1 and not current:
             raise ValueError("mypy failed without parseable diagnostics")
-        raw_patterns = (
+        symbol_patterns = (
             load_symbol_excludes(args.exclusions_config) if args.exclusions_config else ()
-        )
-        imported_patterns = (
-            load_symbol_excludes(args.exclusions_config, "imported_symbols")
-            if args.exclusions_config
-            else ()
         )
         project_root = args.project_root or Path.cwd()
         current = filter_imported_symbol_excludes(
-            filter_symbol_excludes(current, raw_patterns), imported_patterns, project_root
+            filter_symbol_excludes(current, symbol_patterns), symbol_patterns, project_root
         )
         if args.action == "record":
             write_baseline(args.baseline, current)
             print(f"Recorded {sum(current.values())} mypy errors in {args.baseline}")
             return 0
         baseline = filter_imported_symbol_excludes(
-            filter_symbol_excludes(load_baseline(args.baseline), raw_patterns),
-            imported_patterns,
+            filter_symbol_excludes(load_baseline(args.baseline), symbol_patterns),
+            symbol_patterns,
             project_root,
         )
         return check_baseline(current, baseline, partial=args.partial)

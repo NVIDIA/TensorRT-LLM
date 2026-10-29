@@ -7,7 +7,7 @@
     "tensorrt_llm/_torch/attention/kernels/",
     "tensorrt_llm/_torch/attention/backends/prims_ts/kernels/"
   ],
-  "third_party_symbols": [
+  "symbols": [
     "etcd3.MultiEndpointEtcd3Client",
     "etcd3.Lease",
     "tl.*",
@@ -37,10 +37,7 @@
     "cv2",
     "smg_grpc_proto.generated",
     "smg_grpc_proto.*",
-    "transformers_modules"
-  ],
-  "imported_symbols": [
-    "cutlass.Constexpr",
+    "transformers_modules",
     "cutlass.GridConstant",
     "cutlass.cute.*",
     "cuda.bindings.driver.CUstream",
