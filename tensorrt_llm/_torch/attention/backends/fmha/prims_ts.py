@@ -38,7 +38,11 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .utils import get_kv_page_offset, get_multi_processor_count_for_device
+from .utils import (
+    get_kv_page_offset,
+    get_multi_processor_count_for_device,
+    has_uniform_generation_query_lengths,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.context import (
@@ -104,16 +108,14 @@ def get_paged_kv_policy_unsupported_reason(
     metadata: "TrtllmAttentionMetadata",
     *,
     allow_fp8_kv_cache: bool = False,
+    allow_linear_mla: bool = False,
 ) -> Optional[str]:
     """Return why the request's decoding policy is outside the fixed page-table envelope."""
     if metadata.beam_width != 1:
         return "beam search is not supported."
-    if (
-        metadata.is_spec_decoding_enabled
-        or metadata.use_spec_decoding
-        or metadata.is_spec_dec_tree
-        or metadata.is_spec_dec_dynamic_tree
-    ):
+    if metadata.is_spec_dec_tree or metadata.is_spec_dec_dynamic_tree:
+        return "tree speculative decoding is not supported."
+    if not allow_linear_mla and (metadata.is_spec_decoding_enabled or metadata.use_spec_decoding):
         return "speculative decoding is not supported by the initial adapter."
     position_embedding_type = int(attn.position_embedding_type)
     if position_embedding_type in (4, 5, 6, 7, 10):
@@ -138,9 +140,11 @@ def get_paged_kv_policy_unsupported_reason(
 def get_attention_feature_unsupported_reason(
     metadata: "TrtllmAttentionMetadata",
     forward_args: "AttentionForwardArgs",
+    *,
+    allow_helix: bool = False,
 ) -> Optional[str]:
     """Return which optional attention feature the fused-kernel adapters do not implement."""
-    if metadata.helix_position_offsets is not None:
+    if metadata.helix_position_offsets is not None and not allow_helix:
         return "Helix parallelism is not supported."
     if forward_args.relative_attention_bias is not None:
         return "relative attention bias is not supported."
@@ -178,14 +182,13 @@ class PrimsTSFmha(PhasedFmha):
         # the manager itself.
         self._kv_page_offset_cache: dict[tuple[int, int], int] = {}
         self._multi_processor_count: Optional[int] = None
-        # Every other plan attribute is fixed by this layer/model instance.
-        # Batch size is the only execution profile that needs its own wrapper.
+        # Standard-attention decode admits only single-token generation.
         self._context_wrappers: dict[int, "BatchPrefillPagedTSWrapper"] = {}
         # Cache-free context plans, keyed by (batch, seq_len, q/v/out dtype, mask).
         self._contiguous_context_wrappers: dict[tuple[Any, ...], "BatchPrefillTSWrapper"] = {}
         # VC-Attention-QK16 K/V preparation with its token permutation, one per layer.
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
-        self._mla_decode_wrappers: dict[int, "BatchMLADecodePagedTSWrapper"] = {}
+        self._mla_decode_wrappers: dict[tuple[int, int], "BatchMLADecodePagedTSWrapper"] = {}
         self._mla_context_wrappers: dict[
             tuple[int, int, int, str, bool], "BatchPrefillTSWrapper"
         ] = {}
@@ -321,7 +324,12 @@ class PrimsTSFmha(PhasedFmha):
             return False, "sparse attention metadata is not supported."
         if meta.num_sparse_topk > 0:
             return False, "sparse attention metadata is not supported."
-        feature_reason = get_attention_feature_unsupported_reason(meta, fwd)
+        is_mla_generation = (
+            attn.is_mla_enable and fwd.attention_input_type == AttentionInputType.generation_only
+        )
+        feature_reason = get_attention_feature_unsupported_reason(
+            meta, fwd, allow_helix=is_mla_generation
+        )
         if feature_reason is not None:
             return False, feature_reason
         if fwd.sage_attn_qk_dtype is not None:
@@ -338,7 +346,9 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the attention mask is not causal or dense."
         if mask_type not in (AttentionMaskType.causal, AttentionMaskType.padding):
             return False, f"attention mask type {mask_type} is not supported."
-        policy_reason = get_paged_kv_policy_unsupported_reason(attn, meta, allow_fp8_kv_cache=True)
+        policy_reason = get_paged_kv_policy_unsupported_reason(
+            attn, meta, allow_fp8_kv_cache=True, allow_linear_mla=is_mla_generation
+        )
         if policy_reason is not None:
             return False, policy_reason
         is_mla = attn.is_mla_enable
@@ -385,6 +395,8 @@ class PrimsTSFmha(PhasedFmha):
         cache_dtype = binding_to_torch_dtype(meta.kv_cache_manager.dtype)
         if is_fp8_kv and cache_dtype != torch.float8_e4m3fn:
             return False, "FP8 attention requires an FP8 E4M3 KV cache."
+        if is_fp8_mla and getattr(meta.kv_cache_manager, "mla_kv_cache_residual_dim", 0):
+            return False, "FP8 MLA requires a full FP8 KV cache without a high-precision residual."
         if not is_fp8_kv and cache_dtype != q.dtype:
             return False, f"query and KV-cache dtypes must match, got {q.dtype} and {cache_dtype}."
         if output.dtype != q.dtype:
@@ -492,8 +504,45 @@ class PrimsTSFmha(PhasedFmha):
             num_gen_tokens <= 0 or num_generations <= 0 or num_gen_tokens % num_generations != 0
         ):
             return False, "generation tokens must be uniformly divisible across requests."
-        if has_generation and num_gen_tokens != num_generations:
+        if has_generation and not is_mla and num_gen_tokens != num_generations:
             return False, "only single-token generation is supported by the initial adapter."
+        is_helix = meta.helix_position_offsets is not None
+        if is_mla_generation:
+            seq_len_q = num_gen_tokens // num_generations
+            if seq_len_q > 1:
+                if mask_type != AttentionMaskType.causal:
+                    return False, "MLA multi-token generation requires a causal mask."
+                if not has_uniform_generation_query_lengths(meta, num_gen_tokens):
+                    return False, "MLA generation requires uniform per-request query lengths."
+            stats = fwd.softmax_stats_tensor
+            if is_helix and stats is None:
+                return False, "Helix MLA generation requires softmax statistics."
+            if stats is not None and (
+                stats.dtype != torch.float32
+                or stats.device != q.device
+                or not stats.is_contiguous()
+                or stats.shape != (num_gen_tokens, attn.num_heads, 2)
+            ):
+                return False, "MLA softmax statistics must be contiguous FP32 [tokens, heads, 2]."
+            if is_helix:
+                if mask_type != AttentionMaskType.causal:
+                    return False, "Helix MLA generation requires a causal mask."
+                if meta._helix_spec_tokens_valid:
+                    bounds = meta.helix_kv_bounds
+                    if (
+                        bounds is None
+                        or bounds.dtype != torch.int32
+                        or bounds.device != q.device
+                        or bounds.ndim != 1
+                        or not bounds.is_contiguous()
+                        or bounds.numel() < num_gen_tokens
+                    ):
+                        return False, "Helix MLA requires contiguous int32 per-token KV bounds."
+                elif seq_len_q != 1:
+                    return (
+                        False,
+                        "Helix MLA multi-token generation requires valid per-token KV bounds.",
+                    )
 
         host_kv_lens = meta.kv_lens_runtime
         if host_kv_lens is None or host_kv_lens.numel() < num_contexts + num_generations:
@@ -505,7 +554,7 @@ class PrimsTSFmha(PhasedFmha):
             and mask_type == AttentionMaskType.padding
             and fwd.softmax_stats_tensor is not None
         )
-        min_kv_length = 0 if allows_empty_chunk else 1
+        min_kv_length = 0 if allows_empty_chunk or (is_mla_generation and is_helix) else 1
         if active_kv_lens.numel() == 0 or int(active_kv_lens.min()) < min_kv_length:
             return False, "every active request must contain at least one KV token."
         max_kv_length = int(active_kv_lens.max())
@@ -859,10 +908,15 @@ class PrimsTSFmha(PhasedFmha):
         kv_dtype: torch.dtype,
         output_dtype: torch.dtype,
         mask_type: str,
+        store_softmax_stats: bool = False,
+        use_kv_bounds: bool = False,
     ) -> "BatchMLADecodePagedTSWrapper":
         if batch_size <= 0:
             raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
-        wrapper = self._mla_decode_wrappers.get(batch_size)
+        # Dense MLA instances fix the cache capacity, mask, dtypes and Helix
+        # stats/bounds modes. Only batch size and verify width vary per request.
+        key = (batch_size, max_seq_len_q)
+        wrapper = self._mla_decode_wrappers.get(key)
         if wrapper is not None:
             return wrapper
         if torch.cuda.is_current_stream_capturing():
@@ -886,9 +940,11 @@ class PrimsTSFmha(PhasedFmha):
             kv_dtype=kv_dtype,
             out_dtype=output_dtype,
             mask_type=mask_type,
+            store_softmax_stats=store_softmax_stats,
+            use_kv_bounds=use_kv_bounds,
             workspace_buffer=workspace_buffer,
         )
-        self._mla_decode_wrappers[batch_size] = wrapper
+        self._mla_decode_wrappers[key] = wrapper
         return wrapper
 
     def forward(
@@ -1127,6 +1183,7 @@ class PrimsTSFmha(PhasedFmha):
                 kv_dtype=kernel_dtype,
                 out_dtype=forward_args.output.dtype,
                 mask_type=mask_type,
+                store_softmax_stats=forward_args.softmax_stats_tensor is not None,
                 device=q.device,
             )
         else:
@@ -1746,6 +1803,21 @@ class PrimsTSFmha(PhasedFmha):
             params.sequence_lengths,
             batch_size,
         )
+        kv_bounds = None
+        if meta.helix_position_offsets is not None:
+            if meta._helix_spec_tokens_valid:
+                # Helix token buffers are generation-relative, even when the
+                # batch's request metadata has a context prefix.
+                kv_bounds = meta.helix_kv_bounds[: batch_size * seq_len_q]
+            elif seq_len_q == 1:
+                # The ordinary Helix length is already rank-local and corrected
+                # on device. Reuse its view without allocating a graph buffer.
+                kv_bounds = seq_lens
+            else:
+                raise RuntimeError("Helix MLA multi-token generation requires per-token KV bounds.")
+        stats = params.fwd.softmax_stats_tensor
+        if stats is not None:
+            stats = stats.view(batch_size, seq_len_q, attn.num_heads, 2)
         caller_workspace = params.workspace.reshape(-1).view(torch.uint8)
         wrapper = self._get_or_plan_mla_decode_wrapper(
             caller_workspace,
@@ -1760,6 +1832,8 @@ class PrimsTSFmha(PhasedFmha):
             kv_dtype=kv_cache.dtype,
             output_dtype=output.dtype,
             mask_type=mask_type,
+            store_softmax_stats=stats is not None,
+            use_kv_bounds=kv_bounds is not None,
         )
         wrapper.run(
             query,
@@ -1769,6 +1843,8 @@ class PrimsTSFmha(PhasedFmha):
             out=output,
             softmax_scale=bmm1_scale,
             output_scale=bmm2_scale,
+            softmax_stats=stats,
+            kv_bounds=kv_bounds,
             validate=False,
         )
 
