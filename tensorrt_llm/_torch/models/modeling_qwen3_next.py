@@ -24,7 +24,7 @@ import copy
 import os
 from types import SimpleNamespace
 from typing import (TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional,
-                    Tuple)
+                    Tuple, Union)
 
 import torch
 
@@ -947,11 +947,20 @@ class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
         self._init_common(model_config, layer_idx, aux_stream,
                           shared_gate_stream)
 
-    def forward(self, position_ids, hidden_states, *args, **kwargs):
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: Union[torch.Tensor, _Fp8HiddenStates],
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor],
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
         if isinstance(hidden_states, _Fp8HiddenStates):
             # in_proj_qkvz's E4M3 input, made by the previous layer's all-reduce.
             hidden_states, kwargs["h_fp8"] = hidden_states
-        return super().forward(position_ids, hidden_states, *args, **kwargs)
+        return super().forward(position_ids, hidden_states, attn_metadata,
+                               residual, *args, **kwargs)
 
     def mixer_forward(self, position_ids, hidden_states, attn_metadata,
                       spec_metadata, lora_params, all_reduce_params, **kwargs):
