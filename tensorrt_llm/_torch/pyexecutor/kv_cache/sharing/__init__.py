@@ -217,10 +217,11 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
         ValueError: Already attached; CROSS cache; non-Helix context parallelism; model windows or
             recurrent state under Helix; model sparse buffers (``is_sparse``), whose pages can live
             in host memory; a non-REQUIRED attention group without a window; inconsistent groups,
-            configs or declarations, or a missing ``Role.ALL`` mapper declaration; no pages to
-            stage; ``max_bytes`` below one local fetch; a malformed region, or two of one memory
-            kind that overlap; or scope over 65535 bytes. Unmarked sparse-attention buffers are not
-            rejected as sparse.
+            configs or declarations, such as a buffer role the manager does not declare or
+            tensors that do not describe a buffer's bytes (``KVCacheManagerV2.get_page_table``);
+            no pages to stage; ``max_bytes`` below one local fetch; a malformed region, or two of
+            one memory kind that overlap; or scope over 65535 bytes. Unmarked sparse-attention
+            buffers are not rejected as sparse.
         MemoryError: Staging page-lock allocation failed."""
     from ._lender import _attach_lender as _attach
 
