@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import pickle
 import sys
 import weakref
 from dataclasses import dataclass
 from functools import partial
+from types import SimpleNamespace
 from typing import Optional
 
 import _torch.attention.multi_gpu.helix_test_utils as helix_utils
@@ -35,6 +37,7 @@ from _torch.attention.multi_gpu.helix_test_utils import (
     split_inputs_for_rank,
 )
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -94,6 +97,9 @@ class Scenario:
     # a lot of precision and we're using bf16 here.
     atol: float = 1e-1
     rtol: float = 5e-2
+    # Give the module every head's V weight, so generation applies the V
+    # up-projection before the CP all-to-all.
+    helix_v_up: bool = False
 
     @property
     def max_position_embeddings(self) -> int:
@@ -358,9 +364,12 @@ def _run_mla_distributed(
         dtype=scenario.dtype,
         config=config,
     ).cuda()
+    full_v_b_proj = weights["v_b_proj"]
     copy_weights_for_cp(weights, "o_proj.weight", 1, rank, world_size)
     copy_weights_for_cp(weights, "v_b_proj", 0, rank, world_size)
     mla.load_state_dict(weights)
+    if scenario.helix_v_up:
+        mla._bind_helix_v_up_weight(full_v_b_proj.to(device="cuda", dtype=scenario.dtype))
 
     # Set up KVCacheManager and attn_metadata for distributed.
     kv_cache_manager, attn_metadata = setup_kv_and_metadata(
@@ -377,13 +386,11 @@ def _run_mla_distributed(
         input_ctx, position_ids_ctx, scenario, rank, world_size
     )
 
-    # Context step — populate KV cache only; output is discarded.
-    # We call forward_impl directly instead of mla.forward() because
-    # o_proj is sized for helix-gen (num_heads_tp_cp * v_head_dim) and would
-    # crash on the full-width context attention output.
+    # This decode fixture populates each rank's cache from a different token
+    # chunk. Complete, replicated-input prefill outputs are checked separately.
     activate_all_ranks_for_context(attn_metadata, position_ids_ctx_rank)
     ctx_output = input_ctx_rank.new_empty(
-        [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim], dtype=input_ctx_rank.dtype
+        [input_ctx_rank.shape[0], mla.mha.num_heads * mla.v_head_dim], dtype=input_ctx_rank.dtype
     )
     mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, attn_output=[ctx_output])
 
@@ -577,3 +584,263 @@ def test_mla_helix_fifo_v2_unaligned_softmax_stats():
     # row, exercising the float2 fallback used by Kimi K3 over CP32.
     scenario = Scenario(num_heads=6, num_kv_heads=6, batch=1, ctx_len=64)
     run_helix_test(_full_test_multi_gpu, scenario, "fifo_v2")
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "scenario",
+    [dataclasses.replace(s, helix_v_up=True) for s in test_scenarios],
+    ids=lambda x: f"scenario: {x}",
+)
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v1", "fifo_v2"])
+def test_mla_helix_v_up_before_alltoall(scenario: Scenario, comms_medium: str):
+    run_helix_test(_full_test_multi_gpu, scenario, comms_medium)
+
+
+def _v_up_projector(num_heads: int, kv_lora_rank: int, v_head_dim: int, v_full: torch.Tensor):
+    """The fields of an MLA module that ``MLA._helix_project_v_partials`` reads."""
+    module = SimpleNamespace(
+        num_heads_tp=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        helix_v_b_proj_full=v_full,
+        use_cute_dsl_bf16_bmm=False,
+    )
+    module._bmm_bf16_out = partial(MLA._bmm_bf16_out, module)
+    return module
+
+
+def _v_up_builder(kv_b_weight, kv_b_scale, *, num_heads, cp_size, cp_rank, nope, v, k):
+    """The fields of an MLA module that ``MLA._build_helix_v_up_weight`` reads."""
+    module = SimpleNamespace(
+        mapping=SimpleNamespace(has_cp_helix=lambda: True, cp_rank=cp_rank),
+        dtype=torch.bfloat16,
+        kv_b_proj=SimpleNamespace(
+            weight=kv_b_weight,
+            weight_scale=kv_b_scale,
+            partition_plan=SimpleNamespace(enabled=False, op_kind=None),
+        ),
+        num_heads_tp=num_heads,
+        num_heads_tp_cp=num_heads // cp_size,
+        qk_nope_head_dim=nope,
+        v_head_dim=v,
+        kv_lora_rank=k,
+        v_b_proj_dequant=None,
+        helix_v_b_proj_full=None,
+        _helix_v_up_before_exchange=False,
+    )
+    module._bind_helix_v_up_weight = partial(MLA._bind_helix_v_up_weight, module)
+    return module
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_helix_v_up_weight_from_fp8_kv_b(cp_rank: int):
+    """MLA dequantizes every tp-local head's V weight from the loaded FP8 kv_b_proj; this rank's
+    dequantized V chunk becomes a view of it."""
+    h, n, v, k, cp = 4, 128, 128, 256, 2
+    generator = torch.Generator().manual_seed(cp_rank)
+    weight = (torch.randn(h * (n + v), k, generator=generator) * 64).to(torch.float8_e4m3fn)
+    scale = torch.rand(h * (n + v) // 128, k // 128, generator=generator) + 0.5
+    module = _v_up_builder(
+        weight, scale, num_heads=h, cp_size=cp, cp_rank=cp_rank, nope=n, v=v, k=k
+    )
+    module.v_b_proj_dequant = torch.empty(h // cp, v, k, dtype=torch.bfloat16)
+    MLA._build_helix_v_up_weight(module)
+
+    value_codes = weight[h * n :].view(h, v, k)
+    value_scale = scale[h * n // 128 :].view(h, v // 128, k // 128)
+    expanded = value_scale.repeat_interleave(128, 1).repeat_interleave(128, 2)
+    full = (value_codes.float() * expanded).to(torch.bfloat16)
+    assert module._helix_v_up_before_exchange
+    assert torch.equal(module.helix_v_b_proj_full, full)
+    chunk = slice(cp_rank * h // cp, (cp_rank + 1) * h // cp)
+    assert torch.equal(module.v_b_proj_dequant, full[chunk])
+    assert (
+        module.v_b_proj_dequant.untyped_storage().data_ptr()
+        == module.helix_v_b_proj_full.untyped_storage().data_ptr()
+    )
+
+
+def test_helix_v_up_weight_views_bf16_kv_b():
+    h, n, v, k = 4, 64, 128, 256
+    weight = torch.randn(h * (n + v), k, dtype=torch.bfloat16)
+    module = _v_up_builder(weight, None, num_heads=h, cp_size=2, cp_rank=0, nope=n, v=v, k=k)
+    MLA._build_helix_v_up_weight(module)
+    assert module._helix_v_up_before_exchange
+    assert torch.equal(module.helix_v_b_proj_full, weight[h * n :].view(h, v, k))
+    assert module.helix_v_b_proj_full.data_ptr() == weight[h * n :].data_ptr()
+
+
+def test_helix_v_up_weight_needs_loaded_fp8_scales():
+    """A kv_b_proj whose scales are already in a GEMM layout keeps V after the exchange."""
+    h, n, v, k = 4, 128, 128, 256
+    weight = torch.zeros(h * (n + v), k, dtype=torch.float8_e4m3fn)
+    packed_scale = torch.zeros(k // 128 // 4 + 1, h * (n + v), dtype=torch.int32)
+    module = _v_up_builder(
+        weight, packed_scale, num_heads=h, cp_size=2, cp_rank=0, nope=n, v=v, k=k
+    )
+    MLA._build_helix_v_up_weight(module)
+    assert not module._helix_v_up_before_exchange
+    assert module.helix_v_b_proj_full is None
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("num_tokens", [1, 37, 224])
+def test_helix_v_up_commutes_with_combine(num_tokens: int):
+    """Projecting V before the CP exchange equals projecting the combined latent.
+
+    Emulates the fifo_v2 exchange of ``cp_size`` ranks on one GPU and runs the
+    combine kernel on both the latent partials (followed by the rank's V
+    shard) and the V-projected partials. The two differ only by the BF16
+    rounding of the reassociated sums.
+    """
+    torch.manual_seed(0)
+    cp_size, num_heads, kv_lora_rank, v_head_dim = 4, 16, 512, 128
+    heads_per_rank = num_heads // cp_size
+    v_full = torch.randn(num_heads, v_head_dim, kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+    v_full = v_full / kv_lora_rank**0.5
+    projector = _v_up_projector(num_heads, kv_lora_rank, v_head_dim, v_full)
+
+    # Partial outputs and (max, sum) softmax stats of every CP rank for all heads.
+    partials = [
+        torch.randn(num_tokens, num_heads * kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+        for _ in range(cp_size)
+    ]
+    stats = []
+    for _ in range(cp_size):
+        s = torch.empty(num_tokens, num_heads, 2, device="cuda", dtype=torch.float32)
+        s[..., 0].uniform_(-2.0, 2.0)
+        s[..., 1].uniform_(0.5, 4.0)
+        stats.append(s)
+    projected = [MLA._helix_project_v_partials(projector, p) for p in partials]
+
+    def gather(per_rank, rank, value_dim):
+        # What rank ``rank`` holds after the exchange: its head chunk from every rank.
+        chunks = [
+            t.view(num_tokens, cp_size, heads_per_rank * value_dim)[:, rank] for t in per_rank
+        ]
+        return torch.stack(chunks, dim=1).view(num_tokens, cp_size, heads_per_rank, value_dim)
+
+    for rank in range(cp_size):
+        gathered_stats = torch.stack(
+            [s.view(num_tokens, cp_size, heads_per_rank * 2)[:, rank] for s in stats], dim=1
+        ).view(num_tokens, cp_size, heads_per_rank, 2)
+        latent = torch.ops.trtllm.helix_post_process_native(
+            gather(partials, rank, kv_lora_rank).contiguous(), gathered_stats.contiguous(), 1.0, 1
+        ).view(num_tokens, heads_per_rank, kv_lora_rank)
+        v_shard = v_full[rank * heads_per_rank : (rank + 1) * heads_per_rank]
+        reference = torch.empty(
+            num_tokens, heads_per_rank, v_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        torch.ops.trtllm.bmm_out(
+            latent.transpose(0, 1), v_shard.transpose(1, 2), reference.transpose(0, 1)
+        )
+        result = torch.ops.trtllm.helix_post_process_native(
+            gather(projected, rank, v_head_dim).contiguous(), gathered_stats.contiguous(), 1.0, 1
+        ).view(num_tokens, heads_per_rank, v_head_dim)
+        torch.testing.assert_close(result.float(), reference.float(), rtol=2e-2, atol=2e-2)
+
+
+def _alltoall_after_v_up_gemm(rank: int, world_size: int, num_replays: int) -> int:
+    """Count wrong (token, source rank) rows of the fifo_v2 exchange of V-projected partials.
+
+    The V up-projection GEMM and the all-to-all are captured in one CUDA graph,
+    so the all-to-all launches while the GEMM still runs on the SMs
+    (programmatic dependent launch). Every replay checks the received partials
+    and softmax stats bit for bit.
+    """
+    from tensorrt_llm._torch.distributed.ops import HelixAllToAllNative
+
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        cp_size=world_size,
+        cp_config={"cp_type": CpType.HELIX, "use_nccl_for_alltoall": False, "fifo_version": 2},
+    )
+    helix = HelixAllToAllNative.get(mapping)
+    comm = MPI.COMM_WORLD
+    heads_per_rank, kv_lora_rank, v_head_dim = 24, 512, 128
+    num_heads = heads_per_rank * world_size
+    torch.manual_seed(rank)
+    v_full = (
+        torch.randn(num_heads, v_head_dim, kv_lora_rank, device="cuda") / kv_lora_rank**0.5
+    ).to(torch.bfloat16)
+    projector = _v_up_projector(num_heads, kv_lora_rank, v_head_dim, v_full)
+
+    num_bad = 0
+    for num_tokens in (224, 448):
+        latent = torch.empty(
+            num_tokens, num_heads * kv_lora_rank, device="cuda", dtype=torch.bfloat16
+        )
+        stats = torch.empty(num_tokens, num_heads, 2, device="cuda")
+        zero_kv_mask = torch.empty(num_tokens, device="cuda", dtype=torch.bool)
+
+        def fill_inputs():
+            latent.copy_(torch.randn_like(latent, dtype=torch.float32))
+            stats.copy_(torch.randn_like(stats))
+            zero_kv_mask.copy_(torch.rand(num_tokens, device="cuda") < 0.25)
+
+        def exchange():
+            partial_v = MLA._helix_project_v_partials(projector, latent)
+            partial_v_out, stats_out = helix.alltoall_native(
+                partial_v.view(num_tokens, world_size, heads_per_rank * v_head_dim),
+                stats.view(num_tokens, world_size, heads_per_rank * 2),
+                zero_kv_mask,
+            )
+            return partial_v, partial_v_out, stats_out
+
+        fill_inputs()
+        exchange()
+        torch.cuda.synchronize()
+        comm.Barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            partial_v, partial_v_out, stats_out = exchange()
+        comm.Barrier()
+        for _ in range(num_replays):
+            fill_inputs()
+            comm.Barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            # What this rank must hold: its head chunk from every rank, with the
+            # rows a source rank owns no KV for replaced by the no-op contribution.
+            sent = comm.allgather((partial_v.cpu(), stats.cpu(), zero_kv_mask.cpu()))
+            expected_v = torch.stack(
+                [p.view(num_tokens, world_size, -1)[:, rank] for p, _, _ in sent], dim=1
+            )
+            expected_stats = torch.stack(
+                [s.view(num_tokens, world_size, heads_per_rank, 2)[:, rank] for _, s, _ in sent],
+                dim=1,
+            )
+            for src, (_, _, mask) in enumerate(sent):
+                expected_v[mask, src] = 0
+                expected_stats[mask, src, :, 0] = float("-inf")
+                expected_stats[mask, src, :, 1] = 0
+            bad_rows = (partial_v_out.cpu() != expected_v).any(-1) | (
+                stats_out.cpu().view_as(expected_stats) != expected_stats
+            ).flatten(2).any(-1)
+            num_bad += int(bad_rows.sum())
+        del graph
+    return num_bad
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_helix_alltoall_after_v_up_gemm_in_cuda_graph(world_size: int):
+    """The exchange stays exact when it overlaps the V up-projection GEMM.
+
+    The receiver restores each 128-byte line's flagged u64 with ordinary
+    shared-memory stores and then writes the line out with a bulk copy, which
+    only sees those stores after a proxy fence. The overlap with the GEMM makes
+    a missing fence show up as flag values in the received partials or stats.
+    """
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} GPUs to run this test")
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(
+            helix_utils.run_single_rank,
+            *zip(*[(_alltoall_after_v_up_gemm, world_size, 20)] * world_size),
+        )
+        num_bad = list(results)
+    assert num_bad == [0] * world_size, f"wrong (token, source) rows per rank: {num_bad}"

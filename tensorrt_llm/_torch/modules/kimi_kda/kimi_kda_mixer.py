@@ -30,6 +30,7 @@ from torch import nn
 from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
+from ...cute_dsl_utils import sm_reserve
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
@@ -174,6 +175,7 @@ class KimiKDALinearAttention(nn.Module):
         allreduce_strategy=AllReduceStrategy.AUTO,
         aux_stream: Optional[torch.cuda.Stream] = None,
         model_config: Optional[ModelConfig] = None,
+        reduce_output: bool = True,
     ) -> None:
         super().__init__()
         lin = cfg.linear_attn_config
@@ -192,9 +194,11 @@ class KimiKDALinearAttention(nn.Module):
         else:
             self._kda_tp_size = 1
         self._kda_tp_rank = mapping.tp_rank if self._kda_tp_size > 1 else 0
+        # reduce_output=False returns the row-sharded o_proj partials; the
+        # caller owns the reduction (helix_a2a reduce-scatters them).
         self._o_allreduce = (
             AllReduce(mapping=mapping, strategy=allreduce_strategy, dtype=torch.bfloat16)
-            if self._kda_tp_size > 1
+            if self._kda_tp_size > 1 and reduce_output
             else None
         )
 
@@ -307,6 +311,9 @@ class KimiKDALinearAttention(nn.Module):
             use_optimized_decode=kernel_shape_ok,
             use_optimized_verify=kernel_shape_ok,
         )
+        # SMs kept out of the prefill's persistent grids for a kernel resident
+        # for the whole step; fixed before the model is built.
+        self._prefill_sm_reserve = sm_reserve()
 
         self._fuse_prefill_conv = True
 
@@ -882,6 +889,7 @@ class KimiKDALinearAttention(nn.Module):
             max_seqlen=getattr(mamba_metadata, "kda_max_seqlen", 0),
             seq_order=getattr(mamba_metadata, "kda_seq_order", None),
             cu_chunks=getattr(mamba_metadata, "kda_cu_chunks", None),
+            sm_reserve=self._prefill_sm_reserve,
         )
 
         # The packed convolution persisted the live convolution pool in place.
