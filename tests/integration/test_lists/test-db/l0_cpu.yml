@@ -15,6 +15,7 @@ l0_cpu:
   - unittest/_torch/attention/test_helix_context_slots.py
   - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_weight_slice_cache
   - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_rejects_unsupported_projection_before_forward
+  - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_dispatches_to_linear_method
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
