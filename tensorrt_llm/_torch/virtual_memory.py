@@ -11,6 +11,8 @@ from tensorrt_llm.bindings.internal.runtime import (
     get_virtual_memory_manager, pop_virtual_memory_allocator,
     push_virtual_memory_allocator)
 
+from .memory.monitor.pools import register_pool
+
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
     "materialize_with_tag"
@@ -79,6 +81,8 @@ def _scope(
         proxy = _MultiPoolProxy()
         pool = torch.cuda.MemPool(
             _get_torch_pluggable_virtual_memory_allocator())
+        # Lets the memory monitor tell this pool from a CUDA graph's.
+        register_pool(pool.id, f"sleep: {tag}")
         pool_ctx = torch.cuda.use_mem_pool(pool)
         pool_ctx.__enter__()
         proxy._add(pool)
@@ -95,6 +99,7 @@ def _scope(
         if _pool_stack:
             new_pool = torch.cuda.MemPool(
                 _get_torch_pluggable_virtual_memory_allocator())
+            register_pool(new_pool.id, "sleep: resumed parent scope")
             new_ctx = torch.cuda.use_mem_pool(new_pool)
             new_ctx.__enter__()
             _, parent_proxy = _pool_stack[-1]

@@ -104,6 +104,10 @@ class TorchReading:
 
     reserved: int | None
     live: int
+    #: Usage by pool (``pools.PoolUsage``), kind ``default``, ``graph`` or
+    #: ``mempool``. ``None`` when pools could not be read; free space is then
+    #: reported as one figure.
+    pools: tuple | None = None
 
     @property
     def footprint(self) -> int:

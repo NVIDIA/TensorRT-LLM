@@ -188,15 +188,43 @@ def _read_torch(device_index: int) -> TorchReading:
     if live is None:
         live = torch.cuda.memory_allocated(device_index)
     reserved = torch.cuda.memory_reserved(device_index)
-    return TorchReading(reserved=reserved if reserved >= live else None, live=live)
+    if reserved < live:
+        return TorchReading(reserved=None, live=live)
+    return TorchReading(reserved=reserved, live=live, pools=_pools())
 
 
-#: Tags the executor sets during startup, mapped onto report categories.
-#: A tag with no mapping is still reported, under its own name, rather than
-#: dropped -- an unmapped tag is a gap in this table, not absent memory.
+def _pools() -> tuple | None:
+    from .pools import pool_usage
+
+    try:
+        segments = torch.cuda.memory._snapshot()["segments"]
+    except Exception:  # noqa: BLE001
+        return None
+    return tuple(pool_usage(segments))
+
+
+#: Labels attached during startup, by the category they report under.
+#: ``WEIGHTS`` comes from claiming the model; the rest are the executor's
+#: creation steps (``ExecutorMemoryType`` values), each of which tags what
+#: it allocates. A step whose allocations are temporary maps to the same
+#: category as its permanent counterpart, so anything it leaks lands there.
+#: A label with no mapping is still reported, under its own name, rather
+#: than dropped -- an unmapped label is a gap in this table, not absent
+#: memory.
 _TAG_CATEGORIES = {
     "WEIGHTS": Category.WEIGHTS,
-    "SAMPLER": Category.SAMPLER,
+    "CUDA_GRAPHS": Category.CUDA_GRAPHS,
+    "model": Category.MODEL_RUNTIME,
+    "model_extra": Category.MODEL_RUNTIME,
+    "sampler": Category.SAMPLER,
+    "drafter": Category.SPECULATIVE,
+    "draft_model": Category.SPECULATIVE,
+    "spec_resource_manager": Category.SPECULATIVE,
+    "guided_decoder": Category.GUIDED_DECODER,
+    "kv_cache": Category.KV_CACHE_AUX,
+    "_no_capture_init_kv_cache": Category.KV_CACHE_AUX,
+    "executor_extra": Category.EXECUTOR_RUNTIME,
+    "_no_capture_init_extra_resources": Category.EXECUTOR_RUNTIME,
 }
 
 
@@ -210,6 +238,7 @@ def _tag_entries(by_tag: dict[str, int] | None = None) -> list[Entry]:
     an ``unattributed_live`` row from ``torch_live`` minus the tagged total,
     and emitting both would double count.
     """
+    from .startup import step_name
     from .tagging import UNTAGGED, get_frozen_map, live_bytes_by_tag
 
     if by_tag is None:
@@ -223,9 +252,13 @@ def _tag_entries(by_tag: dict[str, int] | None = None) -> list[Entry]:
                 category=_TAG_CATEGORIES.get(label, Category.TAGGED_OTHER),
                 size_bytes=size,
                 source=Source.TAG,
-                placement=Placement.TORCH_DEFAULT,
                 basis=Basis.LOGICAL,
-                owner=label,
+                owner="in use by graphs" if label == "CUDA_GRAPHS" else step_name(label),
+                placement=(
+                    Placement.TORCH_GRAPH_POOL
+                    if label == "CUDA_GRAPHS"
+                    else Placement.TORCH_DEFAULT
+                ),
             )
         )
     return entries

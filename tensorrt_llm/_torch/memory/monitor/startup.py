@@ -52,6 +52,7 @@ __all__ = [
     "record_stage",
     "set_stage_advice",
     "stages",
+    "step_name",
 ]
 
 _GIB = float(1 << 30)
@@ -148,6 +149,11 @@ def failed_stage() -> StageSample | None:
 
 def memory_plan() -> MemoryPlan | None:
     return _plan
+
+
+def step_name(stage: str) -> str:
+    """The executor's own name for a creation step, or ``stage`` itself."""
+    return _names.get(stage, stage)
 
 
 def advice_for_stage(stage: str) -> str | None:
