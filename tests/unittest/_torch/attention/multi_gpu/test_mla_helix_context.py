@@ -38,6 +38,7 @@ from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization import QuantMode
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 cloudpickle.register_pickle_by_value(helix_utils)
@@ -476,17 +477,49 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
                     latent_cache=latent,
                 )
             torch.testing.assert_close(cache.float(), saved_cache.float(), atol=0, rtol=0)
+        table = mixer.mha.rotary_cos_sin
+        saved_table = table.clone()
+        positions = torch.arange(table.numel() // (2 * mixer.qk_rope_head_dim), device=table.device)
+        pair_indices = torch.arange(mixer.qk_rope_head_dim // 2, device=table.device)
+        # Include the page number: position % 4 aliases 64-token compaction.
+        # Signed quarter turns keep BF16 rotations and FP8 cache checks exact.
+        turns = (positions[:, None] // page + positions[:, None] % page + pair_indices) % 4
+        cos_sin = torch.stack(
+            (
+                (turns == 0).float() - (turns == 2).float(),
+                (turns == 1).float() - (turns == 3).float(),
+            ),
+            dim=-1,
+        )
+        global_positions = torch.tensor(
+            [g for length in prefill_lengths for g in range(length - chunk, length)],
+            device=table.device,
+        )
+
+        def rope_reference(values: torch.Tensor) -> torch.Tensor:
+            # Use request-global positions and signed swaps, not native/table lookup.
+            token_turns = (
+                (global_positions // page + global_positions % page)[:, None] + pair_indices
+            ) % 4
+            if values.ndim == 3:
+                token_turns = token_turns[:, None]
+            even, odd = values.unflatten(-1, (-1, 2)).unbind(-1)
+            rotated_even = torch.where(token_turns % 2 == 0, even, -odd)
+            rotated_odd = torch.where(token_turns % 2 == 0, odd, even)
+            return torch.stack(
+                (
+                    torch.where(token_turns < 2, rotated_even, -rotated_even),
+                    torch.where(token_turns < 2, rotated_odd, -rotated_odd),
+                ),
+                dim=-1,
+            ).flatten(-2)
+
         expected_q = q.clone().view(-1, mixer.num_context_heads, mixer.qk_head_dim)
-
-        def quarter_turn(values):
-            pairs = values.unflatten(-1, (-1, 2))
-            return torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(-2)
-
-        expected_q[..., mixer.qk_nope_head_dim :] = quarter_turn(
+        expected_q[..., mixer.qk_nope_head_dim :] = rope_reference(
             expected_q[..., mixer.qk_nope_head_dim :]
         )
         expected_latent = latent.clone()
-        expected_latent[:, mixer.kv_lora_rank :] = quarter_turn(latent[:, mixer.kv_lora_rank :])
+        expected_latent[:, mixer.kv_lora_rank :] = rope_reference(latent[:, mixer.kv_lora_rank :])
         expected_cache = cache.clone()
         for req, length in enumerate(prefill_lengths):
             own = owned_positions(length)
@@ -498,11 +531,9 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
                 expected_cache[block, 0, local % page, 0] = expected_latent[
                     req * chunk + g - (length - chunk)
                 ].to(cache.dtype)
-        table = mixer.mha.rotary_cos_sin
-        saved_table = table.clone()
         try:
-            table.view(-1, 2)[:, 0] = 0
-            table.view(-1, 2)[:, 1] = 1
+            # MLA stores two copies of the interleaved (cos, sin) pairs per position.
+            table.view(-1, mixer.qk_rope_head_dim, 2).copy_(cos_sin.repeat(1, 2, 1))
             mixer.mha.mla_rope_append_paged_kv_assign_q(q, latent, metadata)
             torch.testing.assert_close(q.view_as(expected_q), expected_q, atol=0, rtol=0)
             torch.testing.assert_close(latent, expected_latent, atol=0, rtol=0)
@@ -514,6 +545,120 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
         mixer.forward_context = original_context
         mixer.mqa.mla_rope_generation = original_generation
         manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("residual_dim", [0, 64], ids=["nvfp4", "nvfp4-residual"])
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_mla_helix_nvfp4_owner_only_append(
+    dtype: torch.dtype, residual_dim: int, cp_size: int
+) -> None:
+    """Check native slot routing, not unsupported FP4 cached-context attention.
+
+    Each CP rank's writer runs independently on one GPU. The null-map writer is
+    the quantization control; compare packed payload and scale bytes at the
+    independently enumerated owner slots, including unchanged prefix/guard rows.
+    """
+    page, lora, rope, nope, heads = 64, 512, 64, 128, 4
+    prefixes = [page - 1, page + 1]
+    lengths = [page * cp_size + 7, page * (cp_size + 1) + 5]
+    total_lengths = [prefix + length for prefix, length in zip(prefixes, lengths)]
+    max_blocks = (max(total_lengths) + page - 1) // page
+    num_blocks = len(lengths) * max_blocks + 2
+    storage_dim = lora + rope + residual_dim
+    sentinel = 0xA5
+    block_offsets = (
+        torch.arange(1, num_blocks - 1, dtype=torch.int32, device="cuda")
+        .flip(0)
+        .view(1, len(lengths), 1, max_blocks)
+        .repeat(1, 1, 2, 1)
+    )
+    pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+    cached_indptr = torch.tensor([0, prefixes[0], sum(prefixes)], dtype=torch.int64, device="cuda")
+    kv_indptr = torch.tensor(
+        [0, total_lengths[0], sum(total_lengths)], dtype=torch.int64, device="cuda"
+    )
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    q = torch.randn(
+        sum(lengths), heads * (nope + rope), dtype=dtype, device="cuda", generator=generator
+    )
+    latent = torch.randn(sum(lengths), lora + rope, dtype=dtype, device="cuda", generator=generator)
+    # Exact quarter turns vary with the global page and position within it.
+    positions = torch.arange(max(total_lengths), device="cuda")
+    turns = (positions // page + positions % page) % 4
+    cos_sin = torch.stack(
+        ((turns == 0).float() - (turns == 2).float(), (turns == 1).float() - (turns == 3).float()),
+        dim=-1,
+    )[:, None].repeat(1, rope, 1)
+    scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
+
+    def append(slots: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
+        data = torch.full(
+            (num_blocks, page, storage_dim // 2), sentinel, dtype=torch.uint8, device="cuda"
+        )
+        scales = torch.full(
+            (num_blocks, page, storage_dim // 16), sentinel, dtype=torch.uint8, device="cuda"
+        )
+        pool_pointers = torch.tensor(
+            [[[data.data_ptr(), scales.data_ptr()], [0, 0]]], dtype=torch.int64
+        )
+        q_out, latent_out = q.clone(), latent.clone()
+        torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
+            q_out,
+            latent_out,
+            len(lengths),
+            cached_indptr,
+            kv_indptr,
+            max(lengths),
+            cos_sin,
+            heads,
+            nope,
+            rope,
+            lora,
+            block_offsets,
+            pool_pointers,
+            pool_mapping,
+            scale,
+            residual_dim,
+            0,
+            page,
+            max(total_lengths),
+            1,
+            int(QuantMode.NVFP4_KV_CACHE),
+            slots,
+        )
+        torch.cuda.synchronize()
+        return data, scales, q_out, latent_out
+
+    reference_data, reference_scales, reference_q, reference_latent = append(None)
+    offsets_host = block_offsets.cpu()
+    for rank in range(cp_size):
+        slots = []
+        expected_data = torch.full_like(reference_data, sentinel)
+        expected_scales = torch.full_like(reference_scales, sentinel)
+        for request, (prefix, total) in enumerate(zip(prefixes, total_lengths)):
+            owned = [g for g in range(total) if g // page % cp_size == rank]
+            local_slots = {g: local for local, g in enumerate(owned)}
+            for g in range(prefix, total):
+                local = local_slots.get(g, -1)
+                slots.append(local)
+                if local < 0:
+                    continue
+                src_block = offsets_host[0, request, 0, g // page].item()
+                dst_block = offsets_host[0, request, 0, local // page].item()
+                expected_data[dst_block, local % page] = reference_data[src_block, g % page]
+                expected_scales[dst_block, local % page] = reference_scales[src_block, g % page]
+        data, scales, q_out, latent_out = append(
+            torch.tensor(slots, dtype=torch.int32, device="cuda")
+        )
+        assert torch.any(expected_data != sentinel)
+        assert torch.any(expected_scales != sentinel)
+        torch.testing.assert_close(data, expected_data, atol=0, rtol=0)
+        torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+        torch.testing.assert_close(q_out, reference_q, atol=0, rtol=0)
+        torch.testing.assert_close(latent_out, reference_latent, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
