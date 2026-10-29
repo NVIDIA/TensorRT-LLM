@@ -460,6 +460,49 @@ class TestPythonChatTemplate:
             )
 
 
+class TestProcessorWithoutChatTemplate:
+    """A processor that has no chat template must not hide the tokenizer's."""
+
+    @staticmethod
+    def _tokenizer(template):
+        class JinjaTokenizer:
+            chat_template = template
+
+            def get_chat_template(self, chat_template=None, tools=None):
+                return self.chat_template
+
+            def apply_chat_template(self, **kwargs):
+                # Return the template it was asked to render, so the result names the winner.
+                return kwargs["chat_template"]
+
+        return JinjaTokenizer()
+
+    @staticmethod
+    def _render(tokenizer, processor):
+        return apply_chat_template(
+            model_type="test_string_model",
+            tokenizer=tokenizer,
+            processor=processor,
+            conversation=[ConversationMessage(role="user", content="hello", media=[])],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+        )
+
+    def test_falls_back_to_tokenizer_template(self):
+        class Processor:
+            chat_template = None
+
+        tokenizer = self._tokenizer("{{ 'tokenizer template' }}")
+        assert self._render(tokenizer, Processor()) == "{{ 'tokenizer template' }}"
+
+    def test_processor_template_is_still_preferred(self):
+        class Processor:
+            chat_template = "{{ 'processor template' }}"
+
+        tokenizer = self._tokenizer("{{ 'tokenizer template' }}")
+        assert self._render(tokenizer, Processor()) == "{{ 'processor template' }}"
+
+
 class TestServingChatTemplateGather:
     """Cover the asyncio.gather integration in the serving chat-template paths."""
 
@@ -494,7 +537,9 @@ class TestServingChatTemplateGather:
             captured.update(kwargs)
             return [1, 2, 3]
 
-        monkeypatch.setattr(rg, "async_apply_chat_template", fake_async_apply)
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", fake_async_apply)
 
         token_ids = await governor._convert_messages(
             messages=[{"role": "user", "content": "hi"}],
@@ -543,7 +588,9 @@ class TestServingChatTemplateGather:
             captured.update(kwargs)
             return [1, 2, 3] if kwargs["enable_tokenize"] else "rendered prompt"
 
-        monkeypatch.setattr(ru, "async_apply_chat_template", fake_async_apply)
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", fake_async_apply)
         return ru, captured
 
     @staticmethod
@@ -553,20 +600,22 @@ class TestServingChatTemplateGather:
         request = Mock()
         request.tools = None
         request.store = False
+        tokenizer = Mock()
+        tokenizer.encode.return_value = [1, 2, 3]
         return await ru._create_input_tokens(
             request=request,
             prev_response=None,
             prev_msgs=None,
             conversation_store=None,
             enable_store=False,
-            tokenizer=Mock(),
+            tokenizer=tokenizer,
             model_config=Mock(),
             processor=None,
         )
 
     @pytest.mark.asyncio
     async def test_responses_create_input_tokens_text_only(self, monkeypatch):
-        """Text-only input is rendered straight to token ids."""
+        """Text-only input is rendered to text and tokenized to ids, no media attached."""
         ru, captured = self._stub_responses_rendering(
             monkeypatch,
             conversation=[{"role": "user", "content": "hi", "media": []}],
@@ -574,7 +623,9 @@ class TestServingChatTemplateGather:
         )
 
         assert await self._create_responses_input(ru) == [1, 2, 3]
-        assert captured["enable_tokenize"] is True
+        # The shared renderer produces the text and tokenizes it itself; only a template
+        # that tokenizes natively hands back ids.
+        assert captured["enable_tokenize"] is False
 
     @pytest.mark.asyncio
     async def test_responses_create_input_tokens_attaches_mm_data(self, monkeypatch):

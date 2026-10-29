@@ -42,6 +42,7 @@ def _coordinator(manager: Mock, receive: Mock) -> DisaggTransferCoordinator:
         request_and_receive_sync=receive,
         kv_transfer_timeout_ms=None,
     )
+    coordinator._dist = SimpleNamespace(cp_size=1)
     coordinator.reap_gen_receives = Mock()
     coordinator._check_transfer_errors = Mock()
     return coordinator
@@ -54,6 +55,8 @@ def _manager() -> Mock:
     manager.impl = Mock()
     manager._stream = Mock()
     manager._disagg_receive_ready = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
     manager._pending_preemption = {}
     manager.is_draft = False
     manager.kv_connector_manager = None

@@ -11,7 +11,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
@@ -146,7 +145,8 @@ def create_moe_backend(
             activation=activation,
         )
 
-    if moe_cls is CutlassFusedMoE or issubclass(moe_cls, MarlinFusedMoE):
+    if issubclass(moe_cls, CutlassFusedMoE) or issubclass(
+            moe_cls, MarlinFusedMoE):
         # The two whose constructor takes an expert-bias flag. Marlin declines
         # the flag itself, so the check above already rejected a True.
         return moe_cls(
@@ -179,11 +179,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE, CuteDslFc12FusedMoE):
-        # Both are constructed through the narrower CuteDsl argument set (no
-        # bias / swiglu_alpha-beta-limit). CuteDslB12xFusedMoE now delegates to
-        # CutlassFusedMoE.__init__, which does accept those four, so widening
-        # this branch would need the allow-lists above to admit b12x first.
+    elif issubclass(moe_cls, (CuteDslFusedMoE, CuteDslFc12FusedMoE)):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,

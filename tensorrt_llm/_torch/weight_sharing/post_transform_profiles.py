@@ -52,6 +52,10 @@ QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
 # tensors plus target-only receiver finalization. Mistral shares the dense
 # decoder base class with Llama but is a distinct root with its own contract.
 MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-mistral-dense-target-layout-v1"
+# Stable contract for unquantized Phi3 dense fused-QKV and fused-gate-up
+# tensors plus target-only receiver finalization. Phi3 checkpoints store both
+# projections pre-fused and the root splits them per TP rank while loading.
+PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
 _MISSING = object()
 
 

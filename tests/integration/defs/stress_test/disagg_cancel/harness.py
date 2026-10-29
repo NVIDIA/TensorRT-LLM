@@ -85,7 +85,7 @@ class StressConfig:
 
     mode: str = _STRESS_MODE_LOG_ONLY
     duration_min: float = 120.0
-    kv_cache_manager: str = "v1"  # v1 | v2
+    kv_cache_manager: str = "v2"
     transceiver: str = "python"
     base_concurrency: int = 64
     client_cancel_rate: float = 0.10
@@ -139,15 +139,13 @@ class StressConfig:
         """Reject backend-knob combinations that are not supported.
 
         Raises:
-            ValueError: If ``kv_cache_manager`` is not ``"v1"`` or
-                ``"v2"``, or ``transceiver`` is not ``"python"``.
+            ValueError: If ``kv_cache_manager`` is not ``"v2"``, or
+                ``transceiver`` is not ``"python"``.
         """
         if self.mode not in _STRESS_MODES:
             raise ValueError(f"mode must be one of {_STRESS_MODES}, got {self.mode!r}")
-        if self.kv_cache_manager not in ("v1", "v2"):
-            raise ValueError(
-                f"kv_cache_manager must be 'v1' or 'v2', got {self.kv_cache_manager!r}"
-            )
+        if self.kv_cache_manager != "v2":
+            raise ValueError(f"kv_cache_manager must be 'v2', got {self.kv_cache_manager!r}")
         if self.transceiver != "python":
             raise ValueError(f"transceiver must be 'python', got {self.transceiver!r}")
 

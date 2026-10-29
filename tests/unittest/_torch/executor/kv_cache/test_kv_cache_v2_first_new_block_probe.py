@@ -67,6 +67,9 @@ def make_stub_manager(
     mgr.enable_stats = False
     mgr.is_estimating_kv_cache = False
     mgr._request_stats_enabled_ids = set()
+    mgr._allocation_stream = None
+    mgr._on_allocation_stream = set()
+    mgr._allocation_ready = {}
     mgr._stream = Mock()
     mgr.impl = Mock()
     mgr.impl.probe_first_new_block_key.return_value = b"probed-block-key"

@@ -147,14 +147,13 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         """
         check = getattr(self._llm, "_check_health", None)
         if callable(check):
-            # Only the engine's own failure modes mean "not ready". A TypeError
-            # or AttributeError here is _check_health's contract drifting, and
-            # reporting that as an unhealthy engine is the worst answer a health
-            # endpoint can give: it looks like the thing it is meant to detect.
             try:
                 return bool(check())
             except (RuntimeError, ValueError, OSError) as error:
                 logger.warning(f"OpenEngine health check reported a failure: {error}")
+                return False
+            except (TypeError, AttributeError) as error:
+                logger.error(f"OpenEngine health check contract failed: {error}")
                 return False
         executor = getattr(self._llm, "_executor", None)
         return executor is not None and not executor.is_shutdown()
@@ -284,6 +283,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     ) -> model_pb2.ModelInfo:
         # Single-model server: like Generate, any non-empty name resolves to the
         # loaded model.
+        media_modalities = self._inference.supported_media_modalities
         info = model_pb2.ModelInfo(
             model_id=self._model,
             served_model_name=self._model,
@@ -292,9 +292,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             supports_token_ids_input=True,
             # Generate rejects `lora_name` even on an enable_lora build.
             supports_lora=False,
-            supports_multimodal=False,
+            supports_multimodal=bool(media_modalities),
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
+        info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
 
         max_seq_len = _positive_int(self._llm.args.max_seq_len)
         if max_seq_len is not None:
@@ -416,7 +417,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         if self._frontend is not None:
             try:
                 status = await self._frontend.request("status")
-                model_ready = model_ready and status["ready"]
+                model_ready = model_ready and status["ready"] and not status["stopping"]
             except CoordinationError:
                 model_ready = False
         checks.append(

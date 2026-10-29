@@ -841,6 +841,50 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    def test_side_stream_waits_for_a_busy_recycled_slot(self) -> None:
+        """A full pool hands out a slot its previous owner's stream still writes.
+
+        The cache's stream waits for the slot, so a writer outside every stream,
+        such as the NIC, can allocate on a side stream and synchronize only it.
+        """
+        import torch
+
+        tokens_per_block = 4
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=tokens_per_block,
+                cache_tiers=[GpuCacheTierConfig(4 << 20)],
+                layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096)])],
+            )
+        )
+        owner_stream = torch.cuda.Stream()
+        loader_stream = torch.cuda.Stream()
+        execution_stream = torch.cuda.Stream()
+
+        owner = self.manager.create_kv_cache()
+        self.assertTrue(owner.resume(owner_stream.cuda_stream))
+        capacity = tokens_per_block
+        while owner.resize(capacity + tokens_per_block):
+            capacity += tokens_per_block
+        with torch.cuda.stream(owner_stream):
+            torch.cuda._sleep(1 << 31)
+            owner_done = torch.cuda.Event()
+            owner_done.record(owner_stream)
+        owner.close()
+
+        loader = self.manager.create_kv_cache()
+        try:
+            self.assertTrue(loader.resume(loader_stream.cuda_stream))
+            self.assertTrue(loader.resize(tokens_per_block))
+            self.assertFalse(owner_done.query(), "the owner's work finished before the check")
+            loader_stream.synchronize()
+            self.assertTrue(owner_done.query())
+            # Adopting the cache orders the new stream behind the old one.
+            loader.cuda_stream = execution_stream.cuda_stream
+        finally:
+            loader.close()
+        execution_stream.synchronize()
+
     def test_batch_publishes_sparse_gpu_metadata(self) -> None:
         import torch
 

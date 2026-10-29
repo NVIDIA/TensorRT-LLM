@@ -24,11 +24,6 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::executor
-{
-class RequestWithId;
-}
-
 namespace tensorrt_llm::batch_manager
 {
 class LlmRequest;

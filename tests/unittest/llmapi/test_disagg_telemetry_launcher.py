@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -89,6 +90,7 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
             metrics_log_interval=0,
             schedule_style=None,
             telemetry=True,
+            report_addr=None,
         )
 
     assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] == "deploy123"
@@ -121,6 +123,7 @@ def test_disaggregated_command_identifies_coordinator(monkeypatch) -> None:
             metrics_log_interval=0,
             schedule_style=None,
             telemetry=True,
+            report_addr=None,
         )
 
     assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE] == "coordinator"
@@ -355,6 +358,17 @@ def test_launch_disaggregated_leader_signal_cleans_up_and_reports(
         observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT] == "1"
     )
     assert observed["command"] == [
+        sys.executable,
+        "-S",
+        str(Path(serve.__file__).resolve().parents[1] / "llmapi" / "_llmapi_process_guard.py"),
+        "--parent-pid",
+        str(os.getpid()),
+        "--term-grace",
+        "5",
+        "--autonomous",
+        "--role",
+        "proxy",
+        "--",
         "python3",
         "trtllm-serve",
         "disaggregated_mpi_worker",

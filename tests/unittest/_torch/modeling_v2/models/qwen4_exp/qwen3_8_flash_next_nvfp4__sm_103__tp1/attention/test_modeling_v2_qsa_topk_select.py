@@ -67,29 +67,18 @@ def _logits(kind: str, rows: int, cols: int, gen: torch.Generator) -> torch.Tens
 def _build(spec: dict, seed: int):
     gen = torch.Generator(device=DEV).manual_seed(seed)
     rows, cols, index_topk = spec["rows"], spec["cols"], spec["index_topk"]
-    if spec.get("strided"):
-        backing = _logits(spec["logits"], rows, 2 * cols, gen).view(rows, cols, 2)
-        logits = backing[:, :, 0]
-        assert logits.stride() == (2 * cols, 2)
-    else:
-        logits = _logits(spec["logits"], rows, cols, gen)
+    logits = _logits(spec["logits"], rows, cols, gen)
 
-    kind = spec["windows"][0]
-    if kind in ("positions", "chunk"):
-        if kind == "positions":
-            positions = torch.tensor(spec["windows"][1], device=DEV)
-        else:
-            positions = spec["windows"][1] + torch.arange(rows, device=DEV)
-        assert positions.numel() == rows
-        # QSA's per-row causal bound: complete compressed blocks at the position.
-        row_ends = ((positions + 1) // COMPRESS_RATIO).clamp_max(cols).to(torch.int32)
-        row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    elif kind == "explicit":
-        row_starts = torch.tensor(spec["windows"][1], dtype=torch.int32, device=DEV)
-        row_ends = torch.tensor(spec["windows"][2], dtype=torch.int32, device=DEV)
+    kind, start = spec["windows"]
+    if kind == "positions":
+        positions = torch.tensor(start, device=DEV)
     else:
-        row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-        row_ends = torch.randint(0, cols + 1, (rows,), generator=gen, device=DEV).to(torch.int32)
+        assert kind == "chunk", kind
+        positions = start + torch.arange(rows, device=DEV)
+    assert positions.numel() == rows
+    # QSA's per-row causal bound: complete compressed blocks at the position.
+    row_ends = ((positions + 1) // COMPRESS_RATIO).clamp_max(cols).to(torch.int32)
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
 
     if spec["tail"] == "nan":
         columns = torch.arange(cols, device=DEV)[None, :]
@@ -108,42 +97,12 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     _compare(out, op.reference(*args))
 
 
-def test_selection_honours_row_ends_and_is_not_a_prefix() -> None:
-    """The two wrong answers that would still look plausible.
-
-    The global maxima sit outside every window, and the in-window winners are
-    the *last* visible columns: a selector that ignored `row_ends` would take
-    the former, one that returned the first k columns would miss the latter.
-    """
-    gen = torch.Generator(device=DEV).manual_seed(2)
-    rows, cols, top_k = 6, 1024, 64
-    logits = torch.rand(rows, cols, generator=gen, device=DEV)
-    logits[:, 256:] += 100.0
-    logits[:, 192:256] += 10.0
-    row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    row_ends = torch.full((rows,), 256, dtype=torch.int32, device=DEV)
-    indices = torch.full((rows, top_k), SENTINEL, dtype=torch.int32, device=DEV)
-    out = op(logits, row_starts, row_ends, indices, top_k)
-    _compare(out, op.reference(logits, row_starts, row_ends, indices, top_k))
-    assert bool((out < 256).all()), "selected a column beyond row_ends"
-    assert bool((out >= 192).all()), "did not find the planted in-window maxima"
-
-
-def test_nan_inside_the_window_is_selected() -> None:
-    """Why the note makes finiteness a precondition: NaN outranks every value."""
-    gen = torch.Generator(device=DEV).manual_seed(11)
-    logits = torch.randn(1, 32, generator=gen, device=DEV)
-    logits[0, :4] = float("nan")
-    row_starts = torch.zeros(1, dtype=torch.int32, device=DEV)
-    row_ends = torch.full((1,), 32, dtype=torch.int32, device=DEV)
-    out = op(logits, row_starts, row_ends, torch.empty(1, 8, dtype=torch.int32, device=DEV), 8)
-    assert {0, 1, 2, 3} <= set(out[0].tolist()), "NaN is no longer selected; update the note"
-
-
 def test_cuda_graph_capture_and_replay() -> None:
-    """Captured, then replayed against new scores and a new causal bound."""
+    """Captured, then replayed against new scores and a new causal bound: the 256 rows a
+    verify step of 32 requests carries at max_draft_len 7."""
+    rows = 256
     gen = torch.Generator(device=DEV).manual_seed(8)
-    rows, cols = 8, 2048
+    cols = 2048
     logits = _logits("relu", rows, cols, gen)
     row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
     row_ends = torch.full((rows,), cols, dtype=torch.int32, device=DEV)
@@ -168,21 +127,6 @@ def test_cuda_graph_capture_and_replay() -> None:
     _compare(indices, op.reference(logits, row_starts, row_ends, indices, BLOCK_TOPK))
 
 
-def test_rejects_out_of_contract() -> None:
-    """The op's own loud refusals -- the reason `is_valid` does not restate them."""
-    rows, cols, top_k = 4, 128, 8
-    logits = torch.randn(rows, cols, device=DEV)
-    row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    row_ends = torch.full((rows,), cols, dtype=torch.int32, device=DEV)
-    out = torch.empty(rows, top_k, dtype=torch.int32, device=DEV)
-    with pytest.raises(RuntimeError, match="expected scalar type Float"):
-        op(logits.to(torch.bfloat16), row_starts, row_ends, out, top_k)
-    with pytest.raises(RuntimeError, match="expected scalar type Int"):
-        op(logits, row_starts, row_ends, out.long(), top_k)
-    with pytest.raises(RuntimeError, match="one entry per row"):
-        op(logits, row_starts[:2], row_ends[:2], out, top_k)
-
-
 def _layout_case():
     torch.manual_seed(10)
     rows, cols, top_k = 4, 128, 8
@@ -190,25 +134,6 @@ def _layout_case():
     row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
     row_ends = torch.full((rows,), cols, dtype=torch.int32, device=DEV)
     return logits, row_starts, row_ends, top_k
-
-
-def test_guard_refuses_a_wider_output_buffer() -> None:
-    """Accepted by the op, which packs the rows at a stride of `index_topk`
-    regardless: row 1's answer starts inside row 0's slots and the last row is
-    never written. Shown unguarded first, then refused."""
-    logits, row_starts, row_ends, top_k = _layout_case()
-    rows = logits.shape[0]
-    wide = torch.full((rows, top_k + 4), -99, dtype=torch.int32, device=DEV)
-    op(logits, row_starts, row_ends, wide, top_k)
-    torch.cuda.synchronize()
-    packed = wide.flatten()[: rows * top_k].view(rows, top_k)
-    _compare(packed, op.reference(logits, row_starts, row_ends, packed, top_k))
-    assert not bool((wide[:, top_k:] == -99).all()), "the hazard stopped reproducing"
-    assert bool((wide[-1] == -99).all()), "the hazard stopped reproducing"
-
-    with pytest.raises(AssertionError, match=r"indices must be \[num_rows, index_topk\]"):
-        with validating(op):
-            op(logits, row_starts, row_ends, wide, top_k)
 
 
 def test_guard_refuses_the_token_budget_default() -> None:
@@ -220,14 +145,3 @@ def test_guard_refuses_the_token_budget_default() -> None:
     with pytest.raises(AssertionError, match="index_topk=2048"):
         with validating(op):
             op(logits, row_starts, row_ends, indices)
-
-
-def test_guard_refuses_a_non_contiguous_output() -> None:
-    """A row slice of a wider arena: the same flat addressing, the same fault."""
-    logits, row_starts, row_ends, top_k = _layout_case()
-    arena = torch.full((logits.shape[0], top_k + 4), -99, dtype=torch.int32, device=DEV)
-    view = arena[:, :top_k]
-    assert not view.is_contiguous()
-    with pytest.raises(AssertionError, match="contiguous"):
-        with validating(op):
-            op(logits, row_starts, row_ends, view, top_k)

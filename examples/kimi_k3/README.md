@@ -21,7 +21,7 @@ architectures may be added in a future release.
   the TensorRT-LLM container, from the repository root:
 
   ```bash
-  python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_wheel --yes
+  python3 scripts/build_wheel.py --cuda_architectures 103 --skip_building_wheel --yes
   .venv-3.12/bin/python -m pip install --no-deps -e .
   ```
   Using editable mode is recommended for development and testing; see
@@ -34,8 +34,8 @@ architectures may be added in a future release.
   for `.venv-3.12` in every command below and export
   `TRTLLM_VENV=/path/to/repo/.venv-<major>.<minor>` when submitting the
   Slurm jobs (they default to the repository-root `.venv-3.12`). Adjust
-  `--cuda_architectures` to the target GPUs (`103-real` for GB300,
-  `100-real` for B200).
+  `--cuda_architectures` to the target GPUs (`103` for GB300,
+  `100` for B200).
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g.
   [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
   from the Hugging Face Hub (the example scripts take a local filesystem

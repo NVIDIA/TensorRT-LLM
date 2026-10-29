@@ -2081,7 +2081,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             request_ids=[req_idx],
             token_nums=[seq_lens[req_idx]],
             is_gen=False,
-            prepare_resource=True,
         )
         assert added_requests is not None, (
             f"Failed to allocate KV cache for ctx request {req_idx} with "
@@ -2099,7 +2098,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                 request_ids=[req_idx],
                 token_nums=[seq_lens[req_idx]],
                 is_gen=False,
-                prepare_resource=True,
             )
             assert added_requests is not None, (
                 f"Failed to allocate KV cache for gen request {req_idx} with "

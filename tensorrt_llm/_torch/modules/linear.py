@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Tuple, Union
+from typing import ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -32,11 +32,11 @@ from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
-    per_token_quant_and_transform, resmooth_to_fp8_e8m0,
-    transform_k128_scales_to_cutedsl_mxfp8_layout,
+    Fp8BlockScaleWeightSliceCache, per_token_quant_and_transform,
+    resmooth_to_fp8_e8m0, transform_k128_scales_to_cutedsl_mxfp8_layout,
     transform_sf_into_required_layout)
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f, is_sm_120f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
@@ -136,6 +136,64 @@ def _fp8_block_scales_uses_cute_dsl_sm107(module) -> bool:
     (UE8M0 K32 scales); apply() and transform_weights() must agree on it."""
     return (get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE and
             (module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm))
+
+
+@dataclass(frozen=True)
+class Fp8BlockScaleLowMGemmRange:
+    """Row counts for which an FP8 block-scale linear runs the low-M GEMM
+    (``trtllm::fp8_block_scale_low_m_gemm``) instead of its default GEMM.
+
+    The low-M GEMM reads the operands of ``fp8_swap_ab_gemm(...,
+    disable_ue8m0_cast=True)``: the UE8M0-resmoothed FP8 weight and its
+    DeepGEMM-packed scale. The range comes from the GEMM's selection for the
+    weight shape on the current device (``max_m_for`` / ``kernel_max_m_for`` in
+    ``kernels/blackwell/fp8_block_scale_low_m_gemm.py``) and is resolved once
+    per weight; the default never selects it.
+    """
+
+    #: Forward runs the GEMM on ``1 <= M <= max_m`` BF16 rows.
+    max_m: int = 0
+    #: Its low-M kernel (and the variants that match it bitwise: gated,
+    #: sigmoid, prequantized input) serves ``1 <= M <= kernel_max_m``.
+    kernel_max_m: int = 0
+
+    @classmethod
+    def for_weight(cls, out_features: int,
+                   in_features: int) -> "Fp8BlockScaleLowMGemmRange":
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return cls()
+        from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+        return cls(
+            fp8_block_scale_low_m_gemm.max_m_for(out_features, in_features),
+            fp8_block_scale_low_m_gemm.kernel_max_m_for(out_features,
+                                                        in_features))
+
+    def serves(self, input: torch.Tensor, *, kernel: bool = False) -> bool:
+        """Whether the GEMM (``kernel``: its low-M kernel) runs on the 2-D
+        ``input`` rows."""
+        limit = self.kernel_max_m if kernel else self.max_m
+        return (1 <= input.shape[0] <= limit and input.dtype == torch.bfloat16
+                and input.is_contiguous())
+
+
+def fp8_block_scale_ue8m0_gemm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        low_m: Fp8BlockScaleLowMGemmRange,
+        output_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """FP8 block-scale GEMM of 2-D BF16 ``input`` on SM100f DeepGEMM operands
+    (UE8M0-resmoothed weight, packed UE8M0 scale): the low-M GEMM where
+    ``low_m`` serves the rows and the output is BF16, ``fp8_swap_ab_gemm``
+    otherwise."""
+    if output_dtype is torch.bfloat16 and low_m.serves(input):
+        return torch.ops.trtllm.fp8_block_scale_low_m_gemm(
+            input, weight, weight_scale)
+    return torch.ops.trtllm.fp8_swap_ab_gemm(input,
+                                             weight,
+                                             weight_scale,
+                                             output_dtype=output_dtype,
+                                             disable_ue8m0_cast=True)
 
 
 def _uses_marlin_nvfp4_backend(module) -> bool:
@@ -438,6 +496,17 @@ class LinearMethodBase(ABC):
               bias: Optional[torch.Tensor], *args, **kwargs):
         raise NotImplementedError
 
+    def apply_slice(self, module: Linear, input: torch.Tensor, start: int,
+                    end: int) -> torch.Tensor:
+        raise NotImplementedError(
+            "This quantization method does not support output slicing")
+
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        """Validate slicing support and prepare quantization-specific state."""
+        raise NotImplementedError(
+            "This quantization method does not support output slicing")
+
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
                                tp_group: List[int], *args, **kwargs):
@@ -461,8 +530,9 @@ class LinearMethodBase(ABC):
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
         kargs = {}
-        if isinstance(self, (UnquantizedLinearMethod,
-                             FP8BlockScalesLinearMethod, NVFP4LinearMethod)):
+        if isinstance(self,
+                      (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
+                       NVFP4LinearMethod, MXFP8LinearMethod)):
             kargs['allow_partial_loading'] = allow_partial_loading
         load_fn(module, weights, **kargs)
 
@@ -614,8 +684,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              weight: Optional[torch.Tensor] = None):
+        weight = module.weight if weight is None else weight
         # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
         # kernel and returns None to fall through to the normal GEMM path.
         # Skip when use_custom_cublas_mm is set: that path may allocate output
@@ -623,16 +697,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # the low-M dispatcher does not support.
         if _should_apply_low_m_gemm(input) and not getattr(
                 module, "use_custom_cublas_mm", False):
-            output = apply_low_m_gemm(module, input, module.weight, bias)
+            output = apply_low_m_gemm(module, input, weight, bias)
             if output is not None:
                 return output
         # CuTe DSL BF16 GEMM path for Blackwell / SM107
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
-                and module.weight.dtype == torch.bfloat16):
+                and weight.dtype == torch.bfloat16):
             # input: [*, K], weight: [N, K], output: [*, N]
             input_2d = input.view(-1, input.shape[-1])  # [M, K]
             m, k = input_2d.shape
-            n = module.weight.shape[0]
+            n = weight.shape[0]
             output = torch.empty(m,
                                  n,
                                  dtype=torch.bfloat16,
@@ -642,7 +716,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                             torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
             bf16_gemm_op(
                 input_2d.contiguous(),
-                module.weight,
+                weight,
                 output,
             )
             # Reshape output back to match input batch dims
@@ -661,14 +735,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
                      and module.mapping is not None else None)
             output = torch.ops.trtllm.cublas_mm(
                 input,
-                module.weight.t(),
+                weight.t(),
                 bias,
                 out_dtype=None,
                 output_buffer_kind=output_buffer_kind,
                 group=group)
         else:
-            output = F.linear(input, module.weight, bias)
+            output = F.linear(input, weight, bias)
         return output
+
+    def apply_slice(self, module: Linear, input: torch.Tensor, start: int,
+                    end: int) -> torch.Tensor:
+        bias = module.bias[start:end] if module.bias is not None else None
+        return self.apply(module, input, bias, weight=module.weight[start:end])
+
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        # Quantized subclasses must explicitly opt in to their slice preparation.
+        if type(self) is not UnquantizedLinearMethod:
+            super().prepare_output_slice(module, start, end)
 
     def load_weights_vanilla(self,
                              module: Linear,
@@ -1300,9 +1385,17 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                     requires_grad=False)
         else:
             module.register_parameter("bias", None)
+        # Set once the weight is in the DeepGEMM layout (transform_weights).
+        module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange()
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        return self._apply_with_weights(module, input, bias, module.weight,
+                                        module.weight_scale)
+
+    def _apply_with_weights(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor], weight: torch.Tensor,
+                            weight_scale: torch.Tensor):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
         # buffer; supports_nccl_symmetric_memory_window_output is False so the window path is bypassed.
         if isinstance(input, tuple):
@@ -1318,15 +1411,14 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                         or module.disable_deep_gemm))
             if uses_cute_dsl_rubin:
                 output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                    activation, module.weight, activation_scale,
-                    module.weight_scale)
+                    activation, weight, activation_scale, weight_scale)
             elif (activation_scale.dtype == torch.int32 and is_sm_100f()
                   and not module.disable_deep_gemm):
                 output = torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
                     activation,
                     activation_scale,
-                    module.weight,
-                    module.weight_scale,
+                    weight,
+                    weight_scale,
                     disable_ue8m0_cast=True,
                 )
             else:
@@ -1353,18 +1445,16 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 if _fp8_block_scales_uses_cute_dsl_sm107(module):
                     # transform_weights() re-laid weight_scale out as UE8M0
                     # K32 R128c4; quantize the activation to match.
-                    act_input_fp8, act_input_sf = \
-                        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+                    act_input_fp8, act_input_sf = (
+                        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input))
                     output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                        act_input_fp8, module.weight, act_input_sf,
-                        module.weight_scale)
+                        act_input_fp8, weight, act_input_sf, weight_scale)
                 else:
                     act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                         input)
                     if sm_version in (100, 103):
                         output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                            act_input_fp8, module.weight, act_input_sf,
-                            module.weight_scale)
+                            act_input_fp8, weight, act_input_sf, weight_scale)
                     else:
                         # cute_dsl_fp8_gemm_blackwell runs only on sm100/103. On
                         # other sm_100f GPUs (e.g. sm107 without the CuTe DSL
@@ -1378,24 +1468,21 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                 "trtllm-gen kernel instead.",
                                 key="cute_dsl_fp8_blockscale_unsupported_sm")
                         output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                            act_input_fp8, module.weight, act_input_sf,
-                            module.weight_scale)
+                            act_input_fp8, weight, act_input_sf, weight_scale)
             else:
-                output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    disable_ue8m0_cast=True,
-                )
-        elif sm_version == 120:
+                low_m = (module.fp8_low_m_gemm if weight is module.weight else
+                         Fp8BlockScaleLowMGemmRange())
+                output = fp8_block_scale_ue8m0_gemm(input, weight, weight_scale,
+                                                    low_m)
+        elif is_sm_120f(sm_version):
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+                act_input_fp8, weight, act_input_sf, weight_scale)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+                act_input_fp8, weight, act_input_sf, weight_scale)
 
         # Reshape output back to original shape (with out_features as last dim)
         if len(original_shape) > 2:
@@ -1404,6 +1491,28 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_slice(self, module: Linear, input: torch.Tensor, start: int,
+                    end: int) -> torch.Tensor:
+        # Keep the original N-block quantization grid when a head boundary
+        # falls inside a 128-row scale block. The extra rows are cropped
+        # after GEMM; their cost is bounded by two scale blocks.
+        assert module._output_slice_cache is not None
+        weight, scale, crop = module._output_slice_cache.get(
+            module.weight, start, end)
+        output = self._apply_with_weights(module, input, None, weight, scale)
+        output = output[..., crop:crop + end - start].contiguous()
+        if module.bias is not None:
+            output = output + module.bias[start:end]
+        return output
+
+    def prepare_output_slice(self, module: Linear, start: int,
+                             end: int) -> None:
+        module.transform_weights()
+        if module._output_slice_cache is None:
+            module._output_slice_cache = Fp8BlockScaleWeightSliceCache()
+        module._output_slice_cache.prepare(module.weight, module.weight_scale,
+                                           start, end)
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
@@ -1529,9 +1638,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 module.rebuild_tensor_metadata)
             return
         use_deep_gemm_layout = (
-            is_sm_100f()
-            and not (module.use_cute_dsl_blockscaling_mm
-                     or module.disable_deep_gemm)) or get_sm_version() == 120
+            is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
+                                  or module.disable_deep_gemm)) or is_sm_120f()
         use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
             module, "use_indexer_q_cutedsl_fusion", False))
         if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
@@ -1575,6 +1683,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 module, "weight_scale",
                 nn.Parameter(transformed_scale, requires_grad=False),
                 module.rebuild_tensor_metadata)
+            # On SM107 the low-M GEMM's limits are cross-overs with the CuTe
+            # MXFP8 GEMM, not with fp8_swap_ab_gemm, which this layout runs.
+            if get_sm_version() != 107:
+                module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange.for_weight(
+                    *weight.shape)
 
 
 class NVFP4LinearMethod(LinearMethodBase):
@@ -2373,7 +2486,7 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     def is_supported(module: Linear) -> bool:
         sm_version = get_sm_version()
         block_width = fp4_utils.nvfp4_scaling_vector_size(module.quant_config)
-        return ((89 <= sm_version < 100 or sm_version in (120, 121))
+        return ((89 <= sm_version < 100 or is_sm_120f(sm_version))
                 and getattr(module, "dtype", None) == torch.bfloat16
                 and not getattr(module, "use_fused_gemm_allreduce", False)
                 and block_width
@@ -2387,7 +2500,7 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
         if not cls.is_supported(module):
             return False
         sm_version = get_sm_version()
-        return (sm_version in (120, 121)
+        return (is_sm_120f(sm_version)
                 or "marlin" in getattr(module, "nvfp4_allowed_backends", ()))
 
     def transform_weights(self, module: Linear) -> None:
@@ -3421,7 +3534,7 @@ class MXFP8LinearMethod(LinearMethodBase):
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
         self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
-        # Only PyTorchModelEngine owns the startup tuning lifecycle. Keep
+        # Only ModelEngine owns the startup tuning lifecycle. Keep
         # standalone modules and engine paths that skip warmup (for example,
         # Helix CP) on the direct native op instead of leaving Python
         # AutoTuner dispatch armed indefinitely.
@@ -3634,24 +3747,60 @@ class MXFP8LinearMethod(LinearMethodBase):
         return "weight_scale"
 
     def load_weight_scales(
-            self,
-            weights: List[Dict],
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            tp_mode: Optional[TensorParallelMode] = None) -> List[torch.Tensor]:
+        self,
+        weights: List[Dict],
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        tp_mode: Optional[TensorParallelMode] = None,
+        pad_missing: bool = False,
+        module: Optional[Linear] = None,
+        shard_names: Optional[Sequence[Optional[str]]] = None,
+    ) -> List[torch.Tensor]:
+        """Load per-shard UE8M0 block scales.
+
+        ``module`` routes the slice through ``Linear.load_shard`` instead of the
+        bare ``load_weight_shard`` helper, so a shard whose TP split differs
+        from the plain tp_size/tp_rank rule is honoured. Qwen3.5 is exactly that
+        case: with an attention output gate the fused 'q' shard holds
+        ``2 * q_size`` rows, and slicing the scale without the matching
+        ``name=`` gave it half as many rows as the weight
+        ("size of tensor a (256) must match tensor b (128)").
+
+        With ``pad_missing`` the result stays positionally aligned with
+        ``weights`` (a ``None`` per entry that carries no scale), which the
+        partial-loading paths need to map each scale back onto its fused shard.
+        The default keeps the compacted list the full-load callers expect.
+        """
         device = torch.device("cuda")
         scale_name = self._get_scale_name(weights)
         scales = []
-        for w in weights:
+        for index, w in enumerate(weights):
             if scale_name in w:
-                s = load_weight_shard(w[scale_name],
-                                      tp_size,
-                                      tp_rank,
-                                      tp_mode,
-                                      device=device).contiguous()
+                if module is not None:
+                    key = shard_names[index] if shard_names is not None else None
+                    # Explicit tp_sharding bounds count weight columns. A row-parallel
+                    # layer splits K, where one scale covers BLOCK_SIZE columns, so the
+                    # bounds have to be divided by that span (as the other quant methods
+                    # do). Column-parallel layers split rows, which scales share.
+                    scale_span = (self.BLOCK_SIZE if module.tp_mode
+                                  == TensorParallelMode.ROW else 1)
+                    s = module.load_shard(w,
+                                          scale_name,
+                                          device=device,
+                                          name=key,
+                                          scale_span=scale_span)
+                else:
+                    s = load_weight_shard(w[scale_name],
+                                          tp_size,
+                                          tp_rank,
+                                          tp_mode,
+                                          device=device)
+                s = s.contiguous()
                 assert s.dtype == torch.uint8, (
                     f"MXFP8 weight_scale must be uint8 (UE8M0), got {s.dtype}")
                 scales.append(s)
+            elif pad_missing:
+                scales.append(None)
         return scales
 
     def _store_scale(self, module: Linear, scale_2d: torch.Tensor) -> None:
@@ -3662,21 +3811,112 @@ class MXFP8LinearMethod(LinearMethodBase):
         verbatim into the 2D parameter.
         """
         if self.use_cutlass:
-            swizzled = torch.ops.trtllm.block_scale_interleave(scale_2d)
-            copy_weight(module.weight_scale, swizzled)
+            copy_weight(self._raw_scale_buffer(module), scale_2d)
         else:
             copy_weight(module.weight_scale, scale_2d)
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
-        load_weights_vanilla_helper(module, weights)
-        scales = self.load_weight_scales(weights,
-                                         tp_size=module.tp_size,
-                                         tp_rank=module.tp_rank,
-                                         tp_mode=module.tp_mode)
-        assert len(scales) == 1, (
-            f"MXFP8 vanilla load expects exactly one weight scale, got "
-            f"{len(scales)}")
-        self._store_scale(module, scales[0])
+    def _raw_scale_buffer(self, module: Linear) -> torch.Tensor:
+        """Lazily allocated row-major ``[O, K/32]`` staging copy of the scales.
+
+        The swizzle tiles rows in groups of 128, so an individual fused shard
+        maps to a contiguous run of the 1D swizzled buffer only when its row
+        bounds are 128-aligned -- which q/k/v sizes are not in general (e.g.
+        head_dim=64 GQA). Shards are written into this row-major copy instead,
+        which slices at any alignment, and the swizzle runs once over the whole
+        thing in ``process_weights_after_loading``.
+
+        Allocated on first use and released by that same hook, mirroring the
+        ``tmp_*`` buffers the NVFP4/FP8 MoE methods use: it is only live
+        between the first bucket and the finalize that consumes it. There is no
+        cross-refit state to preserve -- ``pre_reload_weights`` re-creates every
+        parameter empty at the start of a reload, so a refit must deliver all
+        shards anyway.
+        """
+        if not hasattr(module, "tmp_weight_scale_raw"):
+            module.tmp_weight_scale_raw = torch.empty(
+                (module.out_features, module.in_features // self.BLOCK_SIZE),
+                dtype=torch.uint8,
+                device=module.weight_scale.device)
+        return module.tmp_weight_scale_raw
+
+    def _store_scale_shard(self, module: Linear, scale_2d: torch.Tensor,
+                           row_offset: int, row_size: int) -> None:
+        """Write one fused shard's ``[rows, K/32]`` scale.
+
+        MXFP8 blocks span K only, so the out_features axis is 1:1 between
+        weight rows and scale rows and the shard's weight-coordinate
+        offset/size are reused verbatim -- unlike the 128x128 block-scale
+        methods, which remap them through
+        ``remap_fused_shard_indices_by_divisible_factor``.
+
+        Both paths here are plain row-major slices, so any shard bounds work;
+        the swizzle's 128-row tiling is confined to the deferred whole-buffer
+        transform and never constrains an individual shard.
+        """
+        if self.use_cutlass:
+            assert scale_2d.shape[0] == row_size, (
+                f"MXFP8 fused shard scale has {scale_2d.shape[0]} rows but the "
+                f"shard spans {row_size}; the scale was sliced with a different "
+                f"TP rule than the weight")
+            copy_weight_shard(self._raw_scale_buffer(module), scale_2d,
+                              row_offset, row_size)
+        else:
+            copy_weight_shard(module.weight_scale, scale_2d, row_offset,
+                              row_size)
+
+    def process_weights_after_loading(self, module: Linear) -> None:
+        """Apply the deferred scale swizzle exactly once per load sequence.
+
+        Invoked by ``LinearMethodBase.load_weights`` for a full load, and by
+        the RLHF finalize walk (``Linear.process_weights_after_loading``) after
+        a bucketed refit.
+
+        The staging buffer's existence *is* the pending state, so no separate
+        flag is needed: it is absent on the reference path and on modules whose
+        scales were never staged, and releasing it here makes a repeated
+        finalize a no-op (the swizzle is not an involution).
+        """
+        if hasattr(module, "tmp_weight_scale_raw"):
+            swizzled = torch.ops.trtllm.block_scale_interleave(
+                module.tmp_weight_scale_raw).flatten()
+            assert swizzled.numel() == module.weight_scale.numel(), (
+                f"Swizzled scale size {swizzled.numel()} does not match the "
+                f"allocated buffer {module.weight_scale.numel()}")
+            copy_weight(module.weight_scale, swizzled)
+            # Release the staging copy; the next load reallocates it.
+            delattr(module, "tmp_weight_scale_raw")
+        super().process_weights_after_loading(module)
+
+    def _store_fused_scales(self, module: Linear, shard_keys: tuple,
+                            scales: List[Optional[torch.Tensor]]) -> None:
+        """Write the scales of the fused shards a partial bucket carries, each at its own offset."""
+        for shard_key, scale in zip(shard_keys, scales):
+            if scale is None:
+                continue
+            assert shard_key in module.fused_weight_shard_indices_mapping, (
+                f"Shard key {shard_key} not found in fused weight shard "
+                f"indices mapping")
+            shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
+                shard_key]
+            self._store_scale_shard(module, scale, shard_offset, shard_size)
+
+    def load_weights_vanilla(self,
+                             module: Linear,
+                             weights: List[Dict],
+                             allow_partial_loading: bool = False) -> None:
+        load_weights_vanilla_helper(module,
+                                    weights,
+                                    allow_partial_loading=allow_partial_loading)
+        scales = self.load_weight_scales(weights, module=module)
+        if not allow_partial_loading:
+            assert len(scales) == 1, (
+                f"MXFP8 vanilla load expects exactly one weight scale, got "
+                f"{len(scales)}")
+        # The vanilla buffer is rewritten wholesale from the incoming scale, so
+        # a bucket carrying only the weight (or only the scale) is fine and a
+        # repeated bucket is idempotent.
+        if scales:
+            self._store_scale(module, scales[0])
         self.load_kv_cache_scales(module, weights)
 
     def _load_fused_weight_scales(self, module: Linear, weights: List[Dict],
@@ -3705,14 +3945,39 @@ class MXFP8LinearMethod(LinearMethodBase):
         # Concatenate along dim 0 (out_features), the axis of the weights.
         return torch.cat(scales, dim=0)
 
-    def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]) -> None:
+    def load_weights_fused_qkv_linear(
+            self,
+            module: Linear,
+            weights: List[Dict],
+            allow_partial_loading: bool = False) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
-            module, weights)
-        copy_weight(module.weight, torch.cat((q_weight, k_weight, v_weight)))
-        self._store_scale(
-            module,
-            self._load_fused_weight_scales(module, weights, ("q", "k", "v")))
+            module, weights, allow_partial_loading=allow_partial_loading)
+        if not allow_partial_loading:
+            copy_weight(module.weight, torch.cat(
+                (q_weight, k_weight, v_weight)))
+        else:
+            for shard_key, weight in zip(('q', 'k', 'v'),
+                                         (q_weight, k_weight, v_weight)):
+                if weight is not None:
+                    assert shard_key in module.fused_weight_shard_indices_mapping, (
+                        f"Shard key {shard_key} not found in fused weight "
+                        f"shard indices mapping")
+                    shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
+                        shard_key]
+                    copy_weight_shard(module.weight, weight, shard_offset,
+                                      shard_size)
+
+        if not allow_partial_loading:
+            self._store_scale(
+                module,
+                self._load_fused_weight_scales(module, weights,
+                                               ("q", "k", "v")))
+        else:
+            scales = self.load_weight_scales(weights,
+                                             module=module,
+                                             shard_names=('q', 'k', 'v'),
+                                             pad_missing=True)
+            self._store_fused_scales(module, ('q', 'k', 'v'), scales)
 
         self.load_kv_cache_scales(module, weights)
 
@@ -3728,14 +3993,37 @@ class MXFP8LinearMethod(LinearMethodBase):
             [w["v_scale"][...].reshape([]) for w in weights if "v_scale" in w],
         )
 
-    def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]) -> None:
+    def load_weights_fused_gate_up_linear(
+            self,
+            module: Linear,
+            weights: List[Dict],
+            allow_partial_loading: bool = False) -> None:
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
-            module, weights)
-        copy_weight(module.weight, torch.cat((gate_weight, up_weight)))
-        self._store_scale(
-            module,
-            self._load_fused_weight_scales(module, weights, ("gate", "up")))
+            module, weights, allow_partial_loading=allow_partial_loading)
+        if not allow_partial_loading:
+            copy_weight(module.weight, torch.cat((gate_weight, up_weight)))
+        else:
+            for shard_key, weight in zip(('gate', 'up'),
+                                         (gate_weight, up_weight)):
+                if weight is not None:
+                    assert shard_key in module.fused_weight_shard_indices_mapping, (
+                        f"Shard key {shard_key} not found in fused weight "
+                        f"shard indices mapping")
+                    shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
+                        shard_key]
+                    copy_weight_shard(module.weight, weight, shard_offset,
+                                      shard_size)
+
+        if not allow_partial_loading:
+            self._store_scale(
+                module,
+                self._load_fused_weight_scales(module, weights, ("gate", "up")))
+        else:
+            scales = self.load_weight_scales(weights,
+                                             module=module,
+                                             shard_names=('gate', 'up'),
+                                             pad_missing=True)
+            self._store_fused_scales(module, ('gate', 'up'), scales)
 
 
 def get_quant_method(quant_config: Optional[QuantConfig] = None):
@@ -3812,8 +4100,8 @@ class Linear(nn.Module):
                 projection to use the Blackwell-only NVFP4 GEMM + SwiGLU
                 kernel and its required interleaved weight layout.
             nvfp4_allowed_backends: List of backends to consider for NVFP4 GEMM auto-selection.
-                Default (via config): ['cutlass', 'cublaslt', 'cuda_core'] - excludes cutedsl for faster build.
-                Add 'cutedsl' for extreme performance at the cost of longer build time.
+                Default (via config): ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'].
+                CuTeDSL candidates may increase first-launch compilation time.
                 Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
                 Marlin is opt-in on SM89-99. W4A16 BF16 linear layers use
                 Marlin by default on SM120/121.
@@ -3848,9 +4136,10 @@ class Linear(nn.Module):
             if model_attrs:
                 nvfp4_allowed_backends = model_attrs.get(
                     'nvfp4_gemm_allowed_backends')
-        # Default: exclude cutedsl for faster build time
         if nvfp4_allowed_backends is None:
-            nvfp4_allowed_backends = ['cutlass', 'cublaslt', 'cuda_core']
+            nvfp4_allowed_backends = [
+                'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'
+            ]
         self.nvfp4_allowed_backends = list(nvfp4_allowed_backends)
 
         if self.tp_mode not in (TensorParallelMode.ROW,
@@ -3925,6 +4214,7 @@ class Linear(nn.Module):
         self._weights_created = False
         self._weights_transformed = False
         self.reduce_output = reduce_output
+        self._output_slice_cache: Optional[Fp8BlockScaleWeightSliceCache] = None
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
         self.lora = lora
@@ -4303,6 +4593,37 @@ class Linear(nn.Module):
             assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
             return False
 
+    def forward_slice(self, input: torch.Tensor, start: int,
+                      end: int) -> torch.Tensor:
+        """Project a contiguous range of this rank's output features.
+
+        The range is local to the existing COLUMN shard. This reuses its
+        loaded weights and quantization without materializing all outputs.
+
+        Args:
+            input: Activations with shape [..., in_features].
+            start: First output feature in the local weight shard.
+            end: Exclusive end of the local output feature range.
+
+        Returns:
+            A contiguous tensor with shape [..., end - start].
+        """
+        self.prepare_output_slice(start, end)
+        return self.quant_method.apply_slice(self, input, start, end)
+
+    def prepare_output_slice(self, start: int, end: int) -> None:
+        """Validate output slicing and prepare method-specific state."""
+        if self.tp_mode == TensorParallelMode.ROW or self.gather_output:
+            raise ValueError(
+                "Output slicing requires a local COLUMN projection")
+        if not 0 <= start < end <= self.weight.shape[0]:
+            raise ValueError(f"Invalid output feature range [{start}, {end})")
+        if self._locality_domain_weight_shards is not None or self.lora is not None:
+            raise NotImplementedError(
+                "Output slicing does not support locality-domain shards or LoRA"
+            )
+        self.quant_method.prepare_output_slice(self, start, end)
+
     def forward(
         self,
         input: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -4372,11 +4693,12 @@ class Linear(nn.Module):
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method,
                           (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
-                           NVFP4LinearMethod)):
+                           NVFP4LinearMethod, MXFP8LinearMethod)):
             assert allow_partial_loading is False, (
                 f"{type(self.quant_method).__name__} does not support "
                 "allow_partial_loading")
         self._weights_transformed = False
+        self._output_slice_cache = None
         self.quant_method.load_weights(
             self,
             weights,
@@ -4389,6 +4711,7 @@ class Linear(nn.Module):
     def transform_weights(self) -> None:
         if self._weights_transformed:
             return
+        self._output_slice_cache = None
         self.quant_method.transform_weights(self)
         # Localized allocations and full-weight release belong to the mutating
         # stage so both staged ModelLoader walks and post_load_weights run them.
@@ -4416,6 +4739,7 @@ class Linear(nn.Module):
         self.transform_weights()
 
     def pre_reload_weights(self):
+        self._output_slice_cache = None
         assert hasattr(
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"

@@ -350,7 +350,7 @@ def test_no_hard_zero_patterns_exits_immediately(tmp_path: Path):
             generation_servers: {}
             stress_config:
               duration_min: 1
-              kv_cache_manager: v1
+              kv_cache_manager: v2
               transceiver: python
               log_scan:
                 hard_zero_patterns: []
@@ -389,7 +389,7 @@ def test_invalid_regex_is_skipped_with_warning(tmp_path: Path, caplog):
             generation_servers: {}
             stress_config:
               duration_min: 1
-              kv_cache_manager: v1
+              kv_cache_manager: v2
               transceiver: python
               log_scan:
                 hard_zero_patterns:
