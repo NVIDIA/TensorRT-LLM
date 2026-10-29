@@ -694,10 +694,10 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         isolateTestCmdLine += ["--periodic-junit-xmlpath=${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
         try {
-            sh """
+            sh(label: "Run pytest (isolated_${i})", script: """
                 cd ${llmSrc}/tests/integration/defs && \
                 ${isolateTestCmdLine.join(" ")}
-            """
+            """)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -5374,7 +5374,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
     def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
     def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
     def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
-    sh """
+    sh(label: "Generate rerun test lists (${testType})", script: """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
@@ -5383,7 +5383,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
         --stage-name='${stageName}' \
         ${testListArg} \
         ${unfinishedTestArg}
-    """
+    """)
 
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
@@ -5430,10 +5430,10 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
         ]
         try {
             runWithCheckpoints(pipeline, checkpoint) {
-                sh """
+                sh(label: "Rerun pytest (${testType}, rerun ${times})", script: """
                     cd ${llmSrc}/tests/integration/defs && \\
                     ${newTestCmdLine.join(" ")}
-                """
+                """)
             }
         } catch(InterruptedException e) {
             throw e
@@ -6423,11 +6423,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 finalSnapshotRequires: "${WORKSPACE}/${stageName}/results.xml",
                             ]
                             runWithCheckpoints(pipeline, checkpoint) {
-                                sh """
+                                sh(label: "Run pytest (regular)", script: """
                                     rm -rf '${stageName}/'
                                     cd '${llmSrc}/tests/integration/defs'
                                     ${pytestCommand.join(" ")}
-                                """
+                                """)
                             }
                         } else {
                             echo "No regular tests to run for stage ${stageName}"
