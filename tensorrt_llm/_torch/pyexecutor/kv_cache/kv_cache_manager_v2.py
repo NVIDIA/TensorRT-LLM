@@ -2004,6 +2004,14 @@ class KVCacheManagerV2(BaseResourceManager):
         from tensorrt_llm._torch.speculative import draft_prompt_lookahead, get_num_extra_kv_tokens
 
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        # The draft request view (LlmRequest.use_draft_model) reads the context
+        # position and chunk a separate draft engine advances for its own
+        # prefill; a one-engine external drafter (DFlash, DSpark) has no such
+        # engine, so those fields stay at position 0 / chunk = prompt length
+        # and its mirror follows the target's chunking instead.
+        self._mirror_uses_draft_view = not (
+            is_draft and spec_config is not None and spec_config.spec_dec_mode.is_external_drafter()
+        )
         # Mirror V1: expose max_draft_len so the native disagg AuxBuffer
         # (_make_aux_buffer's getattr fallback) is sized for MTP/spec decoding.
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
@@ -5988,16 +5996,22 @@ class KVCacheManagerV2(BaseResourceManager):
         byte budget, and the capacity scheduler admits on the TARGET pool alone
         (`scheduler_v2` touches `draft_kv_cache_manager` only to suspend/free). A
         draft pool smaller in tokens than the target cannot backpressure -- it can
-        only raise, and the raise kills every rank.
+        only raise (see _mirror_resize_error), and the raise kills every rank.
 
         The first question is always how big the draft pool was and how full, so the
         message answers it rather than leaving post-hoc arithmetic over the split log.
 
         """
-        live = sum(c.capacity for c in self.kv_cache_map.values())
+        capacity = sum(c.capacity for c in self.kv_cache_map.values())
+        blocks = sum(int(c.num_blocks) for c in self.kv_cache_map.values())
+        per_cache = ", ".join(
+            f"{req_id}: capacity={c.capacity} history={c.history_length} blocks={c.num_blocks}"
+            for req_id, c in self.kv_cache_map.items()
+        )
         return (
-            f" [draft pool: {len(self.kv_cache_map)} live caches holding "
-            f"{live} tokens, gpu_max_tokens={self._gpu_max_tokens}]"
+            f" [draft pool: {len(self.kv_cache_map)} live caches, capacity {capacity} tokens "
+            f"in {blocks} allocated blocks ({per_cache}), "
+            f"windows={self.max_attention_window_vec}, gpu_max_tokens={self._gpu_max_tokens}]"
         )
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
@@ -6009,8 +6023,11 @@ class KVCacheManagerV2(BaseResourceManager):
         scheduler pre-creates context caches to coordinate the reusable prefix.
         """
         # Joint V2 reuse deliberately shares the target request progress. A
-        # separate draft engine still uses the legacy draft request view.
-        with request_context(not self.enable_joint_kv_cache_reuse, scheduled_batch):
+        # separate draft engine still uses the legacy draft request view; a
+        # one-engine external drafter never advances that view, so its mirror
+        # reads the target's position and chunk (see _mirror_uses_draft_view).
+        use_draft_view = self._mirror_uses_draft_view and not self.enable_joint_kv_cache_reuse
+        with request_context(use_draft_view, scheduled_batch):
             for req in scheduled_batch.context_requests:
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
@@ -6043,12 +6060,27 @@ class KVCacheManagerV2(BaseResourceManager):
                     + draft_len
                     + self.num_extra_kv_tokens
                 )
-                if not kv_cache.resize(capacity):
-                    raise RuntimeError(
-                        f"Draft KV cache context resize failed for request "
-                        f"{req.py_request_id}: could not resize to {capacity} tokens"
-                        f"{self._draft_pool_diagnostic()}"
-                    )
+                # The chunk start is this cache's history: sliding-window layers
+                # keep pages only from history + 1 - window (AttnLifeCycle::
+                # getStaleRange), so a mirror holds its window plus the chunk
+                # it is computing rather than the whole prompt so far.
+                # The executor advances the draft history through
+                # update_context_resources only under joint reuse, and a reused
+                # target prefix starts the mirror at position > 0 with no pages
+                # of its own, so the resize carries the history itself.
+                history = max(kv_cache.history_length, req.context_current_position)
+                if req.is_disagg_generation_init_state:
+                    # A disaggregated generation worker receives the prompt KV
+                    # instead of prefilling it, and the standalone drafter
+                    # starts this request on a fresh slot (DFlash/DSpark
+                    # prepare): the mirror never holds drafter K/V for the
+                    # transferred prompt. The whole prompt is therefore
+                    # history, so the window trims the mirror to its tail
+                    # plus the generation headroom instead of one prompt-sized
+                    # chunk that a windowed draft pool cannot hold.
+                    history = max(history, req.context_current_position + req.context_chunk_size)
+                if not kv_cache.resize(capacity, history):
+                    raise self._mirror_resize_error(req, "context", capacity)
                 self._after_shrink(req.py_request_id, kv_cache)
 
             for req in scheduled_batch.generation_requests:
@@ -6072,11 +6104,25 @@ class KVCacheManagerV2(BaseResourceManager):
                     continue
                 new_cap = self._required_gen_capacity(req, kv_cache.capacity)
                 if not kv_cache.resize(new_cap):
-                    raise RuntimeError(
-                        f"Draft KV cache generation resize failed for request "
-                        f"{req.py_request_id}: could not resize to {new_cap} tokens"
-                        f"{self._draft_pool_diagnostic()}"
-                    )
+                    raise self._mirror_resize_error(req, "generation", new_cap)
+
+    def _mirror_resize_error(self, req: LlmRequest, phase: str, capacity: int) -> RuntimeError:
+        """The error for a draft mirror that could not grow to ``capacity``.
+
+        `KvCache.resize` leaves the cache as it was when the pool has no page to
+        give, and the cache as it was cannot hold what the drafter writes next:
+        the DFlash block decode appends the block's own K/V past the stored
+        context through the mirror's block table, so a mirror that did not grow
+        (a fresh one has no page at all) hands that write a table entry with no
+        page behind it (``BAD_PAGE_INDEX`` on the python V2 backend, another
+        request's block 0 on the cpp one). There is no per-request way to skip
+        drafting, so the failure stays explicit. The message carries the pool
+        diagnostic.
+        """
+        return RuntimeError(
+            f"Draft KV cache {phase} resize failed for request {req.py_request_id}: "
+            f"could not resize to {capacity} tokens{self._draft_pool_diagnostic()}"
+        )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
         """Return a zero-copy beam-0 token view for block reuse."""
@@ -6937,7 +6983,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 if not success:
                     release_resources(req, free_draft_resources=True)
                     return None
-                success = draft_kv_cache.resize(dummy_capacity)
+                if is_gen and not materialize_history:
+                    draft_kv_cache.enable_swa_scratch_reuse = False
+                # Same history hint as the target cache above: a sliding-window
+                # draft pool then backs only the dummy's window, not its whole
+                # length.
+                success = draft_kv_cache.resize(dummy_capacity, history_length=history_hint)
                 if not success:
                     release_resources(req, free_draft_resources=True)
                     return None

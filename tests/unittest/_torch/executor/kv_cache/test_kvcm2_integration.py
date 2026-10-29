@@ -33,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
     _extend_swa_windows_for_reuse,
+    _get_generation_kv_capacity,
     _KVCacheManagerInitStatus,
     _swa_branch_snapshot_point,
     _swa_endpoint_priority,
@@ -1791,6 +1792,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     manager.is_draft = True
     manager.enable_block_reuse = True
     manager.enable_joint_kv_cache_reuse = True
+    manager._mirror_uses_draft_view = True
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     observed_progress_views = []
 
@@ -1814,6 +1816,301 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     assert observed_progress_views == [False, False]
     assert not request.use_draft_model
     manager._required_gen_capacity.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("mirror_history", "expected_history"),
+    [
+        # A fresh mirror for a request whose target prefix was reused: the
+        # history jumps to the chunk start so no page below the window is
+        # allocated for [0, position).
+        (0, 8192),
+        # A later chunk of the same request: the history follows the chunk.
+        (4096, 8192),
+        # Joint reuse already advanced the history past the chunk start; a
+        # resize may not decrease it.
+        (8704, 8704),
+    ],
+)
+def test_unpaired_one_engine_draft_mirror_follows_the_target_chunk(
+    mirror_history: int, expected_history: int
+) -> None:
+    """A one-engine external drafter's mirror reads the target's position and
+    chunk, and its context resize carries the chunk start as history."""
+    position, chunk, draft_len = 8192, 1024, 3
+    request = LlmRequest(
+        request_id=41,
+        max_new_tokens=4,
+        input_tokens=[0] * (position + chunk),
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * draft_len,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = position
+    request.context_chunk_size = chunk
+    assert request.is_last_context_chunk
+
+    kv_cache = Mock(is_active=True, capacity=mirror_history, history_length=mirror_history)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    manager._mirror_uses_draft_view = False
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._resume_and_restore = Mock(return_value=True)
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk.append(request)
+    manager._prepare_draft_resources(batch)
+
+    kv_cache.resize.assert_called_once_with(position + chunk + draft_len, expected_history)
+    assert not request.use_draft_model
+
+
+def test_unpaired_two_engine_draft_mirror_reads_the_draft_request_view() -> None:
+    """The draft view starts at position 0 with the whole prompt as its chunk
+    until a separate draft engine advances it, so a two-engine mirror sizes
+    its cache for the prompt at once."""
+    position, chunk, draft_len = 8192, 1024, 3
+    request = LlmRequest(
+        request_id=42,
+        max_new_tokens=4,
+        input_tokens=[0] * (position + chunk),
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * draft_len,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = position
+    request.context_chunk_size = chunk
+
+    kv_cache = Mock(is_active=True, capacity=0, history_length=0)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    manager._mirror_uses_draft_view = True
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._resume_and_restore = Mock(return_value=True)
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk.append(request)
+    manager._prepare_draft_resources(batch)
+
+    kv_cache.resize.assert_called_once_with(position + chunk + draft_len, 0)
+    assert not request.use_draft_model
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_unpaired_draft_mirror_that_cannot_grow_raises_with_the_pool_diagnostic(phase: str) -> None:
+    """When a mirror finds no page to grow into, the iteration fails
+    explicitly: the mirror left at its size has no storage for the K/V the
+    drafter writes next, and there is no per-request way to skip drafting.
+    The error carries the pool diagnostic."""
+    position, chunk, draft_len = 8192, 1024, 3
+
+    def make_request(request_id: int) -> LlmRequest:
+        request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=4,
+            input_tokens=[0] * (position + chunk),
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            draft_tokens=[1] * draft_len,
+        )
+        if phase == "context":
+            request.state = LlmRequestState.CONTEXT_INIT
+            request.context_current_position = position
+            request.context_chunk_size = chunk
+        else:
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        return request
+
+    requests = [make_request(51), make_request(52)]
+    caches = {
+        51: Mock(is_active=True, capacity=position, history_length=position, beam_width=1),
+        52: Mock(is_active=True, capacity=position, history_length=position, beam_width=1),
+    }
+    caches[51].resize.return_value = True
+    caches[52].resize.return_value = False
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    manager._mirror_uses_draft_view = False
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = dict(caches)
+    manager._allocated_draft_lens = set()
+    manager._resume_and_restore = Mock(return_value=True)
+    manager._required_gen_capacity = Mock(return_value=position + 1 + draft_len)
+    manager._draft_pool_diagnostic = Mock(return_value=" [draft pool: full]")
+    manager.kv_cache_type = CacheType.SELF
+    manager.max_beam_width = 1
+
+    batch = ScheduledRequests()
+    if phase == "context":
+        batch.context_requests_last_chunk.extend(requests)
+        expected_resize = call(position + chunk + draft_len, position)
+        expected_capacity = position + chunk + draft_len
+    else:
+        batch.generation_requests.extend(requests)
+        expected_resize = call(position + 1 + draft_len)
+        expected_capacity = position + 1 + draft_len
+    with pytest.raises(RuntimeError) as excinfo:
+        manager._prepare_draft_resources(batch)
+
+    assert caches[51].resize.call_args_list == [expected_resize]
+    assert caches[52].resize.call_args_list == [expected_resize]
+    message = str(excinfo.value)
+    assert f"Draft KV cache {phase} resize failed for request 52" in message
+    assert f"could not resize to {expected_capacity} tokens" in message
+    assert "[draft pool: full]" in message
+
+
+def test_exhausted_pool_fails_explicitly_on_an_empty_fresh_mirror() -> None:
+    """A fresh mirror whose first resize fails holds no page at all. The
+    manager raises before the forward, with a diagnostic that shows the empty
+    mirror and how full the pool was."""
+    prompt, draft_len = 1024, 3
+    request = LlmRequest(
+        request_id=61,
+        max_new_tokens=4,
+        input_tokens=[0] * prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * draft_len,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 0
+    request.context_chunk_size = prompt
+
+    occupant = Mock(is_active=True, capacity=1216, history_length=0, num_blocks=38)
+    fresh = Mock(is_active=True, capacity=0, history_length=0, num_blocks=0)
+    fresh.resize.return_value = False
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    manager._mirror_uses_draft_view = False
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = {60: occupant, 61: fresh}
+    manager.max_attention_window_vec = [2048]
+    manager._gpu_max_tokens = 1216
+    manager._resume_and_restore = Mock(return_value=True)
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk.append(request)
+    with pytest.raises(RuntimeError) as excinfo:
+        manager._prepare_draft_resources(batch)
+
+    fresh.resize.assert_called_once_with(prompt + draft_len, 0)
+    message = str(excinfo.value)
+    assert (
+        f"context resize failed for request 61: could not resize to {prompt + draft_len} tokens"
+        in message
+    )
+    assert "2 live caches, capacity 1216 tokens in 38 allocated blocks" in message
+    assert "61: capacity=0 history=0 blocks=0" in message
+    assert "windows=[2048]" in message
+    assert "gpu_max_tokens=1216" in message
+
+
+def test_windowed_draft_pool_backs_only_the_window_of_a_generation_dummy() -> None:
+    """A CUDA-graph warmup dummy is a generation request at the longest length
+    the target pool can hold. Its draft mirror carries the same history hint
+    as the target cache, so a windowed draft pool sized for a few mirrors of
+    window + chunk backs only the dummy's window; without the hint the mirror
+    would need the dummy's whole length, which such a pool cannot hold."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=4, speculative_model="draft")
+    # 32 KiB per token (8 layers, 8 KV heads of 128, fp16): a mirror of a
+    # 256-token window plus a 512-token chunk is ~26 MiB; the pool holds four
+    # of them (~104 MiB), while a 60k-token dummy held in full needs ~1.8 GiB.
+    num_layers, num_kv_heads, head_dim = 8, 8, 128
+    tokens_per_block, window, chunk, max_seq_len, batch_size = 32, 256, 512, 65536, 2
+    token_num = 60_000
+    draft_config = KvCacheConfig(
+        enable_block_reuse=False, max_attention_window=[window] * num_layers
+    )
+    bytes_per_token = num_layers * 2 * num_kv_heads * head_dim * 2
+    _, headroom = _get_generation_kv_capacity(spec, is_draft=True)
+    tokens_per_mirror = window + chunk + 2 * headroom + tokens_per_block
+    pages_per_mirror = -(-tokens_per_mirror // tokens_per_block)
+    draft_budget = 2 * batch_size * pages_per_mirror * tokens_per_block * bytes_per_token
+    assert token_num * bytes_per_token > 4 * draft_budget
+    draft = KVCacheManagerV2(
+        draft_config.model_copy(update={"max_gpu_total_bytes": draft_budget}),
+        CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=chunk,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=spec,
+        is_draft=True,
+    )
+    # A small windowless target pool (512 B per token) that holds the whole
+    # dummy, so the target side of add_dummy_requests cannot be what fails.
+    target = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=128 << 20),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=chunk,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=spec,
+    )
+    # Only the external drafter's own manager follows the target's chunking.
+    assert not draft._mirror_uses_draft_view
+    assert target._mirror_uses_draft_view
+    stream = torch.cuda.current_stream().cuda_stream
+
+    def live_pages(cache: object) -> int:
+        return len(cache.get_aggregated_page_indices(0, valid_only=True))
+
+    requests = None
+    try:
+        # The mirror resize without a history hint: the whole dummy on the
+        # windowed pool, which is more than the pool has.
+        probe = draft.impl.create_kv_cache()
+        try:
+            assert probe.resume(stream)
+            assert not probe.resize(token_num + draft.num_extra_kv_tokens)
+        finally:
+            probe.close()
+        requests = target.add_dummy_requests(
+            [7],
+            token_nums=[token_num],
+            is_gen=True,
+            max_num_draft_tokens=spec.max_draft_len,
+            draft_kv_cache_manager=draft,
+        )
+        assert requests is not None, "the dummy's draft mirror did not fit the windowed pool"
+        (request,) = requests
+        target_cache = target.kv_cache_map[request.py_request_id]
+        mirror = draft.kv_cache_map[request.py_request_id]
+        assert live_pages(target_cache) >= token_num // tokens_per_block
+        assert mirror.capacity == target_cache.capacity
+        assert mirror.history_length == token_num - 1
+        assert live_pages(mirror) <= pages_per_mirror
+    finally:
+        for request in requests or ():
+            draft.free_resources(request)
+            target.free_resources(request)
+        draft.shutdown()
+        target.shutdown()
 
 
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
