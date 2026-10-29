@@ -2588,10 +2588,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 }
             )
         )
-        if self._sparse_layer_group_ids:
-            self.sparse_metadata_batch = Batch(
-                self.impl, index_mapper_capacity, self.max_blocks_per_seq, self.max_beam_width
-            )
+        # Metadata publication belongs to the sparse fetch path, which builds the Batch
+        # it publishes through; this manager does not. Every use of
+        # `sparse_metadata_batch` is guarded on it being set, so leaving it unset keeps
+        # those paths inert. Restore this with the full sparse attention support, which
+        # brings that fetch path with it -- it is dropped here only so the KVCM2 core
+        # change stands alone.
 
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
