@@ -16,13 +16,22 @@
 
 # Wrapper for mypy invoked by the pre-commit type-check hook.
 #
-# When the compiled TensorRT-LLM bindings are present (bindings.*.so),
-# performs a full type check including automatic type-stub installation.
-# Otherwise, runs a lightweight check that tolerates missing compiled
-# modules so that developers can type-check without building the wheel.
+# Runs the diagnostic allowlist configured in pyproject.toml, excluding the
+# paths, raw names, and resolved import names in scripts/mypy_exclusion.json,
+# then reporting only errors absent from the exact diagnostic entries in
+# scripts/mypy_baseline.txt. When compiled
+# TensorRT-LLM bindings are present (bindings.*.so), also permits automatic
+# type-stub installation. Without bindings, keeps the same diagnostics and
+# disables automatic stub installation.
+# The check is advisory: write the result to mypy_final_report.txt and return
+# success to the caller even when mypy or baseline comparison fails.
+# Checks changed product Python files by default; explicit paths can be passed
+# by pre-commit or on the command line. Pass --full-project to scan all product
+# Python files. Pass --update-baseline with --full-project to replace the saved
+# entries with the current full scan.
 #
-# Set MYPY_REQUIRE_BINDINGS=1 to fail when the compiled bindings cannot be
-# imported (used by the build stage to enforce the full check after compilation).
+# Set MYPY_REQUIRE_BINDINGS=1 to record a failed check when the compiled
+# bindings cannot be imported.
 #
 # Importing the bindings needs no GPU, but it does need libcuda.so.1 to resolve;
 # on a driverless machine this script falls back to the CUDA stub library (see
@@ -33,24 +42,135 @@
 # pyright has better inference and narrowing, fuller generics/ParamSpec/overload
 # handling, and is considerably faster. ty (Astral, aligns with the ruff already
 # used here) and pyrefly (Meta) target the same niche and are worth re-checking
-# for maturity. Migration cost is bounded — [tool.mypy] files in pyproject.toml
-# is a short explicit list, so a candidate can be run over the same set as a
-# non-blocking stage first to see what it catches that mypy does not.
+# for maturity. The [tool.mypy] files in pyproject.toml cover the product tree,
+# so a candidate can run over the same set as a non-blocking stage
+# first to see what it catches that mypy does not.
 
 set -euo pipefail
 
+BASELINE_ACTION="check"
+FULL_PROJECT=0
+while (( $# > 0 )); do
+    case "$1" in
+        --update-baseline)
+            BASELINE_ACTION="record"
+            shift
+            ;;
+        --full-project)
+            FULL_PROJECT=1
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-
-# Temporary directory holding the CUDA driver stub, if one is needed. Removed on
-# exit; note that mypy below is therefore invoked WITHOUT exec, so this trap runs.
+REPORT_FILE="${MYPY_REPORT_PATH:-$PROJECT_DIR/mypy_final_report.txt}"
 STUB_DIR=""
+MYPY_OUTPUT=""
+MYPY_CONFIG_DIR=""
 cleanup_stub_dir() {
+    local check_status=$?
     if [[ -n "$STUB_DIR" ]]; then
-        rm -rf "$STUB_DIR"
+        rm -rf "$STUB_DIR" || true
     fi
+    if [[ -n "$MYPY_OUTPUT" ]]; then
+        rm -f "$MYPY_OUTPUT" || true
+    fi
+    if [[ -n "$MYPY_CONFIG_DIR" ]]; then
+        rm -rf "$MYPY_CONFIG_DIR" || true
+    fi
+    printf '\n# Check status: %s\n' "$check_status"
+    printf 'mypy report: %s (check status: %s)\n' "$REPORT_FILE" "$check_status" >&3 || true
+    trap - EXIT
+    exit 0
 }
+printf '%s\n' \
+    '# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.' \
+    '# SPDX-License-Identifier: Apache-2.0' \
+    '# Command: scripts/run_mypy.sh' \
+    '' > "$REPORT_FILE"
+exec 3>&1
+exec >> "$REPORT_FILE" 2>&1
 trap cleanup_stub_dir EXIT
+
+EXCLUSIONS_CONFIG="$SCRIPT_DIR/mypy_exclusion.json"
+BASELINE_FILE="$SCRIPT_DIR/mypy_baseline.txt"
+cd "$PROJECT_DIR"
+EXCLUDE_REGEX="$(python3 "$SCRIPT_DIR/mypy_exclusion.py" exclusions \
+    --project-root "$PROJECT_DIR" "$EXCLUSIONS_CONFIG")"
+
+if (( ! FULL_PROJECT )) && [[ "$BASELINE_ACTION" == "record" ]]; then
+    echo "ERROR: --update-baseline requires --full-project" >&2
+    exit 2
+fi
+if (( FULL_PROJECT && $# > 0 )); then
+    echo "ERROR: --full-project does not accept file paths" >&2
+    exit 2
+fi
+if (( ! FULL_PROJECT && $# == 0 )); then
+    CHANGED_PATHS_FILE="$(mktemp)"
+    if ! git diff --name-only -z HEAD -- tensorrt_llm > "$CHANGED_PATHS_FILE" ||
+        ! git ls-files --others --exclude-standard -z -- tensorrt_llm >> "$CHANGED_PATHS_FILE"; then
+        rm -f "$CHANGED_PATHS_FILE"
+        echo "ERROR: could not discover changed files" >&2
+        exit 2
+    fi
+    mapfile -d '' -t changed_paths < "$CHANGED_PATHS_FILE"
+    rm -f "$CHANGED_PATHS_FILE"
+    set -- "${changed_paths[@]}"
+fi
+
+FILTERED_ARGS=()
+KEPT_SOURCES=0
+for argument in "$@"; do
+    if [[ "$argument" == --* ]]; then
+        echo "ERROR: unknown option: $argument" >&2
+        exit 2
+    fi
+    if (( ! FULL_PROJECT )) && [[ "$argument" != tensorrt_llm/* ]]; then
+        echo "Skipping non-product mypy input: $argument"
+        continue
+    fi
+    if (( ! FULL_PROJECT )) && [[ "$argument" != *.py && "$argument" != *.pyi ]]; then
+        echo "Skipping non-Python mypy input: $argument"
+        continue
+    fi
+    if (( ! FULL_PROJECT )) && [[ ! -f "$argument" ]]; then
+        echo "Skipping missing mypy input: $argument"
+        continue
+    fi
+    if [[ "$argument" == *.py || "$argument" == *.pyi ]]; then
+        if python3 "$SCRIPT_DIR/mypy_exclusion.py" exclusions --project-root "$PROJECT_DIR" \
+            --matches "$argument" "$EXCLUSIONS_CONFIG"; then
+            echo "Skipping excluded mypy source: $argument"
+            continue
+        fi
+        KEPT_SOURCES=$((KEPT_SOURCES + 1))
+    fi
+    FILTERED_ARGS+=("$argument")
+done
+if (( ! FULL_PROJECT && KEPT_SOURCES == 0 )); then
+    echo "No eligible changed Python files to check"
+    exit 0
+fi
+set -- "${FILTERED_ARGS[@]}"
+if (( ! FULL_PROJECT )); then
+    printf 'Checking %s changed product Python file(s):\n' "$KEPT_SOURCES"
+    printf '  %s\n' "$@"
+fi
+
+MYPY_CONFIG_DIR="$(mktemp -d)"
+MYPY_CONFIG="$MYPY_CONFIG_DIR/mypy.toml"
+cat "$PROJECT_DIR/pyproject.toml" > "$MYPY_CONFIG"
+if (( ! FULL_PROJECT )); then
+    python3 "$SCRIPT_DIR/mypy_exclusion.py" exclusions --explicit-sources-only "$MYPY_CONFIG"
+fi
+python3 "$SCRIPT_DIR/mypy_exclusion.py" exclusions --import-overrides \
+    --project-root "$PROJECT_DIR" "$EXCLUSIONS_CONFIG" >> "$MYPY_CONFIG"
 
 # Make the bindings loadable on a machine with no CUDA driver installed.
 #
@@ -116,8 +236,8 @@ ensure_cuda_driver_stub
 # separately would close that hole; it is deliberately left as a follow-up
 # rather than folded into this check, since the two catch disjoint failures.
 if python3 -c 'import tensorrt_llm.bindings'; then
-    echo "Compiled bindings detected — running full mypy type check"
-    mypy "$@"
+    echo "Compiled bindings detected — running configured mypy checks"
+    MYPY_ARGS=(--exclude "$EXCLUDE_REGEX")
 else
     if [[ "${MYPY_REQUIRE_BINDINGS:-0}" -eq 1 ]]; then
         echo "ERROR: MYPY_REQUIRE_BINDINGS=1 but 'import tensorrt_llm.bindings'" \
@@ -135,23 +255,26 @@ else
         fi
         exit 1
     fi
-    echo "No compiled bindings — running lightweight mypy type check"
-    # Without installed dependencies and/or compiled bindings every corresponding type
-    # resolves to Any. The flags below suppress the strict-mode checks that cascade
-    # from this:
-    #   --ignore-missing-imports     → silences import errors for the .so modules
-    #   --no-warn-return-any         → [no-any-return] on functions returning Any
-    #   --no-warn-unused-ignores     → [unused-ignore] on "# type: ignore"
-    #                                  comments that become unnecessary
-    #   --allow-untyped-decorators   → [misc] on decorators whose type is Any
-    #   --allow-subclassing-any      → [misc] on classes inheriting from Any
-    mypy \
-        --ignore-missing-imports \
-        --no-warn-return-any \
-        --no-warn-unused-ignores \
-        --allow-untyped-decorators \
-        --allow-subclassing-any \
-        --no-install-types \
-        --interactive \
-        "$@"
+    echo "No compiled bindings — running configured mypy checks without stub installation"
+    # Missing imports remain visible through the configured import-not-found code.
+    MYPY_ARGS=(--exclude "$EXCLUDE_REGEX" --no-install-types --interactive)
+fi
+if (( ! FULL_PROJECT )); then
+    # Analyze only explicit sources; imported implementation modules become Any.
+    MYPY_ARGS+=(--follow-imports=skip)
+fi
+
+MYPY_OUTPUT="$(mktemp)"
+MYPY_STATUS=0
+mypy --config-file "$MYPY_CONFIG" "${MYPY_ARGS[@]}" \
+    --show-error-codes --show-column-numbers --no-pretty \
+    --no-color-output "$@" > "$MYPY_OUTPUT" 2>&1 || MYPY_STATUS=$?
+if (( ! FULL_PROJECT )); then
+    python3 "$SCRIPT_DIR/mypy_exclusion.py" "$BASELINE_ACTION" "$MYPY_OUTPUT" \
+        "$BASELINE_FILE" --mypy-exit-code "$MYPY_STATUS" \
+        --exclusions-config "$EXCLUSIONS_CONFIG" --project-root "$PROJECT_DIR" --partial
+else
+    python3 "$SCRIPT_DIR/mypy_exclusion.py" "$BASELINE_ACTION" "$MYPY_OUTPUT" \
+        "$BASELINE_FILE" --mypy-exit-code "$MYPY_STATUS" \
+        --exclusions-config "$EXCLUSIONS_CONFIG" --project-root "$PROJECT_DIR"
 fi

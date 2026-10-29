@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 ####################################################################################################
 ###############################  BUILD CONFIGURATION  ##############################################
 ####################################################################################################
@@ -844,71 +847,101 @@ follow_imports = "silent"
 explicit_package_bases = true
 namespace_packages = true
 strict = true
+check_untyped_defs = true
 show_error_codes = true
-# Files checked when mypy runs with no explicit paths. This is the single source
-# of truth for the type-check file set. Both the CI build stage (which invokes
-# scripts/run_mypy.sh directly) and the local pre-commit hook run mypy without
-# explicit paths (the hook sets `pass_filenames: false`), so both read this list.
-files = [
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampler.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_common.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampling_resolution.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/logprobs.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_features.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/seed_manager.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/finish_reasons.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/top_p_decay.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/penalties.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py",
-    "tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py",
-    "tests/unittest/_torch/sampler/test_torch_sampler.py",
-    "tests/unittest/_torch/sampler/test_token_ban.py",
-    "tests/unittest/_torch/sampler/test_beam_search.py",
-    "tests/unittest/_torch/sampler/test_beam_search_util.py",
-]
-# NB:
-#   .   -> 'tensorrt_llm'
-#   tests/unittest   -> 'utils'
-#   tests/unittest/_torch/sampler   -> for 'test_beam_search_util'
-mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
-
-[[tool.mypy.overrides]]
-module = ["tensorrt_llm.bindings.*"]
-ignore_errors = true
-
-# Generated pybind11 stub; DeepGEMM returns a bare py::dict from
-# get_bf16_mega_gate_config, which stubgen renders without type parameters.
-[[tool.mypy.overrides]]
-module = ["tensorrt_llm.deep_gemm_cpp_tllm", "deep_gemm_cpp_tllm"]
-disallow_any_generics = false
-
-[[tool.mypy.overrides]]
-module = [
-    "tensorrt_llm._torch.pyexecutor.sampler",
-    "tensorrt_llm._torch.pyexecutor.sampler.*",
+# Diagnostic allowlist for product code. Keep the complementary
+# disabled list in sync with the mypy version pinned in requirements-dev.txt.
+enable_error_code = [
+    "syntax",
+    "import-not-found",
+    "name-defined",
+    "used-before-def",
+    "call-arg",
 ]
 disable_error_code = [
+    "abstract",
+    "annotation-unchecked",
+    "arg-type",
+    "assert-type",
+    "assignment",
+    "attr-defined",
+    "await-not-async",
+    "call-overload",
+    "comparison-overlap",
+    "deprecated",
+    "dict-item",
+    "empty-body",
+    "exhaustive-match",
+    "exit-return",
+    "explicit-any",
+    "explicit-override",
+    "func-returns-value",
+    "has-type",
+    "ignore-without-code",
+    "import",
+    "import-untyped",
+    "index",
+    "list-item",
+    "literal-required",
+    "maybe-unrecognized-str-typeform",
+    "metaclass",
+    "method-assign",
+    "misc",
+    "mutable-override",
+    "name-match",
+    "narrowed-type-not-subtype",
+    "no-any-return",
+    "no-any-unimported",
+    "no-overload-impl",
+    "no-redef",
     "no-untyped-call",
-    # TODO(TRTLLM-15310): strict mode's warn_redundant_casts flags several cast(...) calls
-    # in the sampler package (introduced by #16620). Whether a cast is "redundant" is
-    # binding-dependent -- the full build check (compiled bindings + stubs) flags 2,
-    # the bindings-less local/pre-commit check flags ~20 -- so removing casts is a
-    # fragile WAR. Suppress redundant-cast for the sampler module until the casts are
-    # audited and the annotations tightened, rather than churn the source.
-    "redundant-cast",
-]
-
-[[tool.mypy.overrides]]
-module = [
-    "tests.*",
-    "_torch.*",  # tests/unittest/_torch/*, cf. mypy_path
-    "test_torch_sampler",  # tests/unittest/_torch/sampler/..., cf. mypy_path
-    "test_token_ban",  # tests/unittest/_torch/sampler/..., cf. mypy_path
-    "test_beam_search",  # tests/unittest/_torch/sampler/..., cf. mypy_path
-    "test_beam_search_util",  # tests/unittest/_torch/sampler/..., cf. mypy_path
-]
-disable_error_code = [
     "no-untyped-def",
-    "no-untyped-call",
+    "operator",
+    "overload-cannot-match",
+    "overload-overlap",
+    "override",
+    "possibly-undefined",
+    "prop-decorator",
+    "redundant-cast",
+    "redundant-expr",
+    "redundant-self",
+    "return",
+    "return-value",
+    "safe-super",
+    "str-bytes-safe",
+    "str-format",
+    "truthy-bool",
+    "truthy-function",
+    "truthy-iterable",
+    "top-level-await",
+    "type-abstract",
+    "type-arg",
+    "type-var",
+    "typeddict-item",
+    "typeddict-readonly-mutated",
+    "typeddict-unknown-key",
+    "unreachable",
+    "untyped-decorator",
+    "unused-awaitable",
+    "unused-coroutine",
+    "unused-ignore",
+    "unimported-reveal",
+    "union-attr",
+    "valid-newtype",
+    "valid-type",
+    "var-annotated",
 ]
+# Files checked by scripts/run_mypy.sh --full-project. Pre-commit passes changed
+# product Python files explicitly to the script's default changed-file mode.
+files = ["tensorrt_llm"]
+# scripts/run_mypy.sh reads path and symbol exclusions from scripts/mypy_exclusion.json.
+mypy_path = "."
+
+[[tool.mypy.overrides]]
+# TensorRT-LLM bindings are generated by the C++ build and may be absent in a source checkout.
+module = ["torch.*", "tensorrt_llm.bindings", "tensorrt_llm.bindings.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tensorrt_llm.llmapi.tracer"]
+disable_error_code = ["import-not-found"]
