@@ -264,7 +264,9 @@ def test_kda_verify_keeps_builtin_fallback_dense(
         else KDAIntermediateLayerCache(conv=torch.empty(0), temporal=torch.empty(0))
     )
 
-    def verify_fused(self, *args, output=None, allow_prequantized_output=False):
+    def verify_fused(
+        self, *args, output=None, allow_prequantized_output=False, replay_slot_indices=None
+    ):
         if allow_prequantized_output:
             return _KdaPrequantizedCore(core.reshape(8, -1), torch.ones(1, dtype=torch.uint8))
         return self._store_core(core, output)

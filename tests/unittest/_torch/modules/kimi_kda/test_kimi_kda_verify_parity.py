@@ -115,8 +115,10 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         slot_indices: torch.Tensor,
         output: torch.Tensor | None = None,
         allow_prequantized_output: bool = False,
+        replay_slot_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         captured["slot_indices"] = slot_indices
+        captured["replay_slot_indices"] = replay_slot_indices
         return torch.zeros_like(hidden_states)
 
     monkeypatch.setattr(attention, "forward_prefill", forward_prefill)
@@ -167,6 +169,8 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
 
     assert output.shape == hidden_states.shape
     assert captured["slot_indices"].data_ptr() == aligned_indices.data_ptr()
+    # Without replay slots of their own, the replay caches use the state slots.
+    assert captured["replay_slot_indices"].data_ptr() == aligned_indices.data_ptr()
     torch.testing.assert_close(aligned_indices, generation_slice)
 
 

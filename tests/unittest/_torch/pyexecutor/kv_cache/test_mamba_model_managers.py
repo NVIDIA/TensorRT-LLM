@@ -323,19 +323,27 @@ def test_k3_initializes_only_the_selected_state(
     else:
         selector.assert_not_called()
 
+    # The replay state declares its buffers through the common replay hook and receives their views from it.
+    manager._replay_layouts = {
+        layer_id: replay_layout
+        for layer_id in (0, 1)
+        if (replay_layout := manager._get_replay_layout(layer_id))
+    }
+    assert bool(manager._replay_layouts) == (num_spec is not None)
+    replay_views = [{}, {}]
+    manager._get_replay_views = Mock(return_value=replay_views)
     manager._state_layout = object()
     manager.all_ssm_states, manager.all_conv_states = [], []
-    pool_bind = Mock()
-    monkeypatch.setitem(
-        manager_cls._setup_model_state.__globals__, "bind_kda_replay_pool", pool_bind
-    )
     bind = Mock()
     monkeypatch.setattr(state, "bind", bind)
+    if num_spec is not None:
+        bind_replay_pool = Mock()
+        monkeypatch.setattr(state, "bind_replay_pool", bind_replay_pool)
     manager._setup_model_state()
     if num_spec is not None:
-        pool_bind.assert_called_once_with(state, manager)
+        bind_replay_pool.assert_called_once_with(replay_views)
     else:
-        pool_bind.assert_not_called()
+        manager._get_replay_views.assert_not_called()
     bind.assert_called_once_with(
         manager._state_layout, manager.all_ssm_states, manager.all_conv_states
     )
@@ -759,14 +767,24 @@ def test_kda_pool_allocation_includes_replay_in_native_quota(
     manager.mapping = layout.mapping
     manager._num_reserved_dummy_slots = 1
     manager.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    # What __init__ declares: PRIVATE replay buffers in a fixed pool of one slot per IndexMapper slot.
+    manager._replay_layouts = manager._private_replay_layouts = {
+        layer_id: replay_layout
+        for layer_id in manager.mamba_pp_layers
+        if (replay_layout := manager._get_replay_layout(layer_id))
+    }
+    manager._index_mapper_capacity = 2 * layout.max_batch_size + 1
     persistent_bytes_per_slot = manager._mamba_state_bytes_per_slot()
+    assert persistent_bytes_per_slot == 2 * (128 + 288)
+    replay_bytes = manager._index_mapper_capacity * manager._private_replay_bytes_per_slot()
+    assert bool(replay_bytes) == replay
     total_quota = 1 << 20
     if quota_source in ("max_tokens", "both"):
         monkeypatch.setattr(
             KVCacheManagerV2, "_get_quota_from_max_tokens", lambda self, tokens: tokens * 64
         )
         total_quota = manager._get_quota_from_max_tokens(16384)
-        assert total_quota == 16384 * 64 + 4 * persistent_bytes_per_slot
+        assert total_quota == 16384 * 64 + 4 * persistent_bytes_per_slot + replay_bytes
 
     class Pool:
         def __init__(self, config, **kwargs):
@@ -927,24 +945,31 @@ def test_kda_affine_estimator_includes_replay_scratch(
         kv_cache_config=kv_config,
         spec_config=layout.spec_config,
     )
-    scratch_per_slot = 0
+    seed_per_slot = replay_per_slot = 0
     if replay:
         state = KDAReplayState(2, stochastic_rounding=stochastic_rounding)
         state.bind(layout, _state_views().all_ssm_states, _state_views().all_conv_states)
         buffers = [*state._layer_replay_buffers(), state.prev_num_accepted_tokens]
-        if stochastic_rounding:
-            buffers.append(state.rand_seed)
-        scratch_per_slot = (
+        # KVCM pads the shared accepted-draft count from 4 to 16 bytes.
+        replay_per_slot = (
             sum(buffer.untyped_storage().nbytes() for buffer in buffers) // layout.slot_capacity
+            + 12
         )
+        if stochastic_rounding:
+            seed_per_slot = state.rand_seed.untyped_storage().nbytes() // layout.slot_capacity
     dummy_slots = common._get_num_cuda_graph_padding_dummy_slots(
         layout.spec_config, layout.max_batch_size
     )
-    # KVCM pads the shared accepted-draft count from 4 to 16 bytes.
-    state_bytes = 2 * 416 + scratch_per_slot + (12 if replay else 0)
+    # Every recurrent-state slot, snapshots included, holds the seed; the replay buffers form a fixed pool of one
+    # slot per IndexMapper slot (two leases per sequence with the overlap scheduler, plus the dummies).
+    state_bytes = 2 * 416 + seed_per_slot
+    max_live_kv_caches = 2 * layout.max_batch_size + dummy_slots
     interval = kv_config.mamba_state_config.periodic_snapshot_interval
     slope = (state_bytes + interval - 1) // interval if reuse and interval > 0 else 0
-    assert cost == (slope, (layout.max_batch_size + dummy_slots) * state_bytes)
+    assert cost == (
+        slope,
+        (layout.max_batch_size + dummy_slots) * state_bytes + max_live_kv_caches * replay_per_slot,
+    )
 
 
 @pytest.mark.parametrize("layer", [0, 1])
@@ -1244,15 +1269,18 @@ def test_model_compatibility_properties_follow_owned_state(manager_cls):
 
 def test_k3_resolves_transfer_requests_before_calling_algorithm():
     manager = object.__new__(KimiK3HybridCacheManager)
+    manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {101: 3, 202: 1}
     replay = KDAReplayState(2)
     replay.prev_num_accepted_tokens = torch.zeros(5, dtype=torch.int32)
     replay.seed_transferred_slots = Mock()
     manager._kda_replay = replay
     manager.on_state_transfer_complete([101, 999, 202, 101])
-    slots = replay.seed_transferred_slots.call_args.args[0]
+    slots, replay_slots = replay.seed_transferred_slots.call_args.args
     assert slots.tolist() == [1, 3]
     assert slots.dtype == torch.long
+    # Without replay slots of their own, the replay slots are the state slots.
+    assert replay_slots.tolist() == [1, 3]
     replay.seed_transferred_slots.reset_mock()
     manager.on_state_transfer_complete([999])
     replay.seed_transferred_slots.assert_not_called()
@@ -1261,6 +1289,7 @@ def test_k3_resolves_transfer_requests_before_calling_algorithm():
 @pytest.mark.parametrize("draft_lengths", [[], [0, 0], [1, 0], [1, 1]])
 def test_k3_host_acceptance_handles_empty_mixed_and_completed_requests(draft_lengths):
     manager = object.__new__(KimiK3HybridCacheManager)
+    manager.local_num_mamba_layers = 1
     replay = KDAReplayState(2)
     replay.prev_num_accepted_tokens = torch.tensor([5, 6], dtype=torch.int32)
     manager._kda_replay = replay
