@@ -209,6 +209,15 @@ public:
 // Owns finish events from all SharedPageLocks it issued.
 // Mirrors Python's _UniqPageLock.
 // ---------------------------------------------------------------------------
+struct LockOwner
+{
+    KvCache* kvCache;
+    BeamIndex beamIndex;
+    BlockOrdinal ordinal;
+    LifeCycleId lifeCycle;
+    bool operator==(LockOwner const&) const = default;
+};
+
 class UniqPageLock : public EnableSharedFromThis<UniqPageLock>
 {
 public:
@@ -229,20 +238,32 @@ public:
 
     using FinishEvents = FinishEventVec<CachedCudaEvent>;
 
+    //! Record a copy ordered after page readiness, finished readers, and all live owners' prior work.
+    void recordMigrationEvent(CachedCudaEvent const& event);
+
+    //! Move the locked page to another slot at the same level (copy-based rebalancing, in place),
+    //! republish its index to every owner, and return the source slot. The copy must already be
+    //! fenced through recordMigrationEvent(). Caller holds the API lock.
+    [[nodiscard]] Slot relocate(Slot&& slot);
+
+    //! Every (cache, beam, ordinal, life cycle) currently holding a shared lock on this page.
+    std::vector<LockOwner> const& owners() const noexcept
+    {
+        return mOwners;
+    }
+
     SharedPtr<PageHolder> holder;
     FinishEvents finishEvents;
+
+private:
+    friend class SharedPageLock;
+    void removeOwner(LockOwner const& owner);
+    std::vector<LockOwner> mOwners;
 };
 
 // ---------------------------------------------------------------------------
 // LockOwner — identifies who holds a SharedPageLock.
 // ---------------------------------------------------------------------------
-struct LockOwner
-{
-    KvCache* kvCache;
-    BeamIndex beamIndex;
-    BlockOrdinal ordinal;
-    LifeCycleId lifeCycle;
-};
 
 // ---------------------------------------------------------------------------
 // SharedPageLock — one user's hold on an active page lock.

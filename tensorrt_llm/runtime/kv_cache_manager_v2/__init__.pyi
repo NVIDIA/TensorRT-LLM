@@ -553,6 +553,7 @@ class PoolRebalanceConfig:
     moving_average_decay: float = 0.9999
     copy_based_rebalancing: bool = False
     drop_unreferenced_on_rebalance: bool = False
+    in_place_relocation: bool = False
 
 # Host bytes held by live page slabs in this process.
 def live_slab_bytes() -> int: ...
