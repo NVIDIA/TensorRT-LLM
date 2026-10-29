@@ -119,6 +119,23 @@ class MiniMaxH3RotaryPosEmbed(nn.Module):
         return freqs.cos(), freqs.sin()
 
 
+# Compute capabilities on which FA4's 2-CTA forward kernel is the faster BF16 attention for
+# H3's shapes (56 heads x 128, 19k to 104k packed tokens): SM 103 (B300) and SM 107 (R200).
+# On SM 100 the process default stays, where the same kernel regresses long sequences.
+FA4_2CTA_CAPABILITIES = frozenset({(10, 3), (10, 7)})
+
+
+def fa4_use_2cta_default(attn_backend: str) -> Optional[bool]:
+    """Return the H3 default for FA4's 2-CTA kernel on the current device.
+
+    ``True`` requests the kernel on the parts in ``FA4_2CTA_CAPABILITIES``; ``None`` keeps FA4's
+    process default everywhere else, for other backends and without a CUDA device.
+    """
+    if attn_backend.upper() != "FA4" or not torch.cuda.is_available():
+        return None
+    return True if torch.cuda.get_device_capability() in FA4_2CTA_CAPABILITIES else None
+
+
 class MiniMaxH3Attention(Attention):
     """Full non-causal attention with per-head RMSNorm and partial 3D RoPE."""
 
@@ -132,12 +149,16 @@ class MiniMaxH3Attention(Attention):
         model_config: DiffusionModelConfig,
         layer_idx: int,
         module_name: str,
+        fa4_use_2cta: Optional[bool] = None,
     ) -> None:
         vgm = model_config.visual_gen_mapping
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
         # With ulysses_size > 1 and parallel.async_ulysses, use separate Q/K/V projections so
         # each one is pushed to the peers while the next is computed (forward_async).
         use_async_ulysses = bool(ulysses_size > 1 and model_config.parallel.async_ulysses)
+        backend_kwargs = None
+        if fa4_use_2cta is not None and model_config.attention.backend.upper() == "FA4":
+            backend_kwargs = {"use_2cta": fa4_use_2cta}
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -157,6 +178,7 @@ class MiniMaxH3Attention(Attention):
             module_name=module_name,
             async_ulysses=use_async_ulysses,
             separate_qkv_is_self_attention=True,
+            backend_kwargs=backend_kwargs,
         )
         self.use_async_ulysses = use_async_ulysses
 
@@ -549,6 +571,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         model_config: DiffusionModelConfig,
         layer_idx: int,
         fuse_bf16_gate_up_swiglu: bool = False,
+        fa4_use_2cta: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
@@ -562,6 +585,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             module_name=f"transformer_blocks.{layer_idx}.attn",
+            fa4_use_2cta=fa4_use_2cta,
         )
         self.norm2 = RMSNorm(
             hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
@@ -667,6 +691,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
         # Only VANILLA supports arbitrary padding between packed modalities.
         self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
+        # The transformer blocks' attention runs at the packed clip length; the token refiner
+        # keeps FA4's process default.
+        self.fa4_use_2cta = fa4_use_2cta_default(self._attn_backend)
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
         if quant_algo is not None and not (
@@ -824,6 +851,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     model_config=model_config,
                     layer_idx=layer_idx,
                     fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
+                    fa4_use_2cta=self.fa4_use_2cta,
                 )
                 for layer_idx in range(num_layers)
             ]

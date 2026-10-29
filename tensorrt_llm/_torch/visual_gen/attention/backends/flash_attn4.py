@@ -19,16 +19,23 @@ Uses Flash Attention 4 with the CUTE JIT kernel.
 Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
 """
 
+import contextlib
 import math
 import os
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Tuple
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from ....attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
-# 2CTA regresses long sequences; must precede the import below.
+# FA4 folds FA_DISABLE_2CTA into a module flag when flash_attn.cute.utils is imported below,
+# so the process-wide default is fixed here: the 2-CTA kernel regresses long sequences on
+# SM 100. A model that has measured otherwise on its part asks for the kernel per backend
+# instance through ``use_2cta``; an explicit FA_DISABLE_2CTA in the environment wins over it.
+_FA_DISABLE_2CTA_FROM_ENV = "FA_DISABLE_2CTA" in os.environ
 os.environ.setdefault("FA_DISABLE_2CTA", "1")
 
 
@@ -108,6 +115,37 @@ except (AttributeError, ImportError, OSError) as e:
     _flash_attn_fwd_import_error = e
 
 
+def fa4_2cta_requestable() -> bool:
+    """Whether a backend-level ``use_2cta`` request takes effect in this process.
+
+    False when FA_DISABLE_2CTA was set explicitly in the environment (the user's choice wins)
+    or when FA4 is not importable.
+    """
+    return _flash_attn_fwd is not None and not _FA_DISABLE_2CTA_FROM_ENV
+
+
+@contextlib.contextmanager
+def _fa4_2cta_request(use_2cta: Optional[bool]) -> Iterator[None]:
+    """Steer FA4's 2-CTA kernel choice for the enclosed forward.
+
+    ``flash_attn.cute.utils`` reads its ``_fa_disable_2cta_enabled`` flag on every forward, so a
+    request is applied by setting that flag around the call and restoring it afterwards. FA4's
+    own opt-out on CUDA 12 toolkits (``_fa_disable_2cta_cuda12``) stays in force. ``None`` leaves
+    the process default untouched.
+    """
+    if use_2cta is None or not fa4_2cta_requestable():
+        yield
+        return
+    from flash_attn.cute import utils as fa4_utils
+
+    previous = fa4_utils._fa_disable_2cta_enabled
+    fa4_utils._fa_disable_2cta_enabled = not use_2cta
+    try:
+        yield
+    finally:
+        fa4_utils._fa_disable_2cta_enabled = previous
+
+
 class FlashAttn4Attention(AttentionBackend):
     """
     Flash Attention 4 backend for diffusion models.
@@ -125,14 +163,28 @@ class FlashAttn4Attention(AttentionBackend):
         head_dim: int = 64,
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
+        use_2cta: Optional[bool] = None,
         **kwargs,
     ):
+        """
+        Args:
+            use_2cta: Request (True) or refuse (False) FA4's 2-CTA forward kernel for this
+                backend instance; ``None`` keeps FA4's process default. Ignored when
+                FA_DISABLE_2CTA is set explicitly in the environment. FA4 still applies its
+                own eligibility rules (non-causal, head_dim 128 / 192, long enough sequence).
+        """
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
         self.scale = 1.0 / math.sqrt(head_dim)
+        self.use_2cta = use_2cta if fa4_2cta_requestable() else None
+        if use_2cta is not None and self.use_2cta is None and layer_idx == 0:
+            logger.info(
+                f"FA4 use_2cta={use_2cta} requested but FA_DISABLE_2CTA is set in the "
+                "environment; keeping the environment's choice."
+            )
 
         # FA4 expects [B, S, H, D] format
         self._preferred_layout = AttentionTensorLayout.NHD
@@ -148,23 +200,24 @@ class FlashAttn4Attention(AttentionBackend):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
         # FA4's private forward API may append diagnostics that this backend does not consume.
-        output, lse, *_ = _flash_attn_fwd(
-            q,
-            k,
-            v,
-            seqused_k=seqused_k,
-            softmax_scale=self.scale,
-            causal=causal,
-            window_size_left=None,
-            window_size_right=None,
-            learnable_sink=None,
-            softcap=0.0,
-            pack_gqa=None,
-            mask_mod=None,
-            block_sparse_tensors=None,
-            return_lse=True,
-            num_splits=0,
-        )
+        with _fa4_2cta_request(self.use_2cta):
+            output, lse, *_ = _flash_attn_fwd(
+                q,
+                k,
+                v,
+                seqused_k=seqused_k,
+                softmax_scale=self.scale,
+                causal=causal,
+                window_size_left=None,
+                window_size_right=None,
+                learnable_sink=None,
+                softcap=0.0,
+                pack_gqa=None,
+                mask_mod=None,
+                block_sparse_tensors=None,
+                return_lse=True,
+                num_splits=0,
+            )
         return output, lse
 
     def _prepare_inputs(
