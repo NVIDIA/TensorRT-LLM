@@ -77,6 +77,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch.distributed.constants import default_pg_timeout
 
 # ``megamoe_activation_sf_bytes_per_row`` lives at module top of the
 # custom-op file (NOT inside its ``IS_MEGAMOE_OP_AVAILABLE`` gate), so
@@ -648,6 +649,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # time would be collective on a non-synchronous call stack and
         # deadlock under PP / layer-skip. Construction is globally
         # synchronous across ranks during model build.
+        #
+        # The bootstrap stays OUTSIDE the single-rank fallback below. Every
+        # torch.distributed error is a RuntimeError, and swallowing a failed
+        # ``init_process_group`` makes the next MegaMoE layer retry it on the
+        # failing rank alone. ``init_process_group`` names the default group
+        # from a counter it bumps before the rendezvous, so the retrying rank
+        # exchanges gloo addresses under different store keys than its peers
+        # and every rank hangs until the process-group timeout.
+        self._maybe_init_torch_dist_under_mpi()
         try:
             self._ep_pg = self._resolve_ep_pg()
         except RuntimeError as e:
@@ -820,7 +830,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         The MPI orchestrator (trtllm-bench / mpirun) never calls
         ``init_process_group``, but the symmetric-memory rendezvous needs a
         ProcessGroup; for pure DEP a node-local NCCL WORLD suffices. No-op
-        under Ray or single-rank.
+        under Ray or single-rank. Failures propagate: a rank that retried
+        ``init_process_group`` alone would never rendezvous with its peers.
         """
         if not dist.is_available() or dist.is_initialized():
             return
@@ -847,32 +858,46 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"EP={self.ep_size}."
             )
 
-        # Rank 0 draws a free port (a fixed one collides across same-node
-        # jobs). The bcast is UNCONDITIONAL and rank 0 alone decides
-        # (honoring ITS pre-set MASTER_* env): gating the collective on
-        # per-rank env presence would desync the communicator when the vars
-        # are exported on only a subset of ranks. No bind-race retry: a sound
-        # one needs cross-rank failure agreement, and the close()->bind()
-        # window is negligible next to the fixed-port collision this replaces.
-        def _pick_rendezvous():
-            addr = os.environ.get("MASTER_ADDR")
-            port = os.environ.get("MASTER_PORT")
-            if addr and port:
-                return (addr, port)
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("", 0))
-                port = sock.getsockname()[1]
+        # Rank 0 hosts the rendezvous store on a port the OS assigns when the
+        # store binds, then broadcasts where it is. Binding the store itself
+        # leaves no window between choosing a port and binding it, which
+        # drawing a free port first and letting init_process_group bind it
+        # later does. MASTER_ADDR / MASTER_PORT are neither read nor written:
+        # an MPI worker outlives the LLM that set them (worker shutdown
+        # destroys the process group but not the environment), so the next
+        # LLM in a reused worker pool would get the previous port. The bcast
+        # is unconditional and also carries rank 0's failure, so every rank
+        # raises together instead of waiting for a store that never came up.
+        store = None
+        payload = None
+        if rank == 0:
             try:
-                addr = socket.gethostbyname(socket.gethostname())
-            except OSError:
-                # Unresolvable hostname (minimal containers / broken DNS):
-                # this bootstrap is documented single-node, loopback works.
-                addr = "127.0.0.1"
-            return (addr, str(port))
-
-        host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
-        os.environ["MASTER_ADDR"] = str(host)
-        os.environ["MASTER_PORT"] = str(port)
+                try:
+                    addr = socket.gethostbyname(socket.gethostname())
+                except OSError:
+                    # Unresolvable hostname (minimal containers / broken
+                    # DNS): this bootstrap is documented single-node, so
+                    # loopback works.
+                    addr = "127.0.0.1"
+                store = dist.TCPStore(
+                    addr,
+                    0,
+                    world,
+                    is_master=True,
+                    timeout=default_pg_timeout,
+                    wait_for_workers=False,
+                )
+                payload = (addr, store.port, None)
+            except RuntimeError as e:
+                payload = (None, None, repr(e))
+        host, port, error = mpi_comm().bcast(payload, root=0)
+        if error is not None:
+            raise RuntimeError(
+                f"[MegaMoECuteDsl] rank 0 could not host the torch.distributed "
+                f"rendezvous store: {error}"
+            )
+        if store is None:
+            store = dist.TCPStore(host, port, world, is_master=False, timeout=default_pg_timeout)
         # The executor already bound this rank's device before the model was
         # built (base_worker: global_mpi_rank() % device_count). Re-deriving it
         # here could pick a different GPU (e.g. a disagg ctx/gen pair sharing a
@@ -884,12 +909,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         logger.info(
             f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
             f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
-            f"device={device_id}, "
-            f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
-            f"EP rendezvous."
+            f"device={device_id}, store={host}:{port}) for the EP rendezvous."
         )
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo",
+            store=store,
             rank=rank,
             world_size=world,
             device_id=device_id,
@@ -899,9 +923,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """Return the torch.distributed ProcessGroup for the EP sub-world.
 
         Mirrors :meth:`MegaMoEDeepGemm._resolve_ep_pg` so the two MegaMoE
-        backends share the same fallback chain.
+        backends share the same fallback chain. The caller runs
+        :meth:`_maybe_init_torch_dist_under_mpi` first.
         """
-        self._maybe_init_torch_dist_under_mpi()
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError(
                 "MegaMoECuteDsl requires torch.distributed to be initialized "

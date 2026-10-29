@@ -20,13 +20,14 @@ import importlib
 import itertools
 import logging
 import os
+import socket
 import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
 import torch
@@ -2068,14 +2069,16 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     moe.ep_size = 8
     mpi_comm = MagicMock()
-    mpi_comm.bcast.return_value = ("127.0.0.1", "29500")
+    mpi_comm.bcast.return_value = ("127.0.0.1", 29500, None)
     local_mpi_comm = MagicMock()
     init_process_group = MagicMock()
     set_device = MagicMock()
+    tcp_store = MagicMock()
 
     monkeypatch.setattr(dist, "is_available", lambda: True)
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
     monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(dist, "TCPStore", tcp_store)
     monkeypatch.setattr(utils, "mpi_world_size", lambda: 8)
     monkeypatch.setattr(utils, "mpi_rank", lambda: 3)
     monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
@@ -2090,12 +2093,110 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
     set_device.assert_not_called()
     # Split_type is a collective; it must not run in this bootstrap.
     local_mpi_comm.assert_not_called()
+    # A non-zero rank connects to the store rank 0 broadcast.
+    tcp_store.assert_called_once_with("127.0.0.1", 29500, 8, is_master=False, timeout=ANY)
     init_process_group.assert_called_once_with(
         backend="cuda:nccl,cpu:gloo",
+        store=tcp_store.return_value,
         rank=3,
         world_size=8,
         device_id=torch.device("cuda", 2),
     )
+
+
+def _patch_megamoe_cutedsl_bootstrap(monkeypatch, *, rank, world, bcast):
+    """Patch MPI and torch.distributed for a bootstrap with ``world`` ranks."""
+    import tensorrt_llm._utils as utils
+
+    mpi_comm = MagicMock()
+    mpi_comm.bcast.side_effect = bcast
+    init_process_group = MagicMock()
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(utils, "mpi_world_size", lambda: world)
+    monkeypatch.setattr(utils, "mpi_rank", lambda: rank)
+    monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    moe.ep_size = world
+    return moe, mpi_comm, init_process_group
+
+
+def test_megamoe_cutedsl_mpi_bootstrap_rank0_hosts_store_on_bound_port(monkeypatch):
+    """Rank 0 binds the store itself and ignores a previous LLM's MASTER_* env.
+
+    Drawing a free port and letting ``init_process_group`` bind it later leaves
+    a window in which another socket can take the port. An MPI worker also
+    outlives the LLM that exported MASTER_ADDR / MASTER_PORT, so honoring them
+    would hand the next LLM in a reused worker pool the previous port.
+    """
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    store = MagicMock(port=41234)
+    tcp_store = MagicMock(return_value=store)
+    monkeypatch.setattr(dist, "TCPStore", tcp_store)
+    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
+    monkeypatch.setattr(socket, "gethostbyname", lambda name: "192.168.0.10")
+    moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch, rank=0, world=4, bcast=lambda obj, root: obj
+    )
+
+    moe._maybe_init_torch_dist_under_mpi()
+
+    tcp_store.assert_called_once_with(
+        "192.168.0.10", 0, 4, is_master=True, timeout=ANY, wait_for_workers=False
+    )
+    mpi_comm.bcast.assert_called_once_with(("192.168.0.10", 41234, None), root=0)
+    init_process_group.assert_called_once_with(
+        backend="cuda:nccl,cpu:gloo", store=store, rank=0, world_size=4, device_id=None
+    )
+    assert os.environ["MASTER_ADDR"] == "10.0.0.1"
+    assert os.environ["MASTER_PORT"] == "29500"
+
+
+def test_megamoe_cutedsl_mpi_bootstrap_store_failure_raises_on_every_rank(monkeypatch):
+    """Rank 0's store failure goes out in the bcast so no rank waits for it."""
+    error = dist.DistNetworkError("address already in use")
+    monkeypatch.setattr(dist, "TCPStore", MagicMock(side_effect=error))
+    sent = []
+
+    def bcast(obj, root):
+        sent.append(obj)
+        return obj
+
+    moe, _, init_process_group = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch, rank=0, world=4, bcast=bcast
+    )
+    with pytest.raises(RuntimeError, match="could not host the torch.distributed rendezvous"):
+        moe._maybe_init_torch_dist_under_mpi()
+    init_process_group.assert_not_called()
+
+    # A peer receives that payload and raises without touching the store.
+    peer_store = MagicMock()
+    monkeypatch.setattr(dist, "TCPStore", peer_store)
+    peer, _, peer_init = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch, rank=2, world=4, bcast=lambda obj, root: sent[0]
+    )
+    with pytest.raises(RuntimeError, match="address already in use"):
+        peer._maybe_init_torch_dist_under_mpi()
+    peer_store.assert_not_called()
+    peer_init.assert_not_called()
+
+
+def test_megamoe_cutedsl_init_raises_bootstrap_failure(monkeypatch):
+    """A failed bootstrap must fail construction, not fall back to single rank.
+
+    Every torch.distributed error is a RuntimeError. If ``__init__`` swallowed
+    one, the next MegaMoE layer would retry ``init_process_group`` on this rank
+    alone under a new default-group name, and every rank would hang in the gloo
+    address exchange until the process-group timeout.
+    """
+    bootstrap = MagicMock(side_effect=dist.DistNetworkError("address already in use"))
+    monkeypatch.setattr(MegaMoECuteDsl, "_maybe_init_torch_dist_under_mpi", bootstrap)
+    with pytest.raises(dist.DistNetworkError, match="address already in use"):
+        _make_megamoe_cutedsl_for_ctor_test()
+    bootstrap.assert_called_once()
 
 
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
