@@ -969,8 +969,9 @@ class Monitor:
         try:
             self.progress.operation("validating_metadata", number)
             if pr.get("merged"):
-                promote._check_current(self.gh, plan)
-            upstream_proof = promote._check_source(self.gh, previous, reviewed)
+                upstream_proof = promote._check_current(self.gh, plan)
+            else:
+                upstream_proof = promote._check_source(self.gh, previous, reviewed)
             entry, evidence = None, None
             cache = self.args.workdir / "sources.git"
             if upstream_proof is None:

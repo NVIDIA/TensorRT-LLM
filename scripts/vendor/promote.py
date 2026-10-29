@@ -277,7 +277,9 @@ def _check_source(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) 
         == tip
     )
     contains_previous = (
-        gh.compare(repo, previous.commit, reviewed.commit)["merge_base_commit"]["sha"]
+        gh.compare(_repo_name(previous.url), previous.commit, reviewed.commit)["merge_base_commit"][
+            "sha"
+        ]
         == previous.commit
     )
     upstream = _sha(gh.get(f"repos/{repo}/git/ref/heads/{gh.upstream_branch}")["object"]["sha"])
@@ -479,15 +481,17 @@ class Promotion:
         return result
 
 
-def _check_current(gh: GitHub, plan: Promotion) -> None:
+def _check_current(gh: GitHub, plan: Promotion) -> dict | None:
+    """Check the current consumer lock and return the live source ancestry proof."""
     current = _lock_at(gh, gh.consumer_repo, _main_sha(gh)).to_mapping()
     if current not in (plan.reviewed.to_mapping(), plan.promoted):
         raise ValueError(
             "Consumer branch's vendor lock has been superseded; do not promote this PR."
         )
-    _check_source(gh, plan.previous, plan.reviewed)
+    upstream_proof = _check_source(gh, plan.previous, plan.reviewed)
     if "checked_canonical_tip" in plan.record:
         _verify_upstream_snapshot(gh, plan.record)
+    return upstream_proof
 
 
 def _plan_identity(args: argparse.Namespace, gh: GitHub) -> Promotion:

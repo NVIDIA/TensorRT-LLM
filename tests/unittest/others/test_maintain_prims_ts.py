@@ -139,6 +139,13 @@ class World(m.GitHub):
         _git(root, "clone", "-q", "--bare", str(self.source), str(self.canonical))
         _git(root, "clone", "-q", "--bare", str(self.consumer), str(self.fork))
         _git(self.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", self.previous)
+        # By default the source forks share objects; tests can isolate their histories.
+        self.compare_repositories = {
+            _CONSUMER: self.consumer,
+            "maintainer/flashinfer": self.source,
+            "dev/flashinfer": self.source,
+            _UPSTREAM: self.source,
+        }
         _git(
             self.consumer, "remote", "add", "fork", "https://github.com/maintainer/TensorRT-LLM.git"
         )
@@ -191,7 +198,12 @@ class World(m.GitHub):
         }
 
     def compare(self, repo: str, base: str, head: str, *, all_commits: bool = False) -> dict:
-        source = self.consumer if repo == _CONSUMER else self.source
+        source = self.compare_repositories[repo]
+        for sha in (base, head):
+            if not _git(
+                source, "rev-parse", "--verify", f"{sha}^{{commit}}", allowed_returncodes=(0, 128)
+            ):
+                raise RuntimeError(f"HTTP 404: commit {sha} is unavailable in {repo}")
         commits = _git(source, "rev-list", "--reverse", f"{base}..{head}").splitlines()
         return {
             "merge_base_commit": {"sha": _git(source, "merge-base", base, head)},
@@ -1013,6 +1025,66 @@ def test_upstream_source_wrong_branch_does_not_invent_ancestry_failures(world: W
     text = str(failure.value)
     assert text.count("- FAIL") == 1 and text.count("- PASS") == 2
     assert "<script>" not in text and "&lt;script&gt;" in text
+
+
+@pytest.mark.parametrize("contains_dev", [False, True])
+def test_upstream_source_compares_dev_history_in_canonical_repository(
+    world: World, contains_dev: bool
+) -> None:
+    if not contains_dev:
+        world.reviewed = world.upstream
+    _pin_upstream(world)
+    upstream = _init(world.root / "upstream-only")
+    _git(upstream, "fetch", "-q", str(world.source), world.reviewed)
+    world.compare_repositories[_UPSTREAM] = upstream
+    world.compare_repositories["maintainer/flashinfer"] = world.canonical
+    args = world.args(upstream_pr=[])
+    if contains_dev:
+        plan = m._make_plan(args, world)
+        assert plan.record["checked_canonical_tip"] == world.previous
+        assert plan.record["upstream_observed_main"] == world.reviewed
+    else:
+        with pytest.raises(RuntimeError, match="HTTP 404.*unavailable in flashinfer-ai/flashinfer"):
+            world.compare(_UPSTREAM, world.previous, world.reviewed)
+        with pytest.raises(m.Diagnostic) as failure:
+            m._make_plan(args, world)
+        assert "does not contain" in failure.value.problem
+        assert failure.value.problem.count("- FAIL") == 1
+        assert failure.value.problem.count("- PASS") == 2
+        assert "Temporary fork branch" in failure.value.action
+    assert all(method == "GET" for method, _, _ in world.calls)
+
+
+@pytest.mark.parametrize("upstream", [False, True])
+def test_merged_bot_reuses_source_check_before_attribution(
+    world: World, monkeypatch: pytest.MonkeyPatch, upstream: bool
+) -> None:
+    if upstream:
+        _pin_upstream(world)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        monitor = b.Monitor(_bot_args(world), world, store)
+        feedback = monitor._feedback
+        feedback_checks = []
+
+        def checked_feedback(*args, **kwargs):
+            endpoint = "repos/maintainer/flashinfer/git/ref/heads/trtllm-prims-ts-dev"
+            checks = [index for index, (_, route, _) in enumerate(world.calls) if route == endpoint]
+            feedback_checks.append(len(checks))
+            if not upstream:
+                attribution = next(
+                    index
+                    for index, (_, route, _) in enumerate(world.calls)
+                    if route == f"repos/{_UPSTREAM}/pulls/4829"
+                )
+                assert checks[0] < attribution < checks[1]
+            assert (kwargs["upstream_proof"] is not None) == upstream
+            return feedback(*args, **kwargs)
+
+        monkeypatch.setattr(monitor, "_feedback", checked_feedback)
+        monitor.inspect(17)
+        assert store.get("observation:17")["state"] == "promotion_ready"
+    assert feedback_checks == [2]
+    assert not world.prs
 
 
 @pytest.mark.parametrize("movement", ["dev", "upstream"])
