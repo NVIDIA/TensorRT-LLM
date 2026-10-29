@@ -66,7 +66,14 @@ class _Step:
             state_index=lambda rid: self.slots[rid],
         )
         self.mamba = Mamba2Metadata(max_batch_size=4, chunk_size=128)
-        self.attn = SimpleNamespace(kv_cache_manager=self.manager, mamba_metadata=self.mamba)
+        self.attn = SimpleNamespace(
+            kv_cache_manager=self.manager,
+            mamba_metadata=self.mamba,
+            # Size the pre-Blackwell prefill state workspace.
+            max_num_sequences=4,
+            max_num_requests=4,
+            max_num_tokens=NUM_TOKENS,
+        )
 
     def set(self, requests):
         """requests: (live slot, chunk length, has initial state, tokens after P or 0)."""
