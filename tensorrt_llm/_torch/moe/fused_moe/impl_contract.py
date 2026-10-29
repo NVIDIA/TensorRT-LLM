@@ -473,7 +473,10 @@ def nvfp4_fc1_row_alignment_rejection(
     """
     from tensorrt_llm._torch.utils import is_gated_activation
 
-    if p.identity_quant not in ("nvfp4", "w4a16_nvfp4") or p.intermediate_size is None:
+    if (
+        p.identity_quant not in ("nvfp4", "nvfp4_plus", "w4a16_nvfp4")
+        or p.intermediate_size is None
+    ):
         return None
     # Non-gated FC1 is one block with no gate/up split, so the rows the loader
     # adds stay a zero tail that the kernel never reads as an operand.

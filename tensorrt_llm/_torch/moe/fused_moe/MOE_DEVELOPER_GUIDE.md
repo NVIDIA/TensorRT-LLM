@@ -231,7 +231,7 @@ Still on old path (standalone, with embedded communication):
 | `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103/SM107 | Min-latency and high-throughput on Blackwell/Rubin; also serves unquantized BF16 through FlashInfer, on a gate of its own (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103/SM107 | FP8 Block Scales on Blackwell/Rubin | `EXTERNAL_COMM` |
 | `cutedsl/dense_gemm.py` (+ the `fused_moe_densegemm.py` alias module) | `TrtllmCutedslDenseGemmNvfp4Impl` (aliased as `DenseGEMMFusedMoE`) | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
-| `cutedsl/grouped_gemm/` (+ the `fused_moe_cute_dsl.py` alias module) | the abstract `CuteDslFusedMoEBase` (aliased as `CuteDslFusedMoE`) and its two leaves, `TrtllmCutedslGroupedGemmNvfp4Impl` (`trtllm.cutedsl.grouped_gemm.nvfp4`) and `TrtllmCutedslGroupedGemmBf16Impl` (`trtllm.cutedsl.grouped_gemm.none`) | SM100/SM103/SM107; BF16 SM107 only | High throughput NVFP4, generally faster than Cutlass; unquantized BF16 SwiGLU on Rubin | `EXTERNAL_COMM` |
+| `cutedsl/grouped_gemm/` (+ the `fused_moe_cute_dsl.py` alias module) | the abstract `CuteDslFusedMoEBase` (aliased as `CuteDslFusedMoE`) and its three leaves, `TrtllmCutedslGroupedGemmNvfp4Impl` (`trtllm.cutedsl.grouped_gemm.nvfp4`), `TrtllmCutedslGroupedGemmNvfp4PlusImpl` (`trtllm.cutedsl.grouped_gemm.nvfp4_plus`) and `TrtllmCutedslGroupedGemmBf16Impl` (`trtllm.cutedsl.grouped_gemm.none`) | SM100/SM103/SM107; NVFP4_PLUS and BF16 SM107 only | High throughput NVFP4, generally faster than Cutlass; NVFP4_PLUS (MXFP4 checkpoints, UE5M3 scales) and unquantized BF16 SwiGLU on Rubin | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xNvfp4FusedMoE` and `CuteDslB12xW4a16Nvfp4FusedMoE` (shared mixin `CuteDslB12xFusedMoEBase`, aliased as `CuteDslB12xFusedMoE`) | SM120/SM121 | NVFP4 (CUTLASS prefill, FlashInfer b12x decode) and W4A16 NVFP4 (b12x for every call), best on RTX PRO 6000 and DGX Spark. They head the `CUTEDSL` family, so they win on SM120/121 when flashinfer is present and yield to the grouped-GEMM leaves otherwise. BF16 activations only (`B12xMoEWrapper` reads and writes bfloat16), so a float16 layer falls back to Cutlass. The NVFP4 leaf also declines `force_dynamic_quantization` (`DYNAMIC_QUANT_UNSUPPORTED`): b12x quantizes decode activations against load-time scales, so such a layer falls back to Cutlass too. Single-GPU-shaped topology only: with no dispatch/combine kernel they reject `ep_size > 1` and attention-DP | `EXTERNAL_COMM` |
 | `cutedsl/fused_fc12.py` (+ the `fused_moe_cute_dsl_fc12.py` alias module) | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares `TrtllmCutedslGroupedGemmNvfp4Impl`'s NVFP4 weight layout and autotune runner; reachable through the `CUTEDSL_FC12` family or a pinned `impl_id`; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` (aliased as `MegaMoEDeepGemm`) | SM100/SM103/SM107 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
@@ -409,14 +409,15 @@ the package.
 | `identity.py` | the identity segments (`PROVIDER_TRTLLM`, `TECHNIQUE_CUTEDSL`, `KERNEL_*`), and the grouped-GEMM query and id helper |
 | `kernel_inputs.py` | what more than one kernel takes: the `NvFp4WeightView` dataclass, and free functions taking the impl, `finalize_routing_scales` and `quantize_input_nvfp4`, which every NVFP4 leaf here binds as `quantize_input` |
 | `runners.py` | the outer autotune runners: NVFP4, which the fused-FC12 runner narrows to its tiles, and BF16 |
-| `grouped_gemm/base.py` | `CuteDslFusedMoEBase`, the abstract root of the two grouped-GEMM leaves: construction, the output-memset overlap stream, the locality-domain plan, the weight lifecycle |
+| `grouped_gemm/base.py` | `CuteDslFusedMoEBase`, the abstract root of the grouped-GEMM leaves: construction, the output-memset overlap stream, the locality-domain plan, the weight lifecycle |
 | `grouped_gemm/eligibility.py` | the checks both grouped-GEMM leaves' `can_implement` compose, as free functions |
-| `grouped_gemm/nvfp4.py` / `grouped_gemm/bf16.py` | one registered leaf each |
+| `grouped_gemm/nvfp4.py` / `grouped_gemm/nvfp4_plus.py` / `grouped_gemm/bf16.py` | one registered leaf each |
 | `fused_fc12.py` / `dense_gemm.py` | one registered leaf each, with what only that kernel needs |
 
 | kernel / `quant` | leaf | id |
 |---|---|---|
 | `grouped_gemm` / `nvfp4` | `TrtllmCutedslGroupedGemmNvfp4Impl` | `trtllm.cutedsl.grouped_gemm.nvfp4` |
+| `grouped_gemm` / `nvfp4_plus` | `TrtllmCutedslGroupedGemmNvfp4PlusImpl` | `trtllm.cutedsl.grouped_gemm.nvfp4_plus` |
 | `grouped_gemm` / `none` | `TrtllmCutedslGroupedGemmBf16Impl` | `trtllm.cutedsl.grouped_gemm.none` |
 | `fused_fc12` / `nvfp4` | `TrtllmCutedslFusedFc12Nvfp4Impl` | `trtllm.cutedsl.fused_fc12.nvfp4` |
 | `dense_gemm` / `nvfp4` | `TrtllmCutedslDenseGemmNvfp4Impl` | `trtllm.cutedsl.dense_gemm.nvfp4` |
@@ -647,6 +648,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
 | FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103/107) | Y (SM100/103/107) | N | N‡ | N | N | N | N | Y |
 | NVFP4 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103/107, cu13 cutlass-dsl + symmetric-memory provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
+| NVFP4_PLUS (E2M1, UE5M3 per 32, no global scale) | N | N | N | N | Y (SM107, SwiGLU)※ | N | N | N | N | N |
 | W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121, BF16, via `CuteDslB12xW4a16Nvfp4FusedMoE`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | Y |
 | W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103/107) | N | N | N | N | N | Y (SM90) | N | N |
@@ -691,6 +693,17 @@ constraints the other SMs do not:
   `uses_locality_domain` true, `_should_enable_dwdp` simply returns False.
   Both locality-domain kernels also fuse SwiGLU, so `plan_moe` declines any other
   activation: an NVFP4 Relu2 layer runs unpartitioned rather than being rejected.
+
+※ `NVFP4_PLUS` stores the E2M1 values of NVFP4 with one UE5M3 scale per 32
+values and no global scale, which SM107's block-scaled MMA reads natively. Its
+weights load from MXFP4 checkpoints: `NVFP4PlusCuteDslFusedMoEMethod` turns every
+E8M0 scale into the UE5M3 code of the same power of two, and with no
+`weight_scale_2` / `input_scale` the alphas and input scales stay 1. An MXFP4
+checkpoint selects it with `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` and
+`moe_config.backend: CUTEDSL`. The leaf runs the Rubin NVFP4 grouped-GEMM kernels
+with UE5M3 scales through the `cute_dsl_nvfp4_plus_*_rubin` ops, quantizes its
+input with the CuTe DSL `nvfp4_plus_quantize`, and has no locality-domain, DWDP
+or count-native DeepEP path.
 
 Cutlass covers `W4A16 NVFP4` on a wider SM range than plain `NVFP4` because the
 two run different kernels: `W4A16NVFP4CutlassFusedMoEMethod` dequantizes the FP4

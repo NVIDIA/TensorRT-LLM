@@ -99,6 +99,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4CuteDslFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
     NVFP4MegaMoECuteDslMethod,
+    NVFP4PlusCuteDslFusedMoEMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4FP8CutlassFusedMoEMethod,
@@ -970,6 +971,7 @@ QUANT_ALGOS = [
     QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
+    QuantAlgo.NVFP4_PLUS,
 ]
 
 # Backend types to test
@@ -2077,6 +2079,7 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
     if backend_str == "CUTEDSL":
         method_map = {
             QuantAlgo.NVFP4: NVFP4CuteDslFusedMoEMethod,
+            QuantAlgo.NVFP4_PLUS: NVFP4PlusCuteDslFusedMoEMethod,
         }
         return method_map.get(quant_algo)
 

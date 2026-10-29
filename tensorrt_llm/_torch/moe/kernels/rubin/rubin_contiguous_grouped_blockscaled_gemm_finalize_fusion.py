@@ -1718,6 +1718,8 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             (cutlass.Float4E2M1FN, cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
             (cutlass.Float4E2M1FN, cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
             (cutlass.Float4E2M1FN, cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 32),
+            (cutlass.Float4E2M1FN, cutlass.Float4E2M1FN, cutlass.FloatNV8E5M3FNU, 16),
+            (cutlass.Float4E2M1FN, cutlass.Float4E2M1FN, cutlass.FloatNV8E5M3FNU, 32),
             # 2xFP8
             (cutlass.Float8E5M2, cutlass.Float8E5M2, cutlass.Float8E8M0FNU, 32),
             (cutlass.Float8E5M2, cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),

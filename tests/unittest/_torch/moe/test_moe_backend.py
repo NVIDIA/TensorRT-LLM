@@ -3913,6 +3913,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
+    QuantAlgo.NVFP4_PLUS,
 ]
 
 # Backend types to test

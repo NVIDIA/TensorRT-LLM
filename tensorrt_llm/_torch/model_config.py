@@ -1110,6 +1110,9 @@ class ModelConfig(Generic[TConfig]):
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,
             "W4A8_MXFP4_FP8": QuantAlgo.W4A8_MXFP4_FP8,
+            # MXFP4 weights with E8M0 scales converted to UE5M3 at load, and
+            # E2M1 activations with UE5M3 block scales (Rubin SM107 only).
+            "NVFP4_PLUS": QuantAlgo.NVFP4_PLUS,
         }
         if new_algo is not None:
             if new_algo.upper() in supported_algos:

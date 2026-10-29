@@ -258,6 +258,34 @@ def test_deepseek_v4_base_checkpoint_detection(
     assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
 
 
+@pytest.mark.parametrize("moe_backend", ["CUTEDSL", "AUTO", "TRTLLM"])
+def test_override_quant_algo_selects_nvfp4_plus_for_mxfp4(
+    monkeypatch: pytest.MonkeyPatch, moe_backend: str
+) -> None:
+    """The override holds for any backend name; resolve_moe_impl decides who can serve it.
+
+    The config pre-pass in load_config_and_apply_defaults resolves AUTO without
+    the requested backend, so the config phase must not reject a backend here.
+    """
+    monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "NVFP4_PLUS")
+    assert ModelConfig.get_mxfp4_quant_algo(moe_backend) == QuantAlgo.NVFP4_PLUS
+
+
+def test_deepseek_v4_mxfp4_experts_take_the_nvfp4_plus_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An MXFP4 checkpoint's routed experts become NVFP4_PLUS with 32-value blocks."""
+    monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "NVFP4_PLUS")
+    _write_safetensors_header(tmp_path, "I8", [2048, 2048])
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        types.SimpleNamespace(num_hidden_layers=2), str(tmp_path), "CUTEDSL", None
+    )
+    for layer_idx in range(2):
+        experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
+        assert experts.quant_algo == QuantAlgo.NVFP4_PLUS
+        assert experts.group_size == 32
+
+
 @pytest.mark.parametrize("sidecar", [True, False], ids=["modelopt-file", "modelopt-inline"])
 def test_deepseek_v41_nvfp4_checkpoint_quantization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: bool

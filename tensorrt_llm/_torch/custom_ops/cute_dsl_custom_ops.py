@@ -14,6 +14,7 @@ import torch
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_PLUS_SF_VEC_SIZE
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...math_utils import ceil_div, pad_up
@@ -15771,17 +15772,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tuning_config_cache = dict()
 
             def __init__(
-                self,
-                num_experts: int,
-                top_k: int,
-                num_local_experts: int,
-                local_expert_offset: int,
-                tile_size: int,
-                scaling_vector_size: int = 16,
-                activation_type: ActivationType = ActivationType.Swiglu,
-                situ_beta: Optional[float] = None,
-                situ_linear_beta: Optional[float] = None,
-                swiglu_limit_scalar: float = float("inf")):
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    scaling_vector_size: int = 16,
+                    activation_type: ActivationType = ActivationType.Swiglu,
+                    situ_beta: Optional[float] = None,
+                    situ_linear_beta: Optional[float] = None,
+                    swiglu_limit_scalar: float = float("inf"),
+                    sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -15789,6 +15791,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.local_expert_offset = local_expert_offset
                 self.tile_size = tile_size
                 self.scaling_vector_size = scaling_vector_size
+                # Block-scale format of A, B and the FP4 output: UE4M3 for
+                # NVFP4, UE5M3 for NVFP4_PLUS.
+                self.sf_dtype = sf_dtype
                 self.activation_type = validate_rubin_activation_type(
                     activation_type)
                 self.situ_beta = situ_beta
@@ -15822,6 +15827,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.situ_beta,
                     self.situ_linear_beta,
                     self.swiglu_limit,
+                    self.sf_dtype.__name__,
                 )
 
             def get_valid_tactics(
@@ -15918,7 +15924,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     if self.__class__.kernel_class.can_implement(
                             a_dtype=cutlass.Float4E2M1FN,
                             b_dtype=cutlass.Float4E2M1FN,
-                            sf_dtype=cutlass.Float8E4M3FN,
+                            sf_dtype=self.sf_dtype,
                             sf_vec_size=self.scaling_vector_size,
                             c_dtype=cutlass.Float4E2M1FN,
                             mma_inst_shape=mma_inst_shape,
@@ -16066,11 +16072,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  b.data_ptr(),
                                  cute.AddressSpace.gmem,
                                  assumed_align=32)
-                a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                a_sf_ptr = make_ptr(self.sf_dtype,
                                     a_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
-                b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                b_sf_ptr = make_ptr(self.sf_dtype,
                                     b_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
@@ -16094,7 +16100,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  c.data_ptr(),
                                  cute.AddressSpace.gmem,
                                  assumed_align=32)
-                c_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                c_sf_ptr = make_ptr(self.sf_dtype,
                                     c_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
@@ -16120,9 +16126,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 max_active_clusters = get_max_activate_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
-                cache_key = (self.scaling_vector_size, self.tile_size,
-                             self.top_k, mma_tiler, mma_inst_shape,
-                             cluster_shape_mn, raster_along_m,
+                cache_key = (self.scaling_vector_size, self.sf_dtype,
+                             self.tile_size, self.top_k, mma_tiler,
+                             mma_inst_shape, cluster_shape_mn, raster_along_m,
                              locality_domain_half_gemm, a_path,
                              int(self.activation_type), self.situ_beta,
                              self.situ_linear_beta, self.swiglu_limit,
@@ -16223,6 +16229,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             swiglu_limit_scalar: float,
             precomputed_tactic: Optional[str],
             tuner_key: str,
+            sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             tuner = AutoTuner.get()
             if output_tensor is not None or output_sf_tensor is not None:
@@ -16251,6 +16258,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
                 swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
                     swiglu_limit_scalar),
+                sf_dtype=sf_dtype,
             )
             inputs = [
                 input, weight, input_scale, weight_scale, alpha,
@@ -16373,6 +16381,105 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  dtype=input.dtype,
                                  device=input.device)
             output_scale = torch.empty(m * interm_size // scaling_vector_size,
+                                       dtype=input_scale.dtype,
+                                       device=input_scale.device)
+            return output, output_scale
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_plus_gather_grouped_gemm_act_fusion_rubin",
+            mutates_args=(),
+            device_types="cuda")
+        def cute_dsl_nvfp4_plus_gather_grouped_gemm_act_fusion_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            activation_type: int = int(ActivationType.Swiglu),
+            situ_beta: float = SITU_BETA_DISABLED,
+            situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+            precomputed_tactic: Optional[str] = None,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            """NVFP4_PLUS FC1: E2M1 operands with one UE5M3 scale per 32 values.
+
+            ``input_scale`` is row-major [orig_m, K / 32]; ``weight_scale`` and
+            the returned output scales use the 128x4 swizzled layout.
+            NVFP4_PLUS has no global scale, so ``alpha`` (per expert) and
+            ``global_sf`` (the FC2 input normalization) are ones.
+            """
+            return _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+                input,
+                weight,
+                input_scale,
+                weight_scale,
+                alpha,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                global_sf,
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                None,
+                None,
+                NVFP4_PLUS_SF_VEC_SIZE,
+                -1,
+                ActivationType(activation_type),
+                situ_beta,
+                situ_linear_beta,
+                swiglu_limit_scalar,
+                precomputed_tactic,
+                "trtllm::cute_dsl_nvfp4_plus_gather_grouped_gemm_act_fusion_rubin",
+                sf_dtype=cutlass.FloatNV8E5M3FNU)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_plus_gather_grouped_gemm_act_fusion_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            activation_type: int = int(ActivationType.Swiglu),
+            situ_beta: float = SITU_BETA_DISABLED,
+            situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+            precomputed_tactic: Optional[str] = None,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            m = permuted_idx_to_expanded_idx.size(0)
+            n = weight.size(1)
+            is_gated = is_gated_activation(ActivationType(activation_type))
+            interm_size = n // 2 if is_gated else n
+            output = torch.empty(m,
+                                 interm_size // 2,
+                                 dtype=input.dtype,
+                                 device=input.device)
+            output_scale = torch.empty(m * interm_size //
+                                       NVFP4_PLUS_SF_VEC_SIZE,
                                        dtype=input_scale.dtype,
                                        device=input_scale.device)
             return output, output_scale
@@ -17171,14 +17278,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_cache = dict()
             tuning_config_cache = dict()
 
-            def __init__(self,
-                         num_experts: int,
-                         top_k: int,
-                         num_local_experts: int,
-                         local_expert_offset: int,
-                         tile_size: int,
-                         output_dtype: torch.dtype,
-                         scaling_vector_size: int = 16):
+            def __init__(
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    output_dtype: torch.dtype,
+                    scaling_vector_size: int = 16,
+                    sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -17189,6 +17298,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert output_dtype == torch.bfloat16
                 self.output_dtype = output_dtype
                 self.scaling_vector_size = scaling_vector_size
+                # Block-scale format of A and B: UE4M3 for NVFP4, UE5M3 for
+                # NVFP4_PLUS.
+                self.sf_dtype = sf_dtype
 
                 if (sm_version := get_sm_version()) != 107:
                     raise ValueError(
@@ -17209,6 +17321,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.tile_size,
                     self.output_dtype,
                     self.scaling_vector_size,
+                    self.sf_dtype.__name__,
                 )
 
             @staticmethod
@@ -17278,7 +17391,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     if self.__class__.kernel_class.can_implement(
                             a_dtype=cutlass.Float4E2M1FN,
                             b_dtype=cutlass.Float4E2M1FN,
-                            sf_dtype=cutlass.Float8E4M3FN,
+                            sf_dtype=self.sf_dtype,
                             sf_vec_size=self.scaling_vector_size,
                             c_dtype=cutlass.BFloat16,
                             mma_inst_shape=mma_inst_shape,
@@ -17313,7 +17426,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             0, 0, helper.gen_tuning_buckets,
                             helper.map_to_tuning_buckets), ),
                         constraint_specs=(
-                            ConstraintSpec(2, 0, fp4_scale_infer_shape),
+                            ConstraintSpec(
+                                2, 0,
+                                functools.partial(
+                                    fp4_scale_infer_shape,
+                                    sf_vec_size=self.scaling_vector_size)),
                             ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
@@ -17409,11 +17526,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  b.data_ptr(),
                                  cute.AddressSpace.gmem,
                                  assumed_align=32)
-                a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                a_sf_ptr = make_ptr(self.sf_dtype,
                                     a_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
-                b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                b_sf_ptr = make_ptr(self.sf_dtype,
                                     b_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
@@ -17448,9 +17565,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 max_active_clusters = get_max_activate_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
-                cache_key = (self.scaling_vector_size, self.tile_size,
-                             self.top_k, mma_tiler, mma_inst_shape,
-                             cluster_shape_mn, raster_along_m,
+                cache_key = (self.scaling_vector_size, self.sf_dtype,
+                             self.tile_size, self.top_k, mma_tiler,
+                             mma_inst_shape, cluster_shape_mn, raster_along_m,
                              locality_domain_half_gemm, max_active_clusters)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
@@ -17636,6 +17753,89 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size: int,
             output_dtype: torch.dtype,
             scaling_vector_size: int = 16,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            return
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_plus_grouped_gemm_finalize_inplace_rubin",
+            mutates_args=("output", ),
+            device_types="cuda")
+        def cute_dsl_nvfp4_plus_grouped_gemm_finalize_inplace_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            """NVFP4_PLUS FC2 + finalize: UE5M3 scales per 32 values, both swizzled 128x4.
+
+            ``alpha`` is ones, because NVFP4_PLUS has no global scale.
+            """
+            tuner = AutoTuner.get()
+
+            runner = Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                output_dtype,
+                NVFP4_PLUS_SF_VEC_SIZE,
+                sf_dtype=cutlass.FloatNV8E5M3FNU)
+
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, output,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                token_final_scales
+            ]
+
+            if precomputed_tactic is None:
+                _, best_tactic = tuner.choose_one(
+                    "trtllm::cute_dsl_nvfp4_plus_grouped_gemm_finalize_inplace_rubin",
+                    [runner],
+                    runner.get_tuning_config(),
+                    inputs,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
+
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_plus_grouped_gemm_finalize_inplace_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
             precomputed_tactic: Optional[str] = None,
         ) -> None:
             return
