@@ -808,6 +808,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                       for tile_m in (64, 128, 256)]
         return tiles
 
+    def _sm100_split_k_candidates(n: int, k: int) -> List[int]:
+        """Full-sweep split-K factors of the SM100 dense GEMMs / BMMs whose
+        K slices reduce-add into the zeroed output.
+
+        Split-K pays off for long K with few output tiles.
+        """
+        return [1, 2, 4, 8] if k >= 4096 and n <= 512 else [1]
+
     # SM100 BF16 and FP8 blockwise GEMMs support both rasters. The BF16 GEMM
     # and the FP8 blockwise GEMM/BMM split K: every slice reduce-adds its
     # partial into the zeroed output with TMA (no workspace, no reduction
@@ -1039,6 +1047,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ]
             # prune: prefetch is beneficial only when K is large enough
             use_prefetch_candidates = [True, False]
+            # forward allocates the whole [M, N] output, so K may be split.
+            split_k_candidates = _sm100_split_k_candidates(n, real_k)
 
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch in itertools.product(
@@ -1081,8 +1091,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     )):
                         continue
 
-                    valid_tactics.append(
-                        (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch))
+                    # Split-K serves grids of few output tiles, so only the
+                    # smallest cluster without prefetch splits K.
+                    splits_k = (cluster_shape_mn == (mma_tiler_mn[0] // 128, 1)
+                                and not use_prefetch)
+                    valid_tactics.extend(
+                        (mma_tiler_mn, cluster_shape_mn, swap_ab,
+                         use_prefetch) +
+                        ((1, True, split_k) if split_k > 1 else ())
+                        for split_k in (
+                            split_k_candidates if splits_k else [1]))
 
             logger.debug(
                 f"CuteDSL: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
@@ -5094,8 +5112,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             nvmmh_config = AutoTuner.get().nvmmh_config
             if nvmmh_config is not None:
-                # forward allocates the whole [M, N] output, so nvMMH may
-                # split K.
+                # forward allocates the whole [M, N] output, so K may be
+                # split.
                 nvmmh_tactics = _sm100_nvmmh_tactics(
                     self.__class__.kernel_class,
                     cutlass.Float8E4M3FN,
@@ -5125,8 +5143,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
+            split_k_candi = _sm100_split_k_candidates(n, k)
             return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn) +
+                (("m", 1, split_k) if split_k > 1 else ())
                 for use_2cta_instrs in use_2cta_instrs_candi
                 for mma_tiler_mn in mma_tiler_mn_candi
                 for cluster_shape_mn in cluster_shape_mn_candi
@@ -5144,7 +5164,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_major,
                     b_major,
                     c_major,
-                )
+                ) for split_k in split_k_candi
+                # Split-K serves grids of few output tiles, so only the
+                # smallest cluster M splits K.
+                if split_k == 1 or cluster_shape_mn[0] == (
+                    2 if use_2cta_instrs else 1)
             ]
 
         def forward(
@@ -5471,8 +5495,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
+            split_k_candi = (_sm100_split_k_candidates(n, k)
+                             if inputs[4].shape[1] == m else [1])
             return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn) +
+                (("m", 1, split_k) if split_k > 1 else ())
                 for use_2cta_instrs in use_2cta_instrs_candi
                 for mma_tiler_mn in mma_tiler_mn_candi
                 for cluster_shape_mn in cluster_shape_mn_candi
@@ -5490,7 +5517,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     a_major,
                     b_major,
                     c_major,
-                )
+                ) for split_k in split_k_candi
+                # Split-K serves grids of few output tiles, so only the
+                # smallest cluster M splits K.
+                if split_k == 1 or cluster_shape_mn[0] == (
+                    2 if use_2cta_instrs else 1)
             ]
 
         def forward(
@@ -10237,9 +10268,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      output_dtype: Optional[torch.dtype] = None):
             super().__init__()
             self.use_tvm_ffi = use_tvm_ffi
-            # The tactic space depends on the output dtype (the full sweep
-            # splits K only for FP32 output, and nvMMH models the output
-            # type), so unique_id() keys the profiling cache on it.
+            # The best tactic and the nvMMH ranking depend on the output
+            # dtype, so unique_id() keys the profiling cache on it.
             self.output_dtype = output_dtype
 
         def unique_id(self):
@@ -10302,13 +10332,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
-            # Split-K pays off for long K with few output tiles. The full
-            # sweep offers it only for FP32 output, where the TMA reduce-add
-            # of the slices does not round partial sums to BF16.
-            split_k_candi = [1]
-            if (allow_split_k and c_dtype_cutlass == cutlass.Float32
-                    and k >= 4096 and n <= 512):
-                split_k_candi = [1, 2, 4, 8]
+            split_k_candi = (_sm100_split_k_candidates(n, k)
+                             if allow_split_k else [1])
             return [
                 (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn) +
                 (("m", 1, split_k) if split_k > 1 else ())

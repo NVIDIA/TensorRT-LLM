@@ -404,6 +404,100 @@ def test_cute_dsl_fp8_block_scale_bmm_autotune_profiles() -> None:
     assert cache_profile(5) == cache_profile(7)
 
 
+def _k_block_magnitudes(k: int) -> torch.Tensor:
+    """Per-128-column magnitudes, so a K slice that applied the block scales
+    of another slice would not compute the product."""
+    exponents = torch.randint(-3, 4, (k // 128, ), device='cuda')
+    return torch.exp2(exponents.float()).repeat_interleave(128)
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100 and SM103 only. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("split_k", [2, 4, 8])
+def test_cute_dsl_fp8_block_scale_gemm_split_k(split_k):
+    """The full sweep splits long K for small N, and every split launch
+    (also inside a CUDA graph) computes the product."""
+    torch.random.manual_seed(0)
+    m, n, k = 64, 512, 7168
+    a = (torch.randn(
+        (m, k), device='cuda') * _k_block_magnitudes(k) / k).to(torch.bfloat16)
+    b = (torch.randn(
+        (n, k), device='cuda') * _k_block_magnitudes(k) / k).to(torch.bfloat16)
+    a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+    b_fp8, b_sf = per_block_cast_to_fp8(b)
+    inputs = [a_fp8, b_fp8, a_sf, b_sf]
+    expected = a.float() @ b.float().t()
+
+    runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellRunner()
+    tactic = (False, (128, 128), (1, 1), "m", 1, split_k)
+    assert tactic in runner.get_valid_tactics(inputs, None)
+
+    assert calc_diff(runner(inputs, tactic=tactic), expected) < 1e-3
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = runner(inputs, tactic=tactic)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert calc_diff(output, expected) < 1e-3
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100 and SM103 only. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("split_k", [2, 4, 8])
+def test_cute_dsl_fp8_block_scale_bmm_split_k(split_k):
+    """The full sweep splits long K for small N when the output holds exactly
+    M rows, and every split launch zeroes the output first."""
+    torch.random.manual_seed(0)
+    num_groups, m, n, k = 4, 64, 512, 7168
+    a = (torch.randn((m, num_groups, k), device='cuda') *
+         _k_block_magnitudes(k) / k).to(torch.bfloat16)
+    b = (torch.randn((num_groups, n, k), device='cuda') *
+         _k_block_magnitudes(k) / k).to(torch.bfloat16)
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty((num_groups, n // 128, k // 128),
+                           device='cuda',
+                           dtype=torch.float)
+    for i in range(num_groups):
+        b_fp8[i], b_scales[i] = per_block_cast_to_fp8(b[i])
+    output = torch.empty((num_groups, m, n),
+                         device='cuda',
+                         dtype=torch.bfloat16)
+    inputs = [a_fp8, b_fp8, a_scales, b_scales, output]
+    expected = torch.einsum('mgk,gnk->gmn', a.float(), b.float())
+
+    runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner()
+    tactic = (False, (128, 128), (1, 1), "m", 1, split_k)
+    assert tactic in runner.get_valid_tactics(inputs, None)
+    taller_output = torch.empty((num_groups, m + 8, n),
+                                device='cuda',
+                                dtype=torch.bfloat16)
+    assert all(
+        len(t) < 6
+        for t in runner.get_valid_tactics(inputs[:4] + [taller_output], None))
+
+    output.fill_(float("nan"))
+    runner(inputs, tactic=tactic)
+    torch.cuda.synchronize()
+    assert calc_diff(output, expected) < 1e-3
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner(inputs, tactic=tactic)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert calc_diff(output, expected) < 1e-3
+
+
 @pytest.mark.skipif(
     getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and SM107 CuTe DSL support.",

@@ -1787,7 +1787,7 @@ def _nvmmh_problem(case, sm_version):
 def test_nvmmh_tactics_compute_the_product(case, monkeypatch):
     """Every nvMMH-guided tactic of the SM100/SM103 or SM107 CuTe DSL
     GEMM/BMM runners is correct, including tiles, rasters and split-K
-    factors their full sweeps never enumerate."""
+    factors outside their full sweeps."""
     from tensorrt_llm._torch.custom_ops import \
         cutedsl_matmul_heuristics as nvmmh
     from tensorrt_llm._torch.cute_dsl_utils import (
