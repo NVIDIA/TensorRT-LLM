@@ -55,6 +55,7 @@ pytestmark = pytest.mark.cpu_only
 def _make_executor(
     *,
     enable_kv_pool_rebalance: bool = True,
+    in_place_relocation: bool = False,
     pp_size: int = 1,
     tp_size: int = 1,
     cp_size: int = 1,
@@ -132,6 +133,8 @@ def _make_executor(
     exe.kv_cache_manager.max_beam_width = max_beam_width
     exe.kv_cache_manager.impl = MagicMock()
     exe.kv_cache_manager.impl.need_adjustment = need_adjustment
+    # A bare MagicMock attribute would be truthy and select the in-place path.
+    exe.kv_cache_manager.impl.init_config.pool_rebalance.in_place_relocation = in_place_relocation
 
     # CUDA-graph runner holding the pre-allocated padding dummies.  A bare
     # MagicMock would be truthy and non-iterable in the suspend helper.
@@ -301,6 +304,19 @@ class TestMaybeRebalanceKvPools:
         exe.kv_cache_manager.impl.adjust.assert_called_once()
         assert exe.kv_cache_manager.suspend_request.call_count == 2
         assert exe.kv_cache_manager.resume_request.call_count == 2
+
+    def test_in_place_relocation_adjusts_without_suspending(self, monkeypatch):
+        reqs = [_make_request(1), _make_request(2)]
+        exe = _make_executor(active_requests=reqs, in_place_relocation=True)
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        exe._consume_previous_batch_for_rebalance.assert_called_once()
+        exe.kv_cache_manager.impl.adjust.assert_called_once()
+        exe.kv_cache_manager.suspend_request.assert_not_called()
+        exe.kv_cache_manager.resume_request.assert_not_called()
 
     def test_skips_already_suspended_requests(self, monkeypatch):
         active = _make_request(1)

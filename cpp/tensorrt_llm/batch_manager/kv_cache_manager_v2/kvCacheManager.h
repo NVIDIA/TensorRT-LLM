@@ -695,6 +695,8 @@ private:
     bool _needAdjustment(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
+    //! In-place relocation: the hot-level pages locked by ACTIVE caches, per pool group, each once.
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLockedHotPages() const;
 
     PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);

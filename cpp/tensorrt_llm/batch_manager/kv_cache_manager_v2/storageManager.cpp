@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
@@ -35,6 +36,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <set>
 #include <string>
@@ -399,6 +401,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // From the descriptors: the level's storage does not exist yet.
     mGpuArena = config.gpuArena;
     mDropUnreferencedOnRebalance = config.dropUnreferencedOnRebalance;
+    mInPlaceRelocation = config.inPlaceRelocation;
     if (mGpuArena)
     {
         // The whole GPU quota becomes one arena, rounded down to whole physical chunks.
@@ -1738,8 +1741,8 @@ void StorageManager::shrinkPoolGroup(
     shrinkPoolGroupToWindow(level, pgIdx, SlotWindow{window.begin, window.begin + newNumSlots}, persistentPages);
 }
 
-void StorageManager::shrinkPoolGroupToWindow(
-    CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target, std::vector<SharedPtr<Page>> const& persistentPages)
+void StorageManager::shrinkPoolGroupToWindow(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target,
+    std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages)
 {
     refreshRetention();
     auto& pg = poolGroup(level, pgIdx);
@@ -1795,8 +1798,23 @@ void StorageManager::shrinkPoolGroupToWindow(
     }
     SlotCount numOverflowPersistent = slotCountValueFromSize(overflowPersistent.size());
 
-    // A2: RUNTIME check — persistent overflow pages must fit in the new capacity.
-    if (numOverflowPersistent > newNumSlots)
+    // Locked pages (in-place relocation) in overflow range. Like persistent pages they cannot be
+    // evicted; unlike them they are relocated with their owners' page indices republished.
+    TLLM_CHECK_WITH_INFO(std::all_of(lockedPages.begin(), lockedPages.end(),
+                             [this, level, pgIdx](auto const& p)
+                             { return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx; }),
+        "Locked page cache level or pool group mismatch");
+    std::vector<SharedPtr<Page>> overflowLocked;
+    for (auto const& p : lockedPages)
+    {
+        if (!target.contains(p->slotId()))
+            overflowLocked.push_back(p);
+    }
+    // Pages that must move and cannot be evicted.
+    SlotCount const numMustMove = numOverflowPersistent + slotCountValueFromSize(overflowLocked.size());
+
+    // A2: RUNTIME check — persistent and locked overflow pages must fit in the new capacity.
+    if (numMustMove > newNumSlots)
     {
         throw OutOfPagesError("Not enough slots to hold all persistent pages");
     }
@@ -1810,7 +1828,7 @@ void StorageManager::shrinkPoolGroupToWindow(
     SlotCount minNumEvicted = 0;
     SlotCount numEvictedOverflowSlots = 0;
     while (!overflowSlots.empty()
-        && slotCountValueFromSize(overflowSlots.size()) + numOverflowPersistent
+        && slotCountValueFromSize(overflowSlots.size()) + numMustMove
             > std::min(newNumSlots, overflowSlots.front().first + allocator.numFreeSlots() - numEvictedOverflowSlots))
     {
         minNumEvicted = overflowSlots.front().first + 1;
@@ -1833,7 +1851,7 @@ void StorageManager::shrinkPoolGroupToWindow(
 
     // Ensure free slots for the overflow pages.
     TypedVec<PoolGroupIndex, SlotCount> reqs(numPoolGroups(level), 0);
-    reqs[pgIdx] = slotCountValueFromSize(overflowPages.size());
+    reqs[pgIdx] = slotCountValueFromSize(overflowPages.size() + overflowLocked.size());
     // The eviction order captured above must remain stable through defragmentation.
     _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{});
 
@@ -1844,6 +1862,7 @@ void StorageManager::shrinkPoolGroupToWindow(
 
     // Defragment: migrate overflow pages to free slots within the same level.
     _batchedMigrate(level, level, overflowPages, /*updateSrc=*/true, MigrationRecorder{}, /*defrag=*/true);
+    _relocateLockedPages(level, pgIdx, overflowLocked);
 
     // A18: post-defrag overflow assertion — overflow slot count matches expectations.
     TLLM_CHECK_DEBUG_WITH_INFO(allocator.numOverflowSlots() == allocator.numIssuedOutsideTarget(),
@@ -1876,8 +1895,92 @@ SlotCount StorageManager::dropUnreferencedPagesOutside(CacheLevel level, PoolGro
     return numDropped;
 }
 
-void StorageManager::moveArenaWindow(
-    PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to, std::vector<SharedPtr<Page>> const& persistentPages)
+void StorageManager::_relocateLockedPages(
+    CacheLevel level, PoolGroupIndex pgIdx, std::vector<SharedPtr<Page>> const& pages)
+{
+    if (pages.empty())
+    {
+        return;
+    }
+    auto& pool = poolGroup(level, pgIdx);
+    std::vector<SharedPtr<UniqPageLock>> locks;
+    locks.reserve(pages.size());
+    std::set<CUstream> ownerStreams;
+    for (auto const& page : pages)
+    {
+        auto holder = page->holder.lock();
+        auto lock = holder ? holder->uniqLock.lock() : nullptr;
+        TLLM_CHECK_WITH_INFO(lock && page->cacheLevel == level, "In-place relocation requires a page locked here");
+        for (auto const& owner : lock->owners())
+        {
+            TLLM_CHECK_WITH_INFO(owner.kvCache->isActive(), "In-place relocation requires active owners");
+            ownerStreams.insert(owner.kvCache->cudaStream());
+        }
+        locks.push_back(std::move(lock));
+    }
+
+    auto dstSlots = pool.allocateMultiple(slotCountValueFromSize(pages.size()));
+    auto releaseDestinations = FuncGuard(
+        [&]()
+        {
+            for (auto& slot : dstSlots)
+            {
+                if (slot.hasValidSlot())
+                    pool.release(std::move(slot));
+            }
+        });
+
+    // The copy waits for each owner's prior work, each page's readiness and readers, and each
+    // destination's previous users.
+    std::vector<CachedCudaEvent> ownerEvents;
+    ownerEvents.reserve(ownerStreams.size());
+    std::vector<CUevent> priorEvents;
+    for (auto const ownerStream : ownerStreams)
+    {
+        ownerEvents.emplace_back(reinterpret_cast<CudaStream>(ownerStream));
+        priorEvents.push_back(ownerEvents.back().handle());
+    }
+    std::map<LayerGroupId, std::vector<PageIndexPair>> batches;
+    for (size_t i = 0; i < pages.size(); ++i)
+    {
+        priorEvents.push_back(pages[i]->readyEvent.handle());
+        priorEvents.push_back(dstSlots[i].readyEvent.handle());
+        for (auto const& event : locks[i]->finishEvents)
+            priorEvents.push_back(event.handle());
+        batches[getMigrationBatchingLayerGroupId(level, level, pages[i]->lifeCycle)].push_back(
+            PageIndexPair{slotIdToPageIndexValue(dstSlots[i].slotId()), slotIdToPageIndexValue(pages[i]->slotId())});
+    }
+
+    TemporaryCudaStream tempStream(std::move(priorEvents));
+    {
+        auto scope = tempStream.enter();
+        CUstream const stream = tempStream.get();
+        for (auto const& [layerGroup, indices] : batches)
+        {
+            submitMigrationBatch(level, level, layerGroup, indices.data(), indices.size(), stream);
+        }
+    }
+    CachedCudaEvent const completion = tempStream.takeFinishEvent();
+    for (size_t i = 0; i < pages.size(); ++i)
+    {
+        dstSlots[i].readyEvent = completion;
+        locks[i]->recordMigrationEvent(completion);
+    }
+    // Every owner's next reader observes the copied data.
+    for (auto const ownerStream : ownerStreams)
+    {
+        completion.waitInStream(reinterpret_cast<CudaStream>(ownerStream));
+    }
+    for (size_t i = 0; i < pages.size(); ++i)
+    {
+        // The returned source slot carries the copy's completion as its ready event.
+        pool.release(locks[i]->relocate(std::move(dstSlots[i])));
+    }
+    releaseDestinations.cancel();
+}
+
+void StorageManager::moveArenaWindow(PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to,
+    std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages)
 {
     auto& pg = poolGroup(kHotLevel, pgIdx);
     TLLM_CHECK_DEBUG(pg.slotAllocator().window() == from);
@@ -1890,12 +1993,13 @@ void StorageManager::moveArenaWindow(
     }
     if (hull != to)
     {
-        shrinkPoolGroupToWindow(kHotLevel, pgIdx, to, persistentPages);
+        shrinkPoolGroupToWindow(kHotLevel, pgIdx, to, persistentPages, lockedPages);
     }
 }
 
 void StorageManager::adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList,
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages)
 {
     auto& arena = static_cast<ArenaGpuCacheLevelStorage&>(*mLevels.at(kHotLevel).storage);
     size_t const arenaQuota = arena.roundedNumBytes(CacheTier::GPU_MEM);
@@ -1959,7 +2063,8 @@ void StorageManager::adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<P
         {
             static std::vector<SharedPtr<Page>> const kNoPages;
             moveArenaWindow(pgIdx, oldWindows[pgIdx], newWindows[pgIdx],
-                persistentPages ? (*persistentPages)[pgIdx] : kNoPages);
+                persistentPages ? (*persistentPages)[pgIdx] : kNoPages,
+                lockedPages ? (*lockedPages)[pgIdx] : kNoPages);
         }
         state[pgIdx] = State::kDone;
     };
@@ -1992,13 +2097,15 @@ TypedVec<PoolGroupIndex, SlotWindow> StorageManager::hotWindows() const
 
 void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
     TypedVec<PoolGroupIndex, float> const& ratioList,
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages)
 {
     if (level == kHotLevel && mGpuArena)
     {
-        adjustArenaLevel(newQuota, ratioList, persistentPages);
+        adjustArenaLevel(newQuota, ratioList, persistentPages, lockedPages);
         return;
     }
+    TLLM_CHECK_WITH_INFO(lockedPages == nullptr, "Locked pages can only be relocated in a GPU arena");
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
     size_t quota = newQuota.has_value()

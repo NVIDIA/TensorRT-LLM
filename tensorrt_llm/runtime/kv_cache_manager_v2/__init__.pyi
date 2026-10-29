@@ -479,6 +479,7 @@ class PoolRebalanceConfig:
     moving_average_decay: float = 0.9999
     copy_based_rebalancing: bool = False
     drop_unreferenced_on_rebalance: bool = False
+    in_place_relocation: bool = False
 
 @dataclass(slots=True)
 class KVCacheManagerConfig:
