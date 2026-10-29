@@ -1578,13 +1578,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"only cp_size == 1 or helix CP is supported"
             )
         # Under Helix only a rank's whole slice of the prompt stands for the whole prompt, so a
-        # manager that may move a part of it names no history the receiver could record.
-        transfer_length = getattr(type(self._kv_cache_manager), "disagg_transfer_length", None)
+        # manager that may move a part of it, by its class or on itself, names no history the
+        # receiver could record.
+        transfer_length = getattr(self._kv_cache_manager, "disagg_transfer_length", None)
         if (
             self._mapping.cp_size != 1
             and self._mapping.has_cp_helix()
             and transfer_length is not None
-            and transfer_length is not KVCacheManagerV2.disagg_transfer_length
+            and getattr(transfer_length, "__func__", None)
+            is not KVCacheManagerV2.disagg_transfer_length
         ):
             raise ValueError(
                 "KvCacheTransceiverV2: _check_compatible: "

@@ -88,6 +88,15 @@ def test_python_runtime_refuses_a_partial_transfer_under_helix() -> None:
 
     with pytest.raises(ValueError, match="may transfer part of a prompt"):
         KvCacheTransceiverV2(mapping, Mock(), object.__new__(MovesPart), config)
+    # An override bound on the manager itself counts as one on its class.
+    manager = object.__new__(KVCacheManagerV2)
+    manager.disagg_transfer_length = lambda request: 1
+    with pytest.raises(ValueError, match="may transfer part of a prompt"):
+        KvCacheTransceiverV2(mapping, Mock(), manager, config)
+    # The whole prompt the base manager moves passes.
+    KvCacheTransceiverV2._check_compatible(
+        SimpleNamespace(_mapping=mapping, _kv_cache_manager=object.__new__(KVCacheManagerV2))
+    )
 
 
 @pytest.mark.parametrize(
