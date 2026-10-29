@@ -144,6 +144,68 @@ Consumers must track rank-local sequence numbers and resynchronize on gaps. Publ
 
 Direct ZMQ sockets are unauthenticated. Keep them on a trusted network and restrict access to intended subscribers.
 
+## Prometheus metrics
+
+OpenEngine serves metrics on a separate HTTP port, using the same collection settings and `trtllm_*` metric families as the HTTP server.
+
+Save this as `metrics.yaml` to collect request timing, token counts, and engine statistics such as KV-cache usage:
+
+```yaml
+return_perf_metrics: true
+enable_iter_perf_stats: true
+```
+
+Start the server and check the metrics endpoint:
+
+```bash
+trtllm-serve Qwen/Qwen3-0.6B \
+  --config metrics.yaml \
+  --grpc --grpc-protocol openengine --host 127.0.0.1 --port 50051
+
+curl --fail http://127.0.0.1:8001/prometheus/metrics
+```
+
+Metrics use port `8001` and inherit `--host`. Override them with `--openengine-metrics-port` and `--openengine-metrics-host`; the metrics port must differ from the gRPC port. These options change the address, not whether collection is enabled.
+
+Monitoring tools scrape each service's metrics endpoint directly. Configure the engine endpoint as its own target; another service does not need to re-export these metrics. Metrics endpoint discovery through `GetServerInfo` is deferred, so configure the metrics host, port, and path in your monitoring setup.
+
+For Prometheus, add a separate scrape target:
+
+```yaml
+scrape_configs:
+  - job_name: trtllm-openengine
+    scrape_interval: 15s
+    metrics_path: /prometheus/metrics
+    static_configs:
+      - targets: ["engine-host:8001"]
+```
+
+Replace `engine-host` with an address Prometheus can reach. For remote scraping, bind metrics to a reachable interface. The endpoint has no authentication; restrict access to a trusted network. Use `Control.Health` to check inference health; a successful scrape only checks the exporter.
+
+### Collection settings
+
+- `return_perf_metrics: true` enables the endpoint and request metrics. Both collection settings default to `false`.
+- `enable_iter_perf_stats: true` adds engine statistics. Set it to `false` for request-only collection; it does not enable the endpoint by itself.
+- `perf_metrics_output_dir` also enables collection and the endpoint, matching HTTP enablement, but OpenEngine does not write HTTP per-request JSONL files.
+- KV events and routing load remain separate: metrics do not enable event publishing or `--openengine-enable-load-metrics`.
+
+### Reading the metrics
+
+- `trtllm_request_success_total` counts completed output candidates by finish reason. One successful request with `num_sequences=2` contributes two candidates.
+- `trtllm_prompt_tokens_total` counts the prompt once per request; `trtllm_generation_tokens_total` sums tokens across outputs.
+- `trtllm_openengine_rpc_outcomes_total{phase,outcome}` counts one outcome per `Generate` call, including rejection, cancellation, and engine errors. Use this to distinguish RPC outcomes from candidate completion. Completion means the server consumed the response stream, not that the client acknowledged receipt.
+- `trtllm_openengine_metrics_errors_total{source}` reports collection failures without failing inference.
+
+Request latency histograms measure this worker's execution phase. For separate prefill and decode workers, they do not measure the client's full request latency. Rejected or interrupted requests may have no candidate timing observations. Health probes are excluded from request metrics, but their engine work can appear in iteration statistics.
+
+Engine statistics are collected approximately once per second. Gauges retain the last engine sample when no new sample is available. Served-model labels and `prometheus_metrics_config` histogram buckets match HTTP; OpenEngine's engine gauges omit `pid` labels.
+
+### Performance and deployment notes
+
+- Measure overhead with your workload and scrape interval. To sample KV statistics less often, increase `kv_cache_config.iteration_stats_interval`; this can delay updates. Keep `iter_perf_stats_interval: 1` for complete iteration counters, including speculative-decoding counts.
+- With multiple frontends, one process serves metrics and collects engine statistics; request metrics are combined across all frontends.
+- Metrics storage is managed automatically. If setting `PROMETHEUS_MULTIPROC_DIR`, use an existing writable parent directory; the server creates and cleans up a private child. Forced termination can leave that child behind. When embedding the server, initialize the environment before importing `prometheus_client`.
+
 ## Transport security
 
 The listener is plaintext h2c with no authentication. Any client that can reach

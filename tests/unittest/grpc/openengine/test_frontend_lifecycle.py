@@ -212,6 +212,18 @@ class Engine:
             self._executor._engine_dead = True
 
 server.PyTorchLLM = Engine
+if frontend and sys.argv[3] == "child-server-start-signal":
+    original_start = server.OpenEngineServer.start
+    original_ready = server._signal_frontend_ready
+    async def held_start(self):
+        (root / "server-starting").touch()
+        await asyncio.sleep(1.5)
+        await original_start(self)
+    def ready(mode):
+        (root / "child-ready").touch()
+        original_ready(mode)
+    server.OpenEngineServer.start = held_start
+    server._signal_frontend_ready = ready
 if frontend and sys.argv[3] == "rpc-delayed-peer":
     original_dispatch = server.FrontendClient._dispatch
     async def delayed_dispatch(self, message, context):
@@ -263,6 +275,7 @@ def _wait_until(predicate, timeout=90):
         "child-startup-signal",
         "child-startup-signal-fatal",
         "child-startup-engine-failure",
+        "child-server-start-signal",
         "rpc-single",
         "rpc-launcher",
         "rpc-attached",
@@ -297,6 +310,11 @@ def test_frontend_group_cleanup(tmp_path, failure):
             (tmp_path / "continue-initialization").touch()
             assert (process.wait(timeout=20) == 0) == (failure == "startup-signal")
             assert (tmp_path / "shutdown-0").exists()
+        elif failure == "child-server-start-signal":
+            _wait_until(lambda: (tmp_path / "server-starting").exists())
+            process.terminate()
+            assert process.wait(timeout=30) == 0
+            assert not (tmp_path / "child-ready").exists()
         elif failure in (
             "child-startup-signal",
             "child-startup-signal-fatal",

@@ -922,8 +922,10 @@ def main(*,
                              build_root=build_root)
 
     if cuda_architectures is not None:
-        if "70-real" in cuda_architectures:
-            raise RuntimeError("Volta architecture is deprecated support.")
+        if any(
+                re.match(r"^70a?(-real)?$", arch.strip())
+                for arch in cuda_architectures.split(";")):
+            raise RuntimeError("Volta architecture support is deprecated.")
 
     # Debug and RelWithDebInfo enable CUDA `--generate-line-info`, which
     # inflates .text so much that linking against every supported arch
@@ -932,7 +934,7 @@ def main(*,
     if build_type in ("Debug", "RelWithDebInfo") and not cuda_architectures:
         raise RuntimeError(
             f"Building {build_type} requires --cuda_architectures to be set "
-            "explicitly (e.g. --cuda_architectures=90-real). Building for all "
+            "explicitly (e.g. --cuda_architectures=90). Building for all "
             "architectures with line info enabled exceeds linker section "
             "limits. Pass a narrow arch list matching the GPU you intend to "
             "debug/profile.")
@@ -1634,8 +1636,10 @@ def add_arguments(parser: ArgumentParser):
         "--cuda_architectures",
         "-a",
         help=
-        "CUDA architectures to build for, will be passed to cmake `CUDA_ARCHITECTURES` variable. Example: `--cuda_architectures=90-real;100-real`"
-    )
+        "Exact CUDA architectures the build supports, as plain SM numbers separated by ';' "
+        "(passed to CMake as CMAKE_CUDA_ARCHITECTURES). Each listed architecture gets its fully "
+        "optimized kernels; unlisted architectures are unsupported. Do not add -real/-a/-f "
+        "suffixes. Example: `--cuda_architectures=90;100`")
     parser.add_argument("--install",
                         "-i",
                         action="store_true",

@@ -4018,12 +4018,15 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     imagePullPolicy: Always
         """
     }
-    // Temporarily avoid an arm64 CPU builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-    def blockedNodeAffinity = targetCloud == "kubernetes-cpu" && arch == "arm64" ? '''
-                              - key: "kubernetes.io/hostname"
+    // CPU test pods mount the model scratch from 10.117.145.14, which can't be accessed from ipp6/ipp9 DC.
+    // Pods placed there stay in ContainerCreating. Build stage pods do not mount the model scratch,
+    // so they can still use these nodes.
+    def scratchUnreachableNodeAffinity = type == "cpu" ? '''
+                              - key: "region"
                                 operator: NotIn
                                 values:
-                                - "rl300-0021.ipp2a1.colossus"''' : ""
+                                - "ipp6"
+                                - "ipp9"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -4077,7 +4080,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                                 - "qa_only"
-${blockedNodeAffinity}
+${scratchUnreachableNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -5929,7 +5932,9 @@ def runLLMBuild(
     }
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
-        buildArgs += " -a '90-real;100-real;103-real;120-real'"
+        buildArgs += " -a '90;100;103;107;120;121'"
+    } else {
+        buildArgs += " -a '80;86;89;90;100;103;107;120'"
     }
     def platNameArg = plat_name ? " --plat-name ${plat_name}" : ""
 
