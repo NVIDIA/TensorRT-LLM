@@ -63,6 +63,7 @@ from .packing import (
     align_num_frames,
     audio_latent_num_frames,
     build_packed_sequence,
+    pad_packed_sequence,
     build_row_timesteps,
     keyframe_condition_noise,
     patchify_video_latents,
@@ -252,6 +253,10 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     VIDEO_SCHEDULER_SHIFT = 12.0
     AUDIO_SCHEDULER_SHIFT = 3.0
+    # Packed-length bucket under CUDA graphs: graphs are keyed by every input shape, so the
+    # sequence is padded with trailing masked rows to this multiple and one graph serves every
+    # prompt length within a bucket (at most 255 extra rows, about 1 % of a 19k-token clip).
+    CUDA_GRAPH_SEQUENCE_MULTIPLE = 256
     derive_output_size_from_reference = True
 
     @staticmethod
@@ -333,6 +338,14 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "enters the offload context, so staged components would be used "
                 "directly on the wrong device."
             )
+        if pipeline_config.cuda_graph.enable and pipeline_config.attention.backend not in (
+            "VANILLA",
+            "FA4",
+        ):
+            raise NotImplementedError(
+                "MiniMax-H3 CUDA graphs pad the packed sequence to a fixed bucket, which "
+                "needs an attention backend that honours key_padding_mask: VANILLA or FA4."
+            )
         self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
         vae_size = pipeline_config.parallel.parallel_vae_size
         if not 1 <= vae_size <= world_size:
@@ -348,9 +361,10 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         Same composition with torch.compile as the base implementation: the runner wraps the
         outer ``transformer.forward`` while the compiled blocks run inside the captured graph.
-        One graph per packed layout: the key holds every input shape, so a new prompt length
-        or canvas captures a new graph at its first request (warmup covers the configured
-        resolutions with its own prompt length).
+        One graph per (canvas, frames, timestep-table length, ``CUDA_GRAPH_SEQUENCE_MULTIPLE``
+        bucket of the packed length): ``_forward`` pads the packed sequence to that multiple,
+        so prompts of different lengths within a bucket replay the same graph. Graphs are never
+        evicted; warmup captures the configured resolutions.
         """
         if not self.pipeline_config.cuda_graph.enable:
             return
@@ -1251,6 +1265,10 @@ class MiniMaxH3Pipeline(BasePipeline):
                 latent_width,
                 generator,
             )
+        if self._cuda_graph_runners:
+            # One graph per 256-row bucket instead of one per prompt length: the graph key
+            # holds every input shape, and the text length varies per request.
+            layout = pad_packed_sequence(layout, self.CUDA_GRAPH_SEQUENCE_MULTIPLE)
         position_ids = layout.position_ids.to(self.device)
         token_tags = layout.token_tags.to(self.device)
         video_indices = layout.video_indices.to(self.device)

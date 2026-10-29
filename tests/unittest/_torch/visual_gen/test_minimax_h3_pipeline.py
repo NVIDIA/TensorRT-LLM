@@ -395,6 +395,18 @@ def test_pipeline_keeps_torch_compile_enabled(
     MiniMaxH3Pipeline(graphed)
     assert graphed.torch_compile.enable, "pipeline disabled torch.compile under CUDA graphs"
 
+    # The graph bucket pads the packed sequence, which only the mask-aware backends support.
+    for backend in ("FA4", "VANILLA"):
+        accepted = _config(TorchCompileConfig(enable=True))
+        accepted.cuda_graph = SimpleNamespace(enable=True)
+        accepted.attention = SimpleNamespace(backend=backend)
+        MiniMaxH3Pipeline(accepted)
+    rejected = _config(TorchCompileConfig(enable=True))
+    rejected.cuda_graph = SimpleNamespace(enable=True)
+    rejected.attention = SimpleNamespace(backend="TRTLLM")
+    with pytest.raises(NotImplementedError, match="key_padding_mask"):
+        MiniMaxH3Pipeline(rejected)
+
 
 def test_modular_manifest_discovers_h3_pipeline_and_transformer_config(tmp_path: Path) -> None:
     (tmp_path / "transformer").mkdir()
@@ -1834,3 +1846,35 @@ def test_cuda_graph_runner_clones_and_copies_static_context() -> None:
     assert runner._copy_input(tensor_static, torch.zeros(3)) is tensor_static
     assert tensor_static.sum() == 0
     assert runner._copy_input(True, False) is False
+
+
+def test_pad_packed_sequence_appends_masked_rows_to_the_bucket() -> None:
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
+        build_packed_sequence,
+        build_row_timesteps,
+        pad_packed_sequence,
+    )
+
+    # text tags, latent frames, latent height, latent width, audio latents, patch size, anchors
+    layout = build_packed_sequence(torch.full((7,), MINIMAX_H3_TEXT_TAG), 2, 2, 3, 2, (1, 1, 1), ())
+    padded = pad_packed_sequence(layout, 32)
+
+    assert padded.sequence_length == 32
+    assert padded.token_tags.shape == (32,) and padded.position_ids.shape == (32, 3)
+    pad = padded.sequence_length - layout.sequence_length
+    assert pad > 0
+    torch.testing.assert_close(padded.token_tags[: layout.sequence_length], layout.token_tags)
+    assert (padded.token_tags[layout.sequence_length :] == -1).all()
+    assert (padded.position_ids[layout.sequence_length :] == 0).all()
+    # Padding only trails: FA4 expresses it through seqused_k.
+    assert (padded.token_tags[: layout.sequence_length] >= 0).all()
+    for name in ("video_indices", "audio_indices", "text_indices"):
+        assert getattr(padded, name) is getattr(layout, name)
+    assert pad_packed_sequence(padded, 32) is padded
+    assert pad_packed_sequence(layout, 1) is layout
+
+    unique, indices = build_row_timesteps(padded, 0.25, 0.5, 0.75, 1.0)
+    assert indices.shape == (32,)
+    # Padding rows take the video timestep.
+    assert (unique[indices[layout.sequence_length :]] == 0.25).all()
+    assert pad_packed_sequence(layout, 32).sequence_length % 32 == 0
