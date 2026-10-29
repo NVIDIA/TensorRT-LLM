@@ -332,9 +332,24 @@ public:
     // Release the slot back to storage manager.
     void unlock();
 
+    //! In-place relocation: take over `slot` (same pool group, its data already copied there) and
+    //! return the previous one for the caller to release. Scratch slot ids are read afresh from
+    //! KvCache::getScratchDesc() each step, so there is no page-index buffer to republish to.
+    [[nodiscard]] Slot relocate(Slot&& slot);
+
     Slot const& slot() const noexcept
     {
         return mSlot;
+    }
+
+    KvCache& owner() const noexcept
+    {
+        return *mOwner;
+    }
+
+    LifeCycleId lifeCycle() const noexcept
+    {
+        return mLifeCycle;
     }
 
 private:

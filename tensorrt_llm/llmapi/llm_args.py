@@ -5142,7 +5142,7 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         description=
         "With copy_based_rebalancing: rebalance without suspending running requests. Their "
         "blocks are copied on the GPU between iterations and their block indices rewritten in "
-        "place. Not supported with enable_swa_scratch_reuse.")
+        "place, SWA scratch slots included.")
 
     @model_validator(mode='after')
     def _validate_drop_requires_copy_based(self) -> 'KvPoolRebalanceConfig':

@@ -678,6 +678,12 @@ Slot ScratchSlotLock::detachSlot()
     return result;
 }
 
+Slot ScratchSlotLock::relocate(Slot&& slot)
+{
+    TLLM_CHECK_DEBUG(mSlot.hasValidSlot() && slot.hasValidSlot());
+    return mSlot.exchangeSlot(std::move(slot));
+}
+
 void ScratchSlotLock::unlock()
 {
     TLLM_CHECK_DEBUG(mSlot.hasValidSlot());

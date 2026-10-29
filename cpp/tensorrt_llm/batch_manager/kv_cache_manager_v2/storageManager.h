@@ -42,6 +42,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Forward declarations.
 class Page;
 class KvCache;
+class ScratchSlotLock;
+
+//! In-place relocation: SWA scratch slots held by ACTIVE caches (not owned; they live in the caches).
+using ScratchSlotLockList = std::vector<ScratchSlotLock*>;
 class CopyEngine;
 class StagingBufferManager;
 
@@ -192,10 +196,13 @@ public:
     // Dynamic cache level resizing.
     //! lockedPages (in-place relocation only): hot-level pages locked by ACTIVE caches, per pool
     //! group. They are never evicted; any outside a group's new window is relocated in place.
+    //! scratchSlots (in-place relocation only): the SWA scratch slots ACTIVE caches hold, per pool
+    //! group; treated like locked pages.
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
         TypedVec<PoolGroupIndex, float> const& ratioList,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
-        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages = nullptr);
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages = nullptr,
+        TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots = nullptr);
     void shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots,
         std::vector<SharedPtr<Page>> const& persistentPages);
     void expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots);
@@ -204,7 +211,8 @@ public:
     //! Pages outside the target are dropped (copy-based rebalancing with the drop flag, droppable
     //! pages only), evicted, or copied into free slots inside it, and their slot ids change.
     void shrinkPoolGroupToWindow(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target,
-        std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages = {});
+        std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages = {},
+        ScratchSlotLockList const& scratchSlots = {});
 
     //! Whether the GPU level is a copy-based rebalancing arena.
     [[nodiscard]] bool isGpuArena() const noexcept
@@ -513,15 +521,19 @@ private:
     //! Copy-based rebalancing of the GPU arena: move the window boundaries to `ratioList`.
     void adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
-        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages);
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages,
+        TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots);
     //! Move one arena pool group from `from` to `to`: grow over any space gained, then shrink off
     //! any space lost. Space gained must already have been vacated by its previous owner.
     void moveArenaWindow(PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to,
-        std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages);
-    //! In-place relocation: copy locked pages (of ACTIVE caches) into free slots of their own pool
-    //! group at the same level and republish the new indices to every owner. The copy runs after
-    //! the owners' prior work and their readers, and every owner's stream waits for it.
-    void _relocateLockedPages(CacheLevel level, PoolGroupIndex pgIdx, std::vector<SharedPtr<Page>> const& pages);
+        std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages,
+        ScratchSlotLockList const& scratchSlots);
+    //! In-place relocation: copy locked pages and scratch slots (of ACTIVE caches) into free slots of
+    //! their own pool group at the same level, republish the pages' new indices to every owner and
+    //! hand each scratch lock its new slot. The copy runs after the owners' prior work and their
+    //! readers, and every owner's stream waits for it.
+    void _relocateLockedPages(CacheLevel level, PoolGroupIndex pgIdx, std::vector<SharedPtr<Page>> const& pages,
+        ScratchSlotLockList const& scratchSlots = {});
     //! Move bound pool poolIdx of arena group pgIdx to `target`, its own new window: every group slot
     //! id in use whose data lies outside it is rebound to a free id inside it and its data copied
     //! there. Free group slot ids lose their bindings (completeBindings() restores them). Runs
@@ -530,7 +542,8 @@ private:
     //! adjustArenaLevel for an arena with bound pools: every pool moves on its own.
     void adjustArenaPools(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> const& newWindows,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
-        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages);
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages,
+        TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots);
     //! Drop the droppable (unreferenced) pages of a pool group whose slots lie outside `target`.
     //! Returns how many were dropped.
     SlotCount dropUnreferencedPagesOutside(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target);

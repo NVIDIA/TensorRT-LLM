@@ -3552,6 +3552,20 @@ void ScratchSlots::_mirrorSentinel(size_t from, std::optional<size_t> to)
     std::fill(mirror.ptr + from, mirror.ptr + end, kBadPageIndex.value());
 }
 
+void ScratchSlots::republish()
+{
+    std::visit(
+        [this](auto& buf)
+        {
+            TLLM_CHECK_DEBUG(static_cast<size_t>(buf.size()) >= mSlots.size());
+            for (size_t i = 0; i < mSlots.size(); ++i)
+            {
+                buf[i] = slotIdToPageIndexValue(mSlots[i].slot().slotId());
+            }
+        },
+        mIndices);
+}
+
 ScratchSlotLock ScratchSlots::popBack()
 {
     ScratchSlotLock lock = std::move(mSlots.back());
@@ -3609,8 +3623,9 @@ Span<int const> ScratchSlots::indices() const
 
 HalfOpenRange<BlockOrdinal> KvCache::getSwaScratchRange(LayerGroupId lgId) const
 {
-    // Lock-free: scratch slots are exclusively owned by this KvCache, and defrag-caused page
-    // movement happens only when every KvCache is suspended, which means mScratchSlots is empty.
+    // Lock-free: scratch slots are exclusively owned by this KvCache. Defrag-caused page movement
+    // happens only when every KvCache is suspended (mScratchSlots empty), or, with in-place
+    // relocation, inside adjust() at the executor's quiescence point; either way not concurrently.
     TLLM_CHECK_WITH_INFO(isActive(), "getSwaScratchRange() requires an ACTIVE KvCache");
     return _getScratchRange(mManager->lifeCycles().getLifeCycle(lgId));
 }
