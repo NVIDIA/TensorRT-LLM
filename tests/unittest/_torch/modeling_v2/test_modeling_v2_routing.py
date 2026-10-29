@@ -67,6 +67,9 @@ _R1_DEFAULT_TARGET = (
     "models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.modeling."
     "ModelingV2DeepseekR10528Nvfp4Sm10xDefault"
 )
+_GLM52_TARGET = (
+    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.modeling.ModelingV2Glm52Nvfp4Sm103Tep4"
+)
 
 
 def _qualified(target) -> str:
@@ -117,6 +120,21 @@ def _r1_config(**overrides):
     return PretrainedConfig(**fields)
 
 
+def _glm52_config(**overrides):
+    """The shape GLM-5.2-NVFP4's own config.json declares."""
+    fields = dict(
+        architectures=["GlmMoeDsaForCausalLM"],
+        model_type="glm_moe_dsa",
+        num_hidden_layers=78,
+        hidden_size=6144,
+        n_routed_experts=256,
+        q_lora_rank=2048,
+        index_n_heads=32,
+    )
+    fields.update(overrides)
+    return PretrainedConfig(**fields)
+
+
 def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
     """The deployment, as the LLM API would have been given it.
 
@@ -134,11 +152,14 @@ def _model_config(
     pretrained_config, spec_config=None, kv_cache_quant_algo=_CHECKPOINT_KV, **mapping_kwargs
 ):
     """The loaded config. Its KV-cache algorithm is the checkpoint's own: FP8 for
-    DeepSeek-R1-0528-NVFP4, none (a bf16 pool) for the others."""
+    DeepSeek-R1-0528-NVFP4 and GLM-5.2-NVFP4, none (a bf16 pool) for the others."""
     mapping = Mapping(**mapping_kwargs) if mapping_kwargs else Mapping()
     if kv_cache_quant_algo is _CHECKPOINT_KV:
-        r1 = pretrained_config.architectures[0] == "DeepseekV3ForCausalLM"
-        kv_cache_quant_algo = QuantAlgo.FP8 if r1 else None
+        fp8_kv = pretrained_config.architectures[0] in (
+            "DeepseekV3ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        )
+        kv_cache_quant_algo = QuantAlgo.FP8 if fp8_kv else None
     return ModelConfig(
         pretrained_config=pretrained_config,
         mapping=mapping,
@@ -180,6 +201,8 @@ def _qwen4_exp_config(**vision_overrides):
 
 
 _MTP3 = MTPDecodingConfig(max_draft_len=3)
+_DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True)
+_TEP4 = dict(_DEP4, enable_attention_dp=False)
 
 
 @pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
@@ -1289,3 +1312,89 @@ def test_qwen4_exp_mtp_on_a_bf16_state_cache_matches_with_replay_off(monkeypatch
 def test_qwen4_exp_no_speculation_matches_the_default_state_cache(monkeypatch):
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
     _claimed(_model_config(_qwen4_exp_config()))
+
+
+# --- GLM-5.2 on sm103 -----------------------------------------------------------
+
+
+@pytest.fixture
+def _glm52_sm(_on_sm10x):
+    """The GLM-5.2 target is certified on sm_103 only; on sm_100 it routes nowhere."""
+    if _on_sm10x != (10, 3):
+        pytest.skip("the GLM-5.2 target is certified on sm_103 only")
+
+
+@pytest.mark.usefixtures("_glm52_sm")
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_glm52_tep4_matches(mode):
+    config = _model_config(_glm52_config(), **_TEP4)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _GLM52_TARGET
+
+
+@pytest.mark.usefixtures("_glm52_sm")
+def test_glm52_tep4_with_mtp_matches():
+    config = _model_config(_glm52_config(), spec_config=MTPDecodingConfig(max_draft_len=1), **_TEP4)
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _GLM52_TARGET
+
+
+@pytest.mark.usefixtures("_glm52_sm")
+@pytest.mark.parametrize(
+    "spec_config, missed",
+    [
+        (MTPDecodingConfig(max_draft_len=2), r"max_draft_len=2, max_total_draft_tokens=2"),
+        (MTPDecodingConfig(max_draft_len=3), r"max_draft_len=3, max_total_draft_tokens=3"),
+        (
+            MTPDecodingConfig(max_draft_len=1, use_dynamic_tree=True, dynamic_tree_max_topK=2),
+            r"max_draft_len=1, max_total_draft_tokens=2",
+        ),
+    ],
+    ids=["draft2", "draft3", "dynamic_tree"],
+)
+def test_glm52_tep4_with_more_than_one_draft_token_does_not_match(spec_config, missed):
+    """The decode attention, the base-row index kind and the MLA rope kernel are
+    built for two query rows per sequence; a longer draft chain or a tree puts
+    more rows on a sequence and is a different forward."""
+    config = _model_config(_glm52_config(), spec_config=spec_config, **_TEP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_glm52_sm")
+@pytest.mark.parametrize(
+    "config_kwargs, mapping_kwargs, missed",
+    [
+        # a DeepSeek-V3.2-shaped indexer: same trunk shape, 64 indexer heads
+        (dict(index_n_heads=64), _TEP4, "index_n_heads=64"),
+        # attention DP replicates attention: a different weight layout
+        (dict(), _DEP4, "attention_dp=True"),
+    ],
+)
+def test_glm52_near_misses_do_not_match(config_kwargs, mapping_kwargs, missed):
+    config = _model_config(_glm52_config(**config_kwargs), **mapping_kwargs)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_glm52_sm")
+def test_glm52_on_sm100_does_not_match(monkeypatch):
+    """The context phase runs an sm103-only kernel, so a B200 is not this target."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
+    config = _model_config(_glm52_config(), **_TEP4)
+    with pytest.raises(ValueError, match=r"compute capability \(10, 0\)"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_glm52_sm")
+def test_glm52_with_another_speculative_mode_does_not_match():
+    config = _model_config(_glm52_config(), spec_config=_NGRAM, **_TEP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+@pytest.mark.usefixtures("_glm52_sm")
+def test_glm52_without_an_fp8_kv_cache_does_not_match():
+    config = _model_config(_glm52_config(), kv_cache_quant_algo=None, **_TEP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="KV cache bf16"):
+        modeling_v2_resolve(config, _llm_args("require"))

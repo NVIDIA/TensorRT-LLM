@@ -55,7 +55,7 @@ from ..attention.backends.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..attention.backends.sparse.minimax_m3.common import index_head_range
+from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
@@ -79,6 +79,7 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
+from .checkpoints.hf.weight_mapper import convert_compressed_tensors_nvfp4_weights
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
     DecoderModel,
@@ -437,26 +438,6 @@ def _validate_sparse_attention_runtime_config(
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 or NVFP4 main KV cache."
             )
-
-
-def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
-    """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
-    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-    n_layers = int(text_config.num_hidden_layers)
-    if sparse_cfg is None:
-        return list(range(n_layers)), []
-    if not sparse_cfg.get("use_sparse_attention", True):
-        return list(range(n_layers)), []
-    freq = sparse_cfg.get("sparse_attention_freq")
-    if freq is None:
-        return list(range(n_layers)), []
-    if len(freq) != n_layers:
-        raise ValueError(
-            f"sparse_attention_freq length {len(freq)} does not match num_hidden_layers {n_layers}"
-        )
-    dense = [i for i, f in enumerate(freq) if int(f) == 0]
-    sparse = [i for i, f in enumerate(freq) if int(f) != 0]
-    return dense, sparse
 
 
 def get_sparse_disable_index_value_layer_ids(
@@ -2993,6 +2974,10 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         params_map: Optional[Dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
+        # Accept compressed-tensors NVFP4 names before any loader below reads
+        # the dict. Keyed on the tensor names, not on the global quant config:
+        # that is MIXED_PRECISION when NVFP4 covers only some modules.
+        weights = convert_compressed_tensors_nvfp4_weights(weights)
         # Pack the opt-in five-way projection with MiniMax-specific TP
         # sharding before the generic mapper handles the compatibility path.
         packed_projection_modules = _load_qkv_index_proj_weights(self, weights)

@@ -5402,7 +5402,7 @@ class PyExecutor:
                                 gpu_forward_start,
                                 gpu_forward_end) as fwd_timing:
                             if self.dwdp_manager is not None:
-                                self.dwdp_manager.prefetch_first_layers()
+                                self.dwdp_manager.start_forward()
                             batch_outputs = self._forward_step(scheduled_batch)
 
                         # None: _forward_step hit an exception and
@@ -5688,6 +5688,10 @@ class PyExecutor:
             self.control_action_done.wait()
         self.control_action_done.clear()
         self._active_control_id = None
+        if self.dwdp_manager is not None:
+            # The action may have changed the expert weights that the last
+            # forward pass already prefetched for the next one.
+            self.dwdp_manager.invalidate_prefetch()
         logger.debug("[control_action] control request finished")
 
     def _sync_and_process_resource_governor_queue(self):
