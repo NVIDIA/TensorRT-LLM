@@ -73,6 +73,7 @@ __all__ = [
     "TagSnapshot",
     "freeze_tag_map",
     "get_frozen_map",
+    "live_attribution",
     "live_bytes_by_tag",
     "set_frozen_map",
     "start_tagging_window",
@@ -246,8 +247,11 @@ def freeze_tag_map() -> TagSnapshot:
 CUDA_GRAPHS = "CUDA_GRAPHS"
 
 
-def _live_blocks() -> list[tuple[int, int, bool]] | None:
-    """Sorted ``(address, size, in_graph_pool)`` of every live block, or ``None``."""
+def _live_blocks() -> list[tuple[int, int, bool, list]] | None:
+    """Sorted ``(address, size, in_graph_pool, frames)`` of every live block, or ``None``.
+
+    ``frames`` is the allocating stack when stack recording is on, else empty.
+    """
     from .pools import classify
 
     try:
@@ -260,13 +264,22 @@ def _live_blocks() -> list[tuple[int, int, bool]] | None:
         in_graph = classify(segment.get("segment_pool_id", (0, 0)))[0] == "graph"
         for block in segment["blocks"]:
             if block["state"] == "active_allocated":
-                blocks.append((block["address"], block["size"], in_graph))
+                blocks.append(
+                    (block["address"], block["size"], in_graph, block.get("frames") or [])
+                )
     blocks.sort()
     return blocks
 
 
 def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
-    """Split currently live torch memory across tags and claimed modules.
+    """Split currently live torch memory across tags and claimed modules."""
+    return live_attribution(snapshot)[0]
+
+
+def live_attribution(snapshot: TagSnapshot) -> tuple[dict[str, int], dict[str, int]]:
+    """Live torch memory by label, and the untagged part by allocating code.
+
+    Labels come from tags and claimed modules.
 
     A block held by a claimed module is labelled from the module; otherwise
     the frozen trace map applies. The ``untagged`` entry is always present
@@ -278,11 +291,12 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
     claims = _claimed_storages()
     blocks = _live_blocks()
     if blocks is None:
-        return {}
-    in_graphs = any(graph for _, _, graph in blocks)
-    if not snapshot.supported and not claims and not in_graphs:
-        return {}
-    addresses = [address for address, _, _ in blocks]
+        return {}, {}
+    in_graphs = any(graph for _, _, graph, _ in blocks)
+    with_stacks = any(frames for _, _, _, frames in blocks)
+    if not snapshot.supported and not claims and not in_graphs and not with_stacks:
+        return {}, {}
+    addresses = [address for address, _, _, _ in blocks]
 
     # Each snapshot block is one allocation, so a storage lies inside exactly
     # one block, and storages sharing a block (tied weights) claim it once.
@@ -290,19 +304,28 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
     for pointer, label in claims:
         position = bisect.bisect_right(addresses, pointer) - 1
         if position >= 0:
-            address, size, _ = blocks[position]
+            address, size, _, _ = blocks[position]
             if pointer < address + size:
                 claimed.setdefault(address, label)
 
     # Precedence: a claimed module, then the graph pool a block sits in, then
     # the creation step's tag.
+    from .stacks import site_of
+
     totals: dict[str, int] = {UNTAGGED: 0}
-    for address, size, in_graph in blocks:
+    # What is left untagged, by the code that allocated it -- populated only
+    # when stack recording is on, since blocks carry frames only then.
+    untagged_sites: dict[str, int] = {}
+    for address, size, in_graph, frames in blocks:
         label = claimed.get(address)
         if label is None:
             label = CUDA_GRAPHS if in_graph else snapshot.owners.get(address, UNTAGGED)
         totals[label] = totals.get(label, 0) + size
-    return totals
+        if label == UNTAGGED:
+            site = site_of(frames)
+            if site is not None:
+                untagged_sites[site] = untagged_sites.get(site, 0) + size
+    return totals, untagged_sites
 
 
 _frozen: TagSnapshot = TagSnapshot(supported=False)
@@ -416,7 +439,12 @@ def startup_window(rank: int | None = None):
                 snapshot = freeze_tag_map()
         finally:
             if recording:
-                stop_tagging_window()
+                from .stacks import stacks_enabled, start_stack_recording
+
+                # Either way the event history ends here; stack mode keeps
+                # only each live block's allocating stack from now on.
+                if not (stacks_enabled() and start_stack_recording()):
+                    stop_tagging_window()
         set_frozen_map(snapshot)
         _log_window_result(snapshot, rank, failed=failed)
 
