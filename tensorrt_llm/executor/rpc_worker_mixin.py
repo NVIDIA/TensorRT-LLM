@@ -320,6 +320,16 @@ class RpcWorkerMixin:
         capacity = await asyncio.to_thread(self.fetch_kv_cache_capacity)
         return self._kv_cache_capacity_serializer(capacity)
 
+    async def fetch_openengine_discovery_async(self) -> str:
+        """Serialize startup discovery separately from KV capacity."""
+        discovery = await asyncio.to_thread(self.fetch_openengine_discovery)
+        return self._kv_cache_capacity_serializer(discovery)
+
+    async def fetch_kv_cache_load_async(self) -> str:
+        """Async version of fetch_kv_cache_load using asyncio.to_thread."""
+        load = await asyncio.to_thread(self.fetch_kv_cache_load)
+        return self._kv_cache_load_serializer(load)
+
     async def fetch_kv_cache_events_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_kv_cache_events using asyncio.to_thread.
 

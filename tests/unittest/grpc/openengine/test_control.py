@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
@@ -19,8 +20,10 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     model_pb2,
     server_pb2,
 )
+from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
+from tensorrt_llm.llmapi import KVEventsConfig  # noqa: E402
 
 # Runs on the CPU stage: the engine is stubbed, so nothing here needs a GPU.
 pytestmark = pytest.mark.cpu_only
@@ -65,6 +68,7 @@ def _llm(**overrides):
         max_beam_width=1,
         reasoning_parser=None,
         kv_cache_config=SimpleNamespace(tokens_per_block=32),
+        _enable_routing_load=overrides.get("_enable_routing_load", "_kv_load" in overrides),
     )
     for key, value in overrides.items():
         if key.startswith("_"):
@@ -75,6 +79,9 @@ def _llm(**overrides):
     executor = SimpleNamespace(
         is_shutdown=lambda: shutdown,
         check_health=lambda: not (shutdown or unhealthy),
+        get_kv_cache_capacity=lambda: overrides.get("_kv_capacity", {}),
+        get_openengine_discovery=lambda: overrides.get("_openengine_discovery", {}),
+        get_kv_cache_load=lambda: overrides.get("_kv_load", {}),
     )
     return SimpleNamespace(
         args=args,
@@ -96,7 +103,9 @@ def _servicer(inference=None, kv_transfer_backend="NIXL", **overrides):
 
 @pytest.mark.asyncio
 async def test_server_info_reports_identity_parallelism_and_capacity():
-    info = await _servicer().GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
+    info = await _servicer(_kv_capacity={"maxNumBlocks": 100}).GetServerInfo(
+        server_pb2.GetServerInfoRequest(), FakeServicerContext()
+    )
 
     assert info.engine_name == "tensorrt_llm"
     assert info.instance_id == "instance-1"
@@ -106,6 +115,7 @@ async def test_server_info_reports_identity_parallelism_and_capacity():
     assert info.capacity.max_running_requests == 16
     assert info.capacity.max_batched_tokens == 8192
     assert info.capacity.kv_block_size == 32
+    assert info.capacity.total_kv_blocks == 100
     assert info.kv_connector.enabled is True
     assert info.kv_connector.transfer_backend == "NIXL"
     # Abort(kv_session) is UNIMPLEMENTED, so cleanup must not be advertised: a
@@ -158,6 +168,25 @@ async def test_model_info_reports_the_context_window_and_capabilities():
     assert model_pb2.GUIDED_DECODING_MODE_JSON_SCHEMA in info.generation.guided_decoding.modes
     assert info.generation.output_logprobs.supported is True
     assert info.supports_token_ids_input is True
+    assert info.supports_multimodal is False
+    assert list(info.extra["trtllm_supported_modalities"]) == []
+
+
+@pytest.mark.asyncio
+async def test_model_info_advertises_loaded_image_support(monkeypatch):
+    inference = _inference()
+    monkeypatch.setattr(
+        inference,
+        "_media_capabilities",
+        MediaCapabilities({"image": "<image_{}>"}),
+    )
+
+    info = await _servicer(inference=inference).GetModelInfo(
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
+    )
+
+    assert info.supports_multimodal is True
+    assert list(info.extra["trtllm_supported_modalities"]) == ["image"]
 
 
 @pytest.mark.asyncio
@@ -186,6 +215,51 @@ async def test_get_load_counts_in_flight_requests():
     assert load.running_requests == 2
     assert load.instance_id == "instance-1"
     assert load.timestamp_unix_nanos > 0
+
+
+@pytest.mark.asyncio
+async def test_get_load_reports_kv_snapshot_and_honors_per_rank_opt_in():
+    snapshot = {
+        "timestampUnixNanos": 123,
+        "usedKvBlocks": 7,
+        "totalKvBlocks": 20,
+        "ranks": [
+            {
+                "rank": 0,
+                "runningRequests": 2,
+                "usedKvBlocks": 7,
+                "totalKvBlocks": 20,
+            }
+        ],
+    }
+    servicer = _servicer(_kv_load=snapshot)
+
+    aggregate = await servicer.GetLoad(server_pb2.GetLoadRequest(), FakeServicerContext())
+    per_rank = await servicer.GetLoad(
+        server_pb2.GetLoadRequest(include_per_rank=True), FakeServicerContext()
+    )
+
+    assert aggregate.timestamp_unix_nanos > 123
+    assert aggregate.used_kv_blocks == 7
+    assert aggregate.total_kv_blocks == 20
+    assert list(aggregate.ranks) == []
+    assert per_rank.ranks[0].data_parallel_rank == 0
+    assert per_rank.ranks[0].used_kv_blocks == 7
+
+
+@pytest.mark.asyncio
+async def test_get_load_rejects_stale_occupancy_while_request_is_active():
+    snapshot = {
+        "timestampUnixNanos": 1,
+        "usedKvBlocks": 0,
+        "totalKvBlocks": 20,
+        "ranks": [{"rank": 0, "usedKvBlocks": 0, "totalKvBlocks": 20}],
+    }
+    servicer = _servicer(_inference({"request": _FakeHandle()}), _kv_load=snapshot)
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await servicer.GetLoad(server_pb2.GetLoadRequest(), context)
+    assert context.abort_code == grpc.StatusCode.UNAVAILABLE
 
 
 @pytest.mark.asyncio
@@ -260,7 +334,6 @@ async def test_abort_without_a_target_is_invalid():
         ("LoadLora", lora_pb2.LoadLoraRequest()),
         ("UnloadLora", lora_pb2.UnloadLoraRequest()),
         ("ListLoras", lora_pb2.ListLorasRequest()),
-        ("GetKvEventSources", kv_pb2.GetKvEventSourcesRequest()),
     ],
 )
 async def test_unsupported_rpcs_report_unimplemented(rpc, request_message):
@@ -446,10 +519,11 @@ async def test_health_reports_not_ready_for_a_crashed_engine_that_is_not_shut_do
 
 
 @pytest.mark.asyncio
-async def test_health_survives_a_raising_health_check():
+@pytest.mark.parametrize("error_type", [RuntimeError, TypeError, AttributeError])
+async def test_health_survives_a_raising_health_check(error_type):
     """A probe reports state; it must not turn an engine fault into an RPC error."""
     llm = _llm()
-    llm._check_health = lambda: (_ for _ in ()).throw(RuntimeError("engine gone"))
+    llm._check_health = lambda: (_ for _ in ()).throw(error_type("engine gone"))
     servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
 
     response = await servicer.Health(lifecycle_pb2.HealthRequest(), FakeServicerContext())
@@ -544,3 +618,229 @@ async def test_concurrent_health_probes_share_one_engine_request():
     await asyncio.gather(*probes)
 
     assert calls == 1
+
+
+def _kv_events(**overrides) -> KVEventsConfig:
+    """A streaming KV-event config, using the real model so validation applies."""
+    settings = {"enable_kv_cache_events": True, "endpoint": "tcp://*:5557"}
+    settings.update(overrides)
+    return KVEventsConfig(**settings)
+
+
+def _kv_servicer(kv_events_config=None, **overrides):
+    """A servicer whose engine publishes KV events, optionally under attention DP."""
+    cache_config = SimpleNamespace(tokens_per_block=32, kv_events_config=kv_events_config)
+    return _servicer(kv_cache_config=cache_config, **overrides)
+
+
+@pytest.mark.asyncio
+async def test_server_info_rejects_missing_streaming_discovery():
+    """A worker RPC failure must not advertise routing without a node map."""
+    servicer = _kv_servicer(_kv_events(), _openengine_discovery={})
+    servicer._llm.args._openengine_discovery = {"engine_id": "incarnation"}
+    context = FakeServicerContext()
+
+    with pytest.raises(AbortError):
+        await servicer.GetServerInfo(server_pb2.GetServerInfoRequest(), context)
+    assert context.abort_code == grpc.StatusCode.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("events_enabled", [False, True])
+@pytest.mark.parametrize("load_enabled", [False, True])
+async def test_routing_capabilities_are_independent(events_enabled, load_enabled):
+    snapshot = {
+        "usedKvBlocks": 7,
+        "totalKvBlocks": 20,
+        "ranks": [{"rank": 0, "runningRequests": 0, "usedKvBlocks": 7, "totalKvBlocks": 20}],
+    }
+    servicer = _kv_servicer(
+        _kv_events() if events_enabled else None,
+        _enable_routing_load=load_enabled,
+        _kv_load=snapshot,
+        _openengine_discovery={"sources": [_runtime_source(0)]} if events_enabled else {},
+    )
+    info = await servicer.GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
+    assert info.extra["trtllm_supports_dp_rank_targeting"] is True
+    assert (
+        info.extra["trtllm_kv_event_hash_algo"]
+        if "trtllm_kv_event_hash_algo" in info.extra
+        else None
+    ) == ("v2_sha256_64" if events_enabled else None)
+    sources = await servicer.GetKvEventSources(
+        kv_pb2.GetKvEventSourcesRequest(), FakeServicerContext()
+    )
+    assert bool(sources.sources) == events_enabled
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), FakeServicerContext())
+    assert load.HasField("used_kv_blocks") == load_enabled
+
+
+@pytest.mark.asyncio
+async def test_server_info_advertises_first_turn_dp_rank_hint_with_conversation_affinity():
+    inference = _inference()
+    inference.subagent_affinity_auth_key = "shared-secret"
+    affinity = _servicer(
+        inference,
+        enable_attention_dp=True,
+        attention_dp_config=SimpleNamespace(kv_cache_routing_conversation_affinity=True),
+    )
+    affinity_info = await affinity.GetServerInfo(
+        server_pb2.GetServerInfoRequest(), FakeServicerContext()
+    )
+    assert affinity_info.extra["trtllm_supports_dp_rank_targeting"] is True
+    assert affinity_info.extra["trtllm_supports_subagent_affinity"] is True
+
+    without_adp = _servicer(
+        inference,
+        enable_attention_dp=False,
+        attention_dp_config=SimpleNamespace(kv_cache_routing_conversation_affinity=True),
+    )
+    info = await without_adp.GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
+    assert info.extra["trtllm_supports_subagent_affinity"] is False
+
+
+@pytest.mark.asyncio
+async def test_server_info_uses_actual_dp_capacity_without_exposing_load():
+    snapshot = {
+        "totalKvBlocks": 150,
+        "ranks": [
+            {"rank": 0, "totalKvBlocks": 100},
+            {"rank": 1, "totalKvBlocks": 50},
+        ],
+    }
+    servicer = _kv_servicer(
+        _kv_events(),
+        enable_attention_dp=True,
+        tensor_parallel_size=2,
+        _enable_routing_load=False,
+        _kv_capacity={
+            "maxNumBlocks": 100,
+        },
+        _openengine_discovery={"sources": [_runtime_source(0), _runtime_source(1)]},
+        _kv_load=snapshot,
+    )
+    info = await servicer.GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), FakeServicerContext())
+    assert info.capacity.total_kv_blocks == 150
+    assert not load.HasField("used_kv_blocks")
+
+
+@pytest.mark.asyncio
+async def test_enabled_load_without_snapshot_is_unavailable_not_disabled():
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await _servicer(_enable_routing_load=True).GetLoad(server_pb2.GetLoadRequest(), context)
+    assert context.abort_code == grpc.StatusCode.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_kv_event_sources_are_empty_when_publishing_is_off():
+    """Implemented-but-empty, not UNIMPLEMENTED.
+
+    A client has to be able to tell "this engine publishes nothing right now"
+    from "this engine cannot publish", because only the first is worth retrying
+    against a differently configured replica.
+    """
+    response = await _kv_servicer().GetKvEventSources(
+        kv_pb2.GetKvEventSourcesRequest(), FakeServicerContext()
+    )
+    assert list(response.sources) == []
+
+
+@pytest.mark.asyncio
+async def test_kv_event_sources_are_empty_for_a_null_publisher():
+    """`publisher="null"` builds the event path without binding a socket."""
+    config = _kv_events(publisher="null")
+    response = await _kv_servicer(config).GetKvEventSources(
+        kv_pb2.GetKvEventSourcesRequest(), FakeServicerContext()
+    )
+    assert list(response.sources) == []
+
+
+def _runtime_source(rank, host="node-a"):
+    return {
+        "transport": "zmq",
+        "encoding": "msgpack",
+        "schema_version": 1,
+        "data_parallel_rank": rank,
+        "endpoint_addr": {"host": host, "port": 5557 + rank, "protocol": "tcp"},
+        "replay_endpoint": f"tcp://{host}:{5657 + rank}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_kv_event_sources_return_actual_rank_descriptors():
+    sources = [_runtime_source(0), _runtime_source(1, "node-b")]
+    servicer = _kv_servicer(
+        _kv_events(),
+        enable_attention_dp=True,
+        tensor_parallel_size=2,
+        _openengine_discovery={"sources": sources},
+    )
+    response = await servicer.GetKvEventSources(
+        kv_pb2.GetKvEventSourcesRequest(data_parallel_ranks=[1, 0, 1]),
+        FakeServicerContext(),
+    )
+    assert [
+        (source.data_parallel_rank, source.endpoint_addr.host) for source in response.sources
+    ] == [
+        (0, "node-a"),
+        (1, "node-b"),
+    ]
+    assert response.sources[1].replay_endpoint == "tcp://node-b:5658"
+
+
+@pytest.mark.asyncio
+async def test_kv_event_sources_fail_when_live_discovery_is_missing_or_partial():
+    servicer = _kv_servicer(_kv_events(), _openengine_discovery={})
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await servicer.GetKvEventSources(kv_pb2.GetKvEventSourcesRequest(), context)
+    assert context.abort_code == grpc.StatusCode.UNAVAILABLE
+
+    servicer = _kv_servicer(
+        _kv_events(),
+        enable_attention_dp=True,
+        tensor_parallel_size=2,
+        _openengine_discovery={"sources": [_runtime_source(0)]},
+    )
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await servicer.GetKvEventSources(kv_pb2.GetKvEventSourcesRequest(), context)
+    assert context.abort_code == grpc.StatusCode.FAILED_PRECONDITION
+
+
+@pytest.mark.asyncio
+async def test_kv_event_sources_reject_unknown_rank():
+    servicer = _kv_servicer(_kv_events(), _openengine_discovery={"sources": [_runtime_source(0)]})
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await servicer.GetKvEventSources(
+            kv_pb2.GetKvEventSourcesRequest(data_parallel_ranks=[3]), context
+        )
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.asyncio
+async def test_server_info_reports_the_publishing_rank_count():
+    """A client needs this to tell a complete set of KV event sources from a partial one."""
+    info = await _servicer(enable_attention_dp=True, tensor_parallel_size=4).GetServerInfo(
+        server_pb2.GetServerInfoRequest(), FakeServicerContext()
+    )
+    assert info.parallelism.data_parallel_size == 4
+
+    aggregated = await _servicer(tensor_parallel_size=4).GetServerInfo(
+        server_pb2.GetServerInfoRequest(), FakeServicerContext()
+    )
+    assert aggregated.parallelism.data_parallel_size == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_subscribe_kv_events_is_unimplemented(enabled):
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await _kv_servicer(_kv_events() if enabled else None).SubscribeKvEvents(
+            kv_pb2.SubscribeKvEventsRequest(), context
+        )
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED

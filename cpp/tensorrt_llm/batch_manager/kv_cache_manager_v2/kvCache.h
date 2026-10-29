@@ -27,6 +27,7 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/executor.h"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -88,8 +89,8 @@ struct SeqBlock
         bool ret = treeBlock != nullptr;
         if (TLLM_UNLIKELY(gDebug))
         {
-            // When committed: must have one canonical beam, and all non-null
-            // pages must be CommittedPage.
+            // Committed blocks have one canonical beam; publication concerns reusable pages.
+            // Request-private state stays uncommitted.
             if (ret)
             {
                 TLLM_CHECK(pages.size() == BeamIndex{1});
@@ -98,7 +99,7 @@ struct SeqBlock
                         if (!blockPageIsNull(bp))
                         {
                             auto pg = blockPageGetPage(bp);
-                            TLLM_CHECK(!pg || dynamicPointerCast<CommittedPage>(pg));
+                            TLLM_CHECK(!pg || dynamicPointerCast<CommittedPage>(pg) || pg->isPrivate());
                         }
             }
             else
@@ -204,6 +205,25 @@ private:
     std::vector<CachedCudaEvent> mReadyEvents;
 };
 
+// Availability at the claimed prefix, indexed by LayerGroupId. OPTIONAL
+// candidates are held until the first successful resume or close.
+// Describes the initial prefix claim, not subsequent request progress.
+struct ReuseGroupStatus
+{
+    // Lifecycle group returned by getLayerGroupId(layerId), not a physical pool index.
+    LayerGroupId groupId;
+    // REQUIRED constrains the prefix match; OPTIONAL is selected at resume; PRIVATE is never reused.
+    AttentionReusePolicy policy;
+    // Exclusive token endpoint of the prefix claimed by REQUIRED groups, shared by all groups.
+    int endpoint;
+    // All state needed by this group at endpoint is available; does not imply GPU residency or selection.
+    // False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
+    bool complete;
+    // Retained token ranges [begin, end), including block-rounded SWA windows and sinks.
+    // SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
+    std::vector<std::pair<int, int>> coverage;
+};
+
 // ---------------------------------------------------------------------------
 // KvCache — manages the per-sequence KV cache state.
 // Mirrors Python's _KVCache.
@@ -229,7 +249,8 @@ public:
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
         std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false);
+        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false,
+        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt, bool isPrefetch = false);
 
     ~KvCache();
 
@@ -243,7 +264,8 @@ public:
     // isDecoding defaults to the current phase. A cache starts in prefill and cannot return to it
     // after decode admission. Set true when admitting a suspended request directly to decode.
     // Returns false if utilization too high or out of memory.
-    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt);
+    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt,
+        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
 
     // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
     // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
@@ -264,6 +286,14 @@ public:
     // Commit or discard request-local statistics accumulated since the previous scheduler commit.
     KVCacheStatsDelta commitPendingStats();
     void discardPendingStats();
+
+    //! Record the prompt tokens [tokenBegin, tokenEnd) as loaded by a KV connector from an external
+    //! store rather than computed by the forward pass. They count as connector cached tokens, and
+    //! the uncommitted allocations of the blocks they fill completely count as reused. A block the
+    //! forward pass still writes part of stays a miss. Must be called before the pending stats
+    //! covering those allocations are committed, so the reuse is booked when the load is accepted,
+    //! before an asynchronous transfer completes.
+    void recordConnectorReuse(int tokenBegin, int tokenEnd);
 
     // Best-effort prefetch active pages to the target cache level.
     bool prefetch(CacheLevel target);
@@ -405,6 +435,11 @@ public:
     //! survive, so only the tail stops counting as a local hit.
     void dropPartialBlockCachedTokenAttribution();
 
+    std::vector<ReuseGroupStatus> const& reuseStatus() const noexcept
+    {
+        return mReuseStatus;
+    }
+
     // Internal diagnostic: prefix supported by the attention pages alone,
     // before recurrent-state (SSM) snapshot pruning shortened the reuse.
     int numReusableTokensBeforeHybridPruning() const noexcept
@@ -512,6 +547,12 @@ public:
     // Priority for (blockOrdinal, lifeCycleId) based on the callback.
     Priority getPriority(BlockOrdinal ordinal, LifeCycleId lc) const;
 
+    //! Retention is resolved by block start, with decode beginning after the final prompt block.
+    executor::RetentionPriorityAndDuration getRetention(BlockOrdinal ordinal) const;
+
+    //! Current priorities for the request's allocated pages in one layer group.
+    std::vector<Priority> getPagePriorities(LayerGroupId layerGroupId, BeamIndex beamIndex = kDefaultBeamIndex) const;
+
     // Reference to StorageManager (for page acquisition/release).
     StorageManager* storageManager() const;
 
@@ -590,7 +631,7 @@ private:
     // counts. Called at the end of _setupForReuse, which collects them in the same walk.
     void _finalizeCachedTokensByLevel(
         int numTokens, TypedVec<BlockOrdinal, CacheLevel> const& attentionLevels, std::optional<CacheLevel> ssmLevel);
-    void _setupForReuse(BlockRadixTree::ReuseMatch const& match);
+    void _setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claimRetention);
     // Reconstruct the committed token sequence from a match's blocks (mirrors
     // Python's _get_matched_tokens); used when reuse-matching no longer has the
     // raw input tokens in scope.
@@ -735,6 +776,8 @@ private:
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
     PriorityCb mPriorityCb;
+    std::optional<executor::KvCacheRetentionConfig> mRetentionConfig;
+    std::vector<executor::RetentionPriorityAndDuration> mPromptRetentions;
     std::optional<CUstream> mCudaStream;
     Status mStatus;
     CommitState mCommitState;
@@ -759,6 +802,7 @@ private:
     std::optional<int> mPageStorageRow;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
+    std::vector<FuncGuard<std::function<void()>>> mPartialCopyRetentionHolds;
 
     std::vector<TokenIdExt> mCommittedTokens;
     // Initial current-residency provenance, observed before reused pages are held or promoted.
@@ -781,6 +825,14 @@ private:
     bool mHasResumed = false; // Successful admission, independent of completed deferred copies.
 
     PendingStats mPendingStats;
+
+    std::vector<ReuseGroupStatus> mReuseStatus;
+    TypedVec<LifeCycleId, std::vector<std::pair<BlockOrdinal, SharedPtr<PageHolder>>>> mOptionalCandidates;
+    std::vector<LifeCycleId> mSelectedOptionalGroups;
+    void _collectReuseCandidates();
+    void _selectOptionalGroups(std::vector<LifeCycleId> const& groups);
+    // PRIVATE and unselected OPTIONAL groups need fresh pages for the claimed prefix.
+    bool _needsFreshPrefixPages(LifeCycleId lc) const;
 
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;

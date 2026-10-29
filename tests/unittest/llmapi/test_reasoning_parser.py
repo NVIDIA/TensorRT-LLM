@@ -13,15 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import json
 import os
+import random
 from pathlib import Path
 
 import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import (
-    MODEL_TYPE_TO_REASONING_PARSER, NemotronV3ReasoningParser,
-    ReasoningParserFactory, resolve_auto_reasoning_parser)
+    MODEL_TYPE_TO_REASONING_PARSER, DeepSeekV41ReasoningParser,
+    NemotronV3ReasoningParser, ReasoningParserFactory,
+    resolve_auto_reasoning_parser)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -162,6 +165,18 @@ def test_deepseek_v4_reasoning_parser_streams_when_thinking():
     assert [result.content for result in results] == ["", "visible", " tail"]
     assert [result.reasoning_content
             for result in results] == ["hid", "den", ""]
+
+
+def test_deepseek_v41_reasoning_parser_adapter():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek_v41", {"thinking": True})
+
+    assert isinstance(reasoning_parser, DeepSeekV41ReasoningParser)
+
+    result = reasoning_parser.parse(f"hidden{R1_END}visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == "hidden"
 
 
 TOOL_START = "<|tool_calls_section_begin|>"
@@ -532,15 +547,13 @@ def test_resolved_mode_overrides_whatever_the_caller_sent(
 
 
 @pytest.mark.parametrize("parser", [
-    "deepseek-r1", "deepseek_v4", "qwen3", "qwen3_5", "minimax_m2",
-    "minimax_m3", "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
+    "deepseek-r1", "deepseek_v4", "deepseek_v41", "qwen3", "qwen3_5",
+    "minimax_m2", "gemma4", "kimi_k2", "kimi_k25"
 ])
 def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
     """Parsers that have not opted in must never be resolved from the prompt.
 
-    `deepseek_v4` shares the base class and `nemotron-v3` / `nano-v3` also read
-    `enable_thinking`, so without the flag they would silently pick up a mode
-    the server inferred.
+    Parsers that derive their mode from request kwargs retain that policy.
     """
     # Otherwise a typo or a dropped registration passes vacuously, since an
     # unknown name also resolves to None.
@@ -888,6 +901,24 @@ def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
     assert result == "qwen3"
 
 
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("glm_moe_dsa", "glm_moe_dsa"),  # GLM-5, GLM-5.2
+        # GLM-4.5/4.6 and GLM-4.7 share glm4_moe but differ on whether the
+        # template prefills <think>; GLM-5.3-Flash prefills it whatever
+        # enable_thinking says. Neither is resolved automatically.
+        ("glm4_moe", None),
+        ("glm5_next", None),
+    ])
+def test_auto_detect_glm(tmp_path, model_type, expected):
+    model_dir = str(tmp_path / "GLM")
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
 def test_auto_detect_deepseek_r1(tmp_path):
     """DeepSeek R1 model → 'deepseek-r1' parser."""
     model_dir = str(tmp_path / "DeepSeek-R1")
@@ -906,6 +937,18 @@ def test_auto_detect_deepseek_non_r1(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result is None
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v41", "deepseek_v41_text"])
+def test_auto_detect_deepseek_v41(tmp_path, model_type):
+    """DeepSeek V4.1 variants use the explicit V4.1 reasoning adapter."""
+    model_dir = str(tmp_path / model_type)
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+
+    assert result == "deepseek_v41"
 
 
 def test_auto_detect_unknown_model(tmp_path):
@@ -977,12 +1020,10 @@ def test_auto_detect_nemotron_h(tmp_path, model_type):
     assert result == "nemotron-v3"
 
 
-def test_nemotron_v3_alias_same_parser():
-    """'nemotron-v3' and the legacy 'nano-v3' resolve to the same parser."""
-    nemotron = ReasoningParserFactory.create_reasoning_parser("nemotron-v3")
-    nano = ReasoningParserFactory.create_reasoning_parser("nano-v3")
-    assert isinstance(nemotron, NemotronV3ReasoningParser)
-    assert isinstance(nano, NemotronV3ReasoningParser)
+@pytest.mark.parametrize("name", ["nemotron-v3", "nano-v3", "k-exaone"])
+def test_shared_reasoning_parser_registration(name):
+    parser = ReasoningParserFactory.create_reasoning_parser(name)
+    assert type(parser) is NemotronV3ReasoningParser
 
 
 # ---------------------------------------------------------------------------
@@ -1221,7 +1262,7 @@ def test_kimi_k3_reasoning_parser_stream_matches_parse(chunk_size: int,
     """Streaming in arbitrary chunkings must reproduce the one-shot parse.
 
     This sweeps every marker-split position, which is the riskiest logic in
-    the parser (`_partial_suffix_len` suffix holds).
+    the parser (`_trailing_partial_marker` suffix holds).
     """
     if thinking:
         text = _k3_completion("Let me think.", "Answer: 4.", K3_TOOLS_SECTION)
@@ -1269,3 +1310,316 @@ def test_auto_detect_kimi_k3(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "kimi_k3"
+
+
+_ARGS = "<arg_value>grep -c \"</think><tool_call>\" log</arg_value></tool_call>"
+_OFF = {"enable_thinking": False}
+
+# (key, chat_template_kwargs, text, content, reasoning). `glm`, `glm47` and
+# `glm_moe_dsa` start inside the prefilled block; `glm45` waits for `<think>`.
+_GLM_CASES = [
+    ("glm", None, "plan</think>The answer is 42.", "The answer is 42.", "plan"),
+    # A repeated close is dropped before any content or before the first call.
+    ("glm", None, "recovered.</think>Let me retry.</think><tool_call>f",
+     "Let me retry.<tool_call>f", "recovered."),
+    ("glm", None, "plan</think></think></think>done", "done", "plan"),
+    ("glm", None, "plan</think></think>", "", "plan"),
+    ("glm", None, "plan</think>It printed </think> here.",
+     "It printed </think> here.", "plan"),
+    ("glm", None, "r</think>text</think>", "text</think>", "r"),
+    # `<think>` never opens a second block.
+    ("glm", None, "r</think>a<think>b\n</", "a<think>b\n</", "r"),
+    ("glm", None, "a<think>", "", "a<think>"),
+    # A tool call ends the block; text that only resembles a marker is kept.
+    ("glm", None, "Plan.<tool_call>f<arg_key>m</arg_key></tool_call>",
+     "<tool_call>f<arg_key>m</arg_key></tool_call>", "Plan."),
+    ("glm", None, "plan</think>say<tool_call>f", "say<tool_call>f", "plan"),
+    ("glm", None, "x</t<tool_call>y", "<tool_call>y", "x</t"),
+    ("glm", None, "Planning <tools are useful", "",
+     "Planning <tools are useful"),
+    ("glm", None, "done<tool_c", "", "done<tool_c"),
+    # Tool-call arguments are passed through verbatim.
+    ("glm47", None, "Done.</think><tool_call>exec" + _ARGS,
+     "<tool_call>exec" + _ARGS, "Done."),
+    ("glm47", None, "Plan.<tool_call>exec" + _ARGS, "<tool_call>exec" + _ARGS,
+     "Plan."),
+    # With thinking off the template closed the block in the prompt.
+    ("glm47", _OFF, "Paris.", "Paris.", ""),
+    ("glm_moe_dsa", _OFF, "</think>Paris.</think><tool_call>f",
+     "Paris.<tool_call>f", ""),
+    # The block opens only at the start of the output.
+    ("glm45", None, "\n<think>let me think</think>Answer.", "Answer.",
+     "let me think"),
+    ("glm45", None, " <think>plan<tool_call>f", "<tool_call>f", "plan"),
+    ("glm45", None, "\nAnswer.", "\nAnswer.", ""),
+    ("glm45", None, "Answer.<think>x</think>y", "Answer.<think>x</think>y", ""),
+    ("glm45", None, "</think>a", "a", ""),
+    ("glm45", None, "hello<tool_call>f", "hello<tool_call>f", ""),
+]
+
+
+def _glm_stream(key: str, kwargs: dict | None,
+                deltas: list[str]) -> tuple[str, str]:
+    parser = ReasoningParserFactory.create_reasoning_parser(key, kwargs)
+    results = [parser.parse_delta(delta) for delta in deltas]
+    results.append(parser.finish())
+    content = "".join(r.content for r in results)
+    return content, "".join(r.reasoning_content for r in results)
+
+
+@pytest.mark.parametrize(("key", "kwargs", "text", "content", "reasoning"),
+                         _GLM_CASES)
+def test_glm_reasoning_parser(key: str, kwargs: dict | None, text: str,
+                              content: str, reasoning: str) -> None:
+    expected = (content, reasoning)
+    result = ReasoningParserFactory.create_reasoning_parser(key,
+                                                            kwargs).parse(text)
+    assert (result.content, result.reasoning_content) == expected
+    # Small chunks spread a marker over many deltas; the three-way splits put
+    # two delta boundaries at every pair of offsets.
+    for size in (1, 2, 4):
+        chunks = [text[i:i + size] for i in range(0, len(text), size)]
+        assert _glm_stream(key, kwargs, chunks) == expected, chunks
+    for i, j in itertools.combinations_with_replacement(range(len(text) + 1),
+                                                        2):
+        chunks = [text[:i], text[i:j], text[j:]]
+        assert _glm_stream(key, kwargs, chunks) == expected, chunks
+
+
+@pytest.mark.parametrize("key", ["glm", "glm45"])
+def test_glm_streaming_matches_parse_on_random_text(key: str) -> None:
+    pieces = [
+        "<think>", "</think>", "<tool_call>", "</tool_call>", "<", "</", "<t",
+        "</th", "<tool_", "think>", "call>", "a", " ", "\n"
+    ]
+    rng = random.Random(0)
+    for _ in range(3000):
+        text = "".join(rng.choices(pieces, k=rng.randint(0, 10)))
+        whole = ReasoningParserFactory.create_reasoning_parser(key).parse(text)
+        assert "<tool_call>" not in whole.reasoning_content
+        cuts = [i for i in range(1, len(text)) if rng.random() < 0.3]
+        chunks = [text[i:j] for i, j in zip([0] + cuts, cuts + [len(text)])]
+        expected = (whole.content, whole.reasoning_content)
+        assert _glm_stream(key, None, chunks) == expected, chunks
+
+
+def test_deepseek_r1_keeps_a_second_close_as_content() -> None:
+    result = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek-r1").parse("a</think>b</think><tool_call>f")
+    assert result.content == "b</think><tool_call>f"
+
+
+@pytest.mark.parametrize(
+    "parser_name",
+    ["nemotron-v3", "nano-v3", "NEMOTRON-V3", "k-exaone", "K-EXAONE"])
+@pytest.mark.parametrize("tail,thinking", [
+    ("<think>\n", True),
+    ("<think></think>", False),
+    ("<think>\n\n</think>\n\n", False),
+])
+def test_shared_reasoning_parser_resolves_prefilled_mode(
+        parser_name, tail, thinking):
+    resolved = ReasoningParserFactory.resolve_prefilled_thinking(
+        parser_name, "<assistant>" + tail)
+    assert resolved is thinking
+    parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_name, {"enable_thinking": resolved})
+    output = "hidden</think>visible" if thinking else "visible"
+    result = parser.parse(output)
+    assert result.content == "visible"
+    assert result.reasoning_content == ("hidden" if thinking else "")
+
+
+@pytest.mark.parametrize("chunks,expected_reasoning,expected_content", [
+    (["plan</think><tool_call>f</tool_call>"
+      ], "plan", "<tool_call>f</tool_call>"),
+    (["plan<tool_call>f</tool_call></think>"
+      ], "plan", "<tool_call>f</tool_call></think>"),
+    (["plan<tool_call><parameter=x>a</think>b</parameter></tool_call>"
+      ], "plan", "<tool_call><parameter=x>a</think>b</parameter></tool_call>"),
+    (["plan</th", "ink><tool_call>f</tool_call>"
+      ], "plan", "<tool_call>f</tool_call>"),
+    (["plan<tool", "_call>f</tool_call>"], "plan", "<tool_call>f</tool_call>"),
+])
+def test_nemotron_first_boundary_ends_reasoning(chunks, expected_reasoning,
+                                                expected_content):
+    parser = NemotronV3ReasoningParser()
+    whole = parser.parse("".join(chunks))
+    assert whole.reasoning_content == expected_reasoning
+    assert whole.content == expected_content
+    results = [parser.parse_delta(chunk)
+               for chunk in chunks] + [parser.finish()]
+    assert "".join(result.reasoning_content or ""
+                   for result in results) == expected_reasoning
+    assert "".join(result.content or ""
+                   for result in results) == expected_content
+
+
+M3_START, M3_END = "<mm:think>", "</mm:think>"
+# How the server relays the mode it resolved from the rendered prompt:
+# thinking enabled (`<mm:think>` prefilled), disabled (`</mm:think>`
+# prefilled) and adaptive / unresolved (nothing prefilled).
+M3_ENABLED = {"enable_thinking": True}
+M3_DISABLED = {"enable_thinking": False}
+M3_ADAPTIVE = None
+# The template's own knob, when the caller passes it.
+M3_MODE_ENABLED = {"thinking_mode": "enabled"}
+M3_MODE_ADAPTIVE = {"thinking_mode": "adaptive"}
+# What the Responses path hands the parser for `reasoning.effort`: an injected
+# `thinking` the M3 template never reads, here next to a resolved mode of off.
+M3_EFFORT_INJECTED = {"enable_thinking": False, "thinking": True}
+
+
+def _m3_parser(kwargs: dict | None):
+    return ReasoningParserFactory.create_reasoning_parser("minimax_m3", kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "text", "content", "reasoning_content"),
+    [
+        # Adaptive: the model opens with a tag or with the bare sentinel.
+        (M3_ADAPTIVE, f"{M3_START}a{M3_END}b", "b", "a"),
+        (M3_ADAPTIVE, f"{M3_END}b", "b", ""),
+        (M3_ADAPTIVE, "b", "b", ""),
+        # Reasoning truncated before the closing tag (e.g. by max_tokens).
+        (M3_ADAPTIVE, f"{M3_START}a", "", "a"),
+        (M3_ADAPTIVE, M3_START, "", ""),
+        # Text before an opening tag is content, as in streaming.
+        (M3_ADAPTIVE, f"x{M3_START}a{M3_END}b", "xb", "a"),
+        (M3_ADAPTIVE, f"x{M3_START}a", "x", "a"),
+        (M3_ADAPTIVE, f"x{M3_END}b", "xb", ""),
+        # Enabled: the prompt ends with `<mm:think>`, so the output starts
+        # inside the reasoning block and carries no opening tag.
+        (M3_ENABLED, f"a{M3_END}b", "b", "a"),
+        (M3_ENABLED, "a", "", "a"),
+        (M3_ENABLED, f"{M3_END}b", "b", ""),
+        # Disabled: the prompt ends with `</mm:think>`; the output is content.
+        (M3_DISABLED, "b", "b", ""),
+        (M3_DISABLED, f"{M3_START}a{M3_END}b", "b", "a"),
+        # The template's knob decides when present; an injected `thinking`
+        # (Responses path, `reasoning.effort`) does not open the block.
+        (M3_MODE_ENABLED, f"a{M3_END}b", "b", "a"),
+        (M3_MODE_ADAPTIVE, f"{M3_START}a{M3_END}b", "b", "a"),
+        (M3_EFFORT_INJECTED, "b", "b", ""),
+        (M3_EFFORT_INJECTED, f"{M3_START}a{M3_END}b", "b", "a"),
+        ({
+            "thinking": True
+        }, f"{M3_START}a{M3_END}b", "b", "a"),
+        # The mode resolved from the rendered prompt wins over `thinking_mode`.
+        ({
+            "thinking_mode": "enabled",
+            "enable_thinking": False
+        }, f"{M3_START}a{M3_END}b", "b", "a"),
+        ({
+            "thinking_mode": "disabled",
+            "enable_thinking": True
+        }, f"a{M3_END}b", "b", "a"),
+    ])
+def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
+                                     content: str,
+                                     reasoning_content: str) -> None:
+    result = _m3_parser(kwargs).parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_content
+
+
+# The official template: ``bos_token ~ role``, ``eos_token`` after each
+# message, and ``]~b]ai`` as the generation prompt.
+M3_HEADER = "]~b]ai\n"
+M3_PROMPT = f"]~b]user\nhi[e~[\n{M3_HEADER}"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        (f"{M3_PROMPT}{M3_START}", True),
+        (f"{M3_PROMPT}{M3_END}", False),
+        # Adaptive: nothing after the header, so the output starts outside
+        # reasoning even though a prior turn rendered its own tags.
+        (M3_PROMPT, False),
+        (f"]~b]ai\n{M3_START}a{M3_END}b[e~[\n]~b]user\nmore[e~[\n{M3_HEADER}",
+         False),
+        # Prefilled text after the opening tag is not adaptive; the tail carries
+        # no mode it can read, so `thinking_mode` decides.
+        (f"{M3_PROMPT}{M3_START}Let me think.", None),
+        # A custom template that ends elsewhere is left unresolved as before.
+        ("<user>hi</user>\n<assistant>", None),
+    ])
+def test_minimax_m3_resolves_the_prompt_tail(prompt: str,
+                                             expected: bool | None) -> None:
+    assert ReasoningParserFactory.resolve_prefilled_thinking(
+        "minimax_m3", prompt) is expected
+
+
+def _m3_stream(kwargs: dict | None, chunks: list[str]) -> tuple[str, str]:
+    reasoning_parser = _m3_parser(kwargs)
+    content, reasoning_content = "", ""
+    for chunk in chunks:
+        result = reasoning_parser.parse_delta(chunk)
+        content += result.content
+        reasoning_content += result.reasoning_content
+    result = reasoning_parser.finish()
+    content += result.content
+    reasoning_content += result.reasoning_content
+    return content, reasoning_content
+
+
+@pytest.mark.parametrize(
+    "kwargs", [M3_ADAPTIVE, M3_ENABLED, M3_DISABLED, M3_EFFORT_INJECTED],
+    ids=["adaptive", "enabled", "disabled", "effort-injected"])
+@pytest.mark.parametrize("text", [
+    f"{M3_START}a{M3_END}b",
+    f"{M3_END}b",
+    f"{M3_END}",
+    f"{M3_START}a",
+    M3_START,
+    f"a{M3_END}b",
+    "a",
+    f"x{M3_START}a{M3_END}b",
+    f"x{M3_END}b",
+])
+def test_minimax_m3_reasoning_parser_stream_matches_non_stream(
+        kwargs: dict | None, text: str) -> None:
+    """Streaming in any chunking then finishing must match a non-streaming parse."""
+    if kwargs == M3_ENABLED and text.endswith(M3_START):
+        # Inside a prefilled block a trailing second opening tag is withheld
+        # by streaming as a possible delimiter and dropped at the end; the
+        # shape is outside the contract.
+        pytest.skip("second opening tag inside a prefilled block")
+    whole = _m3_parser(kwargs).parse(text)
+    expected = (whole.content, whole.reasoning_content)
+    assert _m3_stream(kwargs, [text]) == expected
+    assert _m3_stream(kwargs, list(text)) == expected
+    for i, j in itertools.combinations_with_replacement(range(len(text) + 1),
+                                                        2):
+        chunks = [text[:i], text[i:j], text[j:]]
+        assert _m3_stream(kwargs, chunks) == expected, chunks
+
+
+@pytest.mark.parametrize("kwargs", [M3_ADAPTIVE, M3_ENABLED, M3_DISABLED],
+                         ids=["adaptive", "enabled", "disabled"])
+def test_minimax_m3_streaming_matches_parse_on_random_text(
+        kwargs: dict | None) -> None:
+    """Parity on random tag soup with at most one reasoning block.
+
+    A second ``<mm:think>`` after the close is outside the parsers' contract.
+    """
+    pieces = [
+        M3_START, M3_END, "<", "</", "<mm", "</mm:th", "think>", "a", " ", "\n"
+    ]
+    rng = random.Random(0)
+    for _ in range(3000):
+        text = "".join(rng.choices(pieces, k=rng.randint(0, 8)))
+        if text.count(M3_START) > 1 or text.count(M3_END) > 1:
+            continue
+        if kwargs == M3_ENABLED and (
+                text.endswith(M3_START) or
+            (M3_END in text and M3_START in text[text.index(M3_END):])):
+            # The prefilled block is the one block; an opening tag after its
+            # close (or trailing, see above) would start a second one.
+            continue
+        whole = _m3_parser(kwargs).parse(text)
+        cuts = [i for i in range(1, len(text)) if rng.random() < 0.3]
+        chunks = [text[i:j] for i, j in zip([0] + cuts, cuts + [len(text)])]
+        expected = (whole.content, whole.reasoning_content)
+        assert _m3_stream(kwargs, chunks) == expected, chunks

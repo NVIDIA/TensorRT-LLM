@@ -32,6 +32,7 @@ Dynamic Quantization:
 
 import os
 import time
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -52,6 +53,7 @@ from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
     from .models import BasePipeline
+    from .sleep import SleepRestoreMode
 
 
 class PipelineLoader:
@@ -200,6 +202,41 @@ class PipelineLoader:
         checkpoint_dir: Optional[str] = None,
         skip_warmup: bool = False,
         skip_components: Optional[List[Union[str, PipelineComponent]]] = None,
+        *,
+        sleep_restore_mode: "SleepRestoreMode | None" = None,
+    ) -> "BasePipeline":
+        """Load a pipeline, optionally backing its persistent GPU state in host RAM.
+
+        Sleep support and configuration checks belong to the resolved pipeline.
+        Its loading context captures persistent allocations before weights are
+        materialized; warmup runs after that context exits. Ordinary loading
+        does not enter the sleep loading context.
+        """
+        if sleep_restore_mode is None:
+            return self._load(checkpoint_dir, skip_warmup, skip_components)
+
+        with ExitStack() as loading_stack:
+            # Constructor capability checks must use the loader's target GPU.
+            loading_stack.enter_context(torch.cuda.device(self.device))
+            pipeline = self._load(
+                checkpoint_dir,
+                True,
+                skip_components,
+                sleep_restore_mode=sleep_restore_mode,
+                loading_stack=loading_stack,
+            )
+        if not skip_warmup:
+            pipeline.warmup()
+        return pipeline
+
+    def _load(
+        self,
+        checkpoint_dir: Optional[str],
+        skip_warmup: bool,
+        skip_components: Optional[List[Union[str, PipelineComponent]]],
+        *,
+        sleep_restore_mode: "SleepRestoreMode | None" = None,
+        loading_stack: ExitStack | None = None,
     ) -> "BasePipeline":
         """
         Load a diffusion pipeline with optional dynamic quantization.
@@ -294,6 +331,13 @@ class PipelineLoader:
         logger.info("Creating pipeline with MetaInitMode")
         with MetaInitMode():
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
+
+        if sleep_restore_mode is not None:
+            if loading_stack is None:
+                raise RuntimeError("Sleep loading requires a loading context stack")
+            loading_stack.enter_context(
+                pipeline._sleep_loading_context(sleep_restore_mode, device=self.device)
+            )
 
         # Convert meta tensors to their runtime devices. Offloaded submodules
         # stay on CPU until they are explicitly staged.

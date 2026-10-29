@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.autograd import DeviceType
 
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+
 from ..utils import _maybe_print_rank0, _sync
 from .nsys import _NsysProfiler, measured_range
 
@@ -83,7 +85,9 @@ def _time_moe_forward_eager(
     l2_buffer = _l2_flush_buffer(device) if flush_l2 else None
 
     def _do_forward():
-        with torch.inference_mode():
+        # ``forward`` runs outside ``ModelCaller``, so this harness owns the
+        # NCCL-window lease scope for the discarded TP all-reduce output.
+        with torch.inference_mode(), discard_nccl_window_tensor_outputs((x, router_logits)):
             _ = moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]

@@ -27,22 +27,14 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.distributed import all_to_all_4d
+
+from ._worker_pool import run_distributed
 
 # Loop count must comfortably exceed kNumSlots so the ring wraps at least
 # twice. kNumSlots is 3 today; 8 iterations = ~2.67 full rotations.
 NUM_ITERS = 8
-
-
-def _init_dist(rank: int, world_size: int, port: int):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 
 def _slot_ring_logic(rank: int, world_size: int):
@@ -223,55 +215,17 @@ def _multi_pg_logic(rank: int, world_size: int):
         )
 
 
-def _worker(rank, world_size, port):
-    try:
-        _init_dist(rank, world_size, port)
-        _slot_ring_logic(rank, world_size)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-def _worker_capture(rank, world_size, port):
-    try:
-        _init_dist(rank, world_size, port)
-        _capture_smoke_logic(rank, world_size)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-def _worker_multi_pg(rank, world_size, port):
-    try:
-        _init_dist(rank, world_size, port)
-        _multi_pg_logic(rank, world_size)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
 def _run(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            test_fn,
-            args=(world_size, port),
-            nprocs=world_size,
-            join=True,
-        )
-    )
+    run_distributed(world_size, test_fn, preload=("tensorrt_llm",))
 
 
 def test_slot_ring_wraparound():
     """Loop _prepare/_async ≥ 2*kNumSlots iterations on ws=2; assert byte-exact
     match against all_to_all_4d on each iteration (eager mode).
     """
-    _run(2, _worker)
+    _run(2, _slot_ring_logic)
 
 
 def test_capture_smoke():
@@ -279,7 +233,7 @@ def test_capture_smoke():
     K iterations with fresh inputs; assert byte-exact match against
     all_to_all_4d (per-peer cudaMemcpyAsync path under capture).
     """
-    _run(2, _worker_capture)
+    _run(2, _capture_smoke_logic)
 
 
 def test_multi_pg():
@@ -290,4 +244,4 @@ def test_multi_pg():
     re-registration across multiple groups — each PG has its own group_name,
     so each must yield its own cached ``AsyncUlyssesOp`` instance + slot ring.
     """
-    _run(2, _worker_multi_pg)
+    _run(2, _multi_pg_logic)

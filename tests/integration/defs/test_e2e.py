@@ -23,10 +23,8 @@ from typing import Any, Optional, Tuple
 
 import pytest
 import yaml
-from defs.trt_test_alternative import (check_call, check_output, print_info,
-                                       print_warning)
+from defs.trt_test_alternative import check_call, check_output
 
-from .common import get_mmlu_accuracy
 from .conftest import (get_sm_version, llm_models_root, skip_post_blackwell,
                        skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
                        unittest_path)
@@ -39,6 +37,7 @@ _MINIMAX_M3_EVAL_CONFIG = {
     # This is required for minimax M3.
     "sparse_attention_config": {
         "algorithm": "minimax_m3",
+        "implementation": "msa",
     },
     # The below are to prevent OOMs in CI - the model's 1M context length is too large.
     "kv_cache_config": {
@@ -1337,10 +1336,6 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
                  None,
                  marks=skip_pre_blackwell,
                  id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
-    pytest.param('Kimi-K2-Thinking-NVFP4',
-                 None,
-                 marks=skip_pre_blackwell,
-                 id='Kimi-K2-Thinking-NVFP4'),
     pytest.param('MiniMax-M3',
                  _MINIMAX_M3_EVAL_CONFIG,
                  marks=skip_pre_blackwell,
@@ -1349,48 +1344,31 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
                                                                          Any]],
                           tp_size: int, pp_size: int, ep_size: int,
-                          eval_task: str, tmp_path: Path,
-                          mmlu_dataset_root: str) -> None:
+                          eval_task: str, mmlu_dataset_root: str) -> None:
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.evaluate import MMLU
+
     mmlu_threshold = 81.5
-    model_dir = f"{llm_models_root()}/{model_path}"
-    run_cmd = [
-        "trtllm-eval",
-        f"--model={model_dir}",
-        f"--ep_size={ep_size}",
-        f"--tp_size={tp_size}",
-        f"--pp_size={pp_size}",
-        f"--kv_cache_free_gpu_memory_fraction={_MEM_FRACTION_80}",
-        "--max_batch_size=32",
-        "--backend=pytorch",
-    ]
-
-    if "Kimi" in model_path or "MiniMax-M3" in model_path:
-        run_cmd.append("--trust_remote_code")
-    else:
-        run_cmd.append(f"--tokenizer={model_dir}")
-
-    if llm_api_config is not None:
-        config_path = tmp_path / "llm_api_config.yaml"
-        config_path.write_text(yaml.safe_dump(llm_api_config))
-        run_cmd.append(f"--config={config_path}")
-
-    run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
-
-    try:
-        # run the command with trtllm-llmapi-launch pytest wrapper
-        output = subprocess.check_output(run_cmd,
-                                         text=True,
-                                         stderr=subprocess.STDOUT,
-                                         timeout=5400)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        print_warning(f"eval failed: {e.returncode}")
-        print_warning(f"eval output:\n{e.output}")
-        raise
-    else:
-        if os.environ.get("SLURM_PROCID", '0') == '0':
-            print_info(f"eval output:\n{output}")
-            mmlu_accuracy = get_mmlu_accuracy(output)
-            assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+    llm_kwargs = dict(llm_api_config or {})
+    # The LLM is built in the pytest process so it binds to the MPI workers
+    # pre-spawned by trtllm-llmapi-launch; a trtllm-eval subprocess cannot,
+    # because the launcher's IPC HMAC key is consumed by the first in-process
+    # LLM of the session.
+    llm_kwargs["kv_cache_config"] = {
+        "free_gpu_memory_fraction": _MEM_FRACTION_80,
+        **llm_kwargs.get("kv_cache_config", {}),
+    }
+    with LLM(f"{llm_models_root()}/{model_path}",
+             tensor_parallel_size=tp_size,
+             pipeline_parallel_size=pp_size,
+             moe_expert_parallel_size=ep_size,
+             max_batch_size=32,
+             trust_remote_code="MiniMax-M3" in model_path,
+             **llm_kwargs) as llm:
+        sampling_params = SamplingParams(max_tokens=2,
+                                         truncate_prompt_tokens=4094)
+        mmlu_accuracy = MMLU(mmlu_dataset_root).evaluate(llm, sampling_params)
+    assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
 
 
 @pytest.mark.skip_less_device_memory(80000)

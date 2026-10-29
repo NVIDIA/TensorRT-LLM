@@ -299,6 +299,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.spec_decoding_max_generation_length = generationsParams.spec_decoding_max_generation_length;
     xqaParams.spec_decoding_bl_tree_mask_offset = generationsParams.spec_decoding_bl_tree_mask_offset;
     xqaParams.spec_decoding_bl_tree_mask = generationsParams.spec_decoding_bl_tree_mask;
+    xqaParams.spec_decoding_bl_tree_mask_capacity = generationsParams.spec_decoding_bl_tree_mask_capacity;
     xqaParams.spec_bl_tree_first_sparse_mask_offset_kv = generationsParams.spec_bl_tree_first_sparse_mask_offset_kv;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
     xqaParams.helix_position_offsets = generationsParams.helix_position_offsets;
@@ -902,6 +903,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
     size_t const sage_k_sfs_buffer_size = sizeof(float) * mNumAttnKVHeads * static_cast<size_t>(k_max_n_blk);
     size_t const sage_v_sfs_buffer_size = sizeof(float) * static_cast<size_t>(v_max_n_blk);
     size_t const sage_k_mean_buffer_size = mSageAttnSmoothK ? sizeof(float) * local_hidden_units_kv : 0;
+    size_t const sage_k_mean_sum_buffer_size = mSageAttnSmoothK ? sizeof(int64_t) * local_hidden_units_kv : 0;
 
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * padded_num_tokens;
     size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * padded_kv_tokens;
@@ -945,6 +947,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
     workspaceSizes.sageKScale = sage_k_sfs_buffer_size;
     workspaceSizes.sageVScale = sage_v_sfs_buffer_size;
     workspaceSizes.sageKMean = sage_k_mean_buffer_size;
+    workspaceSizes.sageKMeanSum = sage_k_mean_sum_buffer_size;
     workspaceSizes.cpWorkspace = cpWorkspaceSize;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
     context_workspace_size = AttentionWorkspaceManager::buildContextLayout(workspaceSizes).totalSize;
@@ -1208,10 +1211,9 @@ int AttentionOp::mlaGeneration(
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
-        // The attention window size.
-        tllmRunnerParams.mAttentionWindowSize = generation_params.cyclic_attention_window_size;
-        // The chunked attention size.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
+        tllmRunnerParams.mChunkedAttentionSize = 0;
 
         // The scaleQ that will be applied to the BMM1 output.
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
@@ -1629,6 +1631,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const sage_k_sfs_buffer_size = sizeof(float) * mNumAttnKVHeads * static_cast<size_t>(k_max_n_blk);
     size_t const sage_v_sfs_buffer_size = sizeof(float) * static_cast<size_t>(v_max_n_blk);
     size_t const sage_k_mean_buffer_size = mSageAttnSmoothK ? sizeof(float) * local_hidden_units_kv : 0;
+    size_t const sage_k_mean_sum_buffer_size = mSageAttnSmoothK ? sizeof(int64_t) * local_hidden_units_kv : 0;
 
     size_t const padding_offset_size
         = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.input_seq_length;
@@ -1675,6 +1678,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     workspaceSizes.sageKScale = sage_k_sfs_buffer_size;
     workspaceSizes.sageVScale = sage_v_sfs_buffer_size;
     workspaceSizes.sageKMean = sage_k_mean_buffer_size;
+    workspaceSizes.sageKMeanSum = sage_k_mean_sum_buffer_size;
     workspaceSizes.cpWorkspace = cpWorkspaceSize;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
     auto const workspaceLayout = AttentionWorkspaceManager::buildContextLayout(workspaceSizes);
@@ -1921,6 +1925,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             params.mla_param->quant_q_buf = mFP8ContextMLA ? fp8QBuf : nullptr;
             params.mla_param->quant_k_buf = mFP8ContextMLA ? workspaceViews.fp8KBuf : nullptr;
             params.mla_param->quant_v_buf = mFP8ContextMLA ? workspaceViews.fp8VBuf : nullptr;
+            params.mla_param->v_token_stride_elements = 0;
+            if (params.v_stride_in_bytes != 0)
+            {
+                TLLM_CHECK_WITH_INFO(
+                    params.v_stride_in_bytes > 0 && params.v_stride_in_bytes % static_cast<int64_t>(sizeof(T)) == 0,
+                    "MLA Context: V token stride must be a positive multiple of the element size");
+                params.mla_param->v_token_stride_elements = params.v_stride_in_bytes / static_cast<int64_t>(sizeof(T));
+            }
             // Set additional scales for context phase
             params.mla_param->quant_scale_o = params.attention_output_orig_quant;
             params.mla_param->quant_scale_q = params.kv_scale_orig_quant;
@@ -1959,17 +1971,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             // otherwise surface as an empty scale buffer deep inside invokeSageQuant().
             TLLM_CHECK_WITH_INFO(q_max_n_blk > 0 && k_max_n_blk > 0,
                 "No SageQuant kernel on sm_%d for block sizes (q, k, v) = (%d, %d, %d) with qk_int8=%s. SM90 "
-                "requires (2, 16, 1) together with INT8 Q/K; SM100 requires q/k block sizes of 1, 4 or 16.",
+                "requires (2, 16, 1) together with INT8 Q/K; other architectures require q/k block sizes of 1, 4, 16, "
+                "or 32.",
                 mSM, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV,
                 mSageAttnQkInt8 ? "true" : "false");
             TLLM_CHECK_WITH_INFO(!params.kv_scale_quant_orig,
                 "SageAttention disregards the configured params.kv_scale_quant_orig, invalidating the result.");
-            // Reduction buffers must be initialized prior to invokeSageQuant().
-            check_cuda_error(cudaMemsetAsync(workspaceViews.sageVScale, 0, sage_v_sfs_buffer_size, stream));
-            if (mSageAttnSmoothK)
-            {
-                check_cuda_error(cudaMemsetAsync(workspaceViews.sageKMean, 0, sage_k_mean_buffer_size, stream));
-            }
 
             // Common params for sageQuant
             tc::SageQuantParams sageQuantParams{};
@@ -1984,6 +1991,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             sageQuantParams.ptrVQuant = workspaceViews.fp8VBuf;
             sageQuantParams.ptrVScale = workspaceViews.sageVScale;
             sageQuantParams.ptrKForMean = params.k_ptr;
+            sageQuantParams.ptrKMeanSum = workspaceViews.sageKMeanSum;
             sageQuantParams.ptrKMean = workspaceViews.sageKMean;
             sageQuantParams.smCount = mMultiProcessorCount;
             sageQuantParams.stream = stream;
@@ -2093,6 +2101,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 fmhaParams.qPtr = attention_input;
                 fmhaParams.kPtr = params.k_ptr;
                 fmhaParams.vPtr = params.v_ptr;
+                fmhaParams.vStrideInBytes = params.v_stride_in_bytes;
             }
         }
         else if (useSageAttnSeparateQkv)

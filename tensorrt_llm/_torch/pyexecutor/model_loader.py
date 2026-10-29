@@ -20,6 +20,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
@@ -42,6 +43,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
+from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
+from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -49,12 +52,13 @@ from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
+from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, is_mla,
+from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
                            resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
@@ -63,9 +67,17 @@ _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
-    "auto": "auto"
+    "auto": "auto",
+    # Mixed-precision KV: the retained tokens and attention use the second
+    # dtype. float16/bfloat16 leave the KV cache unquantized and must equal
+    # the model dtype (checked in validate_and_set_kv_cache_quant).
+    "mixed_nvfp4_fp8": QuantAlgo.FP8.value,
+    "mixed_nvfp4_float16": None,
+    "mixed_nvfp4_bfloat16": None,
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
+                          "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
+                          "mixed_nvfp4_bfloat16")
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -131,16 +143,22 @@ def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
         kv_cache_config.enable_block_reuse = False
 
 
+def effective_mamba_ssm_cache_dtype(config: ModelConfig,
+                                    mamba_ssm_cache_dtype: str) -> torch.dtype:
+    """The recurrent-state cache dtype the engine runs with."""
+    if mamba_ssm_cache_dtype == "auto":
+        return resolve_auto_ssm_cache_dtype(config.pretrained_config,
+                                            config.torch_dtype)
+    return str_dtype_to_torch(mamba_ssm_cache_dtype)
+
+
 def validate_and_set_mamba_ssm_cache_dtype(
         config: ModelConfig,
         mamba_ssm_cache_dtype: str,
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
-    if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
-            config.pretrained_config, config.torch_dtype)
-    else:
-        mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+    mamba_ssm_cache_dtype = effective_mamba_ssm_cache_dtype(
+        config, mamba_ssm_cache_dtype)
     validate_kimi_kda_state_dtype(config.pretrained_config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding)
@@ -163,9 +181,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
+    # MiniMax-M3 MSA keeps NVFP4 only on its sparse layers, which MSA and
+    # Triton serve; its dense and draft layers stay FP8 for trtllm-gen.
+    sparse_config = model_config.sparse_attention_config
+    uses_minimax_m3_msa = (is_minimax_m3(sparse_config)
+                           and sparse_config.implementation == "msa")
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
-            and torch.cuda.is_available() and get_sm_version() == 107):
+            and not uses_minimax_m3_msa and torch.cuda.is_available()
+            and get_sm_version() == 107):
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")
@@ -189,6 +213,17 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             "Overriding KV cache quantization with an invalid type "
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
+
+    # An unquantized retained dtype has to be the model dtype; KVCacheManagerV2
+    # would otherwise reject it after the weights are loaded.
+    if mapped_pyt_quant is None:
+        retained_dtype = str_dtype_to_torch(
+            pyt_kv_cache_dtype.rsplit("_", 1)[1])
+        if model_config.torch_dtype != retained_dtype:
+            raise ValueError(
+                f'llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" keeps '
+                f"the retained tokens in {retained_dtype}, but the model dtype "
+                f"is {model_config.torch_dtype}.")
 
     # If we get to this point we have a valid explicit quantization setting.
     # Explicit kv_cache_dtype requests force override the checkpoint setting.
@@ -249,6 +284,15 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
             raise ValueError(
                 "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
             )
+        if (kv_cache_config.use_kv_cache_manager_v2 is True
+                and kv_cache_config.enable_block_reuse):
+            # Both self- and cross-attention K/V depend on the full encoder
+            # input, which is not part of V2's prefix reuse identity.
+            logger.warning(
+                "Disabling KV cache block reuse for encoder-decoder models "
+                "with KV cache manager V2: reuse requires the full encoder "
+                "input identity.")
+            kv_cache_config.enable_block_reuse = False
         return
 
     if kv_cache_config.cross_kv_cache_fraction is not None:
@@ -283,6 +327,31 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
             "Encoder-decoder tensor parallelism currently supports "
             f"attn_backend='TRTLLM' only, but got "
             f"attn_backend='{model_config.attn_backend}'.")
+
+
+def validate_lm_head_output_dtype(model: torch.nn.Module,
+                                  requested_dtype: str) -> None:
+    """Reject an explicit output dtype that the constructed LM heads ignore."""
+    if requested_dtype == "auto":
+        return
+
+    expected_dtype = str_dtype_to_torch(requested_dtype)
+    found_lm_head = False
+    for name, module in model.named_modules():
+        # Embedding inherits LMHead but does not project hidden states to logits.
+        if not isinstance(module, LMHead) or isinstance(module, Embedding):
+            continue
+        found_lm_head = True
+        if module.output_dtype != expected_dtype:
+            raise ValueError(
+                f"lm_head_output_dtype={requested_dtype!r} is not supported "
+                f"by {type(model).__name__}: {name or '<root>'}.output_dtype "
+                f"is {module.output_dtype}, expected {expected_dtype}.")
+
+    if not found_lm_head:
+        raise ValueError(
+            f"lm_head_output_dtype={requested_dtype!r} is not supported by "
+            f"{type(model).__name__}: no LMHead was constructed.")
 
 
 def initialize_dummy_weights(
@@ -603,6 +672,58 @@ def _apply_to_buffers_only(model: torch.nn.Module, fn):
                 module._buffers[key] = fn(buf)
 
 
+def _load_weights_strips_compile_wrapper(model: torch.nn.Module) -> bool:
+    """Whether ``model.load_weights`` tolerates a torch.compile wrapper in the tree.
+
+    The generic loaders (``modeling_utils._load_weights_impl`` / ``_v2``) strip
+    the wrapper's ``_orig_mod`` path component before matching checkpoint
+    keys, so a model that inherits ``DecoderModelForCausalLM.load_weights``
+    is safe. A model with its own ``load_weights`` walk is not known to be,
+    unless its class sets ``load_weights_strips_compile_wrapper = True``
+    (for overrides that only pre-process and delegate to the generic path).
+    """
+    cls = type(model)
+    if getattr(cls, "load_weights_strips_compile_wrapper", False):
+        return True
+    from tensorrt_llm._torch.models.modeling_utils import \
+        DecoderModelForCausalLM
+    return getattr(cls, "load_weights",
+                   None) is DecoderModelForCausalLM.load_weights
+
+
+def _assert_no_compile_wrapper_in_paths(model: torch.nn.Module) -> None:
+    """Fail loudly if a torch.compile wrapper would make this reload a no-op.
+
+    Loaders that match checkpoint tensors to modules by dotted path over
+    ``named_modules()`` see ``._orig_mod.`` in every path under a compiled
+    scope and match nothing; because RL refit passes
+    ``allow_partial_loading=True`` the compiled subtree is then skipped in
+    silence and keeps its pre-refit weights. The generic loaders strip the
+    component themselves (``strip_torch_compile_wrapper``); this guard covers
+    models with their own ``load_weights`` walk (see
+    ``_load_weights_strips_compile_wrapper``). Callers unwrap first via
+    ``model_engine.unwrap_compiled_model_for_refit()``.
+    """
+    # Escape hatch, for reproducing the pre-guard behaviour on purpose.
+    if os.environ.get("TLLM_REFIT_SKIP_WRAPPER_CHECK") == "1":
+        return
+    for name, _ in model.named_parameters():
+        if "._orig_mod." in name or name.startswith("_orig_mod."):
+            raise RuntimeError(
+                "Refit would silently load nothing: a torch.compile wrapper is still "
+                f"installed, so parameter paths carry '_orig_mod' (e.g. {name!r}) while "
+                "checkpoint keys do not, and this model's load_weights does not strip "
+                "it. Unwrap before loading weights (e.g. "
+                "model_engine.unwrap_compiled_model_for_refit()), or set "
+                "load_weights_strips_compile_wrapper = True on a model class whose "
+                "load_weights delegates to the generic loaders.")
+
+
+def _check_compile_wrapper_before_reload(model: torch.nn.Module) -> None:
+    if not _load_weights_strips_compile_wrapper(model):
+        _assert_no_compile_wrapper_in_paths(model)
+
+
 class ModelLoaderMetricNames(Enum):
     TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
     CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
@@ -699,6 +820,18 @@ class ModelLoader:
             transform_abi_id=MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="phi3-for-causal-lm-bf16-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_phi3", "Phi3ForCausalLM"),
+            architecture="Phi3ForCausalLM",
+            model_type="phi3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
     ))
 
@@ -934,6 +1067,14 @@ class ModelLoader:
         post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
         load_format = self.llm_args.load_format
+        locality_domain_policy = getattr(config, "locality_domain_policy", None)
+        if (load_format == LoadFormat.GMS
+                and getattr(locality_domain_policy, "enabled", False)):
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with locality domain localized weights. "
+                "GMS shares registered parameters, while locality domain execution "
+                "releases those parameters after creating partition-local "
+                "weight shards.")
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
 
@@ -954,6 +1095,9 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
+
+            validate_lm_head_output_dtype(model,
+                                          self.llm_args.lm_head_output_dtype)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
@@ -1602,6 +1746,11 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
+        locality_domain_policy = getattr(model.model_config,
+                                         "locality_domain_policy", None)
+        if getattr(locality_domain_policy, "enabled", False):
+            enabled_features.add(
+                PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
@@ -1797,6 +1946,12 @@ class ModelLoader:
         running post-load processing once all bytes are present. Weight
         manifests are not written here; see `_dump_final_weight_manifest`.
 
+        A torch.compile wrapper left in the tree is fine for models that load
+        through the generic loaders (they strip the wrapper's ``_orig_mod``
+        path component, ``modeling_utils.strip_torch_compile_wrapper``); a
+        model with its own ``load_weights`` walk must be unwrapped first, and
+        ``_check_compile_wrapper_before_reload`` fails loudly otherwise.
+
         Args:
             model: Model instance receiving the replacement weights.
             weights: Checkpoint weights to pass to `model.load_weights`.
@@ -1811,6 +1966,7 @@ class ModelLoader:
                 "Cannot reload weights: weight_mapper was not initialized. "
                 "This can happen when the initial load used GMS, MX P2P, or "
                 "VISION_ONLY, which bypass the standard weight mapping path.")
+        _check_compile_wrapper_before_reload(model)
         if not allow_partial_loading:
             self._reset_weights_transformed(model)
         self._call_load_weights(model.load_weights,
@@ -1922,6 +2078,11 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            lm_head_output_dtype=(torch.float32
+                                  if self.llm_args.lm_head_output_dtype
+                                  == "float32" else None),
+            locality_domain_policy=LocalityDomainPolicy(
+                enabled=self.llm_args.enable_locality_domains),
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
@@ -1929,6 +2090,14 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+
+        # Decided here, after `load_config_and_apply_defaults` resolved the
+        # built-in class and applied its model defaults to `llm_args`: a
+        # modeling_v2 target reads the arguments as the engine will run with
+        # them and never overrides those defaults.
+        config = replace(config,
+                         modeling_v2_target=modeling_v2_resolve_on_all_ranks(
+                             config, self.llm_args))
 
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a
@@ -1943,6 +2112,8 @@ class ModelLoader:
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
         config.extra_attrs[
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
+        config.extra_attrs["bounded_replay_on_generation"] = (
+            self.llm_args.bounded_replay_on_generation)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

@@ -173,6 +173,7 @@ def staged_qk_mma(
     head_dim_stages=None,
     consumer_label=None,
     include_acquire=True,
+    release_k=True,
 ):
     """Consume staged K descriptors and produce one QK MMA score tile."""
     if consumer_label is None:
@@ -192,7 +193,8 @@ def staged_qk_mma(
         smem_kv.wait()
         kv_desc = getattr(smem_kv, consumer_label)(k_subtile_idx=k_subtile_idx)
         tmem_s.qk_mma(kv_desc=kv_desc, k_subtile_idx=k_subtile_idx)
-        smem_kv.release()
+        if release_k:
+            smem_kv.release()
     tmem_s.commit()
 
 
@@ -206,6 +208,7 @@ def staged_pv_mma(
     consumer_label=None,
     producer_label=None,
     is_tail: bool = False,
+    reuse_k=False,
 ):
     """Consume staged V descriptors and produce one PV MMA output tile."""
     smem_p.wait()
@@ -232,7 +235,8 @@ def staged_pv_mma(
         producer_label is not None and producer_label.find("tail") >= 0
     )
     for v_subtile_idx in range(head_dim_stages):
-        smem_kv.wait()
+        if not reuse_k:
+            smem_kv.wait()
         if producer_label.endswith("_0"):
             v_desc_0 = getattr(smem_kv, consumer_label)(v_subtile_idx=v_subtile_idx)
             getattr(tmem_o, producer_label)(
@@ -316,6 +320,7 @@ def staged_pv_mma_tmem_p(
     head_dim_stages,
     consumer_label,
     producer_label="pv_mma_loop_tmem_p",
+    reuse_k=False,
 ):
     """Consume TMEM P and staged V descriptors to produce one PV output tile."""
     tmem_p.wait()
@@ -323,7 +328,8 @@ def staged_pv_mma_tmem_p(
     tmem_o.acquire()
     is_tail = producer_label == "pv_mma_tail_tmem_p"
     for v_subtile_idx in range(head_dim_stages):
-        smem_kv.wait()
+        if not reuse_k:
+            smem_kv.wait()
         v_desc_0 = getattr(smem_kv, consumer_label)(v_subtile_idx=v_subtile_idx)
         getattr(tmem_o, producer_label)(
             p_stage_idx=p_stage_idx,

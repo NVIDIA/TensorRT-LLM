@@ -117,7 +117,7 @@ void RoutingKernelTest<T>::allocateBuffers(RoutingKernelTestParam const& param)
 template <typename T>
 void RoutingKernelTest<T>::setupBuffers(RoutingKernelTestParam const& param)
 {
-    T* scoresHostPtr = bufferCast<T>(*mPtrScoresHost);
+    T* scoresHostPtr = mPtrScoresHost->getBufferPtr<T>();
     initData(scoresHostPtr, param.numTokens * param.numExperts, mSeed);
     mBufferManager->copy(*mPtrScoresHost, *mPtrScoresDevice);
 }
@@ -127,24 +127,25 @@ template <typename T>
 void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& param)
 {
 
-    int32_t* expertCountsHostPtr = bufferCast<int32_t>(*this->mPtrExpertCountsHost);
-    PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost));
+    int32_t* expertCountsHostPtr = this->mPtrExpertCountsHost->template getBufferPtr<int32_t>();
+    PackedType* expIdxHostPtr
+        = reinterpret_cast<PackedType*>(this->mPtrTopKPackedHost->template getBufferPtr<int8_t>());
 
     auto tokenToExpertHost
         = mBufferManager->pinned(ITensor::makeShape({param.numTokens * param.topK}), tensorrt_llm::DataType::kINT32);
-    auto tokenToExpertHostPtr = bufferCast<int32_t>(*tokenToExpertHost);
+    auto tokenToExpertHostPtr = tokenToExpertHost->getBufferPtr<int32_t>();
 
     auto tokenToIdxInExpertHost
         = mBufferManager->pinned(ITensor::makeShape({param.numTokens * param.topK}), tensorrt_llm::DataType::kINT32);
-    auto tokenToIdxInExpertHostPtr = bufferCast<int32_t>(*tokenToIdxInExpertHost);
+    auto tokenToIdxInExpertHostPtr = tokenToIdxInExpertHost->getBufferPtr<int32_t>();
 
     auto expertScanCountsHost
         = mBufferManager->pinned(ITensor::makeShape({param.numExperts + 1}), tensorrt_llm::DataType::kINT32);
-    auto expertScanCountsHostPtr = bufferCast<int32_t>(*expertScanCountsHost);
+    auto expertScanCountsHostPtr = expertScanCountsHost->getBufferPtr<int32_t>();
 
     auto ctaScanCountsHost
         = mBufferManager->pinned(ITensor::makeShape({param.numExperts + 1}), tensorrt_llm::DataType::kINT32);
-    auto ctaScanCountsHostPtr = bufferCast<int32_t>(*ctaScanCountsHost);
+    auto ctaScanCountsHostPtr = ctaScanCountsHost->getBufferPtr<int32_t>();
 
     for (int ie = 0; ie < param.numExperts + 1; ++ie)
     {
@@ -188,14 +189,14 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
     }
 
     // Store total size needed for permuted indices buffer
-    bufferCast<int32_t>(*this->mPtrPermutedIdxSizeHost)[0] = expertScanCountsHostPtr[param.numExperts];
+    this->mPtrPermutedIdxSizeHost->template getBufferPtr<int32_t>()[0] = expertScanCountsHostPtr[param.numExperts];
     // Store total number of CTAs needed across all experts
-    bufferCast<int32_t>(*this->mPtrNumNonExitingCtasHost)[0] = ctaScanCountsHostPtr[param.numExperts];
+    this->mPtrNumNonExitingCtasHost->template getBufferPtr<int32_t>()[0] = ctaScanCountsHostPtr[param.numExperts];
 
     auto permutedBufferMaxSize
         = param.numTokens * param.topK + mulTileN(param.numExperts, param.tileTokensDim) - param.numExperts;
     for (int ii = 0; ii < permutedBufferMaxSize; ++ii)
-        bufferCast<int32_t>(*this->mPtrPermutedIdxToTokenIdxHost)[ii] = -1;
+        this->mPtrPermutedIdxToTokenIdxHost->template getBufferPtr<int32_t>()[ii] = -1;
 
     for (int tokenIdx = 0; tokenIdx < param.numTokens; tokenIdx++)
     {
@@ -211,10 +212,10 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
             int const offsetForExpert = expertScanCountsHostPtr[expert];
             int const permutedIdx = isLocalExpert ? offsetForExpert + offsetWithinExpert : int32_t{-1};
             // int const permutedIdx = offsetForExpert + offsetWithinExpert;
-            bufferCast<int32_t>(*this->mPtrExpandedIdxToPermutedIdxHost)[expandedIdx] = permutedIdx;
+            this->mPtrExpandedIdxToPermutedIdxHost->template getBufferPtr<int32_t>()[expandedIdx] = permutedIdx;
             if (isLocalExpert)
             {
-                bufferCast<int32_t>(*this->mPtrPermutedIdxToTokenIdxHost)[permutedIdx] = tokenIdx;
+                this->mPtrPermutedIdxToTokenIdxHost->template getBufferPtr<int32_t>()[permutedIdx] = tokenIdx;
             }
         }
     }
@@ -236,8 +237,9 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
         for (int32_t cta = 0; cta < numCta; ++cta)
         {
             // Map CTA index to expert index and compute token range for this CTA
-            bufferCast<int32_t>(*this->mPtrCtaIdxXyToBatchIdxHost)[ctaScanCountsHostPtr[ie] + cta] = localExpertIdx;
-            bufferCast<int32_t>(*this->mPtrCtaIdxXyToMnLimitHost)[ctaScanCountsHostPtr[ie] + cta]
+            this->mPtrCtaIdxXyToBatchIdxHost->template getBufferPtr<int32_t>()[ctaScanCountsHostPtr[ie] + cta]
+                = localExpertIdx;
+            this->mPtrCtaIdxXyToMnLimitHost->template getBufferPtr<int32_t>()[ctaScanCountsHostPtr[ie] + cta]
                 = std::min(mulTileN(ctaScanCountsHostPtr[ie] + cta + 1, param.tileTokensDim),
                     mulTileN(ctaScanCountsHostPtr[ie], param.tileTokensDim) + m);
         }
@@ -262,15 +264,15 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
 
     auto const expandedIdxToPermutedIdxHost
         = mBufferManager->copyFrom(*mPtrExpandedIdxToPermutedIdxDevice, MemoryType::kCPU);
-    auto const hostExpToPermTest = bufferCast<int32_t>(*expandedIdxToPermutedIdxHost);
+    auto const hostExpToPermTest = expandedIdxToPermutedIdxHost->getBufferPtr<int32_t>();
 
     auto const permutedIdxToTokenIdxHost = mBufferManager->copyFrom(*mPtrPermutedIdxToTokenIdxDevice, MemoryType::kCPU);
-    auto const hostPermToTokTest = bufferCast<int32_t>(*permutedIdxToTokenIdxHost);
+    auto const hostPermToTokTest = permutedIdxToTokenIdxHost->getBufferPtr<int32_t>();
 
     mStream->synchronize();
 
-    int32_t* expIdxToPermHostptr = bufferCast<int32_t>(*mPtrExpandedIdxToPermutedIdxHost);
-    PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrTopKPackedHost));
+    int32_t* expIdxToPermHostptr = mPtrExpandedIdxToPermutedIdxHost->getBufferPtr<int32_t>();
+    PackedType* expIdxHostPtr = reinterpret_cast<PackedType*>(mPtrTopKPackedHost->getBufferPtr<int8_t>());
 
     for (int ie = 0; ie < param.numExperts; ++ie)
     {
@@ -331,25 +333,25 @@ void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
     auto const ctaIdxXyToBatchIdxHost = mBufferManager->copyFrom(*mPtrCtaIdxXyToBatchIdxDevice, MemoryType::kCPU);
     auto const ctaIdxXyToMnLimitHost = mBufferManager->copyFrom(*mPtrCtaIdxXyToMnLimitDevice, MemoryType::kCPU);
 
-    auto const expertWeightsPtr = bufferCast<T>(*expertWeightsHost);
-    auto const expertCountsPtr = bufferCast<int32_t>(*expertCountsHost);
-    auto const permutedIdxSizePtr = bufferCast<int32_t>(*permutedIdxSizeHost);
-    auto const numNonExitingCtasPtr = bufferCast<int32_t>(*numNonExitingCtasHost);
-    auto const ctaIdxXyToBatchIdxPtr = bufferCast<int32_t>(*ctaIdxXyToBatchIdxHost);
-    auto const ctaIdxXyToMnLimitPtr = bufferCast<int32_t>(*ctaIdxXyToMnLimitHost);
+    auto const expertWeightsPtr = expertWeightsHost->getBufferPtr<T>();
+    auto const expertCountsPtr = expertCountsHost->getBufferPtr<int32_t>();
+    auto const permutedIdxSizePtr = permutedIdxSizeHost->getBufferPtr<int32_t>();
+    auto const numNonExitingCtasPtr = numNonExitingCtasHost->getBufferPtr<int32_t>();
+    auto const ctaIdxXyToBatchIdxPtr = ctaIdxXyToBatchIdxHost->getBufferPtr<int32_t>();
+    auto const ctaIdxXyToMnLimitPtr = ctaIdxXyToMnLimitHost->getBufferPtr<int32_t>();
 
     mStream->synchronize();
 
     if (param.getExpWeights)
     {
-        EXPECT_EQ(isClose(bufferCast<T>(*mPtrTopKWeightsHost), expertWeightsPtr, param.numTokens * param.topK,
+        EXPECT_EQ(isClose(mPtrTopKWeightsHost->getBufferPtr<T>(), expertWeightsPtr, param.numTokens * param.topK,
                       "expert weights"),
             true);
     }
     // expert counts aren't always used, but if tokens > 8 * 1024, we are sure they are used
     if (param.numTokens > param.singleClusterTokenNum)
     {
-        assertEqual(bufferCast<int32_t>(*mPtrExpertCountsHost), expertCountsPtr, param.numExperts, "expert counts");
+        assertEqual(mPtrExpertCountsHost->getBufferPtr<int32_t>(), expertCountsPtr, param.numExperts, "expert counts");
         // The second half of mPtrExpertCounts is only filled by the multi-kernel offsets pipeline
         // (routingIndicesOffsetsKernel). It is NOT filled by the coop kernel or cluster kernel.
         // On SM90+, both the scores path (RoutingCustomKernels.cuh) and the post-topK path
@@ -361,20 +363,20 @@ void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
             && param.routingMethod != RoutingMethodType::DeepSeekV3 && !coopMayBeUsed;
         if (useMultiKernelPath)
         {
-            assertEqual(bufferCast<int32_t>(*mPtrExpertCountsHost), expertCountsPtr + param.numExperts,
+            assertEqual(mPtrExpertCountsHost->getBufferPtr<int32_t>(), expertCountsPtr + param.numExperts,
                 param.numExperts, "expert counts (2)");
         }
     }
 
-    assertEqual(bufferCast<int32_t>(*mPtrPermutedIdxSizeHost), permutedIdxSizePtr, 1, "permuted idx size");
-    assertEqual(bufferCast<int32_t>(*mPtrNumNonExitingCtasHost), numNonExitingCtasPtr, 1, "#non exiting CTAs");
+    assertEqual(mPtrPermutedIdxSizeHost->getBufferPtr<int32_t>(), permutedIdxSizePtr, 1, "permuted idx size");
+    assertEqual(mPtrNumNonExitingCtasHost->getBufferPtr<int32_t>(), numNonExitingCtasPtr, 1, "#non exiting CTAs");
 
     verifyExpertRoutingIndices(param);
 
-    assertEqual(bufferCast<int32_t>(*mPtrCtaIdxXyToBatchIdxHost), ctaIdxXyToBatchIdxPtr,
-        bufferCast<int32_t>(*mPtrNumNonExitingCtasHost)[0], "cta idx -> batch idx");
-    assertEqual(bufferCast<int32_t>(*mPtrCtaIdxXyToMnLimitHost), ctaIdxXyToMnLimitPtr,
-        bufferCast<int32_t>(*mPtrNumNonExitingCtasHost)[0], "cta idx -> M/N limit");
+    assertEqual(mPtrCtaIdxXyToBatchIdxHost->getBufferPtr<int32_t>(), ctaIdxXyToBatchIdxPtr,
+        mPtrNumNonExitingCtasHost->getBufferPtr<int32_t>()[0], "cta idx -> batch idx");
+    assertEqual(mPtrCtaIdxXyToMnLimitHost->getBufferPtr<int32_t>(), ctaIdxXyToMnLimitPtr,
+        mPtrNumNonExitingCtasHost->getBufferPtr<int32_t>()[0], "cta idx -> M/N limit");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

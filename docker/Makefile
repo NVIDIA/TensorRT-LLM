@@ -3,6 +3,7 @@ BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 TRITON_IMAGE       ?= $(shell grep '^ARG TRITON_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 TRITON_BASE_TAG    ?= $(shell grep '^ARG TRITON_BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+CUDA_COMPAT_TAG    ?= $(shell grep '^ARG CUDA_COMPAT_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 # Name of the new image
 IMAGE_NAME         ?= tensorrt_llm
 IMAGE_TAG          ?= latest
@@ -99,6 +100,7 @@ base_pull:
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
 		$(if $(TRITON_IMAGE), --build-arg TRITON_IMAGE=$(TRITON_IMAGE)) \
 		$(if $(TRITON_BASE_TAG), --build-arg TRITON_BASE_TAG=$(TRITON_BASE_TAG)) \
+		$(if $(CUDA_COMPAT_TAG), --build-arg CUDA_COMPAT_TAG=$(CUDA_COMPAT_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
 		$(if $(BUILD_WHEEL_SCRIPT), --build-arg BUILD_WHEEL_SCRIPT="$(BUILD_WHEEL_SCRIPT)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
@@ -206,30 +208,29 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 13.3.1-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 13.4.1-devel-rockylinux8
+jenkins-rockylinux8_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-rockylinux8_%: BASE_TAG = 13.3.1-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 13.4.1-devel-rockylinux8
+rockylinux8_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
 # For x86_64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu22_%: BASE_TAG = 13.3.1-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 13.4.1-devel-ubuntu22.04
+ubuntu22_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
 # For x86_64 and aarch64
 ubuntu24_%: STAGE = tritondevel
 ubuntu24_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu24_%: BASE_TAG = 13.3.1-devel-ubuntu24.04
+ubuntu24_%: BASE_TAG = 13.4.1-devel-ubuntu24.04
+ubuntu24_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
-trtllm_%: STAGE = release
+trtllm_%: STAGE = tritonrelease
 trtllm_%: PUSH_TO_STAGING := 0
-trtllm_%: DEVEL_IMAGE = $(shell \
-    if [ "$(PLATFORM)" = "amd64" ]; then \
-        . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE; \
-    elif [ "$(PLATFORM)" = "arm64" ]; then \
-        . ../jenkins/current_image_tags.properties && echo $$LLM_SBSA_DOCKER_IMAGE; \
-    fi)
+trtllm_%: DEVEL_IMAGE = tritondevel
 trtllm_%: IMAGE_NAME = $(shell . ../jenkins/current_image_tags.properties && echo $$IMAGE_NAME)
 trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')-$(PLATFORM)
 trtllm_run: WORK_DIR = /app/tensorrt_llm

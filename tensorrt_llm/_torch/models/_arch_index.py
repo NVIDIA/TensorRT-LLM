@@ -41,10 +41,14 @@ MODEL_ARCH_TO_MODULE = {
     "BertForSequenceClassification": "modeling_bert",
     "CLIPVisionModel": "modeling_clip",
     "Cohere2ForCausalLM": "modeling_cohere2",
+    "Cosmos3EdgeForCausalLM": "modeling_cosmos3_edge",
+    "Cosmos3EdgeForConditionalGeneration": "modeling_cosmos3_edge",
     "Cosmos3ForConditionalGeneration": "modeling_cosmos3",
     "DeciLMForCausalLM": "modeling_nemotron_nas",
     "DeepseekV32ForCausalLM": "modeling_deepseekv3",
     "DeepseekV3ForCausalLM": "modeling_deepseekv3",
+    "DeepseekV41ForCausalLM": "modeling_deepseekv41",
+    "DeepseekV41ForConditionalGeneration": "modeling_deepseekv41_multimodal",
     "DeepseekV4ForCausalLM": "modeling_deepseekv4",
     "EAGLE3LlamaForCausalLM": "modeling_speculative",
     "Eagle3DeepSeekV3ForCausalLM": "modeling_speculative",
@@ -130,8 +134,11 @@ MODEL_CLASS_TO_MODULE = {
     "BertForSequenceClassification": "modeling_bert",
     "CLIPVisionModel": "modeling_clip",
     "Cohere2ForCausalLM": "modeling_cohere2",
+    "Cosmos3EdgeModel": "modeling_cosmos3_edge",
     "Cosmos3Model": "modeling_cosmos3",
     "DeepseekV3ForCausalLM": "modeling_deepseekv3",
+    "DeepseekV41ForCausalLM": "modeling_deepseekv41",
+    "DeepseekV41ForConditionalGeneration": "modeling_deepseekv41_multimodal",
     "DeepseekV4ForCausalLM": "modeling_deepseekv4",
     "Exaone4ForCausalLM": "modeling_exaone4",
     "Exaone4_5_ForConditionalGeneration": "modeling_exaone4_5",
@@ -206,7 +213,9 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
     "NemotronH_Nano_Omni_Reasoning_V3": "modeling_nemotron_h_multimodal",
     "NemotronH_Nano_VL_V2": "modeling_nemotron_h_multimodal",
     "cosmos3": "modeling_cosmos3",
+    "cosmos3_edge": "modeling_cosmos3_edge",
     "cosmos3_omni": "modeling_cosmos3",
+    "deepseek_v41": "modeling_deepseekv41_multimodal",
     "exaone4_5": "modeling_exaone4_5",
     "gemma3": "modeling_gemma3vl",
     "gemma4": "modeling_gemma4mm",
@@ -239,7 +248,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
 # model builder (registered via ``@register_draft_model``). Keyed by the enum
 # member *name* rather than the enum itself so this module keeps importing
 # nothing. Modes absent from this table have no one-engine draft model to build
-# (two-model / drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
+# (model-free or drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
 #
 # Adding a speculative decoding mode
 # ----------------------------------

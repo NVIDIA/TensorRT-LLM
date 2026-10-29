@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -46,9 +48,13 @@ _MAX_NEW_TOKENS = 32
 # whole batch within `_MAX_NUM_TOKENS`.
 _MAX_SEQ_LEN = 128
 _MAX_NUM_TOKENS = 256
+# Exit status of a receiver whose own transfer self-check failed before any
+# accuracy evaluation was attempted.
+SELF_CHECK_FAILED_EXIT_CODE = 3
+_EVAL_TASKS = ("MMLU", "GSM8K")
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--role", choices=("baseline", "donor", "receiver"), required=True)
     parser.add_argument("--model", required=True)
@@ -58,7 +64,34 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--stop-file", type=Path)
     parser.add_argument("--max-serve-seconds", type=float, default=1800.0)
-    return parser.parse_args()
+    eval_group = parser.add_argument_group(
+        "eval", "Run an accuracy evaluator on the loaded model instead of the token probe"
+    )
+    eval_group.add_argument("--eval-task", choices=_EVAL_TASKS)
+    eval_group.add_argument("--eval-num-samples", type=int)
+    eval_group.add_argument("--eval-dataset-path")
+    eval_group.add_argument("--eval-max-input-len", type=int)
+    eval_group.add_argument("--eval-max-output-len", type=int)
+    eval_group.add_argument("--eval-max-batch-size", type=int, default=32)
+    eval_group.add_argument("--eval-kv-fraction", type=float, default=0.6)
+    eval_group.add_argument("--eval-random-seed", type=int, default=0)
+    eval_group.add_argument("--eval-apply-chat-template", action="store_true")
+    eval_group.add_argument("--eval-system-prompt")
+    args = parser.parse_args(argv)
+    if args.eval_task is not None:
+        if args.role == "donor":
+            parser.error("--eval-task is not supported for the donor role")
+        required = (
+            "eval_num_samples",
+            "eval_dataset_path",
+            "eval_max_input_len",
+            "eval_max_output_len",
+        )
+        absent = [name for name in required if getattr(args, name) is None]
+        if absent:
+            flags = ", ".join("--" + name.replace("_", "-") for name in absent)
+            parser.error(f"--eval-task requires {flags}")
+    return args
 
 
 def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
@@ -69,12 +102,27 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
         "tensor_parallel_size": args.tp_size,
         "dtype": "bfloat16",
         "attn_backend": "TRTLLM",
-        "skip_tokenizer_init": True,
+        # Evaluators feed string prompts and need the tokenizer; the token
+        # probe works on token IDs only.
+        "skip_tokenizer_init": args.eval_task is None,
         "max_batch_size": len(_PROMPT_TOKEN_IDS),
         "max_num_tokens": _MAX_NUM_TOKENS,
         "max_seq_len": _MAX_SEQ_LEN,
         "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.15),
     }
+    if args.eval_task is not None:
+        # Size the engine for the evaluator instead of the short probe. The
+        # donor keeps the probe sizing; SourceIdentity does not hash engine
+        # limits, so donor and receiver identities still match.
+        max_seq_len = args.eval_max_input_len + args.eval_max_output_len
+        kwargs.update(
+            {
+                "max_batch_size": args.eval_max_batch_size,
+                "max_num_tokens": max(8192, max_seq_len),
+                "max_seq_len": max_seq_len,
+                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=args.eval_kv_fraction),
+            }
+        )
     env_overrides = _rank_process_env_overrides(args)
     if env_overrides:
         kwargs["env_overrides"] = env_overrides
@@ -109,6 +157,89 @@ def _rank_process_env_overrides(args: argparse.Namespace) -> dict[str, str]:
     return overrides
 
 
+def _self_check_receiver_transfer(tp_size: int) -> None:
+    """Abort before spending eval time unless every rank received its shard through MX P2P.
+
+    `MXCheckpointLoader` writes `manifest.transfer.receiver.rank<N>.json` only
+    after rank N received its complete shard through P2P, and `LLM(...)`
+    returns only after every rank finished loading, so each file either exists
+    here or that rank loaded some other way. Problems are printed and the
+    process exits with `SELF_CHECK_FAILED_EXIT_CODE` so the orchestrator can
+    label the failure; its transfer-evidence and manifest comparisons stay
+    authoritative.
+    """
+    from tensorrt_llm._torch.weight_sharing import (
+        WEIGHT_MANIFEST_DIR_ENV,
+        load_weight_manifest,
+        manifest_file_name,
+    )
+
+    manifest_dir = os.environ.get(WEIGHT_MANIFEST_DIR_ENV)
+    if not manifest_dir:
+        raise ValueError(
+            f"The receiver eval role requires {WEIGHT_MANIFEST_DIR_ENV} for its transfer self-check"
+        )
+    problems: list[str] = []
+    for rank in range(tp_size):
+        path = Path(manifest_dir) / manifest_file_name("transfer", "receiver", rank)
+        if not path.is_file():
+            problems.append(f"rank {rank} wrote no MX transfer manifest ({path.name})")
+            continue
+        try:
+            boundary = load_weight_manifest(path).context.get("boundary")
+        except (OSError, TypeError, ValueError, KeyError) as error:
+            problems.append(f"rank {rank} has an unreadable transfer manifest {path.name}: {error}")
+            continue
+        if boundary != "receiver_p2p_success":
+            problems.append(f"rank {rank} transfer manifest records boundary {boundary!r}")
+    if problems:
+        entries = sorted(path.name for path in Path(manifest_dir).glob("*"))
+        print("MX_ACCURACY_SELF_CHECK_FAILED: " + "; ".join(problems), flush=True)
+        print(f"Weight manifest directory {manifest_dir} holds {entries}", flush=True)
+        sys.exit(SELF_CHECK_FAILED_EXIT_CODE)
+
+
+def _run_eval(llm: LLM, args: argparse.Namespace) -> dict[str, object]:
+    """Run the requested `tensorrt_llm.evaluate` task with the reference sampling params."""
+    import tensorrt_llm.evaluate as evaluate
+
+    evaluator_cls = getattr(evaluate, args.eval_task)
+    evaluator = evaluator_cls(
+        dataset_path=args.eval_dataset_path,
+        num_samples=args.eval_num_samples,
+        random_seed=args.eval_random_seed,
+        apply_chat_template=args.eval_apply_chat_template,
+        system_prompt=args.eval_system_prompt,
+    )
+    # Same construction as `accuracy_core.AccuracyTask.evaluate`: greedy by
+    # default, prompts truncated to the task's input length.
+    sampling_params = SamplingParams(
+        max_tokens=args.eval_max_output_len,
+        truncate_prompt_tokens=args.eval_max_input_len,
+    )
+    evaluate_kwargs: dict[str, object] = {}
+    if "scores_filter" in inspect.signature(evaluator.evaluate).parameters:
+        evaluate_kwargs["scores_filter"] = None
+    started = time.perf_counter()
+    score = float(evaluator.evaluate(llm, sampling_params=sampling_params, **evaluate_kwargs))
+    return {
+        "eval_task": args.eval_task,
+        "eval_num_samples": args.eval_num_samples,
+        "eval_seconds": time.perf_counter() - started,
+        "score": score,
+        "engine": {
+            "max_batch_size": args.eval_max_batch_size,
+            "max_seq_len": args.eval_max_input_len + args.eval_max_output_len,
+            "max_num_tokens": max(8192, args.eval_max_input_len + args.eval_max_output_len),
+            "kv_fraction": args.eval_kv_fraction,
+        },
+        "sampling": {
+            "max_tokens": args.eval_max_output_len,
+            "truncate_prompt_tokens": args.eval_max_input_len,
+        },
+    }
+
+
 def main() -> None:
     args = _parse_args()
     if args.role == "donor" and (args.ready_file is None or args.stop_file is None):
@@ -120,6 +251,21 @@ def main() -> None:
     started = time.perf_counter()
     with LLM(**llm_kwargs) as llm:
         load_seconds = time.perf_counter() - started
+        if args.eval_task is not None:
+            self_check_started = time.perf_counter()
+            if args.role == "receiver":
+                _self_check_receiver_transfer(args.tp_size)
+            eval_payload: dict[str, object] = {
+                "role": args.role,
+                "tp_size": args.tp_size,
+                "load_seconds": load_seconds,
+                "self_check_seconds": time.perf_counter() - self_check_started,
+            }
+            eval_payload.update(_run_eval(llm, args))
+            args.output.write_text(json.dumps(eval_payload, indent=2) + "\n", encoding="utf-8")
+            print("MX_WORKER_METRICS " + json.dumps(eval_payload), flush=True)
+            return
+
         sampling_params = SamplingParams(
             max_tokens=_MAX_NEW_TOKENS,
             temperature=0.0,

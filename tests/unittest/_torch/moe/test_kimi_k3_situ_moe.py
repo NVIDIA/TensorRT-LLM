@@ -10,7 +10,7 @@ Covers the SiTU cubin integration behavior:
   ``siTuGlu``, and from the expected cubin family -- ``MxE4m3_MxE2m1`` for
   the MXFP4 drop, ``E2m1_E2m1E2m1`` for the NVFP4 one (tactic availability
   for both families is pinned at the op level in
-  tests/unittest/_torch/thop/serial/test_moe.py);
+  tests/unittest/_torch/moe/kernels/serial/test_moe.py);
 * fused output matches the Python ``SituAndMul`` reference within
   MXFP8/MXFP4 quantization tolerance, for the default AND asymmetric
   non-default ``activation_situ_beta`` / ``activation_situ_linear_beta``;
@@ -143,7 +143,7 @@ def test_cutedsl_kernel_rejects_unusable_situ_betas(situ_beta, situ_linear_beta)
     against NaN is false, and an infinity is positive.
     """
     pytest.importorskip("cutlass")
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+    from tensorrt_llm._torch.moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
         BlockScaledContiguousGatherGroupedGemmKernel,
     )
     from tensorrt_llm._torch.utils import ActivationType
@@ -638,8 +638,9 @@ def test_kimi_k3_allow_list_matches_what_the_backends_declare():
 
     ``any`` rather than ``all`` over a family: resolution walks family members
     in ``IMPL_PRIORITY`` order, so a family serves SiTU when one member does.
-    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` does not
-    declare it, ``CuteDslFusedMoE`` does.
+    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` and the BF16
+    grouped-GEMM leaf do not declare it, ``TrtllmCutedslGroupedGemmNvfp4Impl``
+    does.
     """
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import BACKEND_FAMILY
     from tensorrt_llm._torch.utils import ActivationType
@@ -677,8 +678,8 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     """K3 must propagate strict backend selection through create_moe."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE
     from tensorrt_llm._torch.moe.fused_moe.activation import SiTuActivation
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEEligibility, MoERejectReason
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
         BACKEND_FAMILY,
@@ -699,7 +700,9 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
             ),
         )
     monkeypatch.setattr(
-        CutlassFusedMoE, "can_implement", classmethod(lambda cls, p, d: MoEEligibility.ok())
+        TrtllmCutlassNvfp4Impl,
+        "can_implement",
+        classmethod(lambda cls, p, d: MoEEligibility.ok()),
     )
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     pretrained_config = PretrainedConfig()
@@ -724,7 +727,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
         allow_degradation=True,
     )
     assert report.degraded
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
 
     # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
     with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:
@@ -1178,16 +1181,17 @@ def test_tp_shard_loader_matches_manual_slice(tp_size):
 
 
 @situ_supported
+@pytest.mark.parametrize("tp_size", [8, 16], ids=lambda n: f"tp{n}")
 @pytest.mark.parametrize("num_tokens", [1, 16], ids=lambda n: f"tokens{n}")
-def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
-    """Sum of 8 TP-shard partial outputs == whole-expert reference.
+def test_tp_sharded_forward_matches_whole_expert(num_tokens, tp_size):
+    """Sum of the TP-shard partial outputs == whole-expert reference.
 
     Per-element MXFP4/MXFP8 numerics are identical between the two layouts
-    (group-32 boundaries align: 384 % 32 == 0), so the only expected error
-    is bf16 rounding of the per-shard FC2 partial sums.
+    (group-32 boundaries align: 384 and 192 are multiples of 32), so the only
+    expected error is bf16 rounding of the per-shard FC2 partial sums. At TP16
+    each shard's 192-wide slice is zero-padded to 256 and run as valid 192.
     """
-    tp_size = 8
-    ipp = _TP_INTERMEDIATE // tp_size  # 384 — the production TP8 shard size
+    ipp = _TP_INTERMEDIATE // tp_size  # 384 at TP8; 192 at TP16 (the no-spec layout)
     bank = _make_packed_expert_bank(_TP_EXPERTS, _TP_INTERMEDIATE, _TP_HIDDEN)
     gate = _make_test_gate()
 
@@ -1222,8 +1226,15 @@ def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
         pytest.param(32, 16, id="experts32-top16"),
     ],
 )
+# 3072 is 512-aligned; 2304 clears DeepGEMM's real `% 128` host check but not
+# 512, so it exercises the two intermediate SF records whose TMA-alignment
+# asserts `3rdparty/patches/deepgemm_mega_moe_intermediate_sf_alignment.patch`
+# drops. Without both the patch and the relaxed `MegaMoEDeepGemm` guard, the
+# 2304 arm either hard-aborts in `get_symm_buffer_size_for_mega_moe` or silently
+# falls back to a non-MegaMoE backend and compares TRTLLM-Gen with itself.
+@pytest.mark.parametrize("intermediate_size", [3072, 2304], ids=lambda n: f"inter{n}")
 def test_megamoe_deepgemm_situ_matches_trtllm_gen(
-    num_tokens, num_experts, top_k, _single_rank_nccl_process_group
+    num_tokens, num_experts, top_k, intermediate_size, _single_rank_nccl_process_group
 ):
     """Compare SiTU kernels with identical packed MXFP4 weights and routing.
 
@@ -1232,21 +1243,27 @@ def test_megamoe_deepgemm_situ_matches_trtllm_gen(
     quantized graphs therefore need semantic, rather than elementwise,
     parity: high cosine similarity and bounded relative L2 error.
     """
-    bank = _make_packed_expert_bank(num_experts, _TP_INTERMEDIATE, _TP_HIDDEN)
+    bank = _make_packed_expert_bank(num_experts, intermediate_size, _TP_HIDDEN)
     gate = _make_test_gate(num_experts=num_experts, top_k=top_k)
 
     trtllm_gen = _load_bank(
-        _make_routed_moe(_TP_INTERMEDIATE, gate, num_experts=num_experts),
+        _make_routed_moe(intermediate_size, gate, num_experts=num_experts),
         bank,
     )
     mega_moe = _load_bank(
         _make_routed_moe(
-            _TP_INTERMEDIATE,
+            intermediate_size,
             gate,
             num_experts=num_experts,
             moe_backend="MEGAMOE_DEEPGEMM",
         ),
         bank,
+    )
+    # A fallback would compare TRTLLM-Gen against itself and pass vacuously.
+    mega_backend = type(mega_moe.backend)
+    assert "mega_moe" in mega_backend.__module__ and mega_backend is not type(trtllm_gen.backend), (
+        f"MEGAMOE_DEEPGEMM fell back to {mega_backend.__module__}."
+        f"{mega_backend.__name__} for intermediate_size={intermediate_size}"
     )
 
     torch.manual_seed(37)
@@ -1375,7 +1392,7 @@ def test_tp16_nvfp4_padded_loaders_preserve_rank_ownership():
 #: importing ``cute_dsl_utils`` pulls in the DSL package, which appends its own
 #: directory to ``sys.path``, and this repository fails the whole pytest
 #: session when a test file does that at collection time.
-_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL"]
+_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL", "CUTEDSL_FC12"]
 
 
 def _skip_if_backend_unavailable(moe_backend):
@@ -1386,20 +1403,30 @@ def _skip_if_backend_unavailable(moe_backend):
     early puts the wheel's package directory on ``sys.path`` for every other
     test file in the session.
     """
+    if moe_backend == "CUTEDSL_FC12":
+        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+        # The fused FC1+FC2 kernel is Rubin-only; can_implement() turns every
+        # other SM down, so there is no end-to-end path to exercise.
+        if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            pytest.skip("CUTEDSL_FC12 needs SM107 and CuTe DSL Rubin support")
+        return
     if moe_backend != "CUTEDSL":
         return
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
     if not IS_CUTLASS_DSL_AVAILABLE:
         pytest.skip("CuteDSL MoE requires the CuTe DSL wheel")
-    # nvfp4_moe_supported admits every SM >= 100, but this integration enables
-    # SiTU only on Blackwell. Match can_implement() rather than exercising an
-    # end-to-end path that has not been enabled on SM107.
-    if get_sm_version() not in (100, 103):
-        pytest.skip(
-            f"CuteDSL SiTU MoE needs the Blackwell act-fusion kernel "
-            f"(SM100/SM103), got SM{get_sm_version()}"
-        )
+    # nvfp4_moe_supported admits every SM >= 100; the CuteDSL act-fusion
+    # kernels with a SiTU epilogue exist for SM100/SM103 and SM107 (Rubin).
+    sm_version = get_sm_version()
+    if sm_version not in (100, 103, 107):
+        pytest.skip(f"CuteDSL SiTU MoE needs SM100/SM103/SM107, got SM{sm_version}")
+    if sm_version == 107:
+        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            pytest.skip("CuteDSL SiTU MoE on SM107 needs CuTe DSL Rubin support")
 
 
 def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
@@ -1828,7 +1855,7 @@ def _dequantize_expert_bank(bank):
     meaningful.
 
     This mirrors ``e2m1_and_ufp8_scale_batches`` in
-    ``tests/unittest/_torch/thop/serial/test_moe.py``; the layout arguments
+    ``tests/unittest/_torch/moe/kernels/serial/test_moe.py``; the layout arguments
     follow ``_quantize_expert_to_nvfp4``, which stores UE4M3 block scales
     (``sfUseUE8M0=False`` -> ``sfType=1``) already de-swizzled by
     ``block_scale_interleave_reverse`` (-> ``isSfSwizzledLayout=False``).
@@ -2187,6 +2214,72 @@ def test_cutedsl_situ_betas_reach_the_kernel_cache_key(monkeypatch):
     for betas, output in outputs.items():
         if betas != (4.0, 25.0):
             assert not torch.allclose(first, output), f"soft-caps {betas} reused the first output"
+
+
+@nvfp4_moe_supported
+def test_cutedsl_fc12_survives_autotune_warmup():
+    """Drive FC12 through a cold AutoTuner warmup.
+
+    ``do_preparation`` only runs from inside ``AutoTuner.choose_one``'s
+    profiling path. Other FC12 tests call ``moe.forward`` outside any
+    ``autotune()`` context, so that branch never runs there. ``clear_cache()``
+    is load-bearing: in tuning mode a cache hit also returns early.
+    """
+    from tensorrt_llm._torch.autotuner import AutoTuner, AutoTunerStatistics, autotune
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("CUTEDSL_FC12 needs SM107 and CuTe DSL Rubin support")
+
+    custom_op = "CuteDslFc12FusedMoE::run_moe_nvfp4"
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+
+    torch.manual_seed(91)
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    act_scale = float(x.abs().max().float() / (448 * 6))
+    w1 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w3 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w2 = [
+        torch.randn(hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
+
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
+    _stream_nvfp4_bank(moe, bank)
+    moe.backend._weights_transformed = False
+    moe.post_load_weights()
+
+    router_logits = gate.compute_logits(x)
+
+    autotuner = AutoTuner.get()
+    saved = (autotuner.warmup, autotuner.repeat, autotuner.stream_delay_micro_secs)
+    autotuner.clear_cache()
+    # The singleton outlives the test; fresh statistics keep the positive
+    # control below from being satisfied by an earlier test.
+    autotuner.stats = AutoTunerStatistics()
+    autotuner.warmup, autotuner.repeat, autotuner.stream_delay_micro_secs = 0, 1, 10
+    try:
+        # No cache_path: a shared on-disk cache would turn a cold miss into a
+        # hit and skip the branch under test.
+        with torch.inference_mode(), autotune():
+            tuned = moe.forward(x, router_logits, all_rank_num_tokens=None)
+    finally:
+        autotuner.warmup, autotuner.repeat, autotuner.stream_delay_micro_secs = saved
+
+    assert tuned.shape == x.shape
+    assert torch.isfinite(tuned.float()).all()
+    # Positive control: without it the test passes when nothing is profiled.
+    profiled = autotuner.stats.tuned_op_profiled_configs.get(custom_op, 0)
+    assert profiled > 0, f"{custom_op} was never profiled; the warmup branch did not run"
+    assert not autotuner.stats.failed_profiling_count.get(custom_op, set())
 
 
 def test_fp8_block_scaled_dequantization():

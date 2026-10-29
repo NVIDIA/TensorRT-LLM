@@ -204,6 +204,121 @@ def test_sync_receive_failure_under_multi_rank_adp_waits_for_the_synced_vote(syn
     assert ranks[1].effects.failed == [(_VOTE_MSG, [peer], False)]
 
 
+def _cp_dist(
+    peer_failed_ids, *, enable_attention_dp=False, tp_size=1, pp_size=1
+) -> SimpleNamespace:
+    """Dist stub for CP rank 0 of N = len(peer_failed_ids) + 1 CP ranks.
+
+    ``peer_failed_ids`` holds one id list per CP peer. ``cp_allgather`` records
+    each payload and returns it followed by those lists. Under attention DP,
+    ``world_size`` is tp x N x pp so errors wait for the synced vote, and
+    ``tp_allgather`` gathers this rank alone; otherwise ``world_size`` is 1 and
+    errors fail at once."""
+
+    def cp_allgather(ids, *, small_payload=False):
+        dist.gathered.append(list(ids))
+        return [ids, *peer_failed_ids]
+
+    cp_size = len(peer_failed_ids) + 1
+    world_size = tp_size * cp_size * pp_size if enable_attention_dp else 1
+    dist = SimpleNamespace(
+        rank=0,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        world_size=world_size,
+        gathered=[],
+    )
+    dist.cp_allgather = cp_allgather
+    dist.tp_allgather = lambda obj: [obj]
+    return dist
+
+
+def test_sync_receive_that_failed_on_a_cp_peer_fails_here_too(sync_mode) -> None:
+    """A blocking receive settles on its own rank. A request this CP rank
+    received but a CP peer failed is failed here as well, so the helix CP ranks
+    keep decoding the same batch; the rest keep their outcome."""
+    dist = _cp_dist([[2]])
+    h = CoordinatorHarness(dist=dist)
+    first, second = _gen_init(h, 1), _gen_init(h, 2)
+
+    h.coordinator.receive_gen_init([first, second])
+
+    assert dist.gathered == [[]]
+    assert first.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert second.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == [(_GEN_ERROR_MSG, [second], False)]
+
+
+def test_sync_receive_failure_here_is_shared_with_cp_peers(sync_mode) -> None:
+    dist = _cp_dist([[]])
+    h = CoordinatorHarness(dist=dist)
+    failing, received = _gen_init(h, 1), _gen_init(h, 2)
+    h.transceiver.script_sync_recv(failing, "error")
+
+    h.coordinator.receive_gen_init([failing, received])
+
+    assert dist.gathered == [[1]]
+    assert received.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert h.effects.failed == [(_GEN_ERROR_MSG, [failing], False)]
+
+
+def test_sync_receive_failed_on_a_cp_peer_under_adp_reaches_the_synced_vote(sync_mode) -> None:
+    """Under attention DP the error waits for the synced pass, whose vote spans
+    only the TP group; the CP gather already put it in error on this CP rank."""
+    dist = _cp_dist([[1]], enable_attention_dp=True)
+    h = CoordinatorHarness(dist=dist, enable_attention_dp=True)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == []
+
+    h.coordinator.handle_errors_synced()
+
+    assert h.effects.failed == [(_VOTE_MSG, [req], False)]
+
+
+@pytest.mark.parametrize(
+    "tp_size,pp_size,gathers",
+    [
+        pytest.param(2, 2, False, id="tp2_pp2_skips"),
+        pytest.param(1, 2, True, id="tp1_pp2_gathers"),
+        pytest.param(2, 1, True, id="tp2_pp1_gathers"),
+    ],
+)
+def test_sync_receive_failure_gather_under_attention_dp_follows_pp_scheduling(
+    sync_mode, tp_size, pp_size, gathers
+) -> None:
+    """Under attention DP with tp_size > 1 the PP loop schedules on each first-stage
+    rank, so the CP ranks may hold different requests and cannot share one gather;
+    it is skipped there. Every other layout gives the CP ranks the same requests."""
+    dist = _cp_dist([[1]], enable_attention_dp=True, tp_size=tp_size, pp_size=pp_size)
+    h = CoordinatorHarness(dist=dist, enable_attention_dp=True)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert dist.gathered == ([[]] if gathers else [])
+    assert req.state == (
+        LlmRequestState.DISAGG_TRANS_ERROR
+        if gathers
+        else LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    )
+
+
+def test_sync_receive_without_cp_does_not_gather(sync_mode) -> None:
+    dist = _cp_dist([])
+    dist.cp_allgather = Mock(side_effect=AssertionError("no CP peer to gather with"))
+    h = CoordinatorHarness(dist=dist)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
+
 def test_gen_only_benchmark_marks_requests_complete_without_a_transceiver_call(
     gen_only_benchmark,
 ) -> None:
@@ -218,6 +333,175 @@ def test_gen_only_benchmark_marks_requests_complete_without_a_transceiver_call(
     assert h.transceiver.call_log == []
     assert h.effects.prepared == [admitted]
     assert h.effects.failed == []
+
+
+# -- deferred receive publication ----------------------------------------------
+
+
+class _ScriptedEvent:
+    """Readiness event stub whose ``query`` answers come from a script."""
+
+    def __init__(self, *answers: bool) -> None:
+        self._answers = list(answers)
+        self.queries = 0
+
+    def query(self) -> bool:
+        self.queries += 1
+        return self._answers.pop(0) if len(self._answers) > 1 else self._answers[0]
+
+    def synchronize(self) -> None:
+        raise AssertionError("a deferred receive fence must be polled, never waited on")
+
+
+def _deferring_harness(fences, **kwargs) -> CoordinatorHarness:
+    """Harness whose coordinator defers receives behind per-request fences.
+
+    ``fences`` maps request id to the event the cache manager hands over;
+    requests absent from it get ``None``, i.e. no fence to wait on.
+    """
+    h = CoordinatorHarness(defer_unready_gen_receives=True, **kwargs)
+    taken = []
+
+    def take(req):
+        taken.append(req.py_request_id)
+        return fences.get(req.py_request_id)
+
+    h.kv_cache_manager.take_disagg_receive_ready = take
+    h.taken_fences = taken
+    return h
+
+
+def test_deferred_receive_starts_only_after_its_fence_is_ready(clock) -> None:
+    """An unready receive is held, not started; the request still leaves
+    DISAGG_GENERATION_INIT so it is not admitted again. The receive starts on
+    the first poll that observes the fence ready, and the transfer timer is
+    stamped then rather than at admission."""
+    fence = _ScriptedEvent(False, True)
+    h = _deferring_harness({1: fence}, kv_transfer_timeout_ms=1000)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert h.taken_fences == [1]
+    assert h.transceiver.call_log == ["check_gen_transfer_status:0"]
+    assert req.state == _RECEIVING
+    assert req.py_kv_transfer_start_time is None
+
+    clock["t"] += 5.0
+    h.coordinator.poll_gen_transfers()
+
+    assert h.transceiver.call_log == [
+        "check_gen_transfer_status:0",
+        "request_and_receive_async:1",
+        "check_gen_transfer_status:0",
+    ]
+    assert fence.queries == 2
+    assert req.state == _RECEIVING
+    assert req.py_kv_transfer_start_time == clock["t"]
+
+    h.coordinator.poll_gen_transfers()
+
+    assert h.transceiver.call_log.count("request_and_receive_async:1") == 1
+    assert fence.queries == 2
+    assert h.effects.failed == []
+
+
+def test_deferred_receives_publish_independently_and_in_admission_order() -> None:
+    """A ready or fence-less request starts at admission while an unready one
+    waits; each starts once, in admission order, as its own fence completes."""
+    late = _ScriptedEvent(False, True)
+    h = _deferring_harness({1: _ScriptedEvent(True), 2: late})
+    first, second, unfenced = _gen_init(h, 1), _gen_init(h, 2), _gen_init(h, 3)
+
+    h.coordinator.receive_gen_init([first, second, unfenced])
+
+    assert h.transceiver.call_log == [
+        "request_and_receive_async:1",
+        "request_and_receive_async:3",
+        "check_gen_transfer_status:0",
+    ]
+
+    h.coordinator.poll_gen_transfers()
+
+    assert h.transceiver.call_log[3:] == [
+        "request_and_receive_async:2",
+        "check_gen_transfer_status:0",
+    ]
+    assert [req.state for req in (first, second, unfenced)] == [_RECEIVING] * 3
+
+
+def test_forgotten_deferred_receive_is_never_published() -> None:
+    """A request freed while its receive waits is dropped from the queue, so
+    a later ready fence does not start a receive into freed blocks."""
+    fence = _ScriptedEvent(False)
+    h = _deferring_harness({1: fence})
+    req = _gen_init(h, 1)
+    h.coordinator.receive_gen_init([req])
+
+    h.coordinator.forget_request(1)
+    fence._answers = [True]
+    h.coordinator.poll_gen_transfers()
+
+    assert "request_and_receive_async:1" not in h.transceiver.call_log
+    assert fence.queries == 1
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [LlmRequestState.DISAGG_TRANS_ERROR, LlmRequestState.GENERATION_COMPLETE],
+)
+def test_deferred_receive_of_a_terminated_request_is_dropped_unpublished(
+    terminal_state,
+) -> None:
+    """A request that failed or finished while its receive waited is removed
+    on the next poll without querying its fence or starting the receive. It
+    stays active, as it does until the executor's error or completion pass
+    retires it, so the drop is decided by the state alone."""
+    fence = _ScriptedEvent(False)
+    h = _deferring_harness({1: fence})
+    req = _gen_init(h, 1)
+    h.coordinator.receive_gen_init([req])
+    req.state = terminal_state
+    fence._answers = [True]
+
+    h.coordinator.poll_gen_transfers()
+    h.coordinator.poll_gen_transfers()
+
+    assert "request_and_receive_async:1" not in h.transceiver.call_log
+    assert fence.queries == 1
+    assert req.state == terminal_state
+
+
+@pytest.mark.parametrize(
+    "mode_env",
+    [
+        pytest.param({"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1"}, id="sync"),
+        pytest.param({"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY": "1"}, id="gen_only_benchmark"),
+    ],
+)
+def test_deferral_takes_no_fence_outside_async_transfer_mode(monkeypatch, mode_env) -> None:
+    """Deferral applies only to asynchronous receives: in the other modes the
+    fence stays with the cache manager, which waits on it itself."""
+    for name, value in mode_env.items():
+        monkeypatch.setenv(name, value)
+    h = _deferring_harness({1: _ScriptedEvent(False)})
+
+    h.coordinator.receive_gen_init([_gen_init(h, 1)])
+
+    assert h.taken_fences == []
+
+
+def test_without_deferral_no_fence_is_taken_and_receives_start_at_admission() -> None:
+    """The default coordinator leaves the fence to the cache manager and
+    starts every receive at admission."""
+    h = CoordinatorHarness()
+    h.kv_cache_manager.take_disagg_receive_ready = Mock()
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    h.kv_cache_manager.take_disagg_receive_ready.assert_not_called()
+    assert h.transceiver.call_log[0] == "request_and_receive_async:1"
 
 
 # -- receive completion -------------------------------------------------------
@@ -349,7 +633,9 @@ def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyEx
         }
     )
     executor.sampler = SimpleNamespace(setup_sampler_step=record_batch("sampler"))
-    executor.model_engine = SimpleNamespace(enable_spec_decode=False)
+    executor.model_engine = SimpleNamespace()
+    executor.draft_model_engine = None
+    executor.enable_spec_decode = False
     executor._handle_errors = Mock()
 
     finish = coordinator.try_finish_gen_receive

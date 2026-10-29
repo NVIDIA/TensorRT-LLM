@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners import common
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     apply_position_id_offset,
@@ -14,8 +15,10 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     get_padding_params,
     get_top_level_model,
     make_scheduled_inputs,
+    pad_input_tokens,
     prepare_multimodal_indices,
     ship_multimodal_indices,
+    token_model_inputs,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
@@ -56,7 +59,12 @@ def test_get_all_rank_num_tokens_uses_tp_collective() -> None:
     mapping = SimpleNamespace(has_cp_helix=lambda: False)
 
     result = get_all_rank_num_tokens(
-        SimpleNamespace(num_tokens=5),
+        SimpleNamespace(
+            get_adp_token_counts=lambda: [5],
+            set_adp_token_counts=lambda counts: AttentionMetadata.set_adp_token_counts(
+                None, counts
+            ),
+        ),
         enable_attention_dp=True,
         mapping=mapping,
         dist=dist,
@@ -73,7 +81,12 @@ def test_get_all_rank_num_tokens_reports_post_reduce_scatter_helix_count() -> No
     mapping = SimpleNamespace(cp_size=2, has_cp_helix=lambda: True)
 
     result = get_all_rank_num_tokens(
-        SimpleNamespace(num_tokens=5),
+        SimpleNamespace(
+            get_adp_token_counts=lambda: [5],
+            set_adp_token_counts=lambda counts: AttentionMetadata.set_adp_token_counts(
+                None, counts
+            ),
+        ),
         enable_attention_dp=True,
         mapping=mapping,
         dist=dist,
@@ -130,6 +143,71 @@ def test_attention_dp_padding_uses_all_rank_context_and_token_counts(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize("position_shape", [(8,), (3, 1, 8)], ids=["flat", "mrope"])
+def test_padded_token_inputs_zero_padding_rows_and_keep_position_layout(
+    position_shape: tuple[int, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_prefill_flag = Mock()
+    monkeypatch.setattr(common, "set_per_request_prefill_cuda_graph_flag", set_prefill_flag)
+    attn_metadata = SimpleNamespace(padded_num_tokens=None, all_rank_num_tokens=None)
+    input_ids = torch.full((8,), 7, dtype=torch.int)
+    position_ids = torch.full(position_shape, 7, dtype=torch.int)
+
+    num_tokens = pad_input_tokens(
+        attn_metadata,
+        3,
+        1,
+        None,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        dist=None,
+        enable_attention_dp=False,
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+        prefill_cuda_graph_num_tokens=[4, 8],
+    )
+    inputs = token_model_inputs(
+        attn_metadata,
+        "resources",
+        input_ids=input_ids,
+        position_ids=position_ids,
+        num_tokens=num_tokens,
+        multimodal_params=[],
+    )
+
+    assert num_tokens == 4
+    assert attn_metadata.padded_num_tokens == 4
+    set_prefill_flag.assert_called_once_with(True)
+    assert input_ids.tolist() == [7, 7, 7, 0, 7, 7, 7, 7]
+    assert position_ids[..., 3].eq(0).all() and position_ids[..., 4:].eq(7).all()
+    assert inputs["input_ids"].tolist() == [7, 7, 7, 0]
+    expected_positions = (1, 4) if len(position_shape) == 1 else (3, 1, 4)
+    assert tuple(inputs["position_ids"].shape) == expected_positions
+    assert inputs["resource_manager"] == "resources"
+
+
+def test_unpadded_token_inputs_leave_buffers_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(common, "set_per_request_prefill_cuda_graph_flag", Mock())
+    attn_metadata = SimpleNamespace(padded_num_tokens=5, all_rank_num_tokens=None)
+    input_ids = torch.full((8,), 7, dtype=torch.int)
+
+    num_tokens = pad_input_tokens(
+        attn_metadata,
+        3,
+        0,
+        None,
+        input_ids=input_ids,
+        position_ids=torch.full((8,), 7, dtype=torch.int),
+        dist=None,
+        enable_attention_dp=False,
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
+        prefill_cuda_graph_num_tokens=[],
+    )
+
+    assert num_tokens == 3
+    assert attn_metadata.padded_num_tokens is None
+    assert input_ids.eq(7).all()
 
 
 def test_position_offset_helpers_preserve_identity_and_unwrap_models() -> None:

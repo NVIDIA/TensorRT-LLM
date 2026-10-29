@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 #include <cuda_profiler_api.h>
@@ -384,6 +400,58 @@ bool benchmark_and_verify(int m, int n, int k, int warmup, int iter, bool debug 
     printf("cuda kernel cost time %.6f\n", time1);
     return pass_cuda_kernel;
 }
+
+#if defined(ENABLE_FP8) && defined(ENABLE_BF16)
+TEST(Kernel, Fp8WideOutput)
+{
+    constexpr int m = 8;
+    constexpr int n = 131072;
+    constexpr int k = 16;
+    constexpr float kScaleA = 0.5F;
+    constexpr float kScaleB = 0.25F;
+    constexpr float kAlpha = kScaleA * kScaleB;
+    std::vector<__nv_fp8_e4m3> activation(static_cast<size_t>(m) * k);
+    std::vector<__nv_fp8_e4m3> weight(static_cast<size_t>(n) * k);
+    std::vector<__nv_bfloat16> reference(static_cast<size_t>(m) * n);
+    std::vector<__nv_bfloat16> output(reference.size());
+    std::mt19937 generator(42);
+    std::uniform_int_distribution<int> distribution(-4, 4);
+    for (auto& value : activation)
+    {
+        value = static_cast<__nv_fp8_e4m3>(static_cast<float>(distribution(generator)));
+    }
+    for (auto& value : weight)
+    {
+        value = static_cast<__nv_fp8_e4m3>(static_cast<float>(distribution(generator)));
+    }
+
+    CudaBuffer deviceActivation(activation.size() * sizeof(activation[0]));
+    CudaBuffer deviceWeight(weight.size() * sizeof(weight[0]));
+    CudaBuffer deviceOutput(output.size() * sizeof(output[0]));
+    CudaBuffer scales(2 * sizeof(float));
+    float hostScales[] = {kScaleA, kScaleB};
+    deviceActivation.copy_from(activation.data());
+    deviceWeight.copy_from(weight.data());
+    scales.copy_from(hostScales);
+    // All-one BF16 bits are NaN, so unwritten elements fail the comparison.
+    ASSERT_EQ(cudaMemset(deviceOutput.data(), 0xFF, output.size() * sizeof(output[0])), cudaSuccess);
+    Params const params{deviceActivation.data(), deviceWeight.data(), deviceOutput.data(), m, n, k,
+        scales.data<float>(), scales.data<float>() + 1, CUDA_R_8F_E4M3, CUDA_R_16BF};
+
+    ASSERT_TRUE(cudaCoreGemmDispatcher(params, nullptr));
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(nullptr), cudaSuccess);
+    deviceOutput.copy_to(output.data());
+    run_cpu<__nv_fp8_e4m3, __nv_bfloat16>(weight.data(), activation.data(), kAlpha, params, reference.data());
+
+    // Small integer inputs and a power-of-two scale keep FP32 arithmetic exact.
+    for (size_t i = 0; i < output.size(); ++i)
+    {
+        float const actual = static_cast<float>(output[i]);
+        ASSERT_EQ(actual, static_cast<float>(reference[i])) << "row=" << i / n << ", column=" << i % n;
+    }
+}
+#endif
 
 #ifdef ENABLE_FP8
 TEST(Kernel, Fp8Gemv)

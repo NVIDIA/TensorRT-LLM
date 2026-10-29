@@ -31,8 +31,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalParams)
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -58,7 +57,8 @@ from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
+                       TORCH_LLMARGS_REMOVED_ARGS, ExecutorMemoryType,
+                       RuntimeMemoryStatus, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -67,6 +67,11 @@ from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
+
+_RUNTIME_MEMORY_TYPES = tuple(
+    memory_type for memory_type in ExecutorMemoryType
+    if memory_type not in (ExecutorMemoryType.INIT_KV_CACHE,
+                           ExecutorMemoryType.INIT_EXTRA_RESOURCES))
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -366,6 +371,8 @@ class BaseLLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        enable_routing_load = kwargs.pop("_enable_routing_load", False)
+        openengine_discovery = kwargs.pop("_openengine_discovery", None)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
         self._disaggregated_params: dict | None = None
@@ -394,14 +401,6 @@ class BaseLLM:
                     f"Unknown backend: {backend!r}. Supported backends are "
                     "'pytorch'.")
 
-            # TRTLLM_MODELING_V2=require promises the run measured a modeling_v2
-            # target. Only the pytorch backend reaches the resolver that could
-            # select one, so on any other backend the promise would be broken
-            # silently -- the one failure that mode exists to prevent.
-            from .._torch._experimental.modeling_v2 import \
-                assert_backend_can_route
-            assert_backend_can_route(backend)
-
             # check the kwargs and raise ValueError directly
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
@@ -425,6 +424,8 @@ class BaseLLM:
                                      revision=revision,
                                      tokenizer_revision=tokenizer_revision,
                                      **kwargs)
+            self.args._enable_routing_load = enable_routing_load
+            self.args._openengine_discovery = openengine_discovery
 
             self._capture_usage_startup(llm_args=self.args)
 
@@ -435,6 +436,18 @@ class BaseLLM:
 
         finally:
             logger.set_level(log_level)  # restore the log level
+
+        # Before the ranks these args go to are spawned and before the usage
+        # report reads them, so that one description of the deployment reaches
+        # both. Imported behind the check so that no other deployment loads
+        # this connector's package, which pulls in its worker and scheduler.
+        # The registry names every preset's module without importing any of
+        # them, and tolerates an absent connector config.
+        from .._torch.pyexecutor.connectors.registry import uses_connector
+        if uses_connector(self.args.kv_connector_config, "mooncake-store"):
+            from .._torch.pyexecutor.connectors.mooncake_store.settings import \
+                apply_effective_settings
+            apply_effective_settings(self.args)
 
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
@@ -454,9 +467,9 @@ class BaseLLM:
 
         # Attached serving frontends connect to an already-running worker:
         # they must not spawn an MPI session (see GenerationExecutor.create).
-        is_attached_frontend = os.getenv(
+        self._is_attached_frontend = os.getenv(
             "TLLM_EXECUTOR_ATTACH_INFO") is not None
-        if self.args.parallel_config.is_multi_gpu and not is_attached_frontend:
+        if self.args.parallel_config.is_multi_gpu and not self._is_attached_frontend:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
@@ -964,42 +977,25 @@ class BaseLLM:
             # TODO(TRTLLM-12869): Pass encoder-side MM layout through
             # DisaggregatedParams so prefill does not rebuild prompt tokens,
             # positions, lengths, runs, special offsets, and cumsum here.
-            disagg_mm_inputs = (
+            prompt_token_ids, multimodal_params = (
                 self.input_processor.build_disagg_prefill_multimodal_inputs(
-                    inputs, mm_handles))
-            if not isinstance(disagg_mm_inputs, DisaggPrefillMultimodalInputs):
+                    inputs,
+                    mm_handles,
+                    mm_hashes=disaggregated_params.multimodal_hashes))
+            if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
-                    "DisaggPrefillMultimodalInputs")
-            prompt_token_ids = disagg_mm_inputs.prompt_token_ids
+                    "(prompt_token_ids, MultimodalParams)")
             prompt = inputs.get("prompt", None)
             if is_gen_only:
                 raise ValueError(
                     "Generation-only mode should not need multimodal parameters"
                 )
             else:
-                mm_hashes = disaggregated_params.multimodal_hashes
-                multimodal_input = disagg_mm_inputs.to_multimodal_input(
-                    mm_hashes)
-                # E/P handoff carries SharedTensorContainer dicts. Park them under the
-                # embedding key so BaseWorker's recursive to_tensor("multimodal_data")
-                # restores local tensor views before PyTorch forward. Until then this
-                # key holds handles, not tensors.
-                multimodal_data = {
-                    "multimodal_embedding":
-                    mm_handles,
-                    "multimodal_embedding_lengths":
-                    (disagg_mm_inputs.multimodal_embedding_lengths),
-                }
-                if disagg_mm_inputs.special_token_offsets is not None:
-                    multimodal_data["special_token_offsets"] = (
-                        disagg_mm_inputs.special_token_offsets)
-                if disagg_mm_inputs.item_types is not None:
-                    multimodal_data["layout_metadata"] = {
-                        "item_types": disagg_mm_inputs.item_types
-                    }
+                # BaseWorker resolves embedding handles to local tensor views.
+                multimodal_data = multimodal_params.multimodal_data
                 if disaggregated_params.mrope_position_ids_handle is not None:
-                    # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
+                    # NOTE: `ModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None
                     mrope_config = {}
                     mrope_config[
@@ -1012,10 +1008,6 @@ class BaseLLM:
                 maybe_compute_mm_embed_cumsum(
                     prompt_token_ids, {"multimodal_data": multimodal_data},
                     cast(BaseMultimodalInputProcessor, self.input_processor))
-                multimodal_params = MultimodalParams(
-                    multimodal_input=multimodal_input,
-                    multimodal_data=multimodal_data,
-                )
         # This condition is to ensure that this branch is not hit for models that expand
         # placeholder token IDs with MM data.
         elif ("prompt_token_ids" in inputs
@@ -1025,7 +1017,7 @@ class BaseLLM:
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
-                # PyTorchModelEngine assumes both are present when using mrope.
+                # ModelEngine assumes both are present when using mrope.
                 if disaggregated_params.mrope_position_deltas_handle is None:
                     raise RuntimeError(
                         "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
@@ -1082,7 +1074,7 @@ class BaseLLM:
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
                         'multimodal_data'),
-                    mm_item_order=inputs.get("mm_item_order"))
+                )
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
@@ -1582,8 +1574,8 @@ class BaseLLM:
         spec_dec_mode = getattr(self.args.speculative_config, "spec_dec_mode",
                                 None)
         # use_one_engine() is exactly the set of modes get_spec_decoder hands to
-        # SpecSampler; the two-model modes keep TorchSampler, which implements
-        # all of these.
+        # SpecSampler; the drafter-based modes keep TorchSampler, which
+        # implements all of these.
         if spec_dec_mode is None or not spec_dec_mode.use_one_engine():
             return
         # The module rather than the symbol: the fully-qualified import runs to
@@ -1622,8 +1614,10 @@ class BaseLLM:
                 "(Router Replay): routes are not captured otherwise.")
 
     def _build_model(self):
-        model_loader = CachedModelLoader(self.args,
-                                         mpi_session=self.mpi_session)
+        model_loader = CachedModelLoader(
+            self.args,
+            mpi_session=self.mpi_session,
+            is_attached_frontend=self._is_attached_frontend)
         self._hf_model_dir = model_loader()
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
@@ -1931,10 +1925,117 @@ class _TorchLLM(BaseLLM):
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
 
+    def _check_runtime_memory_enabled(self) -> None:
+        if self.args.sleep_config is None:
+            raise ValueError(
+                "Runtime memory checkpointing is not enabled. Set sleep_config "
+                "when constructing the LLM.")
+
+    @staticmethod
+    def _normalize_runtime_memory_tags(
+        tags: Sequence[ExecutorMemoryType | str] | None,
+        *,
+        default_tags: Sequence[ExecutorMemoryType],
+    ) -> list[ExecutorMemoryType]:
+        if tags is None:
+            return list(default_tags)
+        if not tags:
+            raise ValueError("Runtime memory tags must not be empty.")
+
+        normalized = []
+        seen = set()
+        for tag in tags:
+            try:
+                memory_type = (tag if isinstance(tag, ExecutorMemoryType) else
+                               ExecutorMemoryType(tag))
+            except (TypeError, ValueError) as error:
+                valid = ", ".join(item.value for item in _RUNTIME_MEMORY_TYPES)
+                raise ValueError(
+                    f"Invalid runtime memory tag {tag!r}. Expected one of: {valid}"
+                ) from error
+            if memory_type in (ExecutorMemoryType.INIT_KV_CACHE,
+                               ExecutorMemoryType.INIT_EXTRA_RESOURCES):
+                raise ValueError(
+                    f"Runtime memory tag {memory_type.value!r} is an "
+                    "initialization-only tag and cannot be released.")
+            if memory_type not in seen:
+                normalized.append(memory_type)
+                seen.add(memory_type)
+        return normalized
+
+    @set_api_status("prototype")
+    def get_memory_status(self) -> RuntimeMemoryStatus:
+        """Return the authoritative runtime-memory checkpoint status.
+
+        Returns:
+            tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus: The reconciled
+            state reported by the runtime workers.
+        """
+        self._check_runtime_memory_enabled()
+        replies = self._collective_rpc("get_memory_status")
+        statuses = [
+            RuntimeMemoryStatus.model_validate(reply) for reply in replies
+        ]
+        if not statuses:
+            raise RuntimeError("No worker returned runtime-memory status.")
+        expected = statuses[0]
+        if any(status != expected for status in statuses[1:]):
+            raise RuntimeError(
+                "Runtime-memory state diverged across workers: "
+                f"{[status.model_dump(mode='json') for status in statuses]}")
+        return expected
+
+    @set_api_status("prototype")
+    def release(
+        self,
+        tags: Sequence[ExecutorMemoryType | str] | None = None,
+    ) -> None:
+        """Checkpoint and release selected GPU runtime memory.
+
+        Args:
+            tags (Sequence[tensorrt_llm.llmapi.ExecutorMemoryType | str], optional):
+                Memory types to release. When omitted, release every
+                sleep-managed runtime memory type.
+
+        Returns:
+            None: The call returns after all selected memory has been released.
+        """
+        self._check_runtime_memory_enabled()
+        normalized = self._normalize_runtime_memory_tags(
+            tags, default_tags=_RUNTIME_MEMORY_TYPES)
+        self._collective_rpc("sleep", ([tag.value for tag in normalized], ))
+
+    @set_api_status("prototype")
+    def resume(
+        self,
+        tags: Sequence[ExecutorMemoryType | str] | None = None,
+    ) -> None:
+        """Restore selected GPU runtime memory.
+
+        Args:
+            tags (Sequence[tensorrt_llm.llmapi.ExecutorMemoryType | str], optional):
+                Memory types to restore. When omitted, restore every currently
+                parked memory type.
+
+        Returns:
+            None: The call returns after all selected memory has been restored.
+        """
+        self._check_runtime_memory_enabled()
+        status = self.get_memory_status()
+        if status.state not in ("running", "parked"):
+            raise RuntimeError(
+                f"Cannot resume runtime memory while state is '{status.state}'."
+            )
+        normalized = self._normalize_runtime_memory_tags(
+            tags, default_tags=status.parked_tags)
+        if normalized:
+            self._collective_rpc("wakeup",
+                                 ([tag.value for tag in normalized], ))
+
     def _reject_token_encoder_config_without_buckets(self) -> None:
         """Reject a bucket-less token-encoder config before weights load.
 
-        `PyTorchModelEngine.__init__` asks the instantiated model and keeps the
+        `ModelEngine.__init__` asks the instantiated model and keeps the
         last word; this asks the class its architecture resolves to. It defers
         wherever that class might not be the one the engine builds, so it can
         only reject earlier, never differently. A model that installs
@@ -2033,8 +2134,6 @@ class _TorchLLM(BaseLLM):
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(
-            None,
-            batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
@@ -2056,7 +2155,10 @@ class _TorchLLM(BaseLLM):
         # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
         accepted_keys = (set(TorchLlmArgs.model_fields.keys())
                          | TORCH_LLMARGS_REMOVED_ARGS
-                         | {'_mpi_session', 'backend'})
+                         | {
+                             '_mpi_session', '_enable_routing_load',
+                             '_openengine_discovery', 'backend'
+                         })
 
         # Check if any arguments not supported by the PyTorch backend are passed.
         unsupported_args = [key for key in kwargs if key not in accepted_keys]

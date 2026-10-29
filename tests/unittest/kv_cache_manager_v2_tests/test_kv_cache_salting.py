@@ -14,6 +14,7 @@
 # limitations under the License.
 """Pure unit tests for KV cache reuse scopes."""
 
+import hashlib
 import unittest
 from importlib.util import find_spec
 from typing import TYPE_CHECKING
@@ -39,15 +40,47 @@ def _root_key(scope):
 
 
 class TestReuseScope(unittest.TestCase):
+    def test_string_scope_tuple_contract(self) -> None:
+        for cache_salt in (None, "", "tenant-A", "tenant-中文", "a\x00b"):
+            with self.subTest(cache_salt=cache_salt):
+                scope = ReuseScope(7, cache_salt)
+                self.assertEqual(scope.salt, cache_salt)
+                self.assertEqual(scope, ReuseScope(7, cache_salt))
+                self.assertEqual(scope, (7, cache_salt))
+                self.assertEqual(hash(scope), hash((7, cache_salt)))
+                self.assertEqual(tuple(scope), (7, cache_salt))
+                self.assertEqual(len(scope), 2)
+                self.assertEqual(scope[-1], cache_salt)
+
+    def test_scope_hashes_full_string_bytes(self) -> None:
+        for lora_id in (None, 0, 7):
+            for salt in (None, "", "tenant-A", "tenant-中文", "a\x00b"):
+                with self.subTest(lora_id=lora_id, salt=salt):
+                    mask = (lora_id is not None) | ((salt is not None) << 1)
+                    encoded = bytes([mask])
+                    if lora_id is not None:
+                        encoded += lora_id.to_bytes(8, "little")
+                    if salt is not None:
+                        payload = salt.encode("utf-8")
+                        encoded += len(payload).to_bytes(8, "little") + payload
+                    self.assertEqual(
+                        _root_key(ReuseScope(lora_id, salt)), hashlib.sha256(encoded).digest()
+                    )
+
+    def test_integer_salt_is_not_implicitly_coerced(self) -> None:
+        with self.assertRaises(TypeError):
+            ReuseScope(salt=123)
+
     def test_reuse_scope_seeds_distinct_keys(self) -> None:
-        # Distinct reuse scopes -- including the None-vs-0 cases for each field --
+        # Distinct reuse scopes -- including absent-vs-empty values --
         # must seed distinct radix-tree keys.
         scopes = [
             ReuseScope(),
             ReuseScope(lora_id=0),
-            ReuseScope(salt=0),
-            ReuseScope(lora_id=0, salt=0),
-            ReuseScope(lora_id=7, salt=11),
+            ReuseScope(salt=""),
+            ReuseScope(salt="0"),
+            ReuseScope(lora_id=0, salt=""),
+            ReuseScope(lora_id=7, salt="11"),
         ]
 
         roots = [_root_key(scope) for scope in scopes]
@@ -57,11 +90,11 @@ class TestReuseScope(unittest.TestCase):
 
     def test_blockchain_keys_are_seeded_by_reuse_scope(self) -> None:
         tokens = [TokenId(1), TokenId(2), TokenId(3), TokenId(4)]
-        scope = ReuseScope(lora_id=7, salt=11)
+        scope = ReuseScope(lora_id=7, salt="11")
 
         keys = list(sequence_to_blockchain_keys(2, scope, tokens))
-        same_scope_keys = list(sequence_to_blockchain_keys(2, ReuseScope(7, 11), tokens))
-        different_scope_keys = list(sequence_to_blockchain_keys(2, ReuseScope(7, 12), tokens))
+        same_scope_keys = list(sequence_to_blockchain_keys(2, ReuseScope(7, "11"), tokens))
+        different_scope_keys = list(sequence_to_blockchain_keys(2, ReuseScope(7, "12"), tokens))
 
         self.assertEqual(keys, same_scope_keys)
         self.assertNotEqual([key for _, key in keys], [key for _, key in different_scope_keys])
@@ -70,7 +103,7 @@ class TestReuseScope(unittest.TestCase):
         # The first blockchain key is the reuse-scope digest, and each subsequent key
         # is that chain extended by one block of tokens.
         tokens = [TokenId(1), TokenId(2), TokenId(3), TokenId(4)]
-        scope = ReuseScope(lora_id=7, salt=11)
+        scope = ReuseScope(lora_id=7, salt="11")
 
         keys = list(sequence_to_blockchain_keys(2, scope, tokens))
         self.assertEqual([chunk for chunk, _ in keys], [[], [1, 2], [3, 4]])
@@ -88,12 +121,12 @@ class TestReuseScope(unittest.TestCase):
             return [key for _, key in sequence_to_blockchain_keys(2, scope, tokens)][1:]
 
         self.assertNotEqual(
-            block_keys(ReuseScope(lora_id=7, salt=11)),
-            block_keys(ReuseScope(lora_id=7, salt=12)),
+            block_keys(ReuseScope(lora_id=7, salt="11")),
+            block_keys(ReuseScope(lora_id=7, salt="12")),
         )
         self.assertEqual(
-            block_keys(ReuseScope(lora_id=7, salt=11)),
-            block_keys(ReuseScope(7, 11)),
+            block_keys(ReuseScope(lora_id=7, salt="11")),
+            block_keys(ReuseScope(7, "11")),
         )
 
 

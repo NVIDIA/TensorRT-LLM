@@ -94,6 +94,8 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+@Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
@@ -103,6 +105,7 @@ def globalVars = [
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
     // Pre-declared so updateMapWithJson() populates it from the parent: that
     // helper only updates keys already present here, so an absent key is
     // silently dropped -- which for this one would mean running unpinned
@@ -192,7 +195,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     case "agent":
         containerConfig = """
                   - name: python3
-                    image: urm.nvidia.com/docker/python:3.12-slim
+                    image: artifactory.pdx.nvidia.com/docker-remote/python:3.12-slim
                     command: ['cat']
                     tty: true
                     resources:
@@ -307,10 +310,9 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     //
     // boltOptimizeWheel, by contrast, IS declared, so it reliably arrives. Key
     // off it and let a BOLT request carry itself past both gates. The bypass is
-    // deliberately narrow -- one arch, one dockerfile stage, only when BOLT was
-    // asked for -- so the nvbug's blast radius stays at the SBSA release image
-    // instead of being reopened for every image this job builds.
-    def boltWheelRequired = BOLT_OPTIMIZE_WHEEL && arch == "sbsa" && dockerfileStage == "release"
+    // limited to SBSA release images that request BOLT optimization.
+    def isReleaseStage = dockerfileStage in ["release", "tritonrelease"]
+    def boltWheelRequired = BOLT_OPTIMIZE_WHEEL && arch == "sbsa" && isReleaseStage
 
     if (!boltWheelRequired) {
         if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
@@ -337,8 +339,8 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
         return ""
     }
 
-    if (dockerfileStage != "release") {
-        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not release"
+    if (!isReleaseStage) {
+        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not a release image stage"
         return ""
     }
 
@@ -790,7 +792,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
-            dockerfileStage: "release",
+            dockerfileStage: "tritonrelease",
         ],
         (stageNames.internalReleaseSBSA): [
             target: "trtllm",
@@ -798,7 +800,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64",
-            dockerfileStage: "release",
+            dockerfileStage: "tritonrelease",
         ],
         (stageNames.ciImageX86): [:],
         (stageNames.ciImageSBSA): [
@@ -976,7 +978,7 @@ pipeline {
         booleanParam(
             name: "useWheelFromBuildStage",
             defaultValue: false,
-            description: "Install the wheel from the build-stage tarball instead of compiling one inside the image. Read since Aug 2025 but never DECLARED, so params.useWheelFromBuildStage was always null and prepareWheelFromBuildStage() returned early on every run -- see nvbug 5433581, whose temporary kill switch was never reverted. Declared here so the flag is at least capable of being set; it stays false by default, and nothing turns it on. boltOptimizeWheel does NOT depend on it: a BOLT request carries itself past this gate for the SBSA release image only."
+            description: "Install the build-stage wheel instead of compiling inside the image. The declared job default is false; the nightly release caller explicitly enables this option. SBSA release images with boltOptimizeWheel enabled require the build-stage wheel independently of this flag."
         )
         booleanParam(
             name: "boltOptimizeWheel",
@@ -999,7 +1001,7 @@ pipeline {
     }
     environment {
         CCACHE_DIR="${CCACHE_DIR}"
-        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // Picked up by docker/Makefile and handed to `docker buildx build` as a
         // BuildKit secret, which authenticates the github.com clones inside the
         // image build (docker/common/github_auth.sh).

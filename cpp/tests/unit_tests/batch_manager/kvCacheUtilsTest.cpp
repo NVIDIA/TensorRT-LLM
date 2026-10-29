@@ -56,14 +56,14 @@ TEST_F(BlockIteratorTest, BasicTest)
     for (auto idx : blockIds)
     {
         auto blockTensor = tr::ITensor::slice(pool, blockIds.at(idx), 1);
-        std::fill_n(tr::bufferCast<DataType>(*blockTensor), blockTensor->getSize(), idx);
+        std::fill_n(blockTensor->getBufferPtr<DataType>(), blockTensor->getSize(), idx);
     }
     auto range = BlockRangeForWindow(nullptr, 0, std::move(blockIds), std::move(pool));
     auto begin = range.begin();
     auto end = range.end();
     auto allEqualTo = [](tr::ITensor const& tensor, auto x) -> bool
     {
-        auto const* begin = tr::bufferCast<decltype(x)>(tensor);
+        auto const* begin = tensor.getBufferPtr<decltype(x)>();
         auto const* end = begin + tensor.getSize();
         return std::all_of(begin, end, [x](auto n) { return n == x; });
     };

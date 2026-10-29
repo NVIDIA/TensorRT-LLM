@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -122,12 +122,6 @@ BufferManager::IBufferPtr BufferManager::managed(std::size_t size, tensorrt_llm:
 BufferManager::ITensorPtr BufferManager::managed(tensorrt_llm::Dims dims, tensorrt_llm::DataType type)
 {
     return std::make_unique<UVMTensor>(dims, type);
-}
-
-BufferManager::ITensorPtr BufferManager::ipcNvls(
-    std::set<int> ranks, tensorrt_llm::Dims dims, tensorrt_llm::DataType type)
-{
-    return std::make_unique<MulticastTensor>(dims, type, ranks);
 }
 
 void BufferManager::setZero(IBuffer& buffer) const

@@ -17,7 +17,7 @@
 ConfigurableMoE-compatible MoE backend wrapping the ported
 architecture-specific MegaMoE kernels (fused dispatch + FC1 + activation + FC2 +
 combine) from
-``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``. The kernel is
+``tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe``. The kernel is
 invoked through the standard CuteDSL TunableRunner / torch op pattern;
 the runner + op live in
 ``tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py``. This
@@ -240,7 +240,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             return False, reason
 
     try:
-        from ....cute_dsl_kernels.cutedsl_megamoe import (  # noqa: F401
+        from ....moe.kernels.cutedsl_megamoe import (  # noqa: F401
             BlackwellInferenceMegaMoE,
             RubinInferenceGenphaseMegaMoE,
             RubinInferenceLocalMegaMoE,
@@ -249,7 +249,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
     except ImportError as e:
         reason = (
             f"Ported MegaMoE NVFP4 kernel package failed to import: "
-            f"{e!r}. Verify tensorrt_llm/_torch/cute_dsl_kernels/"
+            f"{e!r}. Verify tensorrt_llm/_torch/moe/kernels/"
             f"cutedsl_megamoe is in the install tree."
         )
         _RUNTIME_PROBE_CACHE[sm_version] = reason
@@ -375,8 +375,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     The per-architecture kernel variants dispatch inside this one identity,
     because architecture is not an id segment: all four segments hold whichever
     kernel runs. The class name carries its ``kernel_name`` segment because
-    ``CuteDslFusedMoE``'s ``trtllm.cutedsl.grouped_gemm.nvfp4`` will differ from
-    this id in that field alone.
+    ``TrtllmCutedslGroupedGemmNvfp4Impl``'s ``trtllm.cutedsl.grouped_gemm.nvfp4``
+    differs from this id in that field alone.
 
     Capability gate (``can_implement``): SM100/103/107 + NVFP4 +
     bfloat16 activation + CUDA 13 Cutlass DSL runtime present.
@@ -517,16 +517,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"MegaMoECuteDsl requires num_slots ({d.num_slots}) "
                 f"divisible by ep_size ({d.ep_size}).",
             )
-        # The fused kernel returns a globally combined routed output. MiniMax-M3
-        # accounts for that when composing routed and shared experts; the other
-        # current model wrappers would apply a second AllReduce under TEP.
-        if d.parallel_size > 1 and not d.use_dp and not is_minimax_swiglu_bias:
-            return _reject(
-                MoERejectReason.TOPOLOGY_UNSUPPORTED,
-                "MegaMoECuteDsl supports TEP only for bias-free MiniMax-style "
-                "SwigluBias; other model compositions would reduce its already-global "
-                "routed output twice.",
-            )
+        # TEP (attention TP + MoE EP) needs no gate here: the fused kernel
+        # returns a globally combined routed output, and FusedCommMoEScheduler
+        # hands it to callers that reduce externally as a rank partial. It is
+        # correct but not cheap: every TP rank dispatches the same replicated
+        # tokens, so expert compute runs parallel_size times (the reason
+        # MegaMoEDeepGemm rejects TEP). validate_configurable_moe warns once.
         # ADP wider than EP would need an outer allgather + reducescatter
         # wrapper that this backend does not have.
         if d.use_dp and d.parallel_size > 1 and d.ep_size != d.parallel_size:
@@ -594,9 +590,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # Preserve V4's pre-quantization routing weights; other models apply them after FC2.
-        self.apply_topk_in_fc1 = "DeepseekV4ForCausalLM" in (
-            getattr(model_config.pretrained_config, "architectures", None) or ()
+        # DeepSeek V4 and V4.1 apply routing weights before FC2 input quantization.
+        architectures = getattr(model_config.pretrained_config, "architectures", None) or ()
+        self.apply_topk_in_fc1 = any(
+            architecture in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+            for architecture in architectures
         )
         self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
 
@@ -801,6 +799,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             raise ValueError(
                 f"MegaMoECuteDsl requires moe_max_num_tokens > 0; got {moe.moe_max_num_tokens}."
             )
+        if not moe.use_dp and moe.parallel_size > 1:
+            logger.warning_once(
+                f"MegaMoECuteDsl under attention TP (TEP, tp_size="
+                f"{moe.parallel_size}) dispatches the same tokens from every TP "
+                f"rank, so expert compute is repeated {moe.parallel_size} times. "
+                "Prefer enable_attention_dp=True for throughput.",
+                key="megamoe_cutedsl_tep_redundant_compute",
+            )
         # Dynamic EPLB is intentionally allowed: the quant method
         # registers mega-format derived parameters alongside the raw
         # NVFP4 family so per-slot migration stays byte-consistent.
@@ -867,13 +873,27 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
         os.environ["MASTER_ADDR"] = str(host)
         os.environ["MASTER_PORT"] = str(port)
+        # The executor already bound this rank's device before the model was
+        # built (base_worker: global_mpi_rank() % device_count). Re-deriving it
+        # here could pick a different GPU (e.g. a disagg ctx/gen pair sharing a
+        # node) and would move only the layers built after this point, so bind
+        # NCCL to the current device instead of selecting one.
+        device_id = None
+        if torch.cuda.is_available():
+            device_id = torch.device("cuda", torch.cuda.current_device())
         logger.info(
             f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
             f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
+            f"device={device_id}, "
             f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
             f"EP rendezvous."
         )
-        dist.init_process_group(backend="cuda:nccl,cpu:gloo", rank=rank, world_size=world)
+        dist.init_process_group(
+            backend="cuda:nccl,cpu:gloo",
+            rank=rank,
+            world_size=world,
+            device_id=device_id,
+        )
 
     def _resolve_ep_pg(self):
         """Return the torch.distributed ProcessGroup for the EP sub-world.
@@ -1147,6 +1167,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         registered by the quantization method's ``create_weights``; the
         value defaults to 1.0 until the checkpoint loader sets it.
 
+        A checkpoint that carries a per-channel pre-quant scale (NVFP4_AWQ /
+        NVFP4_ARC) gets it applied before quantization: the quantization
+        method loads it into ``self.fc31_act_scale`` (``[1, hidden]``), and
+        ``fc31_input_scale`` was calibrated on the scaled activation. The
+        kernel itself only ever sees the quantized input.
+
         Empty input (``x.shape[0] == 0``) short-circuits to empty NVFP4
         + empty SF without launching a quantization kernel, so the
         ``FusedCommMoEScheduler`` can call ``quantize_input`` uniformly
@@ -1167,6 +1193,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
             empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
             return empty_x, empty_sf
+        fc31_act_scale = getattr(self, "fc31_act_scale", None)
+        if fc31_act_scale is not None:
+            # Product stays bf16, which is what ``fp4_quantize`` below is given
+            # on every other route into it: ``_SUPPORTED_ACTIVATION_DTYPES``
+            # admits bf16 activations only, so ``fc31_act_scale``, created at
+            # ``module.dtype``, is bf16 as well.
+            x_bf16 = x_bf16 * fc31_act_scale
         x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
             x_bf16,
             self.fc31_input_scale,

@@ -10,11 +10,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.kernels import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.kernels import (
     block_pool,
     block_thresholds,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.predictor import (
     BLOCK_SIZE,
     SolPredictorOutputs,
     predict,
@@ -55,7 +55,7 @@ def _summary_oracle(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, tor
         begin = block_idx * BLOCK_SIZE
         end = min(begin + BLOCK_SIZE, k.shape[1])
         k_summary[:, block_idx] = k[:, begin:end].float().mean(dim=1).to(torch.bfloat16)
-        v_summary[:, block_idx] = v[:, begin:end].float().sum(dim=1).to(torch.bfloat16)
+        v_summary[:, block_idx] = v[:, begin:end].float().mean(dim=1).to(torch.bfloat16)
     return k_summary, v_summary
 
 
@@ -213,7 +213,7 @@ def test_sol_predictor_runtime_scale_and_tau_extremes() -> None:
 
 
 @_REQUIRES_CUDA
-def test_sol_predictor_long_proxy_group_keeps_tail_mass_and_clears_padding_bits() -> None:
+def test_sol_predictor_long_proxy_group_keeps_tail_mean_and_clears_padding_bits() -> None:
     tokens = 16_451
     q, k, _ = _inputs((1, tokens, 1, 128), 31)
     v = torch.ones_like(q)
@@ -225,7 +225,7 @@ def test_sol_predictor_long_proxy_group_keeps_tail_mass_and_clears_padding_bits(
     assert torch.equal(outputs.exact_block_bits, expected)
     torch.testing.assert_close(outputs.k_summary[:, -1], expected_k[:, -1], rtol=1e-2, atol=1e-2)
     assert torch.equal(outputs.v_summary[:, -1], expected_v[:, -1])
-    assert torch.all(outputs.v_summary[:, -1] == 3)
+    assert torch.all(outputs.v_summary == 1)
     assert int(outputs.exact_block_bits[..., -1].to(torch.int64).max()) < 4
 
 

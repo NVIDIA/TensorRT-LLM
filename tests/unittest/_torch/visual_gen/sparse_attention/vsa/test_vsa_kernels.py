@@ -26,7 +26,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.kernels import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa.kernels import (
     blend_coarse_fine,
     sort_last_dim,
     tile_and_pool_cubes,

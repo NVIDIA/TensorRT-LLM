@@ -68,14 +68,12 @@ worker_config:
       enable_padding: true
       max_batch_size: 1280
     kv_cache_config:
-      use_kv_cache_manager_v2: false
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
       dtype: fp8
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 9216
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
@@ -98,14 +96,12 @@ worker_config:
       enable_padding: true
       max_batch_size: 30
     kv_cache_config:
-      use_kv_cache_manager_v2: false
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
       dtype: fp8
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 9216
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512

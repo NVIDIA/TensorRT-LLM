@@ -876,7 +876,9 @@ class HarmonyAdapter:
             logger.debug(
                 "Falling back to error - harmony library doesn't provide string encoding"
             )
-            raise RuntimeError(
+            from .render.prompt_types import HarmonyConversionError
+
+            raise HarmonyConversionError(
                 f"Failed to convert messages to harmony tokens: {e}. "
                 "The harmony library doesn't provide string-to-tokens encoding for fallback."
             )

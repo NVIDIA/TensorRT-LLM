@@ -33,6 +33,8 @@ from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
     Glm5NextVLM,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_masks, is_glm5_next
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_cuda_graphs
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -111,7 +113,8 @@ def test_text_processing_without_native_processor(monkeypatch):
     from tensorrt_llm.llmapi import SamplingParams
 
     monkeypatch.delitem(PROCESSOR_MAPPING_NAMES, "glm5_next", raising=False)
-    tokenizer = Mock(return_value=SimpleNamespace(input_ids=torch.tensor([[1, 2, 3]])))
+    # A tokenizer called on one string without return_tensors returns a flat list.
+    tokenizer = Mock(return_value=SimpleNamespace(input_ids=[1, 2, 3]))
     with patch(
         "tensorrt_llm._torch.models.modeling_glm5_next_vision.AutoProcessor.from_pretrained"
     ) as load_processor:
@@ -119,6 +122,7 @@ def test_text_processing_without_native_processor(monkeypatch):
         tokens, extra = processor.call_with_text_prompt({"prompt": "hello"}, SamplingParams())
         assert tokens == [1, 2, 3]
         assert extra is None
+        assert "return_tensors" not in tokenizer.call_args.kwargs
         load_processor.assert_not_called()
         with pytest.raises(RuntimeError, match="transformers==5.17.0"):
             processor.get_mm_max_tokens_per_item()
@@ -233,6 +237,65 @@ def test_mixed_processor_matches_separate_inputs(tensor_images):
             )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
+        Glm5NextInputProcessor,
+        _glm5_next_build_batched_input,
+    )
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+        EncoderGroup,
+        MultimodalModelMixin,
+        encode_multimodal_by_groups,
+    )
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    processor = Glm5NextInputProcessor("unused", _config(), tokenizer=Mock())
+    image_processor = Mock(
+        return_value={
+            "pixel_values": torch.zeros(num_images * 16, 12),
+            "image_grid_thw": torch.tensor([[1, 4, 4]] * num_images),
+        },
+        max_image_tokens=4,
+        merge_size=2,
+    )
+    processor._processor = SimpleNamespace(image_processor=image_processor)
+    model = Mock(spec=MultimodalModelMixin, dtype=torch.float16)
+    profiler = object.__new__(KvCacheCreator)
+    profiler._llm_args = SimpleNamespace(disable_mm_encoder=False)
+    profiler._profiling_stage_data = {"enable_mm_reqs": True}
+    profiler._model_engine = SimpleNamespace(
+        model=model,
+        input_processor=processor,
+        encoder_max_num_tokens=num_images * 16,
+        encoder_batch_size=num_images,
+    )
+
+    params = profiler._create_dummy_encoder_inputs()
+
+    def encode(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        assert grid_thw.shape == (num_images, 3)
+        return pixel_values.new_zeros((pixel_values.shape[0] // 4, 2))
+
+    output = encode_multimodal_by_groups(
+        (EncoderGroup(("image", "video"), encode, _glm5_next_build_batched_input),), params
+    )
+    assert output.shape == (num_images * 4, 2)
+    assert output.dtype == torch.float16
+    metadata = params[0].item_metadata
+    assert metadata is not None
+    metadata.validate()
+    assert metadata.item_refs == tuple(("image", i) for i in range(num_images))
+    assert metadata.encoder_token_lengths == (16,) * num_images
+    assert metadata.output_embedding_lengths == (4,) * num_images
+
+
+def _materialize_meta(module: torch.nn.Module) -> None:
+    """Allocate meta tensors on CUDA as ModelLoader does after MetaInitMode construction."""
+    module._apply(lambda t: torch.empty_like(t, device="cuda") if t.is_meta else t)
+
+
 def _config():
     config = PretrainedConfig(
         model_type="glm5_next",
@@ -315,6 +378,24 @@ def test_allreduce_defaults_honor_user_strategy(override):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "architecture", ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]
+)
+@pytest.mark.parametrize("sm_100f, expected", [(True, "TRTLLM"), (False, "CUTLASS")])
+def test_moe_auto_backend_prefers_trtllm_gen_on_blackwell(
+    monkeypatch, architecture, sm_100f, expected
+):
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.is_sm_100f", lambda: sm_100f)
+    nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    assert ModelConfig.resolve_moe_backend("AUTO", architecture) == expected
+    assert ModelConfig.resolve_moe_backend("AUTO", architecture, quant_config=nvfp4) == expected
+    assert ModelConfig.resolve_moe_backend("CUTLASS", architecture, quant_config=nvfp4) == "CUTLASS"
+
+
+@pytest.mark.cpu_only
 def test_mtp_rejects_unsupported_attention_dp_lm_head_sharding():
     from tensorrt_llm.llmapi import MTPDecodingConfig
 
@@ -329,6 +410,26 @@ def test_mtp_rejects_unsupported_attention_dp_lm_head_sharding():
                 spec_config=MTPDecodingConfig(max_draft_len=3),
             )
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("model_config", "separate"),
+    [
+        (_config(), False),
+        (_config().text_config, False),
+        (PretrainedConfig(model_type="deepseek_v3", num_nextn_predict_layers=1), True),
+    ],
+    ids=["glm5_next", "glm5_next_text", "deepseek_v3"],
+)
+def test_mtp_draft_layers_share_the_target_kv_cache(model_config, separate):
+    from tensorrt_llm._torch.speculative import update_spec_config_from_model_config
+    from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+    update_spec_config_from_model_config(spec_config, model_config)
+    assert should_use_separate_draft_kv_cache(spec_config) is separate
 
 
 @pytest.mark.cpu_only
@@ -419,6 +520,307 @@ def test_checkpoint_routes_vision_and_optional_mtp_separately():
             audit_glm5_next_checkpoint(keys, config, num_mtp_layers=invalid)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_nvfp4_loader_preserves_calibrated_scales():
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._utils import get_sm_version
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 comparison requires SM100/103")
+    config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16))
+
+    def build():
+        return GatedMLP(
+            hidden_size=128,
+            intermediate_size=256,
+            bias=False,
+            dtype=torch.bfloat16,
+            config=config,
+            swiglu_limit=7.0,
+        )
+
+    with torch.device("cuda"):
+        reference = build()
+        # The model loader path: meta construction, then uninitialized allocation.
+        with MetaInitMode():
+            actual = build()
+    _materialize_meta(actual)
+    generator = torch.Generator().manual_seed(19136)
+    groups = {}
+    for name, rows, cols in (
+        ("gate_proj", 256, 128),
+        ("up_proj", 256, 128),
+        ("down_proj", 128, 256),
+    ):
+        groups[name] = {
+            "weight": torch.randint(
+                0, 256, (rows, cols // 2), dtype=torch.uint8, generator=generator
+            ),
+            "weight_scale": torch.ones(rows, cols // 16, dtype=torch.float8_e4m3fn),
+            "input_scale": torch.tensor(0.01),
+            "weight_scale_2": torch.tensor(0.02),
+        }
+    reference.gate_up_proj.load_weights([groups["gate_proj"], groups["up_proj"]])
+    reference.down_proj.load_weights([groups["down_proj"]])
+    weights = {
+        f"{name}.{label}": tensor
+        for name, group in groups.items()
+        for label, tensor in group.items()
+    }
+    Glm5NextForCausalLM._fill_module(
+        None, actual, "dense", "", [(key, key) for key in weights], weights, torch.device("cuda")
+    )
+    for name in ("gate_up_proj", "down_proj"):
+        loaded, expected = getattr(actual, name), getattr(reference, name)
+        for scale in ("input_scale", "weight_scale_2", "alpha"):
+            torch.testing.assert_close(getattr(loaded, scale), getattr(expected, scale))
+            assert torch.all(getattr(loaded, scale) > 0)
+        # No KV scales in the checkpoint: they keep their construction value.
+        for scale in ("kv_scales", "inv_kv_scales"):
+            torch.testing.assert_close(
+                getattr(loaded, scale), torch.ones_like(getattr(loaded, scale))
+            )
+    x = torch.randn(8, 128, generator=generator, dtype=torch.bfloat16).cuda()
+    torch.testing.assert_close(actual(x), reference(x), atol=0, rtol=0)
+
+
+@pytest.mark.cpu_only
+def test_checkpoint_lazy_scalar_materialization(tmp_path) -> None:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    expected = {
+        "weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        "input_scale": torch.tensor(0.01),
+    }
+    path = tmp_path / "scalar.safetensors"
+    save_file(expected, path)
+    module = torch.nn.Module()
+    for name, tensor in expected.items():
+        module.register_parameter(
+            name, torch.nn.Parameter(torch.empty_like(tensor), requires_grad=False)
+        )
+    with safe_open(path, framework="pt") as checkpoint:
+        weights = {key: checkpoint.get_slice(key) for key in checkpoint.keys()}
+        Glm5NextForCausalLM._fill_module(
+            None,
+            module,
+            "scalar",
+            "",
+            [(key, key) for key in weights],
+            weights,
+            torch.device("cpu"),
+        )
+    for name, tensor in expected.items():
+        torch.testing.assert_close(getattr(module, name), tensor, rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_moe_loader_collects_expert_tensors() -> None:
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    owner = torch.nn.Module()
+    owner.mlp = torch.nn.Module()
+    owner.mlp.experts = experts = torch.nn.Module()
+    # This EP rank owns experts 0 and 2 of 4.
+    experts.num_experts = 4
+    experts.initial_local_expert_ids = [0, 2]
+    experts.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    experts.load_weights = Mock()
+    labels = ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    prefix = "model.layers.3."
+    weights = {
+        f"{prefix}mlp.experts.{expert}.{proj}.{label}": torch.tensor(float(expert))
+        for expert in range(4)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+        for label in labels
+    }
+    entries = [(key, key) for key in weights]
+    Glm5NextForCausalLM._fill_module(None, owner, 3, prefix, entries, weights, torch.device("cpu"))
+    (loaded,), _ = experts.load_weights.call_args
+    proj_to_w = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+    # Weights come from local experts only; input_scale comes from every
+    # expert so each rank reduces the same layer-wide activation scale.
+    expected = {
+        f"{expert}.{proj_to_w[proj]}.{label}": weights[
+            f"{prefix}mlp.experts.{expert}.{proj}.{label}"
+        ]
+        for expert in range(4)
+        for proj in proj_to_w
+        for label in labels
+        if expert in (0, 2) or label == "input_scale"
+    }
+    assert loaded == [expected]
+
+    # A missing expert tensor fails with the collected and expected counts.
+    del weights[f"{prefix}mlp.experts.1.down_proj.input_scale"]
+    entries = [(key, key) for key in weights]
+    with pytest.raises(ValueError, match="collected 29 expert tensors, expected 30"):
+        Glm5NextForCausalLM._fill_module(
+            None, owner, 3, prefix, entries, weights, torch.device("cpu")
+        )
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_excluded_layer_keeps_experts_unquantized(monkeypatch) -> None:
+    import importlib
+
+    from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextMoE
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    # The package re-exports the create_moe function under the submodule's name.
+    create_moe_module = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    expert_quant = {}
+
+    def fake_create_moe(*, layer_idx, override_quant_config, **_):
+        expert_quant[layer_idx] = override_quant_config
+        return torch.nn.Module()
+
+    monkeypatch.setattr(create_moe_module, "create_moe", fake_create_moe)
+    text = PretrainedConfig(
+        hidden_size=128,
+        moe_intermediate_size=256,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        norm_topk_prob=True,
+        swiglu_limit=10.0,
+    )
+    # Layer 1 is excluded with the text-runtime name the model rewrites
+    # checkpoint exclusions to.
+    config = ModelConfig(
+        pretrained_config=text,
+        moe_backend="CUTLASS",
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, group_size=16, exclude_modules=["model.layers.1.*"]
+        ),
+    )
+    for layer_idx in (0, 1):
+        Glm5NextMoE(text, config, layer_idx)
+    assert expert_quant[0].quant_algo == QuantAlgo.NVFP4
+    assert expert_quant[1].quant_algo is None
+
+
+@pytest.mark.cpu_only
+def test_text_quant_config_renames_checkpoint_exclusions() -> None:
+    from tensorrt_llm._torch.models.modeling_glm5_next import glm5_next_text_quant_config
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    checkpoint_exclusions = [
+        "lm_head",
+        "model.language_model.layers.3.self_attn*",
+        "model.language_model.layers.45*",
+        "model.visual*",
+    ]
+    config = ModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, group_size=16, exclude_modules=list(checkpoint_exclusions)
+        )
+    )
+    quant = glm5_next_text_quant_config(config).quant_config
+    assert quant.exclude_modules == [
+        "lm_head",
+        "model.layers.3.self_attn*",
+        "model.layers.45*",
+        "model.visual*",
+    ]
+    assert config.quant_config.exclude_modules == checkpoint_exclusions
+    unquantized = ModelConfig(quant_config=QuantConfig())
+    assert glm5_next_text_quant_config(unquantized) is unquantized
+
+
+class _ReplicatedFusionOwner(torch.nn.Module):
+    """An owner whose ``fused`` Linear concatenates two checkpoint projections."""
+
+    FUSED_LINEARS = (("fused", ("first", "second")),)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_replicated_fusion_is_rejected(monkeypatch) -> None:
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    owner = _ReplicatedFusionOwner()
+    owner.fused = linear.Linear(
+        128,
+        256,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+        skip_create_weights_in_init=True,
+        reduce_output=False,
+    )
+    weights = {}
+    for name in ("first", "second"):
+        weights[f"{name}.weight"] = torch.zeros(128, 64, dtype=torch.uint8)
+        weights[f"{name}.weight_scale"] = torch.ones(128, 8, dtype=torch.float8_e4m3fn)
+        weights[f"{name}.weight_scale_2"] = torch.tensor(0.02)
+        weights[f"{name}.input_scale"] = torch.tensor(0.01)
+    with patch.object(owner.fused, "load_weights") as load:
+        with pytest.raises(ValueError, match="cannot fuse NVFP4 projections into 'fused'"):
+            Glm5NextForCausalLM._fill_module(
+                None,
+                owner,
+                "replicated",
+                "",
+                [(key, key) for key in weights],
+                weights,
+                torch.device("cpu"),
+            )
+        load.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_loader_rejects_missing_scales(monkeypatch) -> None:
+    from tensorrt_llm._torch.modules import linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(linear, "get_sm_version", lambda: 100)
+    projection = linear.Linear(
+        128,
+        128,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+        skip_create_weights_in_init=True,
+        reduce_output=False,
+    )
+    weights = {
+        "weight": torch.zeros(128, 64, dtype=torch.uint8),
+        "weight_scale": torch.ones(128, 8, dtype=torch.float8_e4m3fn),
+        "weight_scale_2": torch.tensor(0.02),
+        "input_scale": torch.tensor(0.01),
+    }
+    missing = "weight_scale_2"
+    del weights[missing]
+    with patch.object(projection, "load_weights") as load:
+        with pytest.raises(ValueError, match=f"NVFP4 projection .*missing.*{missing}"):
+            Glm5NextForCausalLM._fill_module(
+                None,
+                projection,
+                "projection",
+                "",
+                [(key, key) for key in weights],
+                weights,
+                torch.device("cpu"),
+            )
+        load.assert_not_called()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("route", ["valid", "py_mamba", "manager_preference", "v1", "cpp", "ucx"])
 def test_cache_manager_routing_guards(route, monkeypatch):
@@ -504,10 +906,28 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
             )
     allocate.assert_called_once()
     assert allocate.call_args.kwargs["dtype"] == (DataType.FP8 if fp8_kv_cache else DataType.BF16)
+    assert allocate.call_args.kwargs["conv_state_layout"] == "q_k_v"
+    assert "kda_replay_num_spec" not in allocate.call_args.kwargs
+    manager = object.__new__(Glm5NextCacheManager)
+    manager._requested_num_spec = None
+    manager._requested_draft_records = False
+    manager._kda_replay = None
+    manager._mamba_ssm_stochastic_rounding = False
+    manager.spec_config = spec_config
+    manager._state_layout = SimpleNamespace(
+        spec_config=spec_config,
+        mamba_pp_layers=(),
+        conv_state_layout="q_k_v",
+        conv_section_dims=(),
+    )
+    with patch(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        return_value=verify_kernel is True,
+    ):
+        state = manager._initialize_spec_state()
+    assert manager.use_kda_replay_update is (verify_kernel is True)
     if verify_kernel is True:
-        assert allocate.call_args.kwargs["kda_replay_num_spec"] == 3
-    else:
-        assert "kda_replay_num_spec" not in allocate.call_args.kwargs
+        assert state.num_speculative_tokens == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -554,14 +974,24 @@ def test_kda_shards_preserve_fp32_gate_parameters():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("encoder_cuda_graph", [False, True], ids=["eager", "cuda-graph"])
 @torch.inference_mode()
-def test_vision_attention_dp_is_local_and_matches_single_rank():
+def test_vision_attention_dp_is_local_and_matches_single_rank(encoder_cuda_graph: bool) -> None:
     config = _config()
     reference = Glm5NextVisionModelBase(ModelConfig(pretrained_config=config)).cuda().eval()
     reference.visual.setup_attn_metadata(max_num_tokens=128)
     torch.manual_seed(7)
     for parameter in reference.parameters():
         parameter.normal_(0, 0.05)
+    multimodal_config = (
+        MultimodalConfig(
+            encoder_cuda_graph={
+                "image": MultimodalEncoderCudaGraphConfig(buckets=[(16, 1), (32, 1)])
+            }
+        )
+        if encoder_cuda_graph
+        else None
+    )
 
     # Rank 0 has no image; the other ranks see different token counts and
     # pixels. Any TP collective on the encoder path is an error, even when
@@ -574,18 +1004,30 @@ def test_vision_attention_dp_is_local_and_matches_single_rank():
         for rank, width in enumerate((0, 4, 6, 8)):
             mapping = Mapping(world_size=4, tp_size=4, rank=rank, enable_attention_dp=True)
             local = (
-                Glm5NextVisionModelBase(ModelConfig(pretrained_config=config, mapping=mapping))
+                Glm5NextVisionModelBase(
+                    ModelConfig(
+                        pretrained_config=config,
+                        mapping=mapping,
+                        multimodal_config=multimodal_config,
+                    )
+                )
                 .cuda()
                 .eval()
             )
             local.load_state_dict(reference.state_dict())
             local.visual.setup_attn_metadata(max_num_tokens=128)
+            setup_mm_encoder_cuda_graphs(local)
             if not width:
                 continue
             pixels = torch.randn(4 * width, 3 * 2 * 2 * 2, device="cuda", dtype=torch.bfloat16)
             grid = torch.tensor([[1, 4, width]])
             expected = reference.encode_batched(pixels, grid)
-            actual = local.encode_batched(pixels, grid)
+            with patch.object(
+                local.visual, "_run_blocks_eager", wraps=local.visual._run_blocks_eager
+            ) as eager_blocks:
+                actual = local.encode_batched(pixels, grid)
+            if encoder_cuda_graph:
+                eager_blocks.assert_not_called()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -684,6 +1126,37 @@ def test_sparse_prefill_continuation_preserves_partial_pools():
     broken, _, _ = run([5, 8], discard_prefix=True)
     broken_l2 = (broken.float() - reference.float()).norm() / reference.float().norm()
     assert broken_l2 > 0.03
+
+
+@pytest.mark.cpu_only
+def test_sparse_prefill_bounds_pool_scoring_by_largest_visible_length():
+    """forward_prefill bounds pool scoring by the largest cached + new length.
+
+    Request 0 continues a cached prefix with a shorter chunk than request 1, so a
+    bound that ignored cached tokens would hide visible pools from top-k.
+    """
+    cu_seqlens, cached_lens = [0, 10, 70], [100, 0]
+    tokens, heads, head_dim = cu_seqlens[-1], 2, 4
+    select = Mock(return_value=torch.zeros(tokens, 8))
+    attention = SimpleNamespace(
+        indexer=SimpleNamespace(index_kpool=4, index_kpool_compress_ape=None),
+        attn_backend=Mock(),
+        _project_attention_and_indexer=Mock(
+            return_value=(torch.zeros(tokens, 3), None, None, None)
+        ),
+        q_b_proj=lambda x: torch.zeros(x.shape[0], heads * head_dim),
+        num_heads=heads,
+        qk_head_dim=head_dim,
+        _select_and_attend_paged=select,
+    )
+    Glm5NextSparseAttention.forward_prefill(
+        attention, torch.zeros(tokens, 8), cu_seqlens, cached_lens, SimpleNamespace()
+    )
+    select.assert_called_once()
+    visible = select.call_args.args[3]
+    max_visible = select.call_args.kwargs["max_visible"]
+    assert isinstance(max_visible, int)
+    assert max_visible == int(visible.max()) == 110
 
 
 @pytest.mark.cpu_only

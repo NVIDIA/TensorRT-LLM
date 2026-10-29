@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 350" width="1000" height="350">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect width="1000" height="350" fill="#f5f5f5"/>
+<rect x="50" y="28" width="11" height="11" fill="#ffffff" stroke="#2d3142"/>
+<text x="66.0" y="37.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">uncompressed FP8 host cache</text>
+<rect x="240" y="28" width="11" height="11" fill="rgba(118,185,0,0.08)" stroke="#76B900"/>
+<text x="256.0" y="37.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">NVFP4 host cache</text>
+<text x="150.0" y="68.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">GLM-5.2</text>
+<text x="150.0" y="81.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">8 GB300 · concurrency 128</text>
+<line x1="50" y1="264" x2="250" y2="264" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="60.0" y="221.9" width="36" height="42.1" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="78.0" y="216.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">9,582</text>
+<rect x="104.0" y="136.0" width="36" height="128.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="122.0" y="131.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">29,115</text>
+<text x="100.0" y="278.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">tok/s/GPU</text>
+<text x="100.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">3.0x</text>
+<rect x="160.0" y="231.9" width="36" height="32.1" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="178.0" y="226.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">0.5</text>
+<rect x="204.0" y="136.0" width="36" height="128.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="222.0" y="131.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">1.8</text>
+<text x="200.0" y="278.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">P90 tok/s/user</text>
+<text x="200.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">4.0x</text>
+<text x="150.0" y="310.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">cache-read hit rate 52.6% → 86.7%</text>
+<text x="150.0" y="323.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">TTFT p90 672 s → 173 s</text>
+<text x="383.0" y="68.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">GLM-5.2</text>
+<text x="383.0" y="81.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">24 GB300 · concurrency 352</text>
+<line x1="283" y1="264" x2="483" y2="264" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="293.0" y="194.4" width="36" height="69.6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="311.0" y="189.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">32,326</text>
+<rect x="337.0" y="136.0" width="36" height="128.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="355.0" y="131.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">59,487</text>
+<text x="333.0" y="278.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">tok/s/GPU</text>
+<text x="333.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">+84%</text>
+<rect x="393.0" y="232.8" width="36" height="31.2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="411.0" y="227.8" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">2.7</text>
+<rect x="437.0" y="136.0" width="36" height="128.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="455.0" y="131.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">11.2</text>
+<text x="433.0" y="278.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">P90 tok/s/user</text>
+<text x="433.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">4.1x</text>
+<text x="383.0" y="310.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">cache-read hit rate 85.1% → 94.0%</text>
+<text x="383.0" y="323.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">TTFT p90 126 s → 18 s</text>
+<text x="616.0" y="68.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">GLM-5.2</text>
+<text x="616.0" y="81.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">24 GB300 · concurrency 288</text>
+<line x1="516" y1="264" x2="716" y2="264" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="526.0" y="172.4" width="36" height="91.6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="544.0" y="167.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">41,831</text>
+<rect x="570.0" y="136.0" width="36" height="128.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="588.0" y="131.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">58,427</text>
+<text x="566.0" y="278.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">tok/s/GPU</text>
+<text x="566.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">+40%</text>
+<rect x="626.0" y="222.1" width="36" height="41.9" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="644.0" y="217.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">8.2</text>
+<rect x="670.0" y="136.0" width="36" height="128.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="688.0" y="131.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">25.0</text>
+<text x="666.0" y="278.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">P90 tok/s/user</text>
+<text x="666.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">3.1x</text>
+<text x="616.0" y="310.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">cache-read hit rate 90.2% → 95.5%</text>
+<text x="616.0" y="323.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">TTFT p90 39 s → 7 s</text>
+<text x="849.0" y="68.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">Qwen3.5-397B-A17B</text>
+<text x="849.0" y="81.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">40 GB300 · concurrency 1536</text>
+<line x1="749" y1="264" x2="949" y2="264" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="759.0" y="175.0" width="36" height="89.0" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="777.0" y="170.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">107,214</text>
+<rect x="803.0" y="136.0" width="36" height="128.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="821.0" y="131.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">154,159</text>
+<text x="799.0" y="278.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">tok/s/GPU</text>
+<text x="799.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">+44%</text>
+<rect x="859.0" y="192.0" width="36" height="72.0" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="877.0" y="187.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">10.6</text>
+<rect x="903.0" y="136.0" width="36" height="128.0" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="921.0" y="131.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#2d3142" text-anchor="middle">18.8</text>
+<text x="899.0" y="278.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">P90 tok/s/user</text>
+<text x="899.0" y="292.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">+78%</text>
+<text x="849.0" y="310.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">cache-read hit rate 80.6% → 93.2%</text>
+<text x="849.0" y="323.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#4f5d75" text-anchor="middle">TTFT p90 76 s → 9 s</text>
+</svg>

@@ -1,0 +1,358 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "kv_cache_manager_v2/utils/hostMemBacking.h"
+#include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/utils/hostMem.h"
+#include "kv_cache_manager_v2/utils/math.h"
+
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/topologyDetector.h"
+
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <cuda.h>
+#include <map>
+#include <numaif.h>
+#include <string>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <utility>
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+{
+
+namespace
+{
+
+//! Minimum granularity madvise accepts. The fill worker commits in much larger
+//! chunks; this is only the alignment floor.
+//!
+//! Aligning further, to the huge page size, is deliberately not done: populating
+//! a sub-range of a MADV_HUGEPAGE mapping keeps the pages huge and does not
+//! split the VMA, so a chunk edge inside a huge page costs nothing.
+size_t commitAlignment()
+{
+    return static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+}
+
+//! The pages [addr, addr + size) touches, widened to whole pages.
+//!
+//! For calls that must cover at least the range: populating or opening a few
+//! bytes either side is harmless, and a unit may start or end mid-page because
+//! units are sized in slots rather than pages.
+std::pair<MemAddress, size_t> pagesCovering(MemAddress addr, size_t size)
+{
+    size_t const page = commitAlignment();
+    MemAddress const begin = addr & ~static_cast<MemAddress>(page - 1);
+    MemAddress const end = roundUp(addr + size, page);
+    return {begin, static_cast<size_t>(end - begin)};
+}
+
+//! The pages wholly inside [addr, addr + size).
+//!
+//! For calls that must not reach past the range: a page shared with the
+//! neighbouring unit is left alone, because discarding or protecting it would
+//! take bytes that still belong to that unit. At most one page per boundary
+//! stays resident, which is the price of not corrupting the neighbour.
+std::pair<MemAddress, size_t> pagesWithin(MemAddress addr, size_t size)
+{
+    size_t const page = commitAlignment();
+    MemAddress const begin = roundUp(addr, page);
+    MemAddress const end = (addr + size) & ~static_cast<MemAddress>(page - 1);
+    return {begin, end > begin ? static_cast<size_t>(end - begin) : 0};
+}
+
+//! Places the pages of [addr, addr + size) on the NUMA node the current GPU
+//! attaches to.
+//!
+//! The policy is attached to the address range, not to a thread, so it holds
+//! whichever thread happens to fault a page in. Setting it on the whole range
+//! before anything is committed also avoids splitting the mapping, which a
+//! per-chunk policy would do.
+//!
+//! Best effort, with a working fallback rather than no placement at all. Where
+//! mbind cannot be applied -- no libnuma, a single node, a GPU that reports no
+//! affinity, or a container whose seccomp profile rejects the call -- the range
+//! keeps MPOL_DEFAULT, which faults each page onto the node of the CPU that
+//! first touches it. The fill worker binds itself to the GPU's node before
+//! committing, and it is the thread that first touches every page, so the
+//! common path still places correctly without mbind.
+//!
+//! What mbind adds is independence from *which* thread faults a page: a reader
+//! that races past the watermark, or a re-fault after decommit, need not be the
+//! bound worker. That is why the policy is attached to the range even though
+//! first touch would usually suffice.
+//!
+//! The fallback is not equivalent for allowRemoteFallback == false. First touch
+//! prefers the local node and silently takes a remote page when that node
+//! cannot satisfy it, which is MPOL_PREFERRED's behaviour. Only MPOL_BIND
+//! refuses, and nothing unprivileged reproduces that -- set_mempolicy is gated
+//! with mbind. So where mbind is denied, a strict request degrades to a
+//! preference, which is why that case is reported differently below.
+//!
+//! Note for containers: mbind, set_mempolicy and get_mempolicy sit behind
+//! CAP_SYS_NICE in Docker's default seccomp profile, so an unprivileged
+//! container falls back to first touch.
+void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallback)
+{
+    if (numa_available() < 0 || numa_max_node() < 1)
+    {
+        return;
+    }
+    int const node = runtime::TopologyDetector::getInstance().getCurrentGpuNumaId();
+    if (node < 0)
+    {
+        TLLM_LOG_WARNING("KVCM2 host tier: GPU reports no NUMA node; leaving page placement to first touch");
+
+        return;
+    }
+
+    std::unique_ptr<bitmask, decltype(&numa_free_nodemask)> mask{numa_allocate_nodemask(), &numa_free_nodemask};
+    if (mask == nullptr)
+    {
+        return;
+    }
+    numa_bitmask_setbit(mask.get(), static_cast<unsigned>(node));
+
+    // MPOL_BIND fails an allocation the node cannot satisfy; MPOL_PREFERRED
+    // takes a remote page instead, trading bandwidth for capacity.
+    int const mode = allowRemoteFallback ? MPOL_PREFERRED : MPOL_BIND;
+    if (::mbind(reinterpret_cast<void*>(addr), size, mode, mask->maskp, mask->size + 1, 0) != 0)
+    {
+        if (!allowRemoteFallback)
+        {
+            // First touch prefers the local node but takes a remote page rather
+            // than failing, so it cannot stand in for a strict binding. Refusing
+            // here is better than running as though the request was honoured.
+            throw LogicError(
+                "KVCM2 host tier: allow_remote_numa_fallback=false requires mbind, which failed with errno "
+                + std::to_string(errno) + " for NUMA node " + std::to_string(node)
+                + ". In a container this usually means CAP_SYS_NICE is absent; grant it, or set "
+                  "allow_remote_numa_fallback=true to accept first-touch placement.");
+        }
+        TLLM_LOG_WARNING(
+            "KVCM2 host tier: mbind to NUMA node %d failed with errno %d; falling back to first-touch placement by "
+            "the fill worker, which is bound to that node (in a container this usually means CAP_SYS_NICE is "
+            "absent). Placement is preserved; no behaviour is lost here.",
+            node, errno);
+        return;
+    }
+    TLLM_LOG_INFO("KVCM2 host tier: pages bound to NUMA node %d (%s)", node,
+        allowRemoteFallback ? "remote fallback allowed" : "strict");
+}
+
+} // namespace
+
+HostMemBacking::HostMemBacking(HostMemBackingOptions const& options)
+    : mUnit(std::max(options.commitUnit, commitAlignment()))
+    , mAllowRemoteNumaFallback(options.allowRemoteNumaFallback)
+{
+}
+
+HostMemBacking::~HostMemBacking()
+{
+    HostMemBacking::destroy();
+}
+
+MemAddress HostMemBacking::reserve(size_t size)
+{
+    TLLM_CHECK_WITH_INFO(mAddr == 0, "HostMem backing reserved twice");
+    TLLM_CHECK_DEBUG(size % mUnit == 0);
+
+    // Captured here rather than in commit(): this runs on the thread that owns
+    // the context, while the fill worker only sets the device.
+    cuCheck(cuCtxGetCurrent(reinterpret_cast<CUcontext*>(&mContext)));
+    TLLM_CHECK_WITH_INFO(mContext != nullptr, "HostMemBacking::reserve needs a current CUDA context");
+
+    // No alignment is asked of the mapping. Unit boundaries line up with slot
+    // boundaries because slot 0 sits at the base and a unit is a whole number of
+    // slots, wherever the base happens to land; registration needs no alignment,
+    // and the madvise and mprotect calls round to pages themselves. The mapped
+    // length is page-rounded so the guard below covers whole pages.
+    mMapped = roundUp(size, commitAlignment());
+    mAddr = hostMmap(mMapped);
+    mSize = size;
+
+    //! Applied once over the whole mapping. Per-chunk page-mode advice would
+    //! change VMA flags and split the mapping into one VMA per chunk.
+    hostMadvisePageMode(mAddr, mSize, hostUseThp());
+    bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
+
+    // Nothing is reachable until commit() opens it, so a read that runs ahead
+    // of the fill faults rather than returning zeros from an untouched page.
+    // Costs one VMA and is independent of the size: with no resident pages
+    // there are no page tables to rewrite.
+    auto const [guardAddr, guardSize] = pagesCovering(mAddr, mSize);
+    if (::mprotect(reinterpret_cast<void*>(guardAddr), guardSize, PROT_NONE) != 0)
+    {
+        hostMunmap(mAddr, mMapped);
+        mAddr = 0;
+        mSize = 0;
+        mMapped = 0;
+        throw HostOOMError(std::string("mprotect(PROT_NONE) failed: ") + std::strerror(errno));
+    }
+    return mAddr;
+}
+
+void HostMemBacking::commit(size_t offset, size_t size, bool populated)
+{
+    TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
+    TLLM_CHECK_DEBUG(offset % mUnit == 0 && size % mUnit == 0);
+
+    // cuMemHostRegister needs a current context; the fill worker has only set
+    // the device, which does not give it one.
+    cuCheck(cuCtxSetCurrent(static_cast<CUcontext>(mContext)));
+
+    if (!populated)
+    {
+        open(offset, size);
+        populate(offset, size);
+    }
+
+    size_t committed = 0;
+    try
+    {
+        for (; committed < size; committed += mUnit)
+        {
+            MemAddress const unitAddr = mAddr + offset + committed;
+            CUresult const registered = cuMemHostRegister(
+                reinterpret_cast<void*>(unitAddr), mUnit, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
+            if (registered == CUDA_ERROR_OUT_OF_MEMORY)
+            {
+                throw HostOOMError("cuMemHostRegister failed: out of memory");
+            }
+            cuCheck(registered);
+            mRegistered.emplace(offset + committed, mUnit);
+        }
+    }
+    catch (...)
+    {
+        // The caller treats a failed commit as having taken nothing.
+        decommit(offset, committed);
+        auto const [closeAddr, closeSize] = pagesWithin(mAddr + offset + committed, size - committed);
+        if (closeSize != 0 && ::mprotect(reinterpret_cast<void*>(closeAddr), closeSize, PROT_NONE) != 0)
+        {
+            TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed while unwinding a commit, errno %d", errno);
+        }
+        throw;
+    }
+}
+
+void HostMemBacking::open(size_t offset, size_t size)
+{
+    TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
+    auto const [openAddr, openSize] = pagesCovering(mAddr + offset, size);
+    if (::mprotect(reinterpret_cast<void*>(openAddr), openSize, PROT_READ | PROT_WRITE) != 0)
+    {
+        throw HostOOMError(std::string("mprotect(PROT_READ|PROT_WRITE) failed: ") + std::strerror(errno));
+    }
+}
+
+void HostMemBacking::populate(size_t offset, size_t size) const
+{
+    TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
+    // Allocating and zeroing through the kernel's fault path is the point of
+    // this backing: it scales across processes, where the driver serializes the
+    // same work on a per-process lock.
+    //
+    // Each call holds the process's mmap_lock for reading throughout, and
+    // whatever needs it for writing -- mprotect and registration by other
+    // fills, allocations on the executor -- waits for the call to finish.
+    // Short calls bound that wait.
+    constexpr size_t kPopulateCall = 4ULL << 20;
+    auto const [fillAddr, fillSize] = pagesCovering(mAddr + offset, size);
+    for (size_t done = 0; done < fillSize; done += kPopulateCall)
+    {
+        hostPrefaultChunk(fillAddr + done, std::min(kPopulateCall, fillSize - done));
+    }
+}
+
+void HostMemBacking::unregisterRange(size_t offset, size_t size) noexcept
+{
+    auto unit = mRegistered.lower_bound(offset);
+    while (unit != mRegistered.end() && unit->first < offset + size)
+    {
+        CUresult const result = cuMemHostUnregister(reinterpret_cast<void*>(mAddr + unit->first));
+        if (result != CUDA_SUCCESS)
+        {
+            char const* name = nullptr;
+            cuGetErrorName(result, &name);
+            // The driver and this object disagree about what is registered,
+            // which the pages below are about to be freed on the assumption of.
+            Poison::set("HostMemBacking::unregisterRange", name != nullptr ? name : "cuMemHostUnregister failed");
+        }
+        unit = mRegistered.erase(unit);
+    }
+}
+
+void HostMemBacking::decommit(size_t offset, size_t size) noexcept
+{
+    if (mAddr == 0 || size == 0)
+    {
+        return;
+    }
+    TLLM_CHECK_DEBUG(offset % mUnit == 0 && size % mUnit == 0);
+
+    // Order matters and nothing enforces it: registration does not hold the
+    // pages, so discarding them first destroys memory the GPU still has
+    // registered, with every call reporting success.
+    unregisterRange(offset, size);
+    auto const [dropAddr, dropSize] = pagesWithin(mAddr + offset, size);
+    if (dropSize == 0)
+    {
+        return;
+    }
+    //! MADV_DONTNEED drops the pages without changing VMA flags, so unlike
+    //! mprotect it does not split the mapping.
+    if (::madvise(reinterpret_cast<void*>(dropAddr), dropSize, MADV_DONTNEED) != 0)
+    {
+        TLLM_LOG_WARNING("KVCM2 host tier: madvise(MADV_DONTNEED) failed with errno %d", errno);
+    }
+    // Back to unreachable, so a reader that outlives the shrink faults instead
+    // of silently re-faulting a zero page.
+    if (::mprotect(reinterpret_cast<void*>(dropAddr), dropSize, PROT_NONE) != 0)
+    {
+        TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed with errno %d", errno);
+    }
+}
+
+void HostMemBacking::destroy() noexcept
+{
+    if (mAddr == 0)
+    {
+        return;
+    }
+    // Skipped once KVCM2 is poisoned: teardown then also skips the waits that
+    // let this range's CUDA consumers finish, and unmapping under one corrupts
+    // whatever is mapped there next. The range is kept instead, which costs a
+    // tier in a process whose cache is already permanently unusable.
+    KVCM2_POISON_ON_EXCEPT(
+        [&]
+        {
+            unregisterRange(0, mSize);
+            hostMunmap(mAddr, mMapped);
+        });
+    mRegistered.clear();
+    mAddr = 0;
+    mSize = 0;
+    mMapped = 0;
+}
+
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

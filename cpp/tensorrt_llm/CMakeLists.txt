@@ -140,6 +140,7 @@ if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
   endif()
 endif()
 
+find_package(Threads REQUIRED)
 add_subdirectory(common)
 
 add_library(ipc_nvls_memory_src STATIC runtime/ipcNvlsMemory.cu)
@@ -148,6 +149,11 @@ set_target_properties(
                                  CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_subdirectory(kernels)
+set(KIMI_K3_MODEL_CSRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/csrc"
+)
+add_subdirectory("${KIMI_K3_MODEL_CSRC}"
+                 "${CMAKE_CURRENT_BINARY_DIR}/kimi_k3_model")
 add_subdirectory(runtime)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
@@ -169,7 +175,6 @@ endif()
 
 add_subdirectory(executor)
 
-find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
@@ -194,6 +199,7 @@ set(TRTLLM_LINK_LIBS
     mamba2_mtp_ssm_cache_src
     kda_decode_src
     kimi_k3_attn_res_src
+    kimi_k3_model_src
     ws_layernorm_src
     fusedGatedRMSNormQuant_src
     fpA_intB_gemm_src
@@ -222,6 +228,8 @@ endif()
 if(USING_OSS_CUTLASS_MOE_GEMM)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_gemm_src)
   message(STATUS "USING_OSS_CUTLASS_MOE_GEMM")
+else()
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_host_src)
 endif()
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
@@ -270,10 +278,41 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 target_link_libraries(
   ${SHARED_TARGET}
-  PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+  PRIVATE
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_common_cuda,tllm_executor_types,tllm_executor_serialization,tllm_runtime_memory,tllm_runtime_buffers,tllm_runtime_distributed,tllm_runtime_topology>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_environment,tllm_executor_values,tllm_executor_transfer_agent,tllm_kv_cache_host_memory,tllm_kv_cache,tllm_kv_cache_legacy,tllm_batch_scheduler,tllm_kernel_kv_cache_copy>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+
+# Components also link each other normally; retain all component exports here.
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_error WHOLE_ARCHIVE)
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_logging WHOLE_ARCHIVE)
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_executor_types WHOLE_ARCHIVE)
+
+foreach(
+  component
+  tllm_common_cuda
+  tllm_runtime_memory
+  tllm_runtime_buffers
+  tllm_runtime_distributed
+  tllm_runtime_topology
+  tllm_executor_serialization
+  tllm_common_environment
+  tllm_executor_values
+  tllm_executor_transfer_agent
+  tllm_kv_cache_host_memory
+  tllm_kv_cache
+  tllm_kv_cache_legacy
+  tllm_batch_scheduler
+  tllm_kernel_kv_cache_copy)
+  set_property(TARGET ${SHARED_TARGET}
+               PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
+endforeach()
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
@@ -308,6 +347,8 @@ endif()
 
 if(BUILD_PYT)
   add_subdirectory(thop)
+  # modeling_v2 family libraries: torch-op libraries loaded on demand.
+  add_subdirectory(modeling_v2)
 endif()
 
 add_subdirectory(nanobind)

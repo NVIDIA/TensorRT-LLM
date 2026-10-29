@@ -26,10 +26,12 @@ from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
     Indexer,
     IndexerPrefillChunkMetadata,
+    _atom_ctx_offsets,
     _compute_slot_mappings,
     _effective_compress_ratio_divisor,
-    _pick_dsl_expand,
+    _pick_dsl_split,
     _select_indexer_compress_ratio,
+    use_cute_dsl_paged_mqa_logits,
 )
 from .kernels import fused_dsa_decode_metadata
 from .params import DSAMetadataParams
@@ -98,6 +100,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
+    # (local q_begin, local q_end, per-rank sizes) when indexer_prefill_chunks
+    # cover only this TP rank's share of the context query tokens; the top-k
+    # results are then all-gathered once after the chunks.
+    indexer_prefill_q_split: Optional[Tuple[int, int, List[int]]] = None
     # Max chunk size for two-level chunking:
     # 1. Request-level: Pack multiple small requests into one chunk (up to indexer_max_chunk_size)
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
@@ -112,7 +118,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     max_draft_tokens: int = 0
     # Indexer head dimension
     indexer_head_dim: int = 128
-    # Indexer quant block size
+    # Elements per four-byte scale word, matching Indexer.prepare().
     indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
@@ -139,6 +145,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # (otherwise the populated buffers would mismatch the kernel reshape).
     dsl_expand_factor: int = 1
     dsl_atom: int = 1
+    # In-kernel uneven split (``_pick_dsl_split``): atom count, the window it
+    # was picked for, and the per-atom causal stagger on device. Its schedule
+    # reuses ``kv_lens_expanded_cuda`` / ``scheduler_metadata_buffer_expanded``.
+    dsl_kernel_atoms: int = 1
+    dsl_kernel_next_n: int = 0
+    dsl_atom_ctx_offsets: Optional[torch.Tensor] = None
+    dsl_atom_ctx_offsets_key: Tuple[int, int] = (0, 0)
     # Compression ratio for KV tokens
     compress_ratios: List[int] = field(default_factory=lambda: [1])
     # Number of compressed KV tokens for context requests
@@ -284,6 +297,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
             raise ValueError("DSA sparse attention metadata params are not set")
         self.indexer_max_chunk_size = sparse_metadata_params.indexer_max_chunk_size
+
+    @property
+    def use_cute_dsl_paged_mqa_logits(self) -> bool:
+        """The Indexer's decision: the config flag gated on SM100 and cutlass-dsl."""
+        return use_cute_dsl_paged_mqa_logits(
+            self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
+        )
 
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
@@ -557,7 +577,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if cr not in (1, 4):
             return
         try:
-            from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+            from tensorrt_llm._torch.kernels.blackwell.top_k import (
                 gvr_topk_decode_self_sampling_host as _ss_host,
             )
         except ImportError:
@@ -573,14 +593,20 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         msl_c = int(self.get_indexer_max_seq_len())
         # Prefill leg first: the decode-stride guard below may return early for
         # an odd msl_c, but the DeepGEMM prefill stride is always 256-aligned.
+        # forwarded only when enabled (keeps the default warmup calls unchanged)
+        det_kw = (
+            {"deterministic": True}
+            if getattr(self.sparse_metadata_params, "gvr_deterministic_topk", False)
+            else {}
+        )
         try:
-            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768))
+            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768), **det_kw)
         except torch.cuda.OutOfMemoryError:
             logger.warning(
                 "self-sampling GVR prefill warmup ran out of memory; prefill "
                 "engines will JIT-compile lazily on first touch instead."
             )
-        if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
+        if self.use_cute_dsl_paged_mqa_logits:
             # mirror the DSL paged-MQA arena stride (rows round up to 256
             # elements). A drift here only degrades warmup to unused keys —
             # dispatch still lazy-JITs the true key outside capture.
@@ -602,6 +628,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 next_n=int(next_n),
                 num_rows_list=tuple(sorted(rows)),
                 row_stride=row_stride,
+                **det_kw,
             )
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines
@@ -613,17 +640,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
-        # Especially for the changes in the _preprocess_inputs() of model_engine.py.
+        # Especially for the changes in DecoderInputPreparer.preprocess_inputs().
         #
         # NOTE:
         # In overlap scheduler + speculative decoding, kv_lens_cuda can be corrected at runtime
-        # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
+        # (inside preprocess_inputs) to account for variable accepted tokens. The indexer
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
 
         super().on_update_kv_lens()
 
-        # _preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
+        # preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
         # caches so they are recomputed (and captured) on every _forward_step". Invalidate the
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
@@ -661,6 +688,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.refresh_ragged_row_kv_lens()
             self.refresh_token_major_gen_rows()
 
+        # Uncached DSA prefill aliases these scatter maps as gather maps.
         if self.kv_cache_manager is not None and self.num_tokens > 0 and not fused_eligible:
             seq_lens = self.seq_lens_cuda[: self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
@@ -687,7 +715,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 req_indices,
                 index_head_dim,
                 self._tokens_per_block,
-                self.kv_cache_manager.quant_block_size,
+                self.indexer_quant_block_size,
                 data_bytes_per_token=data_bytes_per_token,
             )
             self.slot_mapping_fp8[: self.num_tokens] = fp8_indices
@@ -734,6 +762,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.kv_lens_expanded_cuda[:num_tokens].copy_(kv_lens_expanded)
                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
                     self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                    _DG_SCHEDULE_BLOCK_KV,
+                    self.num_sms,
+                )
+                self.scheduler_metadata_buffer_expanded.copy_(
+                    scheduler_metadata_buffer_expanded, non_blocking=True
+                )
+            if self.expand_for_dsl and self.dsl_kernel_atoms > 1:
+                num_rows = self.num_generations * self.dsl_kernel_atoms
+                atom_lens = gen_indexer_kv_lens.unsqueeze(1) - self.dsl_atom_ctx_offsets
+                self.kv_lens_expanded_cuda[:num_rows].copy_(atom_lens.reshape(-1))
+                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                    self.kv_lens_expanded_cuda[:num_rows].view(-1, 1),
                     _DG_SCHEDULE_BLOCK_KV,
                     self.num_sms,
                 )
@@ -799,7 +839,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             max_query_len=1 + self.max_draft_tokens,
             tokens_per_block=self._tokens_per_block,
             index_head_dim=index_head_dim,
-            quant_block_size=self.kv_cache_manager.quant_block_size,
+            quant_block_size=self.indexer_quant_block_size,
             data_bytes_per_token=data_bytes_per_token,
         )
 
@@ -1676,7 +1716,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # TODO:
         # - Drop this sm90 branch (and the expanded buffers) once
         #   fp8_paged_mqa_logits supports an arbitrary next_n on sm90 too.
-        use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
+        use_dsl = self.use_cute_dsl_paged_mqa_logits
         if not self.is_ragged_verify:
             self._ragged_num_rows = 0
             self._attn_num_rows = 0
@@ -1732,7 +1772,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             kernel_atoms = (1, 2, 3) if self.kv_cache_manager.use_fp4 else (1, 2, 3, 4)
             gen_kv_lens = self.get_indexer_kv_lens(kv_lens[self.num_contexts : self.num_seqs])
             max_ctx = int(gen_kv_lens.max().item()) if gen_kv_lens.numel() else 0
-            expand_factor, atom = _pick_dsl_expand(
+            expand_factor, atom, kernel_split_atoms = _pick_dsl_split(
                 next_n,
                 batch_size=self.num_generations,
                 max_ctx=max_ctx,
@@ -1741,6 +1781,25 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
             self.dsl_expand_factor = expand_factor
             self.dsl_atom = atom
+            self.dsl_kernel_atoms = kernel_split_atoms
+            self.dsl_kernel_next_n = next_n
+            if kernel_split_atoms > 1:
+                offsets = _atom_ctx_offsets(next_n, kernel_split_atoms)
+                if self.dsl_atom_ctx_offsets_key != (next_n, kernel_split_atoms):
+                    # Built outside graph capture; on_update_kv_lens only subtracts.
+                    self.dsl_atom_ctx_offsets = torch.tensor(
+                        offsets, dtype=torch.int32, device="cuda"
+                    )
+                    self.dsl_atom_ctx_offsets_key = (next_n, kernel_split_atoms)
+                num_rows = self.num_generations * kernel_split_atoms
+                atom_lens = gen_kv_lens.unsqueeze(1) - torch.tensor(
+                    offsets, dtype=gen_kv_lens.dtype, device=gen_kv_lens.device
+                )
+                atom_lens = atom_lens.reshape(-1)
+                self.kv_lens_expanded_host[:num_rows].copy_(atom_lens)
+                self.kv_lens_expanded_cuda[:num_rows].copy_(
+                    self.kv_lens_expanded_host[:num_rows], non_blocking=True
+                )
             if expand_factor > 1:
                 num_tokens = self.num_generations * expand_factor
                 gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(expand_factor)
@@ -1752,6 +1811,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.dsl_expand_factor = 1
             self.dsl_atom = self.gen_token_stride
+            self.dsl_kernel_atoms = 1
 
     def _prepare_ragged_row_kv_lens(self, kv_lens: torch.Tensor) -> None:
         """Populate the causal KV extent of each ragged generation row."""

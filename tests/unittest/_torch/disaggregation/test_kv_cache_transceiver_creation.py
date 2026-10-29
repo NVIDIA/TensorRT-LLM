@@ -26,6 +26,15 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    CppMambaHybridCacheManager,
+    MixedMambaHybridCacheManager,
+)
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -53,4 +62,72 @@ def test_python_runtime_rejects_non_helix_cp_at_creation() -> None:
     mapping.cp_config = {"cp_type": "star_attention"}
 
     with pytest.raises(ValueError, match="only cp_size == 1 or helix CP"):
-        transceiver_module.create_kv_cache_transceiver(mapping, Mock(), Mock(), Mock(), config)
+        transceiver_module.create_kv_cache_transceiver(
+            mapping, Mock(), Mock(spec=KVCacheManagerV2), Mock(), config
+        )
+
+
+@pytest.mark.parametrize(
+    "manager_cls", [KVCacheManager, CppMambaHybridCacheManager, MixedMambaHybridCacheManager]
+)
+def test_python_runtime_rejects_v1_manager_at_creation(
+    manager_cls: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = object.__new__(manager_cls)
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+    constructor = Mock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.KvCacheTransceiverV2", constructor
+    )
+
+    with pytest.raises(ValueError, match="does not support KV cache manager V1"):
+        transceiver_module.create_kv_cache_transceiver(None, None, manager, None, config)
+
+    constructor.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "manager_cls", [KVCacheManager, CppMambaHybridCacheManager, MixedMambaHybridCacheManager]
+)
+def test_direct_python_transceiver_rejects_v1_before_resource_setup(
+    manager_cls: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = object.__new__(manager_cls)
+    worker = Mock()
+    monkeypatch.setattr("tensorrt_llm._torch.disaggregation.transceiver.TransferWorker", worker)
+
+    with pytest.raises(ValueError, match="does not support KV cache manager V1"):
+        KvCacheTransceiverV2(None, None, manager, None)
+
+    worker.assert_not_called()
+
+
+@pytest.mark.parametrize("factory", [build_page_table_from_manager, create_cache_reuse_adapter])
+def test_python_transfer_resources_reject_v1_manager(factory) -> None:
+    with pytest.raises(ValueError, match="requires KVCacheManagerV2; V1 is unsupported"):
+        factory(object.__new__(KVCacheManager))
+
+
+def test_python_runtime_accepts_v2_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+    constructor = Mock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.KvCacheTransceiverV2", constructor
+    )
+
+    result = transceiver_module.create_kv_cache_transceiver(None, None, manager, None, config)
+
+    assert result is constructor.return_value
+    constructor.assert_called_once_with(None, None, manager, config)
+
+
+def test_python_runtime_rejects_separate_legacy_mamba_manager() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    legacy_mamba = object.__new__(MixedMambaHybridCacheManager)
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+
+    with pytest.raises(ValueError, match="does not support KV cache manager V1"):
+        transceiver_module.create_kv_cache_transceiver(
+            None, None, manager, None, config, mamba_cache_manager=legacy_mamba
+        )

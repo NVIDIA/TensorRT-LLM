@@ -28,7 +28,7 @@ from tensorrt_llm.llmapi.llm import _TorchLLM
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, ModelLoader
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
-from tensorrt_llm.llmapi.utils import AsyncQueue
+from tensorrt_llm.llmapi.utils import AsyncQueue, _SyncQueue
 
 # isort: off
 from .test_llm import llama_model_path
@@ -77,10 +77,31 @@ def test_cached_model_loader_returns_model_dir(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_attached_model_loader_resolves_hub_on_nonzero_device(
+        monkeypatch, tmp_path):
+    args = TorchLlmArgs(model="example/model", gpus_per_node=1)
+    loader = CachedModelLoader(args, is_attached_frontend=True)
+    model = SimpleNamespace(is_hub_model=True,
+                            model_name="example/model",
+                            model_dir=None)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.local_mpi_rank",
+                        lambda: 1)
+    download = MagicMock(return_value=tmp_path)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.download_hf_model",
+                        download)
+
+    assert loader._download_hf_model_if_needed(
+        model, revision="pinned-revision") == tmp_path
+    assert model.model_dir == tmp_path
+    download.assert_called_once_with("example/model", "pinned-revision")
+
+
+@pytest.mark.cpu_only
 def test_torch_llm_build_passes_model_dir_to_executor(monkeypatch, tmp_path):
     llm = object.__new__(_TorchLLM)
     llm.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
     llm.mpi_session = None
+    llm._is_attached_frontend = False
     llm._executor_cls = MagicMock()
 
     monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)
@@ -103,16 +124,17 @@ def test_torch_llm_build_passes_model_dir_to_executor(monkeypatch, tmp_path):
     llm._build_model()
 
     create_call = llm._executor_cls.create.call_args
-    assert create_call.args == (None, )
+    assert create_call.args == ()
     assert create_call.kwargs["hf_model_dir"] == tmp_path
 
 
 @pytest.mark.cpu_only
-def test_multimodal_encoder_build_passes_none_to_executor(
+def test_multimodal_encoder_build_passes_model_dir_to_executor(
         monkeypatch, tmp_path):
     encoder = object.__new__(MultimodalEncoder)
     encoder.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
     encoder.mpi_session = None
+    encoder._is_attached_frontend = False
     encoder._executor_cls = MagicMock()
 
     monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)
@@ -125,7 +147,9 @@ def test_multimodal_encoder_build_passes_none_to_executor(
 
     encoder._build_model()
 
-    assert encoder._executor_cls.create.call_args.args == (None, )
+    create_call = encoder._executor_cls.create.call_args
+    assert create_call.args == ()
+    assert create_call.kwargs["hf_model_dir"] == tmp_path
 
 
 @pytest.mark.cpu_only
@@ -160,3 +184,77 @@ def test_AsyncQueue():
     thread.start()
     asyncio.run(get_data_from_queue())
     thread.join()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("batched", [False, True])
+def test_async_queue_thread_notifications(batched):
+
+    async def run():
+        queues = [AsyncQueue(), AsyncQueue()]
+        loop = asyncio.get_running_loop()
+
+        async def consume(queue):
+            return [await queue.get() for _ in range(10)]
+
+        def produce(offset):
+            for value in range(offset, offset + 10):
+                for queue in queues:
+                    if batched:
+                        queue.sync_q.put_nowait(value)
+                    else:
+                        queue.sync_q.put(value)
+            if batched:
+                _SyncQueue.notify_many(loop, [q.sync_q for q in queues] * 2)
+
+        for offset in (0, 10, 20):
+            cancelled = asyncio.create_task(queues[0].get())
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            consumers = [asyncio.create_task(consume(q)) for q in queues]
+            await asyncio.sleep(0)
+            await asyncio.to_thread(produce, offset)
+            values = await asyncio.wait_for(asyncio.gather(*consumers), 5)
+            assert values == [list(range(offset, offset + 10))] * 2
+            assert all(q.empty() for q in queues)
+            # A late notification after draining must not strand the next get.
+            await asyncio.to_thread(_SyncQueue.notify_many, loop,
+                                    [q.sync_q for q in queues])
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("state",
+                         ["stopped", "closed", "close_during_schedule"])
+def test_async_queue_notification_shutdown(batched, state, monkeypatch):
+    loop = asyncio.new_event_loop()
+
+    async def make_queue():
+        return AsyncQueue()
+
+    queue = loop.run_until_complete(make_queue())
+    if state == "closed":
+        loop.close()
+    elif state == "close_during_schedule":
+        monkeypatch.setattr(loop, "is_running", lambda: True)
+
+        def close(*args):
+            monkeypatch.setattr(loop, "is_running", lambda: False)
+            loop.close()
+            raise RuntimeError("Event loop is closed")
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", close)
+    try:
+        with pytest.raises(AsyncQueue.EventLoopShutdownError):
+            if batched:
+                queue.sync_q.put_nowait(1)
+                _SyncQueue.notify_many(loop, [queue.sync_q])
+            else:
+                queue.sync_q.put(1)
+    finally:
+        loop.close()

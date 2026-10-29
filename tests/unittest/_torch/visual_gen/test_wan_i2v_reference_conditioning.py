@@ -12,8 +12,12 @@ anything was wrong.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import WanImageToVideoPipeline
 from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _request(*refs) -> SimpleNamespace:

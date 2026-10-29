@@ -14,23 +14,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+
+# Import new integrated versions
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import _cute_dsl_import_error
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
+    _flash_attn_fwd as _fa4_fwd,
+)
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     Attention2DAttention,
     RingAttention,
     UlyssesAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-# Import new integrated versions
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,

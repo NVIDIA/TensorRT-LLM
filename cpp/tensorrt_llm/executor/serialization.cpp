@@ -170,85 +170,6 @@ size_t Serialization::serializedSize(RequestPerfMetrics const& metrics)
     return totalSize;
 }
 
-// SamplingConfig
-SamplingConfig Serialization::deserializeSamplingConfig(std::istream& is)
-{
-    auto beamWidth = su::deserialize<SizeType32>(is);
-    auto topK = su::deserialize<std::optional<SizeType32>>(is);
-    auto topP = su::deserialize<std::optional<FloatType>>(is);
-    auto topPMin = su::deserialize<std::optional<FloatType>>(is);
-    auto topPResetIds = su::deserialize<std::optional<TokenIdType>>(is);
-    auto topPDecay = su::deserialize<std::optional<FloatType>>(is);
-    auto randomSeed = su::deserialize<std::optional<RandomSeedType>>(is);
-    auto temperature = su::deserialize<std::optional<FloatType>>(is);
-    auto minLength = su::deserialize<std::optional<SizeType32>>(is);
-    auto beamSearchDiversityRate = su::deserialize<std::optional<FloatType>>(is);
-    auto repetitionPenalty = su::deserialize<std::optional<FloatType>>(is);
-    auto presencePenalty = su::deserialize<std::optional<FloatType>>(is);
-    auto frequencyPenalty = su::deserialize<std::optional<FloatType>>(is);
-    auto promptIgnoreLength = su::deserialize<std::optional<SizeType32>>(is);
-    auto lengthPenalty = su::deserialize<std::optional<FloatType>>(is);
-    auto earlyStopping = su::deserialize<std::optional<SizeType32>>(is);
-    auto noRepeatNgramSize = su::deserialize<std::optional<SizeType32>>(is);
-    auto numReturnSequences = su::deserialize<std::optional<SizeType32>>(is);
-    auto minP = su::deserialize<std::optional<FloatType>>(is);
-    auto beamWidthArray = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
-
-    return SamplingConfig{beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed, temperature, minLength,
-        beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, promptIgnoreLength,
-        lengthPenalty, earlyStopping, noRepeatNgramSize, numReturnSequences, minP, beamWidthArray};
-}
-
-void Serialization::serialize(SamplingConfig const& config, std::ostream& os)
-{
-    su::serialize(config.mBeamWidth, os);
-    su::serialize(config.mTopK, os);
-    su::serialize(config.mTopP, os);
-    su::serialize(config.mTopPMin, os);
-    su::serialize(config.mTopPResetIds, os);
-    su::serialize(config.mTopPDecay, os);
-    su::serialize(config.mSeed, os);
-    su::serialize(config.mTemperature, os);
-    su::serialize(config.mMinTokens, os);
-    su::serialize(config.mBeamSearchDiversityRate, os);
-    su::serialize(config.mRepetitionPenalty, os);
-    su::serialize(config.mPresencePenalty, os);
-    su::serialize(config.mFrequencyPenalty, os);
-    su::serialize(config.mPromptIgnoreLength, os);
-    su::serialize(config.mLengthPenalty, os);
-    su::serialize(config.mEarlyStopping, os);
-    su::serialize(config.mNoRepeatNgramSize, os);
-    su::serialize(config.mNumReturnSequences, os);
-    su::serialize(config.mMinP, os);
-    su::serialize(config.mBeamWidthArray, os);
-}
-
-size_t Serialization::serializedSize(SamplingConfig const& config)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(config.mBeamWidth);
-    totalSize += su::serializedSize(config.mTopK);
-    totalSize += su::serializedSize(config.mTopP);
-    totalSize += su::serializedSize(config.mTopPMin);
-    totalSize += su::serializedSize(config.mTopPResetIds);
-    totalSize += su::serializedSize(config.mTopPDecay);
-    totalSize += su::serializedSize(config.mSeed);
-    totalSize += su::serializedSize(config.mTemperature);
-    totalSize += su::serializedSize(config.mMinTokens);
-    totalSize += su::serializedSize(config.mBeamSearchDiversityRate);
-    totalSize += su::serializedSize(config.mRepetitionPenalty);
-    totalSize += su::serializedSize(config.mPresencePenalty);
-    totalSize += su::serializedSize(config.mFrequencyPenalty);
-    totalSize += su::serializedSize(config.mPromptIgnoreLength);
-    totalSize += su::serializedSize(config.mLengthPenalty);
-    totalSize += su::serializedSize(config.mEarlyStopping);
-    totalSize += su::serializedSize(config.mNoRepeatNgramSize);
-    totalSize += su::serializedSize(config.mNumReturnSequences);
-    totalSize += su::serializedSize(config.mMinP);
-    totalSize += su::serializedSize(config.mBeamWidthArray);
-    return totalSize;
-}
-
 // OutputConfig
 OutputConfig Serialization::deserializeOutputConfig(std::istream& is)
 {
@@ -1008,29 +929,6 @@ size_t Serialization::serializedSize(Tensor const& tensor)
     return totalSize;
 }
 
-// SpeculativeDecodingFastLogitsInfo
-SpeculativeDecodingFastLogitsInfo Serialization::deserializeSpecDecFastLogitsInfo(std::istream& is)
-{
-    auto draftRequestId = su::deserialize<uint64_t>(is);
-    auto draftParticipantId = su::deserialize<int32_t>(is);
-
-    return SpeculativeDecodingFastLogitsInfo{draftRequestId, draftParticipantId};
-}
-
-void Serialization::serialize(SpeculativeDecodingFastLogitsInfo const& info, std::ostream& os)
-{
-    su::serialize(info.draftRequestId, os);
-    su::serialize(info.draftParticipantId, os);
-}
-
-size_t Serialization::serializedSize(SpeculativeDecodingFastLogitsInfo const& info)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(info.draftRequestId);
-    totalSize += su::serializedSize(info.draftParticipantId);
-    return totalSize;
-}
-
 // Result
 Result Serialization::deserializeResult(std::istream& is)
 {
@@ -1039,10 +937,6 @@ Result Serialization::deserializeResult(std::istream& is)
     result.outputTokenIds = su::deserialize<BeamTokens>(is);
     result.cumLogProbs = su::deserialize<std::optional<VecLogProbs>>(is);
     result.logProbs = su::deserialize<std::optional<std::vector<VecLogProbs>>>(is);
-    result.contextLogits = su::deserialize<std::optional<Tensor>>(is);
-    result.generationLogits = su::deserialize<std::optional<Tensor>>(is);
-    result.specDecFastLogitsInfo = su::deserialize<std::optional<SpeculativeDecodingFastLogitsInfo>>(is);
-    result.encoderOutput = su::deserialize<std::optional<Tensor>>(is);
     result.finishReasons = su::deserialize<std::vector<FinishReason>>(is);
     result.contextPhaseParams = su::deserialize<std::optional<ContextPhaseParams>>(is);
     result.decodingIter = su::deserialize<SizeType32>(is);
@@ -1050,7 +944,6 @@ Result Serialization::deserializeResult(std::istream& is)
     result.sequenceIndex = su::deserialize<SizeType32>(is);
     result.isSequenceFinal = su::deserialize<bool>(is);
     result.requestPerfMetrics = su::deserialize<std::optional<RequestPerfMetrics>>(is);
-    result.additionalOutputs = su::deserialize<std::vector<AdditionalOutput>>(is);
     return result;
 }
 
@@ -1060,10 +953,6 @@ void Serialization::serialize(Result const& result, std::ostream& os)
     su::serialize(result.outputTokenIds, os);
     su::serialize(result.cumLogProbs, os);
     su::serialize(result.logProbs, os);
-    su::serialize(result.contextLogits, os);
-    su::serialize(result.generationLogits, os);
-    su::serialize(result.specDecFastLogitsInfo, os);
-    su::serialize(result.encoderOutput, os);
     su::serialize(result.finishReasons, os);
     su::serialize(result.contextPhaseParams, os);
     su::serialize(result.decodingIter, os);
@@ -1071,7 +960,6 @@ void Serialization::serialize(Result const& result, std::ostream& os)
     su::serialize(result.sequenceIndex, os);
     su::serialize(result.isSequenceFinal, os);
     su::serialize(result.requestPerfMetrics, os);
-    su::serialize(result.additionalOutputs, os);
 }
 
 size_t Serialization::serializedSize(Result const& result)
@@ -1081,10 +969,6 @@ size_t Serialization::serializedSize(Result const& result)
     totalSize += su::serializedSize(result.outputTokenIds);
     totalSize += su::serializedSize(result.cumLogProbs);
     totalSize += su::serializedSize(result.logProbs);
-    totalSize += su::serializedSize(result.contextLogits);
-    totalSize += su::serializedSize(result.specDecFastLogitsInfo);
-    totalSize += su::serializedSize(result.generationLogits);
-    totalSize += su::serializedSize(result.encoderOutput);
     totalSize += su::serializedSize(result.finishReasons);
     totalSize += su::serializedSize(result.contextPhaseParams);
     totalSize += su::serializedSize(result.decodingIter);
@@ -1092,7 +976,6 @@ size_t Serialization::serializedSize(Result const& result)
     totalSize += su::serializedSize(result.sequenceIndex);
     totalSize += su::serializedSize(result.isSequenceFinal);
     totalSize += su::serializedSize(result.requestPerfMetrics);
-    totalSize += su::serializedSize(result.additionalOutputs);
     return totalSize;
 }
 
@@ -1159,28 +1042,6 @@ std::vector<char> Serialization::serialize(std::vector<Response> const& response
         su::serialize(response, os);
     }
     return buffer;
-}
-
-AdditionalOutput Serialization::deserializeAdditionalOutput(std::istream& is)
-{
-    return {
-        Serialization::deserializeString(is),
-        Serialization::deserializeTensor(is),
-    };
-}
-
-void Serialization::serialize(AdditionalOutput const& additionalOutput, std::ostream& os)
-{
-    su::serialize(additionalOutput.name, os);
-    su::serialize(additionalOutput.output, os);
-}
-
-size_t serializedSize(AdditionalOutput const& additionalOutput)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(additionalOutput.name);
-    totalSize += su::serializedSize(additionalOutput.output);
-    return totalSize;
 }
 
 // KvCacheConfig

@@ -18,6 +18,7 @@
 
 import java.lang.InterruptedException
 import groovy.transform.Field
+import com.nvidia.bloom.FailureEvidenceCollector
 import trtllm.FailureClassifier
 import trtllm.exceptions.InfraFailure
 
@@ -124,28 +125,28 @@ def BUILD_CONFIGS = [
   (CONFIG_LINUX_X86_64_VANILLA) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;107-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=0 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_UCX=0 --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks",
     (TARNAME) : "single-device-TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;107-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;107-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "90-real;100-real;103-real;107-real;120-real",
     (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "90-real;100-real;103-real;107-real;120-real",
     (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
 ]
@@ -516,21 +517,33 @@ def runLLMBuild(
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        // cmake will download third-party sources, so we add retry
+        trtllm_utils.llmExecStepWithRetry(
+            pipeline,
+            script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        )
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
-    // place. Runs mypy directly (not via pre-commit) so this step does zero
-    // network: the pre-commit orchestrator clones every remote hook repo from
-    // github up front, which flakes on nodes without github access. mypy and its
+    // place. Runs mypy directly (not via pre-commit) so this step does not clone
+    // anything from github: the pre-commit orchestrator clones every remote hook
+    // repo up front, which flakes on nodes without github access. mypy and its
     // config come from requirements-dev.txt (installed above) via the internal
     // PyPI mirror. MYPY_REQUIRE_BINDINGS=1 makes run_mypy.sh hard-fail if the
     // bindings can't be imported, rather than silently degrading to the
     // lightweight (no-bindings) check.
+    //
+    // The step still talks to the network: [tool.mypy] sets install_types, so
+    // mypy pip-installs the missing stub packages from the internal PyPI mirror
+    // before checking.
     if (typeCheck) {
         echo "-- Running mypy type check with compiled bindings..."
         withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-            sh "cd ${LLM_ROOT} && bash scripts/run_mypy.sh"
+            trtllm_utils.llmExecStepWithRetry(
+                pipeline,
+                script: "cd ${LLM_ROOT} && bash scripts/run_mypy.sh",
+                shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
+            )
         }
     }
 
@@ -701,7 +714,7 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     }
 }
 
-def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, cpver="312", extra_args="")
+def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, cpver="312", extra_args="", reconfigure=false)
 {
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
@@ -721,9 +734,9 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
 
     if (extra_args == "") {
         if (triple == AARCH64_TRIPLE) {
-            extra_args = "-a '90-real;100-real;103-real;120-real'"
+            extra_args = "-a '90-real;100-real;103-real;107-real;120-real'"
         } else {
-            extra_args = "-a '80-real;86-real;89-real;90-real;100-real;103-real;120-real'"
+            extra_args = "-a '80-real;86-real;89-real;90-real;100-real;103-real;107-real;120-real'"
         }
     }
     if (pre_cxx11abi) {
@@ -738,7 +751,14 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
     sh "bash -c 'git config --global --add safe.directory \"*\"'"
     // Because different architectures involve different macros, a comprehensive test is conducted here.
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+    def buildCommand = "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}"
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"${buildCommand}\"")
+    if (reconfigure) {
+        // Verify that reconfiguration works.
+        // Configure the built tree again with identical arguments and rebuild it incrementally,
+        // so CMake logic that only breaks once the cache and fetched dependencies exist fails CI.
+        sh "bash -c \"${buildCommand} --configure_cmake --skip_building_wheel\""
+    }
 }
 
 def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
@@ -858,7 +878,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks")
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks", true)
                         }
                     }
                 })
@@ -876,7 +896,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         // ENABLE_INFRA_SCOPED_FAILFAST; off = plain failFast + parallel, as before.
         trtllm_utils.runBranchesWithInfraDefer(pipeline, parallelJobs, enableFailFast,
                 ENABLE_INFRA_SCOPED_FAILFAST) { e, stageName ->
-            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)
+            def evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, e, FailureClassifier.failureEvidenceQueries(InfraFailure.K8S))
+            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S, evidence)
         }
     } // Build stage
 }
@@ -898,7 +919,7 @@ pipeline {
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
         GITHUB_MIRROR="https://urm.nvidia.com/artifactory/github-go-remote"
-        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
     }

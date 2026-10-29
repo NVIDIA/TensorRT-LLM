@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.kernels import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.kernels import (
     _LOG2_E,
     _block_pool_torch,
     _block_thresholds_torch,

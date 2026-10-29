@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -5,7 +8,6 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, CUDAGraphRunnerConfig)
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.mapping import Mapping
 
 
@@ -236,27 +238,28 @@ def reference_block_scale_moe_torch(
     return results.view_as(x)
 
 
-def create_mock_cuda_graph_runner(batch_size: int,
-                                  use_mrope: bool = False,
-                                  max_num_tokens: int = 1):
-    config = CUDAGraphRunnerConfig(
-        use_cuda_graph=True,
-        cuda_graph_padding_enabled=False,
-        cuda_graph_batch_sizes=[batch_size],
-        max_cuda_graph_batch_size=batch_size,
-        batch_size=batch_size,
-        max_beam_width=1,
-        max_num_tokens=max_num_tokens,
-        use_mrope=use_mrope,
-        spec_config=None,
-        cuda_graph_mem_pool=None,
-        enable_attention_dp=False,
-        original_max_draft_len=0,
-        original_max_total_draft_tokens=0,
-        is_encoder_decoder=False,
-        mapping=Mapping(),
-        dist=None,
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER)
+def create_mock_cuda_graph_runner(
+        batch_size: int,
+        use_mrope: bool = False,
+        max_num_tokens: int = 1,
+        static_input_ids: Optional[torch.Tensor] = None,
+        static_position_ids: Optional[torch.Tensor] = None):
+    config = CUDAGraphRunnerConfig(use_cuda_graph=True,
+                                   cuda_graph_padding_enabled=False,
+                                   cuda_graph_batch_sizes=[batch_size],
+                                   max_cuda_graph_batch_size=batch_size,
+                                   batch_size=batch_size,
+                                   max_beam_width=1,
+                                   max_num_tokens=max_num_tokens,
+                                   use_mrope=use_mrope,
+                                   spec_config=None,
+                                   enable_attention_dp=False,
+                                   original_max_total_draft_tokens=0,
+                                   is_encoder_decoder=False,
+                                   mapping=Mapping(),
+                                   dist=None,
+                                   static_input_ids=static_input_ids,
+                                   static_position_ids=static_position_ids)
     return CUDAGraphRunner(config)
 
 
@@ -277,3 +280,29 @@ def make_hf_hybrid_cache_for_tests(
     from transformers.cache_utils import StaticCache
 
     return StaticCache(config=config, max_cache_len=max_cache_len)
+
+
+def dspark_markov_chain_logits_reference(base_logits: torch.Tensor,
+                                         first_prev_tokens: torch.Tensor,
+                                         markov_w1: torch.Tensor,
+                                         markov_w2: torch.Tensor,
+                                         argmax_fn=None) -> torch.Tensor:
+    """Eager DSpark vanilla-Markov chain on raw tensors; the biased logits only.
+
+    The reference for the fused chain (``vocab_parallel.markov_chain_logits``).
+    ``markov_w2`` may be sliced to one TP rank's vocab shard; ``argmax_fn``
+    then maps a shard-local row to its full-vocab token id.
+    """
+    from tensorrt_llm._torch.models.modeling_speculative import (
+        dspark_markov_chain, dspark_markov_step_bias)
+
+    def _step_bias(prev_tokens, step_hidden):
+        del step_hidden
+        return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
+
+    _, corrected = dspark_markov_chain(base_logits,
+                                       first_prev_tokens,
+                                       _step_bias,
+                                       next_token_fn=argmax_fn,
+                                       cast_bias_to_logits=True)
+    return corrected

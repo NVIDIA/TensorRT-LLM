@@ -11,15 +11,17 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, global_mpi_rank
+from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager, ResourceManagerType)
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -33,7 +35,11 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.ipc import IpcQueue
+
 from ..attention.backends.interface import AttentionRuntimeFeatures
+from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
 from ..models.modeling_utils import timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
@@ -41,17 +47,19 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    compute_max_num_sequences, create_py_executor_instance,
-                    instantiate_sampler, is_disagg_enabled, is_mla,
-                    validate_feature_combination)
+                    create_py_executor_instance, instantiate_sampler,
+                    is_disagg_enabled, is_mla)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.registry import uses_connector
 from .dwdp import DwdpManager, get_global_dwdp_manager
+from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
-from .model_engine import PyTorchModelEngine
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .model_engine import ModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
@@ -84,53 +92,35 @@ class _ExecutorMemoryMonitor:
         return bytes / (1024)**3
 
     memory_type_friendly_names = {
-        ExecutorMemoryType.SAMPLER:
-        "Sampler",
-        ExecutorMemoryType.DRAFTER:
-        "Drafter",
-        ExecutorMemoryType.GUIDED_DECODER:
-        "Guided Decoder",
-        ExecutorMemoryType.SPEC_RESOURCES:
-        "Speculative decoding resources",
+        ExecutorMemoryType.SAMPLER: "Sampler",
+        ExecutorMemoryType.DRAFTER: "Drafter",
+        ExecutorMemoryType.GUIDED_DECODER: "Guided Decoder",
+        ExecutorMemoryType.SPEC_RESOURCES: "Speculative decoding resources",
         ExecutorMemoryType.INIT_KV_CACHE:
         "Initial KV Cache (temporary for KV cache size estimation)",
         ExecutorMemoryType.INIT_EXTRA_RESOURCES:
         "Additional executor resources (temporary for KV cache size estimation)",
-        ExecutorMemoryType.MODEL_EXTRA:
-        "Model resources created during usage",
-        ExecutorMemoryType.EXTRA_RESOURCES:
-        "Additional executor resources",
-        ExecutorMemoryType.KV_CACHE:
-        "KV cache",
-        ExecutorMemoryType.MODEL_ENGINE_MAIN:
-        "Model",
-        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
-        "Draft model for speculative decoding",
+        ExecutorMemoryType.MODEL_EXTRA: "Model resources created during usage",
+        ExecutorMemoryType.EXTRA_RESOURCES: "Additional executor resources",
+        ExecutorMemoryType.KV_CACHE: "KV cache",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN: "Model",
     }
 
     creation_stage_metric_names = {
-        ExecutorMemoryType.SAMPLER:
-        "sampler_creation_seconds",
-        ExecutorMemoryType.DRAFTER:
-        "speculative_drafter_creation_seconds",
-        ExecutorMemoryType.GUIDED_DECODER:
-        "guided_decoder_creation_seconds",
+        ExecutorMemoryType.SAMPLER: "sampler_creation_seconds",
+        ExecutorMemoryType.DRAFTER: "speculative_drafter_creation_seconds",
+        ExecutorMemoryType.GUIDED_DECODER: "guided_decoder_creation_seconds",
         ExecutorMemoryType.SPEC_RESOURCES:
         "speculative_decoding_resource_manager_creation_seconds",
-        ExecutorMemoryType.INIT_KV_CACHE:
-        "initial_kv_cache_creation_seconds",
+        ExecutorMemoryType.INIT_KV_CACHE: "initial_kv_cache_creation_seconds",
         ExecutorMemoryType.INIT_EXTRA_RESOURCES:
         "initial_py_executor_creation_seconds_for_kv_cache_estimation",
         ExecutorMemoryType.MODEL_EXTRA:
         "kv_cache_capacity_configuration_seconds",
         ExecutorMemoryType.EXTRA_RESOURCES:
         "final_py_executor_creation_seconds",
-        ExecutorMemoryType.KV_CACHE:
-        "final_kv_cache_creation_seconds",
-        ExecutorMemoryType.MODEL_ENGINE_MAIN:
-        "model_engine_creation_seconds",
-        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
-        "draft_model_engine_creation_seconds",
+        ExecutorMemoryType.KV_CACHE: "final_kv_cache_creation_seconds",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN: "model_engine_creation_seconds",
     }
 
     # Suggestion to reduce component memory usage
@@ -146,9 +136,6 @@ class _ExecutorMemoryMonitor:
         ExecutorMemoryType.INIT_KV_CACHE:
         "reduce max_num_tokens",
         ExecutorMemoryType.MODEL_ENGINE_MAIN:
-        ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
-         "pipeline and/or tensor parallelism"),
-        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
         ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
          "pipeline and/or tensor parallelism"),
         ExecutorMemoryType.INIT_EXTRA_RESOURCES:
@@ -229,7 +216,7 @@ def _flashinfer_one_engine_spec_supported(attn_backend: str,
     but that does not establish FlashInfer serving-scale qualification.
 
     Other speculative modes are admitted when they do not need a separate
-    draft KV cache manager.
+    draft KV cache manager. The overlap scheduler has an independent guard.
     """
     if spec_config is None or attn_backend != "FLASHINFER":
         return True
@@ -238,11 +225,123 @@ def _flashinfer_one_engine_spec_supported(attn_backend: str,
     return not should_use_separate_draft_kv_cache(spec_config)
 
 
-def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
-    for engine in model_engines:
-        if engine is None:
-            continue
-        engine.attn_runtime_features.cache_reuse = cache_reuse
+ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR = "TRTLLM_ALLOW_UNCORRECTED_OVERLAP_SPEC"
+
+
+def _overlap_spec_kv_lengths_uncorrected(attn_backend: str,
+                                         spec_config,
+                                         disable_overlap_scheduler: bool,
+                                         sparse_attention_config=None) -> bool:
+    """Whether overlap decode would run this speculation on stale KV lengths.
+
+    With the overlap scheduler on, generation rows are prepared before
+    acceptance is known, so their KV lengths assume every draft token was
+    accepted and have to be corrected afterwards. Backends that expose
+    ``kv_lens_cuda`` are corrected unconditionally by the model engine. The
+    other correction hook, ``apply_spec_decode_kv_lens_offsets``, is opt-in:
+    it returns immediately unless the engine also put this configuration on
+    the full generation page table, which only happens for speculation
+    configs that share the target KV cache. For every other one-engine
+    speculation on such a backend the correction is a silent no-op, decode
+    attends KV slots that were never committed, and the engine returns wrong
+    tokens with no error anywhere -- hence a refusal rather than a fallback.
+    """
+    if spec_config is None or disable_overlap_scheduler:
+        return False
+    if not spec_config.spec_dec_mode.use_one_engine():
+        return False
+    # Resolved exactly as the runtime resolves it: with lowered sparse params
+    # when sparse attention is configured (a sparse config replaces the dense
+    # backend in its slot with a sparse backend whose metadata owns its own
+    # KV-length handling), and with the fallback to TRTLLM when the requested
+    # backend is unavailable.
+    if sparse_attention_config is not None:
+        try:
+            sparse_params = sparse_attention_config.to_sparse_params()
+            metadata_cls = get_attention_backend(
+                attn_backend, sparse_params=sparse_params).Metadata
+        except Exception:
+            # Some sparse configs only lower once checkpoint-derived fields
+            # are available (the engine lowers with pretrained_config, which
+            # does not exist yet at this point), and some sparse backends
+            # probe hardware during resolution. When the effective backend
+            # cannot be resolved here, do not refuse: no sparse metadata
+            # class relies on the opt-in correction hook this guard is
+            # about, and a real resolution error still fails engine
+            # construction in its established place.
+            return False
+    else:
+        metadata_cls = get_attention_backend(attn_backend).Metadata
+    if not hasattr(metadata_cls, 'apply_spec_decode_kv_lens_offsets'):
+        # This backend does not use the opt-in hook, so it cannot no-op.
+        return False
+    # Same predicate the engine evaluates per forward pass, on the metadata
+    # class instead of an instance, so the two cannot drift apart.
+    return not uses_full_generation_page_table(disable_overlap_scheduler,
+                                               spec_config, metadata_cls)
+
+
+def _enforce_overlap_spec_kv_correction(attn_backend: str,
+                                        spec_config,
+                                        disable_overlap_scheduler: bool,
+                                        sparse_attention_config=None) -> None:
+    """Refuse a speculation whose KV lengths overlap decode would not correct.
+
+    The failure this prevents is silent: the engine boots, drafts and accepts
+    tokens, and returns a corrupted answer. Refusing at construction is the
+    only place it can still be reported.
+    """
+    if not _overlap_spec_kv_lengths_uncorrected(attn_backend, spec_config,
+                                                disable_overlap_scheduler,
+                                                sparse_attention_config):
+        return
+    message = (
+        f"Speculation mode {spec_config.spec_dec_mode.name} on the "
+        f"{attn_backend} attention backend has no KV-length correction after "
+        "draft acceptance, so running it with the overlap scheduler makes "
+        "decode attend KV slots that were never committed and silently "
+        "return wrong tokens. Pass disable_overlap_scheduler=True to run this "
+        f"speculation. Setting {ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR}=1 "
+        "downgrades this refusal to a warning, for experimentation only: the "
+        "outputs are known to be corrupted.")
+    if os.environ.get(ALLOW_UNCORRECTED_OVERLAP_SPEC_ENV_VAR, "0") == "1":
+        logger.warning_once(message, key="uncorrected_overlap_spec")
+        return
+    raise ValueError(message)
+
+
+def _branch_snapshot_ctx_chunk_config(
+    ctx_chunk_config: Optional[tuple],
+    kv_cache_manager: Optional[BaseResourceManager],
+    tokens_per_block: int,
+    configured_policy: Optional[ContextChunkingPolicy] = None
+) -> Optional[tuple]:
+    """Force chunk boundaries at SWA branch points if the manager records them.
+
+    Decided on the built manager, which alone knows whether branch points apply
+    (SWA layers present, no joint target/draft reuse). Otherwise the configured
+    chunking is kept unchanged.
+    """
+    if not (isinstance(kv_cache_manager, KVCacheManagerV2)
+            and kv_cache_manager.records_branch_snapshots):
+        return ctx_chunk_config
+    if ctx_chunk_config is None:
+        logger.warning_once(
+            "block_reuse_config.enable_branch_snapshot turns on chunked "
+            "prefill with the FORCE_CHUNK policy, although "
+            "enable_chunked_prefill is False.",
+            key="branch_snapshot_enables_chunking")
+    elif (configured_policy is not None
+          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
+        logger.warning_once(
+            "block_reuse_config.enable_branch_snapshot replaces "
+            f"scheduler_config.context_chunking_policy={configured_policy} "
+            "with FORCE_CHUNK.",
+            key="branch_snapshot_replaces_chunking_policy")
+    # Keep the unit chosen for this model; it only aligns budget-shortened chunks.
+    chunk_unit_size = (ctx_chunk_config[1]
+                       if ctx_chunk_config is not None else tokens_per_block)
+    return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -342,7 +441,7 @@ def create_encoder_executor(
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     dist = Distributed.get(mapping)
 
-    model_engine = PyTorchModelEngine(
+    model_engine = ModelEngine(
         model_path=checkpoint_dir,
         llm_args=llm_args,
         mapping=mapping,
@@ -372,21 +471,11 @@ def log_memory_usage(stage: str):
     )
 
 
-def _move_model_engine_metrics(
-        py_executor: PyExecutor,
-        model_engine: PyTorchModelEngine,
-        stage: str,
-        draft_model_engine: Optional[PyTorchModelEngine] = None) -> None:
-    """Move model-engine metrics and optional draft-model-engine metrics into the
-    executor under a startup stage.
-    """
+def _move_model_engine_metrics(py_executor: PyExecutor,
+                               model_engine: ModelEngine, stage: str) -> None:
+    """Move model-engine metrics into the executor under a startup stage."""
     py_executor.metrics[f"{stage}_model_engine"] = dict(model_engine.metrics)
     model_engine.metrics.clear()
-
-    if draft_model_engine is not None:
-        py_executor.metrics[f"{stage}_draft_model_engine"] = dict(
-            draft_model_engine.metrics)
-        draft_model_engine.metrics.clear()
 
 
 def _create_py_executor_impl(
@@ -395,7 +484,7 @@ def _create_py_executor_impl(
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
-    resource_governor_queue=None,
+    resource_governor_queue: "Optional[IpcQueue]" = None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -545,6 +634,12 @@ def _create_py_executor(
             "mode needs a separate draft KV cache manager, which FLASHINFER "
             "does not support. Use TRTLLM target attention.")
 
+    _enforce_overlap_spec_kv_correction(
+        llm_args.attn_backend,
+        spec_config,
+        llm_args.disable_overlap_scheduler,
+        sparse_attention_config=llm_args.sparse_attention_config)
+
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
         llm_args.disable_overlap_scheduler = True
@@ -561,14 +656,16 @@ def _create_py_executor(
     # about dwdp_size/dwdp_rank, so inject them here (before anything reads
     # mapping.dwdp_enabled / moe_ep_rank).
     #
-    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
+    # dwdp_rank MUST be derived from the global DWDP rank (the global MPI
+    # rank, or TRTLLM_DWDP_RANK when context workers are launched
+    # independently -- see modules.dwdp.rendezvous), not mapping.rank:
     # in disaggregated serving each context worker is its own TP=1 instance
     # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
     # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
     # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
     if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
         dwdp_size = llm_args.dwdp_config.dwdp_size
-        dwdp_rank = global_mpi_rank() % dwdp_size
+        dwdp_rank = dwdp_global_rank() % dwdp_size
         mapping = Mapping(**{
             **mapping.to_dict(), "dwdp_size": dwdp_size,
             "dwdp_rank": dwdp_rank
@@ -581,6 +678,15 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
+    # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
+    if (mapping.has_cp_helix()
+            and not is_disagg_enabled(cache_transceiver_config)
+            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
+        raise NotImplementedError(
+            "Helix context parallelism is supported only on disaggregated "
+            "generation servers; aggregated serving with Helix is not "
+            "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
+            "development only).")
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -629,8 +735,8 @@ def _create_py_executor(
 
     # Initialize DWDP Manager.
     #
-    # DWDP needs every global MPI rank to be a complete, unsharded model replica
-    # owning one expert slice -- `dwdp_rank = global_mpi_rank() % dwdp_size` is
+    # DWDP needs every global DWDP rank to be a complete, unsharded model replica
+    # owning one expert slice -- `dwdp_rank = dwdp_global_rank() % dwdp_size` is
     # only meaningful under that bijection. Disaggregated context workers satisfy
     # this with TP=1, aggregated serving with full attention DP; everything that
     # shards a replica across ranks is rejected. Pipeline and context parallelism
@@ -655,6 +761,13 @@ def _create_py_executor(
                 "tp_size=1 (disaggregated context worker) or "
                 "enable_attention_dp=True (aggregated serving), but got "
                 f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
+        # The host issues the expert prefetch as the MoE layers run, and the
+        # last layers of a pass already prefetch the next pass; a replayed
+        # CUDA graph would bind buffer slots the host schedule does not track.
+        if llm_args.cuda_graph_config is not None:
+            raise ValueError(
+                "DWDP does not support CUDA graphs; set cuda_graph_config=None."
+            )
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
@@ -696,7 +809,7 @@ def _create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
-        model_engine = PyTorchModelEngine(
+        model_engine = ModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
             mapping=mapping,
@@ -708,7 +821,9 @@ def _create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
-    validate_feature_combination(llm_args, model_engine)
+    # Model loading can disable reuse after runtime features were created.
+    model_engine.attn_runtime_features.cache_reuse = (
+        kv_cache_config.enable_block_reuse)
 
     calibrator = get_calibrator()
     layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
@@ -717,11 +832,9 @@ def _create_py_executor(
                     layer_wise_benchmarks_config.calibration_layer_indices,
                     mapping=mapping,
                     dist=dist)
-    model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
+    calibrator.maybe_wrap_model(model_engine.model)
 
-    draft_model_engine = None
-
-    # PyTorchModelEngine modifies these fields, update them
+    # ModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
@@ -740,19 +853,13 @@ def _create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
-    sparse_attention_config = model_engine.sparse_attention_config
+    sparse_attention_config = model_engine.model.model_config.sparse_attention_config
 
     # Resolve this before cache reuse and cache manager selection consume it.
     resolve_cache_transceiver_config(cache_transceiver_config)
 
     config = model_engine.model.model_config.pretrained_config
-    max_num_seq_slots = getattr(
-        model_engine, "max_num_seq_slots", None) or compute_max_num_sequences(
-            mapping,
-            max_batch_size,
-            llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=getattr(model_engine,
-                                            "_enable_overlap_headroom", False))
+    max_num_seq_slots = model_engine.max_num_seq_slots
     if is_mla(config):
         if uses_fp4_mla_attention(model_engine.model.model_config):
             tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
@@ -765,8 +872,7 @@ def _create_py_executor(
                     "FP4 MLA cached-context attention is not supported yet; "
                     "disabling KV cache block reuse.")
                 kv_cache_config.enable_block_reuse = False
-                _set_model_engines_cache_reuse(
-                    [model_engine, draft_model_engine], False)
+                model_engine.attn_runtime_features.cache_reuse = False
         elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
@@ -791,8 +897,7 @@ def _create_py_executor(
                            f"{_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR}, "
                            f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                           False)
+            model_engine.attn_runtime_features.cache_reuse = False
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         nvfp4_sparse_cache_reuse = (kv_cache_quant_algo == QuantAlgo.NVFP4
@@ -809,8 +914,7 @@ def _create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                           False)
+            model_engine.attn_runtime_features.cache_reuse = False
         if (enable_chunked_context and sm_version
                 not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
             logger.warning("Chunked Prefill for MLA can only be enabled on "
@@ -818,8 +922,19 @@ def _create_py_executor(
                            f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
-            if draft_model_engine is not None:
-                draft_model_engine.attn_runtime_features.chunked_prefill = False
+
+    if (kv_cache_config.enable_block_reuse
+            and model_engine.model.model_config.is_encoder_decoder
+            and getattr(model_engine.input_processor,
+                        "requires_encoder_features", False)):
+        # Both KV pools depend on encoder features, which have no token IDs
+        # or input discriminator to safely key reuse between requests.
+        logger.info(
+            "Disabling block reuse for the self- and cross-KV caches: "
+            "the encoder takes feature tensors, so requests carry no "
+            "encoder tokens or input discriminator to key cache entries.")
+        kv_cache_config.enable_block_reuse = False
+        model_engine.attn_runtime_features.cache_reuse = False
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
@@ -872,7 +987,7 @@ def _create_py_executor(
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):
-                    # GuidedDecoder is applicable to non-speculative decoding and two-model speculative decoding.
+                    # GuidedDecoder is applicable to non-speculative decoding and drafter-based speculative decoding.
                     guided_decoder = GuidedDecoder(**kwargs)
                 elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
                 ):
@@ -906,24 +1021,12 @@ def _create_py_executor(
             f"Initializing kv connector with config: {kv_connector_config}")
 
         # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
-        # not chosen until model loading, so the three manager-dependent
-        # rejections below fire here only when the config names the manager
-        # outright, sparing an explicit config a model load it cannot use.
-        # `_maybe_init_kv_connector_manager` repeats all three against the
+        # not chosen until model loading, so the manager-dependent
+        # rejections below fire here when the config selects a boolean value,
+        # including the default True, sparing it a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats them against the
         # manager that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
-
-        # A policy that destroys and replays a live request leaves the
-        # connector's per-request block delta measured against pages that were
-        # freed with it. Only KVCacheManagerV2 drops that delta on replay.
-        if (scheduler_config.capacity_scheduler_policy
-                != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-                and v2_selection is False):
-            raise NotImplementedError(
-                "KV connector in this configuration is only supported with the "
-                "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
-                "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
-            )
 
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
@@ -935,20 +1038,21 @@ def _create_py_executor(
                 "KV connector is not supported with speculative decoding. "
                 "Disable speculative decoding to run a connector.")
 
-        # VSWA allocates one pool per window size, which only
-        # `register_kv_cache_layout` can describe.
+        # V1 registers a single pool. V2 checks its resolved layer groups
+        # during executor initialization.
         max_attention_window = kv_cache_config.max_attention_window
         if (uses_vswa_kv_cache_layout(max_attention_window)
                 and v2_selection is False):
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
-                "in this configuration. Set kv_cache_config.use_kv_cache_manager_v2=True."
+                "in this configuration. Use KVCacheManagerV2 with a connector "
+                "that implements the per-layer-group APIs, or use a single attention window."
             )
 
-        if mapping.enable_attention_dp:
+        if mapping.enable_attention_dp and v2_selection is False:
             raise NotImplementedError(
-                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
-            )
+                "KV connector attention data parallelism requires KVCacheManagerV2. "
+                "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
         try:
             module = importlib.import_module(
@@ -958,6 +1062,13 @@ def _create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
+            if mapping.enable_attention_dp:
+                KvCacheConnectorManager.validate_attention_dp(
+                    worker_cls,
+                    scheduler_cls,
+                    pp_size=mapping.pp_size,
+                    cp_size=mapping.cp_size)
+
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -965,7 +1076,8 @@ def _create_py_executor(
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                if scheduler_cls is not None and (rank == 0 or
+                                                  mapping.enable_attention_dp):
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -981,11 +1093,36 @@ def _create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                enable_attention_dp=mapping.enable_attention_dp)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
             raise e
+
+        if not kv_connector_manager.capacity_only:
+            if (scheduler_config.capacity_scheduler_policy
+                    != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+                    and v2_selection is False):
+                raise NotImplementedError(
+                    "KV connector in this configuration is only supported with the "
+                    "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
+                    "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
+                )
+
+        if uses_connector(kv_connector_config, "mooncake-store"):
+            # Imported here because `registry.py` leaves a connector package to
+            # the importlib call above, off every other deployment's path.
+            from .connectors.mooncake_store import settings as mooncake_settings
+
+            # `BaseLLM.__init__` settles these for the usage report and the
+            # ranks alike; this covers a caller that reached an executor
+            # without the constructor, and a role it could not resolve. The KV
+            # cache manager is built after this and reads the result.
+            if not kv_connector_manager.capacity_only:
+                mooncake_settings.apply_transferring_role_overrides(
+                    kv_cache_config)
     else:
         kv_connector_manager = None
 
@@ -1024,7 +1161,6 @@ def _create_py_executor(
 
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
-            draft_model_engine=draft_model_engine,
             mapping=mapping,
             net_max_seq_len=net_max_seq_len,
             kv_connector_manager=kv_connector_manager,
@@ -1064,8 +1200,7 @@ def _create_py_executor(
     # to provide a resource manager if required.
 
     with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
-        spec_resource_manager = get_spec_resource_manager(
-            model_engine, draft_model_engine)
+        spec_resource_manager = get_spec_resource_manager(model_engine)
     if spec_resource_manager is not None:
         resources[
             ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
@@ -1073,14 +1208,10 @@ def _create_py_executor(
     # Drafter for speculative decoding
     with allocation_scope(ExecutorMemoryType.DRAFTER):
         drafter = get_spec_drafter(model_engine,
-                                   draft_model_engine,
-                                   sampler,
-                                   spec_resource_manager=spec_resource_manager,
-                                   guided_decoder=guided_decoder)
+                                   spec_resource_manager=spec_resource_manager)
 
-    for engine in (model_engine, draft_model_engine):
-        if engine is not None:
-            engine._warmup_timer.purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
+    model_engine.set_warmup_purpose(
+        "memory_profiling" if estimating_kv_cache else "final_executor")
 
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
@@ -1092,7 +1223,10 @@ def _create_py_executor(
             resources=resources,
             mapping=mapping,
             llm_args=llm_args,
-            ctx_chunk_config=ctx_chunk_config,
+            ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                ctx_chunk_config,
+                resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                tokens_per_block, scheduler_config.context_chunking_policy),
             model_engine=model_engine,
             start_worker=False,
             sampler=sampler,
@@ -1121,8 +1255,7 @@ def _create_py_executor(
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
-        _move_model_engine_metrics(py_executor, model_engine, "initial",
-                                   draft_model_engine)
+        _move_model_engine_metrics(py_executor, model_engine, "initial")
         # record initial metrics as py_executor will be deleted later
         initial_model_engine_metrics = dict(py_executor.metrics)
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
@@ -1142,13 +1275,6 @@ def _create_py_executor(
                 with _startup_timer.phase("profiling_kv_cache_teardown"):
                     kv_cache_creator.teardown_managers(resources)
 
-            # configure_kv_cache_capacity shuts down the Phase-1 executor, which
-            # releases its CUDA graphs before its resource managers. Only the
-            # profiling attention metadata remains to be discarded here.
-            for eng in [model_engine, draft_model_engine]:
-                if eng is not None:
-                    eng.attn_metadata = None
-
             del py_executor  # free before constructing new
             gc.collect()
             torch.cuda.empty_cache()
@@ -1160,9 +1286,7 @@ def _create_py_executor(
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
 
-        for engine in (model_engine, draft_model_engine):
-            if engine is not None:
-                engine._warmup_timer.purpose = "final_executor"
+        model_engine.set_warmup_purpose("final_executor")
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
@@ -1173,7 +1297,10 @@ def _create_py_executor(
                 resources=resources,
                 mapping=mapping,
                 llm_args=llm_args,
-                ctx_chunk_config=ctx_chunk_config,
+                ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                    ctx_chunk_config,
+                    resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                    tokens_per_block, scheduler_config.context_chunking_policy),
                 model_engine=model_engine,
                 start_worker=False,
                 sampler=sampler,
@@ -1202,14 +1329,25 @@ def _create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    with _startup_timer.phase("executor_start_worker",
-                              metrics=creation_metrics,
-                              metric_name="worker_start_seconds"):
-        py_executor.start_worker()
+    # Only the final executor advertises ready publishers.
+    events = getattr(llm_args.kv_cache_config, "kv_events_config", None)
+    if (getattr(llm_args, "_openengine_discovery", None) is not None
+            and events is not None and events.enable_kv_cache_events
+            and events.publisher == "zmq"):
+        from tensorrt_llm.grpc.openengine.node import initialize_node_discovery
+        initialize_node_discovery(py_executor)
+    try:
+        with _startup_timer.phase("executor_start_worker",
+                                  metrics=creation_metrics,
+                                  metric_name="worker_start_seconds"):
+            py_executor.start_worker()
+    except BaseException:
+        if py_executor._openengine_node_server is not None:
+            py_executor._openengine_node_server.close()
+        raise
 
     py_executor.metrics.update(initial_model_engine_metrics)
-    _move_model_engine_metrics(py_executor, model_engine, "final",
-                               draft_model_engine)
+    _move_model_engine_metrics(py_executor, model_engine, "final")
 
     return py_executor
 

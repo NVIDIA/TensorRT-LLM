@@ -10,40 +10,36 @@ shared abstractions. The two live side by side: ``models/<x>/`` here
 corresponds one-to-one with the zoo's ``modeling_<x>.py``, and the contrast is
 the point.
 
-Entry is a single environment variable::
+Entry is a single LLM API argument::
 
-    TRTLLM_MODELING_V2 = require
+    LLM(model, modeling_v2="require")
 
-``off`` (unset, the default) is byte-for-byte today's behaviour: the resolver returns
+``off`` (the default) is byte-for-byte today's behaviour: the resolver returns
 immediately and nothing in this package is imported. ``auto`` uses a target
-when one matches and falls back to the built-in implementation when none
-does. ``require`` raises instead of falling back -- see ``_router_index`` for
-why that mode is not optional.
+when one claims the configuration and falls back to the built-in
+implementation otherwise. ``require`` raises instead of falling back -- see
+``_router_index`` for why that mode is not optional.
 
-This package sits *beside* ``_torch/models/`` rather than inside it, which is
-load-bearing twice over: ``is_builtin_zoo_module`` matches on the zoo's
-package prefix, so registrations from here count as external and always win
-their architecture slot; and ``test_lazy_model_zoo``'s non-recursive scan of
-the zoo directory would not see these modules, so putting the synthetic names
-in the built-in static index would fail its staleness assertion.
+This package sits *beside* ``_torch/models/`` rather than inside it. Targets
+are not registered in the model zoo at all: ``route`` returns the class and the
+loader builds it, so nothing here competes for an architecture slot and the
+zoo's static index never has to know these classes exist.
 """
 
 from ._router_index import (
-    MODELING_V2_ENV,
-    MODELING_V2_ROUTERS,
-    ROUTING_BACKENDS,
-    ModelingV2Context,
+    MODELING_V2_VALIDATE_ENV,
     ModelingV2Mode,
-    assert_backend_can_route,
+    NoTarget,
     modeling_v2_resolve,
+    modeling_v2_resolve_on_all_ranks,
+    step_contract_enabled,
 )
 
 __all__ = [
-    "ROUTING_BACKENDS",
-    "MODELING_V2_ENV",
-    "MODELING_V2_ROUTERS",
-    "ModelingV2Context",
+    "MODELING_V2_VALIDATE_ENV",
     "ModelingV2Mode",
-    "assert_backend_can_route",
+    "NoTarget",
     "modeling_v2_resolve",
+    "modeling_v2_resolve_on_all_ranks",
+    "step_contract_enabled",
 ]

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import socket
+from types import ModuleType
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -53,6 +54,7 @@ from ..impl_contract import (
 from ..impl_environment import MoEDep
 from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
+from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod, _import_deep_gemm
 from ..routing import BaseMoeRoutingMethod
 
@@ -79,6 +81,34 @@ __all__ = ["DeepgemmCudaW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm"]
 # into a false stale -- freeing a buffer another layer already holds.
 # ``release_symm_buffer_cache`` bounds the lifetime.
 _MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, Tuple[object, object]] = {}
+
+
+class _DeepGemmTimeoutProxy:
+    """Applies MoE communication timeouts to DeepGEMM's in-kernel barriers.
+
+    The timeout lives in DeepGEMM's process-wide runtime and each ``fp8_fp4_mega_moe``
+    launch passes it to the kernel as an argument, so one proxy serves every layer.
+    """
+
+    name = "DeepGEMM MegaMoE"
+
+    def __init__(self, dg: ModuleType) -> None:
+        self._dg = dg
+
+    def set_timeout_seconds(self, seconds: int | None) -> None:
+        # DeepGEMM restores its JIT-time default for 0.
+        self._dg.set_barrier_timeout_seconds(0 if seconds is None else seconds)
+
+
+# Kept alive here because the timeout guard holds its proxies weakly.
+_TIMEOUT_PROXY: Optional[_DeepGemmTimeoutProxy] = None
+
+
+def _register_timeout_proxy(dg: ModuleType) -> None:
+    global _TIMEOUT_PROXY
+    if _TIMEOUT_PROXY is None:
+        _TIMEOUT_PROXY = _DeepGemmTimeoutProxy(dg)
+    register_moe_comm_timeout_proxy(_TIMEOUT_PROXY)
 
 
 def _free_symm_buffer(buffered: object) -> int:
@@ -343,19 +373,48 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 MoERejectReason.QUANT_UNSUPPORTED,
                 f"MegaMoEDeepGemm supports W4A8_MXFP4_MXFP8 only, got {p.quant_algo}",
             )
-        # TMA requires packed-UE8M0 scale-factor rows to be 16-byte aligned (K % 512 == 0).
+        # The 16-byte-aligned thing is the per-token scale-factor *record* in the
+        # symmetric dispatch buffer, not the weight SF row. DeepGEMM sizes those
+        # records as `Data(hidden / 32)` and `Data(intermediate_hidden / 32)`
+        # (`deep_gemm/include/deep_gemm/layout/mega_moe.cuh`, the `Buffer`
+        # layout), and `Data`'s constructor asserts `num_bytes % 16 == 0`.
+        #
+        # The two widths are not symmetric, which is why only `hidden_size` is
+        # held at 512 here:
+        #   * `input_sf_buffer` is the one SF buffer whose per-token record size
+        #     is an addressing stride -- `Buffer::get_data_buffer(token_idx)`
+        #     advances by it in `sm100_fp8_fp4_mega_moe.cuh`. One UE8M0 byte per
+        #     32 channels then makes `hidden % 512 == 0` a real requirement.
+        #   * `l2_sf_buffer` / `shared_l2_sf_buffer` are only ever taken as a
+        #     bare `get_base_ptr()` and indexed MN-major by the kernel, so their
+        #     record size only sizes the buffer. Both totals are 16-byte
+        #     multiples regardless of `intermediate_hidden % 512`, so requiring
+        #     TMA alignment on those records rejected valid shapes -- notably
+        #     DeepSeek-V4.1's `moe_intermediate_size = 2304`.
+        # `3rdparty/patches/deepgemm_mega_moe_intermediate_sf_alignment.patch`
+        # drops the two redundant asserts, leaving DeepGEMM's own host check
+        # (`intermediate_hidden % 128 == 0` in `csrc/apis/mega.hpp`) as the real
+        # constraint. Keep the guard below in sync with that patch: without it,
+        # a K that clears 128 but not 512 aborts inside
+        # `get_symm_buffer_size_for_mega_moe` before any GEMM runs.
+        #
+        # Do not relax `hidden_size` by reading the weight path either: the
+        # weight and activation SF *matrices* are MN-major, so their 16-byte
+        # alignment sits on MN (`check_sf_layout`'s
+        # `stride(-1) == get_tma_aligned_size(mn, ...)`). Those are a different
+        # tensor from the dispatch-buffer records.
         if p.hidden_size is not None and p.hidden_size % 512 != 0:
             return _reject(
                 MoERejectReason.SHAPE_UNALIGNED,
                 f"MegaMoEDeepGemm requires hidden_size % 512 == 0 "
-                f"(DeepGEMM TMA-aligned packed-UE8M0 SF row); "
+                f"(TMA-aligned packed-UE8M0 SF record in DeepGEMM's dispatch buffer); "
                 f"got hidden_size={p.hidden_size}",
             )
-        if p.intermediate_size is not None and p.intermediate_size % 512 != 0:
+        if p.intermediate_size is not None and p.intermediate_size % 128 != 0:
             return _reject(
                 MoERejectReason.SHAPE_UNALIGNED,
-                f"MegaMoEDeepGemm requires intermediate_size % 512 == 0 "
-                f"(DeepGEMM TMA-aligned packed-UE8M0 SF row); "
+                f"MegaMoEDeepGemm requires intermediate_size % 128 == 0 "
+                f"(DeepGEMM's `mega.hpp` host check); "
                 f"got intermediate_size={p.intermediate_size}",
             )
         if p.activation_type not in cls.activation_support.kinds:
@@ -501,6 +560,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         # paying that on every forward (``run_moe`` path) shows up in host-side
         # CPU overhead even though the underlying ``import`` is cached by Python.
         self._dg = _import_deep_gemm()
+        _register_timeout_proxy(self._dg)
 
         # NVLink SymmBuffer activation workspace. Allocation is a
         # model-build-period collective (``symm_mem.rendezvous`` over the
@@ -592,16 +652,33 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 return (host, port)
             return None
 
-        # Respect pre-set launcher env vars (Slurm, Ray, torchrun).
-        if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+        # Respect launcher env vars only when they describe this MPI world.
+        # A disaggregated launcher may export its outer context/generation
+        # world into each server's independent model MPI world.
+        launcher_env_matches_mpi = False
+        launcher_port = None
+        if all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+            try:
+                # Parse the port here too: accepting the launcher env on
+                # RANK/WORLD_SIZE alone and only converting MASTER_PORT later
+                # turns a non-numeric port into an uncaught ValueError instead
+                # of falling back to the MPI rendezvous.
+                launcher_port = int(os.environ["MASTER_PORT"])
+                launcher_env_matches_mpi = (
+                    int(os.environ["RANK"]) == rank and int(os.environ["WORLD_SIZE"]) == world_size
+                )
+            except ValueError:
+                launcher_env_matches_mpi = False
+
+        if not launcher_env_matches_mpi:
             host, port = comm.bcast(_pick_rendezvous(), root=0)
-            os.environ.setdefault("MASTER_ADDR", host)
-            os.environ.setdefault("MASTER_PORT", str(port))
-            os.environ.setdefault("RANK", str(rank))
-            os.environ.setdefault("WORLD_SIZE", str(world_size))
+            os.environ["MASTER_ADDR"] = host
+            os.environ["MASTER_PORT"] = str(port)
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
         else:
             host = os.environ["MASTER_ADDR"]
-            port = int(os.environ["MASTER_PORT"])
+            port = launcher_port
 
         device_id = None
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:

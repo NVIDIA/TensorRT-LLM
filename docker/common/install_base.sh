@@ -5,11 +5,11 @@ set -ex
 GITHUB_URL="https://github.com"
 if [ -n "${GITHUB_MIRROR}" ]; then
     GITHUB_URL=${GITHUB_MIRROR}
-    export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+    export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 
 if [ -n "${GITHUB_MIRROR}" ]; then
-  BOOST_URL="https://urm.nvidia.com/artifactory/sw-dl-triton-generic-local/triton/ci-cd/binaries/boost/1.80.0/boost_1_80_0.tar.gz"
+  BOOST_URL="https://artifactory.nvidia.com/artifactory/sw-dl-triton-generic-local/triton/ci-cd/binaries/boost/1.80.0/boost_1_80_0.tar.gz"
 else
   BOOST_URL="https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz"
 fi
@@ -131,7 +131,7 @@ install_python_rockylinux() {
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
   if [ -n "${GITHUB_MIRROR}" ]; then
-    PYTHON_URL="https://urm.nvidia.com/artifactory/api/vcs/downloadTag/vcs-remote/python/cpython/v${PYTHON_VERSION}?ext=tar.gz"
+    PYTHON_URL="https://artifactory.nvidia.com/artifactory/api/vcs/downloadTag/vcs-remote/python/cpython/v${PYTHON_VERSION}?ext=tar.gz"
   fi
   dnf makecache --refresh
   dnf install \

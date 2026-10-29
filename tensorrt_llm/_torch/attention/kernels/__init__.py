@@ -14,10 +14,12 @@
 # limitations under the License.
 """Attention-owned fused kernels.
 
-Kernels whose only production consumer is the attention module layer beside
-this package. Each submodule hosts one operator; callers own the enablement
-checks and keep the unfused op chains as fallbacks.
+Architecture-specific kernels live under ``blackwell/`` and ``rubin/``, keyed
+below that by kernel family, so a submodule may host several related operators
+rather than exactly one; architecture-agnostic kernels, such as the Triton
+``fused_qk_norm_rope_gate``, sit at the top level. Callers own the enablement
+checks and decide what to do when a kernel does not apply.
 
-Nothing is re-exported from this file on purpose, for the same reason as the
-parent package: importing one kernel must not drag in the others.
+Nothing is re-exported from this file on purpose: importing one kernel must
+not drag in the others.
 """

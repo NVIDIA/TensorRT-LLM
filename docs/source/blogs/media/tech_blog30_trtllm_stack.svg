@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="436" viewBox="0 0 1000 436" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif">
+<rect width="1000" height="436" fill="#f5f5f5"/>
+<rect x="12" y="12" width="976" height="412" rx="8" fill="none" stroke="#4f5d75" stroke-width="1.25"/>
+<svg x="24" y="22" width="106" height="20.1758" viewBox="215 523 2070 394" role="img" aria-label="NVIDIA">
+<path fill="#76B900" d="M436.93785,640.78361v-35.49175c3.4459-.24553,6.92613-.42918,10.4726-.54024,97.07249-3.05104,160.75618,83.40761,160.75618,83.40761,0,0-68.78225,95.53503-142.53101,95.53503-10.62215,0-20.12751-1.71234-28.69777-4.58826v-107.62396c37.79122,4.56486,45.3879,21.25692,68.11388,59.12728l50.52954-42.60379s-36.88389-48.37696-99.0625-48.37696c-6.76609,0-13.23133.47815-19.58092,1.15504M436.93785,523.54106v53.0144c3.48438-.27548,6.97313-.49739,10.4726-.62333,134.99401-4.54781,222.93894,110.70911,222.93894,110.70911,0,0-101.01819,122.83652-206.25515,122.83652-9.64223,0-18.67162-.89028-27.15639-2.39142v32.76954c7.25714.92242,14.77052,1.46463,22.61492,1.46463,97.93719,0,168.75864-50.01037,237.34237-109.20595,11.3631,9.10406,57.91698,31.25152,67.49078,40.95975-65.2126,54.58595-217.17638,98.58388-303.32785,98.58388-8.30134,0-16.28653-.50177-24.12021-1.25321v46.05397h372.23407v-392.91789h-372.23407ZM436.93785,779.10599v27.98036c-90.57969-16.14985-115.72071-110.3077-115.72071-110.3077,0,0,43.48994-48.18696,115.72071-55.99504v30.69842c-.05553,0-.09183-.01487-.14102-.01487-37.90229-4.55218-67.51832,30.86283-67.51832,30.86283,0,0,16.59175,59.61825,67.65934,76.776M276.05771,692.6985s53.68509-79.21639,160.88014-87.40665v-28.7364c-118.72891,9.52895-221.54711,110.08578-221.54711,110.08578,0,0,58.23072,168.35047,221.54711,183.76373v-30.54909c-119.84569-15.0781-160.88014-147.15739-160.88014-147.15739Z"/>
+<path fill="#000000" d="M1479.66576,597.78723l.02592,257.90666h72.83585v-257.90223l-72.86177-.00443ZM906.67774,597.43677v258.25712h73.48583v-196.09803l56.92818.01949c18.8585,0,32.28898,4.69251,41.37629,14.3888,11.5213,12.27737,16.22358,32.06825,16.22358,68.28803v113.4017l71.18818-.01297.01297-142.67253c0-101.83834-64.91535-115.57162-128.42042-115.57162h-130.7946M1596.94459,597.79587v257.89802h118.13971c62.94459,0,83.48829-10.46877,105.70657-33.93954,15.70652-16.47653,25.85275-52.64668,25.85275-92.1744,0-36.24991-8.58863-68.59087-23.57472-88.73-26.98413-36.0142-65.86086-43.05408-123.8987-43.05408h-102.22561ZM1669.19603,653.95164h31.31755c45.4339,0,74.81747,20.40298,74.81747,73.34165,0,52.95174-29.38356,73.35472-74.81747,73.35472h-31.31755v-146.69636ZM1374.64705,597.79587l-60.78862,204.3991-58.24896-204.38603-78.62696-.01307,83.18745,257.89802h104.97972l83.84098-257.89802h-74.3436ZM1880.53784,855.69389h72.84869v-257.88495l-72.86597-.01307.01728,257.89802ZM2084.72543,597.88892l-101.70877,257.71614h71.82122l16.09133-45.55054h120.36811l15.23266,45.55054h77.97807l-102.48525-257.73763-97.29737.02149ZM2132.0067,644.90644l44.12286,120.73556h-89.63895l45.51609-120.73556Z"/>
+</svg>
+<text x="142" y="39" font-size="18" font-weight="700" fill="#2d3142">TensorRT LLM</text>
+<text x="24" y="81.5" font-size="12.5" font-weight="600" fill="#2d3142">Serving &amp; APIs</text>
+<rect x="222.0" y="52" width="341.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="230.0" y="73" font-size="12.5" font-weight="600" fill="#2d3142">trtllm-serve</text>
+<text x="230.0" y="89" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">OpenAI-compatible API</text>
+<rect x="575.0" y="52" width="341.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="583.0" y="73" font-size="12.5" font-weight="600" fill="#2d3142">LLM API</text>
+<text x="583.0" y="89" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">Python</text>
+<text x="24" y="143.5" font-size="12.5" font-weight="600" fill="#2d3142">Runtime &amp; Scheduling</text>
+<rect x="222.0" y="114" width="223.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="230.0" y="135" font-size="12.5" font-weight="600" fill="#2d3142">Executor &amp; scheduler</text>
+<text x="230.0" y="151" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">in-flight batching, KV budget</text>
+<rect x="457.3" y="114" width="223.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="465.3" y="135" font-size="12.5" font-weight="600" fill="#2d3142">Speculative decoding</text>
+<text x="465.3" y="151" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">MTP, EAGLE3</text>
+<rect x="692.7" y="114" width="223.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="700.7" y="135" font-size="12.5" font-weight="600" fill="#2d3142">Disaggregated serving</text>
+<text x="700.7" y="151" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">prefill and decode workers</text>
+<text x="24" y="205.5" font-size="12.5" font-weight="600" fill="#2d3142">KV Cache Management</text>
+<rect x="222.0" y="176" width="341.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="230.0" y="197" font-size="12.5" font-weight="600" fill="#2d3142">KV cache manager</text>
+<text x="230.0" y="213" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">paging, block reuse, host and disk tiers</text>
+<rect x="575.0" y="176" width="341.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="583.0" y="197" font-size="12.5" font-weight="600" fill="#2d3142">KV transfer</text>
+<text x="583.0" y="213" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">KV connectors</text>
+<text x="24" y="267.5" font-size="12.5" font-weight="600" fill="#2d3142">Compression</text>
+<rect x="222.0" y="238" width="223.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="230.0" y="259" font-size="12.5" font-weight="600" fill="#2d3142">Quantization</text>
+<text x="230.0" y="275" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">FP8, NVFP4, INT4</text>
+<rect x="457.3" y="238" width="223.3" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="465.3" y="259" font-size="12.5" font-weight="600" fill="#2d3142">Sparse Attention</text>
+<text x="465.3" y="272" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">DeepSeek-V3.2, GLM-5.2</text>
+<text x="465.3" y="283" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">DeepSeek-V4</text>
+<rect x="692.7" y="238" width="223.3" height="50" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="700.7" y="259" font-size="12.5" font-weight="600" fill="#2d3142">KV Cache Compression</text>
+<text x="700.7" y="275" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#76B900">cold-page compression, TriAttention</text>
+<text x="24" y="329.5" font-size="12.5" font-weight="600" fill="#2d3142">Model Execution</text>
+<rect x="222.0" y="300" width="341.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="230.0" y="321" font-size="12.5" font-weight="600" fill="#2d3142">Model engine</text>
+<text x="230.0" y="337" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">PyTorch models, CUDA Graphs</text>
+<rect x="575.0" y="300" width="341.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="583.0" y="321" font-size="12.5" font-weight="600" fill="#2d3142">Parallelism</text>
+<text x="583.0" y="337" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">TP, EP, PP, DP</text>
+<text x="24" y="391.5" font-size="12.5" font-weight="600" fill="#2d3142">Kernels &amp; Communication</text>
+<rect x="222.0" y="362" width="341.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="230.0" y="383" font-size="12.5" font-weight="600" fill="#2d3142">Kernels</text>
+<text x="230.0" y="399" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">attention, GEMM, MoE</text>
+<rect x="575.0" y="362" width="341.0" height="50" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="583.0" y="383" font-size="12.5" font-weight="600" fill="#2d3142">Communication</text>
+<text x="583.0" y="399" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75">NCCL, custom all-reduce</text>
+<rect x="928" y="52" width="48" height="360" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="0" y="0" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="middle" transform="translate(944.0,232.0) rotate(-90)">Tooling &amp; metrics</text>
+<text x="0" y="0" font-size="9.5" font-weight="500" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" fill="#4f5d75" text-anchor="middle" transform="translate(962.0,232.0) rotate(-90)">trtllm-bench, /metrics endpoint</text>
+</svg>

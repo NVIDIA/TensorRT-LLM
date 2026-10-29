@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -38,7 +38,7 @@ from tensorrt_llm.deep_gemm import (
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..params import use_self_sampling_gvr
+from ..params import get_indexer_mqa_logits_elem_budget, use_self_sampling_gvr
 from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -51,12 +51,30 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # indefinitely in cuMemCreate on the longest-context (attention_dp laggard) rank
 # -> GPU idle -> peers block at the next MoE all-to-all -> watchdog hang. Tiling
 # the query dimension caps the transient to q_tile x kv with identical results
-# (each query row's logits/top-k are independent). Override via env if needed.
-_INDEXER_MQA_LOGITS_ELEM_BUDGET = int(
-    os.environ.get("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", 1 << 31)
+# (each query row's logits/top-k are independent). Override via env if needed;
+# the KV cache budget reserves the same cap (see KvCacheCreator), so both read it
+# through one helper.
+_INDEXER_MQA_LOGITS_ELEM_BUDGET = get_indexer_mqa_logits_elem_budget()
+
+# Cap on the [sum(q) x sum(kv)] logits of context requests packed into one
+# indexer prefill chunk (in elements; 1 << 28 is 1 GiB of fp32). A packed
+# chunk gathers the KV of every request in it and scores every query against
+# all of it, so its logits grow with the product of the packed totals while
+# each query row only needs its own request's window. Prefix-reuse hits make
+# this explode: each brings few new tokens but its whole cached context. The
+# cap only decides which requests share a chunk; _packed_logits_elem_budget
+# also clamps it to the largest single-request logits tile the configuration
+# can reach. The memory of each logits call is bounded separately by the query
+# tiling under _INDEXER_MQA_LOGITS_ELEM_BUDGET, which also accounts for the
+# per-head dot products of the decoded FP4 path and tiles a request whose own
+# logits exceed this cap in a chunk of its own. Override via env if needed.
+_INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
+    os.environ.get("TLLM_INDEXER_PACKED_LOGITS_ELEM_BUDGET", 1 << 28)
 )
 
 if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
+
     from .metadata import DSAtrtllmAttentionMetadata
 
 # Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
@@ -69,6 +87,17 @@ except ImportError:
     HAS_FAST_HADAMARD = False
 
 _DG_SCHEDULE_BLOCK_KV = 64
+
+
+def use_cute_dsl_paged_mqa_logits(requested: bool) -> bool:
+    """Whether the CuTe DSL paged MQA logits kernel runs instead of DeepGEMM.
+
+    The indexer and the metadata must both use this: the metadata builds
+    DSL-only buffers (atom-split expansion, padded logits row stride) and
+    skips the sm90 MTP expansion off the same decision. is_sm_100f() is the
+    custom op's own precondition.
+    """
+    return requested and IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()
 
 
 def _pick_dsl_expand(
@@ -124,6 +153,46 @@ def _pick_dsl_expand(
     cands.sort(key=lambda x: (x[0], -x[1]))  # min waves, max factor
     _, factor, eff = cands[0]
     return factor, eff
+
+
+def _atom_ctx_offsets(next_n: int, num_atoms: int) -> List[int]:
+    """Per-atom causal stagger of an in-kernel next_n split: atom i (0 = oldest)
+    sees the context shortened by the tokens of the atoms after it. Same split
+    as the kernel (first ``next_n % num_atoms`` atoms get one extra token)."""
+    base, rem = divmod(next_n, num_atoms)
+    return [
+        next_n - (i * base + min(i, rem) + base + (1 if i < rem else 0)) for i in range(num_atoms)
+    ]
+
+
+def _pick_dsl_split(
+    next_n: int,
+    num_sms: int,
+    batch_size: int = 0,
+    max_ctx: int = 0,
+    kernel_atoms: Tuple[int, ...] = (1, 2, 3),
+) -> Tuple[int, int, int]:
+    """``_pick_dsl_expand`` plus the kernel's in-kernel uneven split.
+
+    Returns ``(expand_factor, atom, num_kernel_atoms)``. When no atom > 1 in
+    ``kernel_atoms`` divides ``next_n`` (e.g. 5 or 7), the caller-side split can
+    only run atom 1 and reads the KV ``next_n`` times; the in-kernel split runs
+    ``ceil(next_n / max(kernel_atoms))`` atoms instead. It is taken when atom 1
+    would need many waves and the split needs fewer, or when the workload is unknown.
+    """
+    factor, atom = _pick_dsl_expand(next_n, num_sms, batch_size, max_ctx, kernel_atoms)
+    if atom != 1 or next_n <= 1 or any(next_n % a == 0 for a in kernel_atoms if a > 1):
+        return factor, atom, 1
+    num_atoms = -(-next_n // max(kernel_atoms))
+    if batch_size > 0 and max_ctx > 0:
+        tiles = -(-max_ctx // 256)
+        waves_split = -(-batch_size * num_atoms * tiles // num_sms)
+        waves_atom1 = -(-batch_size * next_n * tiles // num_sms)
+        # Below ~16 atom-1 waves the split's wider tiles cost more than the KV
+        # re-reads they save (GB300, next_n=7: B=1 0.87-1.00x; >= 24 waves 1.04-2.6x).
+        if waves_split >= waves_atom1 or waves_atom1 < 16:
+            return factor, atom, 1
+    return 1, -(-next_n // num_atoms), num_atoms
 
 
 def _compute_slot_mappings(
@@ -380,6 +449,108 @@ def split_prefill_chunks(
     return chunk_groups
 
 
+def group_prefill_requests_by_logits_budget(
+    q_lens: Sequence[int],
+    kv_lens: Sequence[int],
+    elem_budget: int,
+) -> List[List[int]]:
+    """Group consecutive context requests into indexer prefill chunks.
+
+    A request joins the current group only while the group's packed logits,
+    ``sum(q_lens) * sum(kv_lens)``, stay within ``elem_budget``. A request that
+    exceeds the budget on its own forms a single-request group.
+
+    Args:
+        q_lens: New (query) tokens per request.
+        kv_lens: Compressed KV tokens per request, cached plus new.
+        elem_budget: Maximum packed logits elements for a multi-request group.
+
+    Returns:
+        Groups of request indices, in order, covering every request once.
+    """
+    assert len(q_lens) == len(kv_lens)
+    groups: List[List[int]] = []
+    group_q = group_kv = 0
+    for req_idx, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+        if groups and (group_q + q_len) * (group_kv + kv_len) <= elem_budget:
+            groups[-1].append(req_idx)
+            group_q += q_len
+            group_kv += kv_len
+        else:
+            groups.append([req_idx])
+            group_q, group_kv = q_len, kv_len
+    return groups
+
+
+def plan_mla_chunked_prefill_chunks(
+    q_lens: Sequence[int],
+    kv_lens: Sequence[int],
+    elem_budget: int,
+    q_begin: int = 0,
+    q_end: Optional[int] = None,
+) -> List[List[Tuple[int, int, int, int]]]:
+    """Plan the indexer prefill chunks covering context query tokens ``[q_begin, q_end)``.
+
+    Requests that lie fully inside the range are grouped with
+    ``group_prefill_requests_by_logits_budget``. A request cut by the range
+    boundary contributes only its covered query tokens, as a chunk of its own.
+
+    Args:
+        q_lens: New (query) tokens per request.
+        kv_lens: Compressed KV tokens per request, cached plus new.
+        elem_budget: Maximum packed logits elements for a multi-request group.
+        q_begin: First context query token to cover.
+        q_end: End of the covered context query tokens; defaults to all of them.
+
+    Returns:
+        Chunk specs for ``Indexer.prepare_one_prefill_chunk``, in token order:
+        ``(req_idx, token_start_in_req, token_end_in_req, req_cum_start)``.
+    """
+    assert len(q_lens) == len(kv_lens)
+    if q_end is None:
+        q_end = sum(q_lens)
+    q_starts = []
+    q_start = 0
+    for q_len in q_lens:
+        q_starts.append(q_start)
+        q_start += q_len
+
+    chunks: List[List[Tuple[int, int, int, int]]] = []
+    full_run: List[int] = []
+
+    def flush_full_run() -> None:
+        groups = group_prefill_requests_by_logits_budget(
+            [q_lens[i] for i in full_run], [kv_lens[i] for i in full_run], elem_budget
+        )
+        for group in groups:
+            chunks.append(
+                [(full_run[g], 0, q_lens[full_run[g]], q_starts[full_run[g]]) for g in group]
+            )
+        full_run.clear()
+
+    for req_idx, q_len in enumerate(q_lens):
+        begin = max(q_begin, q_starts[req_idx])
+        end = min(q_end, q_starts[req_idx] + q_len)
+        if begin >= end:
+            continue
+        if end - begin == q_len:
+            full_run.append(req_idx)
+        else:
+            flush_full_run()
+            chunks.append(
+                [
+                    (
+                        req_idx,
+                        begin - q_starts[req_idx],
+                        end - q_starts[req_idx],
+                        q_starts[req_idx],
+                    )
+                ]
+            )
+    flush_full_run()
+    return chunks
+
+
 # Shrink the indexer prefill chunk size for very long requests to bound the
 # fp8(_fp4)_mqa_logits activation memory (~ chunk_size * K_compressed), keyed on
 # the largest compressed KV length in the batch. Entries are
@@ -498,6 +669,44 @@ class IndexerPrefillChunkMetadata:
     k_token_end: int  # K token end index in batch
 
 
+def _split_prefill_queries(
+    count: int, mapping: Optional[Mapping], threshold: int
+) -> Tuple[int, int, Optional[List[int]]]:
+    """Return local query bounds and optional sizes for a TP prefill gather."""
+    if (
+        threshold < 0
+        or count < threshold
+        or mapping is None
+        or mapping.enable_attention_dp
+        or mapping.tp_size <= 1
+    ):
+        return 0, count, None
+    size, rank = mapping.tp_size, mapping.tp_rank
+    sizes = [(r + 1) * count // size - r * count // size for r in range(size)]
+    return count * rank // size, count * (rank + 1) // size, sizes
+
+
+def _prefill_q_split_threshold(metadata: DSAtrtllmAttentionMetadata) -> int:
+    """Query-token count from which prefill indexer queries are split across TP ranks."""
+    sparse_metadata_params = metadata.sparse_metadata_params
+    return sparse_metadata_params.q_split_threshold if sparse_metadata_params is not None else 8192
+
+
+def _packed_logits_elem_budget(metadata: DSAtrtllmAttentionMetadata) -> int:
+    """Packed-logits cap for grouping context requests into one prefill chunk.
+
+    A single request's logits tile is at most ``min(_INDEXER_MQA_LOGITS_ELEM_BUDGET,
+    max_num_tokens * max_seq_len)`` elements, the size the KV cache estimate
+    reserves for the indexer logits workspace where it reserves one. Clamping
+    the packed cap to it keeps a packed chunk within that reserve.
+    """
+    single_request_tile = min(
+        _INDEXER_MQA_LOGITS_ELEM_BUDGET,
+        metadata.max_num_tokens * metadata.kv_cache_manager.max_seq_len,
+    )
+    return min(_INDEXER_PACKED_LOGITS_ELEM_BUDGET, single_request_tile)
+
+
 @maybe_compile(dynamic=True)
 def _scale(weights: torch.Tensor, q_scale: torch.Tensor, s: float) -> torch.Tensor:
     """Scale attention weights by quantization scale and constant factor."""
@@ -597,6 +806,8 @@ class IndexerParams:
 class Indexer(nn.Module):
     """DSA sparse attention indexer that selects top-K KV cache entries per token."""
 
+    projection_free: bool = False
+
     def __init__(
         self,
         quant_config: Optional[QuantConfig],
@@ -608,66 +819,78 @@ class Indexer(nn.Module):
         compress_ratio: int = 1,
         layer_idx: int = 0,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        *,
+        projection_free: bool = False,
     ):
         """Initialize indexer with projection weights, norms, and TopK configuration."""
         super().__init__()
-        self.hidden_size = mla_params.hidden_size
-        self.q_lora_rank = mla_params.q_lora_rank
-        self.rope_dim = mla_params.qk_rope_head_dim
+        self.projection_free = projection_free
+        sm_version = get_sm_version() if torch.cuda.is_available() else 0
+        if not projection_free and (mla_params is None or pos_embd_params is None):
+            raise ValueError("Projecting indexers require MLA and positional parameters")
+        if projection_free and sparse_params.enable_heuristic_topk:
+            raise ValueError("Prepared indexers require exact Top-K selection")
+        self.hidden_size = mla_params.hidden_size if mla_params is not None else None
+        self.q_lora_rank = mla_params.q_lora_rank if mla_params is not None else None
+        self.rope_dim = mla_params.qk_rope_head_dim if mla_params is not None else 0
         self.n_heads = sparse_params.index_n_heads  # 64
         self.head_dim = sparse_params.index_head_dim  # 128
         self.index_topk = sparse_params.index_topk  # 2048
         self.layer_idx = layer_idx
         self.compress_ratio = compress_ratio
 
-        self.wq_b = Linear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            bias=False,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True,
-        )
-        # When TRTLLM_DSA_INDEXER_BF16=1, run the fused wk + weights_proj
-        # projection in the model dtype instead of fp32. The fp32 path has no
-        # native GEMM on recent architectures (it falls back to a TF32 tensor-
-        # core kernel) and requires bf16<->fp32 casts around it; the model-dtype
-        # path runs a single native GEMM with no casts. The default stays fp32
-        # because the indexer top-k selection is precision sensitive.
-        self._indexer_bf16 = os.environ.get("TRTLLM_DSA_INDEXER_BF16", "0") == "1"
-        _wk_wp_dtype = dtype if self._indexer_bf16 else torch.float32
-        self.wk = Linear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            dtype=_wk_wp_dtype,
-            quant_config=None,
-            skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True,
-        )
-        self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
-        self.weights_proj = Linear(
-            self.hidden_size,
-            self.n_heads,
-            bias=False,
-            dtype=_wk_wp_dtype,
-            quant_config=None,
-            skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True,
-        )
-
-        # Fused wk + weights_proj weight for a single F.linear GEMM. fp32 by
-        # default (TF32 tensor cores on Ampere+); model dtype when
-        # TRTLLM_DSA_INDEXER_BF16 is enabled.
+        self.wq_b = self.wk = self.k_norm = self.weights_proj = self.rotary_emb = None
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
+        self._indexer_bf16 = False
+        if not projection_free:
+            self.wq_b = Linear(
+                self.q_lora_rank,
+                self.n_heads * self.head_dim,
+                bias=False,
+                dtype=dtype,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                use_custom_cublas_mm=True,
+            )
+            # When TRTLLM_DSA_INDEXER_BF16=1, run the fused wk + weights_proj
+            # projection in the model dtype instead of fp32. The fp32 path has no
+            # native GEMM on recent architectures (it falls back to a TF32 tensor-
+            # core kernel) and requires bf16<->fp32 casts around it; the model-dtype
+            # path runs a single native GEMM with no casts. The default stays fp32
+            # because the indexer top-k selection is precision sensitive.
+            self._indexer_bf16 = os.environ.get("TRTLLM_DSA_INDEXER_BF16", "0") == "1"
+            _wk_wp_dtype = dtype if self._indexer_bf16 else torch.float32
+            self.wk = Linear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                dtype=_wk_wp_dtype,
+                quant_config=None,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                use_custom_cublas_mm=True,
+            )
+            self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
+            self.weights_proj = Linear(
+                self.hidden_size,
+                self.n_heads,
+                bias=False,
+                dtype=_wk_wp_dtype,
+                quant_config=None,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                use_custom_cublas_mm=True,
+            )
 
-        indexer_rope_interleave = sparse_params.indexer_rope_interleave
-        self.rotary_emb = RotaryEmbedding(
-            pos_embd_params.rope,
-            head_dim=self.rope_dim,
-            is_neox=not indexer_rope_interleave,
-        )
+            # Fused wk + weights_proj weight for a single F.linear GEMM. fp32 by
+            # default (TF32 tensor cores on Ampere+); model dtype when
+            # TRTLLM_DSA_INDEXER_BF16 is enabled.
+            self._fused_wk_wp_weight: Optional[torch.Tensor] = None
+
+            indexer_rope_interleave = sparse_params.indexer_rope_interleave
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.rope_dim,
+                is_neox=not indexer_rope_interleave,
+            )
 
         self.softmax_scale = self.head_dim**-0.5
         # TODO: make it configurable from hf config
@@ -678,19 +901,19 @@ class Indexer(nn.Module):
         # kernel asserts SM100 + head_dim=128 at launch time under FP4.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.ln_events = [] if projection_free else [torch.cuda.Event(), torch.cuda.Event()]
         # Fork/join events for the aux-stream prev_topk write-back.
-        self.prev_topk_copy_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.prev_topk_copy_events = (
+            [] if projection_free else [torch.cuda.Event(), torch.cuda.Event()]
+        )
         self._prev_topk_copy_pending = False
         self.use_cute_dsl_topk = sparse_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
-        self.use_cute_dsl_paged_mqa_logits = (
-            sparse_params.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
+        self.use_cute_dsl_paged_mqa_logits = use_cute_dsl_paged_mqa_logits(
+            sparse_params.use_cute_dsl_paged_mqa_logits
         )
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
-        self._enable_heuristic_topk = (
-            sparse_params.enable_heuristic_topk and get_sm_version() >= 100
-        )
+        self._enable_heuristic_topk = sparse_params.enable_heuristic_topk and sm_version >= 100
         # Two-level GVR dispatch: enable_heuristic_topk selects the GVR
         # family over the exact radix path; use_self_sampling_topk (default
         # True) selects the hint-free self-sampling engine over the
@@ -705,7 +928,7 @@ class Indexer(nn.Module):
             index_topk=sparse_params.index_topk,
             compress_ratio=compress_ratio,
             is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
-            sm_version=get_sm_version(),
+            sm_version=sm_version,
         )
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING") is not None:
             logger.warning_once(
@@ -724,7 +947,7 @@ class Indexer(nn.Module):
                 "use_self_sampling_topk=True but the self-sampling GVR "
                 "prerequisites are not met "
                 f"(cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
-                f"sm={get_sm_version()}, "
+                f"sm={sm_version}, "
                 f"index_topk={sparse_params.index_topk}, "
                 f"compress_ratio={compress_ratio}); falling back to the "
                 "temporal GVR path (exact radix when the DSL engine is "
@@ -738,7 +961,7 @@ class Indexer(nn.Module):
             and IS_CUTLASS_DSL_AVAILABLE
             # datacenter Blackwell only; consumer Blackwell (sm_120/121)
             # lacks the thread-block clusters both GVR engines use
-            and get_sm_version() in (100, 103)
+            and sm_version in (100, 103)
         ):
             decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR
         else:
@@ -771,6 +994,7 @@ class Indexer(nn.Module):
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
             gvr_self_sampling=self._use_self_sampling_topk,
+            gvr_deterministic=sparse_params.gvr_deterministic_topk,
         )
         # Emission block-skip is a temporal-hint (V1) optimization: the FP4
         # indexer epilogue emits per-block max logits the GVR Top-K consumes to
@@ -791,6 +1015,8 @@ class Indexer(nn.Module):
 
     def cache_derived_state(self) -> None:
         """Fuse wk and weights_proj for F.linear with TF32 tensor cores on Ampere+."""
+        if self.projection_free:
+            return
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
         # → fused: [head_dim + n_heads, hidden_size]
         self._fused_wk_wp_weight = torch.cat(
@@ -1122,21 +1348,37 @@ class Indexer(nn.Module):
         """
         num_contexts = indexer_params.num_contexts
         seq_lens = indexer_params.seq_lens
+        metadata.indexer_prefill_q_split = None
 
-        # When MLA chunked prefill is active, it already handles chunking
-        # Indexer should just process the current MLA chunk as a single chunk
+        # When MLA chunked prefill is active, it already bounds the new tokens per
+        # request, so requests are not split by length here. From
+        # q_split_threshold context query tokens on, the batch's queries are
+        # split evenly across TP ranks and each rank plans chunks for its share
+        # only. Within that share, requests are grouped so that a chunk's packed
+        # logits stay bounded: with cached KV, a request's KV can be far longer
+        # than its new tokens.
         has_mla_chunked_prefill = (
             metadata.enable_context_mla_with_cached_kv and metadata.runtime_features.chunked_prefill
         )
         if has_mla_chunked_prefill:
-            chunk_specs = [
-                (i, 0, seq_lens[i].item(), seq_lens[:i].sum().item() if i > 0 else 0)
+            compress_ratio = _effective_compress_ratio_divisor(
+                _select_indexer_compress_ratio(metadata.compress_ratios)
+            )
+            q_lens = seq_lens[:num_contexts].tolist()
+            cached_indptr = metadata.host_ctx_cached_token_indptr[: num_contexts + 1].tolist()
+            kv_lens = [
+                (cached_indptr[i + 1] - cached_indptr[i] + q_lens[i]) // compress_ratio
                 for i in range(num_contexts)
             ]
+            q_begin, q_end, q_sizes = _split_prefill_queries(
+                sum(q_lens), metadata.mapping, _prefill_q_split_threshold(metadata)
+            )
+            if q_sizes is not None:
+                metadata.indexer_prefill_q_split = (q_begin, q_end, q_sizes)
             metadata.indexer_prefill_chunks = [
-                Indexer.prepare_one_prefill_chunk(
-                    metadata,
-                    chunk_specs,
+                Indexer.prepare_one_prefill_chunk(metadata, chunk_specs)
+                for chunk_specs in plan_mla_chunked_prefill_chunks(
+                    q_lens, kv_lens, _packed_logits_elem_budget(metadata), q_begin, q_end
                 )
             ]
         else:
@@ -1369,6 +1611,62 @@ class Indexer(nn.Module):
 
         return k_fp8, k_scale
 
+    def forward_prepared(
+        self,
+        q_data: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        output_indices: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run shared dense MQA and prefill Top-K on prequantized inputs.
+
+        Row bounds index the shared K matrix. Output preserves DSA's row-local
+        unsorted offsets. Only those row windows are read by Top-K, so the
+        existing no-clean logits fast path remains valid.
+        """
+        if output_indices.shape != (q_data.shape[0], self.index_topk):
+            raise ValueError("Prepared output must match query rows and configured Top-K")
+        if q_data.shape[0] == 0 or k_data.shape[0] == 0:
+            return output_indices.fill_(-1)
+        logits = self._call_mqa_logits(
+            q_data,
+            k_data,
+            k_scale,
+            weights,
+            row_starts,
+            row_ends,
+            q_scale,
+            clean_logits=False,
+        )
+        return self.top_k(
+            logits,
+            output_indices,
+            is_prefill=True,
+            row_starts=row_starts,
+            row_ends=row_ends,
+        )
+
+    @staticmethod
+    def _decode_mxfp4(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """Decode existing FP4 index inputs without introducing FP8 rounding."""
+        data = data.contiguous().view(torch.uint8)
+        codes = torch.stack((data & 15, data >> 4), dim=-1).flatten(-2).long()
+        magnitudes = torch.arange(8, device=data.device)
+        levels = torch.where(
+            magnitudes < 4,
+            magnitudes.float() * 0.5,
+            torch.exp2(((magnitudes - 2) // 2).float()) * (1 + 0.5 * (magnitudes % 2)),
+        )
+        values = levels[codes & 7] * torch.where((codes & 8) != 0, -1.0, 1.0)
+        groups = values.shape[-1] // 32
+        scale_bytes = scales.contiguous().view(torch.uint8).reshape(*values.shape[:-1], groups)
+        decoded = values.reshape(*values.shape[:-1], groups, 32)
+        return (decoded * torch.exp2(scale_bytes.float() - 127)[..., None]).flatten(-2)
+
     def _call_mqa_logits(
         self,
         q_fp8: torch.Tensor,
@@ -1395,10 +1693,41 @@ class Indexer(nn.Module):
         """
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
-            k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
-            # q_scale arrives as (chunk_tokens, n_heads, 1); the FP4 kernel
-            # asserts q_sf is 2D so collapse the trailing unit axis.
-            q_scale_2d = q_scale.reshape(-1, self.n_heads)
+            if q_scale is None:
+                raise ValueError("FP4 indexer queries require packed per-32 scale bytes")
+            if self.head_dim != 128 or not q_fp8.is_cuda or get_sm_version() < 100:
+                q = self._decode_mxfp4(q_fp8, q_scale)
+                k = self._decode_mxfp4(k_fp4_bytes, k_scale)
+                if q.is_cuda:
+                    from tensorrt_llm._torch.custom_ops import bmm_out
+
+                    dots = torch.empty(
+                        (q.shape[0], q.shape[1], k.shape[0]), dtype=q.dtype, device=q.device
+                    )
+                    bmm_out(q, k.T.unsqueeze(0).expand(q.shape[0], -1, -1), dots)
+                else:
+                    dots = torch.matmul(q, k.T)
+                # Keep decoded dot products and head-weight reductions in FP32;
+                # rounding either to BF16 can change the exact Top-K selection.
+                logits = (dots.relu() * weights.float().unsqueeze(-1)).sum(1)
+                columns = torch.arange(k.shape[0], device=q.device)[None, :]
+                return logits.masked_fill(
+                    (columns < cu_seqlen_ks[:, None]) | (columns >= cu_seqlen_ke[:, None]),
+                    -torch.inf,
+                )
+            k_scale_int32 = k_scale.contiguous().view(torch.int32).reshape(-1)
+            q_scale_2d = q_scale.contiguous().view(torch.int32).reshape(q_fp8.shape[:2])
+            q_fp8 = q_fp8.view(torch.int8)
+            heads = q_fp8.shape[1]
+            if not 1 <= heads <= 64:
+                raise ValueError("FP4 MQA requires between 1 and 64 index heads")
+            # Consumer Blackwell lacks the 8-head FP4 MQA specialization.
+            supported_heads = (16, 32, 64) if get_sm_version() in (120, 121) else (8, 16, 32, 64)
+            padded_heads = next(size for size in supported_heads if size >= heads)
+            if padded_heads != heads:
+                q_fp8 = F.pad(q_fp8, (0, 0, 0, padded_heads - heads))
+                q_scale_2d = F.pad(q_scale_2d, (0, padded_heads - heads))
+                weights = F.pad(weights, (0, padded_heads - heads))
             return fp8_fp4_mqa_logits(
                 (q_fp8, q_scale_2d),
                 (k_fp4_bytes, k_scale_int32),
@@ -1464,6 +1793,7 @@ class Indexer(nn.Module):
         When ``is_generation`` is ``None``, the inputs contain the full mixed
         batch. Otherwise they contain only the selected context or generation
         phase. ``q_scale`` is only consumed by the FP4 dispatch.
+
         """
         # DSACacheManager / DeepseekV4CacheManager force quant_block_size to
         # 128 (FP8 path) or 32 (MXFP4 path); both round-trip to the same
@@ -1516,23 +1846,10 @@ class Indexer(nn.Module):
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
-                sparse_metadata_params = metadata.sparse_metadata_params
-                q_split_threshold = (
-                    sparse_metadata_params.q_split_threshold
-                    if sparse_metadata_params is not None
-                    else 8192
-                )
-                q_split_eligible = (
-                    q_split_threshold >= 0
-                    and metadata.mapping is not None
-                    and not metadata.mapping.enable_attention_dp
-                    and metadata.mapping.tp_size > 1
-                )
-
-                if q_split_eligible:
-                    tp_rank = metadata.mapping.tp_rank
-                    tp_size = metadata.mapping.tp_size
-
+                q_split_threshold = _prefill_q_split_threshold(metadata)
+                # Chunks planned for this rank's share of the queries only are
+                # never split again; their top-k rows are gathered after the loop.
+                batch_q_split = metadata.indexer_prefill_q_split
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
                 # FP4 packs two codes per byte so the gathered row holds half
                 # as many bytes as in the FP8 path. The scale (4 bytes) is the
@@ -1557,13 +1874,12 @@ class Indexer(nn.Module):
                     )
 
                     chunk_num_token = chunk.token_end - chunk.token_start
-                    apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold
-                    if apply_q_split:
-                        chunk_q_start = chunk_num_token * tp_rank // tp_size
-                        chunk_q_end = chunk_num_token * (tp_rank + 1) // tp_size
+                    if batch_q_split is None:
+                        chunk_q_start, chunk_q_end, q_sizes = _split_prefill_queries(
+                            chunk_num_token, metadata.mapping, q_split_threshold
+                        )
                     else:
-                        chunk_q_start = 0
-                        chunk_q_end = chunk_num_token
+                        chunk_q_start, chunk_q_end, q_sizes = 0, chunk_num_token, None
 
                     global_q_start = chunk.token_start + chunk_q_start
                     global_q_end = chunk.token_start + chunk_q_end
@@ -1579,44 +1895,46 @@ class Indexer(nn.Module):
                     # allocation is the same size and the caching allocator
                     # reuses one block (peak ~= one tile, no extra sync).
                     local_q_len = chunk_q_end - chunk_q_start
-                    q_tile = max(
-                        1, min(local_q_len, _INDEXER_MQA_LOGITS_ELEM_BUDGET // max(1, num_k_tokens))
-                    )
+                    budget = _INDEXER_MQA_LOGITS_ELEM_BUDGET
+                    if self.use_fp4 and (
+                        self.head_dim != 128 or not q_fp8.is_cuda or get_sm_version() < 100
+                    ):
+                        # Decoded MQA also materializes per-head dot products.
+                        budget = max(1, budget // self.n_heads)
+                    q_tile = max(1, min(local_q_len, budget // max(1, num_k_tokens)))
                     for tile_off in range(0, local_q_len, q_tile):
                         c0 = chunk_q_start + tile_off
                         c1 = min(c0 + q_tile, chunk_q_end)
                         g0 = chunk.token_start + c0
                         g1 = chunk.token_start + c1
                         tile_q_scale = q_scale[g0:g1, ...] if self.use_fp4 else None
-                        logits = self._call_mqa_logits(
+                        self.forward_prepared(
                             q_fp8[g0:g1, ...],
                             chunk_k_fp8,
                             chunk_k_scale,
                             weights[g0:g1, ...],
                             chunk.cu_seqlen_ks[c0:c1],
                             chunk.cu_seqlen_ke[c0:c1],
-                            tile_q_scale,
-                            clean_logits=False,
-                        )
-                        self.top_k(
-                            logits,
                             topk_indices_buffer[g0:g1, :],
-                            is_prefill=True,
-                            row_starts=chunk.cu_seqlen_ks[c0:c1],
-                            row_ends=chunk.cu_seqlen_ke[c0:c1],
+                            tile_q_scale,
                         )
 
-                    if apply_q_split:
-                        q_sizes = [
-                            (r + 1) * chunk_num_token // tp_size - r * chunk_num_token // tp_size
-                            for r in range(tp_size)
-                        ]
+                    if q_sizes is not None:
                         topk_indices_buffer[chunk.token_start : chunk.token_end, :] = allgather(
                             topk_indices_buffer[global_q_start:global_q_end, :],
                             metadata.mapping,
                             dim=0,
                             sizes=q_sizes,
                         )
+
+                if batch_q_split is not None:
+                    local_q_begin, local_q_end, q_sizes = batch_q_split
+                    topk_indices_buffer[: sum(q_sizes), :] = allgather(
+                        topk_indices_buffer[local_q_begin:local_q_end, :],
+                        metadata.mapping,
+                        dim=0,
+                        sizes=q_sizes,
+                    )
             elif metadata.num_ctx_kv_tokens == 0:
                 # No compressed KV tokens — fill with -1 (no valid indices)
                 topk_indices_buffer[:num_ctx_tokens, :].fill_(-1)
@@ -1627,22 +1945,15 @@ class Indexer(nn.Module):
                 cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
 
                 ctx_q_scale = q_scale[:num_ctx_tokens, ...] if self.use_fp4 else None
-                logits = self._call_mqa_logits(
+                self.forward_prepared(
                     q_fp8[:num_ctx_tokens, ...],
                     k_fp8[:num_ctx_kv_tokens, ...],
                     k_scale[:num_ctx_kv_tokens, ...],
                     weights[:num_ctx_tokens, ...],
                     cu_seqlen_ks,
                     cu_seqlen_ke,
-                    ctx_q_scale,
-                    clean_logits=False,
-                )
-                self.top_k(
-                    logits,
                     topk_indices_buffer[:num_ctx_tokens, :],
-                    is_prefill=True,
-                    row_starts=cu_seqlen_ks,
-                    row_ends=cu_seqlen_ke,
+                    ctx_q_scale,
                 )
         elif has_prefill and metadata.skip_indexer_for_ctx_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
@@ -1770,6 +2081,17 @@ class Indexer(nn.Module):
                     metadata.dsl_expand_factor > 1
                     and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
                 )
+                # In-kernel uneven split (next_n with no exact atom divisor):
+                # native Q / context_lens / block_table, schedule over the
+                # staggered per-atom rows. Same full-window gate as above.
+                dsl_kernel_split = (
+                    metadata.dsl_kernel_atoms > 1 and next_n == metadata.dsl_kernel_next_n
+                )
+                dsl_split_kwargs: dict = {}
+                if dsl_kernel_split:
+                    dsl_split_kwargs = dict(
+                        num_next_n_atoms=metadata.dsl_kernel_atoms, atom=metadata.dsl_atom
+                    )
                 gvr_emit_kwargs: dict = {}
                 # emitting for a step the Top-K cannot consume only churns
                 # the closed-loop state, so gate on the consumable shape
@@ -1778,6 +2100,7 @@ class Indexer(nn.Module):
                     and gvr_prior_indices is not None
                     and next_n == 1
                     and not dsl_atom_split
+                    and not dsl_kernel_split
                     and num_gen_tokens <= 256
                     # ext tiers are single-CTA/sort-path only; row reordering
                     # routes the Top-K through order_row, which excludes them
@@ -1811,6 +2134,8 @@ class Indexer(nn.Module):
                         dsl_context_lens = metadata.kv_lens_expanded_cuda[:exp_B]
                         dsl_block_table = metadata.block_table_expanded[:exp_B]
                         dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                    elif dsl_kernel_split:
+                        dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
 
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q,
@@ -1822,6 +2147,7 @@ class Indexer(nn.Module):
                         dsl_schedule_meta,
                         indexer_max_seq_len,
                         **gvr_emit_kwargs,
+                        **dsl_split_kwargs,
                     )
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
@@ -1841,6 +2167,8 @@ class Indexer(nn.Module):
                         fp8_ctx_lens = metadata.kv_lens_expanded_cuda[:exp_B]
                         fp8_block_table = metadata.block_table_expanded[:exp_B]
                         fp8_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                    elif dsl_kernel_split:
+                        fp8_schedule_meta = metadata.scheduler_metadata_buffer_expanded
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q,
                         k_cache,
@@ -1850,6 +2178,7 @@ class Indexer(nn.Module):
                         fp8_schedule_meta,
                         indexer_max_seq_len,
                         **gvr_emit_kwargs,
+                        **dsl_split_kwargs,
                     )
             else:
                 decode_q_scale = (
@@ -2031,6 +2360,8 @@ class Indexer(nn.Module):
         ignores it. It is returned unconditionally so the two-op CUDA graph
         split in dsa.module.forward_dsa_proj sees a stable signature.
         """
+        if self.projection_free:
+            raise RuntimeError("Projection-free Indexer requires forward_prepared()")
         assert self._fused_wk_wp_weight is not None, (
             "cache_derived_state() must be called before forward()"
         )

@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -38,12 +39,12 @@ struct GpuCacheTierConfig
 {
     size_t quota = 0; // bytes
 
-    CacheTier tier() const noexcept
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::GPU_MEM;
     }
 
-    void assertValid() const
+    void validate() const
     {
         if (quota == 0)
             throw std::invalid_argument("GpuCacheTierConfig: quota must be > 0");
@@ -54,15 +55,42 @@ struct HostCacheTierConfig
 {
     size_t quota = 0; // bytes
 
-    CacheTier tier() const noexcept
+    //! Upper bound this tier may ever be resized to, in bytes.
+    //!
+    //! The address range is reserved once at this size so that growing the tier
+    //! only commits more of it and never moves the base address. Reserving costs
+    //! address space, not memory. A resize past this bound is rejected.
+    //!
+    //! Defaults to the host memory the OS reports, which no allocation can
+    //! exceed anyway.
+    std::optional<size_t> maxQuota;
+
+    //! Whether a page may come from a NUMA node other than the one the GPU
+    //! attaches to, when the local node cannot satisfy it.
+    //!
+    //! False keeps every page local, at the cost of capping the tier at one
+    //! node's memory: a quota sized from total system memory cannot then be
+    //! filled. True accepts a remote page, which the GPU reaches more slowly,
+    //! rather than failing the allocation.
+    //!
+    //! False additionally requires that a memory policy be settable. Where the
+    //! host tier is mmap-backed, a container without CAP_SYS_NICE cannot set
+    //! one, and the tier refuses to start rather than fall back to first touch
+    //! -- which prefers the local node but takes a remote page instead of
+    //! failing, and so would not be the strictness that was asked for.
+    bool allowRemoteNumaFallback = true;
+
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::HOST_MEM;
     }
 
-    void assertValid() const
+    void validate() const
     {
         if (quota == 0)
             throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
+        if (maxQuota.has_value() && *maxQuota < quota)
+            throw std::invalid_argument("HostCacheTierConfig: maxQuota must be >= quota");
     }
 };
 
@@ -71,12 +99,12 @@ struct DiskCacheTierConfig
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
 
-    CacheTier tier() const noexcept
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;
     }
 
-    void assertValid() const;
+    void validate() const;
 };
 
 // Variant holding any tier config.
@@ -93,6 +121,15 @@ inline size_t cacheTierQuota(CacheTierConfig const& cfg)
     return std::visit([](auto const& c) { return c.quota; }, cfg);
 }
 
+//! The configured ceiling on this tier's quota, where it has one. Only the host
+//! tier reserves address space up front and so carries a maximum; the others are
+//! bounded by the device or the filesystem.
+inline std::optional<size_t> cacheTierMaxQuota(CacheTierConfig const& cfg)
+{
+    auto const* host = std::get_if<HostCacheTierConfig>(&cfg);
+    return host != nullptr ? host->maxQuota : std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // Buffer configuration (one KV buffer inside an attention layer).
 // ---------------------------------------------------------------------------
@@ -107,6 +144,10 @@ struct BufferConfig
     std::optional<int> tokensPerBlockOverride;
 
     bool isSparse = false; //!< Whether history uses the sparse attention lifecycle.
+
+    //! Buffers may coalesce only when their group and expanded size match.
+    //! This does not change their lifecycle or shared slot allocation.
+    int coalescingGroup = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -137,6 +178,19 @@ inline void validateNoDuplicateBufferRoles(std::vector<BufferConfig> const& buff
 
 } // namespace detail
 
+//! Controls whether an attention lifecycle participates in prefix matching and page reuse.
+enum class AttentionReusePolicy
+{
+    //! Commit reusable pages and require live-window coverage when matching a prefix.
+    REQUIRED = 0,
+    //! Keep request-local working pages; never publish or reuse them through the radix tree.
+    PRIVATE = 1,
+    //! Commit reusable pages without constraining the REQUIRED prefix match. The caller selects
+    //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
+    //! These pages may be evicted independently without removing the REQUIRED prefix.
+    OPTIONAL = 2,
+};
+
 struct AttentionLayerConfig
 {
     static constexpr LayerType type = LayerType::ATTENTION;
@@ -149,6 +203,9 @@ struct AttentionLayerConfig
 
     // nullopt or 0 = no sink tokens.
     std::optional<int> numSinkTokens;
+
+    // Private working pages never constrain prefix matching or enter the tree.
+    AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
 
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
@@ -285,6 +342,55 @@ struct SwaScratchReuseConfig
 };
 
 // ---------------------------------------------------------------------------
+// Pool rebalancing configuration (mirrors _config.py::PoolRebalanceConfig).
+// Tunes the auto-tuner driven by KvCacheManager::needAdjustment / adjust.
+// ---------------------------------------------------------------------------
+struct PoolRebalanceConfig
+{
+    // Minimum number of sampled (closed) KvCaches observed before rebalancing is considered.
+    int minSampledKvCaches = 2000;
+
+    // Minimum time, in seconds, between successive rebalancing adjustments.
+    double cooldownSecs = 120.0;
+
+    // Number of newly sampled KvCaches between recomputations of the target pool ratios.
+    int targetRatioUpdateInterval = 100;
+
+    // How far a pool group's current ratio may drift from its target before a rebalance is
+    // triggered, as a fraction of the smaller of the two. The comparison is symmetric, so
+    // 0.25 means "rebalance once one of the two exceeds the other by more than 25%".
+    float ratioTolerance = 0.25f;
+
+    // Decay factor for the exponential moving averages (reused length, capacity, history
+    // length) used to compute target pool ratios. Higher values react more slowly to change.
+    double movingAverageDecay = 0.9999;
+
+    void validate() const
+    {
+        if (minSampledKvCaches < 0)
+        {
+            throw std::invalid_argument("PoolRebalanceConfig: min_sampled_kv_caches must be non-negative");
+        }
+        if (!std::isfinite(cooldownSecs) || cooldownSecs < 0.0)
+        {
+            throw std::invalid_argument("PoolRebalanceConfig: cooldown_secs must be finite and non-negative");
+        }
+        if (targetRatioUpdateInterval <= 0)
+        {
+            throw std::invalid_argument("PoolRebalanceConfig: target_ratio_update_interval must be positive");
+        }
+        if (!std::isfinite(ratioTolerance) || ratioTolerance <= 0.0f)
+        {
+            throw std::invalid_argument("PoolRebalanceConfig: ratio_tolerance must be finite and > 0");
+        }
+        if (!std::isfinite(movingAverageDecay) || movingAverageDecay <= 0.0 || movingAverageDecay >= 1.0)
+        {
+            throw std::invalid_argument("PoolRebalanceConfig: moving_average_decay must be finite and in (0, 1)");
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Top-level KV cache manager configuration (mirrors _config.py::KVCacheManagerConfig).
 // ---------------------------------------------------------------------------
 
@@ -335,6 +441,9 @@ struct KVCacheManagerConfig
     // Collect V2 KV cache allocation, reuse, and transfer statistics.
     bool enableStats = true;
 
+    // Tuning for the pool rebalancing auto-tuner. Only consulted when the executor opts in.
+    PoolRebalanceConfig poolRebalance;
+
     // Deployment-level guarantee that no request carries multi-modal content, so token
     // sequences never contain digests. Lets block-key hashing take the digest-free fast
     // path without scanning. A per-KvCache text_only override may only tighten this
@@ -344,6 +453,9 @@ struct KVCacheManagerConfig
     // Publish a finalized partial block for reuse when committing stops.
     // Beam search disables this while retaining full-block reuse.
     bool enablePartialCommit = true;
+
+    // Unreferenced GPU pages below this priority are dropped instead of offloaded.
+    Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
 
     bool enableSwaScratchReuse() const noexcept
     {

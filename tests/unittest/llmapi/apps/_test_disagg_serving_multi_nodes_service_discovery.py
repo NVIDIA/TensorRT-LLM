@@ -1,4 +1,5 @@
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -6,8 +7,9 @@ import uuid
 
 import openai
 import pytest
+from test_common import cluster_env
 
-from tensorrt_llm._utils import get_free_port
+from tensorrt_llm._utils import get_free_port, get_sm_version
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
 from ..test_llm import get_model_path
@@ -47,12 +49,18 @@ def is_pytest_node():
 def env():
     # Remove MPI related environment variables to isolate the ctx/gen processes
     # so that they will not be in the same MPI communicator, otherwise the rank and world_size may mismatch
-    return {
+    e = {
         k: v
         for k, v in os.environ.items()
         if not ("PMI_" in k or "OMPI_" in k or "PMIX_" in k or "SLURM_" in k)
         and k not in ["UCX_TLS", "UCX_NET_DEVICES"]
     }
+    # GB300 (sm_103 + aarch64) needs UCX_TLS set explicitly. A cluster rule, if
+    # one matches, overrides this.
+    if get_sm_version() == 103 and platform.machine().lower() == "aarch64":
+        e["UCX_TLS"] = "cuda_copy,cuda_ipc,sm,self,tcp"
+    cluster_env.apply_ucx_env(e, cluster_name=os.environ.get("SLURM_CLUSTER_NAME"))
+    return e
 
 
 @pytest.fixture
@@ -111,6 +119,10 @@ def worker(model_name: str, disagg_cluster_config: dict):
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
+        # Qwen3.5 reserves recurrent state for max_batch_size * pp_size
+        # sequences up front; the defaults do not fit on 80 GB GPUs.
+        "max_batch_size": 128,
+        "max_seq_len": 8192,
     }
     # start workers on 0.0.0.0:<free_port>, then the workers should be able to
     # report their correct hostname:port to the disagg server

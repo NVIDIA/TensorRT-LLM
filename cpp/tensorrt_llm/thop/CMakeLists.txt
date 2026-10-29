@@ -30,7 +30,13 @@ endif()
 
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+# Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
+# OptionalArrayRef in the reverse order, relying on C++20's automatic generation
+# of the reversed comparison operator. th_utils/th_common only contain host .cpp
+# sources, so scope the bump to these targets instead of the repo-wide C++17
+# standard.
+set_target_properties(th_utils PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                          ON)
 # Declare the dependency on the main shared library explicitly so consumers
 # (e.g. thUtilsTest) place it after th_utils on the link line; this was
 # previously satisfied transitively via the removed TensorRT plugin target.
@@ -69,6 +75,12 @@ add_th_common_family(
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp)
+
+target_sources(
+  th_common_attention
+  PRIVATE "${KIMI_K3_MODEL_CSRC}/k3AttnResOp.cpp"
+          "${KIMI_K3_MODEL_CSRC}/k3MnnvlCommOp.cpp"
+          "${KIMI_K3_MODEL_CSRC}/k3MnnvlFusionOp.cpp")
 
 add_th_common_family(
   th_common_gemm_quant
@@ -133,15 +145,20 @@ add_th_common_family(
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  dwdpFabricGatherOp.cpp)
 
 add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
 
 add_th_common_family(
-  th_common_visual_gen fusedAdaptiveLayerNormOp.cpp fusedDiTQKNormRopeOp.cpp
-  fusedDiTSplitQKNormRopeOp.cpp fusedDiTSplitNormOp.cpp
-  fusedDiTGateResidNormShiftScaleOp.cpp)
+  th_common_visual_gen
+  fusedAdaptiveLayerNormOp.cpp
+  fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp
+  fusedDiTSplitNormOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
+  sageQuantizeOp.cpp)
 
 add_th_common_family(
   th_common_decoding
@@ -149,11 +166,16 @@ add_th_common_family(
   parallelDecodeKVCacheUpdateOp.cpp
   specDecOp.cpp
   fusedSamplingOp.cpp
+  chainSpeculativeSamplingOp.cpp
   dynamicTreeOp.cpp
   loraOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
+
+# GLM bindings keep their existing family targets; source lists live with the
+# model.
+add_subdirectory(glmMoeDsa)
 
 add_library(
   th_common SHARED
@@ -165,6 +187,8 @@ add_library(
   $<TARGET_OBJECTS:th_common_visual_gen>
   $<TARGET_OBJECTS:th_common_decoding>)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                           ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)

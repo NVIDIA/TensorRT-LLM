@@ -15,14 +15,14 @@ from pydantic import ValidationError
 
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import fmha as cute_dsl_fmha
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import fmha as cute_dsl_fmha
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.fmha import (
     CuTeDSLAttention,
     _resolve_skip_softmax_threshold_scale_factor,
 )
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig, VisualGenArgs
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
@@ -517,7 +517,7 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
             o.zero_()
 
         monkeypatch.setattr(
-            "tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha.cute_dsl_fmha_fwd",
+            "tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.fmha.cute_dsl_fmha_fwd",
             _fake_cute_dsl_fmha_fwd,
         )
 

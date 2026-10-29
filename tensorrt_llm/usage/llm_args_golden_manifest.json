@@ -226,7 +226,7 @@
         "num_tokens",
         "batch_size"
       ],
-      "capture_policy": "tuple[int|literal]",
+      "capture_policy": "list[tuple[int|literal]]",
       "kind": "categorical",
       "path": "cuda_graph_config.extra_model_inputs.shape"
     },
@@ -311,6 +311,11 @@
       "path": "dwdp_config.num_prefetch_experts"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_slots"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "enable_attention_dp"
@@ -364,6 +369,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "enable_lm_head_tp_in_adp"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "enable_locality_domains"
     },
     {
       "capture_policy": "bool",
@@ -425,7 +435,7 @@
         "num_tokens",
         "batch_size"
       ],
-      "capture_policy": "tuple[int|literal]",
+      "capture_policy": "list[tuple[int|literal]]",
       "kind": "categorical",
       "path": "encoder_cuda_graph_config.extra_model_inputs.shape"
     },
@@ -566,11 +576,25 @@
     },
     {
       "allowed_values": [
+        0,
+        64
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.nvfp4_residual_dim"
+    },
+    {
+      "allowed_values": [
         "nvfp4"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_compression_config.quant"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_compression_config.skip_rope_quantization"
     },
     {
       "capture_policy": "int",
@@ -581,6 +605,11 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "kv_cache_config.avg_seq_len"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.enable_branch_snapshot"
     },
     {
       "capture_policy": "int",
@@ -601,6 +630,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.cold_tier_offload_min_priority"
     },
     {
       "capture_policy": "bool",
@@ -630,7 +664,10 @@
         "float32",
         "fp8",
         "fp8_ds_mla",
-        "nvfp4"
+        "nvfp4",
+        "mixed_nvfp4_fp8",
+        "mixed_nvfp4_float16",
+        "mixed_nvfp4_bfloat16"
       ],
       "capture_policy": "allowlist",
       "kind": "categorical",
@@ -722,6 +759,36 @@
       "path": "kv_cache_config.kv_events_config.publisher"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.check_interval"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.cooldown_secs"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.moving_average_decay"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.ratio_tolerance"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",
@@ -741,11 +808,6 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
-    },
-    {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
     },
     {
       "capture_policy": "int",
@@ -773,14 +835,19 @@
       "path": "kv_cache_config.max_util_for_resume"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mixed_precision_first_n"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.mixed_precision_last_n"
+    },
+    {
       "capture_policy": "list[float]|none",
       "kind": "value",
       "path": "kv_cache_config.pool_ratio"
-    },
-    {
-      "capture_policy": "int|none",
-      "kind": "value",
-      "path": "kv_cache_config.secondary_offload_min_priority"
     },
     {
       "capture_policy": "int|none",
@@ -809,11 +876,38 @@
       "allowed_values": [
         "lmcache",
         "lmcache-mp",
-        "kvbm"
+        "kvbm",
+        "mooncake-store"
       ],
       "capture_policy": "allowlist|none",
       "kind": "categorical",
       "path": "kv_connector_config.connector"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.control_grace_sec"
+    },
+    {
+      "allowed_values": [
+        "both",
+        "producer",
+        "consumer",
+        "capacity"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_connector_config.mooncake_store.role"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_connector_config.mooncake_store.segment_size"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.transfer_timeout_sec"
     },
     {
       "capture_policy": "list[int]|none",
@@ -829,6 +923,15 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "layer_wise_benchmarks_config.calibration_mode"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "float32"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "lm_head_output_dtype"
     },
     {
       "allowed_values": [
@@ -923,6 +1026,16 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "mm_encoder_only"
+    },
+    {
+      "allowed_values": [
+        "off",
+        "auto",
+        "require"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "modeling_v2"
     },
     {
       "capture_policy": "int|none",
@@ -1301,6 +1414,7 @@
     },
     {
       "allowed_values": [
+        "csa2",
         "dsa",
         "deepseek_v4",
         "minimax_m3",
@@ -1331,6 +1445,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.gvr_deterministic_topk"
     },
     {
       "allowed_values": [
@@ -1512,6 +1631,11 @@
       "path": "sparse_attention_config.use_cute_dsl_topk"
     },
     {
+      "capture_policy": "bool|none",
+      "kind": "value",
+      "path": "sparse_attention_config.use_fp8_staging"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.use_gvr_emission"
@@ -1578,6 +1702,11 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.block_size"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.context_recompute_tail"
     },
     {
       "allowed_values": [
@@ -1752,6 +1881,11 @@
       "path": "speculative_config.skip_ctx_buffer_budget_check"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.spec_dec_variant"
+    },
+    {
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "speculative_config.target_layer_ids"
@@ -1822,6 +1956,11 @@
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "torch_compile_config.capture_num_tokens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "torch_compile_config.compile_only_piecewise_graphs"
     },
     {
       "capture_policy": "bool",

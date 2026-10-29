@@ -6,6 +6,9 @@
 import asyncio
 import base64
 import gc
+import hashlib
+import hmac
+import json
 import weakref
 from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
@@ -14,8 +17,9 @@ from typing import Any
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.disagg as oe_disagg  # noqa: E402
@@ -275,6 +279,39 @@ def test_disaggregated_params_context_only_from_extra() -> None:
     params = oe_disagg.disaggregated_params_from_request(request)
     assert params is not None
     assert params.request_type == "context_only"
+
+
+def test_independent_prefill_handoffs_keep_distinct_transfer_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID
+
+    nonces = iter((0, (1 << 63) - MIN_GLOBAL_ID - 1))
+
+    def next_nonce(upper: int) -> int:
+        assert upper == (1 << 63) - MIN_GLOBAL_ID
+        return next(nonces)
+
+    monkeypatch.setattr("secrets.randbelow", next_nonce)
+    transfer_ids = []
+    for worker in range(2):
+        request = generation_pb2.GenerateRequest()
+        request.extra.update({"request_type": "context_only"})
+        params = oe_disagg.disaggregated_params_from_request(request)
+        assert params is not None
+        # Independent prefill engines can return the same local context ID.
+        params.ctx_request_id = 274
+        params.ctx_info_endpoint = f"tcp://127.0.0.1:{7001 + worker}"
+        response = oe_disagg.prefill_ready_response("req", params, "NIXL")
+        handoff = generation_pb2.GenerateResponse.FromString(response.SerializeToString())
+        follow_up = generation_pb2.GenerateRequest()
+        follow_up.kv.session.CopyFrom(handoff.prefill_ready.kv_session)
+        decoded = oe_disagg.disaggregated_params_from_request(follow_up)
+        assert decoded is not None
+        assert decoded.ctx_request_id == 274
+        transfer_ids.append(decoded.disagg_request_id)
+
+    assert transfer_ids == [MIN_GLOBAL_ID, (1 << 63) - 1]
 
 
 def test_disaggregated_params_invalid_request_type() -> None:
@@ -963,23 +1000,15 @@ def test_generate_does_not_abort_slow_engine(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.parametrize(
-    ("key", "value"),
+    "value",
     [
-        ("openengine-priority", "7"),
-        ("openengine-priority", "not-an-integer"),
-        ("openengine-target-dp-rank", "0"),
-        ("openengine-target-dp-rank", "-1"),
+        "7",
+        "not-an-integer",
     ],
 )
-def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> None:
-    """Unsupported OpenEngine metadata returns UNIMPLEMENTED, whatever the value.
-
-    Control advertises both headers as unsupported and Generate never reads the
-    value, so the status must tell the client to stop sending the header rather
-    than to correct it.
-    """
+def test_generate_rejects_unsupported_priority_metadata(value: str) -> None:
     servicer = OpenEngineInferenceServicer(_FakeLlm([]), model="test-model")
-    context = FakeServicerContext(metadata=((key, value),))
+    context = FakeServicerContext(metadata=(("openengine-priority", value),))
     request = generation_pb2.GenerateRequest(
         request_id="request-6",
         model="test-model",
@@ -994,6 +1023,193 @@ def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> 
         asyncio.run(collect_responses())
 
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+
+
+@pytest.mark.parametrize("enable_attention_dp, rank", [(True, 2), (False, 0)])
+def test_generate_maps_target_dp_rank_to_strict_scheduling(
+    enable_attention_dp: bool, rank: int
+) -> None:
+    """A Dynamo route must not be relaxed onto a rank that lacks the selected prefix."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = enable_attention_dp
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", str(rank)),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-dp-rank",
+        model="test-model",
+        prompt="hello",
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(collect_responses())
+
+    scheduling_params = llm.generate_kwargs["scheduling_params"]
+    assert scheduling_params.attention_dp_rank == rank
+    assert scheduling_params.attention_dp_relax is False
+
+
+def test_generate_uses_rank_hint_for_first_conversation_turn() -> None:
+    """A Dynamo KV route seeds the conversation binding on its first turn."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "2"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-conversation-rank",
+        model="test-model",
+        prompt="hello",
+    )
+    request.extra.update({"conversation_id": "session-a"})
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(collect_responses())
+
+    assert llm.generate_kwargs["scheduling_params"].attention_dp_rank == 2
+    assert llm.generate_kwargs["scheduling_params"].attention_dp_relax is False
+    assert llm.generate_kwargs["conversation_params"].conversation_id == "session-a"
+
+
+def test_generate_rejects_rank_hint_without_conversation_affinity_key() -> None:
+    """Dropping an explicit rank hint must not leave placement unkeyed."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "1"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="missing-conversation", model="test-model", prompt="hello"
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(collect_responses())
+    assert error.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("key", ["openengine-routing-key", "openengine-unknown-route"])
+def test_generate_rejects_ignored_routing_metadata(key: str) -> None:
+    """A caller's routing request must not succeed after being discarded."""
+    llm = _FakeLlm([])
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=((key, "parent-1"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="unsupported-route", model="test-model", prompt="hello"
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(collect_responses())
+    assert error.value.code == grpc.StatusCode.UNIMPLEMENTED
+
+
+def test_generate_preserves_child_identity_and_authenticates_parent_affinity() -> None:
+    """A sidecar parent hint must place the request without replacing its child ID."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(
+        llm, model="test-model", subagent_affinity_auth_key="shared-secret"
+    )
+    request = generation_pb2.GenerateRequest(
+        request_id="child-request", model="test-model", prompt="hello"
+    )
+    request.extra.update({"conversation_id": "child-a", "request_type": "context_only"})
+    payload = {
+        "purpose": "x-trtllm-subagent-affinity-id",
+        "model": "test-model",
+        "request_id": "child-request",
+        "conversation_id": "child-a",
+        "subagent_affinity_id": "parent-1",
+        "request_type": "context_only",
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    signature = "sha256=" + hmac.new(b"shared-secret", encoded, hashlib.sha256).hexdigest()
+
+    async def send(parent: str) -> None:
+        context = FakeServicerContext(
+            metadata=(
+                ("x-trtllm-subagent-affinity-id", parent),
+                ("x-trtllm-subagent-affinity-auth", signature),
+            )
+        )
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(send("parent-1"))
+    assert llm.generate_kwargs["conversation_params"].conversation_id == "child-a"
+    scheduling = llm.generate_kwargs["scheduling_params"]
+    assert scheduling.subagent_affinity_id == "parent-1"
+    assert scheduling.attention_dp_rank is None
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(send("different-parent"))
+    assert error.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_generate_rejects_target_dp_rank_with_multiple_sequences() -> None:
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "2"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-multi-dp-rank",
+        model="test-model",
+        prompt="hello",
+        sampling=generation_pb2.SamplingParams(num_sequences=2),
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError):
+        asyncio.run(collect_responses())
+
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize(
+    "value, enable_attention_dp",
+    [("-1", True), ("4", True), ("not-an-integer", True), ("1", False)],
+)
+def test_generate_rejects_invalid_target_dp_rank(value: str, enable_attention_dp: bool) -> None:
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = enable_attention_dp
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", value),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-invalid-dp-rank",
+        model="test-model",
+        prompt="hello",
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError):
+        asyncio.run(collect_responses())
+
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
 
 
 def test_generate_context_only_ends_at_prefill_ready() -> None:

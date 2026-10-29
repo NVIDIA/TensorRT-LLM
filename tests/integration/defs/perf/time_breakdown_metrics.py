@@ -71,7 +71,7 @@ import os
 import statistics
 import time
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 STATS = ("mean", "median", "p75", "p99")
 METRIC_PREFIX = "d_tb_"
@@ -264,8 +264,12 @@ def _classify(path: str, records: List[Dict[str, Any]]) -> str:
     return "ctx_worker"
 
 
-def _read_jsonl(path: str) -> Tuple[List[Dict[str, Any]], int]:
+def _read_jsonl(path: str, num_leading_lines_to_skip: int = 0) -> Tuple[List[Dict[str, Any]], int]:
     """Parse a JSONL file, skipping unparsable lines. Returns ``(records, skipped)``.
+
+    The first ``num_leading_lines_to_skip`` lines are ignored without being parsed and are not
+    counted in ``skipped``, which counts unparsable lines only; see
+    ``compute_time_breakdown_metrics`` for why they are ignored.
 
     A malformed line is expected rather than exceptional: the client and every worker
     append to these files while the run is live, so the final line can be a partial
@@ -279,7 +283,9 @@ def _read_jsonl(path: str) -> Tuple[List[Dict[str, Any]], int]:
     out: List[Dict[str, Any]] = []
     skipped = 0
     with open(path) as handle:
-        for line in handle:
+        for line_idx, line in enumerate(handle):
+            if line_idx < num_leading_lines_to_skip:
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -486,6 +492,7 @@ def compute_time_breakdown_metrics(
     paths: Sequence[str],
     benchmark_mode: str,
     drop_warmup_request: bool = False,
+    leading_lines_to_skip: Optional[Mapping[str, int]] = None,
 ) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """Reduce per-request JSONLs to ``{d_tb_<metric>_<stat>: value_ms}``.
 
@@ -501,6 +508,11 @@ def compute_time_breakdown_metrics(
             ``--no-test-input`` for ``e2e`` and ``ctx_only``). Discards that request's record
             so the breakdown covers the same population as every other metric on the row; see
             :func:`_drop_warmup_record`. Reported as ``info["warmup_dropped"]``.
+        leading_lines_to_skip: per file basename, the number of leading lines to ignore
+            because they record traffic sent before the measured clients (perf-sanity's
+            connection warmup and warmup pass). The servers append every request to the
+            same files, so those records would otherwise join the population. Reported as
+            ``info["leading_lines_skipped"]``.
 
     Returns:
         ``(metrics, info)``. ``metrics`` always has exactly ``len(ALL_METRICS) * 4`` keys;
@@ -527,12 +539,17 @@ def compute_time_breakdown_metrics(
     gen_workers: List[Tuple[str, List[Dict[str, Any]]]] = []
 
     skipped_lines: Dict[str, int] = {}
+    leading_lines_skipped: Dict[str, int] = {}
+    leading_lines_to_skip = leading_lines_to_skip or {}
     for path in paths:
+        num_leading_lines = leading_lines_to_skip.get(os.path.basename(path), 0)
         try:
-            records, skipped = _read_jsonl(path)
+            records, skipped = _read_jsonl(path, num_leading_lines_to_skip=num_leading_lines)
         except OSError as exc:
             warnings.append(f"{os.path.basename(path)}: unreadable ({exc})")
             continue
+        if num_leading_lines:
+            leading_lines_skipped[os.path.basename(path)] = num_leading_lines
         if skipped:
             skipped_lines[os.path.basename(path)] = skipped
             warnings.append(
@@ -650,6 +667,9 @@ def compute_time_breakdown_metrics(
         "warmup_dropped": warmup_dropped,
         # Per file, non-empty only when a line failed to parse (usually a partial write).
         "skipped_lines": skipped_lines,
+        # Per file, how many leading lines were ignored as pre-measurement traffic (the
+        # connection warmup and the warmup pass).
+        "leading_lines_skipped": leading_lines_skipped,
         "sample_counts": {
             name: len(
                 (per_instance if name in CHUNK_METRICS + STEP_METRICS else per_request).get(
@@ -722,6 +742,55 @@ def _count_lines(path: str) -> int:
             total += chunk.count(b"\n")
 
 
+# Records _census_role parses to tell a file's role. A file holds one role's records, so a
+# few suffice, and a gen worker's records carry an entry per decode step, so they can be large.
+_CENSUS_ROLE_SAMPLE_RECORDS = 8
+
+
+def _census_role(path: str) -> str:
+    """``_classify`` of the file's first complete records; ``empty`` until it has one."""
+    records: List[Dict[str, Any]] = []
+    with open(path, "rb") as handle:
+        for line in handle:
+            if not line.endswith(b"\n"):
+                break  # A partial write.
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+                if len(records) == _CENSUS_ROLE_SAMPLE_RECORDS:
+                    break
+    return _classify(path, records)
+
+
+def _census(
+    line_counts: Mapping[str, int],
+    leading_lines_to_skip: Mapping[str, int],
+    roles: Mapping[str, str],
+) -> int:
+    """Complete records of the role that wrote the most, after each file's skipped lines.
+
+    The disagg server, the ctx workers and the gen workers each write one record per
+    request, and so does an aggregated server, so any one role's records are the run's
+    census. A role writes several files when it has several instances, or when an instance
+    runs several frontend processes (``num_serve_frontends``): each process writes its own
+    file, which holds only its share of the requests. So the census sums each role's files.
+
+    Args:
+        line_counts: Complete lines per file basename.
+        leading_lines_to_skip: Lines per file basename to leave out of the count.
+        roles: ``_census_role`` per file basename; ``empty`` files are left out.
+    """
+    totals: Dict[str, int] = defaultdict(int)
+    for name, count in line_counts.items():
+        role = roles.get(name, "empty")
+        if role != "empty":
+            totals[role] += max(0, count - leading_lines_to_skip.get(name, 0))
+    return max(totals.values(), default=0)
+
+
 def wait_for_perf_metrics_files(
     output_dir: str,
     expected_requests: Optional[int] = None,
@@ -730,8 +799,10 @@ def wait_for_perf_metrics_files(
     poll_seconds: float = COMPLETION_POLL_SECONDS,
     sleep=time.sleep,
     monotonic=time.monotonic,
+    leading_lines_to_skip: Optional[Mapping[str, int]] = None,
+    wait_for_expected_requests: bool = False,
 ) -> Tuple[List[str], Dict[str, Any]]:
-    """Wait for the perf_metrics JSONLs to stop growing, then return them.
+    """Wait for the perf_metrics JSONLs to hold still (and optionally to reach a count).
 
     Positive completion gate for the aggregation. The harness has no completion signal for
     the context workers or the disaggregated server -- unlike the generation workers, whose
@@ -742,18 +813,33 @@ def wait_for_perf_metrics_files(
 
     Poll the discovered set's total byte size until it holds still for ``stable_seconds``
     (new files appearing counts as growth), bounded by ``timeout_seconds``. Then, if
-    ``expected_requests`` is known, compare it against the largest file's complete-line
-    count -- the disagg server and the aggregated server each write one record per request,
-    so that file is the run's census -- and report a shortfall.
+    ``expected_requests`` is known, compare it against the census -- the complete records
+    of the role that wrote the most, summed over that role's files (see ``_census``) --
+    and report a shortfall. Each file's ``leading_lines_to_skip`` entry is subtracted from
+    its count first, so earlier traffic cannot mask a shortfall. ``info["line_counts"]``
+    stays raw (before the subtraction).
+
+    With ``wait_for_expected_requests``, the files also need a census of at least
+    ``expected_requests`` before they count as settled, and an empty directory is polled
+    instead of returned at once. On timeout, ``info["stable"]`` is False and the caller
+    decides. The harness snapshots its warmup traffic (the connection warmup and the
+    warmup pass) in this mode, because the snapshot starts as soon as the last warmup
+    client exits. At that point the servers may not have written their last records, or
+    even created their files.
 
     ``sleep`` / ``monotonic`` are injected so the unit tests can drive this without wall
     time.
 
-    Returns ``(paths, info)``; ``info`` carries ``stable`` (bool), ``waited_seconds``,
-    ``total_bytes``, ``line_counts`` and ``warnings``.
+    Returns ``(paths, info)``; ``info`` carries ``stable`` (bool: the files held still for
+    ``stable_seconds`` and, with ``wait_for_expected_requests``, the census reached
+    ``expected_requests``), ``waited_seconds``, ``total_bytes``, ``line_counts`` and
+    ``warnings``.
     """
+    if wait_for_expected_requests and not expected_requests:
+        raise ValueError("wait_for_expected_requests needs a positive expected_requests")
     warnings: List[str] = []
     deadline = monotonic() + timeout_seconds
+    leading_lines_to_skip = leading_lines_to_skip or {}
 
     def snapshot() -> Tuple[List[str], Tuple[Tuple[str, Optional[int]], ...]]:
         paths = discover_perf_metrics_files(output_dir)
@@ -767,12 +853,32 @@ def wait_for_perf_metrics_files(
                 sizes.append((os.path.basename(path), None))
         return paths, tuple(sizes)
 
+    # A file's role never changes once it has a record, so each file is read once for it.
+    roles: Dict[str, str] = {}
+
+    def census(paths: List[str], line_counts: Mapping[str, int]) -> int:
+        for path in paths:
+            name = os.path.basename(path)
+            if roles.get(name, "empty") == "empty":
+                try:
+                    roles[name] = _census_role(path)
+                except OSError:
+                    roles[name] = "empty"
+        return _census(line_counts, leading_lines_to_skip, roles)
+
+    def holds_expected_requests(paths: List[str]) -> bool:
+        try:
+            line_counts = {os.path.basename(path): _count_lines(path) for path in paths}
+        except OSError:
+            return False
+        return census(paths, line_counts) >= expected_requests
+
     started = monotonic()
     paths, fingerprint = snapshot()
-    if not paths:
-        # Nothing was ever created, so there is nothing to wait for: the workers write
-        # their first record long before the client exits. The caller reports the empty
-        # discovery itself.
+    if not paths and not wait_for_expected_requests:
+        # Without a count to wait for, no file means nothing was ever written: the workers
+        # write their first record long before the client exits. The caller reports the
+        # empty discovery itself.
         return [], {
             "stable": True,
             "waited_seconds": 0.0,
@@ -785,14 +891,18 @@ def wait_for_perf_metrics_files(
     stable = False
     while True:
         now = monotonic()
-        if now - unchanged_since >= stable_seconds:
+        held_still = now - unchanged_since >= stable_seconds
+        if held_still and (not wait_for_expected_requests or holds_expected_requests(paths)):
             stable = True
             break
         if now >= deadline:
-            warnings.append(
-                f"perf_metrics files under {output_dir} were still growing after "
-                f"{timeout_seconds:.0f}s; aggregating what is on disk"
-            )
+            # If the files held still, only a short census kept this waiting; the census
+            # check below reports it when any file exists.
+            if not held_still:
+                warnings.append(
+                    f"perf_metrics files under {output_dir} were still growing after "
+                    f"{timeout_seconds:.0f}s; aggregating what is on disk"
+                )
             break
         sleep(min(poll_seconds, max(0.0, deadline - now)))
         paths, new_fingerprint = snapshot()
@@ -808,12 +918,12 @@ def wait_for_perf_metrics_files(
             warnings.append(f"{os.path.basename(path)}: could not count lines ({exc})")
 
     if expected_requests and line_counts:
-        census = max(line_counts.values())
-        if census < expected_requests:
+        num_recorded = census(paths, line_counts)
+        if num_recorded < expected_requests:
             warnings.append(
-                f"the largest perf_metrics file holds {census} complete record(s) but the "
-                f"client issued {expected_requests} request(s); the breakdown covers a "
-                "subset of the run"
+                f"the server role with the most perf_metrics records holds {num_recorded} "
+                f"complete record(s) but the client issued {expected_requests} request(s); "
+                "the breakdown covers a subset of the run"
             )
 
     info = {
@@ -870,6 +980,16 @@ def main() -> int:
         help="discard the client's un-measured warmup request (perf-sanity runs one for "
         "e2e and ctx_only); pass this to match what the harness uploads",
     )
+    parser.add_argument(
+        "--leading-lines-to-skip",
+        type=json.loads,
+        default=None,
+        metavar="JSON",
+        help="per-file leading lines to ignore, as a JSON object of basename -> count; for "
+        "a run with warmup traffic, pass the dict the harness logged after 'Time breakdown: "
+        "excluded warmup records from' (with --drop-warmup-request) to match what it "
+        "uploads",
+    )
     args = parser.parse_args()
 
     paths = list(args.input)
@@ -879,7 +999,10 @@ def main() -> int:
         parser.error("no input: pass --input and/or --output-dir")
 
     metrics, info = compute_time_breakdown_metrics(
-        paths, args.mode, drop_warmup_request=args.drop_warmup_request
+        paths,
+        args.mode,
+        drop_warmup_request=args.drop_warmup_request,
+        leading_lines_to_skip=args.leading_lines_to_skip,
     )
 
     if args.log_lines:

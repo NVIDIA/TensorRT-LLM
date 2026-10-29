@@ -23,8 +23,9 @@ import numpy as np
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
-from tensorrt_llm._torch.disaggregation.base import Cancelled, Chunk, Failed, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 

@@ -7,12 +7,15 @@ Reported capabilities describe what ``Generate`` accepts, not how the engine was
 built: a capability a client acts on and ``Generate`` then rejects turns
 discovery into a per-request failure.
 
-The LoRA lifecycle and KV-event RPCs return ``UNIMPLEMENTED`` -- the LLM API has
-no runtime adapter load/unload, and KV events are published out of band.
+The LoRA lifecycle RPCs return ``UNIMPLEMENTED``: the LLM API has no runtime
+adapter load/unload. KV-event discovery advertises the engine's streaming
+publisher, which is off unless ``kv_cache_config.kv_events_config`` enables it.
+Event delivery is direct ZMQ; ``SubscribeKvEvents`` remains unimplemented.
 """
 
 import asyncio
 import time
+import uuid
 from typing import Any, Optional
 
 import grpc
@@ -33,7 +36,10 @@ from .bindings import (
     server_pb2,
 )
 from .capabilities import supported_guides
+from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
 from .errors import AbortFailedError
+from .kv_events import data_parallel_size, events_config
+from .request_mapping import conversation_affinity_enabled
 
 __all__ = ["OpenEngineControlServicer"]
 
@@ -51,6 +57,8 @@ _MODE_BY_GUIDE_FIELD = {
 }
 
 _INFERENCE_PROBE_TIMEOUT_SECONDS = 30.0
+_LOAD_SNAPSHOT_CACHE_SECONDS = 0.1
+_MAX_ACTIVE_LOAD_AGE_SECONDS = 30.0
 
 
 def _abort_quietly(handle: Any, reason: str) -> None:
@@ -93,12 +101,41 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         model: str,
         inference: Any,
         kv_transfer_backend: str = "",
+        frontend: FrontendClient | None = None,
+        instance_id: str | None = None,
     ) -> None:
+        self._frontend = frontend
+        self._instance_id = (
+            instance_id if instance_id is not None else str(getattr(llm, "llm_id", "") or "")
+        )
         self._llm = llm
         self._model = model
         self._inference = inference
         self._kv_transfer_backend = kv_transfer_backend
         self._probe: Optional[asyncio.Future] = None
+        self._load_snapshot: dict = {}
+        self._load_snapshot_deadline = 0.0
+        self._load_snapshot_lock = asyncio.Lock()
+        self._load_reporting_enabled = bool(getattr(llm.args, "_enable_routing_load", False))
+        self._capacity_reporting_enabled = (
+            self._load_reporting_enabled or events_config(llm) is not None
+        )
+
+    async def _get_kv_cache_load(self) -> dict:
+        """Coalesce concurrent control-plane polls into one engine query."""
+        if not self._capacity_reporting_enabled:
+            return {}
+        now = time.monotonic()
+        if now < self._load_snapshot_deadline:
+            return self._load_snapshot
+        async with self._load_snapshot_lock:
+            now = time.monotonic()
+            if now >= self._load_snapshot_deadline:
+                executor = getattr(self._llm, "_executor", None)
+                getter = getattr(executor, "get_kv_cache_load", None)
+                self._load_snapshot = await asyncio.to_thread(getter) if callable(getter) else {}
+                self._load_snapshot_deadline = time.monotonic() + _LOAD_SNAPSHOT_CACHE_SECONDS
+        return self._load_snapshot
 
     def _engine_is_healthy(self) -> bool:
         """Readiness via the predicate the engine's own HTTP /health uses.
@@ -110,14 +147,13 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         """
         check = getattr(self._llm, "_check_health", None)
         if callable(check):
-            # Only the engine's own failure modes mean "not ready". A TypeError
-            # or AttributeError here is _check_health's contract drifting, and
-            # reporting that as an unhealthy engine is the worst answer a health
-            # endpoint can give: it looks like the thing it is meant to detect.
             try:
                 return bool(check())
             except (RuntimeError, ValueError, OSError) as error:
                 logger.warning(f"OpenEngine health check reported a failure: {error}")
+                return False
+            except (TypeError, AttributeError) as error:
+                logger.error(f"OpenEngine health check contract failed: {error}")
                 return False
         executor = getattr(self._llm, "_executor", None)
         return executor is not None and not executor.is_shutdown()
@@ -134,7 +170,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             engine_version=str(trtllm_version),
             # The same build serves either phase; the role is per request.
             engine_role=server_pb2.ENGINE_ROLE_UNSPECIFIED,
-            instance_id=str(getattr(self._llm, "llm_id", "") or ""),
+            instance_id=self._instance_id,
             supported_models=[self._model],
             schema_revision=SCHEMA_REVISION,
             minimum_client_revision=MINIMUM_CLIENT_REVISION,
@@ -147,6 +183,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             ("tensor_parallel_size", args.tensor_parallel_size),
             ("pipeline_parallel_size", args.pipeline_parallel_size),
             ("decode_context_parallel_size", args.context_parallel_size),
+            # One KV event publisher binds per attention-DP rank, so a client
+            # subscribing to GetKvEventSources needs this to tell a complete set
+            # of sources from a partial one.
+            ("data_parallel_size", data_parallel_size(self._llm)),
         ):
             size = _positive_int(value)
             if size is not None:
@@ -182,7 +222,57 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         block_size = _positive_int(self._llm.args.kv_cache_config.tokens_per_block)
         if block_size is not None:
             capacity.kv_block_size = block_size
+        executor = getattr(self._llm, "_executor", None)
+        capacity_getter = getattr(executor, "get_kv_cache_capacity", None)
+        if callable(capacity_getter):
+            kv_capacity = await asyncio.to_thread(capacity_getter)
+            local_blocks = _positive_int(kv_capacity.get("maxNumBlocks"))
+            if local_blocks is not None and data_parallel_size(self._llm) == 1:
+                capacity.total_kv_blocks = local_blocks
+        discovery_getter = getattr(executor, "get_openengine_discovery", None)
+        discovery = await asyncio.to_thread(discovery_getter) if callable(discovery_getter) else {}
+        events = events_config(self._llm)
+        discovery_required = (
+            getattr(self._llm.args, "_openengine_discovery", None) is not None
+            and events is not None
+            and events.enable_kv_cache_events
+            and events.publisher == "zmq"
+        )
+        node = discovery.get("node") if isinstance(discovery, dict) else None
+        if discovery_required and (
+            not isinstance(node, dict)
+            or not node.get("engine_id")
+            or not isinstance(node.get("source_owners"), dict)
+        ):
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE, "OpenEngine node discovery is unavailable"
+            )
+        if node is not None:
+            info.extra.update({"trtllm_node": node})
         info.capacity.CopyFrom(capacity)
+
+        # A rank hint places the first turn; conversation affinity preserves
+        # that binding on later turns, even if their hints differ.
+        info.extra.update({"trtllm_supports_dp_rank_targeting": True})
+        info.extra.update(
+            {
+                "trtllm_supports_subagent_affinity": bool(
+                    getattr(self._inference, "subagent_affinity_auth_key", None)
+                    and conversation_affinity_enabled(self._llm)
+                )
+            }
+        )
+        if events_config(self._llm) is not None:
+            info.extra.update({"trtllm_kv_event_hash_algo": "v2_sha256_64"})
+        if self._capacity_reporting_enabled:
+            snapshot = await self._get_kv_cache_load()
+            if snapshot.get("ranks"):
+                info.capacity.total_kv_blocks = snapshot["totalKvBlocks"]
+            elif data_parallel_size(self._llm) > 1:
+                await context.abort(
+                    grpc.StatusCode.UNAVAILABLE,
+                    "Per-rank KV capacity is unavailable",
+                )
 
         return info
 
@@ -193,6 +283,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     ) -> model_pb2.ModelInfo:
         # Single-model server: like Generate, any non-empty name resolves to the
         # loaded model.
+        media_modalities = self._inference.supported_media_modalities
         info = model_pb2.ModelInfo(
             model_id=self._model,
             served_model_name=self._model,
@@ -201,9 +292,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             supports_token_ids_input=True,
             # Generate rejects `lora_name` even on an enable_lora build.
             supports_lora=False,
-            supports_multimodal=False,
+            supports_multimodal=bool(media_modalities),
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
+        info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
 
         max_seq_len = _positive_int(self._llm.args.max_seq_len)
         if max_seq_len is not None:
@@ -253,14 +345,57 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         request: server_pb2.GetLoadRequest,
         context: grpc.aio.ServicerContext,
     ) -> server_pb2.LoadInfo:
-        load = server_pb2.LoadInfo(
-            instance_id=str(getattr(self._llm, "llm_id", "") or ""),
-            timestamp_unix_nanos=time.time_ns(),
-        )
-        # Scheduler internals are only available through the streaming stats
-        # iterator, which a point query cannot sample without blocking, so they
-        # stay unset.
-        load.running_requests = self._inference.active_request_count()
+        snapshot = await self._get_kv_cache_load() if self._load_reporting_enabled else {}
+        if self._load_reporting_enabled and not snapshot.get("ranks"):
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "KV occupancy is enabled but no load snapshot is available",
+            )
+        if self._frontend is None:
+            running_requests = self._inference.active_request_count()
+        else:
+            try:
+                status = await self._frontend.request("status")
+            except CoordinationError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            running_requests = status["count"]
+        sample_time = snapshot.get("timestampUnixNanos", 0)
+        if (
+            self._load_reporting_enabled
+            and running_requests
+            and (
+                not sample_time
+                or time.time_ns() - sample_time > _MAX_ACTIVE_LOAD_AGE_SECONDS * 1_000_000_000
+            )
+        ):
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "KV occupancy sample is stale while requests are active",
+            )
+        load = server_pb2.LoadInfo(instance_id=self._instance_id)
+        load.timestamp_unix_nanos = time.time_ns()
+        load.running_requests = running_requests
+        used_blocks = snapshot.get("usedKvBlocks")
+        total_blocks = snapshot.get("totalKvBlocks")
+        if isinstance(used_blocks, int) and used_blocks >= 0:
+            load.used_kv_blocks = used_blocks
+        if isinstance(total_blocks, int) and total_blocks > 0:
+            load.total_kv_blocks = total_blocks
+        if request.include_per_rank:
+            for rank in snapshot.get("ranks", []):
+                rank_load = load.ranks.add()
+                rank_load.data_parallel_rank = int(rank["rank"])
+                rank_used = rank.get("usedKvBlocks")
+                rank_total = rank.get("totalKvBlocks")
+                rank_running = rank.get("runningRequests")
+                if data_parallel_size(self._llm) == 1:
+                    rank_running = load.running_requests
+                if isinstance(rank_used, int) and rank_used >= 0:
+                    rank_load.used_kv_blocks = rank_used
+                if isinstance(rank_total, int) and rank_total > 0:
+                    rank_load.total_kv_blocks = rank_total
+                if isinstance(rank_running, int) and rank_running >= 0:
+                    rank_load.running_requests = rank_running
         return load
 
     # -- Health and lifecycle ----------------------------------------------
@@ -279,6 +414,12 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         ]
 
         model_ready = self._engine_is_healthy()
+        if self._frontend is not None:
+            try:
+                status = await self._frontend.request("status")
+                model_ready = model_ready and status["ready"] and not status["stopping"]
+            except CoordinationError:
+                model_ready = False
         checks.append(
             lifecycle_pb2.HealthCheck(
                 name="model",
@@ -300,8 +441,11 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 )
             )
 
-        if request.include_inference_probe:
-            checks.append(await self._inference_probe(request.model or self._model))
+        if request.include_inference_probe and (self._frontend is None or model_ready):
+            try:
+                checks.append(await self._inference_probe(request.model or self._model))
+            except CoordinationError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
 
         state = lifecycle_pb2.HEALTH_STATE_READY
         for check in checks:
@@ -333,16 +477,23 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         from tensorrt_llm.sampling_params import SamplingParams
 
         handle = None
+        reservation = None
         # Counted by GetLoad and reachable by Abort(all_requests): a probe
         # occupies a scheduler slot like any other request, and a router sizing
         # itself on running_requests must see it.
-        probe_id = f"__openengine_health_probe__{time.time_ns()}"
+        probe_id = f"__openengine_health_probe__{uuid.uuid4().hex}"
         try:
+            if self._frontend is not None:
+                reservation = await self._frontend.reserve(probe_id)
+                if reservation.aborted:
+                    raise RuntimeError("Health probe aborted before submission")
             handle = self._llm.generate_async(
                 [1],
                 sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
                 streaming=False,
             )
+            if reservation is not None:
+                reservation.bind(handle)
             self._inference.track_request(probe_id, handle)
             await asyncio.wait_for(handle.aresult(), timeout=_INFERENCE_PROBE_TIMEOUT_SECONDS)
             return lifecycle_pb2.HealthCheck(
@@ -371,6 +522,8 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             )
         finally:
             self._inference.untrack_request(probe_id, handle)
+            if reservation is not None:
+                await asyncio.shield(reservation.release())
 
     async def Abort(
         self,
@@ -378,6 +531,31 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         context: grpc.aio.ServicerContext,
     ) -> lifecycle_pb2.AbortResponse:
         target = request.WhichOneof("target")
+
+        if self._frontend is not None and target in ("request_id", "all_requests"):
+            fields = {"request_id": request.request_id} if target == "request_id" else {}
+            try:
+                outcome = await self._frontend.request("abort", **fields)
+            except InvalidRequestIdError as error:
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+            except CoordinationError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            if outcome["failed"]:
+                await context.abort(
+                    grpc.StatusCode.INTERNAL, f"{outcome['failed']} request(s) could not be aborted"
+                )
+            return lifecycle_pb2.AbortResponse(
+                status=(
+                    lifecycle_pb2.ABORT_STATUS_ABORTED
+                    if outcome["aborted"]
+                    else lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED
+                ),
+                message=(
+                    request.request_id
+                    if target == "request_id"
+                    else f"aborted {outcome['aborted']} request(s)"
+                ),
+            )
 
         if target == "request_id":
             # AbortStatus has no failure value, and reporting ALREADY_FINISHED
@@ -458,15 +636,60 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             "runtime LoRA enumeration is not supported",
         )
 
+    async def _requested_sources(
+        self,
+        ranks: Any,
+        context: grpc.aio.ServicerContext,
+    ) -> list[kv_pb2.KvEventSource]:
+        """Return live publisher descriptors for `ranks`, or all ranks when empty.
+
+        Returns an empty list when KV events are disabled: the RPC is
+        implemented, there is simply nothing to publish, and a client can tell
+        that from "not supported" by the absence of an UNIMPLEMENTED status.
+        """
+        if events_config(self._llm) is None:
+            return []
+        executor = getattr(self._llm, "_executor", None)
+        getter = getattr(executor, "get_openengine_discovery", None)
+        discovery = await asyncio.to_thread(getter) if callable(getter) else {}
+        descriptors = discovery.get("sources")
+        if descriptors is None:
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "KV event publisher discovery is unavailable",
+            )
+        sources = [kv_pb2.KvEventSource(**source) for source in descriptors]
+        expected_ranks = set(range(data_parallel_size(self._llm)))
+        if {source.data_parallel_rank for source in sources} != expected_ranks or len(
+            sources
+        ) != len(expected_ranks):
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "KV event publisher discovery is incomplete",
+            )
+        if not ranks:
+            return sources
+        by_rank = {source.data_parallel_rank: source for source in sources}
+        unknown = sorted(set(ranks) - by_rank.keys())
+        if unknown:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"no KV event source for data-parallel rank(s) {unknown}; this engine "
+                f"publishes ranks 0..{len(sources) - 1}",
+            )
+        # Deduplicated and ordered by rank: a client repeating a rank must not
+        # get two subscriptions to the same socket.
+        return [by_rank[rank] for rank in sorted(set(ranks))]
+
     async def GetKvEventSources(
         self,
         request: kv_pb2.GetKvEventSourcesRequest,
         context: grpc.aio.ServicerContext,
     ) -> kv_pb2.GetKvEventSourcesResponse:
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "KV cache events are not published over the OpenEngine Control service",
-        )
+        sources = await self._requested_sources(request.data_parallel_ranks, context)
+        if not sources:
+            return kv_pb2.GetKvEventSourcesResponse()
+        return kv_pb2.GetKvEventSourcesResponse(sources=sources)
 
     async def SubscribeKvEvents(
         self,
@@ -475,5 +698,5 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     ):
         await context.abort(
             grpc.StatusCode.UNIMPLEMENTED,
-            "KV cache events are not published over the OpenEngine Control service",
+            "SubscribeKvEvents is not implemented; use GetKvEventSources and subscribe directly over ZMQ",
         )
