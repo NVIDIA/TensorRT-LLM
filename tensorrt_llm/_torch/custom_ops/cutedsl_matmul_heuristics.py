@@ -135,8 +135,26 @@ def cta_order_to_raster(cta_order: int) -> str:
 
 @lru_cache(maxsize=1)
 def _pairs_only_cluster_m_2() -> bool:
-    """0.1.0.x PyPI releases model 2-CTA MMA for cluster M == 2 only."""
-    match = re.fullmatch(r"0\.1\.0\.(\d+)", library_version())
+    """0.1.0.x PyPI releases model 2-CTA MMA for cluster M == 2 only.
+
+    An installation without version metadata is a 0.1.0.x release if its
+    interface lacks the per-backend silicon-metric API newer builds add.
+    """
+    version = library_version()
+    if version == "unknown":
+        interface = _interface_class()
+        old = not (
+            hasattr(interface, "estimateSiliconMetricEx")
+            and hasattr(interface, "setBackendPropertyValue")
+        )
+        logger.warning_once(
+            "nvMatmulHeuristics reports no version; assuming "
+            f"{'a 0.1.0.x release' if old else 'a libheuristics build'} "
+            "from its API.",
+            key="nvmmh_unknown_version",
+        )
+        return old
+    match = re.fullmatch(r"0\.1\.0\.(\d+)", version)
     return match is not None and int(match.group(1)) < 10000
 
 
