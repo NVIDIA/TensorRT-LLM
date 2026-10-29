@@ -38,7 +38,7 @@ import torch
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.utils import ceil_div, pad_up, unswizzle_sf
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, ceil_div, pad_up, unswizzle_sf
 
 
 def fused_add_rmsnorm_fp4_quantize_available():
@@ -417,6 +417,126 @@ def test_fused_rmsnorm_fp4_quantize_contiguous_matches_strided(dtype):
     )
 
     torch.testing.assert_close(fp4_packed, fp4_strided, rtol=0, atol=0)
+
+
+# Gemma RMSNorm module through the fused NVFP4 path.
+def _make_gemma_rmsnorm(n: int, weight: torch.Tensor, quantize: bool):
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    norm = RMSNorm(
+        hidden_size=n,
+        eps=1e-6,
+        dtype=weight.dtype,
+        device=weight.device,
+        use_gemma=True,
+        quantize_type="nvfp4" if quantize else None,
+    )
+    norm.weight.data.copy_(weight)
+    return norm
+
+
+@skip_unless_add_rmsnorm
+@pytest.mark.parametrize("m", [1, 64, 4096])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gemma_rmsnorm_module_fused_nvfp4(m, dtype):
+    """Fused gemma add+RMSNorm+quant matches gemma add+RMSNorm then fp4_quantize."""
+    torch.manual_seed(0)
+    n = 2560
+    hidden = torch.randn(m, n, dtype=dtype, device="cuda")
+    residual = torch.randn(m, n, dtype=dtype, device="cuda")
+    weight = torch.randn(n, dtype=dtype, device="cuda") * 0.1
+
+    ref_norm = _make_gemma_rmsnorm(n, weight, quantize=False)
+    normed_ref, residual_ref = ref_norm(hidden.clone(), residual.clone())
+    sf_scale = make_sf_scale(normed_ref)
+    fp4_ref, sf_ref = fp4_quantize_ref(normed_ref, sf_scale)
+
+    norm = _make_gemma_rmsnorm(n, weight, quantize=True)
+    norm._fused_norm_weight = (weight.float() + 1.0).to(dtype)
+    norm.nvfp4_scale = sf_scale
+    out, residual_out = norm(hidden.clone(), residual.clone())
+
+    ctx = f"gemma m={m} n={n} {dtype}"
+    assert isinstance(out, Fp4QuantizedTensor), ctx
+    assert_fp4_match(out.fp4_tensor.view(torch.uint8), fp4_ref.view(torch.uint8), ctx)
+    assert_sf_match(out.scaling_factor, sf_ref, m, n, ctx)
+    torch.testing.assert_close(residual_out, residual_ref, rtol=2e-2, atol=2e-2)
+
+
+@skip_unless_add_rmsnorm
+def test_gemma_rmsnorm_module_without_cached_weight_is_unfused():
+    """A gemma norm without the cached (1 + weight) stays unfused."""
+    n = 2560
+    weight = torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.1
+    hidden = torch.randn(4, n, dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn(4, n, dtype=torch.bfloat16, device="cuda")
+
+    norm = _make_gemma_rmsnorm(n, weight, quantize=True)
+    norm.nvfp4_scale = torch.tensor([1.0], device="cuda")
+    out, _ = norm(hidden, residual)
+
+    assert not isinstance(out, Fp4QuantizedTensor)
+    assert out.dtype == torch.bfloat16
+
+
+@skip_unless_add_rmsnorm
+@pytest.mark.parametrize("eligible", [True, False])
+def test_qwen3_next_dense_cache_derived_state_folds_gate_up_quant(eligible):
+    """cache_derived_state attaches a static NVFP4 gate_up_proj input_scale to
+    post_attention_layernorm only when the projection is eligible."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from tensorrt_llm._torch.models.modeling_qwen3_next import (
+        Qwen3NextForCausalLM,
+        _DenseMlpAdapter,
+    )
+
+    torch.manual_seed(0)
+    m, n = 64, 2560
+    hidden = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    ref_norm = _make_gemma_rmsnorm(n, weight, quantize=False)
+    normed_ref, residual_ref = ref_norm(hidden.clone(), residual.clone())
+    sf_scale = make_sf_scale(normed_ref)
+
+    gate_up_proj = SimpleNamespace(
+        has_nvfp4_activation_quantization=True,
+        force_dynamic_quantization=not eligible,
+        input_scale=sf_scale,
+        pre_quant_scale=None,
+        requires_unquantized_activation=False,
+    )
+    layer = nn.Module()
+    layer.post_attention_layernorm = _make_gemma_rmsnorm(n, weight, quantize=True)
+    layer.mlp = _DenseMlpAdapter(
+        SimpleNamespace(gate_up_proj=gate_up_proj), SimpleNamespace(enable_attention_dp=False)
+    )
+    model = Qwen3NextForCausalLM.__new__(Qwen3NextForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([layer])
+    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(num_hidden_layers=1))
+
+    model.cache_derived_state()
+
+    norm = layer.post_attention_layernorm
+    out, residual_out = norm(hidden.clone(), residual.clone())
+    torch.testing.assert_close(residual_out, residual_ref, rtol=2e-2, atol=2e-2)
+    if eligible:
+        assert norm.nvfp4_scale is sf_scale
+        assert isinstance(out, Fp4QuantizedTensor)
+        fp4_ref, sf_ref = fp4_quantize_ref(normed_ref, sf_scale)
+        ctx = f"qwen3_next dense m={m} n={n}"
+        assert_fp4_match(out.fp4_tensor.view(torch.uint8), fp4_ref.view(torch.uint8), ctx)
+        assert_sf_match(out.scaling_factor, sf_ref, m, n, ctx)
+    else:
+        assert norm.nvfp4_scale is None
+        assert not isinstance(out, Fp4QuantizedTensor)
+        torch.testing.assert_close(out, normed_ref, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------
