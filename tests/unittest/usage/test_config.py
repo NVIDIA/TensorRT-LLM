@@ -41,6 +41,7 @@ class TestTelemetryConfigLocation:
             "CLI_BENCH",
             "CLI_EVAL",
             "DISAGGREGATED",
+            "VISUAL_GEN_CLASS",
         }
         actual = {e.name for e in config.UsageContext}
         assert expected == actual

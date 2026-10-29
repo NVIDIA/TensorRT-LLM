@@ -104,6 +104,8 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     ],
     doc="Wan 2.1 & 2.2 image-to-video family.",
     supports_nvfp4_vae=True,
+    modality="video",
+    telemetry_safe=True,
 )
 class WanImageToVideoPipeline(BasePipeline):
     def __init__(self, pipeline_config):

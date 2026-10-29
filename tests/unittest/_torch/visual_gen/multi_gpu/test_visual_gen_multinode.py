@@ -37,6 +37,9 @@ class TestDetectExternalLaunch:
             "SLURM_PROCID",
             "SLURM_NTASKS",
             "SLURM_LOCALID",
+            "SLURM_NNODES",
+            "GROUP_WORLD_SIZE",
+            "LOCAL_WORLD_SIZE",
         ]:
             monkeypatch.delenv(var, raising=False)
 
@@ -55,19 +58,22 @@ class TestDetectExternalLaunch:
         monkeypatch.setenv("MASTER_ADDR", "node0")
         monkeypatch.setenv("MASTER_PORT", "29500")
 
-        rank, local_rank, world_size, master_addr, master_port = _detect_external_launch()
+        rank, local_rank, world_size, master_addr, master_port, mode, nodes = (
+            _detect_external_launch()
+        )
         assert rank == 2
         assert local_rank == 2
         assert world_size == 8
         assert master_addr == "node0"
         assert master_port == 29500
+        assert (mode, nodes) == ("torchrun", 0)
 
     def test_torchrun_default_local_rank_and_port(self, monkeypatch):
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "4")
         monkeypatch.setenv("MASTER_ADDR", "node0")
 
-        rank, local_rank, world_size, master_addr, master_port = _detect_external_launch()
+        rank, local_rank, world_size, master_addr, master_port, _, _ = _detect_external_launch()
         assert local_rank == 0  # defaults to RANK when LOCAL_RANK absent
         assert master_port == 29500  # defaults to 29500 when MASTER_PORT absent
 
@@ -84,11 +90,14 @@ class TestDetectExternalLaunch:
         monkeypatch.setenv("MASTER_ADDR", "node0")
         monkeypatch.setenv("MASTER_PORT", "29500")
 
-        rank, local_rank, world_size, master_addr, master_port = _detect_external_launch()
+        rank, local_rank, world_size, master_addr, master_port, mode, nodes = (
+            _detect_external_launch()
+        )
         assert rank == 1
         assert local_rank == 1
         assert world_size == 4
         assert master_addr == "node0"
+        assert (mode, nodes) == ("slurm", 0)
 
     def test_slurm_single_task_returns_none(self, monkeypatch):
         monkeypatch.setenv("SLURM_PROCID", "0")
@@ -100,6 +109,61 @@ class TestDetectExternalLaunch:
         monkeypatch.setenv("SLURM_NTASKS", "4")
         with pytest.raises(RuntimeError, match="MASTER_ADDR must be set"):
             _detect_external_launch()
+
+    @pytest.mark.parametrize("launcher", ["torchrun", "slurm"])
+    @pytest.mark.parametrize(
+        ("node_count", "local_world_size", "expected"),
+        [
+            ("2", "invalid", 2),
+            (None, "4", 2),
+            ("invalid", "3", 3),
+            ("0", "4", 2),
+            ("-1", "4", 2),
+            (None, None, 0),
+            ("invalid", "invalid", 0),
+            ("0", "0", 0),
+            ("-1", "-4", 0),
+        ],
+    )
+    def test_node_count_is_best_effort(
+        self, monkeypatch, launcher, node_count, local_world_size, expected
+    ):
+        rank_env, world_env, nodes_env = (
+            ("RANK", "WORLD_SIZE", "GROUP_WORLD_SIZE")
+            if launcher == "torchrun"
+            else ("SLURM_PROCID", "SLURM_NTASKS", "SLURM_NNODES")
+        )
+        monkeypatch.setenv(rank_env, "0")
+        monkeypatch.setenv(world_env, "8")
+        monkeypatch.setenv("MASTER_ADDR", "node0")
+        if node_count is not None:
+            monkeypatch.setenv(nodes_env, node_count)
+        if local_world_size is not None:
+            monkeypatch.setenv("LOCAL_WORLD_SIZE", local_world_size)
+
+        assert _detect_external_launch() == (0, 0, 8, "node0", 29500, launcher, expected)
+
+    @pytest.mark.parametrize("torchrun_world_size", ["1", "8"])
+    def test_mixed_environment_preserves_detection_precedence(
+        self, monkeypatch, torchrun_world_size
+    ):
+        for name, value in {
+            "RANK": "0",
+            "WORLD_SIZE": torchrun_world_size,
+            "GROUP_WORLD_SIZE": "2",
+            "SLURM_PROCID": "1",
+            "SLURM_NTASKS": "4",
+            "SLURM_NNODES": "4",
+            "MASTER_ADDR": "node0",
+        }.items():
+            monkeypatch.setenv(name, value)
+
+        expected = (
+            (0, 0, 8, "node0", 29500, "torchrun", 2)
+            if torchrun_world_size == "8"
+            else (1, 1, 4, "node0", 29500, "slurm", 4)
+        )
+        assert _detect_external_launch() == expected
 
 
 # =============================================================================

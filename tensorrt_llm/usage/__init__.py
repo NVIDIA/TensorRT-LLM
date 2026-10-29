@@ -22,7 +22,7 @@ Opt-out:
   - Set environment variable TELEMETRY_DISABLED=true or TELEMETRY_DISABLED=1
   - Set environment variable DO_NOT_TRACK=1
   - Create file ~/.config/trtllm/do_not_track
-  - Pass TelemetryConfig(disabled=True) to LLM() or --no-telemetry via CLI
+  - Pass TelemetryConfig(disabled=True) to LLM()/VisualGen() or --no-telemetry via CLI
   - Automatically disabled in CI/test environments (override with TRTLLM_USAGE_FORCE_ENABLED=1)
 """
 
@@ -40,6 +40,10 @@ record_llm_initialization_attempt = _usage_lib.record_llm_initialization_attempt
 record_llm_initialization_failure = _usage_lib.record_llm_initialization_failure
 record_llm_initialized = _usage_lib.record_llm_initialized
 record_llm_shutdown = _usage_lib.record_llm_shutdown
+record_visual_gen_initialization_attempt = _usage_lib.record_visual_gen_initialization_attempt
+record_visual_gen_initialization_failure = _usage_lib.record_visual_gen_initialization_failure
+record_visual_gen_initialized = _usage_lib.record_visual_gen_initialized
+record_visual_gen_shutdown = _usage_lib.record_visual_gen_shutdown
 record_observed_signal = _usage_lib.record_observed_signal
 record_termination_observation = _usage_lib.record_termination_observation
 set_lifecycle_phase = _usage_lib.set_lifecycle_phase
@@ -59,6 +63,10 @@ __all__ = [
     "record_llm_initialization_failure",
     "record_llm_initialized",
     "record_llm_shutdown",
+    "record_visual_gen_initialization_attempt",
+    "record_visual_gen_initialization_failure",
+    "record_visual_gen_initialized",
+    "record_visual_gen_shutdown",
     "record_observed_signal",
     "record_termination_observation",
     "report_exit",

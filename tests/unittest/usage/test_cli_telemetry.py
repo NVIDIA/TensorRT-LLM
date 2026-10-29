@@ -164,7 +164,7 @@ def _captured_terminal_parameters(payloads):
     """Return the parameters from one fully serialized terminal event."""
     assert len(payloads) == 1
     payload = payloads[0]
-    assert payload["eventSchemaVer"] == "0.7"
+    assert payload["eventSchemaVer"] == "0.8"
     assert len(payload["events"]) == 1
     event = payload["events"][0]
     assert event["name"] == "trtllm_exit_report"
@@ -225,6 +225,97 @@ class TestTelemetryGroup:
             )
 
         apply_config.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            (["--set", "dtype=auto"], "--set configures LlmArgs"),
+            (["--grpc"], "--grpc is not supported"),
+            (["--report_addr", "unused.json"], "--report_addr is only supported"),
+            (["--enable_sleep_mode"], "requires TRTLLM_RUNTIME_CONTROL_API_KEY"),
+            (["--enable_sleep_mode", "--grpc"], "only supported by the HTTP server"),
+            (
+                ["--enable_sleep_mode", "--backend", "_autodeploy"],
+                "only supported by the PyTorch backend",
+            ),
+            (["--openengine-enable-load-metrics"], "requires --grpc --grpc-protocol openengine"),
+        ],
+    )
+    @pytest.mark.parametrize("explicit_enable", [False, True])
+    def test_visual_gen_serve_yaml_opt_out_precedes_option_validation(
+        self, tmp_path, captured_exit_payloads, monkeypatch, options, message, explicit_enable
+    ):
+        from click.testing import CliRunner
+
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        monkeypatch.delenv("TRTLLM_RUNTIME_CONTROL_API_KEY", raising=False)
+        config_path = tmp_path / "visual_gen.yaml"
+        config_path.write_text("telemetry_config:\n  disabled: true\n", encoding="utf-8")
+        result = CliRunner().invoke(
+            serve_main,
+            ["test-model", "--visual_gen_args", str(config_path), *options]
+            + (["--telemetry"] if explicit_enable else []),
+        )
+        assert result.exit_code == 2
+        assert message in result.output
+        if explicit_enable:
+            assert _captured_terminal_parameters(captured_exit_payloads)["exitCode"] == 2
+        else:
+            assert captured_exit_payloads == []
+
+    def test_visual_gen_bench_yaml_opt_out_precedes_prompt_validation(
+        self,
+        tmp_path,
+        captured_exit_payloads,
+    ):
+        """A valid YAML opt-out is honored before benchmark argument errors."""
+        from click.testing import CliRunner
+
+        from tensorrt_llm.commands.bench import main as bench_main
+
+        config_path = tmp_path / "visual_gen.yaml"
+        config_path.write_text(
+            "telemetry_config:\n  disabled: true\n",
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            bench_main,
+            [
+                "--model",
+                "test-model",
+                "visual-gen",
+                "--visual_gen_args",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code == 2
+        assert "Either --prompt or --prompt_file must be specified." in result.output
+        assert captured_exit_payloads == []
+
+    def test_visual_gen_bench_attributes_invalid_yaml_to_visual_gen(
+        self,
+        tmp_path,
+        captured_exit_payloads,
+    ):
+        from click.testing import CliRunner
+
+        from tensorrt_llm.commands.bench import main as bench_main
+
+        config_path = tmp_path / "visual_gen.yaml"
+        config_path.write_text("invalid: [", encoding="utf-8")
+
+        result = CliRunner().invoke(
+            bench_main,
+            ["--model", "test-model", "visual-gen", "--visual_gen_args", str(config_path)],
+        )
+
+        assert result.exit_code != 0
+        parameters = _captured_terminal_parameters(captured_exit_payloads)
+        assert parameters["component"] == "visual_gen"
+        assert parameters["ingressPoint"] == "cli_bench"
 
     @pytest.mark.parametrize(
         ("yaml_config", "telemetry", "expected_disabled"),

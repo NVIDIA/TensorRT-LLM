@@ -723,6 +723,7 @@ class TestPipelineMetadataBridging:
                 "status": "READY",
                 "default_generation_params": pipeline_cls.default_generation_params.fget(mock_self),
                 "extra_param_specs": pipeline_cls.extra_param_specs.fget(mock_self),
+                "telemetry_metadata": {"modality": "video"},
             },
         )
 
@@ -731,6 +732,70 @@ class TestPipelineMetadataBridging:
         import pickle
 
         return pickle.loads(pickle.dumps(response))
+
+    @pytest.mark.parametrize("telemetry_safe", [False, True])
+    def test_pipeline_preserves_registry_name_after_variant_resolution(
+        self, monkeypatch, telemetry_safe
+    ):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen.executor import _visual_gen_telemetry_metadata
+        from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+        from tensorrt_llm._torch.visual_gen.pipeline_registry import (
+            PIPELINE_REGISTRY,
+            AutoPipeline,
+            _PipelineEntry,
+        )
+
+        for method in (
+            "_init_transformer",
+            "_install_nccl_window_tensor_scope_hooks",
+            "_setup_cuda_graphs",
+        ):
+            monkeypatch.setattr(BasePipeline, method, lambda self: None)
+        monkeypatch.delenv("TLLM_PROFILE_VISUAL_GEN_START_STOP", raising=False)
+
+        class _VariantPipeline(BasePipeline):
+            pass
+
+        class _OriginalPipeline(BasePipeline):
+            @classmethod
+            def resolve_variant(cls, _config):
+                return _VariantPipeline
+
+        for name, cls in (
+            ("OriginalPipeline", _OriginalPipeline),
+            ("VariantPipeline", _VariantPipeline),
+        ):
+            monkeypatch.setitem(
+                PIPELINE_REGISTRY,
+                name,
+                _PipelineEntry(pipeline_cls=cls, telemetry_safe=telemetry_safe),
+            )
+        monkeypatch.setattr(
+            AutoPipeline,
+            "_detect_from_checkpoint",
+            lambda _checkpoint_dir: "OriginalPipeline",
+        )
+
+        config = SimpleNamespace(
+            primary_pretrained_config=SimpleNamespace(),
+            model_configs={},
+            vae_conv_quant_config=None,
+            mapping=SimpleNamespace(),
+            device="cpu",
+        )
+        assert BasePipeline(config).pipeline_class_name == "other"
+        pipeline = AutoPipeline.from_config(config, "/model")
+        assert isinstance(pipeline, _VariantPipeline)
+        assert pipeline.pipeline_class_name == "OriginalPipeline"
+        metadata = _visual_gen_telemetry_metadata(pipeline, SimpleNamespace(model="private"))
+        assert metadata["pipeline_class_name"] == (
+            "OriginalPipeline" if telemetry_safe else "other"
+        )
+        assert metadata["resolved_pipeline_class"] == (
+            "_VariantPipeline" if telemetry_safe else "other"
+        )
 
     def test_ready_payload_pickle_roundtrip(self):
         """The READY dict survives pickle (the ZMQ transport layer)."""
@@ -805,7 +870,10 @@ class TestPipelineMetadataBridging:
         assert restored.output["default_generation_params"]["height"] == 1024
 
     def test_client_extracts_metadata_from_ready(self):
-        """DiffusionRemoteClient stores metadata when processing a READY response."""
+        """The real READY wait path stores pipeline and telemetry metadata."""
+        import asyncio
+        from types import SimpleNamespace
+
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
         from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
         from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient
@@ -816,20 +884,112 @@ class TestPipelineMetadataBridging:
         ltx2_defaults = LTX2Pipeline.default_generation_params.fget(None)
         ltx2_specs = LTX2Pipeline.extra_param_specs.fget(None)
 
-        # Simulate what _wait_ready_async does: extract from the response payload
-        client = MagicMock(spec=DiffusionRemoteClient)
-        client.default_generation_params = {}
-        client.extra_param_specs = {}
+        async def wait_ready():
+            client = SimpleNamespace(
+                lock=asyncio.Lock(),
+                completed_responses={-1: restored},
+                default_generation_params={},
+                extra_param_specs={},
+                supports_image_edit=False,
+                ref_slot_specs={},
+                telemetry_metadata={},
+                _worker_failure=None,
+                worker_processes=[],
+                _ext_worker_thread=None,
+                response_event=asyncio.Event(),
+            )
+            await DiffusionRemoteClient._wait_ready_async(client)
+            return client
 
-        payload = restored.output
-        if isinstance(payload, dict):
-            client.default_generation_params = payload.get("default_generation_params", {})
-            client.extra_param_specs = payload.get("extra_param_specs", {})
+        client = asyncio.run(wait_ready())
 
         assert client.default_generation_params == ltx2_defaults
         assert set(client.extra_param_specs.keys()) == set(ltx2_specs.keys())
         for spec in client.extra_param_specs.values():
             assert isinstance(spec, ExtraParamSchema)
+        assert client.telemetry_metadata == {"modality": "video"}
+
+    def test_worker_telemetry_metadata_allowlists_identity_and_components(self, monkeypatch):
+        """READY metadata never forwards an unknown model or component name."""
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen import executor
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        class _Pipeline:
+            transformer_components = ("transformer", "private_component")
+
+            def __init__(self):
+                self.pipeline_class_name = "PublicPipeline"
+                self.pipeline_config = SimpleNamespace(
+                    model_configs={
+                        "transformer": SimpleNamespace(
+                            quant_config=SimpleNamespace(quant_algo=QuantAlgo.NVFP4),
+                            dynamic_weight_quant=True,
+                        ),
+                    },
+                )
+
+        registry = {
+            "PublicPipeline": SimpleNamespace(
+                pipeline_cls=_Pipeline,
+                hf_ids=["nvidia/public-model"],
+                modality="image",
+                telemetry_safe=True,
+            )
+        }
+        monkeypatch.setattr(executor, "PIPELINE_REGISTRY", registry)
+
+        public = executor._visual_gen_telemetry_metadata(
+            _Pipeline(), SimpleNamespace(model="nvidia/public-model")
+        )
+        private = executor._visual_gen_telemetry_metadata(
+            _Pipeline(), SimpleNamespace(model="/private/customer/model")
+        )
+
+        assert public["model_id"] == "nvidia/public-model"
+        assert public["pipeline_class_name"] == "PublicPipeline"
+        assert public["resolved_pipeline_class"] == "_Pipeline"
+        assert public["modality"] == "image"
+        assert public["quantization_algo"] == "NVFP4"
+        assert public["quantized_components"] == ["transformer"]
+        assert private["model_id"] == "other"
+
+        class _PrivatePipeline(_Pipeline):
+            def __init__(self):
+                super().__init__()
+                self.pipeline_class_name = "CustomerPipeline"
+
+        registry["CustomerPipeline"] = SimpleNamespace(
+            pipeline_cls=_PrivatePipeline,
+            hf_ids=["customer/private-model"],
+            modality="image",
+            telemetry_safe=False,
+        )
+        private_pipeline = executor._visual_gen_telemetry_metadata(
+            _PrivatePipeline(), SimpleNamespace(model="customer/private-model")
+        )
+        assert private_pipeline["model_id"] == "other"
+        assert private_pipeline["pipeline_class_name"] == "other"
+        assert private_pipeline["resolved_pipeline_class"] == "other"
+        assert private_pipeline["modality"] == "unknown"
+
+        from tensorrt_llm.usage.usage_lib import _visual_gen_initial_fields
+        from tensorrt_llm.visual_gen import VisualGenArgs
+
+        failed = executor._visual_gen_telemetry_metadata(object(), SimpleNamespace(model="private"))
+        assert failed == {}
+        fields = _visual_gen_initial_fields(VisualGenArgs(model="private"), failed)
+        assert (
+            fields["modelId"]
+            == fields["pipelineClassName"]
+            == fields["resolvedPipelineClass"]
+            == "other"
+        )
+        assert fields["modality"] == "unknown"
+        assert fields["quantizationAlgo"] == ""
+        assert fields["dynamicWeightQuant"] is False
+        assert fields["quantizedComponentsJson"] == "[]"
 
 
 # =============================================================================

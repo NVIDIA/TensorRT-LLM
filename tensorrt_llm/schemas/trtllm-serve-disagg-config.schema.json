@@ -344,6 +344,13 @@
       "additionalProperties": false,
       "description": "Configuration for KV cache block reuse policies.",
       "properties": {
+        "enable_branch_snapshot": {
+          "default": false,
+          "description": "Keep reusable state where a request's prompt diverges from the prefix cache, so later requests sharing that prefix can reuse up to the fork. For sliding-window attention (SWA), the SWA window at the fork is committed. This helps when only the SWA window at a chunk end is kept: policy 'per_request' or 'per_conversation', or SWA scratch reuse. The fork is aligned down to a block boundary and becomes a forced context chunk boundary. SWA layers skip this with joint target/draft KV cache reuse. For hybrid Mamba models, the recurrent state is snapshotted at the fork. If no periodic or additional snapshot point applies to the prompt, the prompt end is snapshotted as a fallback. Requires KV cache manager v2 and block reuse.",
+          "status": "prototype",
+          "title": "Enable Branch Snapshot",
+          "type": "boolean"
+        },
         "max_num_turns": {
           "default": 1,
           "description": "Maximum number of completed conversation turns whose committed SWA-window blocks and Mamba stable-boundary state are retained by KV cache manager v2. Only used when `policy` is 'per_conversation'.",
@@ -5346,9 +5353,11 @@
         },
         "enable_branch_snapshot": {
           "default": false,
-          "description": "Snapshot the Mamba recurrent state where a request's content diverges from the prefix cache, so that later requests sharing the same prefix can reuse up to the fork instead of being truncated to an earlier snapshot. If no periodic or additional snapshot point applies to the prompt, the prompt end is snapshotted as a fallback. Requires KV cache manager V2.",
-          "status": "prototype",
-          "telemetry": {},
+          "description": "Deprecated alias for kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes effect only when block reuse is enabled.",
+          "status": "deprecated",
+          "telemetry": {
+            "exclude": true
+          },
           "title": "Enable Branch Snapshot",
           "type": "boolean"
         },
@@ -7552,7 +7561,7 @@
         "usage_context": {
           "$ref": "#/$defs/UsageContext",
           "default": "unknown",
-          "description": "Identifies how TRT-LLM was invoked (CLI command vs Python API). Set automatically by CLI commands; defaults to UNKNOWN (promoted to LLM_CLASS by BaseLLM.__init__ for direct Python API usage)."
+          "description": "Identifies how TRT-LLM was invoked (CLI command vs Python API). Set automatically by CLI commands; defaults to UNKNOWN (promoted to LLM_CLASS or VISUAL_GEN_CLASS for direct Python API usage)."
         }
       },
       "title": "TelemetryConfig",
@@ -7680,6 +7689,7 @@
       "enum": [
         "unknown",
         "llm_class",
+        "visual_gen_class",
         "cli_serve",
         "cli_bench",
         "cli_eval",

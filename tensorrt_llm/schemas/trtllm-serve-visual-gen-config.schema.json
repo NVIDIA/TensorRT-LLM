@@ -911,6 +911,25 @@
       "title": "TeaCacheConfig",
       "type": "object"
     },
+    "TelemetryConfig": {
+      "additionalProperties": false,
+      "description": "Telemetry configuration for usage data collection.\n\nControls opt-out behavior and tracks which entry point invoked TRT-LLM.",
+      "properties": {
+        "disabled": {
+          "default": false,
+          "description": "Disable anonymous usage telemetry collection. Can also be set via TRTLLM_NO_USAGE_STATS=1, TELEMETRY_DISABLED=true, DO_NOT_TRACK=1, or file ~/.config/trtllm/do_not_track.",
+          "title": "Disabled",
+          "type": "boolean"
+        },
+        "usage_context": {
+          "$ref": "#/$defs/UsageContext",
+          "default": "unknown",
+          "description": "Identifies how TRT-LLM was invoked (CLI command vs Python API). Set automatically by CLI commands; defaults to UNKNOWN (promoted to LLM_CLASS or VISUAL_GEN_CLASS for direct Python API usage)."
+        }
+      },
+      "title": "TelemetryConfig",
+      "type": "object"
+    },
     "TorchCompileConfig": {
       "additionalProperties": false,
       "description": "Configuration for torch.compile and autotuning.\n\nWarmup shapes for torch.compile specialization are configured via\nCompilationConfig (resolutions + num_frames), not here.",
@@ -936,6 +955,20 @@
       },
       "title": "TorchCompileConfig",
       "type": "object"
+    },
+    "UsageContext": {
+      "description": "Identifies how TRT-LLM was invoked for telemetry tracking.",
+      "enum": [
+        "unknown",
+        "llm_class",
+        "visual_gen_class",
+        "cli_serve",
+        "cli_bench",
+        "cli_eval",
+        "disaggregated"
+      ],
+      "title": "UsageContext",
+      "type": "string"
     },
     "VAEConfig": {
       "additionalProperties": false,
@@ -1100,6 +1133,14 @@
       "default": null,
       "description": "Startup-preloaded LoRA adapter fused into VisualGen transformer weights.",
       "status": "prototype"
+    },
+    "telemetry_config": {
+      "$ref": "#/$defs/TelemetryConfig",
+      "description": "Configure anonymous usage telemetry for this VisualGen process.",
+      "status": "prototype",
+      "telemetry": {
+        "exclude": true
+      }
     },
     "torch_compile_config": {
       "$ref": "#/$defs/TorchCompileConfig",

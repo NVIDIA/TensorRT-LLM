@@ -7,17 +7,23 @@
             "$ref": "#/definitions/events/trtllm_heartbeat"
         },
         {
+            "$ref": "#/definitions/events/trtllm_visual_gen_initial_report"
+        },
+        {
+            "$ref": "#/definitions/events/trtllm_visual_gen_heartbeat"
+        },
+        {
             "$ref": "#/definitions/events/trtllm_exit_report"
         }
     ],
     "$schema": "http://json-schema.org/draft-07/schema#",
     "schemaMeta": {
-        "schemaVersion": "0.7",
+        "schemaVersion": "0.8",
         "clientId": "616561816355034",
         "clientName": "TrtllmTelemetry",
         "definitionVersion": "2.0"
     },
-    "description": "TensorRT-LLM usage telemetry events. Collects anonymous session-level deployment data (GPU type, parallelism config, model architecture class) with opt-out via TRTLLM_NO_USAGE_STATS=1. Auto-disabled in CI/test environments.",
+    "description": "TensorRT-LLM usage telemetry events. Collects anonymous session-level LLM and VisualGen deployment data with opt-out via TRTLLM_NO_USAGE_STATS=1. Auto-disabled in CI/test environments.",
     "definitions": {
         "types": {
             "ShortString": {
@@ -117,7 +123,7 @@
                     },
                     "llmApiConfigJson": {
                         "type": "string",
-                        "description": "JSON-serialized sanitized, opt-in subset of effective LLM API configuration"
+                        "description": "JSON-serialized sanitized, type-driven subset of effective LLM API configuration"
                     },
                     "llmApiConfigMetaJson": {
                         "type": "string",
@@ -230,6 +236,426 @@
                     "llmInitializationFailures"
                 ]
             },
+            "trtllm_visual_gen_initial_report": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM VisualGen initial session report with bounded pipeline, topology, feature, and sanitized configuration details. No prompts, outputs, model paths, or request data are collected."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "visualGenMetricsJson": {
+                        "maxLength": 8192,
+                        "type": "string"
+                    },
+                    "peakNumQueuedRequests": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "peakNumActiveRequests": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "sessionDurationSec": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "failedComponent": {
+                        "enum": [
+                            "none",
+                            "unclassified"
+                        ],
+                        "type": "string"
+                    },
+                    "visualGenInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeVisualGenInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "trtllmVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "platform": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "pythonVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "cpuArchitecture": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "cpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuName": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "gpuMemoryMB": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "cudaVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "runtimeKind": {
+                        "type": "string",
+                        "enum": [
+                            "visual_gen"
+                        ]
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "modelId": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "pipelineClassName": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "resolvedPipelineClass": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "modality": {
+                        "enum": [
+                            "image",
+                            "video",
+                            "video_audio",
+                            "layered_image",
+                            "mixed",
+                            "unknown"
+                        ],
+                        "type": "string"
+                    },
+                    "launchMode": {
+                        "enum": [
+                            "local_spawn",
+                            "torchrun",
+                            "slurm",
+                            "unknown"
+                        ],
+                        "type": "string"
+                    },
+                    "nodeCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "nWorkers": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "quantizationAlgo": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "dynamicWeightQuant": {
+                        "type": "boolean"
+                    },
+                    "quantizedComponentsJson": {
+                        "type": "string"
+                    },
+                    "cfgSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "ulyssesSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "ringSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "attn2dRowSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "attn2dColSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "tensorParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "parallelVaeSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "parallelVaeSplitDim": {
+                        "enum": [
+                            "width",
+                            "height"
+                        ],
+                        "type": "string"
+                    },
+                    "componentsPresentJson": {
+                        "maxLength": 1024,
+                        "type": "string"
+                    },
+                    "transformerCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "checkpointFormat": {
+                        "enum": [
+                            "diffusers",
+                            "single_safetensors",
+                            "other"
+                        ],
+                        "type": "string"
+                    },
+                    "pipelineLoadDurationSec": {
+                        "maximum": 4294967295,
+                        "minimum": 0,
+                        "type": "number"
+                    },
+                    "warmupDurationSec": {
+                        "maximum": 4294967295,
+                        "minimum": 0,
+                        "type": "number"
+                    },
+                    "cacheBackend": {
+                        "enum": [
+                            "teacache",
+                            "cache_dit",
+                            "none",
+                            "other"
+                        ],
+                        "type": "string"
+                    },
+                    "sparseAttentionAlgorithm": {
+                        "enum": [
+                            "skip_softmax",
+                            "vsa",
+                            "none",
+                            "other"
+                        ],
+                        "type": "string"
+                    },
+                    "vsaSparsity": {
+                        "enum": [
+                            "le_0.25",
+                            "le_0.5",
+                            "le_0.75",
+                            "le_1.0",
+                            "gt_1.0",
+                            "unknown"
+                        ],
+                        "type": "string"
+                    },
+                    "targetSparsity": {
+                        "enum": [
+                            "le_0.25",
+                            "le_0.5",
+                            "le_0.75",
+                            "le_1.0",
+                            "gt_1.0",
+                            "unknown"
+                        ],
+                        "type": "string"
+                    },
+                    "quantAttentionEnabled": {
+                        "type": "boolean"
+                    },
+                    "qkDtype": {
+                        "enum": [
+                            "bf16",
+                            "int8",
+                            "fp8",
+                            "mxfp8",
+                            "nvfp4",
+                            "none",
+                            "other"
+                        ],
+                        "type": "string"
+                    },
+                    "vDtype": {
+                        "enum": [
+                            "bf16",
+                            "int8",
+                            "fp8",
+                            "mxfp8",
+                            "nvfp4",
+                            "none",
+                            "other"
+                        ],
+                        "type": "string"
+                    },
+                    "qBlockSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "kBlockSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "vBlockSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "attentionBackend": {
+                        "enum": [
+                            "VANILLA",
+                            "TRTLLM",
+                            "FA4",
+                            "CUTEDSL",
+                            "other"
+                        ],
+                        "type": "string"
+                    },
+                    "cudaGraphEnable": {
+                        "type": "boolean"
+                    },
+                    "torchCompileEnable": {
+                        "type": "boolean"
+                    },
+                    "enableFullgraph": {
+                        "type": "boolean"
+                    },
+                    "enableAutotune": {
+                        "type": "boolean"
+                    },
+                    "featuresJson": {
+                        "maxLength": 1024,
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "visualGenMetricsJson",
+                    "peakNumQueuedRequests",
+                    "peakNumActiveRequests",
+                    "sessionDurationSec",
+                    "failedComponent",
+                    "visualGenInitializationAttempts",
+                    "visualGenInstancesCreated",
+                    "activeVisualGenInstances",
+                    "visualGenInitializationFailures",
+                    "trtllmVersion",
+                    "platform",
+                    "pythonVersion",
+                    "cpuArchitecture",
+                    "cpuCount",
+                    "gpuCount",
+                    "gpuName",
+                    "gpuMemoryMB",
+                    "cudaVersion",
+                    "runtimeKind",
+                    "ingressPoint",
+                    "modelId",
+                    "pipelineClassName",
+                    "resolvedPipelineClass",
+                    "modality",
+                    "launchMode",
+                    "nodeCount",
+                    "nWorkers",
+                    "quantizationAlgo",
+                    "dynamicWeightQuant",
+                    "quantizedComponentsJson",
+                    "cfgSize",
+                    "ulyssesSize",
+                    "ringSize",
+                    "attn2dRowSize",
+                    "attn2dColSize",
+                    "tensorParallelSize",
+                    "parallelVaeSize",
+                    "parallelVaeSplitDim",
+                    "componentsPresentJson",
+                    "transformerCount",
+                    "checkpointFormat",
+                    "pipelineLoadDurationSec",
+                    "warmupDurationSec",
+                    "cacheBackend",
+                    "sparseAttentionAlgorithm",
+                    "vsaSparsity",
+                    "targetSparsity",
+                    "quantAttentionEnabled",
+                    "qkDtype",
+                    "vDtype",
+                    "qBlockSize",
+                    "kBlockSize",
+                    "vBlockSize",
+                    "attentionBackend",
+                    "cudaGraphEnable",
+                    "torchCompileEnable",
+                    "enableFullgraph",
+                    "enableAutotune",
+                    "featuresJson"
+                ]
+            },
+            "trtllm_visual_gen_heartbeat": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM VisualGen periodic heartbeat with bounded topology and aggregate lifecycle counters."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "visualGenMetricsJson": {
+                        "maxLength": 8192,
+                        "type": "string"
+                    },
+                    "peakNumQueuedRequests": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "peakNumActiveRequests": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "sessionDurationSec": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "failedComponent": {
+                        "enum": [
+                            "none",
+                            "unclassified"
+                        ],
+                        "type": "string"
+                    },
+                    "visualGenInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeVisualGenInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "seq": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "runtimeKind": {
+                        "type": "string",
+                        "enum": [
+                            "visual_gen"
+                        ]
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "nWorkers": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    }
+                },
+                "required": [
+                    "visualGenMetricsJson",
+                    "peakNumQueuedRequests",
+                    "peakNumActiveRequests",
+                    "sessionDurationSec",
+                    "failedComponent",
+                    "visualGenInitializationAttempts",
+                    "visualGenInstancesCreated",
+                    "activeVisualGenInstances",
+                    "visualGenInitializationFailures",
+                    "seq",
+                    "runtimeKind",
+                    "ingressPoint",
+                    "nWorkers",
+                    "gpuCount"
+                ]
+            },
             "trtllm_exit_report": {
                 "eventMeta": {
                     "service": "telemetry",
@@ -241,62 +667,37 @@
                 "additionalProperties": false,
                 "type": "object",
                 "properties": {
-                    "exitCodeKnown": {
-                        "type": "boolean"
+                    "visualGenMetricsJson": {
+                        "maxLength": 8192,
+                        "type": "string"
                     },
-                    "exitCode": {
+                    "peakNumQueuedRequests": {
                         "$ref": "#/definitions/types/PositiveInt"
                     },
-                    "signalNumber": {
+                    "peakNumActiveRequests": {
                         "$ref": "#/definitions/types/PositiveInt"
                     },
-                    "terminationKind": {
-                        "type": "string",
+                    "sessionDurationSec": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "failedComponent": {
                         "enum": [
-                            "clean",
-                            "exception",
-                            "signal",
-                            "worker_failure",
-                            "timeout",
-                            "unknown"
-                        ]
+                            "none",
+                            "unclassified"
+                        ],
+                        "type": "string"
                     },
-                    "lifecyclePhase": {
-                        "type": "string",
-                        "enum": [
-                            "cli_parsing",
-                            "config_validation",
-                            "model_initialization",
-                            "serving",
-                            "unknown"
-                        ]
+                    "visualGenInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
                     },
-                    "component": {
-                        "type": "string",
-                        "enum": [
-                            "llm",
-                            "server",
-                            "engine_worker",
-                            "disagg_worker",
-                            "unknown"
-                        ]
+                    "visualGenInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
                     },
-                    "reportingSource": {
-                        "type": "string",
-                        "enum": [
-                            "self",
-                            "supervisor",
-                            "executor_proxy"
-                        ]
+                    "activeVisualGenInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
                     },
-                    "ingressPoint": {
-                        "$ref": "#/definitions/types/ShortString"
-                    },
-                    "disaggRole": {
-                        "$ref": "#/definitions/types/ShortString"
-                    },
-                    "deploymentId": {
-                        "$ref": "#/definitions/types/ShortString"
+                    "visualGenInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
                     },
                     "llmInitializationAttempts": {
                         "$ref": "#/definitions/types/PositiveInt"
@@ -312,9 +713,96 @@
                     },
                     "llmInitializationFailures": {
                         "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "exitCodeKnown": {
+                        "description": "Whether exitCode is an observed process exit code.",
+                        "type": "boolean"
+                    },
+                    "exitCode": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "signalNumber": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "terminationKind": {
+                        "description": "Allowlisted classification of how the session terminated.",
+                        "enum": [
+                            "clean",
+                            "exception",
+                            "signal",
+                            "worker_failure",
+                            "timeout",
+                            "unknown"
+                        ],
+                        "type": "string"
+                    },
+                    "lifecyclePhase": {
+                        "description": "Last known lifecycle phase when the session terminated.",
+                        "enum": [
+                            "cli_parsing",
+                            "config_validation",
+                            "model_initialization",
+                            "serving",
+                            "unknown"
+                        ],
+                        "type": "string"
+                    },
+                    "component": {
+                        "description": "TRT-LLM component associated with the terminal outcome.",
+                        "enum": [
+                            "llm",
+                            "visual_gen",
+                            "server",
+                            "engine_worker",
+                            "disagg_worker",
+                            "unknown"
+                        ],
+                        "type": "string"
+                    },
+                    "reportingSource": {
+                        "description": "Observer that classified and reported the terminal outcome.",
+                        "enum": [
+                            "self",
+                            "supervisor",
+                            "executor_proxy"
+                        ],
+                        "type": "string"
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "disaggRole": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "deploymentId": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "runtimeKind": {
+                        "description": "Runtime families observed in this process.",
+                        "enum": [
+                            "llm",
+                            "visual_gen",
+                            "mixed",
+                            "unknown"
+                        ],
+                        "type": "string"
                     }
                 },
                 "required": [
+                    "visualGenMetricsJson",
+                    "peakNumQueuedRequests",
+                    "peakNumActiveRequests",
+                    "sessionDurationSec",
+                    "failedComponent",
+                    "visualGenInitializationAttempts",
+                    "visualGenInstancesCreated",
+                    "activeVisualGenInstances",
+                    "visualGenInitializationFailures",
+                    "llmInitializationAttempts",
+                    "llmInstancesCreated",
+                    "activeLlmInstances",
+                    "maxConcurrentLlmInstances",
+                    "llmInitializationFailures",
                     "exitCodeKnown",
                     "exitCode",
                     "signalNumber",
@@ -325,11 +813,7 @@
                     "ingressPoint",
                     "disaggRole",
                     "deploymentId",
-                    "llmInitializationAttempts",
-                    "llmInstancesCreated",
-                    "activeLlmInstances",
-                    "maxConcurrentLlmInstances",
-                    "llmInitializationFailures"
+                    "runtimeKind"
                 ]
             }
         }

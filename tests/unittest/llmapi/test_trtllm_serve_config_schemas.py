@@ -79,6 +79,21 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"model": "public/model", "telemetry_config": {"disabled": True}},
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"model": "public/model", "telemetry_config": {"usage_context": "visual_gen_class"}},
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"model": "public/model", "telemetry_config": {"usage_context": "private-context"}},
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
         (
             generator.SERVE_SCHEMA,
