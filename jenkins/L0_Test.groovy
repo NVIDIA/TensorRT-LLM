@@ -7057,7 +7057,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             // behaviour.
             def boltProfileRef = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
             def boltProfileBranch = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
-            def kitmakerDryRun = globalVars[JOB_TYPE] == "L0_PostMerge"
+            def kitmakerDryRun = testFilter[(IS_POST_MERGE)] ?: false
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
