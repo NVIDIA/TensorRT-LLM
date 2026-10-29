@@ -207,6 +207,19 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
                     }
                 }
             },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "peano",
+                    }
+                }
+            },
             False,
         ),
     ],

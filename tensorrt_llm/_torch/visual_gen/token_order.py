@@ -17,9 +17,10 @@
 Block-sparse attention kernels such as Sol-Attn decide per block of
 consecutive tokens. In the native T-H-W raster order a block is a run along
 width inside one frame row, so blocks have weak 3D locality. A Morton
-(Z-order) permutation makes consecutive tokens cover compact 3D neighborhoods
-instead. Dense attention is permutation-equivariant, so the reorder only
-changes the result of block-wise decisions, never the dense math.
+(Z-order) or Hilbert permutation makes consecutive tokens cover compact 3D
+neighborhoods instead. Dense attention is permutation-equivariant in exact
+arithmetic, so the reorder changes the result of block-wise decisions and the
+bf16 rounding of the attention sums, never the math.
 
 A model applies the permutation once to its token sequence and RoPE tables
 before the block stack and the inverse after it; everything in between (norms,
@@ -34,6 +35,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import TokenOrder
 
 _MORTON_CACHE: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+_HILBERT_CACHE: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _part1by2(value: torch.Tensor) -> torch.Tensor:
@@ -71,6 +73,71 @@ def morton3d_permutation(
         hit = (perm, torch.argsort(perm))
         _MORTON_CACHE[key] = hit
     return hit[0].to(device), hit[1].to(device)
+
+
+def _hilbert3d_index(t: torch.Tensor, h: torch.Tensor, w: torch.Tensor, bits: int) -> torch.Tensor:
+    """Hilbert index of integer coordinates on a ``2**bits`` cube (Skilling, 2004).
+
+    ``AxesToTranspose`` followed by the bit interleave of the transposed axes;
+    ``t`` is the most significant axis. Vectorized over the coordinate tensors.
+    """
+    axes = [t.clone(), h.clone(), w.clone()]
+    n = len(axes)
+    top = 1 << (bits - 1)
+    q = top
+    while q > 1:
+        p = q - 1
+        for i in range(n):
+            hit = (axes[i] & q) != 0
+            axes[0] = torch.where(hit, axes[0] ^ p, axes[0])
+            swap = torch.where(hit, torch.zeros_like(axes[0]), (axes[0] ^ axes[i]) & p)
+            axes[0] = axes[0] ^ swap
+            axes[i] = axes[i] ^ swap
+        q >>= 1
+    for i in range(1, n):
+        axes[i] = axes[i] ^ axes[i - 1]
+    flip = torch.zeros_like(axes[0])
+    q = top
+    while q > 1:
+        flip = torch.where((axes[n - 1] & q) != 0, flip ^ (q - 1), flip)
+        q >>= 1
+    axes = [a ^ flip for a in axes]
+    code = torch.zeros_like(axes[0])
+    for b in range(bits):
+        for i in range(n):
+            code |= ((axes[i] >> b) & 1) << (n * b + (n - 1 - i))
+    return code
+
+
+def hilbert3d_permutation(
+    grid: Tuple[int, int, int], device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(perm, inverse)`` for a ``(frames, height, width)`` grid in Hilbert order.
+
+    The grid is embedded in the smallest power-of-two cube and the valid
+    coordinates are sorted by their Hilbert index, so consecutive tokens are
+    neighbours along a continuous curve: unlike Morton order there are no
+    jumps between octants. Cached per grid on CPU like :func:`morton3d_permutation`.
+    """
+    key = tuple(int(x) for x in grid)
+    hit = _HILBERT_CACHE.get(key)
+    if hit is None:
+        frames, height, width = key
+        linear = torch.arange(frames * height * width, dtype=torch.long)
+        frame_area = height * width
+        t = linear // frame_area
+        rem = linear - t * frame_area
+        h = rem // width
+        w = rem - h * width
+        bits = max(1, (max(key) - 1).bit_length())
+        code = _hilbert3d_index(t, h, w, bits)
+        perm = torch.argsort(code)
+        hit = (perm, torch.argsort(perm))
+        _HILBERT_CACHE[key] = hit
+    return hit[0].to(device), hit[1].to(device)
+
+
+_PERMUTATIONS = {"morton": morton3d_permutation, "hilbert": hilbert3d_permutation}
 
 
 def resolve_token_order(sparse_attention_config) -> TokenOrder:
@@ -129,7 +196,7 @@ class TokenReorder:
             return
         hit = self._indices.get((key, device))
         if hit is None:
-            hit = morton3d_permutation(key, device)
+            hit = _PERMUTATIONS[self.order](key, device)
             self._indices[(key, device)] = hit
             logger.info(
                 f"[token-order] {self.order} ordering over grid {key} ({hit[0].numel()} tokens)"

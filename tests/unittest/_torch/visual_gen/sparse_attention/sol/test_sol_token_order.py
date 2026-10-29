@@ -31,6 +31,7 @@ from pydantic import ValidationError
 
 from tensorrt_llm._torch.visual_gen.token_order import (
     TokenReorder,
+    hilbert3d_permutation,
     morton3d_permutation,
     require_native_token_order,
     resolve_token_order,
@@ -45,7 +46,7 @@ def test_token_order_defaults_to_native_and_rejects_unknown():
     assert SolAttentionConfig(tau=2.0).token_order == "native"
     assert SolAttentionConfig(tau=2.0, token_order="morton").token_order == "morton"
     with pytest.raises(ValidationError):
-        SolAttentionConfig(tau=2.0, token_order="hilbert")
+        SolAttentionConfig(tau=2.0, token_order="peano")
 
 
 @_CPU_ONLY
@@ -121,6 +122,51 @@ def test_morton3d_blocks_cover_compact_cubes():
     # Native raster order, by contrast, keeps a 64-token block inside one frame.
     native = torch.arange(perm.numel())
     assert int((native[:64] // (height * width)).max()) == 0
+
+
+@_CPU_ONLY
+@pytest.mark.parametrize("grid", [(1, 32, 32), (4, 8, 8), (21, 30, 52), (3, 5, 7)])
+def test_hilbert3d_permutation_round_trips(grid):
+    perm, inverse = hilbert3d_permutation(grid, torch.device("cpu"))
+    n = math.prod(grid)
+    assert perm.shape == (n,) and inverse.shape == (n,)
+    assert torch.equal(torch.sort(perm).values, torch.arange(n))
+    assert torch.equal(perm[inverse], torch.arange(n))
+
+
+@_CPU_ONLY
+def test_hilbert3d_is_a_continuous_curve_on_a_cube():
+    """On a power-of-two cube consecutive tokens are lattice neighbours (L1 distance 1),
+    which Morton order violates at every octant jump; every 64-token block is a 4x4x4 cube."""
+    side = 8
+    perm, _ = hilbert3d_permutation((side, side, side), torch.device("cpu"))
+    t = perm // (side * side)
+    h = (perm % (side * side)) // side
+    w = perm % side
+    coords = torch.stack([t, h, w], dim=1)
+    steps = (coords[1:] - coords[:-1]).abs().sum(dim=1)
+    assert torch.equal(steps, torch.ones_like(steps))
+    for start in range(0, perm.numel(), 64):
+        sl = slice(start, start + 64)
+        for axis in (t, h, w):
+            assert int(axis[sl].max() - axis[sl].min()) == 3
+    morton, _ = morton3d_permutation((side, side, side), torch.device("cpu"))
+    mc = torch.stack(
+        [morton // (side * side), (morton % (side * side)) // side, morton % side], dim=1
+    )
+    assert int((mc[1:] - mc[:-1]).abs().sum(dim=1).max()) > 1
+
+
+@_CPU_ONLY
+def test_token_reorder_hilbert_restores():
+    x = torch.randn(1, 21 * 30 * 52, 5)
+    hilbert = TokenReorder("hilbert")
+    hilbert.prepare((21, 30, 52), x.device)
+    assert hilbert.active
+    y = hilbert.permute(x)
+    assert not torch.equal(y, x)
+    assert torch.equal(hilbert.restore(y), x)
+    assert SolAttentionConfig(tau=2.0, token_order="hilbert").token_order == "hilbert"
 
 
 @_CPU_ONLY

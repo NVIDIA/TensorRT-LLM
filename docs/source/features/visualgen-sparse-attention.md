@@ -278,7 +278,7 @@ attention_config:
     disabled_until_timestep: 0.6  # dense while the normalized timestep >= cutoff
     dense_layers: [0, 2, 3, 4]    # optional: layer indices forced dense
     thresh_type: diag             # block threshold policy: "diag" or "exact"
-    token_order: native           # or "morton" (Wan): Z-order tokens for 3D-local blocks
+    token_order: native           # or "morton" / "hilbert" (Wan): 3D-local token blocks
 ```
 
 - `tau` is the routing threshold in standard deviations above the mean block
