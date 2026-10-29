@@ -455,7 +455,7 @@ class WanPipeline(BasePipeline):
                 width=width,
                 num_frames=num_frames,
                 num_inference_steps=steps,
-                guidance_scale=5.0,
+                guidance_scale=self.default_generation_params["guidance_scale"],
                 seed=42,
                 max_sequence_length=512,
             )

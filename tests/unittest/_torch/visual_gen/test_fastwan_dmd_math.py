@@ -33,6 +33,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -125,6 +126,58 @@ def _run(pipe, latents, zero_noise=False):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "resolutions,num_frames,expected_shapes",
+    [
+        (None, None, [(704, 1280, 33), (704, 1280, 121)]),
+        ([(352, 640)], [17], [(352, 640, 17)]),
+    ],
+)
+def test_warmup_plan_uses_fixed_dmd_schedule(resolutions, num_frames, expected_shapes):
+    pipe = object.__new__(WanDMDPipeline)
+    pipe.is_wan22_5b = True
+    pipe.is_wan22_14b = False
+    pipe.vae_scale_factor_spatial = 16
+    pipe.transformer = mock.Mock(config=mock.Mock(patch_size=_PATCH_SIZE))
+    pipe.pipeline_config = mock.Mock(
+        compilation=mock.Mock(resolutions=resolutions, num_frames=num_frames)
+    )
+
+    shapes, steps = pipe.resolve_warmup_plan()
+
+    assert shapes == expected_shapes
+    assert steps == len(WanDMDPipeline.DMD_TIMESTEPS) == 3
+
+
+@pytest.mark.parametrize(
+    "pipeline_class,is_5b,is_14b,num_heads,expected_guidance",
+    [
+        (WanDMDPipeline, True, False, 24, 1.0),
+        (WanPipeline, True, False, 24, 5.0),
+        (WanPipeline, False, True, 40, 4.0),
+        (WanPipeline, False, False, 12, 5.0),
+        (WanPipeline, False, False, 40, 5.0),
+    ],
+)
+def test_warmup_uses_pipeline_guidance_defaults(
+    pipeline_class, is_5b, is_14b, num_heads, expected_guidance
+):
+    pipe = object.__new__(pipeline_class)
+    pipe.is_wan22_5b = is_5b
+    pipe.is_wan22_14b = is_14b
+    pipe.config = mock.Mock(_name_or_path="", num_attention_heads=num_heads)
+    with (
+        mock.patch.object(pipeline_class, "_warmup_fp4_vae_encoder") as encoder_warmup,
+        mock.patch.object(pipeline_class, "forward") as forward,
+    ):
+        pipe._run_warmup(height=704, width=1280, num_frames=121, steps=3)
+
+    encoder_warmup.assert_called_once_with(704, 1280)
+    forward.assert_called_once()
+    assert forward.call_args.kwargs["guidance_scale"] == expected_guidance
+    assert forward.call_args.kwargs["num_inference_steps"] == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
