@@ -497,8 +497,12 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             throw std::invalid_argument(
                 "copy-based KV pool rebalancing does not support fixed-capacity pool groups yet");
         }
-        // The whole GPU quota becomes one arena, rounded down to whole physical chunks.
-        size_t const arenaBytes = roundDown(gpuQuota, gpuGranularity);
+        // The whole GPU quota becomes one arena, rounded down to whole physical chunks. Like the VMM path
+        // (computeSlotCountForLevel), a quota below what minSlots needs is raised to it: the executor's
+        // estimation pass sizes the first manager from free memory, which can be tiny (one GPU holding
+        // most of DeepSeek-V4's weights leaves under 1 GiB).
+        size_t const arenaBytes = std::max(roundDown(gpuQuota, gpuGranularity),
+            roundUp(ArenaGpuCacheLevelStorage::minArenaBytes(slotSizeLists, mHotMinSlots), gpuGranularity));
         auto arena = std::make_unique<ArenaGpuCacheLevelStorage>(
             slotDescList(kHotLevel), arenaBytes, hotRatio, mHotMinSlots, *mGpuPhysMemAllocator);
         // Migration to and from lower tiers addresses every pool of a GPU slot by one slot id (the
