@@ -176,9 +176,10 @@ deepseek-ai/DeepSeek-V4-Pro:
   # Aggregate DEP4 DSpark path against the NVFP4 export
   # (nvidia/deepseek-v4-pro-nvfp4-dspark) on MegaMoE CuTe DSL. MIXED_PRECISION
   # is what the checkpoint's hf_quant_config declares: NVFP4 routed experts,
-  # everything else left alone. Floor kept level with the FP8 row; a full
-  # 1319-sample DEP8 run on this export scored 96.21, and DEP4 uses the same
-  # model numerics.
+  # everything else left alone. Reference kept level with the FP8 row; a full
+  # 1319-sample DEP8 run on this export scored 96.21. Eleven DEP4 runs on
+  # 4x GB300 scored 95.72-96.40 (mean 96.01, std 0.19), so the reference is
+  # not a per-run floor; the harness's hypothesis test gates the score.
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: DSpark
     accuracy: 95.9
