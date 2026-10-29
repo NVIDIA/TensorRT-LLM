@@ -46,6 +46,7 @@ def _cuda_tensors(
     value: Any,
     tensors: list[torch.Tensor],
     visited: set[int] | None = None,
+    include_dataclasses: bool = True,
 ) -> None:
     if isinstance(value, torch.Tensor):
         if value.is_cuda:
@@ -60,25 +61,27 @@ def _cuda_tensors(
     visited.add(identity)
 
     if isinstance(value, Fp4QuantizedTensor):
-        _cuda_tensors(value.fp4_tensor, tensors, visited)
-        _cuda_tensors(value.scaling_factor, tensors, visited)
-        _cuda_tensors(value.unquantized_hidden_states, tensors, visited)
+        _cuda_tensors(value.fp4_tensor, tensors, visited, include_dataclasses)
+        _cuda_tensors(value.scaling_factor, tensors, visited, include_dataclasses)
+        _cuda_tensors(value.unquantized_hidden_states, tensors, visited, include_dataclasses)
     elif isinstance(value, MxFp8QuantizedTensor):
-        _cuda_tensors(value.fp8_tensor, tensors, visited)
-        _cuda_tensors(value.scaling_factor, tensors, visited)
+        _cuda_tensors(value.fp8_tensor, tensors, visited, include_dataclasses)
+        _cuda_tensors(value.scaling_factor, tensors, visited, include_dataclasses)
     elif is_dataclass(value) and not isinstance(value, type):
+        if not include_dataclasses:
+            return
         for field in fields(value):
             # Computed metadata properties can require initialization or read CUDA values.
             if isinstance(getattr(type(value), field.name, None), property):
                 continue
             # ``init=False`` fields need not exist until the dataclass initializes them.
-            _cuda_tensors(getattr(value, field.name, None), tensors, visited)
+            _cuda_tensors(getattr(value, field.name, None), tensors, visited, include_dataclasses)
     elif isinstance(value, dict):
         for item in value.values():
-            _cuda_tensors(item, tensors, visited)
+            _cuda_tensors(item, tensors, visited, include_dataclasses)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            _cuda_tensors(item, tensors, visited)
+            _cuda_tensors(item, tensors, visited, include_dataclasses)
 
 
 class _NCCLWindowTensorScope:
@@ -93,9 +96,9 @@ class _NCCLWindowTensorScope:
     scope's entry depth, quarantining their unescaped leases.
     """
 
-    def __init__(self, inputs: Any):
+    def __init__(self, inputs: Any, *, include_dataclasses: bool = True) -> None:
         self._inputs: list[torch.Tensor] = []
-        _cuda_tensors(inputs, self._inputs)
+        _cuda_tensors(inputs, self._inputs, include_dataclasses=include_dataclasses)
         self._outputs: list[torch.Tensor] = []
         self._entry_depth = 0
 
@@ -148,7 +151,9 @@ def install_module_nccl_window_tensor_scopes(
         )
 
         def begin_scope(_module, args, kwargs, *, active_scopes=active_scopes):
-            scope = nccl_window_tensor_scope((args, kwargs))
+            # Shared metadata belongs to the enclosing forward, including when
+            # nested inside activation containers. Outputs still escape recursively.
+            scope = _NCCLWindowTensorScope((args, kwargs), include_dataclasses=False)
             scope.__enter__()
             active_scopes.set((*active_scopes.get(), scope))
 
