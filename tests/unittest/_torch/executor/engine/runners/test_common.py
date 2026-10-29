@@ -13,6 +13,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners import (
     EncoderDecoderRunner,
     EncoderRunner,
     common,
+    resolve_runner_type,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     apply_position_id_offset,
@@ -26,12 +27,42 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     token_model_inputs,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ModelRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    ("encode_only", "mm_encoder_only", "is_generation", "is_encoder_decoder", "runner_type"),
+    [
+        (True, False, False, False, EncoderRunner),
+        (True, True, False, False, MultimodalEncoderRunner),
+        (False, True, False, False, MultimodalEncoderRunner),
+        (False, False, False, True, PoolingRunner),
+        (False, False, True, True, EncoderDecoderRunner),
+        (False, False, True, False, DecoderRunner),
+    ],
+)
+def test_resolve_runner_dispatches_startup_families(
+    encode_only: bool,
+    mm_encoder_only: bool,
+    is_generation: bool,
+    is_encoder_decoder: bool,
+    runner_type: type[ModelRunner],
+) -> None:
+    args = SimpleNamespace(encode_only=encode_only, mm_encoder_only=mm_encoder_only)
+    model = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_generation=is_generation, is_encoder_decoder=is_encoder_decoder
+        )
+    )
+
+    assert resolve_runner_type(model, args) is runner_type
 
 
 @pytest.mark.parametrize(

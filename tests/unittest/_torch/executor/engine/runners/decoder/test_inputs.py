@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 from _torch.executor.engine.runners.decoder.utils import decoder_config, input_preparer
 from _torch.executor.engine_test_utils import (
@@ -95,6 +96,7 @@ def input_preparer_and_kv_cache(
         yield inputs, manager
 
 
+@pytest.mark.cpu_only
 class TestCachedKvTokenLogging(unittest.TestCase):
     def setUp(self) -> None:
         self.inputs = _input_preparer()
@@ -166,6 +168,7 @@ class TestCachedKvTokenLogging(unittest.TestCase):
         self.check_counts([], (([], 1),), [], 0)
 
 
+@pytest.mark.cpu_only
 def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
     """An internal chunk hands back the next prompt token; the last one does not.
 
@@ -189,12 +192,14 @@ def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
     assert _get_context_prompt_lookahead_token(request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN
 
 
+@pytest.mark.cpu_only
 def test_zero_fill_row_spans_merges_unsorted_and_adjacent_spans() -> None:
     buffer = torch.arange(1, 13, dtype=torch.int32)
     _zero_fill_row_spans(buffer, [(9, 11), (2, 4), (4, 5), (7, 8)])
     assert buffer.tolist() == [1, 2, 0, 0, 0, 6, 7, 0, 9, 0, 0, 12]
 
 
+@pytest.mark.cpu_only
 def test_zero_fill_row_spans_without_spans_is_noop() -> None:
     buffer = torch.arange(4, dtype=torch.int32)
     _zero_fill_row_spans(buffer, [])
