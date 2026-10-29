@@ -368,6 +368,7 @@ def test_transformer_keeps_dynamic_fp8_linear_inputs_high_precision() -> None:
             self.dtype = output_dtype
             self.out_features = out_features
             self.output_dtype = output_dtype
+            self.has_any_quant = True
             self.input_dtypes: list[torch.dtype] = []
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1931,10 +1932,13 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
         assert getattr(model, name).weight.dtype == torch.float32
 
     # The loaded scales must give finite dequantised weights, and every quantized Linear must
-    # produce a finite output, so a failure names the first GEMM that does not.
+    # produce a finite output of plausible magnitude (unit-scale inputs, 0.05-scale weights,
+    # K = 64), so a failure names the first GEMM that does not.
     from tensorrt_llm._torch.modules.linear import Linear
 
+    amplitude_bound = 1e4
     non_finite: list[str] = []
+    amplitudes: list[tuple[float, str]] = []
     handles = []
     for name, module in model.named_modules():
         if not isinstance(module, Linear) or not module.has_any_quant:
@@ -1945,8 +1949,10 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
             assert torch.isfinite(module.weight.float() * module.weight_scale.float()).all(), name
 
         def record(_module, _inputs, output, name=name) -> None:
+            shape = f"{name} {tuple(_inputs[0].shape)} -> {tuple(output.shape)}"
             if not torch.isfinite(output).all():
-                non_finite.append(f"{name} {tuple(_inputs[0].shape)} -> {tuple(output.shape)}")
+                non_finite.append(shape)
+            amplitudes.append((output.float().abs().amax().item(), shape))
 
         handles.append(module.register_forward_hook(record))
 
@@ -1976,4 +1982,7 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
     assert video.shape == (1, 2, shapes["in_channels"])
     assert audio.shape == (1, 1, shapes["audio_in_channels"])
     assert not non_finite, f"non-finite Linear outputs (first: {non_finite[0]})"
+    loudest = max(amplitudes)
+    assert loudest[0] < amplitude_bound, f"Linear output amplitude {loudest[0]:.3e} at {loudest[1]}"
     assert torch.isfinite(video).all() and torch.isfinite(audio).all()
+    assert video.abs().max() < amplitude_bound and audio.abs().max() < amplitude_bound
