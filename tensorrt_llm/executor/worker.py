@@ -548,6 +548,10 @@ def worker_main(
                               [worker_queues.result_queue_addr])
 
         assert result_queues is not None
+        # A reused worker process may still hold cyclic garbage from the LLM it
+        # hosted before, including CUDA objects. Collect it here: a forked
+        # postprocess worker that finalizes them aborts on CUDA.
+        gc.collect()
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
         for i in range(postproc_worker_config.num_postprocess_workers):
