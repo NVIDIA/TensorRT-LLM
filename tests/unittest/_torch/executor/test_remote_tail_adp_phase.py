@@ -618,6 +618,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         enable_in_graph_sampling=False,
         enable_overlap_headroom=False,
         mm_encoder_item_scheduling_enabled=False,
+        spec_decode_fast_paths=False,
         cuda_graph_runner=runner,
         model=SimpleNamespace(
             model=SimpleNamespace(

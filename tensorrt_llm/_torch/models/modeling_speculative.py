@@ -1714,6 +1714,9 @@ def get_draft_model(model_config, draft_config, lm_head, model):
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
+    # Set per instance from supports_spec_decode_fast_paths in __init__.
+    spec_decode_fast_paths: bool = False
+
     @classmethod
     def supports_spec_decode_fast_paths(cls, model_config: ModelConfig) -> bool:
         """Whether one-engine speculative decoding of this model takes the
