@@ -2507,6 +2507,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
         attention_window_size=96,
     )
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    fmha.prepare_workspace(q.clone(), None, None, metadata, forward_args, workspace)
 
     stream.synchronize.assert_not_called()
     assert fmha._mla_decode_wrappers[(2, 1)] is wrapper
@@ -2548,13 +2549,166 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
     assert workspace.numel() == 32
 
-    dense_forward_args = replace(
-        forward_args,
-        attention_mask=PredefinedAttentionMask.FULL,
-    )
-    fmha.prepare_workspace(q, None, None, metadata, dense_forward_args, workspace)
+    metadata.kv_cache_block_offsets = torch.empty((2, 2, 6), dtype=torch.int32)
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
 
     assert workspace.numel() == 64
+
+
+@pytest.mark.parametrize("fp8,with_stats", [(False, False), (True, False), (True, True)])
+def test_mla_workspace_size_cache_tracks_request_geometry(
+    monkeypatch: pytest.MonkeyPatch, fp8: bool, with_stats: bool
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    workspace_size = Mock(
+        side_effect=lambda batch, heads, latent, rope, page, capacity, **kwargs: (
+            32 * batch * kwargs["max_seq_len_q"] + capacity
+        )
+    )
+    monkeypatch.setattr(
+        prims_ts_package, "get_prims_ts_batch_mla_decode_workspace_size", workspace_size
+    )
+    attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
+    attn.quant_mode = QuantMode.FP8_KV_CACHE if fp8 else QuantMode(0)
+    fmha = PrimsTSFmha(attn)
+    fmha._multi_processor_count = 1
+    metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        kv_cache_block_offsets=torch.empty((4, 2, 3), dtype=torch.int32),
+        max_num_requests=4,
+        max_num_tokens=32,
+        num_contexts=0,
+        num_generations=2,
+        num_ctx_tokens=0,
+        tokens_per_block=32,
+    )
+    workspace = torch.empty(0, dtype=torch.uint8)
+    for index, (batch, query_width) in enumerate(((2, 1), (2, 6), (4, 8), (2, 1))):
+        metadata.num_generations = batch
+        metadata.max_num_requests = 4 * (index + 1)
+        metadata.max_num_tokens = 32 * (index + 1)
+        metadata.is_cuda_graph = bool(index % 2)
+        q = torch.empty((batch * query_width, attn.num_heads * 576), dtype=torch.bfloat16)
+        forward_args = AttentionForwardArgs(
+            output=torch.empty((batch * query_width, attn.num_heads * 512), dtype=q.dtype),
+            attention_input_type=AttentionInputType.generation_only,
+            softmax_stats_tensor=torch.empty((batch * query_width, attn.num_heads, 2))
+            if with_stats
+            else None,
+        )
+        fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+        assert workspace.numel() >= 32 * batch * query_width + 96
+
+    assert workspace_size.call_count == 3
+    assert set(fmha._mla_decode_workspace_sizes) == {(2, 1), (2, 6), (4, 8)}
+    assert all(isinstance(size, int) for size in fmha._mla_decode_workspace_sizes.values())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    assert workspace_size.call_count == 3
+
+    # A larger table invalidates capacity-bound plans even when existing scratch
+    # already fits, so pointer stability does not conceal a changed plan bound.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    previous_pointer = workspace.data_ptr()
+    fmha._mla_decode_wrappers[(2, 1)] = Mock()
+    metadata.kv_cache_block_offsets = torch.empty((4, 2, 6), dtype=torch.int32)
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    assert workspace_size.call_count == 4
+    assert workspace_size.call_args.args[5] == 192
+    assert set(fmha._mla_decode_workspace_sizes) == {(2, 1)}
+    assert fmha._mla_decode_wrappers == {}
+    assert workspace.data_ptr() == previous_pointer
+
+    metadata.kv_cache_block_offsets = torch.empty((4, 2, 64), dtype=torch.int32)
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+    assert workspace_size.call_count == 5
+    assert workspace_size.call_args.args[5] == 2048
+    assert workspace.numel() == 32 * 2 + 2048
+
+
+def test_mla_workspace_size_cache_preserves_allocation_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    workspace_size = Mock(return_value=48)
+    monkeypatch.setattr(
+        prims_ts_package, "get_prims_ts_batch_mla_decode_workspace_size", workspace_size
+    )
+    attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
+    fmha = PrimsTSFmha(attn)
+    fmha._multi_processor_count = 1
+    metadata = SimpleNamespace(
+        kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
+        num_contexts=0,
+        num_generations=2,
+        num_ctx_tokens=0,
+        tokens_per_block=32,
+    )
+    q = torch.empty((12, attn.num_heads * 576), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((12, attn.num_heads * 512), dtype=q.dtype),
+        attention_input_type=AttentionInputType.generation_only,
+    )
+    first_workspace = torch.empty(0, dtype=torch.uint8)
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, first_workspace)
+    fmha._mla_decode_wrappers[(2, 6)] = Mock()
+    context_wrapper = Mock()
+    fmha._context_wrappers[2] = context_wrapper
+
+    second_workspace = torch.empty(48, dtype=torch.uint8)
+    assert second_workspace.data_ptr() != first_workspace.data_ptr()
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, second_workspace)
+    workspace_size.assert_called_once()
+    assert fmha._mla_decode_wrappers == {}
+    assert fmha._context_wrappers[2] is context_wrapper
+
+    too_small = torch.empty(16, dtype=torch.uint8)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="must be sized before CUDA graph capture"):
+        fmha.prepare_workspace(q, None, None, metadata, forward_args, too_small)
+    workspace_size.assert_called_once()
+    assert too_small.numel() == 16
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, too_small)
+    workspace_size.assert_called_once()
+    assert too_small.numel() == 48
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_mla_context_workspace_tracks_each_chunk_without_decode_size_cache(
+    monkeypatch: pytest.MonkeyPatch, fp8: bool
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    workspace_size = Mock(side_effect=AssertionError("context must not use decode sizing"))
+    monkeypatch.setattr(
+        prims_ts_package, "get_prims_ts_batch_mla_decode_workspace_size", workspace_size
+    )
+    attn = _Attention(head_dim=192, is_mla=True, num_heads=4)
+    attn.quant_mode = QuantMode.FP8_KV_CACHE if fp8 else QuantMode(0)
+    fmha = PrimsTSFmha(attn)
+    fmha._multi_processor_count = 1
+    metadata = SimpleNamespace(
+        kv_cache_block_offsets=torch.empty((2, 2, 8), dtype=torch.int32),
+        num_contexts=2,
+        num_generations=0,
+        num_ctx_tokens=8,
+        tokens_per_block=32,
+    )
+    workspace = torch.empty(0, dtype=torch.uint8)
+    for q_tokens, kv_tokens in ((8, 8), (16, 32)):
+        metadata.num_ctx_tokens = q_tokens
+        q = torch.empty((q_tokens, attn.num_heads * 192), dtype=torch.bfloat16)
+        k = torch.empty((kv_tokens, attn.num_heads * 192), dtype=q.dtype)
+        forward_args = AttentionForwardArgs(
+            output=torch.empty((q_tokens, attn.num_heads * 128), dtype=q.dtype),
+            attention_input_type=AttentionInputType.context_only,
+        )
+        expected_bytes = fmha._mla_context_workspace_layout(q, k, 2)[1]
+        fmha.prepare_workspace(q, k, None, metadata, forward_args, workspace)
+        assert workspace.numel() == expected_bytes
+    workspace_size.assert_not_called()
+    assert fmha._mla_decode_workspace_sizes == {}
 
 
 @pytest.mark.parametrize("fp8", [False, True])
