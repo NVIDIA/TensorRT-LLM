@@ -2684,6 +2684,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "gpu_slot_windows", [](kv::KvCacheManager& manager) { return kv::KvCacheIntrospection::gpuSlotWindows(manager); },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "gpu_pool_windows",
+        [](kv::KvCacheManager& manager) { return kv::KvCacheIntrospection::gpuPoolWindows(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     // White-box reuse-tree introspection: mirror the Python manager's _life_cycles
     // and _radix_tree attributes so shared tests can inspect reuse state.
     mIntrospection.def(
@@ -3542,6 +3546,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "because a fetch with no converted indices would read the wrong pages rather than fail. Their "
             "shape is not a choice, so this saves a caller re-deriving the pool layout to restate it.")
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
+        .def("get_page_index_bindings", &kv::KvCacheManager::getPageIndexBindings, nb::arg("layer_id"),
+            nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_page_index_binding_version", &kv::KvCacheManager::getPageIndexBindingVersion,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
         .def("is_sparse", &kv::KvCacheManager::isSparse, nb::arg("layer_id"), nb::arg("data_role"),

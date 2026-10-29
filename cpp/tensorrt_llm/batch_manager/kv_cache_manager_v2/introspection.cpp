@@ -643,6 +643,18 @@ std::vector<std::pair<SlotCount, SlotCount>> KvCacheIntrospection::gpuSlotWindow
     return result;
 }
 
+std::vector<std::vector<std::pair<SlotCount, SlotCount>>> KvCacheIntrospection::gpuPoolWindows(KvCacheManager& manager)
+{
+    std::vector<std::vector<std::pair<SlotCount, SlotCount>>> result;
+    for (auto const& pools : manager.mStorage->hotPoolWindows())
+    {
+        auto& out = result.emplace_back();
+        for (auto const& window : pools)
+            out.emplace_back(window.begin.value(), window.end.value());
+    }
+    return result;
+}
+
 namespace
 {
 

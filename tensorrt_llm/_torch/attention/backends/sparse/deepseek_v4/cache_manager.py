@@ -279,6 +279,14 @@ def _get_attn_bytes_per_token(
     return token_bytes
 
 
+def _translate_page_indices(base: torch.Tensor, bindings: torch.Tensor) -> torch.Tensor:
+    """Base page indices to a bound pool's own ids (copy-based rebalancing with several pools in a
+    pool group). Bad or out-of-range indices become BAD_PAGE_INDEX."""
+    valid = (base >= 0) & (base < bindings.numel())
+    translated = bindings[base.clamp(0, bindings.numel() - 1).long()]
+    return torch.where(valid, translated, torch.full_like(base, BAD_PAGE_INDEX))
+
+
 def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
     if attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
         return PageIndexMode.PER_LAYER
@@ -801,9 +809,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     converter.scratch_pages_per_block
                 )
 
+        self._init_page_index_bindings()
         device = torch.device("cuda", torch.cuda.current_device())
-        self._device_kv_cache_block_offsets_input = torch.empty_like(
-            self.host_kv_cache_block_offsets,
+        # One row per pool group's base page indices, then one per bound pool, translated.
+        self._device_kv_cache_block_offsets_input = torch.empty(
+            (self.num_pools + len(self._bound_pools), *self.host_kv_cache_block_offsets.shape[1:]),
+            dtype=self.host_kv_cache_block_offsets.dtype,
             device=device,
         )
         self._precomputed_sliding_block_tables = torch.empty(
@@ -937,6 +948,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         kv_cache = self.kv_cache_map[request_id]
         base_indices = kv_cache.get_base_page_indices(pool_id).tolist()
+        binding_key = self._binding_key(layer_id, data_role)
+        if binding_key is not None:
+            self._refresh_page_index_bindings()
+            bindings = self._host_bindings[binding_key]
+            base_indices = [
+                int(bindings[i]) if i != BAD_PAGE_INDEX else BAD_PAGE_INDEX for i in base_indices
+            ]
         converter = self.impl.get_page_index_converter(layer_id, data_role)
         page_index_mode = _get_index_mode(attn_type)
         return converter(
@@ -1502,14 +1520,100 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         buffer = self.get_buffers(layer_idx, DeepseekV4AttentionType.INDEXER_COMPRESS).unsqueeze(2)
         return buffer.view(torch.uint8)
 
+    def _init_page_index_bindings(self) -> None:
+        """Copy-based rebalancing with several pools in a pool group: a buffer in a bound pool has
+        its own slot ids, and its kernel page index is ``bindings[base_page_index] * scale`` plus
+        the converter's layer offset. Sliding tables read such buffers from one extra device row
+        per bound pool, refilled every step from its group's row; the shared (compressed, indexer)
+        tables translate on the host."""
+        # (layer_id, role) -> (pool group's row, pool index), from the storage layout.
+        self._buffer_pools = {}
+        for pool_group in self.impl.pool_group_descs:
+            for variant in pool_group.slot_desc.variants:
+                row = int(variant.layer_group_id)
+                for pool_idx, coalesced in enumerate(variant.coalesced_buffers):
+                    for buffer_id in coalesced.buffer_ids:
+                        self._buffer_pools[int(buffer_id.layer_id), str(buffer_id.role)] = (
+                            row,
+                            pool_idx,
+                        )
+        # Bound pools, each named by (row, pool index), with one of its buffers to query.
+        self._bound_buffers = {}
+        checked = set()
+        for (layer_id, role), key in self._buffer_pools.items():
+            if key in checked:
+                continue
+            checked.add(key)
+            if self.impl.get_page_index_bindings(LayerId(layer_id), DataRole(role)) is not None:
+                self._bound_buffers[key] = (LayerId(layer_id), DataRole(role))
+        # Extra device rows, after the pool groups' rows: (pool group's row, binding key).
+        self._bound_pools = [(key[0], key) for key in self._bound_buffers]
+        extra_row = {key: self.num_pools + i for i, (_, key) in enumerate(self._bound_pools)}
+        self._host_bindings = {}
+        self._device_bindings = {}
+        self._bindings_version = None
+
+        self._compress_binding_keys = {}
+        self._indexer_compress_binding_key = None
+        for layer_idx in self.pp_layers:
+            compress_ratio = self._compress_ratios[layer_idx]
+            if compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS):
+                self._compress_binding_keys[compress_ratio] = self._binding_key(
+                    self._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS],
+                    DeepseekV4AttentionType.COMPRESS.role,
+                )
+            if compress_ratio_has_attention(
+                compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESS
+            ):
+                self._indexer_compress_binding_key = self._binding_key(
+                    self._layer_attn_to_layer_id[
+                        layer_idx, DeepseekV4AttentionType.INDEXER_COMPRESS
+                    ],
+                    DeepseekV4AttentionType.INDEXER_COMPRESS.role,
+                )
+            local_layer_idx = self.layer_offsets[layer_idx]
+            for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
+                if not compress_ratio_has_attention(compress_ratio, attn_type):
+                    continue
+                key = self._binding_key(
+                    self._layer_attn_to_layer_id[layer_idx, attn_type], attn_type.role
+                )
+                if key is not None:
+                    self._layer_attn_pool_ids[local_layer_idx, attn_type.value] = extra_row[key]
+
+    def _binding_key(self, layer_id, role):
+        """The bound pool holding this buffer, or None if it uses the base page indices."""
+        key = self._buffer_pools.get((int(layer_id), str(role)))
+        return key if key in self._bound_buffers else None
+
+    def _refresh_page_index_bindings(self) -> None:
+        """Fetch the bound pools' bindings again after a rebalance has moved them."""
+        if not self._bound_buffers:
+            return
+        version = self.impl.get_page_index_binding_version()
+        if version == self._bindings_version:
+            return
+        device = torch.device("cuda", torch.cuda.current_device())
+        for key, (layer_id, role) in self._bound_buffers.items():
+            bindings = torch.tensor(
+                self.impl.get_page_index_bindings(layer_id, role), dtype=torch.int32
+            )
+            self._host_bindings[key] = bindings
+            self._device_bindings[key] = bindings.to(device)
+        self._bindings_version = version
+
     def _compute_shared_block_table(
-        self, pool_id: int, scale: int, copy_idx: torch.Tensor
+        self, pool_id: int, scale: int, copy_idx: torch.Tensor, binding_key=None
     ) -> torch.Tensor:
         """
-        Get the shared offset for one pool and copy index.
+        Get the shared offset for one pool and copy index. binding_key names the bound pool the
+        buffer lives in (copy-based rebalancing), whose ids translate the base page indices.
         Return shape: [num_seqs, max_blocks_per_seq]
         """
         base = self.host_kv_cache_block_offsets[pool_id, copy_idx, 0, :]
+        if binding_key is not None:
+            self._refresh_page_index_bindings()
+            base = _translate_page_indices(base, self._host_bindings[binding_key])
         return torch.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale)
 
     def _copy_idx_to_device(self, copy_idx: torch.Tensor) -> torch.Tensor:
@@ -1584,10 +1688,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             ]
 
         device_copy_idx = self._copy_idx_to_device(copy_idx)
-        self._device_kv_cache_block_offsets_input.copy_(
+        self._device_kv_cache_block_offsets_input[: self.num_pools].copy_(
             self.host_kv_cache_block_offsets,
             non_blocking=True,
         )
+        self._refresh_page_index_bindings()
+        for row, (pool_id, binding_key) in enumerate(self._bound_pools, start=self.num_pools):
+            self._device_kv_cache_block_offsets_input[row] = _translate_page_indices(
+                self._device_kv_cache_block_offsets_input[pool_id],
+                self._device_bindings[binding_key],
+            )
 
         if scratch_descs_by_pool is not None:
             scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
@@ -2005,7 +2115,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             raise RuntimeError(
                 f"Missing COMPRESS pool metadata for compress ratio {compress_ratio}"
             )
-        staging[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
+        binding_key = self._compress_binding_keys.get(compress_ratio)
+        staging[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx, binding_key)
         dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
 
     @nvtx_range_debug("dsv4_copy_batch_indexer_compress_block_tables")
@@ -2024,7 +2135,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         scale = self._csa_indexer_compress_scale
         if pool_id is None or scale is None:
             raise RuntimeError("Missing INDEXER_COMPRESS pool metadata")
-        host_block_table[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
+        host_block_table[:num_seqs] = self._compute_shared_block_table(
+            pool_id, scale, copy_idx, self._indexer_compress_binding_key
+        )
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping, **kwargs):

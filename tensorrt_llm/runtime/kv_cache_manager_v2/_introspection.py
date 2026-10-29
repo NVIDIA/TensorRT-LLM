@@ -246,6 +246,11 @@ def gpu_slot_windows(manager: Any) -> list[tuple[int, int]]:
     return [tuple(window) for window in _cpp().gpu_slot_windows(manager)]
 
 
+def gpu_pool_windows(manager: Any) -> list[list[tuple[int, int]]]:
+    """GPU window [begin, end) of every pool of every pool group, in the pool's own ids."""
+    return [[tuple(window) for window in pools] for pools in _cpp().gpu_pool_windows(manager)]
+
+
 def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     """Return storage utilization by pool group for a cache level."""
     return list(_cpp().storage_utilization(manager, cache_level))

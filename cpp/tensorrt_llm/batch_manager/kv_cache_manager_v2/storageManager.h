@@ -218,12 +218,23 @@ public:
         return mInPlaceRelocation;
     }
 
-    //! Exclusive bound on the hot-level slot ids pool group pgIdx can ever use; kernel views over
-    //! the pool must extend this far. For an arena that is the arena end, in this group's slots.
-    [[nodiscard]] SlotCount slotIdUpperBound(PoolGroupIndex pgIdx) const;
+    //! Exclusive bound on the hot-level ids pool poolIdx of group pgIdx can ever use; kernel views
+    //! over the pool must extend this far. For an arena that is the arena end, in that pool's slots;
+    //! otherwise the group's hot slot count (VMM pools share the group's ids).
+    [[nodiscard]] SlotCount slotIdUpperBound(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
     //! Current hot-level window of each pool group.
     [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> hotWindows() const;
+
+    //! Current hot-level window of every pool, in its own ids (bound pools have their own).
+    [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> hotPoolWindows() const;
+
+    //! For a bound pool of the GPU arena: its id for each of the group's slot ids (-1 where unbound).
+    //! std::nullopt for any other pool, whose ids are the group's.
+    [[nodiscard]] std::optional<std::vector<int32_t>> hotPoolBindings(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
+    //! Changes whenever hotPoolBindings() may return something different.
+    [[nodiscard]] uint64_t hotPoolBindingVersion() const noexcept;
 
     // ---- Migration ---------------------------------------------------------
 
@@ -488,8 +499,10 @@ private:
         bool defrag = false);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
+    //! move: the source slots are given up afterwards (defragmentation, in-place relocation). In a
+    //! GPU arena the bound pools' data then stays put and the bindings are exchanged instead.
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
-        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream, bool move = false);
 
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
@@ -509,6 +522,15 @@ private:
     //! group at the same level and republish the new indices to every owner. The copy runs after
     //! the owners' prior work and their readers, and every owner's stream waits for it.
     void _relocateLockedPages(CacheLevel level, PoolGroupIndex pgIdx, std::vector<SharedPtr<Page>> const& pages);
+    //! Move bound pool poolIdx of arena group pgIdx to `target`, its own new window: every group slot
+    //! id in use whose data lies outside it is rebound to a free id inside it and its data copied
+    //! there. Free group slot ids lose their bindings (completeBindings() restores them). Runs
+    //! synchronously, at the rebalance's quiescence point.
+    void remapArenaPool(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotWindow target);
+    //! adjustArenaLevel for an arena with bound pools: every pool moves on its own.
+    void adjustArenaPools(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> const& newWindows,
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages);
     //! Drop the droppable (unreferenced) pages of a pool group whose slots lie outside `target`.
     //! Returns how many were dropped.
     SlotCount dropUnreferencedPagesOutside(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target);

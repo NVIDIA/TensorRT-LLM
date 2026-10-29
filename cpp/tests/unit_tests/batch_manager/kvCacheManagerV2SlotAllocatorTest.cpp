@@ -313,4 +313,185 @@ TEST(KvCacheManagerV2ArenaLayoutTest, RejectsArenaTooSmallForMinSlots)
     EXPECT_THROW(arenaWindows(32 * kMiB, {2 * kMiB, 10 * kMiB}, {0.5f, 0.5f}, {4, 4}), std::invalid_argument);
 }
 
+// ---------------------------------------------------------------------------
+// Arena layout with several pools per group (bound pools).
+// ---------------------------------------------------------------------------
+
+using PoolSizes = std::vector<std::vector<size_t>>;
+
+TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> arenaPoolWindows(
+    size_t arenaBytes, PoolSizes const& sizes, std::vector<float> ratios, std::vector<SlotCount> minSlots)
+{
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> typed;
+    for (auto const& group : sizes)
+        typed.push_back(TypedVec<PoolIndex, size_t>{group});
+    return ArenaGpuCacheLevelStorage::computeArenaPoolWindows(
+        arenaBytes, typed, TypedVec<PoolGroupIndex, float>{ratios}, TypedVec<PoolGroupIndex, SlotCount>{minSlots});
+}
+
+// DeepSeek-V4-Flash per rank (fp8 KV, 256 tokens per block): full attention, sliding window, and
+// compressor-state groups.
+PoolSizes const kDsv4Sizes{{688128, 91392, 20480}, {20971520, 5636096}, {44040192, 11010048}};
+
+// Every pool's window, in bytes, in layout order; checks they lie in order without overlap and that
+// each group's pools have one slot count. Returns the bytes no pool uses.
+size_t checkPoolLayout(
+    size_t arena, PoolSizes const& sizes, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> const& w)
+{
+    size_t previousEnd = 0;
+    size_t used = 0;
+    for (size_t g = 0; g < sizes.size(); ++g)
+    {
+        PoolGroupIndex const pg{static_cast<int>(g)};
+        EXPECT_EQ(w[pg].size(), PoolIndex{static_cast<int>(sizes[g].size())});
+        for (size_t p = 0; p < sizes[g].size(); ++p)
+        {
+            PoolIndex const pool{static_cast<int>(p)};
+            size_t const s = sizes[g][p];
+            EXPECT_EQ(w[pg][pool].size(), w[pg][PoolIndex{0}].size()) << "group " << g << " pool " << p;
+            EXPECT_GE(toSizeT(w[pg][pool].begin) * s, previousEnd) << "group " << g << " pool " << p;
+            previousEnd = toSizeT(w[pg][pool].end) * s;
+            used += slotCountToSizeT(w[pg][pool].size()) * s;
+        }
+    }
+    EXPECT_LE(previousEnd, arena);
+    return arena - used;
+}
+
+// With one pool per group the general layout is exactly computeArenaWindows.
+TEST(KvCacheManagerV2ArenaPoolLayoutTest, SinglePoolsMatchGroupLayout)
+{
+    size_t const arena = 1024 * kMiB;
+    auto const pools = arenaPoolWindows(arena, {{128 * kKiB}, {704 * kKiB}}, {0.3f, 0.7f}, {1, 1});
+    auto const groups = arenaWindows(arena, {128 * kKiB, 704 * kKiB}, {0.3f, 0.7f}, {1, 1});
+    for (PoolGroupIndex pg{0}; pg < PoolGroupIndex{2}; ++pg)
+    {
+        ASSERT_EQ(pools[pg].size(), PoolIndex{1});
+        EXPECT_EQ(pools[pg][PoolIndex{0}], groups[pg]);
+    }
+}
+
+// Pools lie one after another, each group's pools share one slot count, the shares follow the
+// ratio, and every pool wastes under two of its own blocks.
+TEST(KvCacheManagerV2ArenaPoolLayoutTest, DeepSeekV4PoolsTileTheArena)
+{
+    size_t const arena = 100 * 1024 * kMiB;
+    for (auto const& ratio : {std::vector<float>{0.95976f, 0.01311f, 0.02713f},
+             std::vector<float>{0.11645f, 0.30154f, 0.58200f}})
+    {
+        auto const w = arenaPoolWindows(arena, kDsv4Sizes, ratio, {1, 1, 1});
+        size_t const unused = checkPoolLayout(arena, kDsv4Sizes, w);
+        size_t bound = 0;
+        for (auto const& group : kDsv4Sizes)
+            for (size_t const s : group)
+                bound += 2 * s;
+        EXPECT_LT(unused, bound);
+        for (size_t g = 0; g < kDsv4Sizes.size(); ++g)
+        {
+            PoolGroupIndex const pg{static_cast<int>(g)};
+            size_t perSlot = 0;
+            for (size_t const s : kDsv4Sizes[g])
+                perSlot += s;
+            double const share = static_cast<double>(slotCountToSizeT(w[pg][PoolIndex{0}].size()) * perSlot)
+                / static_cast<double>(arena);
+            EXPECT_NEAR(share, ratio[g], 0.01) << "group " << g;
+        }
+    }
+}
+
+TEST(KvCacheManagerV2ArenaPoolLayoutTest, SameRatioSameWindowsAndMinSlots)
+{
+    size_t const arena = 4 * 1024 * kMiB;
+    auto const a = arenaPoolWindows(arena, kDsv4Sizes, {0.98f, 0.01f, 0.01f}, {1, 3, 5});
+    auto const b = arenaPoolWindows(arena, kDsv4Sizes, {0.98f, 0.01f, 0.01f}, {1, 3, 5});
+    checkPoolLayout(arena, kDsv4Sizes, a);
+    for (PoolGroupIndex pg{0}; pg < PoolGroupIndex{3}; ++pg)
+    {
+        for (PoolIndex pool{0}; pool < a[pg].size(); ++pool)
+            EXPECT_EQ(a[pg][pool], b[pg][pool]);
+    }
+    EXPECT_GE(a[PoolGroupIndex{1}][PoolIndex{0}].size(), 3);
+    EXPECT_GE(a[PoolGroupIndex{2}][PoolIndex{0}].size(), 5);
+    EXPECT_THROW(arenaPoolWindows(64 * kMiB, kDsv4Sizes, {0.5f, 0.25f, 0.25f}, {1, 2, 2}), std::invalid_argument);
+}
+
+// ---------------------------------------------------------------------------
+// Bound pools: a group's slot ids map to each bound pool's own ids.
+// ---------------------------------------------------------------------------
+
+// No memory is touched: the arena base is only used for address arithmetic.
+constexpr MemAddress kFakeArenaBase = MemAddress(1) << 40;
+
+GpuPoolGroup makeBoundGroup(SlotWindow window0, SlotWindow window1, size_t arenaBytes)
+{
+    return GpuPoolGroup(TypedVec<PoolIndex, SlotWindow>{window0, window1}, SlotAllocator::Growth::kAscending,
+        TypedVec<PoolIndex, size_t>{4 * kKiB, 1 * kKiB}, kFakeArenaBase, arenaBytes, size_t{2} << 20);
+}
+
+TEST(KvCacheManagerV2BoundPoolTest, BindsInOrderAndResolvesAddresses)
+{
+    auto group = makeBoundGroup(SlotWindow{SlotId{0}, SlotId{8}}, SlotWindow{SlotId{40}, SlotId{48}}, kMiB);
+    EXPECT_FALSE(group.isBoundPool(PoolIndex{0}));
+    EXPECT_TRUE(group.isBoundPool(PoolIndex{1}));
+    auto const& pool = group.arenaPool(PoolIndex{1});
+    for (SlotId s{0}; s < SlotId{8}; ++s)
+    {
+        EXPECT_EQ(pool.localId(s), SlotId{40 + s.value()});
+        auto const addrs = group.slotAddress(s);
+        EXPECT_EQ(std::get<MemAddress>(addrs[PoolIndex{0}]), kFakeArenaBase + toSizeT(s) * 4 * kKiB);
+        EXPECT_EQ(std::get<MemAddress>(addrs[PoolIndex{1}]), kFakeArenaBase + (40 + toSizeT(s)) * kKiB);
+    }
+    // Pool 1 may address any id up to the arena end in its own (smaller) slots.
+    EXPECT_EQ(group.slotIdUpperBound(PoolIndex{0}), SlotCount{256});
+    EXPECT_EQ(group.slotIdUpperBound(PoolIndex{1}), SlotCount{1024});
+}
+
+// A move swaps bindings: the block keeps its bound-pool data, the vacated id takes the other one.
+TEST(KvCacheManagerV2BoundPoolTest, MoveSwapsBindings)
+{
+    auto group = makeBoundGroup(SlotWindow{SlotId{0}, SlotId{8}}, SlotWindow{SlotId{40}, SlotId{48}}, kMiB);
+    auto& pool = group.arenaPool(PoolIndex{1});
+    group.swapBoundPoolBindings(SlotId{6}, SlotId{1});
+    EXPECT_EQ(pool.localId(SlotId{6}), SlotId{41});
+    EXPECT_EQ(pool.localId(SlotId{1}), SlotId{46});
+    // An unbound destination takes the binding and leaves the source unbound.
+    pool.unbind(SlotId{7});
+    group.swapBoundPoolBindings(SlotId{7}, SlotId{2});
+    EXPECT_EQ(pool.localId(SlotId{7}), SlotId{42});
+    EXPECT_FALSE(pool.localId(SlotId{2}).has_value());
+    EXPECT_FALSE(pool.groupId(SlotId{47}).has_value());
+}
+
+// After a rebalance every id in the group's window is bound again inside the pool's new window;
+// ids already bound there keep their binding, ids outside the window lose theirs.
+TEST(KvCacheManagerV2BoundPoolTest, CompleteBindingsAfterMove)
+{
+    auto group = makeBoundGroup(SlotWindow{SlotId{0}, SlotId{8}}, SlotWindow{SlotId{40}, SlotId{48}}, kMiB);
+    auto& pool = group.arenaPool(PoolIndex{1});
+    // The group's window becomes [2, 10), pool 1's [44, 52). A remap has already dropped the
+    // bindings of free ids and moved the one block in use (id 3) into the new window.
+    for (SlotId s{0}; s < SlotId{8}; ++s)
+        pool.unbind(s);
+    pool.setWindow(SlotWindow{SlotId{40}, SlotId{52}});
+    pool.bind(SlotId{3}, SlotId{50}); // a block in use, already moved into the new window
+    pool.bind(SlotId{0}, SlotId{41}); // stale binding of an id about to leave the group's window
+    pool.setWindow(SlotWindow{SlotId{44}, SlotId{52}});
+    group.slotAllocator().expandWindow(SlotWindow{SlotId{0}, SlotId{10}});
+    group.slotAllocator().prepareForShrinkWindow(SlotWindow{SlotId{2}, SlotId{10}});
+    group.slotAllocator().finishShrink();
+    group.completeBindings();
+    EXPECT_FALSE(pool.localId(SlotId{0}).has_value());
+    EXPECT_EQ(pool.localId(SlotId{3}), SlotId{50});
+    std::vector<int> seen;
+    for (SlotId s{2}; s < SlotId{10}; ++s)
+    {
+        auto const local = pool.localId(s);
+        ASSERT_TRUE(local.has_value());
+        EXPECT_TRUE(pool.window().contains(*local));
+        seen.push_back(local->value());
+    }
+    std::sort(seen.begin(), seen.end());
+    EXPECT_TRUE(std::adjacent_find(seen.begin(), seen.end()) == seen.end());
+}
+
 } // namespace

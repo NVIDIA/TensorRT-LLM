@@ -406,9 +406,14 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         // The whole GPU quota becomes one arena, rounded down to whole physical chunks.
         size_t const arenaBytes = roundDown(gpuQuota, gpuGranularity);
-        mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel,
-            std::make_unique<ArenaGpuCacheLevelStorage>(
-                slotDescList(kHotLevel), arenaBytes, hotRatio, mHotMinSlots, *mGpuPhysMemAllocator));
+        auto arena = std::make_unique<ArenaGpuCacheLevelStorage>(
+            slotDescList(kHotLevel), arenaBytes, hotRatio, mHotMinSlots, *mGpuPhysMemAllocator);
+        // Migration to and from lower tiers addresses every pool of a GPU slot by one slot id (the
+        // cold-page codec); bound pools have their own ids, which it does not know yet.
+        TLLM_CHECK_WITH_INFO(!arena->hasBoundPools() || config.cacheTiers.size() == CacheLevel{1},
+            "Copy-based rebalancing with several pools in a pool group does not support host or disk "
+            "cache tiers yet");
+        mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, std::move(arena));
     }
     else
     {
@@ -677,11 +682,11 @@ std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGro
 
 Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const
 {
-    return mLevels.at(level).storage->slotAddress(pgIdx, slotId).at(poolIdx);
+    return mLevels.at(level).storage->poolGroup(pgIdx).slotAddress(slotId, poolIdx);
 }
 
 void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
-    PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+    PageIndexPair const* pageIndices, size_t numPages, CUstream stream, bool move)
 {
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
     PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
@@ -701,14 +706,26 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     {
         auto const srcSizes = slotSize(srcLevel, srcPgIdx);
         TLLM_CHECK_DEBUG(srcSizes == slotSize(dstLevel, dstPgIdx));
+        // A block moving within an arena group leaves its bound pools' data where it is: the
+        // destination slot id takes over the source's bindings.
+        bool const keepBoundPools = move && &srcPoolGroup == &dstPoolGroup && srcPoolGroup.hasBoundPools();
+        if (keepBoundPools)
+        {
+            for (size_t index = 0; index < numPages; ++index)
+            {
+                srcPoolGroup.swapBoundPoolBindings(toSlotId(pageIndices[index].dst), toSlotId(pageIndices[index].src));
+            }
+        }
         for (PoolIndex poolIdx{0}; poolIdx < srcSizes.size(); ++poolIdx)
         {
+            if (keepBoundPools && srcPoolGroup.isBoundPool(poolIdx))
+                continue;
             std::vector<CopyTask> tasks;
             tasks.reserve(numPages);
             for (size_t index = 0; index < numPages; ++index)
             {
-                tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[index].dst)).at(poolIdx),
-                    srcPoolGroup.slotAddress(toSlotId(pageIndices[index].src)).at(poolIdx)});
+                tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[index].dst), poolIdx),
+                    srcPoolGroup.slotAddress(toSlotId(pageIndices[index].src), poolIdx)});
             }
             // Per pool, not per group: a GPU-tier group holds device-backed pools beside
             // host-backed sparse ones, and the copy engine picks its implementation from
@@ -791,7 +808,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
             tasks.reserve(batchSize);
             for (size_t index = 0; index < batchSize; ++index)
             {
-                tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].dst)).at(PoolIndex{0}),
+                tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].dst), PoolIndex{0}),
                     Address{std::in_place_type<MemAddress>, staging.address() + index * coldPageBytes}});
             }
             mCopyEngine->transfer(CacheTier::DISK, CacheTier::HOST_MEM, coldPageBytes, tasks, stream);
@@ -803,7 +820,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
             for (size_t index = 0; index < batchSize; ++index)
             {
                 tasks.push_back({Address{std::in_place_type<MemAddress>, staging.address() + index * coldPageBytes},
-                    srcPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].src)).at(PoolIndex{0})});
+                    srcPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].src), PoolIndex{0})});
             }
             mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::DISK, coldPageBytes, tasks, stream);
             for (size_t index = 0; index < batchSize; ++index)
@@ -1430,8 +1447,8 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         {
             auto scope = tempStream.enter();
             CUstream const stream = tempStream.get();
-            submitMigrationBatch(
-                dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(), stream);
+            submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(),
+                stream, /*move=*/defrag);
         }
         updateReadyEvents.run();
 
@@ -1957,7 +1974,7 @@ void StorageManager::_relocateLockedPages(
         CUstream const stream = tempStream.get();
         for (auto const& [layerGroup, indices] : batches)
         {
-            submitMigrationBatch(level, level, layerGroup, indices.data(), indices.size(), stream);
+            submitMigrationBatch(level, level, layerGroup, indices.data(), indices.size(), stream, /*move=*/true);
         }
     }
     CachedCudaEvent const completion = tempStream.takeFinishEvent();
@@ -2024,7 +2041,15 @@ void StorageManager::adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<P
             std::ceil(static_cast<double>(unevictable) / static_cast<double>(mMaxUtilForResume)));
         minSlots[pgIdx] = std::max(minSlots[pgIdx], resumable);
     }
-    auto const newWindows = arena.computeWindows(ratioList, minSlots);
+    auto const newPoolWindows = arena.computePoolWindows(ratioList, minSlots);
+    if (arena.hasBoundPools())
+    {
+        adjustArenaPools(newPoolWindows, persistentPages, lockedPages);
+        return;
+    }
+    TypedVec<PoolGroupIndex, SlotWindow> newWindows;
+    for (auto const& windows : newPoolWindows)
+        newWindows.push_back(windows[PoolIndex{0}]);
     PoolGroupIndex const numPg = oldWindows.size();
     auto byteRange = [this](PoolGroupIndex pgIdx, SlotWindow w)
     {
@@ -2074,9 +2099,206 @@ void StorageManager::adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<P
     }
 }
 
-SlotCount StorageManager::slotIdUpperBound(PoolGroupIndex pgIdx) const
+void StorageManager::adjustArenaPools(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> const& newWindows,
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages)
 {
-    return mLevels.at(kHotLevel).storage->poolGroup(pgIdx).slotIdUpperBound();
+    auto& arena = static_cast<ArenaGpuCacheLevelStorage&>(*mLevels.at(kHotLevel).storage);
+    auto const oldWindows = arena.poolWindows();
+    PoolGroupIndex const numPg = oldWindows.size();
+
+    // 1. A group that shrinks first gives up the blocks that will not fit, so that each of its pools
+    //    can then move on its own, in any order.
+    TypedVec<PoolGroupIndex, SlotCount> giveUp(numPg, 0);
+    bool anyShrink = false;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        SlotCount const oldCount = oldWindows[pgIdx][PoolIndex{0}].size();
+        SlotCount const newCount = newWindows[pgIdx][PoolIndex{0}].size();
+        if (newCount < oldCount)
+        {
+            giveUp[pgIdx] = oldCount - newCount;
+            anyShrink = true;
+        }
+    }
+    if (anyShrink)
+    {
+        prepareFreeSlots(kHotLevel, giveUp);
+    }
+
+    // 2. Move every pool. One whose new bytes overlap another's old bytes waits for that one: pools
+    //    keep their order in the arena, so (as for whole groups) no two can wait for each other.
+    struct Entry
+    {
+        PoolGroupIndex pg;
+        PoolIndex pool;
+    };
+    std::vector<Entry> entries;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        for (PoolIndex poolIdx{0}; poolIdx < oldWindows[pgIdx].size(); ++poolIdx)
+            entries.push_back(Entry{pgIdx, poolIdx});
+    }
+    auto byteRange = [&](Entry const& e, SlotWindow w)
+    {
+        size_t const s = slotSize(kHotLevel, e.pg)[e.pool];
+        return std::make_pair(toSizeT(w.begin) * s, toSizeT(w.end) * s);
+    };
+    auto gainsFrom = [&](size_t a, size_t b)
+    {
+        auto const [aBegin, aEnd] = byteRange(entries[a], newWindows[entries[a].pg][entries[a].pool]);
+        auto const [bBegin, bEnd] = byteRange(entries[b], oldWindows[entries[b].pg][entries[b].pool]);
+        return a != b && aBegin < bEnd && bBegin < aEnd;
+    };
+    enum class State : std::uint8_t
+    {
+        kPending,
+        kMoving,
+        kDone
+    };
+    std::vector<State> state(entries.size(), State::kPending);
+    static std::vector<SharedPtr<Page>> const kNoPages;
+    std::function<void(size_t)> move = [&](size_t i)
+    {
+        if (state[i] == State::kDone)
+            return;
+        TLLM_CHECK_WITH_INFO(state[i] == State::kPending, "Cyclic arena window dependency");
+        state[i] = State::kMoving;
+        for (size_t other = 0; other < entries.size(); ++other)
+        {
+            if (gainsFrom(i, other))
+                move(other);
+        }
+        auto const [pgIdx, poolIdx] = entries[i];
+        SlotWindow const from = oldWindows[pgIdx][poolIdx];
+        SlotWindow const to = newWindows[pgIdx][poolIdx];
+        if (from != to)
+        {
+            if (poolIdx == PoolIndex{0})
+            {
+                moveArenaWindow(pgIdx, from, to, persistentPages ? (*persistentPages)[pgIdx] : kNoPages,
+                    lockedPages ? (*lockedPages)[pgIdx] : kNoPages);
+            }
+            else
+            {
+                remapArenaPool(pgIdx, poolIdx, to);
+            }
+        }
+        state[i] = State::kDone;
+    };
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        move(i);
+    }
+
+    // 3. Every slot id in a group's window is bound again, ready to be allocated.
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        arena.poolGroup(pgIdx).completeBindings();
+    }
+    arena.bumpBindingVersion();
+}
+
+void StorageManager::remapArenaPool(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotWindow target)
+{
+    auto& group = poolGroup(kHotLevel, pgIdx);
+    auto& pool = group.arenaPool(poolIdx);
+    TLLM_CHECK_WITH_INFO(pool.isBound(), "remapArenaPool: pool %d of group %d is not bound", poolIdx.value(),
+        pgIdx.value());
+    auto const inUse = group.slotAllocator().occupiedSlotIds();
+    TLLM_CHECK_WITH_INFO(slotCountValueFromSize(inUse.size()) <= target.size(),
+        "remapArenaPool: %zu blocks in use do not fit the new window of %ld slots", inUse.size(),
+        static_cast<long>(target.size()));
+
+    // Free group slot ids give up their bindings, which frees their ids for the blocks in use.
+    {
+        std::vector<std::uint8_t> used(pool.bindings().size(), 0);
+        for (SlotId const slot : inUse)
+            used.at(toSizeT(slot)) = 1;
+        for (size_t id = 0; id < used.size(); ++id)
+        {
+            if (!used[id])
+                pool.unbind(SlotId{static_cast<SlotCount>(id)});
+        }
+    }
+
+    // Blocks in use whose data lies outside the target move to free ids inside it.
+    pool.setWindow(pool.window().hull(target));
+    std::vector<CopyTask> tasks;
+    SlotId next = target.begin;
+    for (SlotId const slot : inUse)
+    {
+        auto const local = pool.localId(slot);
+        TLLM_CHECK_WITH_INFO(local.has_value(), "remapArenaPool: group slot id %ld is in use but not bound",
+            static_cast<long>(slot.value()));
+        if (target.contains(*local))
+            continue;
+        while (pool.groupId(next).has_value())
+            ++next;
+        TLLM_CHECK_DEBUG(target.contains(next));
+        tasks.push_back(CopyTask{Address{std::in_place_type<MemAddress>, pool.localAddress(next)},
+            Address{std::in_place_type<MemAddress>, pool.localAddress(*local)}});
+        pool.unbind(slot);
+        pool.bind(slot, next);
+    }
+    if (!tasks.empty())
+    {
+        // The rebalance runs between iterations. Every reader and writer of the blocks, and every
+        // earlier user of the space they move into, has finished once the context is idle.
+        cuCheck(cuCtxSynchronize());
+        TemporaryCudaStream tempStream(std::vector<CUevent>{});
+        {
+            auto scope = tempStream.enter();
+            mCopyEngine->transfer(CacheTier::GPU_MEM, CacheTier::GPU_MEM, pool.slotSize(), tasks, tempStream.get());
+        }
+        // The ids just vacated may be bound to a new block as soon as this returns.
+        tempStream.takeFinishEvent().synchronize();
+    }
+    pool.setWindow(target);
+}
+
+SlotCount StorageManager::slotIdUpperBound(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+{
+    if (!mGpuArena)
+    {
+        // VMM pools share the group's slot ids, and a pool may hold more slots than the group uses (the group's
+        // count is the minimum over its pools): views over any pool of the group cover the group's slots.
+        return numSlots(pgIdx, kHotLevel);
+    }
+    // Arena pools have arena-relative ids of their own; the bound is the pool's (the arena end).
+    return mLevels.at(kHotLevel).storage->poolGroup(pgIdx).slotIdUpperBound(poolIdx);
+}
+
+TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> StorageManager::hotPoolWindows() const
+{
+    auto const& storage = *mLevels.at(kHotLevel).storage;
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> result;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storage.numPoolGroups(); ++pgIdx)
+    {
+        auto const& pg = storage.poolGroup(pgIdx);
+        TypedVec<PoolIndex, SlotWindow> pools;
+        for (PoolIndex poolIdx{0}; poolIdx < pg.numPools(); ++poolIdx)
+        {
+            pools.push_back(mGpuArena ? pg.arenaPool(poolIdx).window() : pg.slotAllocator().window());
+        }
+        result.push_back(std::move(pools));
+    }
+    return result;
+}
+
+std::optional<std::vector<int32_t>> StorageManager::hotPoolBindings(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+{
+    auto const& pg = mLevels.at(kHotLevel).storage->poolGroup(pgIdx);
+    if (!pg.isBoundPool(poolIdx))
+        return std::nullopt;
+    return pg.arenaPool(poolIdx).bindings();
+}
+
+uint64_t StorageManager::hotPoolBindingVersion() const noexcept
+{
+    if (!mGpuArena)
+        return 0;
+    return static_cast<ArenaGpuCacheLevelStorage const&>(*mLevels.at(kHotLevel).storage).bindingVersion();
 }
 
 TypedVec<PoolGroupIndex, SlotWindow> StorageManager::hotWindows() const

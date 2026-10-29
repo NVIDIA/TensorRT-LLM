@@ -124,6 +124,17 @@ SlotCount SlotAllocator::numIssuedOutside(SlotWindow target) const noexcept
     return mNumIssuedOutsideTarget + mIssued.size() - mIssued.intersect(target).size();
 }
 
+std::vector<SlotId> SlotAllocator::occupiedSlotIds() const
+{
+    std::vector<SlotId> result;
+    for (SlotId id = mWindow.begin; id < mWindow.end; ++id)
+    {
+        if (mOccupiedMask.get(toSizeT(id)))
+            result.push_back(id);
+    }
+    return result;
+}
+
 SlotId SlotAllocator::issueFreshId()
 {
     TLLM_CHECK_DEBUG(mIssued.size() < mTarget.size());
@@ -467,8 +478,83 @@ void ArenaGpuSlotPool::setWindow(SlotWindow window)
 
 Address ArenaGpuSlotPool::slotAddress(SlotId slot) const
 {
+    if (mBound)
+    {
+        auto const local = localId(slot);
+        TLLM_CHECK_WITH_INFO(local.has_value(), "ArenaGpuSlotPool::slotAddress: group slot id %ld is not bound",
+            static_cast<long>(slot.value()));
+        return localAddress(*local);
+    }
     TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "ArenaGpuSlotPool::slotAddress: slot outside the pool's window");
     return MemAddress(mArenaBase + mSlotSize * toSizeT(slot));
+}
+
+MemAddress ArenaGpuSlotPool::localAddress(SlotId local) const
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(local), "ArenaGpuSlotPool::localAddress: id outside the pool's window");
+    return MemAddress(mArenaBase + mSlotSize * toSizeT(local));
+}
+
+void ArenaGpuSlotPool::bindInOrder(SlotWindow groupWindow, SlotCount groupIdBound)
+{
+    TLLM_CHECK_WITH_INFO(!mBound && groupWindow.size() == mWindow.size()
+            && toSizeT(groupWindow.end) <= slotCountToSizeT(groupIdBound),
+        "ArenaGpuSlotPool::bindInOrder: the group window must match this pool's window in size");
+    mBound = true;
+    mGroupToLocal.assign(slotCountToSizeT(groupIdBound), -1);
+    mLocalToGroup.assign(slotCountToSizeT(slotIdUpperBound()), -1);
+    for (SlotCount i = 0; i < groupWindow.size(); ++i)
+    {
+        bind(groupWindow.begin + i, mWindow.begin + i);
+    }
+}
+
+std::optional<SlotId> ArenaGpuSlotPool::localId(SlotId slot) const noexcept
+{
+    if (slot < SlotId{0} || toSizeT(slot) >= mGroupToLocal.size() || mGroupToLocal[toSizeT(slot)] < 0)
+        return std::nullopt;
+    return SlotId{mGroupToLocal[toSizeT(slot)]};
+}
+
+std::optional<SlotId> ArenaGpuSlotPool::groupId(SlotId local) const noexcept
+{
+    if (local < SlotId{0} || toSizeT(local) >= mLocalToGroup.size() || mLocalToGroup[toSizeT(local)] < 0)
+        return std::nullopt;
+    return SlotId{mLocalToGroup[toSizeT(local)]};
+}
+
+void ArenaGpuSlotPool::bind(SlotId slot, SlotId local)
+{
+    TLLM_CHECK_WITH_INFO(mBound && !localId(slot).has_value() && !groupId(local).has_value()
+            && toSizeT(slot) < mGroupToLocal.size() && toSizeT(local) < mLocalToGroup.size(),
+        "ArenaGpuSlotPool::bind: group slot id %ld or own id %ld is out of range or already bound",
+        static_cast<long>(slot.value()), static_cast<long>(local.value()));
+    mGroupToLocal[toSizeT(slot)] = static_cast<int32_t>(local.value());
+    mLocalToGroup[toSizeT(local)] = static_cast<int32_t>(slot.value());
+}
+
+void ArenaGpuSlotPool::unbind(SlotId slot)
+{
+    if (auto const local = localId(slot))
+    {
+        mLocalToGroup[toSizeT(*local)] = -1;
+        mGroupToLocal[toSizeT(slot)] = -1;
+    }
+}
+
+void ArenaGpuSlotPool::swapBindings(SlotId a, SlotId b)
+{
+    TLLM_CHECK_WITH_INFO(mBound && a >= SlotId{0} && b >= SlotId{0} && toSizeT(a) < mGroupToLocal.size()
+            && toSizeT(b) < mGroupToLocal.size(),
+        "ArenaGpuSlotPool::swapBindings: group slot id out of range");
+    auto const localA = localId(a);
+    auto const localB = localId(b);
+    unbind(a);
+    unbind(b);
+    if (localB)
+        bind(a, *localB);
+    if (localA)
+        bind(b, *localA);
 }
 
 Address ArenaGpuSlotPool::baseAddress() const
@@ -706,19 +792,75 @@ void PoolGroupBase::resizePools(std::optional<SlotCount> newNumSlots)
 void PoolGroupBase::setPoolWindows(SlotWindow window)
 {
     for (auto& p : mPools)
-        p->setWindow(window);
+    {
+        if (!p->isBound())
+            p->setWindow(window);
+    }
 }
 
-SlotCount PoolGroupBase::slotIdUpperBound() const noexcept
+bool PoolGroupBase::hasBoundPools() const noexcept
 {
-    if (mPools.empty())
-        return 0;
-    SlotCount bound = mPools.front()->slotIdUpperBound();
+    return std::any_of(mPools.begin(), mPools.end(), [](auto const& p) { return p->isBound(); });
+}
+
+ArenaGpuSlotPool& PoolGroupBase::arenaPool(PoolIndex poolIdx)
+{
+    auto* pool = dynamic_cast<ArenaGpuSlotPool*>(mPools.at(poolIdx).get());
+    TLLM_CHECK_WITH_INFO(pool != nullptr, "PoolGroupBase::arenaPool: pool %d is not an arena pool", poolIdx.value());
+    return *pool;
+}
+
+ArenaGpuSlotPool const& PoolGroupBase::arenaPool(PoolIndex poolIdx) const
+{
+    return const_cast<PoolGroupBase*>(this)->arenaPool(poolIdx);
+}
+
+void PoolGroupBase::swapBoundPoolBindings(SlotId dst, SlotId src)
+{
     for (PoolIndex poolIdx{1}; poolIdx < mPools.size(); ++poolIdx)
     {
-        bound = std::min(bound, mPools[poolIdx]->slotIdUpperBound());
+        if (mPools[poolIdx]->isBound())
+            arenaPool(poolIdx).swapBindings(dst, src);
     }
-    return bound;
+}
+
+void PoolGroupBase::completeBindings()
+{
+    SlotWindow const window = mSlotAllocator.window();
+    for (PoolIndex poolIdx{1}; poolIdx < mPools.size(); ++poolIdx)
+    {
+        if (!mPools[poolIdx]->isBound())
+            continue;
+        auto& pool = arenaPool(poolIdx);
+        TLLM_CHECK_WITH_INFO(pool.window().size() == window.size(),
+            "completeBindings: bound pool %d has %ld slots, the group %ld", poolIdx.value(),
+            static_cast<long>(pool.window().size()), static_cast<long>(window.size()));
+        // Ids outside the window are free, so their bindings go.
+        auto const& bindings = pool.bindings();
+        for (size_t id = 0; id < bindings.size(); ++id)
+        {
+            SlotId const slot{static_cast<SlotCount>(id)};
+            if (bindings[id] >= 0 && !window.contains(slot))
+                pool.unbind(slot);
+        }
+        // Every id inside the window gets one of the pool's ids, in order.
+        SlotId local = pool.window().begin;
+        for (SlotId slot = window.begin; slot < window.end; ++slot)
+        {
+            if (pool.localId(slot).has_value())
+            {
+                TLLM_CHECK_WITH_INFO(pool.window().contains(*pool.localId(slot)),
+                    "completeBindings: group slot id %ld is bound outside its pool's window",
+                    static_cast<long>(slot.value()));
+                continue;
+            }
+            while (pool.groupId(local).has_value())
+                ++local;
+            TLLM_CHECK_WITH_INFO(pool.window().contains(local), "completeBindings: bound pool %d ran out of ids",
+                poolIdx.value());
+            pool.bind(slot, local);
+        }
+    }
 }
 
 TypedVec<PoolIndex, Address> PoolGroupBase::slotAddress(SlotId slotId) const
@@ -803,17 +945,25 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
     }
 }
 
-GpuPoolGroup::GpuPoolGroup(SlotWindow window, SlotAllocator::Growth growth,
+GpuPoolGroup::GpuPoolGroup(TypedVec<PoolIndex, SlotWindow> const& poolWindows, SlotAllocator::Growth growth,
     TypedVec<PoolIndex, size_t> const& slotSizeList, MemAddress arenaBase, size_t arenaBytes, size_t arenaGranularity)
-    : PoolGroupBase(window, growth)
+    : PoolGroupBase(poolWindows.at(PoolIndex{0}), growth)
 {
-    // A group's pools share slot ids, but in an arena each pool needs its own region that moves
-    // with the others; that layout is not implemented, so the arena takes one pool per group.
-    TLLM_CHECK_WITH_INFO(slotSizeList.size() == PoolIndex{1},
-        "Copy-based rebalancing supports exactly one pool per pool group (this group has %d)",
-        slotSizeList.size().value());
-    mPools.push_back(std::make_unique<ArenaGpuSlotPool>(
-        slotSizeList[PoolIndex{0}], arenaBase, arenaBytes, window, arenaGranularity));
+    TLLM_CHECK_WITH_INFO(poolWindows.size() == slotSizeList.size() && !slotSizeList.empty(),
+        "GpuPoolGroup: one arena window per pool is required");
+    SlotWindow const groupWindow = poolWindows[PoolIndex{0}];
+    for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
+    {
+        mPools.push_back(
+            std::make_unique<ArenaGpuSlotPool>(
+                slotSizeList[poolIdx], arenaBase, arenaBytes, poolWindows[poolIdx], arenaGranularity));
+    }
+    // Pool 0's ids are the group's; the other pools bind them to their own.
+    SlotCount const groupIdBound = mPools[PoolIndex{0}]->slotIdUpperBound();
+    for (PoolIndex poolIdx{1}; poolIdx < slotSizeList.size(); ++poolIdx)
+    {
+        arenaPool(poolIdx).bindInOrder(groupWindow, groupIdBound);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -909,24 +1059,6 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 // ArenaGpuCacheLevelStorage
 // ---------------------------------------------------------------------------
 
-namespace
-{
-TypedVec<PoolGroupIndex, size_t> singlePoolSlotSizes(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList)
-{
-    TypedVec<PoolGroupIndex, size_t> sizes;
-    sizes.reserve(slotDescList.size());
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
-    {
-        auto const sizeList = slotDescList[pgIdx].slotSizeList();
-        TLLM_CHECK_WITH_INFO(sizeList.size() == PoolIndex{1},
-            "Copy-based rebalancing supports exactly one pool per pool group (pool group %d has %d)", pgIdx.value(),
-            sizeList.size().value());
-        sizes.push_back(sizeList[PoolIndex{0}]);
-    }
-    return sizes;
-}
-} // namespace
-
 ArenaGpuCacheLevelStorage::ArenaGpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     size_t arenaBytes, TypedVec<PoolGroupIndex, float> const& ratioList,
     TypedVec<PoolGroupIndex, SlotCount> const& minSlots, PooledPhysMemAllocator& physMemAllocator)
@@ -947,12 +1079,16 @@ ArenaGpuCacheLevelStorage::ArenaGpuCacheLevelStorage(TypedVec<PoolGroupIndex, Sl
                 pgIdx.value(), p.value());
         }
     }
-    auto const sizes = singlePoolSlotSizes(slotDescList);
-    auto const windows = computeArenaWindows(arenaBytes, sizes, ratioList, minSlots);
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
+    sizes.reserve(slotDescList.size());
+    for (auto const& slotDesc : slotDescList)
+        sizes.push_back(slotDesc.slotSizeList());
+    auto const windows = computeArenaPoolWindows(arenaBytes, sizes, ratioList, minSlots);
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(windows[pgIdx], growthFor(pgIdx, slotDescList.size()),
-            slotDescList[pgIdx].slotSizeList(), arenaBase(), arenaBytes, physMemAllocator.physMemSize()));
+        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
+            windows[pgIdx], growthFor(pgIdx, slotDescList.size()), sizes[pgIdx], arenaBase(), arenaBytes,
+            physMemAllocator.physMemSize()));
     }
 }
 
@@ -967,12 +1103,12 @@ void ArenaGpuCacheLevelStorage::destroy()
     mArena.destroy();
 }
 
-TypedVec<PoolGroupIndex, size_t> ArenaGpuCacheLevelStorage::slotSizes() const
+TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> ArenaGpuCacheLevelStorage::slotSizes() const
 {
-    TypedVec<PoolGroupIndex, size_t> sizes;
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> sizes;
     sizes.reserve(mPoolGroups.size());
     for (auto const& pg : mPoolGroups)
-        sizes.push_back(pg->slotSize()[PoolIndex{0}]);
+        sizes.push_back(pg->slotSize());
     return sizes;
 }
 
@@ -985,10 +1121,136 @@ TypedVec<PoolGroupIndex, SlotWindow> ArenaGpuCacheLevelStorage::windows() const
     return result;
 }
 
-TypedVec<PoolGroupIndex, SlotWindow> ArenaGpuCacheLevelStorage::computeWindows(
+TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStorage::poolWindows() const
+{
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> result;
+    result.reserve(mPoolGroups.size());
+    for (auto const& pg : mPoolGroups)
+    {
+        TypedVec<PoolIndex, SlotWindow> pools;
+        for (PoolIndex poolIdx{0}; poolIdx < pg->numPools(); ++poolIdx)
+            pools.push_back(pg->arenaPool(poolIdx).window());
+        result.push_back(std::move(pools));
+    }
+    return result;
+}
+
+TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStorage::computePoolWindows(
     TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
-    return computeArenaWindows(mArenaBytes, slotSizes(), ratioList, minSlots);
+    return computeArenaPoolWindows(mArenaBytes, slotSizes(), ratioList, minSlots);
+}
+
+bool ArenaGpuCacheLevelStorage::hasBoundPools() const noexcept
+{
+    return std::any_of(mPoolGroups.begin(), mPoolGroups.end(), [](auto const& pg) { return pg->hasBoundPools(); });
+}
+
+TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStorage::computeArenaPoolWindows(
+    size_t arenaBytes, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizes,
+    TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
+{
+    PoolGroupIndex const numPg = slotSizes.size();
+    TLLM_CHECK_WITH_INFO(numPg > PoolGroupIndex{0} && ratioList.size() == numPg && minSlots.size() == numPg,
+        "computeArenaPoolWindows: slot sizes, ratios and min slots must have one entry per pool group");
+    bool const singlePools = std::all_of(
+        slotSizes.begin(), slotSizes.end(), [](auto const& sizes) { return sizes.size() == PoolIndex{1}; });
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> result(numPg);
+    if (singlePools)
+    {
+        TypedVec<PoolGroupIndex, size_t> groupSizes;
+        for (auto const& sizes : slotSizes)
+            groupSizes.push_back(sizes[PoolIndex{0}]);
+        auto const windows = computeArenaWindows(arenaBytes, groupSizes, ratioList, minSlots);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+            result[pgIdx] = TypedVec<PoolIndex, SlotWindow>{windows[pgIdx]};
+        return result;
+    }
+
+    TypedVec<PoolGroupIndex, size_t> perSlot(numPg, 0);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        TLLM_CHECK_WITH_INFO(!slotSizes[pgIdx].empty() && ratioList[pgIdx] > 0.f,
+            "computeArenaPoolWindows: every group needs a pool and a positive ratio");
+        for (size_t const s : slotSizes[pgIdx])
+        {
+            TLLM_CHECK_WITH_INFO(s > 0, "computeArenaPoolWindows: slot sizes must be positive");
+            perSlot[pgIdx] += s;
+        }
+    }
+    auto minSlotsOf = [&](PoolGroupIndex pgIdx) { return std::max(minSlots[pgIdx], SlotCount{1}); };
+    // A pool loses under one of its blocks where its share begins (rounding up to a whole block) and
+    // under one where it ends; the group then keeps the count every pool reaches.
+    auto floorBytesOf = [&](PoolGroupIndex pgIdx)
+    { return static_cast<double>((slotCountToSizeT(minSlotsOf(pgIdx)) + 2) * perSlot[pgIdx]); };
+
+    // 1. Byte share per group, pinning groups below their floor as computeArenaWindows does.
+    TypedVec<PoolGroupIndex, double> share(numPg, 0.0);
+    TypedVec<PoolGroupIndex, std::uint8_t> pinned(numPg, 0);
+    double budget = static_cast<double>(arenaBytes);
+    while (true)
+    {
+        double ratioSum = 0.0;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+        {
+            if (!pinned[pgIdx])
+                ratioSum += static_cast<double>(ratioList[pgIdx]);
+        }
+        if (ratioSum == 0.0)
+            break;
+        bool newlyPinned = false;
+        double pinnedBytes = 0.0;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+        {
+            if (pinned[pgIdx])
+                continue;
+            share[pgIdx] = budget * static_cast<double>(ratioList[pgIdx]) / ratioSum;
+            double const floorBytes = floorBytesOf(pgIdx);
+            if (share[pgIdx] < floorBytes)
+            {
+                share[pgIdx] = floorBytes;
+                pinned[pgIdx] = 1;
+                pinnedBytes += floorBytes;
+                newlyPinned = true;
+            }
+        }
+        budget -= pinnedBytes;
+        if (budget < 0.0)
+        {
+            throw std::invalid_argument("GPU arena of " + std::to_string(arenaBytes)
+                + " bytes is too small for the pool groups' min_slots constraints");
+        }
+        if (!newlyPinned)
+            break;
+    }
+
+    // 2. Pools one after another; each takes its group's share in proportion to its slot size.
+    double begin = 0.0;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        auto const& sizes = slotSizes[pgIdx];
+        TypedVec<PoolIndex, SlotId> first(sizes.size(), SlotId{0});
+        SlotCount count = std::numeric_limits<SlotCount>::max();
+        for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+        {
+            double const s = static_cast<double>(sizes[poolIdx]);
+            double const end = std::min(begin + share[pgIdx] * s / static_cast<double>(perSlot[pgIdx]),
+                static_cast<double>(arenaBytes));
+            first[poolIdx] = SlotId{static_cast<SlotCount>(std::ceil(begin / s))};
+            auto const last = static_cast<SlotCount>(std::floor(end / s));
+            count = std::min(count, std::max(SlotCount{0}, last - first[poolIdx].value()));
+            begin = end;
+        }
+        if (count < minSlotsOf(pgIdx))
+        {
+            throw std::invalid_argument("GPU arena of " + std::to_string(arenaBytes) + " bytes leaves pool group "
+                + std::to_string(pgIdx.value()) + " " + std::to_string(count) + " slots, below its minimum of "
+                + std::to_string(minSlotsOf(pgIdx)));
+        }
+        for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+            result[pgIdx].push_back(SlotWindow{first[poolIdx], first[poolIdx] + count});
+    }
+    return result;
 }
 
 SlotAllocator::Growth ArenaGpuCacheLevelStorage::growthFor(PoolGroupIndex pgIdx, PoolGroupIndex numPoolGroups) noexcept
