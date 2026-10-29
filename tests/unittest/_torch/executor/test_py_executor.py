@@ -3127,7 +3127,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
         seen["active"] = total_num_active_requests
         seen["all_ranks"] = all_ranks_num_active_requests
-        return []
+        return [], {}
 
     stub._pop_from_waiting_queue = _pop
     with patch(

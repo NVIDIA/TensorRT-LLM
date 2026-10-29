@@ -29,7 +29,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
@@ -2411,14 +2411,16 @@ def _fp8_quantize_1x128_sm90_constraint(inputs: List[List[int]]) -> int:
 @lru_cache(maxsize=None)
 def _get_fp8_block_scaling_gemm_constraint_spec(
         sm_version: int) -> Tuple[ConstraintSpec, ...]:
-    if sm_version == 120:
+    if is_sm_120f(sm_version):
         return (ConstraintSpec(2, 0,
                                _fp8_block_scaling_gemm_sm120_constraint), )
-    if sm_version >= 100:
+    if is_sm_100f(sm_version):
         return (ConstraintSpec(2, 1,
                                _fp8_block_scaling_gemm_sm100_constraint), )
-    else:
+    if sm_version in (89, 90):
         return (ConstraintSpec(2, 0, _fp8_quantize_1x128_sm90_constraint), )
+
+    raise NotImplementedError(f"Unsupported GPU architecture: {sm_version}")
 
 
 def get_fp8_block_scaling_gemm_constraint_spec() -> Tuple[ConstraintSpec, ...]:
