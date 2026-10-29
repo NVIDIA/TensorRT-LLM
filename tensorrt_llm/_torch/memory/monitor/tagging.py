@@ -425,10 +425,31 @@ def _log_window_result(
     except Exception as exc:  # noqa: BLE001 - never fail startup over a log line
         logger.debug(f"memory monitor: startup summary failed ({type(exc).__name__}: {exc})")
 
+    from . import startup
     from .triggers import report_now
 
     tag_name = "startup_failed" if failed else "startup_complete"
-    report = report_now(tag=tag_name, rank=rank)
+    headline, suggestion = "", ""
+    step = startup.failed_stage() if failed else None
+    if step is not None:
+        headline = (
+            f"STARTUP FAILED while creating: {step.name} "
+            f"(free device memory before it: {step.free_before / (1 << 30):.2f} GiB)."
+        )
+        suggestion = startup.advice_for_stage(step.stage) or ""
+    elif failed:
+        headline = "STARTUP FAILED."
+    # A completed startup, warmup included, is the baseline later reports
+    # compare against: every static allocation exists by now, and warmup
+    # has already run the largest shapes, so later growth is the workload's.
+    report = report_now(
+        tag=tag_name,
+        rank=rank,
+        record_baseline=not failed,
+        headline=headline,
+        suggestion=suggestion,
+        startup_steps=True,
+    )
     if report is not None:
         log = logger.warning if failed else logger.info
         log(f"memory monitor: {tag_name.replace('_', ' ')} breakdown\n{report}")

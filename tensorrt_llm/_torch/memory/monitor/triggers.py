@@ -31,6 +31,13 @@ forwards "run with device memory deliberately exhausted". torch's observer
 fires before anyone catches, so arming it earlier reports every one of
 those as if it were a failure.
 
+torch's observer only sees the PyTorch allocator. Allocations made in C++ --
+cuBLAS workspaces, NCCL buffers, TensorRT-LLM's own pools -- fail with a
+plain error that the executor catches per iteration, so the executor's error
+handler also passes its message through :func:`notify_error`, which reports
+when the message describes an out-of-memory condition. Both paths share one
+rate limit, so a torch OOM that the executor then handles is reported once.
+
 The handler runs while an allocation is failing, so it allocates no device
 memory and swallows every exception. Reports are limited by time rather
 than by count: a retry loop that OOMs repeatedly collapses to one report
@@ -40,6 +47,7 @@ per interval, while an unrelated OOM hours later is still reported.
 from __future__ import annotations
 
 import os
+import re
 import time
 
 import torch
@@ -48,6 +56,7 @@ from tensorrt_llm.logger import logger
 
 __all__ = [
     "install_oom_reporter",
+    "notify_error",
     "report_now",
     "uninstall_oom_reporter",
 ]
@@ -61,8 +70,18 @@ _DEFAULT_INTERVAL_S = 60.0
 #: attach would double every report.
 _attached = False
 
+#: Whether OOM reporting is armed. Independent of ``_attached``: errors
+#: passed to :func:`notify_error` are reported even where torch offers no
+#: observer.
 _enabled_flag = False
 _last_report_at: float | None = None
+
+#: Messages from CUDA, the driver, NCCL and TensorRT-LLM's C++ code that mean
+#: an allocation failed.
+_OOM_PATTERN = re.compile(
+    r"out of memory|OUT_OF_MEMORY|cudaErrorMemoryAllocation|OutOfMemoryError",
+    re.IGNORECASE,
+)
 
 
 def _interval_s() -> float:
@@ -75,16 +94,33 @@ def _interval_s() -> float:
         return _DEFAULT_INTERVAL_S
 
 
-def report_now(tag: str, rank: int | None = None) -> str | None:
+def report_now(
+    tag: str,
+    rank: int | None = None,
+    *,
+    headline: str = "",
+    record_baseline: bool = False,
+    suggestion: str = "",
+    startup_steps: bool = False,
+) -> str | None:
     """Render the monitor for this process, or ``None`` if it is disabled.
 
     Returns the text as well as logging it so a caller can attach it to an
     exception or a crash dump rather than hoping the log survives.
+    ``record_baseline`` makes this reading the one later reports compare
+    against.
     """
     from . import capture, render_capture
 
     try:
-        snapshot = capture(tag=tag, rank=rank)
+        snapshot = capture(
+            tag=tag,
+            rank=rank,
+            headline=headline,
+            record_baseline=record_baseline,
+            suggestion=suggestion,
+            startup_steps=startup_steps,
+        )
     except Exception as exc:  # noqa: BLE001 - a report must not add a failure
         logger.warning(f"memory monitor: capture for {tag!r} failed ({type(exc).__name__}: {exc})")
         return None
@@ -99,7 +135,8 @@ def report_now(tag: str, rank: int | None = None) -> str | None:
         return None
 
 
-def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserved: int) -> None:
+def _report_oom(headline: str) -> None:
+    """Emit one OOM report, subject to the shared rate limit. Never raises."""
     global _last_report_at
 
     if not _enabled_flag:
@@ -109,19 +146,36 @@ def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserv
         return
     _last_report_at = now
 
-    gib = 1 << 30
     try:
-        header = (
-            f"memory monitor: out of memory on device {device} -- "
-            f"request {allocation_bytes / gib:.2f} GiB, "
-            f"torch allocated {allocated / gib:.2f} GiB, "
-            f"torch reserved {reserved / gib:.2f} GiB"
-        )
-        report = report_now(tag="out_of_memory")
+        report = report_now(tag="out_of_memory", headline=headline)
         # WARNING rather than ERROR: the caller may yet handle the OOM, and
-        # the OutOfMemoryError itself is what reports the failure.
-        logger.warning(header if report is None else f"{header}\n{report}")
+        # the error itself is what reports the failure.
+        logger.warning(
+            f"memory monitor: {headline}" if report is None else f"memory monitor:\n{report}"
+        )
     except Exception:  # noqa: BLE001 - never add a second failure to an OOM
+        pass
+
+
+def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserved: int) -> None:
+    _report_oom(
+        f"OUT OF MEMORY: PyTorch could not allocate {allocation_bytes / (1 << 30):.2f} GiB "
+        f"on device {device}."
+    )
+
+
+def notify_error(message: str | None) -> None:
+    """Report if ``message`` describes an out-of-memory error. Never raises.
+
+    For errors raised outside the PyTorch allocator, which torch's observer
+    does not see. Cheap when the monitor is off or the message is unrelated.
+    """
+    try:
+        if not _enabled_flag or not message or not _OOM_PATTERN.search(message):
+            return
+        first_line = message.strip().splitlines()[0][:200]
+        _report_oom(f"OUT OF MEMORY reported by the executor: {first_line}")
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -141,14 +195,16 @@ def install_oom_reporter(rank: int | None = None) -> bool:
     if not enabled(rank):
         return False
 
+    # Armed even if torch's observer cannot be attached: errors from outside
+    # the PyTorch allocator still arrive through notify_error.
+    _enabled_flag = True
     if _attached:
-        _enabled_flag = True
         return True
 
     attach = getattr(torch._C, "_cuda_attach_out_of_memory_observer", None)
     if attach is None:
         logger.debug("memory monitor: this torch has no OOM observer")
-        return False
+        return True
 
     try:
         attach(_on_out_of_memory)
@@ -156,10 +212,9 @@ def install_oom_reporter(rank: int | None = None) -> bool:
         logger.debug(
             f"memory monitor: could not attach the OOM observer ({type(exc).__name__}: {exc})"
         )
-        return False
+        return True
 
     _attached = True
-    _enabled_flag = True
     return True
 
 

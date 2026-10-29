@@ -142,9 +142,13 @@ class TestUnknownIsNotZero:
         )
         text = render(frame, _capability())
         assert UNAVAILABLE.strip() in text
-        dwdp_lines = [line for line in text.splitlines() if str(Category.DWDP_PAGES) in line]
+        # The detail row for the category itself, not the summary row that
+        # names it among the unmeasured (whose "50.00 GiB" contains "0.00 GiB").
+        dwdp_lines = [
+            line for line in text.splitlines() if line.split()[:1] == [str(Category.DWDP_PAGES)]
+        ]
         assert dwdp_lines
-        assert not any("0.00 GiB" in line for line in dwdp_lines)
+        assert not any(" 0.00 GiB" in line for line in dwdp_lines)
 
     def test_unknown_survives_category_aggregation(self):
         frame = build_frame(
