@@ -59,6 +59,7 @@ def build_attention_metadata(
     draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
     enable_context_mla_with_cached_kv: bool | None = None,
     max_num_heads_per_kv: int | None = None,
+    enable_ragged_verification: bool = False,
 ) -> AttentionMetadata:
     """Construct attention metadata and resolve model-derived inputs."""
     pretrained_config = model_config.pretrained_config
@@ -75,6 +76,15 @@ def build_attention_metadata(
         if sparse_attention_config is not None
         else None
     )
+    metadata_kwargs = {}
+    if enable_ragged_verification:
+        from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+            DSAtrtllmAttentionMetadata,
+        )
+
+        if not issubclass(attention_backend.Metadata, DSAtrtllmAttentionMetadata):
+            raise ValueError("Ragged verification requires the DSA target metadata backend")
+        metadata_kwargs["enable_ragged_verification"] = True
     return attention_backend.Metadata(
         max_num_requests=max_batch_size,
         max_num_tokens=max_num_tokens,
@@ -88,4 +98,5 @@ def build_attention_metadata(
         cache_indirection=cache_indirection,
         max_num_heads_per_kv=max_num_heads_per_kv,
         sparse_metadata_params=sparse_metadata_params,
+        **metadata_kwargs,
     )

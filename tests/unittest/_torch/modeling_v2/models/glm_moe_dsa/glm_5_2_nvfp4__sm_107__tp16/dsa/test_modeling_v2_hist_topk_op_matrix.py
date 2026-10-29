@@ -7,6 +7,7 @@ The matrix itself is ``_hist_topk_op_matrix.py`` beside this file, its own 4-ran
 need the 4-node launch its docstring describes.
 """
 
+__extra_import_path__ = ["."]
 import _glm_rank_job
 import pytest
 import torch

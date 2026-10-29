@@ -4,14 +4,15 @@
 
 Both the Triton reference and the MSA (fmha_sm100) path share these
 backend-neutral pieces: the lowered parameter and per-rank kernel config
-bundles, block-priority sentinels, and the paged-cache slot mapping builder.
+bundles, block-priority sentinels, the paged-cache slot mapping builder, and
+the dense/sparse layer split the model and the KV cache manager both read.
 MSA-only helpers live in :mod:`.kernels.msa_utils`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -24,6 +25,8 @@ from ..params import SparseMetadataParams, SparseParams
 from .kernels.paged_cache import write_kv_slots
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm.mapping import Mapping
 
 # Sentinel scores that force init and local blocks into the top-k regardless
@@ -54,6 +57,26 @@ def index_head_range(
     rank = 0 if tp_size == 1 else mapping.tp_rank // (tp_size // shard_count)
     count = num_index_heads // shard_count
     return rank * count, (rank + 1) * count
+
+
+def get_sparse_layer_ids(text_config: "PretrainedConfig") -> Tuple[List[int], List[int]]:
+    """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
+    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
+    n_layers = int(text_config.num_hidden_layers)
+    if sparse_cfg is None:
+        return list(range(n_layers)), []
+    if not sparse_cfg.get("use_sparse_attention", True):
+        return list(range(n_layers)), []
+    freq = sparse_cfg.get("sparse_attention_freq")
+    if freq is None:
+        return list(range(n_layers)), []
+    if len(freq) != n_layers:
+        raise ValueError(
+            f"sparse_attention_freq length {len(freq)} does not match num_hidden_layers {n_layers}"
+        )
+    dense = [i for i, f in enumerate(freq) if int(f) == 0]
+    sparse = [i for i, f in enumerate(freq) if int(f) != 0]
+    return dense, sparse
 
 
 @dataclass(frozen=True)
@@ -300,5 +323,6 @@ __all__ = [
     "MiniMaxM3SparseParams",
     "PagedKvSlotMapping",
     "build_paged_kv_slot_mapping",
+    "get_sparse_layer_ids",
     "write_kv_slots",
 ]
