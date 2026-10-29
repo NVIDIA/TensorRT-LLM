@@ -707,9 +707,6 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
             testListCmd += ["--durations-path ${durationsPath}"]
         }
         testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
-        if (testDBList.contains('/waive_refresh_validation_')) {
-            testListCmd += ['test_unittests.py']
-        }
 
         try {
             // First execute the pytest command and check if it succeeds
@@ -1671,9 +1668,6 @@ def getPytestBaseCommandLine(
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-    if (stageName.startsWith('CPU-Generic-WaiveRefresh-')) {
-        extraInternalEnv += " TRTLLM_WAIVE_REFRESH_VALIDATION=${stageName}"
-    }
     // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
@@ -1765,9 +1759,6 @@ def getPytestBaseCommandLine(
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" :
         (stageName =~ /PackageSanityCheck|-Sanity-Test/) ? "" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
-    if (stageName.startsWith('CPU-Generic-WaiveRefresh-')) {
-        testCmdLine += ['test_unittests.py']
-    }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -4510,21 +4501,6 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
 }
 
 def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null) {
-    if (stageName.startsWith('CPU-Generic-WaiveRefresh-')) {
-        sh """
-            wget -nv --tries=3 -O '${llmSrc}/waive_validation_scripts.tar.gz' \
-                'https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive-validation/waive_validation_scripts.tar.gz'
-            tar -xzf '${llmSrc}/waive_validation_scripts.tar.gz' -C '${llmSrc}'
-            sha256sum '${llmSrc}/jenkins/scripts/refresh_test_waives.py' '${llmSrc}/tests/integration/defs/test_unittests.py'
-        """
-        def testList = "${llmSrc}/waive_refresh_validation_${stageName}.txt"
-        def isolated = stageName.contains('-Isolated-') ? ' ISOLATION' : ''
-        sh """printf '%s\\n' \
-            'unittest/llmapi/test_mpi_session.py::test_remote_mpi_session[submit_sync]${isolated}' \
-            'unittest/llmapi/test_mpi_session.py::test_mpi_session_basic' > '${testList}'"""
-        echo "[WAIVE-VALIDATION] Two explicit pytest cases for ${stageName}: ${testList}"
-        return testList
-    }
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
@@ -6778,16 +6754,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
-    if (globalVars[GITHUB_PR_API_URL]?.endsWith('/pulls/21009')) {
-        def validationConfigs = [
-            "CPU-Generic-WaiveRefresh-Pass-1": ["cpu", "l0_cpu", 1, 1],
-            "CPU-Generic-WaiveRefresh-Fail-1": ["cpu", "l0_cpu", 1, 1],
-            "CPU-Generic-WaiveRefresh-Isolated-1": ["cpu", "l0_cpu", 1, 1],
-        ]
-        x86TestConfigs += validationConfigs.findAll { key, value ->
-            key in (testFilter[TEST_STAGE_LIST] ?: [])
-        }
-    }
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
