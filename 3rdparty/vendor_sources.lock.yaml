@@ -25,6 +25,7 @@ vendors:
     digest: sha256-tree-v1:f2f444f7e6d4ad688fbf4e1e9eed11ff7c78d835cfd0af5ef9d7660780b059e0
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
+    # TODO: When an OpenEngine release includes Shutdown, pin its tag and commit and update the BSR release in the schema manifest.
     branch: feat/engine-shutdown-rpc
     commit: 78ac56152781559b5e4e8ae9ef357aaee833f19f
     source: proto/openengine/v1
