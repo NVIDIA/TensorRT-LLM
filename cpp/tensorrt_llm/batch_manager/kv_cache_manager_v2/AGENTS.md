@@ -321,7 +321,9 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   each living cache holds exactly one, so that capacity keeps the group at or
   below the resume gate. All three call sites take fixed groups out of the quota
   first and split the rest by ratio; their ratio entries are ignored, `adjust()`
-  never resizes them, and their tuner target is their actual size.
+  never resizes them, and their tuner target is their actual size. The fixed
+  capacity is also the group's entry in `mMinSlots`, so a GPU quota too small
+  for all floors is raised to fit it, as for the elastic floors.
   `createKvCache()` enforces the bound (suspended caches count) and
   `setBeamWidth()` rejects widths above one. Other PRIVATE lifecycles, such as
   windowed attention, stay ratio-sized because their per-cache demand depends on

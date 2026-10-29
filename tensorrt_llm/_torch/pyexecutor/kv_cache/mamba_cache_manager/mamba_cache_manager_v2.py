@@ -49,7 +49,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
     _compute_index_mapper_capacity,
-    _gpu_alloc_granularity,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -70,7 +69,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     DataRole,
-    GpuCacheTierConfig,
     KVCacheDesc,
     LayerId,
     PageIndexMode,
@@ -783,9 +781,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             for batch in config.constraints
         ]
 
-        if self._private_replay_layouts:
-            cache_tiers = self._fit_fixed_replay_pool(cache_tiers, layers)
-
         typical_step = config.typical_step
         if config.initial_pool_ratio is None:
             typical_capacity = self._get_typical_request_capacity(kv_cache_config)
@@ -824,41 +819,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # capacity bounds the living caches that each hold a PRIVATE slot.
             max_live_kv_caches=self._max_live_kv_caches() or config.max_live_kv_caches,
         )
-
-    def _fit_fixed_replay_pool(self, cache_tiers: list, layers: list) -> list:
-        """Raise a small GPU quota so the fixed PRIVATE replay pool fits.
-
-        The native manager raises a quota below the elastic pools' minimum
-        slots, but a fixed-capacity pool must fit in the configured quota
-        together with those minimums, each pool rounded up to whole allocation
-        units. Near the minimum, allow one unit per pool, bounded by the
-        distinct buffer classes of the layers.
-        """
-        gpu_quota = cache_tiers[0].quota
-        num_pools = len(
-            {
-                (
-                    isinstance(layer, SsmLayerConfig),
-                    getattr(layer, "sliding_window_size", None),
-                    layer.reuse_policy if buffer.reuse_policy is None else buffer.reuse_policy,
-                    buffer.size,
-                    buffer.coalescing_group,
-                    buffer.tokens_per_block_override,
-                )
-                for layer in layers
-                for buffer in layer.buffers
-            }
-        )
-        minimum_quota = math.ceil(
-            self._minimum_live_gpu_quota() / self.kv_cache_config.max_util_for_resume
-        ) + num_pools * _gpu_alloc_granularity(gpu_quota)
-        if gpu_quota >= minimum_quota:
-            return cache_tiers
-        logger.info(
-            f"Raising the V2 Mamba GPU cache quota from {gpu_quota} to {minimum_quota} bytes "
-            "to fit the fixed-capacity replay pool and the minimum slots of the other pools."
-        )
-        return [GpuCacheTierConfig(quota=int(minimum_quota)), *cache_tiers[1:]]
 
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""

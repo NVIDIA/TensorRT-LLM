@@ -4209,9 +4209,7 @@ def test_v2_hybrid_intermediate_states_size_by_tokens_per_gen_step():
 
 
 @skip_no_cuda
-# The byte limits leave room for the fixed replay pool next to the other pools' minimum slots, each
-# rounded up to whole allocation units; a smaller quota is raised to fit them.
-@pytest.mark.parametrize("max_tokens,byte_limit", [(512, 0), (None, 32 << 20), (512, 32 << 20)])
+@pytest.mark.parametrize("max_tokens,byte_limit", [(512, 0), (None, 16 << 20), (512, 16 << 20)])
 def test_v2_kda_replay_policy_allocates_logical_slot_caches(max_tokens, byte_limit):
     spec_config = MTPDecodingConfig(max_draft_len=2)
     policy = KDAReplayState(

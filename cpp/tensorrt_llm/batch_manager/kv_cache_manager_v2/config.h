@@ -430,8 +430,9 @@ struct KVCacheManagerConfig
     // its own: its pages never enter the radix tree, so only living caches use them, one slot each.
     // Hot-tier ratio-based sizing (initialPoolRatio, typicalStep, the tuner and resize()) distributes
     // only the remaining GPU quota among the other pool groups; constraint floors do not apply to the
-    // fixed group, and cold tiers are sized as before. Beam widths above 1 are rejected. Other PRIVATE
-    // layer groups, such as windowed attention, stay ratio-sized: their per-cache demand is not fixed.
+    // fixed group, and cold tiers are sized as before. Like the elastic floors, the fixed capacity raises
+    // a GPU quota that cannot hold it. Beam widths above 1 are rejected. Other PRIVATE layer groups, such
+    // as windowed attention, stay ratio-sized: their per-cache demand is not fixed.
     std::optional<int> maxLiveKvCaches;
 
     // Try to reuse tokens from partially matched blocks.

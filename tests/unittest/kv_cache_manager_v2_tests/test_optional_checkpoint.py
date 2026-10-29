@@ -426,9 +426,15 @@ def test_max_live_kv_caches_config():
 
 def test_max_live_kv_caches_reserves_private_ssm_pool():
     stream = torch.cuda.Stream()
-    # ceil(4096 / 0.8) private slots of 4 KiB do not fit in 16 MiB.
-    with pytest.raises(ValueError, match="max_live_kv_caches"):
-        kv.KVCacheManager(_bounded_config(max_util_for_resume=0.8, max_live_kv_caches=4096))
+    # ceil(4096 / 0.8) private slots of 4 KiB do not fit in 16 MiB, so they raise the quota as the
+    # elastic floors do instead of shrinking.
+    large = kv.KVCacheManager(_bounded_config(max_util_for_resume=0.8, max_live_kv_caches=4096))
+    try:
+        private = large.get_buffer_group_id(1, "old_x")
+        pools = large.get_life_cycle_pool_group_indices(0)
+        assert large.get_storage_statistics(0)[pools[private]].total == 5120
+    finally:
+        large.shutdown()
     manager = kv.KVCacheManager(_bounded_config(max_util_for_resume=0.8, max_live_kv_caches=4))
     caches = []
     try:
