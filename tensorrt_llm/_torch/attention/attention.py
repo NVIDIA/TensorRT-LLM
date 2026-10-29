@@ -33,6 +33,16 @@ from .backends.utils import create_attention, get_attention_backend
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
 
+def _inherit_process_group_attrs(mapping: Mapping, source: Mapping) -> Mapping:
+    """Preserve out-of-band process group routing on derived TP mappings."""
+    tp_group_pg = getattr(source, "_tp_group_pg", None)
+    if tp_group_pg is not None:
+        mapping._tp_group_pg = tp_group_pg
+    if getattr(source, "_use_torch_distributed_allreduce", False):
+        mapping._use_torch_distributed_allreduce = True
+    return mapping
+
+
 def extract_extra_attrs(layer_idx: str, attn_type: str):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
     extra_attrs = get_model_extra_attrs()
@@ -291,7 +301,8 @@ def _helix_post_process(
 
     This is shared by both MHA (Attention) and MLA modules.  The only
     dimension that differs between the two callers is *value_dim*
-    (``head_dim`` for MHA, ``kv_lora_rank`` for MLA).
+    (``head_dim`` for MHA; for MLA ``kv_lora_rank``, or ``v_head_dim`` when
+    the V up-projection runs before the exchange).
 
     zero_kv_mask marks tokens this CP rank owns no KV for; those rows are forced
     to a no-op contribution before the exchange, exactly once per backend:
@@ -613,6 +624,7 @@ class Attention(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        mapping = _inherit_process_group_attrs(mapping, self.mapping)
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.tp_rank = mapping.tp_rank
@@ -671,6 +683,7 @@ class Attention(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        mapping_o = _inherit_process_group_attrs(mapping_o, self.mapping)
         self.mapping_o = mapping_o
 
         self.o_proj = Linear(

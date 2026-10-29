@@ -78,17 +78,12 @@ def _manager(rank: int = 1) -> KvCacheConnectorManager:
 
 
 def _configure_recovery_controls(executor: "PyExecutor") -> None:
-    from tensorrt_llm._torch.distributed import Distributed
     from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
 
-    executor.dist = MagicMock(tp_size=1, cp_size=1, pp_size=1, tp_rank=0, has_cp_helix=False)
-    executor.dist.tp_cp_allgather_int64.side_effect = partial(
-        Distributed.tp_cp_allgather_int64, executor.dist
-    )
+    executor.dist = MagicMock(tp_size=1, cp_size=1, pp_size=1)
     executor.enable_attention_dp = True
     executor.enable_early_first_token_response = False
     executor.kv_connector_manager = None
-    executor.kv_cache_transceiver = None
     executor._is_kv_manager_v2 = False
     executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
     executor._kv_cache_capacity = {}
@@ -419,7 +414,6 @@ def test_batch_start_combines_readiness_with_status(batch_sizes: tuple[int, int]
         _configure_recovery_controls(executor)
         executor.kv_connector_manager = _manager(rank)
         executor.dist.tp_size = 2
-        executor.dist.tp_rank = rank
         executor.dist.tp_allgather_int64.side_effect = partial(collective.gather_int64, rank)
         executors.append(executor)
 

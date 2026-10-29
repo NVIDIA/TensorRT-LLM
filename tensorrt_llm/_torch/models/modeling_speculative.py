@@ -29,6 +29,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -1438,6 +1439,10 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None and mtp_repeat_count > 1:
+            for layer_idx in range(mtp_num_layers):
+                dwdp_manager.add_repeated_layer(layer_idx + start_layer_idx)
         self.owns_lm_head = lm_head_quant_config is not None
         if self.owns_lm_head:
             if getattr(model_config.pretrained_config, "tie_word_embeddings",
@@ -1570,7 +1575,9 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
         moe_backend=_get_requested_draft_moe_backend(model_config, spec_config),
-        mapping=model_config.mapping,
+        # The drafter runs on every row; keep it TP where the TP group shares
+        # requests (helix + attention DP at tp_size 1).
+        mapping=model_config.mapping.mapping_for_full_rows(),
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
@@ -1735,7 +1742,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             MistralConfigLoader
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
-                            mapping=model_config.mapping,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             moe_backend=requested_draft_moe_backend,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
@@ -1756,7 +1764,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
                             moe_backend=requested_draft_moe_backend,
-                            mapping=model_config.mapping,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1774,7 +1783,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
                         moe_backend=requested_draft_moe_backend,
-                        mapping=model_config.mapping,
+                        mapping=model_config.mapping.mapping_for_full_rows(),
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1816,7 +1825,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
-                model_config.mapping,
+                model_config.mapping.mapping_for_full_rows(),
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
