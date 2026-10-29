@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The vision weight walk into a built (tiny) tower.
 
-``Linear.load_weights`` places weights on the GPU, so this check needs a
+`Linear.load_weights` places weights on the GPU, so this check needs a
 device; the key accounting it builds on runs on CPU in
-``test_musespark_open_omni_weights.py``.
+`test_musespark_open_omni_weights.py`.
 """
 
 import pytest

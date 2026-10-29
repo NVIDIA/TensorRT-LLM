@@ -10,14 +10,14 @@ gap for an eager profile.
 Two properties are worth pinning, because both fail silently.
 
 The ranges must cost nothing when profiling is off. The enable flag is
-resolved once per module at construction, so ``forward`` enters one shared
+resolved once per module at construction, so `forward` enters one shared
 no-op context and does no environment lookup, string formatting or allocation
 per step -- 62 layers times a few ranges times every decode iteration is not a
 place to do any of those.
 
-And every op name used in a ``forward`` must exist in the tuple its module
-declared. ``LayerNvtx.__call__`` indexes a dict, so a name that was renamed on
-one side only raises ``KeyError`` -- but only when profiling is enabled, which
+And every op name used in a `forward` must exist in the tuple its module
+declared. `LayerNvtx.__call__` indexes a dict, so a name that was renamed on
+one side only raises `KeyError` -- but only when profiling is enabled, which
 is exactly when someone is midway through a 30-minute capture. Nothing else in
 the suite would catch it: with profiling off the lookup never happens.
 """
@@ -71,7 +71,7 @@ def test_on_builds_zero_padded_per_layer_names(monkeypatch):
 
 
 def _nvtx_names_by_class() -> dict:
-    """Per class: the op names declared in its ``LayerNvtx``, and those used.
+    """Per class: the op names declared in its `LayerNvtx`, and those used.
 
     Read from the file rather than by constructing the modules, which would
     need a full model config and a mapping with a real TP group.

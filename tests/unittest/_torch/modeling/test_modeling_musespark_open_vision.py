@@ -199,7 +199,7 @@ def tiny_tower(monkeypatch):
 
 
 def _reference_patchify(frames: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """``[T, C, H, W]`` -> ``[grid_h * grid_w, T * C * p * p]``, laid out ``[t][c][py][px]``."""
+    """`[T, C, H, W]` -> `[grid_h * grid_w, T * C * p * p]`, laid out `[t][c][py][px]`."""
     t, c, h, w = frames.shape
     grid_h, grid_w = h // patch_size, w // patch_size
     return (
@@ -876,11 +876,11 @@ class TestNoDeviceHostSyncs:
                 assert banned not in source, f"{member.__qualname__} contains {banned}"
 
     def test_host_geometry_is_confined_to_one_helper(self):
-        """``_host_grid_rows`` is the only place host geometry is read.
+        """`_host_grid_rows` is the only place host geometry is read.
 
         It reads Python ints out of an already-host tensor, which is why
-        ``.tolist()`` lives here and nowhere else. It must NOT contain
-        ``.cpu()``: this helper used to fall back to copying a device tensor
+        `.tolist()` lives here and nowhere else. It must NOT contain
+        `.cpu()`: this helper used to fall back to copying a device tensor
         after warning once, so the warning fired on the first forward and every
         later one silently paid the stall. It now refuses a device tensor, and
         the absence of the copy is the property worth pinning -- an earlier
@@ -902,10 +902,10 @@ class TestVisionAttnBackend:
 
     TRTLLM has no fused context-FMHA kernel for the tower's head_dim (96), so
     it falls back to the padded unfused MHA, whose workspace is sized from the
-    metadata maxima (``max_num_requests * max_seq_len ** 2``). The window
+    metadata maxima (`max_num_requests * max_seq_len ** 2`). The window
     metadata declares one request per encoder-budget token, so an 8192-token
     budget requested a 232 GiB workspace during startup encoder profiling and
-    the boot OOMed before serving anything. See ``vision_attn_backend``.
+    the boot OOMed before serving anything. See `vision_attn_backend`.
     """
 
     def test_trtllm_decoder_gets_flashinfer_tower(self):

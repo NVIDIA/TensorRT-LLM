@@ -16,11 +16,11 @@
 
 The checkpoint does not fit the generic module walk in three ways:
 
-* Attention ships four separate projections (``q_proj``, ``k_proj``,
-  ``v_proj``, ``o_gate_proj``) that have to be fused into TRT-LLM's
-  ``qkv_proj`` with the query and its output gate interleaved head by head.
-* Experts are stored stacked per layer (``w13_weight [E, 2I, ...]``,
-  ``w2_weight [E, H, ...]``) with per-half global scales, while TRT-LLM's MoE
+* Attention ships four separate projections (`q_proj`, `k_proj`,
+  `v_proj`, `o_gate_proj`) that have to be fused into TRT-LLM's
+  `qkv_proj` with the query and its output gate interleaved head by head.
+* Experts are stored stacked per layer (`w13_weight [E, 2I, ...]`,
+  `w2_weight [E, H, ...]`) with per-half global scales, while TRT-LLM's MoE
   loader wants one entry per expert and per projection.
 * Shards are packed by tensor kind, not by layer, so a truncated checkpoint's
   linked shards expose tensors for layers the config does not have. Those keys
@@ -54,9 +54,9 @@ _IGNORED_SUFFIXES = (
     ".self_attn.prob_scale",
 )
 
-# Named dispositions inside ``PERCEPTION_KEY_PREFIXES``: the towers consume
+# How each key under `PERCEPTION_KEY_PREFIXES` is handled: the towers consume
 # part of that subtree, and every key they skip is recorded with its reason.
-# Order matters: all four ``modalities.*`` prefixes below overlap, so they are
+# Order matters: all four `modalities.*` prefixes below overlap, so they are
 # matched longest-first.
 #
 # Counts on the released checkpoints: 808 canonical + 1 projection consumed,
@@ -67,7 +67,7 @@ _IGNORED_SUFFIXES = (
 CANONICAL_VISION_PREFIX = "vision_model."
 
 #: The 8192x4096 projection into decoder hidden size. It sits under
-#: ``modalities.``, not under the tower, and it is the one tensor there the
+#: `modalities.`, not under the tower, and it is the one tensor there the
 #: model loads.
 VISION_PROJECTION_KEY = "modalities.vision_perception.encoder.vision_projection.weight"
 
@@ -77,16 +77,16 @@ VISION_PROJECTION_ALIAS = "vision_projection.weight"
 
 #: 658 bit-identical copies of the tower. Skipped. Preferring this copy would
 #: silently give the tower no attention biases -- the 150
-#: ``encoder.layers.{0..49}.attn.{q,k,v}_proj.bias`` tensors exist ONLY under
+#: `encoder.layers.{0..49}.attn.{q,k,v}_proj.bias` tensors exist ONLY under
 #: :data:`CANONICAL_VISION_PREFIX`.
 DUPLICATE_VISION_PREFIX = "modalities.vision_perception.encoder.vision_model."
 
-#: 50 orphan ``attn.wqkv.bias [4608]`` tensors with no matching weight: a TP=8
+#: 50 orphan `attn.wqkv.bias [4608]` tensors with no matching weight: a TP=8
 #: fused column-parallel layout that nothing reads. Skipped.
 STALE_FUSED_QKV_PREFIX = "modalities.vision_perception.encoder.vision_module."
 
 #: 72 audio tensors. Consumed by the audio tower when the model builds one
-#: (``load_audio=True``); otherwise skipped with a warning, see
+#: (`load_audio=True`); otherwise skipped with a warning, see
 #: :func:`_warn_unconsumed_audio`.
 AUDIO_PREFIX = "modalities.soft_audio_perception."
 
@@ -103,7 +103,7 @@ _TENSORS_PER_VISION_LAYER = 16
 
 
 class WeightAccounting:
-    """Per-load tally of every checkpoint key, by disposition."""
+    """Per-load tally of every checkpoint key: consumed, or skipped and why."""
 
     def __init__(self) -> None:
         self.consumed: set = set()
@@ -148,8 +148,8 @@ def _classify_perception_key(
     """Route one perception key to its named bucket.
 
     Longest prefix first: :data:`AUDIO_PREFIX` and the two
-    ``modalities.vision_perception.encoder.*`` prefixes all sit under
-    ``modalities.``, so a shortest-first chain would swallow them all.
+    `modalities.vision_perception.encoder.*` prefixes all sit under
+    `modalities.`, so a shortest-first chain would swallow them all.
     """
     if key.startswith(DUPLICATE_VISION_PREFIX):
         accounting.ignored_duplicate_vision.add(key)
@@ -176,7 +176,7 @@ def _classify_perception_key(
         # load a model that silently ignores part of itself.
         raise ValueError(
             f"MuseSparkOpen checkpoint has an unknown 'modalities.' subtree: {key!r}. "
-            "Add a disposition for it in musespark_open_weight_mapper.py rather than "
+            "Handle it in musespark_open_weight_mapper.py rather than "
             "letting it be skipped."
         )
     # "audio_model." is in PERCEPTION_KEY_PREFIXES but matches nothing in the
@@ -207,7 +207,7 @@ def classify_keys(
     """Split checkpoint keys into in-range text keys and ignorable ones.
 
     In-range keys are left out of the accounting object; the loader adds them
-    to ``consumed`` as it uses them, and anything left over is an error.
+    to `consumed` as it uses them, and anything left over is an error.
 
     Args:
         load_vision: when set, the canonical tower keys and the vision
@@ -237,12 +237,12 @@ def rename_open_format_weights(weights) -> bool:
     A no-op (returns False) on a source-format checkpoint, so both entry
     points can call it unconditionally and the multimodal loader's call makes
     the text loader's one idempotent. In place on purpose: the lazy weights dict
-    (``_LazySafetensorsWeights``) owns the open file handles its slices read
-    from, so a derived dict via ``take_ownership`` would clear them.
+    (`_LazySafetensorsWeights`) owns the open file handles its slices read
+    from, so a derived dict via `take_ownership` would clear them.
 
-    The rename map is total and injective (``build_open_format_rename``
+    The rename map is total and injective (`build_open_format_rename`
     raises otherwise), and no open-export key is the source spelling of a
-    *different* tensor (the two namespaces share only ``lm_head.weight``,
+    *different* tensor (the two namespaces share only `lm_head.weight`,
     which maps to itself), so the loop cannot overwrite a not-yet-renamed
     entry; the guard turns that invariant into an error rather than a
     corrupted load if a future re-export breaks it.
@@ -272,9 +272,9 @@ def rename_open_format_weights(weights) -> bool:
 def _load_router(moe, weight: torch.Tensor, num_experts: int, hidden_size: int) -> None:
     """Load the router, whichever way this export oriented it.
 
-    The source export stores ``[hidden, experts]`` (transposed into TRT-LLM's
-    ``Linear`` ``[out, in]`` here); the open export already stores
-    ``[experts, hidden]``. The two shapes are distinguishable as long as the
+    The source export stores `[hidden, experts]` (transposed into TRT-LLM's
+    `Linear` `[out, in]` here); the open export already stores
+    `[experts, hidden]`. The two shapes are distinguishable as long as the
     expert count differs from the hidden size, which the guard pins down --
     silently transposing a square router would be unfalsifiable at load time.
     """
@@ -298,19 +298,19 @@ def _load_router(moe, weight: torch.Tensor, num_experts: int, hidden_size: int) 
 def interleave_rope_rows(tensor: torch.Tensor, head_dim: int) -> torch.Tensor:
     """Convert q/k rows from the half rotary layout back to interleaved.
 
-    The open export stores every ``q_proj``/``k_proj`` with the per-head rows
-    in the half (NeoX) rotary order -- component ``i`` of a head's first half
-    at row ``i``, its partner at row ``half + i`` -- because that is the layout
+    The open export stores every `q_proj`/`k_proj` with the per-head rows
+    in the half (NeoX) rotary order -- component `i` of a head's first half
+    at row `i`, its partner at row `half + i` -- because that is the layout
     the composite HF model applies RoPE in. The runtime applies RoPE in the
-    source interleaved order (pairs at rows ``2i``/``2i + 1``), so the rows
-    are put back: ``out[2i] = in[i]``, ``out[2i + 1] = in[half + i]``,
+    source interleaved order (pairs at rows `2i`/`2i + 1`), so the rows
+    are put back: `out[2i] = in[i]`, `out[2i + 1] = in[half + i]`,
     per head.
 
     Applied uniformly to every layer, exactly as the exporter permuted them:
     on NoPE layers the permutation is semantically neutral (q and k are
     permuted identically, so their per-head dot products are unchanged), and
-    only RoPE gives the row order meaning. Works for weights ``[heads *
-    head_dim, in]`` and for per-head biases ``[heads * head_dim]``.
+    only RoPE gives the row order meaning. Works for weights `[heads *
+    head_dim, in]` and for per-head biases `[heads * head_dim]`.
     """
     if tensor.shape[0] % head_dim:
         raise ValueError(
@@ -366,9 +366,9 @@ def build_expert_weights(
 ) -> Dict[str, Any]:
     """Explode this layer's stacked expert tensors into per-expert entries.
 
-    Checkpoint layout: ``w13_weight[e]`` holds the gate rows in ``[0:I)`` and
-    the up rows in ``[I:2I)`` (packed FP4 halves the last dim). The global
-    scales are per half: ``w13_weight_scale_2[e, 0]`` is gate, ``[e, 1]`` is
+    Checkpoint layout: `w13_weight[e]` holds the gate rows in `[0:I)` and
+    the up rows in `[I:2I)` (packed FP4 halves the last dim). The global
+    scales are per half: `w13_weight_scale_2[e, 0]` is gate, `[e, 1]` is
     up. Dropping, swapping or maxing those two columns silently rescales the
     up projection, so they are threaded through separately.
     """
@@ -501,7 +501,7 @@ def load_layer(
 
 
 def _load_linear_with_bias(module, weights, prefix: str, accounting: WeightAccounting) -> None:
-    """Load a ``Linear`` whose checkpoint entry carries a bias."""
+    """Load a `Linear` whose checkpoint entry carries a bias."""
     module.load_weights(
         [
             {
@@ -542,10 +542,10 @@ def _load_vision_layer(
     """Load one of the 50 encoder layers; returns the tensors it consumed.
 
     Checkpoint suffix to module attribute goes through the tower's own
-    ``CKPT_TO_MODULE``, not a second copy of the mapping here. Two of the six
+    `CKPT_TO_MODULE`, not a second copy of the mapping here. Two of the six
     names differ because the repo module fixes them -- the tower composes
-    ``modules.mlp.MLP``, whose projections are ``up_proj`` / ``down_proj``, and
-    ``attention.Attention``, whose output projection is ``o_proj`` -- and a
+    `modules.mlp.MLP`, whose projections are `up_proj` / `down_proj`, and
+    `attention.Attention`, whose output projection is `o_proj` -- and a
     private copy of that mapping in this file is exactly how they came to
     disagree in the first place.
     """
@@ -703,11 +703,11 @@ def load_musespark_open_weights(
     # MuseSparkOpenGatedResidual / MuseSparkOpenRMSNormWeightFirst are filled by the
     # loader's own post-load stages, which those modules implement directly.
     # A walk from here was actively harmful: it runs during loading, i.e. before
-    # transform_weights, and calling a generic ``cache_derived_state`` on every
-    # module reaches Linear -- whose implementation sets ``_weights_transformed
-    # = True`` (modules/linear.py). transform_weights() then returns early, so
+    # transform_weights, and calling a generic `cache_derived_state` on every
+    # module reaches Linear -- whose implementation sets `_weights_transformed
+    # = True` (modules/linear.py). transform_weights() then returns early, so
     # every quantized weight transform in the model is skipped, silently. The
-    # loader's real walks guard on ``_weights_removed`` and run at the right
+    # loader's real walks guard on `_weights_removed` and run at the right
     # point; this one did neither.
 
     summary = accounting.summary()
@@ -718,12 +718,11 @@ def load_musespark_open_weights(
 def load_musespark_open_audio_weights(audio_encoder, weights, accounting: WeightAccounting) -> None:
     """Load the 72 audio-tower tensors under :data:`AUDIO_ENCODER_PREFIX`.
 
-    The tower's module tree mirrors the checkpoint suffixes one for one
-    (asserted by ``test_musespark_open_omni_audio.py``), so the walk is the
-    tower's own ``state_dict`` with the prefix prepended. All tensors are BF16
-    in the checkpoint and the tower's parameters are BF16; ``_copy_param``'s
+    The tower's module tree mirrors the checkpoint suffixes one for one, so
+    the walk is the tower's own `state_dict` with the prefix prepended. All tensors are BF16
+    in the checkpoint and the tower's parameters are BF16; `_copy_param`'s
     cast is a no-op. The tower is deliberately NOT quantized -- see the module
-    docstring of ``musespark_open_audio.py``.
+    docstring of `musespark_open_audio.py`.
     """
     from ...musespark_open_audio import audio_state_dict_to_checkpoint_keys
 
@@ -763,7 +762,7 @@ def load_musespark_open_omni_weights(model, weights) -> Dict[str, int]:
     The towers go first: they are the only consumers of the perception subtree,
     and dropping the skipped perception tensors before the decoder walk keeps
     peak host memory at the text model's footprint rather than the sum. The
-    audio walk runs only when the model built a tower (``input_mode == "wav"``
+    audio walk runs only when the model built a tower (`input_mode == "wav"`
     and the mm encoder enabled); otherwise the 72 tensors are skipped with a
     warning.
     """
@@ -828,15 +827,13 @@ def _unaccounted_keys(weights, accounting: WeightAccounting) -> set:
 def missing_in_range_keys(
     keys: List[str],
     num_hidden_layers: int,
-    num_experts: int,
     bf16_expert_layers: Optional[List[int]],
 ) -> List[str]:
     """Names of the in-range text tensors this checkpoint does not carry.
 
-    Used by the load-accounting test: a checkpoint that silently drops a
-    projection or a scale must fail loudly rather than load a zero tensor.
+    A checkpoint that silently drops a projection or a scale must fail loudly
+    rather than load a zero tensor.
     """
-    del num_experts
     present = set(keys)
     expected = ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
     bf16_layers = set(bf16_expert_layers or [])

@@ -14,14 +14,14 @@
 # limitations under the License.
 """Muse Spark Open text decoder for the PyTorch backend.
 
-The decoder handles text only. ``MuseSparkForConditionalGeneration`` in
-``modeling_musespark_open_omni`` wraps it with the vision and audio towers;
+The decoder handles text only. `MuseSparkForConditionalGeneration` in
+`modeling_musespark_open_omni` wraps it with the vision and audio towers;
 this module never constructs them.
 
 Shape summary for the released checkpoint: 62 MoE decoder layers, hidden 8192,
 128 query heads / 16 KV heads of dim 64, 256 experts with top-8 routing, expert
-state 4096 wide (``compression_factor=2``) and expert FFN intermediate 4096.
-Layers ``l`` with ``(num_layers - l - 1) % 4 == 0`` are NoPE + full causal; the
+state 4096 wide (`compression_factor=2`) and expert FFN intermediate 4096.
+Layers `l` with `(num_layers - l - 1) % 4 == 0` are NoPE + full causal; the
 rest are interleaved-RoPE with a 2048-key sliding window.
 
 The residual stream is FP32. Each branch reads a BF16 cast of it, and its
@@ -64,8 +64,8 @@ from .modeling_utils import DecoderModel
 # and their tensors are hundreds of GiB, so the loader skips them unread.
 PERCEPTION_KEY_PREFIXES = ("vision_model.", "modalities.", "audio_model.")
 
-# Per-layer, per-op NVTX ranges, on when ``TLLM_LLMAPI_ENABLE_NVTX`` or
-# ``TLLM_NVTX_DEBUG`` is set (the variables ``nvtx_range_debug`` reads). The
+# Per-layer, per-op NVTX ranges, on when `TLLM_LLMAPI_ENABLE_NVTX` or
+# `TLLM_NVTX_DEBUG` is set (the variables `nvtx_range_debug` reads). The
 # decision is made once per module at construction, so with profiling off a
 # forward enters one shared no-op context per range and formats no strings.
 # The ranges are host-side: under CUDA graphs they annotate the capture pass,
@@ -81,7 +81,7 @@ def nvtx_layer_ranges_enabled() -> bool:
 
 
 class LayerNvtx:
-    """Prebuilt ``<module>.L<idx>.<op>`` NVTX ranges for one layer."""
+    """Prebuilt `<module>.L<idx>.<op>` NVTX ranges for one layer."""
 
     def __init__(self, module: str, layer_idx: int, ops: Tuple[str, ...]):
         self.enabled = nvtx_layer_ranges_enabled()
@@ -96,11 +96,11 @@ class LayerNvtx:
 def normalize_exclude_modules(patterns: List[str]) -> List[str]:
     """Rewrite the checkpoint's bare-substring exclusions as fnmatch globs.
 
-    ``hf_quant_config.json`` lists ``["self_attn", "lm_head", "layers.0.",
-    "layers.61."]``. TRT-LLM matches an exclusion against the module name and
-    its ancestors with ``fnmatch``, so a bare substring like ``layers.0.``
+    `hf_quant_config.json` lists `["self_attn", "lm_head", "layers.0.",
+    "layers.61."]`. TRT-LLM matches an exclusion against the module name and
+    its ancestors with `fnmatch`, so a bare substring like `layers.0.`
     matches nothing and the BF16 layers would be built as NVFP4. Anchor each
-    substring with ``*`` unless the producer already wrote a glob or regex.
+    substring with `*` unless the producer already wrote a glob or regex.
     """
     normalized = []
     for pattern in patterns:
@@ -127,17 +127,17 @@ def post_expert_norm_rows(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Weight-first RMSNorm of each selected expert's output, before combining.
 
-    Returns ``(rows, valid)`` with ``rows`` shaped ``[num_tokens, top_k,
-    hidden_size]`` in FP32 and ``valid`` marking the slots whose expert is
+    Returns `(rows, valid)` with `rows` shaped `[num_tokens, top_k,
+    hidden_size]` in FP32 and `valid` marking the slots whose expert is
     local to this rank.
 
     The per-expert rows are kept separate from the combine below so a parity
     check can compare them individually: against their sum alone, normalizing
     after the sum and normalizing before it are indistinguishable.
 
-    ``expanded_idx_to_permuted_idx`` holds ``-1`` for slots whose expert is not
+    `expanded_idx_to_permuted_idx` holds `-1` for slots whose expert is not
     local to this rank (or is padding). The MoE kernel never writes those rows
-    of ``gemm2_output``, so they may hold NaN; they are selected out rather
+    of `gemm2_output`, so they may hold NaN; they are selected out rather
     than multiplied by zero.
     """
     index = expanded_idx_to_permuted_idx.reshape(num_tokens, top_k)
@@ -204,7 +204,7 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
     """sigmoid -> add expert bias (selection only) -> top-k -> renormalize.
 
     Same algorithm as MiniMax-M2, with the checkpoint's renormalization epsilon
-    (``router_score_division_eps``) instead of the MiniMax constant. Routing
+    (`router_score_division_eps`) instead of the MiniMax constant. Routing
     runs here rather than inside the MoE kernel, so the kernel and the
     post-expert-norm finalize use exactly these top-k ids and weights; routing
     again inside the kernel would apply a different epsilon.
@@ -233,11 +233,11 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
 
 
 class MuseSparkOpenRMSNormWeightFirst(nn.Module):
-    """``rmsnorm((1 + w) * x, eps)`` with no output gain.
+    """`rmsnorm((1 + w) * x, eps)` with no output gain.
 
-    The checkpoint's "input scale" norm form, used for ``post_expert_norm`` and
-    ``post_ffn_norm``. It is not the same function as
-    ``RMSNorm(use_gemma=True)``, which applies ``(1 + w)`` *after* normalizing.
+    The checkpoint's "input scale" norm form, used for `post_expert_norm` and
+    `post_ffn_norm`. It is not the same function as
+    `RMSNorm(use_gemma=True)`, which applies `(1 + w)` *after* normalizing.
     """
 
     def __init__(self, hidden_size: int, eps: float, dtype: Optional[torch.dtype]):
@@ -245,12 +245,12 @@ class MuseSparkOpenRMSNormWeightFirst(nn.Module):
         # Zero-centered gamma: the stored value is an offset from 1.0.
         self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype), requires_grad=False)
         self.variance_epsilon = eps
-        # ``weight + 1``, derived from the frozen parameter once the weights
+        # `weight + 1`, derived from the frozen parameter once the weights
         # are loaded. Non-persistent, so it never enters a checkpoint.
         self.register_buffer("_weight_plus_one", None, persistent=False)
 
     def cache_derived_state(self) -> None:
-        """Cache ``weight + 1``; the loader calls this after the weights land."""
+        """Cache `weight + 1`; the loader calls this after the weights land."""
         if self.weight.is_meta:
             return
         self._weight_plus_one = self.weight + 1
@@ -259,15 +259,15 @@ class MuseSparkOpenRMSNormWeightFirst(nn.Module):
         self.cache_derived_state()
 
     def gain(self) -> torch.Tensor:
-        """``1 + w``, from the cache when it has been filled."""
+        """`1 + w`, from the cache when it has been filled."""
         if self._weight_plus_one is None:
             return self.weight + 1
         return self._weight_plus_one
 
     def _apply(self, *args, **kwargs):
         # .to()/.cuda()/.float()/.half() all funnel through _apply and would
-        # carry the cache along. Casting ``w + 1`` is not the same as
-        # computing ``cast(w) + 1``, so drop the cache on any move; the forward
+        # carry the cache along. Casting `w + 1` is not the same as
+        # computing `cast(w) + 1`, so drop the cache on any move; the forward
         # recomputes until cache_derived_state() runs again.
         out = super()._apply(*args, **kwargs)
         self._weight_plus_one = None
@@ -286,9 +286,9 @@ class MuseSparkOpenRMSNormWeightFirst(nn.Module):
 class MuseSparkOpenGatedResidual(nn.Module):
     """Norm-preserving gated residual add, evaluated in FP32.
 
-    ``h' = alpha * h + beta * y`` with ``beta = sigmoid(g / 0.3)`` and
-    ``alpha = sqrt(max(sigmoid(-g / 0.3) * (1 + beta), 1e-3))``. Both branches
-    are gated (this is not ``h + g * y``), which keeps ``alpha^2 + beta^2 == 1``
+    `h' = alpha * h + beta * y` with `beta = sigmoid(g / 0.3)` and
+    `alpha = sqrt(max(sigmoid(-g / 0.3) * (1 + beta), 1e-3))`. Both branches
+    are gated (this is not `h + g * y`), which keeps `alpha^2 + beta^2 == 1`
     away from the clamp.
     """
 
@@ -312,9 +312,9 @@ class MuseSparkOpenGatedResidual(nn.Module):
     def cache_derived_state(self) -> None:
         """Cache alpha and beta from the loaded gate.
 
-        ``ModelLoader`` calls ``cache_derived_state`` on every module that
+        `ModelLoader` calls `cache_derived_state` on every module that
         defines it, including on readers that import weights another rank
-        committed and never run the weight mapper; ``post_load_weights``
+        committed and never run the weight mapper; `post_load_weights`
         delegates here so the ordinary load path fills the cache too. Skips a
         meta parameter, which has no values to cache, and recomputes from the
         live parameter on every call.
@@ -351,10 +351,10 @@ class MuseSparkOpenGatedResidual(nn.Module):
         eps: float,
         gain: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """``self(residual, rmsnorm(branch))``: one residual join of a layer.
+        """`self(residual, rmsnorm(branch))`: one residual join of a layer.
 
-        ``gain`` selects the norm: ``1 + w`` for the weight-first FFN norm,
-        ``None`` for the weightless attention one. The gain product and the
+        `gain` selects the norm: `1 + w` for the weight-first FFN norm,
+        `None` for the weightless attention one. The gain product and the
         normalized branch are each rounded to the activation dtype, as the
         modules they stand for do.
         """
@@ -391,7 +391,7 @@ def _allreduce_strategy(model_config: ModelConfig) -> AllReduceStrategy:
     - The attention output projection reduces a tiny message per decode step,
       and AUTO sends tiny messages down the NCCL symmetric-memory path, which
       corrupts the reduce and returns non-finite layer outputs.
-    - The MoE all-reduce goes through ``tunable_allreduce``, whose autotuner
+    - The MoE all-reduce goes through `tunable_allreduce`, whose autotuner
       profiles each tactic inside a CUDA-graph capture that the ranks do not
       enter as one collective, so engine warmup hangs.
 
@@ -412,8 +412,8 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
     """Attention with weightless per-head Q/K norms, a query pre-scale, an
     output norm+gate fused into the QKV projection, and a per-layer scope.
 
-    ``QKNormRoPEAttention(is_qk_norm=False)`` gives exactly the checkpoint's
-    weightless per-head RMSNorm over ``head_dim``; the query pre-scale and the
+    `QKNormRoPEAttention(is_qk_norm=False)` gives exactly the checkpoint's
+    weightless per-head RMSNorm over `head_dim`; the query pre-scale and the
     output norm are layered on top.
     """
 
@@ -488,7 +488,7 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         """Weightless per-head RMSNorm on the attention result, then the gate.
 
         Order matters: the checkpoint normalizes each head of the attention
-        output before multiplying by ``sigmoid(o_gate)``, and only then
+        output before multiplying by `sigmoid(o_gate)`, and only then
         projects.
         """
         normed = self.o_head_norm(attention_output.reshape(-1, self.head_dim)).reshape(
@@ -516,14 +516,14 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
 class MuseSparkOpenMoE(nn.Module):
     """Router + pooled experts + per-expert post-norm combine + unpooler.
 
-    Order (the checkpoint's ``feed_forward``): route on the 8192-wide pre-FFN
+    Order (the checkpoint's `feed_forward`): route on the 8192-wide pre-FFN
     activation, pool it to 4096, pre-expert norm, run the top-8 experts, apply
     the weight-first post-expert norm to *each* expert output before the
     weighted sum, all-reduce the partial sums across expert-parallel ranks,
     then unpool back to 8192.
 
-    The per-expert norm is why the MoE runs with ``do_finalize=False`` and
-    this module's ``finalize`` registered as its ``unfinalized_combine_fn``:
+    The per-expert norm is why the MoE runs with `do_finalize=False` and
+    this module's `finalize` registered as its `unfinalized_combine_fn`:
     RMSNorm is nonlinear, so normalizing the already-combined result would be a
     different model.
     """
@@ -677,11 +677,11 @@ class MuseSparkOpenMoE(nn.Module):
         routing_weights: torch.Tensor,
         num_tokens: int,
     ) -> torch.Tensor:
-        """The MoE's ``unfinalized_combine_fn``: per-expert norm, then combine.
+        """The MoE's `unfinalized_combine_fn`: per-expert norm, then combine.
 
         The scheduler calls this on the backend's unfinalized output with the
         routing weights it dispatched with, before any communication combine.
-        Each output row depends on one ``(token, expert)`` row at a time and
+        Each output row depends on one `(token, expert)` row at a time and
         non-local slots contribute exact zeros, so combining the per-rank
         results equals finalizing after the combine.
         """
@@ -908,10 +908,10 @@ def validate_spec_config(spec_config: Any) -> None:
 
     External drafters (NGram, user-provided) run outside the model and need
     nothing from it. The suffix automaton is one-engine and weight-free, so
-    ``SpecDecOneEngineForCausalLM`` runs its worker inside this forward.
+    `SpecDecOneEngineForCausalLM` runs its worker inside this forward.
     DFlash is one-engine but its drafter weights come from the separate
-    ``speculative_model`` checkpoint; the decoder layers feed it through
-    ``spec_metadata.maybe_capture_hidden_states``. The remaining one-engine
+    `speculative_model` checkpoint; the decoder layers feed it through
+    `spec_metadata.maybe_capture_hidden_states`. The remaining one-engine
     modes (MTP, Eagle3, PARD, DSpark) need draft weights the target checkpoint
     does not carry.
     """
@@ -990,8 +990,8 @@ def head_interleaved_q_gate(
 ) -> torch.Tensor:
     """Interleave the query and output-gate projections head by head.
 
-    ``Attention.preprocess_qkv`` reads the first ``2 * q_size`` columns as
-    ``[tokens, num_heads, 2 * head_dim]`` and splits the last dim in half, so
+    `Attention.preprocess_qkv` reads the first `2 * q_size` columns as
+    `[tokens, num_heads, 2 * head_dim]` and splits the last dim in half, so
     each head's query rows must be immediately followed by that head's gate
     rows. Column-parallel sharding then keeps each rank's heads (and their
     gates) contiguous.

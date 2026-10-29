@@ -14,15 +14,15 @@
 # limitations under the License.
 """The MuseSparkOpen waveform ("wav_ae") audio tower and its token accounting.
 
-Plain PyTorch on purpose, and importable without the rest of ``tensorrt_llm``:
+Plain PyTorch on purpose, and importable without the rest of `tensorrt_llm`:
 the module hierarchy and parameter names mirror the checkpoint suffixes under
-``modalities.soft_audio_perception.interaction_encoder.`` one for one
-(``stages.{s}.0.linear`` / ``stages.{s}.0.norm`` for the patchifiers,
-``stages.{s}.{1,2}.{conv.conv,norm,linear1,linear2}`` for the conv/MLP blocks,
-then ``norm`` / ``o_proj`` / ``dual_norm``), so the weight mapper can walk
-``state_dict()`` and prepend the checkpoint prefix. The geometry is fixed in
+`modalities.soft_audio_perception.interaction_encoder.` one for one
+(`stages.{s}.0.linear` / `stages.{s}.0.norm` for the patchifiers,
+`stages.{s}.{1,2}.{conv.conv,norm,linear1,linear2}` for the conv/MLP blocks,
+then `norm` / `o_proj` / `dual_norm`), so the weight mapper can walk
+`state_dict()` and prepend the checkpoint prefix. The geometry is fixed in
 code rather than read from the config (the config's
-``audio_perception_modality_args`` names only the encoder family and the input
+`audio_perception_modality_args` names only the encoder family and the input
 mode), so a checkpoint with different patchify factors fails at load with a
 shape mismatch rather than adapting.
 
@@ -30,21 +30,21 @@ The tower consumes the RAW mono 24 kHz float waveform: no mel, no STFT, no
 amplitude normalization. Four cascaded patchify stages divide the time axis by
 16 * 6 * 5 * 4 = 1920, so one latent token covers 1920 samples = 80 ms, and the
 tail is zero-padded up to a multiple of 1920 -- which is why the token count is
-``ceil(num_samples / 1920)``, computed on the resampled, mono waveform.
+`ceil(num_samples / 1920)`, computed on the resampled, mono waveform.
 
-The output is already in decoder embedding width: ``o_proj`` maps
+The output is already in decoder embedding width: `o_proj` maps
 2048 -> hidden_size (8192) inside the tower and there is no separate audio
-projector. Rows come out of ``dual_norm`` un-normed by the decoder's
-``embed_norm``; the decoder applies that weightless norm to the merged
+projector. Rows come out of `dual_norm` un-normed by the decoder's
+`embed_norm`; the decoder applies that weightless norm to the merged
 embedding tensor exactly once, text and audio alike. RMSNorm is per-row, so
 this equals norming the audio rows before the merge.
 
 QUANTIZATION: this tower is BF16 and is never quantized. The checkpoint stores
 all 72 audio tensors in BF16 with no quantization scales, but
-``hf_quant_config.json``'s ``exclude_modules`` does not name any audio prefix,
+`hf_quant_config.json`'s `exclude_modules` does not name any audio prefix,
 so a quantization plan derived from the checkpoint metadata alone would put
 the tower in scope for NVFP4. The exemption is structural instead: every layer
-is a plain ``nn.Linear`` / ``nn.Conv1d`` built without a quant_config, which
+is a plain `nn.Linear` / `nn.Conv1d` built without a quant_config, which
 TRT-LLM's quantization plumbing (applied through its own Linear modules) does
 not reach.
 """
@@ -82,8 +82,8 @@ AUDIO_TARGET_SAMPLE_RATE = 24_000
 AUDIO_SAMPLES_PER_TOKEN = 1_920
 
 #: Token names the expansion is defined in terms of. The ids are resolved by
-#: vocab name lookup, never from the config: the ``next_audio_token`` /
-#: ``empty_audio_token`` ids in ``config.json`` take no part in inference.
+#: vocab name lookup, never from the config: the `next_audio_token` /
+#: `empty_audio_token` ids in `config.json` take no part in inference.
 AUDIO_TOKEN_NAMES: Dict[str, str] = {
     "audio": "<|audio|>",
     "soft_audio_start": "<|soft_audio_start|>",
@@ -91,7 +91,7 @@ AUDIO_TOKEN_NAMES: Dict[str, str] = {
 }
 
 #: The name lookups above, resolved against the shipped tokenizer and
-#: pinned here in the same style as ``VISION_TOKEN_IDS``. ``<|audio|>`` is the
+#: pinned here in the same style as `VISION_TOKEN_IDS`. `<|audio|>` is the
 #: repeated placeholder whose positions the merge overwrites; the two
 #: delimiters keep their learned text embeddings and are never overwritten.
 #: :func:`verify_audio_token_ids` re-derives these from a live vocab so a
@@ -104,9 +104,9 @@ AUDIO_TOKEN_IDS: Dict[str, int] = {
 
 
 def num_audio_tokens(num_samples: int) -> int:
-    """Decoder tokens one clip occupies: ``ceil(num_samples / 1920)``.
+    """Decoder tokens one clip occupies: `ceil(num_samples / 1920)`.
 
-    ``num_samples`` is measured AFTER the resample to 24 kHz and AFTER the
+    `num_samples` is measured AFTER the resample to 24 kHz and AFTER the
     mono downmix. Rounds up: the encoder zero-pads the tail to a multiple of
     1920, so a 1-sample clip is 1 token and 1921 samples are 2. Excludes the
     two delimiter tokens, which carry no embeddings.
@@ -119,9 +119,9 @@ def num_audio_tokens(num_samples: int) -> int:
 def resampled_num_samples(num_samples: int, sample_rate: int) -> int:
     """Length a clip will have after the resample to 24 kHz.
 
-    The output length of ``librosa.resample(..., fix=True)``, which is what
+    The output length of `librosa.resample(..., fix=True)`, which is what
     :func:`to_mono_24k` uses, computed with librosa's own float operations:
-    the ratio first, then ``ceil(n * ratio)``. Multiplying before dividing
+    the ratio first, then `ceil(n * ratio)`. Multiplying before dividing
     differs at some lengths (88,200 samples at 44.1 kHz resample to 48,001,
     not 48,000), and then the placeholder count would disagree with the
     waveform the encoder sees.
@@ -133,9 +133,9 @@ def resampled_num_samples(num_samples: int, sample_rate: int) -> int:
 
 
 def audio_placeholder_ids(count: int) -> List[int]:
-    """The id run one clip expands to: start + ``count`` fillers + end.
+    """The id run one clip expands to: start + `count` fillers + end.
 
-    Only the interior ``<|audio|>`` ids are overwritten with encoder rows; the
+    Only the interior `<|audio|>` ids are overwritten with encoder rows; the
     delimiters stay ordinary text embeddings.
     """
     if count <= 0:
@@ -150,12 +150,12 @@ def audio_placeholder_ids(count: int) -> List[int]:
 def tokenizer_vocab(tokenizer: Any) -> Dict[str, int]:
     """Vocab of a live tokenizer, unwrapping TRT-LLM's tokenizer wrapper.
 
-    The served path hands the input processor a ``TransformersTokenizer``
-    (or its musespark_open subclass, via ``--custom_tokenizer``), which
-    inherits ``PreTrainedTokenizerBase.get_vocab()`` -- a stub that raises
-    ``NotImplementedError``. The real vocab lives on the wrapped HF
-    tokenizer at ``.tokenizer``. Try the object itself first (the offline /
-    unit-test path passes the HF tokenizer directly), then the wrapped one.
+    The served path hands the input processor a `TransformersTokenizer`
+    (or its musespark_open subclass, via `--custom_tokenizer`), which
+    inherits `PreTrainedTokenizerBase.get_vocab()` -- a stub that raises
+    `NotImplementedError`. The real vocab lives on the wrapped HF
+    tokenizer at `.tokenizer`. Try the object itself first (an offline caller
+    passes the HF tokenizer directly), then the wrapped one.
     """
     inner = getattr(tokenizer, "tokenizer", None)
     for obj in (tokenizer, inner):
@@ -204,8 +204,8 @@ def to_mono_24k(audio: Any, sample_rate: Optional[int] = None) -> np.ndarray:
     wrong-duration token counts, so callers that know the rate must pass it.
 
     The channel axis is taken to be the shorter axis of a 2-D input: soundfile
-    (the loader behind ``AudioMediaIO``) returns ``(frames, channels)`` while
-    other callers pass channels-first ``(channels, frames)``, and any real clip
+    (the loader behind `AudioMediaIO`) returns `(frames, channels)` while
+    other callers pass channels-first `(channels, frames)`, and any real clip
     is longer than its channel count. Ties (a clip as short as its channel
     count) resolve channels-first.
     """
@@ -251,9 +251,9 @@ class MuseSparkOpenAudioRMSNorm(nn.Module):
     """Weighted RMSNorm with eps 1e-6: normalize in fp32, downcast, then scale.
 
     The eps is the audio tower's training value, not the decoder's
-    ``rms_norm_eps`` (1e-5). The ordering matches the reference outputs:
+    `rms_norm_eps` (1e-5). The ordering matches the reference outputs:
     upcast to fp32, normalize, downcast to the input dtype, then multiply by
-    the (bf16) weight. ``F.rms_norm`` multiplies the weight in fp32 before the
+    the (bf16) weight. `F.rms_norm` multiplies the weight in fp32 before the
     downcast instead; the two differ by at most 1 bf16 ulp.
     """
 
@@ -272,7 +272,7 @@ class MuseSparkOpenAudioRMSNorm(nn.Module):
 
 
 def _patchify(value: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """Group ``patch_size`` consecutive timesteps into the channel axis."""
+    """Group `patch_size` consecutive timesteps into the channel axis."""
     batch, length, channels = value.shape
     if length % patch_size:
         raise ValueError(f"audio length {length} is not divisible by {patch_size}")
@@ -280,7 +280,7 @@ def _patchify(value: torch.Tensor, patch_size: int) -> torch.Tensor:
 
 
 class _Patchifier(nn.Module):
-    """Patchify -> Linear -> RMSNorm. Checkpoint children: ``linear``, ``norm``."""
+    """Patchify -> Linear -> RMSNorm. Checkpoint children: `linear`, `norm`."""
 
     def __init__(
         self, patch_size: int, input_size: int, output_size: int, dtype: torch.dtype
@@ -297,7 +297,7 @@ class _Patchifier(nn.Module):
 class _DepthwiseCausalConv(nn.Module):
     """Depthwise causal conv1d; causal via an explicit left zero-pad.
 
-    Checkpoint child: ``conv`` (hence the ``conv.conv`` suffix). Offline
+    Checkpoint child: `conv` (hence the `conv.conv` suffix). Offline
     encoding only: there is no streaming cache.
     """
 
@@ -321,7 +321,7 @@ class _DepthwiseCausalConv(nn.Module):
 class _Block(nn.Module):
     """conv -> RMSNorm -> Linear -> GELU -> Linear, with a residual.
 
-    Checkpoint children: ``conv``, ``norm``, ``linear1``, ``linear2``. The
+    Checkpoint children: `conv`, `norm`, `linear1`, `linear2`. The
     norm sits after the conv and before the MLP, and the residual spans the
     whole block.
     """
@@ -343,7 +343,7 @@ class _Block(nn.Module):
 
 
 class MuseSparkOpenAudioEncoder(nn.Module):
-    """The ``wav_ae`` tower: mono 24 kHz waveform -> one 8192-wide row / 1920 samples.
+    """The `wav_ae` tower: mono 24 kHz waveform -> one 8192-wide row / 1920 samples.
 
     Geometry is fixed (see the module docstring); only the output width -- the
     decoder hidden size -- comes from the config. Built in BF16 by default,
@@ -400,7 +400,7 @@ class MuseSparkOpenAudioEncoder(nn.Module):
         return self.dual_norm(self.o_proj(self.norm(value)))
 
     def forward(self, waveforms: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Encode a list of 1-D waveforms; each output is ``[ceil(N/1920), output_size]``.
+        """Encode a list of 1-D waveforms; each output is `[ceil(N/1920), output_size]`.
 
         A per-clip loop: clips have unequal lengths and each is padded
         independently to its own multiple of 1920.
@@ -418,10 +418,10 @@ class MuseSparkOpenAudioEncoder(nn.Module):
 def audio_state_dict_to_checkpoint_keys(
     encoder: MuseSparkOpenAudioEncoder, prefix: str
 ) -> List[Tuple[str, str]]:
-    """``(parameter_path, checkpoint_key)`` pairs for every tower tensor.
+    """`(parameter_path, checkpoint_key)` pairs for every tower tensor.
 
     The module tree mirrors the checkpoint suffixes exactly, so the mapping is
-    a prefix concatenation; kept as a function so the weight mapper and the
-    tests derive it from the same place.
+    a prefix concatenation; kept as a function so that every user of the
+    mapping derives it the same way.
     """
     return [(name, f"{prefix}{name}") for name in encoder.state_dict()]

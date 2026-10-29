@@ -15,8 +15,8 @@ Environment for the golden test:
     MUSESPARK_CKPT_DIR      HF checkpoint dir (model.safetensors.index.json +
                             shards) to pull the 72 audio tensors from.
     MUSESPARK_AUDIO_GOLDENS Directory containing speech_<k>.pt golden files,
-                            each a torch.save dict with keys ``wav_24k``
-                            (float32 [N]), ``n_tokens`` (int), ``embeddings``
+                            each a torch.save dict with keys `wav_24k`
+                            (float32 [N]), `n_tokens` (int), `embeddings`
                             (bfloat16 [n_tokens, 8192]).
 Both unset -> the golden test skips cleanly.
 """
@@ -139,7 +139,7 @@ def test_resampled_length_matches_fix_true_semantics(num_samples, rate, expected
     ],
 )
 def test_resampled_length_matches_librosa(num_samples, rate):
-    """The count is defined on the waveform ``to_mono_24k`` actually produces."""
+    """The count is defined on the waveform `to_mono_24k` actually produces."""
     import numpy as np
 
     pytest.importorskip("librosa")
@@ -198,7 +198,7 @@ def test_token_id_verification_by_vocab_name():
 def test_tokenizer_vocab_unwraps_a_wrapper_whose_get_vocab_is_a_stub():
     """The served path's tokenizer wrapper inherits the PreTrainedTokenizerBase
     get_vocab() stub (raises NotImplementedError); the real vocab lives on the
-    wrapped tokenizer at ``.tokenizer``. tokenizer_vocab must fall through to
+    wrapped tokenizer at `.tokenizer`. tokenizer_vocab must fall through to
     it, still prefer a working get_vocab on the object itself, and refuse an
     object with no resolvable vocab at all."""
     good = {"<|audio|>": 200038, "<|soft_audio_start|>": 201463, "<|soft_audio_end|>": 201464}
@@ -354,8 +354,8 @@ def _load_real_tower():
     """Build the tower and load the 72 audio tensors from the checkpoint shards.
 
     Works on either checkpoint layout. The source export names the tower
-    ``modalities.soft_audio_perception.interaction_encoder.*``; the open (HF
-    re-export) layout names it ``model.audio_tower.*``. Filtering on the source
+    `modalities.soft_audio_perception.interaction_encoder.*`; the open (HF
+    re-export) layout names it `model.audio_tower.*`. Filtering on the source
     prefix alone finds ZERO tensors in an open-format checkpoint and the test
     dies at the count assertion before it ever compares an embedding, so the
     layout is resolved through the tier's own mapper rather than a second

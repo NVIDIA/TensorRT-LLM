@@ -17,8 +17,8 @@
 The framework-light half of the MuseSparkOpen multimodal input path: everything
 between "a PIL image / a decoded video" and "the patch tensor the tower
 consumes plus the exact prompt token ids the decoder sees". It imports only
-``torch``, ``numpy`` and ``PIL``, so it is importable and unit-testable on a
-machine with no GPU, no engine and no tokenizer.
+`torch`, `numpy` and `PIL`, so it is importable on a machine with no GPU, no
+engine and no tokenizer.
 
 Not in this module: the NaViT tower, the input-processor class, the embedding
 merge, the weight mapper.
@@ -29,33 +29,33 @@ Native variable resolution -- no tiling, no cropping, no padding, no fixed 448
 resize. Each image is converted to RGB (alpha is composited over white *before*
 resampling, so transparent pixels cannot bleed into the visible edge), resized
 once with PIL LANCZOS onto a canvas whose sides are multiples of the token patch
-``patch_size * downsample_factor = 14 * 2 = 28``, and normalized in fp32 as
-``(x / 255 - mean) / std`` with ``mean = std = 0.5``.
+`patch_size * downsample_factor = 14 * 2 = 28`, and normalized in fp32 as
+`(x / 255 - mean) / std` with `mean = std = 0.5`.
 
 The canvas comes from :func:`least_distortion_fit`: the ideal fractional cell
-grid ``(H/28, W/28)`` is rescaled if its product falls outside
-``[min_num_tokens, max_num_image_tokens]``, then the floor/ceil combination that
+grid `(H/28, W/28)` is rescaled if its product falls outside
+`[min_num_tokens, max_num_image_tokens]`, then the floor/ceil combination that
 minimizes aspect-ratio distortion wins. :func:`find_resize_target` is the same
 computation in the reference's own argument order and also returns the cell
 grid; a fallback scan handles aspect ratios so extreme that no floor/ceil
 combination fits the budget.
 
-``image_size = 448`` in the config is *not* a resize target. It is the side of
+`image_size = 448` in the config is *not* a resize target. It is the side of
 the learned positional-embedding grid the tower interpolates from.
 
 Video path
 ----------
-Frames are sampled at ``sampling_fps = 2.0``, capped at
-``num_frames_per_video = 96``, floored to a multiple of
-``max(frame_factor, patch_temporal) = 2`` and picked with ``np.linspace`` over
+Frames are sampled at `sampling_fps = 2.0`, capped at
+`num_frames_per_video = 96`, floored to a multiple of
+`max(frame_factor, patch_temporal) = 2` and picked with `np.linspace` over
 the source frame range -- uniform, not a stride, so the last frame is always
 kept. Every frame is resized to one canvas under a per-frame budget of
-``max_num_tokens_per_frame = 144`` tokens. Two consecutive frames form one
+`max_num_tokens_per_frame = 144` tokens. Two consecutive frames form one
 temporal clip, and each clip carries the timestamp of its *first* frame.
 
-``max_num_video_tokens`` (4096) is deliberately not enforced while
-``max_num_tokens_per_frame > 0``: that branch wins outright in the reference, so
-a 96-frame video really does produce ``48 * 144 = 6912`` video rows. Matching
+`max_num_video_tokens` (4096) is deliberately not enforced while
+`max_num_tokens_per_frame > 0`: that branch wins outright in the reference, so
+a 96-frame video really does produce `48 * 144 = 6912` video rows. Matching
 the reference matters more here than honouring the declared cap, but the cap is
 what the reference reports to its scheduler, so an encoder budget sized from it
 will be ~68% short. The two numbers are therefore NOT alternatives: 4096 is a
@@ -66,22 +66,21 @@ Where the per-frame budget comes from
 -------------------------------------
 144 is a code default, not a checkpoint value -- no export has ever declared it,
 and it is pinned here because it reproduces the reference runtime token for
-token (``TestOracleExpansion::test_video_prompt_expansion`` replays a captured
-reference prompt whose video expands to ``48 * 144 = 6912`` rows).
+token: a captured reference prompt's video expands to `48 * 144 = 6912` rows.
 
-Newer exports do declare it. They drop ``config.json ->
-vision_config.navit_config`` and ship a HuggingFace-style
-``processor_config.json`` instead, renaming the same knobs on the way:
-``max_num_image_tokens`` -> ``image_processor.max_image_tokens``, and a
+Newer exports do declare it. They drop `config.json ->
+vision_config.navit_config` and ship a HuggingFace-style
+`processor_config.json` instead, renaming the same knobs on the way:
+`max_num_image_tokens` -> `image_processor.max_image_tokens`, and a
 per-frame video budget that never had a config home before as
-``video_processor.max_video_frame_tokens``. :func:`with_processor_config` reads
+`video_processor.max_video_frame_tokens`. :func:`with_processor_config` reads
 that file so the checkpoint's own declaration governs;
 :data:`_PROCESSOR_ALIASES` is the rename map, and a checkpoint that ships no
 such file keeps the defaults above unchanged.
 
 Placeholder expansion
 ---------------------
-The chat template emits the bare strings ``<image>`` / ``<video>``; the token run
+The chat template emits the bare strings `<image>` / `<video>`; the token run
 of each marker is replaced, in prompt order, with::
 
     image: <|image_start|> <|patch|>*N <|image_end|>
@@ -90,31 +89,31 @@ of each marker is replaced, in prompt order, with::
                            ... ) <|vid_end|>
 
 No row/column separators inside an image, no newline after a timestamp, and
-``<|image|>`` (200090) is **not** emitted. The checkpoint config declares
-``image_token_id: 200090`` but the token that actually carries image embeddings
-is ``<|patch|>`` (200092); wiring the merge to 200090 would silently place
+`<|image|>` (200090) is **not** emitted. The checkpoint config declares
+`image_token_id: 200090` but the token that actually carries image embeddings
+is `<|patch|>` (200092); wiring the merge to 200090 would silently place
 vision rows on the wrong positions. Ids are therefore taken from
-:data:`VISION_TOKEN_IDS`, never from ``config.image_token_id``.
+:data:`VISION_TOKEN_IDS`, never from `config.image_token_id`.
 
 Shapes and conventions
 ----------------------
-``grid_thw = (t, h, w)`` describes one medium: ``t`` temporal clips, ``h`` and
-``w`` 14-px patches per frame (both even, because the canvas is a multiple of
-28). One medium is ``t * h * w`` tower patches and
-``t * (h // 2) * (w // 2)`` decoder rows -- the 2x2 pixel shuffle merges four
+`grid_thw = (t, h, w)` describes one medium: `t` temporal clips, `h` and
+`w` 14-px patches per frame (both even, because the canvas is a multiple of
+28). One medium is `t * h * w` tower patches and
+`t * (h // 2) * (w // 2)` decoder rows -- the 2x2 pixel shuffle merges four
 patches into one row. :func:`num_placeholder_rows` is that second number and
 must equal the tower's output first dim for the same medium.
 
-``pixel_values`` is fp32 ``[num_patches, patch_dim]`` with
-``patch_dim = num_channels * patch_temporal * patch_size ** 2 = 3*2*14*14 =
-1176``. Each row is one 14x14 patch of one clip, flattened ``[t][c][py][px]``
+`pixel_values` is fp32 `[num_patches, patch_dim]` with
+`patch_dim = num_channels * patch_temporal * patch_size ** 2 = 3*2*14*14 =
+1176`. Each row is one 14x14 patch of one clip, flattened `[t][c][py][px]`
 with the temporal index outermost; rows run clip-major, then patch row-major
-(``h`` outer, ``w`` inner). A still image is *expanded* to ``patch_temporal``
+(`h` outer, `w` inner). A still image is *expanded* to `patch_temporal`
 identical copies, never zero-padded -- zero padding would halve the energy of
 every patch vector.
 
-Every function that takes a ``cfg`` accepts the parsed vision config, the
-top-level model config, a plain dict, or ``None`` for the checkpoint defaults;
+Every function that takes a `cfg` accepts the parsed vision config, the
+top-level model config, a plain dict, or `None` for the checkpoint defaults;
 :meth:`MuseSparkOpenPreprocessConfig.from_config` does the walking.
 """
 
@@ -198,10 +197,10 @@ class VisionPreprocessError(Exception):
 
 @dataclass(frozen=True)
 class MuseSparkOpenPreprocessConfig:
-    """Preprocessing knobs, as read from ``vision_config.navit_config``.
+    """Preprocessing knobs, as read from `vision_config.navit_config`.
 
-    ``num_frames_per_video``, ``sampling_fps``, ``frame_factor``,
-    ``max_num_tokens_per_frame`` and ``video_frame_timestamp_format`` are absent
+    `num_frames_per_video`, `sampling_fps`, `frame_factor`,
+    `max_num_tokens_per_frame` and `video_frame_timestamp_format` are absent
     from the shipped checkpoint config, so these defaults are what actually
     runs; the rest match the checkpoint.
     """
@@ -225,12 +224,12 @@ class MuseSparkOpenPreprocessConfig:
 
     @property
     def token_patch(self) -> int:
-        """Canvas alignment in pixels: ``patch_size * downsample_factor`` = 28."""
+        """Canvas alignment in pixels: `patch_size * downsample_factor` = 28."""
         return self.patch_size * self.downsample_factor
 
     @property
     def patch_dim(self) -> int:
-        """Width of one patch vector: ``C * patch_temporal * patch_size**2``."""
+        """Width of one patch vector: `C * patch_temporal * patch_size**2`."""
         return self.num_channels * self.patch_temporal * self.patch_size * self.patch_size
 
     @property
@@ -240,9 +239,9 @@ class MuseSparkOpenPreprocessConfig:
 
     @classmethod
     def from_config(cls, cfg: Any) -> "MuseSparkOpenPreprocessConfig":
-        """Build from a vision config, a model config, a dict, or ``None``.
+        """Build from a vision config, a model config, a dict, or `None`.
 
-        Walks ``cfg`` -> ``cfg.vision_config`` -> ``.navit_config`` and takes the
+        Walks `cfg` -> `cfg.vision_config` -> `.navit_config` and takes the
         first level that defines each key, which is how both reference runtimes
         resolve them.
         """
@@ -287,7 +286,7 @@ class MuseSparkOpenPreprocessConfig:
 
 
 def _lookup(node: Any, name: str, default: Any = None) -> Any:
-    """Read ``name`` off an attribute bag or a mapping."""
+    """Read `name` off an attribute bag or a mapping."""
     if isinstance(node, dict):
         return node.get(name, default)
     return getattr(node, name, default)
@@ -299,7 +298,7 @@ def _cfg(cfg: Any) -> MuseSparkOpenPreprocessConfig:
 
 PROCESSOR_CONFIG_FILE = "processor_config.json"
 
-# HuggingFace-style spellings in ``processor_config.json``, per block, mapped
+# HuggingFace-style spellings in `processor_config.json`, per block, mapped
 # onto this module's names. Only keys this module acts on appear here; a key
 # outside the map is ignored rather than guessed at.
 _PROCESSOR_ALIASES: dict[str, dict[str, str]] = {
@@ -329,11 +328,11 @@ _PROCESSOR_KEYS_NOT_ADOPTED: dict[str, str] = {
 
 
 def processor_config_overrides(model_path: str | os.PathLike[str] | None) -> dict[str, Any]:
-    """Preprocessing values ``model_path``'s ``processor_config.json`` declares.
+    """Preprocessing values `model_path`'s `processor_config.json` declares.
 
     Returns them under this module's names, ready to hand to
     :meth:`MuseSparkOpenPreprocessConfig.from_config`. An absent or unreadable
-    file yields ``{}`` -- a checkpoint that ships no processor config is the
+    file yields `{}` -- a checkpoint that ships no processor config is the
     normal case for older exports and must not become a hard failure.
     """
     if not model_path:
@@ -359,23 +358,23 @@ def processor_config_overrides(model_path: str | os.PathLike[str] | None) -> dic
 
 
 def with_processor_config(vision_config: Any, model_path: str | os.PathLike[str] | None) -> Any:
-    """``vision_config`` carrying whatever the checkpoint declares about preprocessing.
+    """`vision_config` carrying whatever the checkpoint declares about preprocessing.
 
-    The open re-export moved the preprocessing knobs out of ``config.json``
-    (dropping ``vision_config.navit_config`` wholesale) into
-    ``processor_config.json``, so a config object built from ``config.json``
+    The open re-export moved the preprocessing knobs out of `config.json`
+    (dropping `vision_config.navit_config` wholesale) into
+    `processor_config.json`, so a config object built from `config.json`
     alone no longer sees them and every value silently falls back to this
     module's defaults. Reading them here is what lets the CHECKPOINT decide its
     own supported preprocessing rather than a constant in this file.
 
-    Returns ``vision_config`` UNCHANGED, same object, when the checkpoint
-    declares nothing -- so exports without a ``processor_config.json`` keep
+    Returns `vision_config` UNCHANGED, same object, when the checkpoint
+    declares nothing -- so exports without a `processor_config.json` keep
     byte-identical behaviour and stay comparable with captured reference runs.
     Otherwise returns a copy carrying the declared values; the original is not
     mutated, because the tower and the weight mapper share it.
 
     Accepts either config shape. The serve path hands over the checkpoint's
-    ``MuseSparkOpenVisionConfig`` (a mutable attribute bag), but an already
+    `MuseSparkOpenVisionConfig` (a mutable attribute bag), but an already
     resolved :class:`MuseSparkOpenPreprocessConfig` is frozen AND short-circuits
     :meth:`MuseSparkOpenPreprocessConfig.from_config`, so attaching attributes to
     it would both raise and, if it did not, be ignored -- it has to be rebuilt
@@ -434,16 +433,16 @@ def _least_distortion_grid(
     side or a token count outside the budget are dropped, and the survivor
     closest to the source aspect ratio wins.
 
-    The candidate list is built as ``list(set(product(...)))`` and scanned with
-    ``min``, exactly as the reference does, because roughly one image shape in
+    The candidate list is built as `list(set(product(...)))` and scanned with
+    `min`, exactly as the reference does, because roughly one image shape in
     150 produces an *exact* tie -- a near-square image whose ideal grid falls
-    between two integers ties ``(floor, floor)`` against ``(ceil, ceil)``, and
+    between two integers ties `(floor, floor)` against `(ceil, ceil)`, and
     those two differ by up to a factor of four in token count. Which one wins is
     then decided by set iteration order, so the construction is transcribed
     rather than tidied into a sort: a "cleaner" ordering silently changes the
     prompt length of every square image. (Deterministic in practice: tuples of
     small ints hash identically on every CPython build and are inserted in a
-    fixed order.) ``test_square_image_tie_break`` pins two of these.
+    fixed order.)
     """
     candidates = list(
         set(
@@ -519,14 +518,14 @@ def find_resize_target(
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     """Resolve the resize target that best preserves the aspect ratio.
 
-    ``token_patch`` is the 28-px token cell, not the 14-px encoder patch.
-    Returns ``((canvas_h, canvas_w), (nph, npw))`` -- height first, matching the
+    `token_patch` is the 28-px token cell, not the 14-px encoder patch.
+    Returns `((canvas_h, canvas_w), (nph, npw))` -- height first, matching the
     tensor layout the rest of the module uses.
 
-    When the ideal grid overshoots ``max_num_tokens`` the fractional grid is
-    rescaled so its product is exactly ``max_num_tokens`` at the original aspect
+    When the ideal grid overshoots `max_num_tokens` the fractional grid is
+    rescaled so its product is exactly `max_num_tokens` at the original aspect
     ratio, and the floor/ceil fit then lands inside the budget; the symmetric
-    branch grows an undersized image up to ``min_num_tokens``.
+    branch grows an undersized image up to `min_num_tokens`.
     """
     if img_h <= 0 or img_w <= 0:
         raise VisionPreprocessError(f"image must have positive extent, got {img_h}x{img_w}")
@@ -570,9 +569,9 @@ def least_distortion_fit(
 ) -> tuple[int, int]:
     """Canvas size for one image, both sides a multiple of 28 px.
 
-    Argument and result order are **width first**, matching ``PIL.Image.size``;
+    Argument and result order are **width first**, matching `PIL.Image.size`;
     everything else in this module is height-first because that is the tensor
-    and ``grid_thw`` layout. Returns ``(canvas_width, canvas_height)``.
+    and `grid_thw` layout. Returns `(canvas_width, canvas_height)`.
     """
     (canvas_h, canvas_w), _ = find_resize_target(
         img_h=height,
@@ -593,7 +592,7 @@ def to_rgb(image: Image.Image) -> Image.Image:
     """Convert a PIL image of any mode to 3-channel RGB.
 
     RGBA alpha is composited over :data:`RGBA_BACKGROUND_COLOR`; every other
-    non-RGB mode takes ``.convert("RGB")``. Compositing must happen before the
+    non-RGB mode takes `.convert("RGB")`. Compositing must happen before the
     resize: LANCZOS on an RGBA image interpolates against fully-transparent
     pixels whose RGB is arbitrary, which bleeds them into the visible edge.
     """
@@ -607,16 +606,16 @@ def to_rgb(image: Image.Image) -> Image.Image:
 
 
 def resize_lanczos(image: Image.Image, canvas_h: int, canvas_w: int) -> torch.Tensor:
-    """PIL LANCZOS resize to a uint8 ``[C, H, W]`` tensor."""
+    """PIL LANCZOS resize to a uint8 `[C, H, W]` tensor."""
     resized = image.resize((canvas_w, canvas_h), resample=Image.Resampling.LANCZOS)
     return torch.from_numpy(np.asarray(resized).copy()).permute(2, 0, 1)
 
 
 def normalize_pixels(pixels: torch.Tensor, cfg: Any = None) -> torch.Tensor:
-    """Scale uint8 pixels to ``[0, 1]``, then apply mean/std normalization.
+    """Scale uint8 pixels to `[0, 1]`, then apply mean/std normalization.
 
-    The cast is an explicit ``.float()``: dividing an integral tensor by a
-    Python float resolves to ``torch.get_default_dtype()``, which a worker may
+    The cast is an explicit `.float()`: dividing an integral tensor by a
+    Python float resolves to `torch.get_default_dtype()`, which a worker may
     have set to the model dtype, and this stage is fp32.
     """
     config = _cfg(cfg)
@@ -641,10 +640,10 @@ def normalize_pixels(pixels: torch.Tensor, cfg: Any = None) -> torch.Tensor:
 def expand_temporal(pixel_values: torch.Tensor, cfg: Any = None) -> torch.Tensor:
     """Give a still image the temporal extent the patch vector needs.
 
-    ``patch_dim = C * patch_temporal * patch_size**2``, so a single frame is
-    *duplicated* to ``patch_temporal`` identical copies -- never zero-padded,
-    which would halve the energy of every patch vector. ``[C, H, W]`` in,
-    ``[patch_temporal, C, H, W]`` out; a tensor that already has a temporal axis
+    `patch_dim = C * patch_temporal * patch_size**2`, so a single frame is
+    *duplicated* to `patch_temporal` identical copies -- never zero-padded,
+    which would halve the energy of every patch vector. `[C, H, W]` in,
+    `[patch_temporal, C, H, W]` out; a tensor that already has a temporal axis
     of a valid size passes through.
     """
     config = _cfg(cfg)
@@ -665,12 +664,12 @@ def expand_temporal(pixel_values: torch.Tensor, cfg: Any = None) -> torch.Tensor
 
 
 def patchify(frames: torch.Tensor, cfg: Any = None) -> torch.Tensor:
-    """Vectorize ``[T, C, H, W]`` frames into ``[num_patches, patch_dim]``.
+    """Vectorize `[T, C, H, W]` frames into `[num_patches, patch_dim]`.
 
-    ``T`` must be a multiple of ``patch_temporal``; consecutive frames are fused
+    `T` must be a multiple of `patch_temporal`; consecutive frames are fused
     into clips. Each output row is one 14x14 patch of one clip, flattened
-    ``[t][c][py][px]`` with the temporal index outermost, and the rows run
-    clip-major then patch row-major (``h`` outer, ``w`` inner) -- the order the
+    `[t][c][py][px]` with the temporal index outermost, and the rows run
+    clip-major then patch row-major (`h` outer, `w` inner) -- the order the
     tower's positional embedding and 2D RoPE index with.
     """
     config = _cfg(cfg)
@@ -720,9 +719,9 @@ def _check_grid(
 
 
 def num_placeholder_rows(grid_thw: Sequence[int], cfg: Any = None) -> int:
-    """Decoder rows one medium occupies: ``t * (h // 2) * (w // 2)``.
+    """Decoder rows one medium occupies: `t * (h // 2) * (w // 2)`.
 
-    Equivalently ``(H // 14) * (W // 14) // 4`` per clip. This MUST equal the
+    Equivalently `(H // 14) * (W // 14) // 4` per clip. This MUST equal the
     tower's output first dim for the same medium: the encoder wrapper compares
     the two, and a mismatch silently disables multimodal embedding caching, so
     the tower re-runs on every chunked-prefill chunk.
@@ -734,14 +733,14 @@ def num_placeholder_rows(grid_thw: Sequence[int], cfg: Any = None) -> int:
 
 
 def num_patches(grid_thw: Sequence[int], cfg: Any = None) -> int:
-    """Tower patch rows one medium occupies: ``t * h * w``."""
+    """Tower patch rows one medium occupies: `t * h * w`."""
     config = _cfg(cfg)
     t, h, w = _check_grid(grid_thw, config)
     return t * h * w
 
 
 def patch_dim(cfg: Any = None) -> int:
-    """Width of one patch vector: ``C * patch_temporal * patch_size**2`` = 1176."""
+    """Width of one patch vector: `C * patch_temporal * patch_size**2` = 1176."""
     return _cfg(cfg).patch_dim
 
 
@@ -757,8 +756,8 @@ def preprocess_image(
 ) -> tuple[torch.Tensor, tuple[int, int, int]]:
     """Preprocess one image for the NaViT tower.
 
-    Returns ``(pixel_values, grid_thw)`` with ``pixel_values`` fp32
-    ``[num_patches, patch_dim]`` and ``grid_thw = (1, H // 14, W // 14)`` of the
+    Returns `(pixel_values, grid_thw)` with `pixel_values` fp32
+    `[num_patches, patch_dim]` and `grid_thw = (1, H // 14, W // 14)` of the
     resized canvas. Each image is sized independently: there is no shared canvas
     and no global token budget across the images of one prompt, so multi-image
     prompts simply call this once per image.
@@ -788,15 +787,15 @@ def sample_video_frame_indices(
     cfg: Any = None,
     total_num_frames: int | None = None,
 ) -> list[int]:
-    """Indices to keep from a decoded video, as positions into ``frames``.
+    """Indices to keep from a decoded video, as positions into `frames`.
 
-    ``target = int(total_num_frames * sampling_fps / source_fps)``, clamped into
-    ``[frame_alignment, min(num_frames_per_video, num_frames)]``, floored to a
-    multiple of ``frame_alignment``, then ``np.linspace`` over
-    ``[0, num_frames - 1]``. Uniform, not a stride, so the last frame is always
+    `target = int(total_num_frames * sampling_fps / source_fps)`, clamped into
+    `[frame_alignment, min(num_frames_per_video, num_frames)]`, floored to a
+    multiple of `frame_alignment`, then `np.linspace` over
+    `[0, num_frames - 1]`. Uniform, not a stride, so the last frame is always
     kept.
 
-    ``total_num_frames`` defaults to ``num_frames`` and differs only when the
+    `total_num_frames` defaults to `num_frames` and differs only when the
     decoder already subsampled: the fps target is then computed against the
     *source* frame count while the linspace runs over what was decoded, which is
     what stops a pre-sampling decoder from sampling twice.
@@ -822,7 +821,7 @@ def sample_video_frame_indices(
 
 
 def _frame_to_pil(frame: Any) -> Image.Image:
-    """Accept a PIL image or a uint8 ``[H, W, C]`` array/tensor."""
+    """Accept a PIL image or a uint8 `[H, W, C]` array/tensor."""
     if isinstance(frame, Image.Image):
         return to_rgb(frame)
     array = frame.numpy() if isinstance(frame, torch.Tensor) else np.asarray(frame)
@@ -873,7 +872,7 @@ def video_grid_thw(
     total_num_frames: int | None = None,
     resize_to_max_canvas: bool = False,
 ) -> tuple[int, int, int]:
-    """The ``grid_thw`` :func:`preprocess_video` will produce, from geometry alone.
+    """The `grid_thw` :func:`preprocess_video` will produce, from geometry alone.
 
     The runtime asks how many prompt tokens a video will occupy *before* it is
     preprocessed, once per item per request. Answering by calling
@@ -915,19 +914,19 @@ def preprocess_video(
 ) -> tuple[torch.Tensor, tuple[int, int, int], list[float]]:
     """Preprocess a decoded video for the NaViT tower.
 
-    ``frames`` are the decoded frames (PIL images or uint8 ``[H, W, C]``
-    arrays) and ``fps`` is the source frame rate. Sampling happens here: 2.0
-    fps, at most 96 frames, floored to a multiple of 2, ``np.linspace``.
+    `frames` are the decoded frames (PIL images or uint8 `[H, W, C]`
+    arrays) and `fps` is the source frame rate. Sampling happens here: 2.0
+    fps, at most 96 frames, floored to a multiple of 2, `np.linspace`.
 
-    Returns ``(pixel_values, grid_thw, clip_timestamps)`` with ``pixel_values``
-    fp32 ``[num_patches, patch_dim]``, ``grid_thw = (num_clips, H // 14,
-    W // 14)`` and one timestamp per clip, taken from the clip's *first* frame.
+    Returns `(pixel_values, grid_thw, clip_timestamps)` with `pixel_values`
+    fp32 `[num_patches, patch_dim]`, `grid_thw = (num_clips, H // 14,
+    W // 14)` and one timestamp per clip, taken from the clip's *first* frame.
 
-    ``frame_indices`` / ``total_num_frames`` are for a decoder that already
-    subsampled: ``frame_indices`` are the original indices of the frames handed
-    in (timestamps are ``original_index / fps``) and ``total_num_frames`` is the
+    `frame_indices` / `total_num_frames` are for a decoder that already
+    subsampled: `frame_indices` are the original indices of the frames handed
+    in (timestamps are `original_index / fps`) and `total_num_frames` is the
     source frame count the fps target is computed against. Both default to
-    "``frames`` is the whole video".
+    "`frames` is the whole video".
     """
     config = _cfg(cfg)
     if len(frames) == 0:
@@ -980,11 +979,11 @@ def preprocess_video(
 
 
 def image_placeholder_ids(grid_thw: Sequence[int], cfg: Any = None) -> list[int]:
-    """``<|image_start|> + <|patch|> * N + <|image_end|>``.
+    """`<|image_start|> + <|patch|> * N + <|image_end|>`.
 
-    ``N = num_placeholder_rows(grid_thw)`` = ``(H // 14) * (W // 14) // 4``.
+    `N = num_placeholder_rows(grid_thw)` = `(H // 14) * (W // 14) // 4`.
     There are no row, column or tile separators and no newline tokens, and
-    ``<|image|>`` (200090) is not emitted.
+    `<|image|>` (200090) is not emitted.
     """
     config = _cfg(cfg)
     rows = num_placeholder_rows(grid_thw, config)
@@ -998,8 +997,8 @@ def image_placeholder_ids(grid_thw: Sequence[int], cfg: Any = None) -> list[int]
 def _encode_text(tokenizer: Any, text: str) -> list[int]:
     """Tokenize ordinary text with whatever tokenizer object we were handed.
 
-    Accepts an HF tokenizer, a raw ``tokenizers.Tokenizer`` (whose ``encode``
-    returns an ``Encoding``), or a plain ``str -> ids`` callable. Special tokens
+    Accepts an HF tokenizer, a raw `tokenizers.Tokenizer` (whose `encode`
+    returns an `Encoding`), or a plain `str -> ids` callable. Special tokens
     are never added: the timestamp is ordinary text in the middle of a prompt.
     """
     if tokenizer is None:
@@ -1028,12 +1027,12 @@ def video_placeholder_ids(
     cfg: Any = None,
     tokenizer: Any = None,
 ) -> list[int]:
-    """``<|vid_start|>``, the per-clip body, then ``<|vid_end|>``.
+    """`<|vid_start|>`, the per-clip body, then `<|vid_end|>`.
 
-    Per clip ``c`` of ``patch_temporal`` frames: a
-    ``<|vid_frame_separator|>`` for every clip after the first, the timestamp
-    text ``"Time: {s:.1f}s"`` tokenized as ordinary text with no trailing
-    newline, and ``M = (h // 2) * (w // 2)`` ``<|video|>`` fillers.
+    Per clip `c` of `patch_temporal` frames: a
+    `<|vid_frame_separator|>` for every clip after the first, the timestamp
+    text `"Time: {s:.1f}s"` tokenized as ordinary text with no trailing
+    newline, and `M = (h // 2) * (w // 2)` `<|video|>` fillers.
     """
     config = _cfg(cfg)
     t, h, w = _check_grid(grid_thw, config)
@@ -1060,7 +1059,7 @@ def is_embed_mask(token_ids: Sequence[int]) -> list[bool]:
     """True exactly where the merge overwrites a position with an encoder row.
 
     Markers and timestamp text keep their own token embeddings, so only
-    ``<|patch|>`` and ``<|video|>`` are True.
+    `<|patch|>` and `<|video|>` are True.
     """
     return [int(i) in _EMBED_TOKEN_IDS for i in token_ids]
 
@@ -1070,7 +1069,7 @@ def _find_next_marker(
     start: int,
     markers: Sequence[tuple[str, tuple[int, ...]]],
 ) -> tuple[str, int, int] | None:
-    """Leftmost occurrence of any marker at or after ``start``.
+    """Leftmost occurrence of any marker at or after `start`.
 
     Ties on position break toward the longest marker, so a marker that is a
     prefix of another cannot shadow it.
@@ -1094,16 +1093,16 @@ def expand_prompt_placeholders(
     image_marker_ids: Iterable[int] = (),
     video_marker_ids: Iterable[int] = (),
 ) -> ExpandedPrompt:
-    """Replace every ``<image>`` / ``<video>`` marker run, in prompt order.
+    """Replace every `<image>` / `<video>` marker run, in prompt order.
 
-    ``expansions`` is the media of the prompt in order, each as
-    ``("image" | "video", ids)`` from :func:`image_placeholder_ids` /
+    `expansions` is the media of the prompt in order, each as
+    `("image" | "video", ids)` from :func:`image_placeholder_ids` /
     :func:`video_placeholder_ids`. The i-th marker of a modality takes the i-th
     expansion of that modality. Multiple images per prompt are the normal case,
     so a count mismatch in either direction is an error, not a silent
     truncation.
 
-    ``image_marker_ids`` / ``video_marker_ids`` are the *tokenized* forms of the
+    `image_marker_ids` / `video_marker_ids` are the *tokenized* forms of the
     literal strings the chat template emits; they are ordinary text, not special
     tokens, so each usually spans several ids.
     """

@@ -3,9 +3,9 @@
 """The MuseSparkOpen vision embedding merge, checked against the frozen oracle.
 
 The reference implementation norms vision rows inside its encoder with
-``perception_emb_norm`` and merges them *after* the text embeddings have had
-their own ``tok_embeddings_norm``. The decoder instead applies one
-``embed_norm`` to whatever ``inputs_embeds`` it is handed, so the encoder hands
+`perception_emb_norm` and merges them *after* the text embeddings have had
+their own `tok_embeddings_norm`. The decoder instead applies one
+`embed_norm` to whatever `inputs_embeds` it is handed, so the encoder hands
 over **un-normed** projected rows and the decoder norms text and vision alike,
 exactly once.
 
@@ -13,14 +13,14 @@ That is only correct if the reference's two norms are the same function. They
 are, and this file proves it against the oracle's own captured tensors rather
 than against a reimplementation of them:
 
-* the reference's ``tok_embeddings_norm`` is a weightless RMSNorm over
-  ``hidden_size`` with ``eps=rms_norm_eps``;
-* its ``perception_emb_norm`` is a weightless RMSNorm over the same width with
-  ``eps=1e-5``;
-* the checkpoint has ``rms_norm_eps = 1e-05`` and ``hidden_size = 8192``, so the
+* the reference's `tok_embeddings_norm` is a weightless RMSNorm over
+  `hidden_size` with `eps=rms_norm_eps`;
+* its `perception_emb_norm` is a weightless RMSNorm over the same width with
+  `eps=1e-5`;
+* the checkpoint has `rms_norm_eps = 1e-05` and `hidden_size = 8192`, so the
   two are the same weightless RMSNorm over the same width;
-* the decoder's ``embed_norm`` is ``RMSNorm(hidden_size, eps=rms_norm_eps,
-  has_weights=False)`` — the same again.
+* the decoder's `embed_norm` is `RMSNorm(hidden_size, eps=rms_norm_eps,
+  has_weights=False)` — the same again.
 
 RMSNorm is per-row, so merge-then-norm and norm-then-merge agree row by row.
 The tests below check that claim on real captured activations, and the last one
@@ -138,30 +138,30 @@ def test_perception_norm_is_the_weightless_rmsnorm_we_apply(manifest, weightless
     assert cosine > 0.999, f"{record['tag']}: cosine {cosine:.6f}"
 
 
-#: Images fill with ``<|patch|>``, video with ``<|video|>``. Counting only the
+#: Images fill with `<|patch|>`, video with `<|video|>`. Counting only the
 #: image filler reports every video record as inconsistent -- the first version
-#: of the consistency test did exactly that and flagged ``vmme_short_1``, whose
+#: of the consistency test did exactly that and flagged `vmme_short_1`, whose
 #: own counts (6912 marked, 6912 rows) agree perfectly.
 FILLER_TOKEN_IDS = {200092, 200091}
 
 #: A record's captured window is the part of its prompt the forward actually
 #: computed, which is not the whole prompt: the oracle ran with vLLM's prefix
-#: cache on, so ``merged_input_ids`` is the prompt's *uncached suffix*. Eight
-#: records lose the 112-token template header they all share. ``mc_multi_4``
-#: loses 512, because its first image is byte-identical to ``mc_single_1``'s
+#: cache on, so `merged_input_ids` is the prompt's *uncached suffix*. Eight
+#: records lose the 112-token template header they all share. `mc_multi_4`
+#: loses 512, because its first image is byte-identical to `mc_single_1`'s
 #: (the only repeated image in the 15-file
 #: media set), so the two prompts agree for 516 tokens and 32 of vLLM's
 #: 16-token blocks hit.
 #:
 #: The same duplicate image also hits the multimodal embedding cache, so the
-#: encoder never ran for ``mc_multi_4``'s image 0 and its tensors hold 1173 rows
+#: encoder never ran for `mc_multi_4`'s image 0 and its tensors hold 1173 rows
 #: (3 x 391) while the window's mask marks 1176 positions. The extra 3 are the
 #: tail of image 0's 391-token run, which starts at prompt position 124 and so
 #: ends 3 tokens past the 512-token prefix boundary. The encoder rows therefore
-#: align to the LAST ``rows`` marked positions, not the first.
+#: align to the LAST `rows` marked positions, not the first.
 #:
 #: With that alignment the merge is bitwise identical (max_abs 0.0) on all
-#: nine records of the reference capture set; at offset 0, ``mc_multi_4``
+#: nine records of the reference capture set; at offset 0, `mc_multi_4`
 #: differs by 21.78. Its four counts (1564 prompt fillers, 1286 window tokens,
 #: 1176 marked, 1173 rows) are a faithful capture of a partially cached
 #: forward, not a record disagreeing with itself.
@@ -278,7 +278,7 @@ def test_every_record_agrees_with_itself_once_the_caches_are_accounted_for(manif
     the marked positions its encoder rows do not cover are the pinned number.
     The earlier version of this test compared the whole prompt's filler count
     against the mask and the rows, read the prefix-cache gap as corruption, and
-    excluded ``mc_multi_4`` on it; this one measures what the forward actually
+    excluded `mc_multi_4` on it; this one measures what the forward actually
     saw, so every record is refereed rather than one being skipped.
     """
     root, records = _records(manifest)

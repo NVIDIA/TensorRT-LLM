@@ -24,21 +24,21 @@ Two things about this model differ from the shape a reader coming from the
 other VLMs in this directory would expect.
 
 **The projected media rows are handed over un-normed.** The reference
-implementation runs vision rows through a weightless ``perception_emb_norm``
+implementation runs vision rows through a weightless `perception_emb_norm`
 inside its encoder and merges them after the text embeddings have had their own
 norm. The decoder (:meth:`MuseSparkOpenModel.forward`) instead applies
-``embed_norm`` to whatever ``inputs_embeds`` it is given, and ``embed_norm`` is
-the same function: a weightless ``RMSNorm(hidden_size, eps=rms_norm_eps)``.
+`embed_norm` to whatever `inputs_embeds` it is given, and `embed_norm` is
+the same function: a weightless `RMSNorm(hidden_size, eps=rms_norm_eps)`.
 Since RMSNorm is per-row, merging first and norming once is row-for-row
 identical to norming first and merging. Normalizing in the encoder as well
 would apply the norm twice, which is not a no-op in bf16 for rows of small
 magnitude. So the towers return raw projected rows and the decoder norms text
-and media alike, exactly once, and then scales both by ``m_emb``.
+and media alike, exactly once, and then scales both by `m_emb`.
 
-**The inner LLM is imported, not resolved through ``AutoModelForCausalLM``.**
-The usual wrapper pattern resolves the decoder from a ``text_config``
-sub-config. This checkpoint has no ``text_config``: ``MuseSparkOpenConfig`` is
-the text config, with ``vision_config`` hanging off it, so the wrapper imports
+**The inner LLM is imported, not resolved through `AutoModelForCausalLM`.**
+The usual wrapper pattern resolves the decoder from a `text_config`
+sub-config. This checkpoint has no `text_config`: `MuseSparkOpenConfig` is
+the text config, with `vision_config` hanging off it, so the wrapper imports
 the decoder class directly.
 
 Positions are plain 1D sequential and shared with the text: no mRoPE and no
@@ -108,7 +108,7 @@ __all__ = [
 
 # What the chat template leaves in the prompt where a medium was attached.
 # These are PLAIN TEXT, not special tokens: the template writes them from a
-# content part (``render_content`` in chat_template.jinja), and it rewrites
+# content part (`render_content` in chat_template.jinja), and it rewrites
 # any literal occurrence in caller-supplied text to "< image>" so a prompt
 # cannot forge one. The tokenizer has no added token for either string, so each
 # is a short run of ordinary ids whose interior depends on what sits next to it
@@ -134,7 +134,7 @@ MEDIA_MARKER_ALIASES: Dict[str, Tuple[str, ...]] = {
 
 #: Per-item audio token budget for the runtime profiler, in decoder rows
 #: (1 row = 80 ms, so 1024 rows = 81.92 s per clip). Not clamped by
-#: ``max_num_encoder_tokens``: that is the vision encoder's attention budget,
+#: `max_num_encoder_tokens`: that is the vision encoder's attention budget,
 #: and the audio tower has no attention.
 _MAX_AUDIO_TOKENS_PER_ITEM = 1024
 
@@ -146,9 +146,9 @@ _DUMMY_AUDIO_SAMPLES = AUDIO_TARGET_SAMPLE_RATE
 class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     """Turn (text, images/videos/audio) into token ids plus per-modality tensors.
 
-    There is no HF ``AutoProcessor`` for this model in the pinned
-    ``transformers``, so the preprocessing and the placeholder expansion are
-    local (``musespark_open_vision_processing`` and ``musespark_open_audio``).
+    There is no HF `AutoProcessor` for this model in the pinned
+    `transformers`, so the preprocessing and the placeholder expansion are
+    local (`musespark_open_vision_processing` and `musespark_open_audio`).
     """
 
     def __init__(
@@ -189,8 +189,8 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
     def processor(self):
         """Raises: no HF AutoProcessor exists for this model in the pinned transformers.
 
-        The preprocessing lives in ``musespark_open_vision_processing`` and
-        ``musespark_open_audio``. Raising here, rather than returning the
+        The preprocessing lives in `musespark_open_vision_processing` and
+        `musespark_open_audio`. Raising here, rather than returning the
         tokenizer, fails a caller that expects a processor at the point of the
         mistake instead of later on a missing attribute.
         """
@@ -204,14 +204,14 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
         """The tokenizer, built from the checkpoint when none was handed over.
 
         The engine constructs its own copy of this processor with
-        ``tokenizer=None`` and expects the processor to supply one, as the
+        `tokenizer=None` and expects the processor to supply one, as the
         other input processors do. It is built lazily: the copy the engine
         profiles with never tokenizes, so no rank pays for a load it does not
         use, and a processor built against a path with no tokenizer still
         constructs.
 
-        Built with the caller's ``trust_remote_code`` and ``use_fast``, which
-        the base class carries, not with ``from_pretrained``'s defaults. The
+        Built with the caller's `trust_remote_code` and `use_fast`, which
+        the base class carries, not with `from_pretrained`'s defaults. The
         slow and fast tokenizers for this checkpoint disagree on digit
         tokenization, so the processor has to use the same kind as the engine.
         """
@@ -246,20 +246,20 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
         """The ids whose positions the merge overwrites with encoder rows.
 
         Only the three embed-carrying ids, and no specials. The base class would
-        otherwise look for ``self.processor.mm_token_ids``, and this model has
+        otherwise look for `self.processor.mm_token_ids`, and this model has
         no HF processor to ask.
 
         No framing token is included because none sits *inside* an image unit:
-        an image expands to one unbroken run of ``<|patch|>`` between its start
+        an image expands to one unbroken run of `<|patch|>` between its start
         and end markers, so the run is already one span. A video genuinely is
         several spans -- its per-clip timestamp text is ordinary text between
-        the ``<|video|>`` runs and cannot be enumerated as ids -- and the
-        runtime's per-item run offsets handle that; adding ``<|vid_start|>``
+        the `<|video|>` runs and cannot be enumerated as ids -- and the
+        runtime's per-item run offsets handle that; adding `<|vid_start|>`
         and friends here would not merge the runs, it would only inflate the
         count this class is required to keep in step with
-        ``get_num_tokens_per_*``. The audio delimiters
-        (``<|soft_audio_start|>`` / ``<|soft_audio_end|>``) are likewise
-        excluded: only the interior ``<|audio|>`` run carries encoder rows.
+        `get_num_tokens_per_*`. The audio delimiters
+        (`<|soft_audio_start|>` / `<|soft_audio_end|>`) are likewise
+        excluded: only the interior `<|audio|>` run carries encoder rows.
         """
         return torch.tensor(
             [VISION_TOKEN_IDS["patch"], VISION_TOKEN_IDS["video"], AUDIO_TOKEN_IDS["audio"]],
@@ -278,10 +278,10 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
         media loader produced it. Only its size is read; the canvas fit decides
         the row count, so this answers without touching pixels.
 
-        The temporal extent is one. ``patch_temporal`` is how many frames are
+        The temporal extent is one. `patch_temporal` is how many frames are
         packed into a clip, and a still image is duplicated to fill one clip;
-        it is not a second clip, so the grid is ``(1, h, w)`` as in
-        ``preprocess_image``.
+        it is not a second clip, so the grid is `(1, h, w)` as in
+        `preprocess_image`.
         """
         cfg = self._vision_config
         image_width, image_height = _image_size(image)
@@ -308,9 +308,9 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
 
         Sampling is what makes this more than a per-frame multiply: 2 fps out
         of the source rate decides how many frames survive, so the source frame
-        rate is required. It arrives in ``video_metadata['fps']`` when a media
+        rate is required. It arrives in `video_metadata['fps']` when a media
         loader decoded the video, which is the normal serving path; a caller
-        handing over bare frames must pass it as ``mm_processor_kwargs``.
+        handing over bare frames must pass it as `mm_processor_kwargs`.
         """
         del video_audio
         frames = list(video)
@@ -341,14 +341,14 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
     ) -> int:
         """How many decoder rows this audio clip will occupy.
 
-        ``ceil(samples_at_24kHz / 1920)``, computed post-resample and
+        `ceil(samples_at_24kHz / 1920)`, computed post-resample and
         post-mono-downmix, exclusive of the two delimiter tokens (which keep
         their own text embeddings and are not in :meth:`get_mm_token_ids`).
-        The resample itself is not run here: ``resampled_num_samples`` is
-        exactly the length ``librosa.resample(fix=True)`` produces, so the
+        The resample itself is not run here: `resampled_num_samples` is
+        exactly the length `librosa.resample(fix=True)` produces, so the
         count matches the real path without touching the samples. The rate
-        comes from the item alone, an ``(array, rate)`` pair or a dict with
-        ``sampling_rate``; a bare array is taken to be 24 kHz already. The
+        comes from the item alone, an `(array, rate)` pair or a dict with
+        `sampling_rate`; a bare array is taken to be 24 kHz already. The
         framework counts items without the request's processor kwargs, which
         is why preprocessing does not read a rate from them either.
         """
@@ -376,8 +376,8 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
 
         The two numbers are in different units. The caps in the vision config
         count decoder rows (what the item costs the prompt, after the 2x2 pixel
-        shuffle), while ``max_num_encoder_tokens`` is the encoder's own
-        attention budget, in patches. One row is ``downsample_factor**2``
+        shuffle), while `max_num_encoder_tokens` is the encoder's own
+        attention budget, in patches. One row is `downsample_factor**2`
         patches, so the budget is converted to rows before the two are
         compared.
         """
@@ -398,23 +398,23 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         """Ask the loaders for PIL and for the model's own video sampling.
 
-        Format: the framework's default is ``pt`` (``ToTensor()`` output, a
+        Format: the framework's default is `pt` (`ToTensor()` output, a
         float32 CHW tensor in 0..1), while this model's preprocessing works on
-        PIL: ``to_rgb`` composites RGBA by image mode and ``resize_lanczos``
-        calls ``Image.resize``. Asking for PIL also skips a round-trip through
-        0..1 floats on every request. ``_to_pil`` still normalizes whatever
-        arrives, because a per-request ``media_io_kwargs`` override outranks
+        PIL: `to_rgb` composites RGBA by image mode and `resize_lanczos`
+        calls `Image.resize`. Asking for PIL also skips a round-trip through
+        0..1 floats on every request. `_to_pil` still normalizes whatever
+        arrives, because a per-request `media_io_kwargs` override outranks
         this.
 
-        Video sampling: ``VideoMediaIO`` defaults to ``num_frames=10,
-        fps=30``, 10 frames per video regardless of length, while this model
-        samples at ``sampling_fps`` capped at ``num_frames_per_video`` (2 fps
-        and 96 frames for the released checkpoint, ``processor_config.json``
-        values included via ``with_processor_config``). The loader samples
-        ``min(num_frames, floor(duration * fps))`` frames uniformly, which is
-        that policy. A server-level ``--media_io_kwargs`` and per-request
-        kwargs still override these defaults (``VideoMediaIO.merge_kwargs``
-        also drops the unmentioned ``fps``/``num_frames`` partner when an
+        Video sampling: `VideoMediaIO` defaults to `num_frames=10,
+        fps=30`, 10 frames per video regardless of length, while this model
+        samples at `sampling_fps` capped at `num_frames_per_video` (2 fps
+        and 96 frames for the released checkpoint, `processor_config.json`
+        values included via `with_processor_config`). The loader samples
+        `min(num_frames, floor(duration * fps))` frames uniformly, which is
+        that policy. A server-level `--media_io_kwargs` and per-request
+        kwargs still override these defaults (`VideoMediaIO.merge_kwargs`
+        also drops the unmentioned `fps`/`num_frames` partner when an
         override sets only one).
         """
         cfg = MuseSparkOpenPreprocessConfig.from_config(self._vision_config)
@@ -431,13 +431,13 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
 
         Used to size the encoder's memory contribution at startup, so the grid
         and the pixel rows have to describe the SAME item: the tower segments
-        the packed batch by ``t * h * w`` read off the grid, and a grid that
+        the packed batch by `t * h * w` read off the grid, and a grid that
         claims more patches than were allocated walks off the end of
-        ``pixel_values``.
+        `pixel_values`.
 
-        ``t`` is 1 here, not ``patch_temporal``: ``patch_temporal`` is how
+        `t` is 1 here, not `patch_temporal`: `patch_temporal` is how
         many frames are packed into one clip, and it is already inside
-        ``patch_dim`` (``num_channels * patch_temporal * patch_size**2``).
+        `patch_dim` (`num_channels * patch_temporal * patch_size**2`).
         """
         cfg = self._vision_config
         patch_dim = cfg.num_channels * cfg.patch_temporal * cfg.patch_size**2
@@ -509,7 +509,7 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
 
         Read off the expanded prompt (see :func:`item_metadata_from_prompt`).
         The encoder runs over whole requests, so no encoder costs are declared.
-        Input preparation checks the references against ``mm_item_order`` when
+        Input preparation checks the references against `mm_item_order` when
         the frontend supplies one.
         """
         del mm_item_order
@@ -615,7 +615,7 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
         return fused, {"multimodal_data": multimodal_data}
 
     def _splice_placeholders(self, text: str, expansions: List[Tuple[str, List[int]]]) -> List[int]:
-        """Tokenize ``text``, replacing each media marker with its expanded run.
+        """Tokenize `text`, replacing each media marker with its expanded run.
 
         Markers are consumed in prompt order, which is the order the chat
         handler decoded the media in, so item *i* of a modality lands on marker
@@ -623,14 +623,14 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
 
         Markers are located in the text, and the segments between them are
         tokenized separately. They cannot be matched in the id stream: the
-        chat templates write them as plain text (``<image>``) or as
-        ``<|patch|>``-style spellings, neither of which is a dedicated special
+        chat templates write them as plain text (`<image>`) or as
+        `<|patch|>`-style spellings, neither of which is a dedicated special
         token, and BPE merges the seam between adjacent markers
-        (``<image><image>`` does not tokenize as two copies of ``<image>``).
+        (`<image><image>` does not tokenize as two copies of `<image>`).
         Splitting the text is safe because each expansion begins and ends with
-        a special token (``<|image_start|>`` / ``<|image_end|>``,
-        ``<|vid_start|>`` / ``<|vid_end|>``, ``<|soft_audio_start|>`` /
-        ``<|soft_audio_end|>``), and a special token never merges with its
+        a special token (`<|image_start|>` / `<|image_end|>`,
+        `<|vid_start|>` / `<|vid_end|>`, `<|soft_audio_start|>` /
+        `<|soft_audio_end|>`), and a special token never merges with its
         neighbours.
         """
         pending: Dict[str, List[List[int]]] = {modality: [] for modality in MEDIA_MARKERS}
@@ -665,7 +665,7 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
         return out
 
     def _next_marker(self, text: str, position: int) -> Tuple[Optional[str], int, str]:
-        """The first marker at or after ``position``: modality, start, spelling.
+        """The first marker at or after `position`: modality, start, spelling.
 
         Every modality is searched together and the earliest wins, so an
         interleaved prompt keeps its media in the order they were written.
@@ -691,7 +691,7 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
 
 
 def _image_size(image: Any) -> Tuple[int, int]:
-    """``(width, height)`` of whichever image representation arrived.
+    """`(width, height)` of whichever image representation arrived.
 
     The media loaders disagree on purpose -- the hashing path feeds CHW tensors
     to avoid a ToPIL round-trip, the "np" format yields HWC uint8, and direct
@@ -715,8 +715,8 @@ def _to_pil(image: Any) -> Any:
     The media loaders hand over three different things: the hashing path feeds
     CHW tensors to avoid a ToPIL round-trip, the "np" media format yields HWC
     uint8, and a direct caller passes PIL. The preprocessing downstream is
-    written against PIL (``to_rgb`` composites RGBA by mode and
-    ``resize_lanczos`` calls ``Image.resize``), so the representations are
+    written against PIL (`to_rgb` composites RGBA by mode and
+    `resize_lanczos` calls `Image.resize`), so the representations are
     normalized here, at the one boundary where they differ.
     """
     from PIL import Image  # noqa: PLC0415
@@ -749,14 +749,14 @@ def _frames_and_fps(
     as a length mismatch against the encoder much later, or not at all.
 
     The sampling metadata matters for the same reason. When a decoder has
-    already subsampled, ``frames`` is not the whole video: ``frames_indices``
+    already subsampled, `frames` is not the whole video: `frames_indices`
     are the original indices of what survived, so a timestamp is
-    ``original_index / fps`` rather than ``position / fps``, and
-    ``total_num_frames`` is the source count the 2-fps target is computed
+    `original_index / fps` rather than `position / fps`, and
+    `total_num_frames` is the source count the 2-fps target is computed
     against. Without them a decoder-subsampled video gets both the wrong clip
     timestamps and the wrong number of clips.
 
-    The serving path delivers a ``VideoData``, whose ``metadata`` carries all
+    The serving path delivers a `VideoData`, whose `metadata` carries all
     three; the dict and pair forms are for callers holding frames they decoded
     themselves.
     """
@@ -784,10 +784,10 @@ def _frames_and_fps(
 
 
 def _sampling_from(metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """The two sampling fields ``preprocess_video`` accepts, when present.
+    """The two sampling fields `preprocess_video` accepts, when present.
 
     Both are omitted rather than defaulted when the decoder did not report
-    them, because ``preprocess_video``'s own defaults ("frames is the whole
+    them, because `preprocess_video`'s own defaults ("frames is the whole
     video") are the right answer in that case and a guess here would not be.
     """
     sampling: Dict[str, Any] = {}
@@ -814,7 +814,7 @@ def validate_vision_segment_lengths(mm_data: Dict[str, Any], max_seq_len: int) -
     """Reject, at admission, any clip whose full-attention segment cannot run.
 
     The tower presents each temporal clip to full attention as one segment of
-    ``grid_h * grid_w`` patches, and ``prepare_attn_metadata`` raises when a
+    `grid_h * grid_w` patches, and `prepare_attn_metadata` raises when a
     segment exceeds the configured maximum. That check fires mid-forward,
     where the executor's error handling fails every request in the scheduled
     batch, so the same arithmetic runs here too, per request, before
@@ -845,12 +845,12 @@ def _per_item_chunks(
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     """Split one modality's packed tensors back into per-item pairs.
 
-    ``call_with_text_prompt`` concatenates every item of a modality into one
-    ``pixel_values`` and stacks their grids, so item boundaries survive only in
-    the grid: row ``i`` describes ``t * h * w`` patches. Reading them off the
-    grid is a HOST read, not a device sync -- ``multimodal_data_device_paths``
-    deliberately leaves ``*_grid_thw`` behind, and the tower's
-    ``_host_grid_rows`` raises if it ever arrives on the device.
+    `call_with_text_prompt` concatenates every item of a modality into one
+    `pixel_values` and stacks their grids, so item boundaries survive only in
+    the grid: row `i` describes `t * h * w` patches. Reading them off the
+    grid is a HOST read, not a device sync -- `multimodal_data_device_paths`
+    deliberately leaves `*_grid_thw` behind, and the tower's
+    `_host_grid_rows` raises if it ever arrives on the device.
     """
     values, grid = item["pixel_values"], item[grid_key]
     chunks: List[Tuple[torch.Tensor, torch.Tensor]] = []
@@ -870,9 +870,9 @@ def _per_item_chunks(
 def _per_audio_chunks(item: Dict[str, Any]) -> List[torch.Tensor]:
     """Split one request's packed audio back into per-clip waveforms.
 
-    ``call_with_text_prompt`` concatenates every clip into one 1-D
-    ``waveforms`` tensor; the boundaries survive in ``sample_counts``, which
-    stays on the HOST (it is absent from ``multimodal_data_device_paths``), so
+    `call_with_text_prompt` concatenates every clip into one 1-D
+    `waveforms` tensor; the boundaries survive in `sample_counts`, which
+    stays on the HOST (it is absent from `multimodal_data_device_paths`), so
     reading it here is not a device sync.
     """
     waveforms, counts = item["waveforms"], item["sample_counts"]
@@ -929,7 +929,7 @@ def item_metadata_from_prompt(
     closes with the matching end id, so walking the ids yields the items in
     prompt order. An item's output rows are the row-carrying ids between its
     start and end; a video's per-clip timestamp text sits in between but
-    carries no rows. When ``multimodal_data`` is given, the per-modality item
+    carries no rows. When `multimodal_data` is given, the per-modality item
     counts must match the data attached to the request.
     """
     starts = {frame[0]: modality for modality, frame in _ITEM_FRAMES.items()}
@@ -966,14 +966,14 @@ def item_metadata_from_prompt(
 
 
 def _items_in_prompt_order(params: Any) -> List[Tuple[str, Any]]:
-    """One request's media items as ``(modality, payload)``, in prompt order.
+    """One request's media items as `(modality, payload)`, in prompt order.
 
-    The payload is ``(pixel_values, grid_thw)`` for image/video and a 1-D
+    The payload is `(pixel_values, grid_thw)` for image/video and a 1-D
     waveform tensor for audio.
 
-    ``fuse_input_embeds`` writes the encoder's rows into the prompt's media
+    `fuse_input_embeds` writes the encoder's rows into the prompt's media
     positions left to right, so rows must come out in prompt order, which is
-    the order of the request's ``item_metadata.item_refs``. Within one
+    the order of the request's `item_metadata.item_refs`. Within one
     modality, item order already is prompt order, so a single-modality request
     needs no record. Reordering the encoder input rather than its output is
     exact because both towers process each item independently.
@@ -1020,15 +1020,15 @@ class MuseSparkOpenVisionEncoder(nn.Module):
     """Runs the towers once over every media item in the batch.
 
     Despite the name this is the model's whole perception side: the packed
-    NaViT vision tower plus, when the config enables it, the ``wav_ae`` audio
+    NaViT vision tower plus, when the config enables it, the `wav_ae` audio
     tower. Returns a single tensor whose first dimension is the total
     placeholder count across the batch, which is what the mixin checks the
     result against before merging and caching it.
 
     Rows come out in request order and, within a request, in prompt order
     (see :func:`_items_in_prompt_order`). Both towers emit decoder-width
-    (``hidden_size``) rows, un-normed: the decoder applies its weightless
-    ``embed_norm`` to the merged embedding tensor exactly once, text, vision
+    (`hidden_size`) rows, un-normed: the decoder applies its weightless
+    `embed_norm` to the merged embedding tensor exactly once, text, vision
     and audio alike.
     """
 
@@ -1063,8 +1063,8 @@ class MuseSparkOpenVisionEncoder(nn.Module):
 
         vision_rows = None
         if pixel_values:
-            # The preprocessing normalizes ``(x/255 - 0.5)/0.5`` in fp32, the
-            # reference's arithmetic, and the engine stages ``pixel_values`` to
+            # The preprocessing normalizes `(x/255 - 0.5)/0.5` in fp32, the
+            # reference's arithmetic, and the engine stages `pixel_values` to
             # the device without changing its dtype, so the cast to the tower's
             # dtype happens here.
             packed = torch.cat(pixel_values, dim=0).to(dtype=self.tower.dtype)
@@ -1092,7 +1092,7 @@ class MuseSparkOpenVisionEncoder(nn.Module):
             return torch.cat(audio_rows, dim=0)
 
         # Interleave back into prompt order. The vision tower emitted its rows
-        # in the order its items appear in ``ordered``; per-item row counts
+        # in the order its items appear in `ordered`; per-item row counts
         # come from the grids, a host read (see _per_item_chunks).
         rows: List[torch.Tensor] = []
         vision_offset, audio_index = 0, 0
@@ -1139,25 +1139,25 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     This class is registered under the checkpoint's architecture string. The
     text decoder, :class:`MuseSparkOpenForCausalLM`, has no registration of its
     own and is reached through this class; a request with no media is a
-    straight pass-through to it (``fuse_input_embeds`` with an empty embed
+    straight pass-through to it (`fuse_input_embeds` with an empty embed
     list).
 
-    The class inherits ``MultimodalModelMixin`` and uses the mixin's
-    ``forward``. Startup encoder profiling runs only for mixin models, so the
+    The class inherits `MultimodalModelMixin` and uses the mixin's
+    `forward`. Startup encoder profiling runs only for mixin models, so the
     towers' activations are measured before the KV cache is sized. The merge
-    is ``fuse_input_embeds`` with non-None ``mm_token_ids``: embed the whole
-    ``input_ids`` through :attr:`text_embedding_layer`, then overwrite the
+    is `fuse_input_embeds` with non-None `mm_token_ids`: embed the whole
+    `input_ids` through :attr:`text_embedding_layer`, then overwrite the
     media rows. The towers return un-normed rows and
-    ``MuseSparkOpenModel.forward`` applies the weightless ``embed_norm`` and
-    ``m_emb`` to the whole ``inputs_embeds`` it receives, text and media alike,
+    `MuseSparkOpenModel.forward` applies the weightless `embed_norm` and
+    `m_emb` to the whole `inputs_embeds` it receives, text and media alike,
     exactly once, so :attr:`text_embedding_layer` must be the raw
-    ``Embedding``: a norm-wrapped module would norm the text twice.
+    `Embedding`: a norm-wrapped module would norm the text twice.
 
     The mixin's persistent cross-request encoder cache
-    (``supports_encoder_cache``) and encoder item scheduling
-    (``supports_mm_encoder_item_scheduling``) stay at their ``False``
+    (`supports_encoder_cache`) and encoder item scheduling
+    (`supports_mm_encoder_item_scheduling`) stay at their `False`
     defaults. The per-request, per-chunk caching in
-    ``get_multimodal_embeddings`` applies as for any mixin model.
+    `get_multimodal_embeddings` applies as for any mixin model.
     """
 
     config_class = type(None)  # resolved from model_config, not from a HF class
@@ -1165,7 +1165,7 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     # -- class-level hooks -------------------------------------------------
     #
     # The framework asks these of the registered class before any instance
-    # exists, so the ``language_model`` property cannot answer them. Each one
+    # exists, so the `language_model` property cannot answer them. Each one
     # delegates to the decoder, so the wrapper always states the decoder's
     # preferences.
     @classmethod
@@ -1214,15 +1214,15 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     def language_model(self) -> MuseSparkOpenForCausalLM:
         """The text decoder this wraps, under the name the framework uses.
 
-        ``MultimodalModelMixin`` and the code that reaches past a VLM wrapper
+        `MultimodalModelMixin` and the code that reaches past a VLM wrapper
         (the guided decoder, for one) look for the inner decoder under this
-        name. ``vocab_size_padded`` and ``infer_max_seq_len`` come from the
+        name. `vocab_size_padded` and `infer_max_seq_len` come from the
         mixin, which delegates both to it.
         """
         return self.llm
 
     # The speculative-decoding members live on the decoder (a
-    # ``SpecDecOneEngineForCausalLM``), while ``model_loader`` loads draft
+    # `SpecDecOneEngineForCausalLM`), while `model_loader` loads draft
     # weights through the top-level model, which is this wrapper.
 
     @property
@@ -1248,9 +1248,9 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     def multimodal_token_ids(self) -> torch.IntTensor:
         """The in-vocab ids that carry encoder rows.
 
-        Handed to ``fuse_input_embeds`` so it can locate the media positions
+        Handed to `fuse_input_embeds` so it can locate the media positions
         without an out-of-vocabulary sentinel and without a device sync.
-        ``<|audio|>`` carries audio rows; its delimiters keep their own text
+        `<|audio|>` carries audio rows; its delimiters keep their own text
         embeddings and are deliberately absent.
         """
         return torch.tensor(
@@ -1262,9 +1262,9 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     def text_embedding_layer(self) -> Embedding:
         """The raw token embedding, not a norm-wrapped module.
 
-        ``fuse_input_embeds`` embeds the whole prompt through this layer and
+        `fuse_input_embeds` embeds the whole prompt through this layer and
         then overwrites the media rows, so whatever runs here runs on the text
-        rows. The decoder applies ``embed_norm`` (and ``m_emb``) to the merged
+        rows. The decoder applies `embed_norm` (and `m_emb`) to the merged
         tensor afterwards, once, over text and media alike; returning anything
         normed here would norm the text twice, which is not a no-op in bf16 at
         small row scale.
@@ -1283,10 +1283,10 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     def multimodal_data_device_paths(self) -> List[str]:
         """Only the pixels and the packed waveforms go to the device.
 
-        ``*_grid_thw`` and ``audio.sample_counts`` are absent: they are
+        `*_grid_thw` and `audio.sample_counts` are absent: they are
         geometry the towers need on the host, to segment the packed batches
         into per-item runs, and staging them on the device would force a
-        device sync inside ``forward`` to read them back.
+        device sync inside `forward` to read them back.
         """
         return [
             "image.pixel_values",
@@ -1301,13 +1301,13 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
         Called by the startup KV-cache profiler, which runs the encoder at the
         scheduling limits so the towers' activations land in the measured
         peak. The request path reaches the same encoder through
-        ``get_multimodal_embeddings``, which keeps the per-chunk cache.
+        `get_multimodal_embeddings`, which keeps the per-chunk cache.
         """
         return self.mm_encoder.forward(multimodal_params)
 
-    # No ``forward`` here: ``MultimodalModelMixin.forward`` runs the encoder,
+    # No `forward` here: `MultimodalModelMixin.forward` runs the encoder,
     # selects the rows active in this chunk and merges them with
-    # ``fuse_input_embeds`` (see the class docstring).
+    # `fuse_input_embeds` (see the class docstring).
 
     def get_language_model_extra_forward_kwargs(
         self,
@@ -1319,10 +1319,10 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
         lora_params: Optional[Dict[str, Any]] = None,
         **forward_kwargs: Any,
     ) -> Dict[str, Any]:
-        """Forward ``spec_metadata`` and ``lora_params`` to the decoder.
+        """Forward `spec_metadata` and `lora_params` to the decoder.
 
-        The mixin's default forwards neither, and the decoder's ``forward``
-        defaults both to ``None``, so without this neither speculative
+        The mixin's default forwards neither, and the decoder's `forward`
+        defaults both to `None`, so without this neither speculative
         decoding nor LoRA would reach the decoder.
         """
         del raw_input_ids, position_ids, mm_inputs, forward_kwargs
@@ -1341,10 +1341,10 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
         return summary
 
     # The towers are not quantized: every perception tensor in the checkpoint
-    # is BF16 with no scales. ``hf_quant_config.json``'s exclude_modules does
+    # is BF16 with no scales. `hf_quant_config.json`'s exclude_modules does
     # not name either tower, so the exemption is explicit in code: the vision
     # tower modules are built with quant_config=None, and the audio tower is
-    # plain ``nn.Linear`` / ``nn.Conv1d`` that the quantization plumbing does
+    # plain `nn.Linear` / `nn.Conv1d` that the quantization plumbing does
     # not reach (see musespark_open_audio.py).
     @property
     def vision_tower(self) -> MuseSparkOpenNaViTVisionTower:
@@ -1354,9 +1354,9 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     def audio_encoder(self) -> Optional[MuseSparkOpenAudioEncoder]:
         """The wav_ae tower, or None when the config or CLI disables it.
 
-        The weight mapper keys the audio-tensor disposition off this: present
-        means the 72 checkpoint tensors are consumed, absent means they are
-        skipped with a warning.
+        The weight mapper decides from this what happens to the audio tensors:
+        present means the 72 checkpoint tensors are consumed, absent means they
+        are skipped with a warning.
         """
         if self.mm_encoder is None:
             return None
@@ -1366,9 +1366,9 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
         """Admission check: every vision clip must fit the tower's segment cap.
 
         This model opts out of item scheduling, so the executor's only other
-        multimodal admission check (``initialize_multimodal_encoder_request``)
+        multimodal admission check (`initialize_multimodal_encoder_request`)
         never runs for it. Without this hook an over-budget image is caught
-        only by ``prepare_attn_metadata`` inside the tower forward, which
+        only by `prepare_attn_metadata` inside the tower forward, which
         fails every request in the scheduled batch instead of just this one.
         """
         if self.mm_encoder is None:

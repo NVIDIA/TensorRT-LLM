@@ -98,13 +98,13 @@ def audio_keys():
 
 @pytest.fixture
 def trtllm_warnings():
-    """Collect TRT-LLM warnings. ``caplog`` cannot see them.
+    """Collect TRT-LLM warnings. `caplog` cannot see them.
 
-    ``tensorrt_llm.logger.Logger`` sets ``propagate = False`` on its stdlib
+    `tensorrt_llm.logger.Logger` sets `propagate = False` on its stdlib
     logger and installs its own stdout handler, so pytest's root-logger capture
-    never receives a record. It also refuses ``set_level`` once ``TLLM_LOG_LEVEL``
+    never receives a record. It also refuses `set_level` once `TLLM_LOG_LEVEL`
     is set in the environment -- which it is inside the container -- and its
-    default level is ``error``, so a warning is dropped before it is formatted.
+    default level is `error`, so a warning is dropped before it is formatted.
     Attach to the named logger directly and lower both thresholds for the
     duration.
     """
@@ -191,7 +191,7 @@ def test_omni_path_leaves_the_tower_keys_for_the_tower_walk():
     """With a tower, the canonical copy and the projection stop being 'skipped'.
 
     They are left unbucketed exactly as in-range text keys are, so the loader
-    adds them to ``consumed`` and the zero-unaccounted check still closes.
+    adds them to `consumed` and the zero-unaccounted check still closes.
     """
     keys = text_keys() + all_perception_keys()
     accounting = classify_keys(keys, num_hidden_layers=4, load_vision=True)
@@ -226,7 +226,7 @@ def test_every_perception_key_lands_in_exactly_one_bucket():
 
 
 def test_projection_is_not_swallowed_by_the_duplicate_prefix():
-    """``...encoder.vision_projection.weight`` shares a prefix with the 658.
+    """`...encoder.vision_projection.weight` shares a prefix with the 658.
 
     A shortest-prefix-first chain would bucket it as a duplicate and the tower
     would come up with no projection into decoder hidden size.
@@ -249,10 +249,10 @@ def test_unknown_modalities_subtree_is_an_error_not_a_silent_skip():
 
 
 def test_audio_model_prefix_matches_nothing_and_is_not_the_audio_guard():
-    """``audio_model.`` is in PERCEPTION_KEY_PREFIXES and matches zero tensors.
+    """`audio_model.` is in PERCEPTION_KEY_PREFIXES and matches zero tensors.
 
-    The real audio prefix is ``modalities.soft_audio_perception.``. Anything
-    that did arrive under ``audio_model.`` is not audio-perception and must not
+    The real audio prefix is `modalities.soft_audio_perception.`. Anything
+    that did arrive under `audio_model.` is not audio-perception and must not
     be counted as such.
     """
     accounting = classify_keys(["audio_model.something.weight"], 62)

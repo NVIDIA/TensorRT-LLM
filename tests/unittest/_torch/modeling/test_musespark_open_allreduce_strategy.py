@@ -30,7 +30,7 @@ pytestmark = pytest.mark.cpu_only
 def _method_node(module, class_name: str, method: str) -> ast.FunctionDef:
     """The ast node of one method, parsed from the module file.
 
-    ``inspect.getsource`` on a method needs the function object; going through
+    `inspect.getsource` on a method needs the function object; going through
     the file keeps this a check on the code as written, and works the same
     whichever way the module was loaded. The node keeps the file's line
     numbers, so statement order inside the method is readable off it.
@@ -82,14 +82,14 @@ def test_an_explicit_nccl_symmetric_is_rejected(strategy):
 
 
 def test_a_strategy_named_in_the_llm_args_is_used_as_configured():
-    """``allreduce_strategy`` reaches the model config as a string."""
+    """`allreduce_strategy` reaches the model config as a string."""
     model_config = ModelConfig(allreduce_strategy="ONESHOT")
     assert _allreduce_strategy(model_config) is AllReduceStrategy.ONESHOT
 
 
 @pytest.mark.parametrize("class_name", ["MuseSparkOpenAttention", "MuseSparkOpenMoE"])
 def test_both_allreduces_use_the_resolved_strategy(class_name):
-    """``__init__`` must build its AllReduce from the resolver, not the config.
+    """`__init__` must build its AllReduce from the resolver, not the config.
 
     A source check: constructing either module needs a full model config and a
     mapping with a real TP group. What can regress cheaply is the wiring --

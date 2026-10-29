@@ -14,28 +14,22 @@
 # limitations under the License.
 """Key spelling of the Muse Spark Open export, mapped back to the source names.
 
-The open-export checkpoint (``model_type: muse_spark``) stores the identical
+The open-export checkpoint (`model_type: muse_spark`) stores the identical
 tensors under HF-conventional names: the decoder under
-``model.language_model.``, the towers under ``model.vision_tower.`` /
-``model.audio_tower.``, and per-module renames (``feed_forward`` -> ``mlp``,
-``add_attn`` -> ``post_attention_residual_gate``, ...). The loader in
-``musespark_open_weight_mapper.py`` walks the source spelling; this module is the
+`model.language_model.`, the towers under `model.vision_tower.` /
+`model.audio_tower.`, and per-module renames (`feed_forward` -> `mlp`,
+`add_attn` -> `post_attention_residual_gate`, ...). The loader in
+`musespark_open_weight_mapper.py` walks the source spelling; this module is the
 total, injective map from every open-export key back to that spelling, so one
 in-place rename up front makes the open checkpoint indistinguishable from the
 source export to everything downstream.
-
-Totality and injectivity are enforced, not assumed: an open-export key with no
-mapping raises (a re-export that grows a tensor must fail loudly, mirroring the
-``modalities.`` guard in the loader), and the caller's in-place rename raises
-on a collision. Kept free of torch/framework imports so the offline key-map
-audit and the unit tests can load it standalone.
 """
 
 import re
 from typing import Dict, Iterable, List
 
 #: Present exactly when a checkpoint uses the open-export spelling: the source
-#: export stores the embedding at ``model.embed_tokens.weight``.
+#: export stores the embedding at `model.embed_tokens.weight`.
 OPEN_FORMAT_SENTINEL_KEY = "model.language_model.embed_tokens.weight"
 
 _DECODER_LAYER_KEY = re.compile(r"^model\.language_model\.layers\.(\d+)\.(.+)$")
@@ -44,10 +38,10 @@ _AUDIO_STAGE_KEY = re.compile(r"^model\.audio_tower\.layers\.(\d+)\.(.+)$")
 _AUDIO_CONV_BLOCK = re.compile(r"^conv_blocks\.(\d+)\.(.+)$")
 
 # Per-decoder-layer tails, open spelling -> source spelling. The five
-# ``self_attn.{q,k,v,o,o_gate}`` projections keep their names apart from
-# ``gate_proj`` -> ``o_gate_proj``; everything under ``mlp.`` moves to
-# ``feed_forward.`` with the router/pooler renames; the stacked expert tensors
-# recover their ``w13``/``w2`` names (same packing: gate rows then up rows,
+# `self_attn.{q,k,v,o,o_gate}` projections keep their names apart from
+# `gate_proj` -> `o_gate_proj`; everything under `mlp.` moves to
+# `feed_forward.` with the router/pooler renames; the stacked expert tensors
+# recover their `w13`/`w2` names (same packing: gate rows then up rows,
 # per-half scale columns).
 _DECODER_TAILS = {
     "input_layernorm.weight": "self_attn.pre_qkv_proj_norm.weight",
@@ -65,7 +59,7 @@ _DECODER_TAILS = {
     "mlp.pre_expert_proj.weight": "feed_forward.pooler.weight",
     "mlp.post_expert_proj.weight": "feed_forward.unpooler.weight",
     "mlp.pre_expert_norm.weight": "feed_forward.pre_expert_norm.weight",
-    # The open export nests the post-expert norm under ``experts``; the source
+    # The open export nests the post-expert norm under `experts`; the source
     # keeps it beside the pre-expert norm.
     "mlp.experts.post_expert_norm.weight": "feed_forward.post_expert_norm.weight",
     "mlp.experts.gate_up_proj": "feed_forward.experts.w13_weight",
@@ -99,8 +93,8 @@ _VISION_TAILS = {
 }
 
 # Audio conv-block tails, shared by both blocks of a stage. The stage's
-# ``nn.Sequential`` puts the patchifier at index 0, so open-export block ``m``
-# is source sub-module ``m + 1``.
+# `nn.Sequential` puts the patchifier at index 0, so open-export block `m`
+# is source sub-module `m + 1`.
 _AUDIO_BLOCK_TAILS = {
     "conv.weight": "conv.conv.weight",
     "conv.bias": "conv.conv.bias",
@@ -137,7 +131,7 @@ _EXACT_KEYS = {
     "model.vision_adapter.fc1.weight": "vision_model.adapter.c_fc.weight",
     "model.vision_adapter.fc2.weight": "vision_model.adapter.c_proj.weight",
     # The bare-alias spelling the loader already accepts (the wrapped
-    # ``modalities.`` spelling names a subtree the open export dropped).
+    # `modalities.` spelling names a subtree the open export dropped).
     "model.vision_projection.weight": "vision_projection.weight",
     "model.audio_tower.norm.weight": (
         "modalities.soft_audio_perception.interaction_encoder.norm.weight"
@@ -197,7 +191,7 @@ def open_format_to_source_key(key: str) -> str:
 
     raise ValueError(
         f"Muse Spark Open format: no source-spelling mapping for checkpoint key {key!r}. "
-        "A re-export grew or renamed a tensor; add its disposition to "
+        "A re-export grew or renamed a tensor; map it in "
         "musespark_open_format.py rather than letting it be skipped."
     )
 

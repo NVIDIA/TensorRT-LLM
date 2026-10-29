@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The MoE's per-expert finalize meets ConfigurableMoE's finalize-hook contract.
 
-``MuseSparkOpenMoE`` registers its ``finalize`` as the MoE's
-``unfinalized_combine_fn``, so the scheduler applies the weight-first
+`MuseSparkOpenMoE` registers its `finalize` as the MoE's
+`unfinalized_combine_fn`, so the scheduler applies the weight-first
 post-expert norm to each expert output before the top-k sum. These run on CPU
 with stub modules: the contract is the registration, the keyword signature the
 scheduler calls, and the output shape, none of which needs a device.
@@ -30,7 +30,7 @@ TOKENS, TOP_K, HIDDEN = 3, 2, 16
 
 
 def _finalizer() -> MuseSparkOpenMoE:
-    """A ``MuseSparkOpenMoE`` with only what ``finalize`` reads."""
+    """A `MuseSparkOpenMoE` with only what `finalize` reads."""
     moe = MuseSparkOpenMoE.__new__(MuseSparkOpenMoE)
     torch.nn.Module.__init__(moe)
     moe.mapping = SimpleNamespace(moe_tp_size=1)
@@ -120,9 +120,9 @@ def test_finalized_partials_combine_to_the_finalized_whole():
     """Finalizing before a combine is sound for this finalize.
 
     Under expert parallelism each rank finalizes only its local slots (the
-    others are ``-1``) and the combine sums the results. That equals finalizing
+    others are `-1`) and the combine sums the results. That equals finalizing
     every slot at once only because each output term depends on one
-    ``(token, expert)`` row and non-local slots contribute exact zeros.
+    `(token, expert)` row and non-local slots contribute exact zeros.
     """
     torch.manual_seed(1)
     moe = _finalizer()

@@ -22,11 +22,11 @@ vectorization order, still-image temporal duplication, RGBA compositing, video
 frame sampling -- so no shared helper can make both sides agree on the wrong
 answer.
 
-``TestOracleExpansion`` is the gate: it replays a captured reference prompt set
+`TestOracleExpansion` is the gate: it replays a captured reference prompt set
 and asserts the expanded prompt ids match token for token. That refset is a
 large out-of-tree artifact, so the class is skipped unless
-``MUSESPARK_OPEN_VISION_ORACLE`` points at a directory holding
-``vision-manifest.json``, ``media-manifest.json`` and ``media/``.
+`MUSESPARK_OPEN_VISION_ORACLE` points at a directory holding
+`vision-manifest.json`, `media-manifest.json` and `media/`.
 """
 
 import json
@@ -421,10 +421,10 @@ class TestPreprocessVideo:
 
 
 class TestProcessorConfigDeclaration:
-    """The checkpoint's own ``processor_config.json`` decides the budgets.
+    """The checkpoint's own `processor_config.json` decides the budgets.
 
-    Exports that dropped ``config.json -> vision_config.navit_config`` declare
-    the preprocessing knobs in a HuggingFace-style ``processor_config.json``
+    Exports that dropped `config.json -> vision_config.navit_config` declare
+    the preprocessing knobs in a HuggingFace-style `processor_config.json`
     under different names. Before this was read, every one of those values
     silently fell back to this module's defaults -- including the per-frame
     video token budget, where the default and the declaration differ and the
@@ -446,7 +446,7 @@ class TestProcessorConfigDeclaration:
     def test_a_checkpoint_without_the_file_changes_nothing(self, tmp_path):
         """The identity case, and the reason captured reference runs stay valid.
 
-        Older exports ship no ``processor_config.json``. They must resolve to
+        Older exports ship no `processor_config.json`. They must resolve to
         byte-identical preprocessing, so the same object comes back -- not a
         copy that merely happens to compare equal.
         """
@@ -497,7 +497,7 @@ class TestProcessorConfigDeclaration:
     def test_undeclared_keys_keep_their_defaults(self, tmp_path):
         """Reading the file is not adopting all of it.
 
-        ``num_frames`` and ``frame_timestamp_format`` are declared by the same
+        `num_frames` and `frame_timestamp_format` are declared by the same
         block and deliberately not mapped; this pins that so a later widening
         of the alias map is a deliberate edit rather than a side effect.
         """
@@ -694,7 +694,7 @@ def _oracle_dir():
 def _split_expansions(token_ids):
     """Cut every vision expansion out of a reference prompt.
 
-    Returns ``(skeleton, segments)``: the skeleton carries a one-token marker
+    Returns `(skeleton, segments)`: the skeleton carries a one-token marker
     where each expansion was, and the segments are the expansions themselves in
     prompt order. Replaying then reconstructs the *whole* prompt, so the
     assertion covers the surrounding text as well as the expansion.

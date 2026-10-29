@@ -170,9 +170,9 @@ def test_gated_residual_is_norm_preserving():
 def test_frozen_constant_cache_is_bit_exact(dtype):
     """Caching the frozen-gate constants must not move a single bit.
 
-    ``coefficients()`` and ``(weight + 1)`` read only ``requires_grad=False``
+    `coefficients()` and `(weight + 1)` read only `requires_grad=False`
     parameters, so they are recomputed identically on every call -- 124 and 62
-    times per decode step. ``cache_derived_state()`` hoists them out of the
+    times per decode step. `cache_derived_state()` hoists them out of the
     hot path, and the whole justification for doing so is that it changes *when*
     the ops run and not *what* they compute. This asserts that at zero
     tolerance, on the module outputs and not only on the cached vectors, so a
@@ -241,12 +241,12 @@ def _tiny_cached_model(hidden=32):
 def test_frozen_constant_cache_fills_from_either_loader_walk(stage):
     """Both loader walks must reach both cache owners.
 
-    ``ModelLoader`` has two post-load walks and they look up *different* names
-    (``pyexecutor/model_loader.py``):
+    `ModelLoader` has two post-load walks and they look up *different* names
+    (`pyexecutor/model_loader.py`):
 
-    * ``_walk_full_post_load`` looks up ``post_load_weights``. This is the
+    * `_walk_full_post_load` looks up `post_load_weights`. This is the
       branch the ordinary load takes.
-    * ``_walk_cache_state`` looks up ``cache_derived_state``. This is the branch
+    * `_walk_cache_state` looks up `cache_derived_state`. This is the branch
       the GPU-memory-service read-only reader and the staged-receiver path take;
       an RO rank never calls the MuseSparkOpen weight mapper at all, it zero-copy
       imports weights another rank committed and then runs exactly this stage.
@@ -256,7 +256,7 @@ def test_frozen_constant_cache_fills_from_either_loader_walk(stage):
     forward just falls back to recomputing per call. That is the whole failure
     mode this cache exists to remove, reappearing on some ranks and not others.
 
-    Parametrized over the two stage names, walking by ``getattr`` exactly as the
+    Parametrized over the two stage names, walking by `getattr` exactly as the
     loader does, so dropping either hook fails here rather than in a profile.
     """
     torch.manual_seed(0)
@@ -286,7 +286,7 @@ def test_frozen_constant_cache_skips_meta_parameters(stage):
     """Neither owner may cache anything while its parameter is still meta.
 
     Both walks can reach a module before its weights are real -- the RO path
-    materializes between ``setup_aliases()`` and the cache stage. Computing from
+    materializes between `setup_aliases()` and the cache stage. Computing from
     a meta tensor does not raise; it yields meta tensors, which would be cached
     and then read by the forward as if they held values. The guard has to be on
     *both* owners, so this is parametrized over both stage names and asserts the
@@ -307,12 +307,12 @@ def test_frozen_constant_cache_skips_meta_parameters(stage):
 
 @pytest.mark.parametrize("moved_dtype", [torch.float32, torch.bfloat16])
 def test_frozen_constant_cache_is_dropped_by_a_dtype_move(moved_dtype):
-    """A ``.to()`` after the cache is filled must not leave a stale cache.
+    """A `.to()` after the cache is filled must not leave a stale cache.
 
-    nn.Module carries buffers through ``.to()``/``.cuda()``/``.half()``, so
-    without the ``_apply`` hook a dtype move would silently rewrite the cached
-    constants. That is wrong in two different ways: casting ``w + 1`` is not
-    ``cast(w) + 1``, and alpha/beta are FP32 by construction whatever dtype the
+    nn.Module carries buffers through `.to()`/`.cuda()`/`.half()`, so
+    without the `_apply` hook a dtype move would silently rewrite the cached
+    constants. That is wrong in two different ways: casting `w + 1` is not
+    `cast(w) + 1`, and alpha/beta are FP32 by construction whatever dtype the
     module is in, so a move to bf16 would hand back something the uncached path
     can never produce. Nothing in the serving path moves a module after weight
     load, which is exactly why this would go unnoticed.
@@ -483,7 +483,7 @@ def test_the_whole_decoder_stack_of_levers_runs_under_inference_mode():
     The routing memo's version read was one autograd-only API on the serving
     path; the same mistake in any other lever would fail the same way and
     equally invisibly. This drives EVERY lever entry point on the decode path
-    under ``torch.inference_mode()`` and requires the answers to match the
+    under `torch.inference_mode()` and requires the answers to match the
     ordinary-mode ones exactly.
 
     The routing method is in the list deliberately. When this test was first
@@ -786,15 +786,12 @@ def test_missing_in_range_keys_reports_a_dropped_tensor():
         present.append(f"model.layers.1.feed_forward.experts.{name}")
     present += ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
 
-    missing = missing_in_range_keys(
-        present, num_hidden_layers=2, num_experts=256, bf16_expert_layers=[0]
-    )
+    missing = missing_in_range_keys(present, num_hidden_layers=2, bf16_expert_layers=[0])
     assert missing == []
 
     missing = missing_in_range_keys(
         [k for k in present if not k.endswith("o_gate_proj.weight")],
         num_hidden_layers=2,
-        num_experts=256,
         bf16_expert_layers=[0],
     )
     assert len(missing) == 2
@@ -910,7 +907,7 @@ def test_frozen_gate_cache_returns_the_cached_tensors(device):
 def test_causal_lm_is_a_one_engine_speculative_model():
     """The decoder derives from the one-engine base so the SA worker runs in its forward.
 
-    The omni wrapper forwards ``spec_metadata`` to this class, and the executor
+    The omni wrapper forwards `spec_metadata` to this class, and the executor
     never reads speculative attributes on the wrapper, so this is the only place
     the plumbing has to live. The decoder's own overrides must survive the base change.
     """

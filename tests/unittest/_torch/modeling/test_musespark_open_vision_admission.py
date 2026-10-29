@@ -15,13 +15,13 @@
 """Admission-time validation of vision segment lengths.
 
 The vision tower presents each temporal clip to full attention as one segment
-of ``grid_h * grid_w`` patches and raises when a segment exceeds the
+of `grid_h * grid_w` patches and raises when a segment exceeds the
 configured maximum. Before this check existed at admission, that condition
 was first caught inside the tower forward, where the executor's error
 handling fails every request in the scheduled batch; on the overlap loop the
 None forward result then crashed the executor loop on every rank. These tests
 pin the admission-side arithmetic and the model hook that the executor's
-``_validate_request`` calls.
+`_validate_request` calls.
 """
 
 import types

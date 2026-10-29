@@ -15,7 +15,7 @@
 """MuseSparkOpen NaViT perception tower for the PyTorch backend.
 
 A 50-layer packed variable-resolution ViT. Images and video clips of different
-sizes are concatenated into one flat ``[total_patches, patch_dim]`` sequence and
+sizes are concatenated into one flat `[total_patches, patch_dim]` sequence and
 kept apart by per-clip attention segments, so one forward covers a whole batch
 of media without padding.
 
@@ -37,33 +37,33 @@ Flow::
 Five details this port has to get exactly right, none of which has a behavioral
 proxy short of running a whole benchmark:
 
-1. ``conv1_linear`` is a **Linear** over pre-vectorized patches, not a Conv2d.
-   The input row layout is ``[t][c][py][px]`` and a still image is **expanded**
-   (frame duplicated) to ``patch_temporal`` frames, never zero-padded. The
-   input processor produces that layout; see ``PATCH_VECTORIZATION`` below.
-2. The positional embedding is a learned ``[1024, 1536]`` grid viewed as
-   ``[1, 1536, 32, 32]`` and sampled with ``F.grid_sample(align_corners=False)``
-   at pixel-centre coordinates built by a meshgrid with ``indexing="xy"``. That
+1. `conv1_linear` is a **Linear** over pre-vectorized patches, not a Conv2d.
+   The input row layout is `[t][c][py][px]` and a still image is **expanded**
+   (frame duplicated) to `patch_temporal` frames, never zero-padded. The
+   input processor produces that layout; see `PATCH_VECTORIZATION` below.
+2. The positional embedding is a learned `[1024, 1536]` grid viewed as
+   `[1, 1536, 32, 32]` and sampled with `F.grid_sample(align_corners=False)`
+   at pixel-centre coordinates built by a meshgrid with `indexing="xy"`. That
    indexing transposes the coordinate list relative to patch order; the model
    was trained that way, so it is replicated verbatim and deliberately not
-   "fixed". The result is added **before** ``ln_pre``, in the activation dtype.
-3. 2D RoPE uses ``head_dim // 4`` = 24 base frequencies per axis, theta 10000,
-   **1-indexed** positions, **width first** (``cat([freq_w, freq_h])``), and
+   "fixed". The result is added **before** `ln_pre`, in the activation dtype.
+3. 2D RoPE uses `head_dim // 4` = 24 base frequencies per axis, theta 10000,
+   **1-indexed** positions, **width first** (`cat([freq_w, freq_h])`), and
    **interleaved** adjacent pairs (not a half-split). The rotation runs in fp32
    and is cast back.
 4. Only 13 of the 50 layers attend over a whole clip: those with
-   ``(i + 1) % sparse_attention_factor == 0`` plus the last one. The other 37
+   `(i + 1) % sparse_attention_factor == 0` plus the last one. The other 37
    are restricted to 32x32-patch windows, implemented as a single permutation
-   of both ``x`` and the RoPE table applied once before the stack and inverted
-   with ``index_copy_`` before ``ln_post`` -- not as a per-layer gather.
+   of both `x` and the RoPE table applied once before the stack and inverted
+   with `index_copy_` before `ln_post` -- not as a per-layer gather.
 5. Normalization is LayerNorm (weight + bias, eps 1e-5), not RMSNorm. Biases
-   exist on ``qkv_proj``/``out_proj``/``mlp.c_fc``/``mlp.c_proj`` and NOT on
-   ``conv1_linear``/``adapter.*``/``vision_projection``. Row-parallel biases are
+   exist on `qkv_proj`/`out_proj`/`mlp.c_fc`/`mlp.c_proj` and NOT on
+   `conv1_linear`/`adapter.*`/`vision_projection`. Row-parallel biases are
    added after the tensor-parallel all-reduce.
 
 The tower returns **unnormed** projected rows. It deliberately does not apply
-``perception_emb_norm``: ``MuseSparkOpenModel.forward`` already applies the same
-weightless ``RMSNorm(8192, eps=1e-5)`` to whatever ``inputs_embeds`` it is
+`perception_emb_norm`: `MuseSparkOpenModel.forward` already applies the same
+weightless `RMSNorm(8192, eps=1e-5)` to whatever `inputs_embeds` it is
 handed, and RMSNorm is per-row, so merging first and norming once reproduces the
 reference's norm-then-merge row for row. Applying it here would norm vision rows
 twice, which is not a no-op in bf16 at small row scale.
@@ -102,17 +102,17 @@ __all__ = [
     "vision_rows_for_grid",
 ]
 
-# How one patch row of ``pixel_values`` is laid out, slowest-varying axis first.
+# How one patch row of `pixel_values` is laid out, slowest-varying axis first.
 # The input processor owns the vectorization; the tower owns this statement of
-# what it expects, and ``conv1_linear``'s weight is only correct for this order.
+# what it expects, and `conv1_linear`'s weight is only correct for this order.
 PATCH_VECTORIZATION = ("patch_temporal", "num_channels", "patch_y", "patch_x")
 
 # Checkpoint suffix -> module attribute, for the entries where the two differ.
 # Everything else is named exactly as the checkpoint names it, so the weight
 # mapper is a prefix rename. The four deviations all come from reusing TRT-LLM
-# modules instead of hand-rolling: ``Attention`` fuses q/k/v into one
-# column-parallel ``qkv_proj`` and calls the output projection ``o_proj``, and
-# ``MLP`` calls its two projections ``up_proj``/``down_proj``. Importable so the
+# modules instead of hand-rolling: `Attention` fuses q/k/v into one
+# column-parallel `qkv_proj` and calls the output projection `o_proj`, and
+# `MLP` calls its two projections `up_proj`/`down_proj`. Importable so the
 # weight mapper reads it rather than restating it.
 CKPT_TO_MODULE: Dict[str, str] = {
     # q, k and v are three separate checkpoint tensors (weight + bias each) that
@@ -125,8 +125,8 @@ CKPT_TO_MODULE: Dict[str, str] = {
     "mlp.c_proj": "mlp.down_proj",
 }
 
-# ``vision_projection`` is the one tower weight that does NOT live under the
-# ``vision_model.`` prefix: the checkpoint stores it as this single key,
+# `vision_projection` is the one tower weight that does NOT live under the
+# `vision_model.` prefix: the checkpoint stores it as this single key,
 # [8192, 4096], with no bias.
 VISION_PROJECTION_CKPT_KEY = "modalities.vision_perception.encoder.vision_projection.weight"
 
@@ -134,9 +134,9 @@ VISION_PROJECTION_CKPT_KEY = "modalities.vision_perception.encoder.vision_projec
 def _gelu_exact(x: torch.Tensor) -> torch.Tensor:
     """Exact-erf GELU.
 
-    Deliberately not ``approximate="tanh"``: the reference builds ``nn.GELU()``
-    and the checkpoint's ``hidden_act`` is ``"gelu"``. Keeping it a distinct
-    function object also keeps ``MLP`` off its fused GELU(tanh) epilogue, which
+    Deliberately not `approximate="tanh"`: the reference builds `nn.GELU()`
+    and the checkpoint's `hidden_act` is `"gelu"`. Keeping it a distinct
+    function object also keeps `MLP` off its fused GELU(tanh) epilogue, which
     would silently substitute the tanh approximation.
     """
     return F.gelu(x)
@@ -151,17 +151,17 @@ def precompute_rope_freqs_cis(
     dtype: torch.dtype = torch.float32,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
-    """Build the 2D RoPE table up to ``max_height`` x ``max_width`` patches.
+    """Build the 2D RoPE table up to `max_height` x `max_width` patches.
 
-    Returns ``[max_height, max_width, dim // 2, 2]`` where the last axis is
-    ``(cos, sin)``::
+    Returns `[max_height, max_width, dim // 2, 2]` where the last axis is
+    `(cos, sin)`::
 
         angle[h, w, :dim // 4] = (w + 1) * theta ** (-4i / dim)   # width first
         angle[h, w, dim // 4:] = (h + 1) * theta ** (-4i / dim)
 
-    Three things here are easy to get wrong and all three are load tests for
-    parity: positions are **1-indexed**, the width half comes **first**, and
-    there are ``dim // 4`` base frequencies per axis (not ``dim // 2``).
+    Three things here are easy to get wrong, and parity with the reference
+    depends on all three: positions are **1-indexed**, the width half comes **first**, and
+    there are `dim // 4` base frequencies per axis (not `dim // 2`).
     """
     if dim % 4:
         raise ValueError(f"2D RoPE needs head_dim divisible by 4, got {dim}")
@@ -182,10 +182,10 @@ def precompute_rope_freqs_cis(
 def apply_rope_2d(
     q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Rotate ``q``/``k`` ``[seq, heads, head_dim]`` by ``freqs_cis`` ``[seq, head_dim // 2, 2]``.
+    """Rotate `q`/`k` `[seq, heads, head_dim]` by `freqs_cis` `[seq, head_dim // 2, 2]`.
 
-    Adjacent elements are paired (``[0,1], [2,3], ...``); a half-split rotation
-    would use ``[0, head_dim // 2]`` pairs and produce a plausible-looking wrong
+    Adjacent elements are paired (`[0,1], [2,3], ...`); a half-split rotation
+    would use `[0, head_dim // 2]` pairs and produce a plausible-looking wrong
     answer. Computed in fp32 and cast back, matching the reference.
     """
     cos = freqs_cis[..., 0].unsqueeze(1)
@@ -207,10 +207,10 @@ def _window_geometry(
 ) -> Tuple[torch.Tensor, Tuple[int, ...]]:
     """Window permutation and per-window lengths for one clip.
 
-    Returns a **host** int64 permutation of ``range(grid_h * grid_w)`` that
+    Returns a **host** int64 permutation of `range(grid_h * grid_w)` that
     reorders row-major patch order into window-major order, plus the token count
     of each window. Built on the host on purpose: it depends only on the
-    geometry, so caching it here keeps ``forward`` free of the boolean-mask
+    geometry, so caching it here keeps `forward` free of the boolean-mask
     compaction (a device-to-host sync) the reference does on device.
     """
     padded_h = math.ceil(grid_h / window_h) * window_h
@@ -234,10 +234,10 @@ def _window_geometry(
 
 @lru_cache(maxsize=256)
 def _pixel_shuffle_permutation(grid_h: int, grid_w: int, downsample_factor: int) -> torch.Tensor:
-    """Host permutation that groups each ``r x r`` patch block contiguously.
+    """Host permutation that groups each `r x r` patch block contiguously.
 
-    ``rearrange("(h r1 w r2) -> (h w r1 r2)")``; the pixel shuffle then folds
-    each group of ``r ** 2`` rows into one row of ``r ** 2 * dim`` features.
+    `rearrange("(h r1 w r2) -> (h w r1 r2)")`; the pixel shuffle then folds
+    each group of `r ** 2` rows into one row of `r ** 2 * dim` features.
     """
     if grid_h % downsample_factor or grid_w % downsample_factor:
         raise ValueError(
@@ -253,10 +253,10 @@ def _pixel_shuffle_permutation(grid_h: int, grid_w: int, downsample_factor: int)
 def vision_rows_for_grid(t: int, h: int, w: int, cfg: MuseSparkOpenVisionConfig) -> int:
     """Decoder rows one medium occupies -- the tower's output first dim for it.
 
-    A ``grid_thw`` row is ``(clips, grid_h, grid_w)``: ``t`` counts temporal
-    clips (``frames // patch_temporal``, so 1 for a still image) and ``h``/``w``
+    A `grid_thw` row is `(clips, grid_h, grid_w)`: `t` counts temporal
+    clips (`frames // patch_temporal`, so 1 for a still image) and `h`/`w`
     are **patch** counts of the resized canvas, not pixels. Each clip is one
-    attention segment of ``grid_h * grid_w`` patches. Must equal the input
+    attention segment of `grid_h * grid_w` patches. Must equal the input
     processor's placeholder count for the medium, or the encoder's output no
     longer lines up with the placeholders and embedding caching is skipped.
     """
@@ -275,12 +275,12 @@ def vision_attn_backend(decoder_attn_backend: str) -> str:
     The TRTLLM backend has no fused context-FMHA kernel for this tower's
     head_dim (96), so every tower call takes the padded unfused-MHA fallback.
     That path sizes its workspace from the metadata MAXIMA
-    (``max_num_requests * max_seq_len ** 2`` per head, see
-    ``AttentionOp::getWorkspaceSizeForContext``), not from the call's actual
+    (`max_num_requests * max_seq_len ** 2` per head, see
+    `AttentionOp::getWorkspaceSizeForContext`), not from the call's actual
     segment lengths. The window metadata declares one request per budget token,
     so with an 8192-token encoder budget the first windowed layer asked for a
     232 GiB workspace at startup encoder profiling; the full-attention metadata
-    (``max_num_tokens // 4`` requests at a budget-length maximum) would ask for
+    (`max_num_tokens // 4` requests at a budget-length maximum) would ask for
     far more. No capacity declaration fixes this: the two maxima cannot
     co-occur under the packed token budget, but the workspace formula prices
     them as if they did.
@@ -295,16 +295,16 @@ def vision_attn_backend(decoder_attn_backend: str) -> str:
 def _unquantized_vision_model_config(
     model_config: ModelConfig[MuseSparkOpenConfig],
 ) -> ModelConfig[MuseSparkOpenConfig]:
-    """A copy of ``model_config`` with quantization and sparsity turned off.
+    """A copy of `model_config` with quantization and sparsity turned off.
 
     The perception tower is BF16 even in the NVFP4 checkpoint -- all 1589
     perception tensors are BF16 and no scale tensor exists under any perception
     prefix. That is because the tower was never quantized, **not** because
-    ``hf_quant_config.json`` excludes it: its ``exclude_modules`` list is
-    ``["self_attn", "lm_head", "layers.0.", "layers.61."]`` with no vision entry,
+    `hf_quant_config.json` excludes it: its `exclude_modules` list is
+    `["self_attn", "lm_head", "layers.0.", "layers.61."]` with no vision entry,
     so inheriting the parent's quant config would build an NVFP4 tower against
     BF16 weights. Every tower submodule is therefore built with
-    ``quant_config=None``, explicitly. The decoder's sparse-attention and
+    `quant_config=None`, explicitly. The decoder's sparse-attention and
     KV-compression settings are cleared for the same reason: they describe the
     text stack, and the tower runs cacheless context-only attention.
     """
@@ -393,7 +393,7 @@ class MuseSparkOpenVisionAttention(Attention):
 
 
 class MuseSparkOpenVisionMLP(MLP):
-    """``c_fc -> exact GELU -> c_proj`` with biases on both projections."""
+    """`c_fc -> exact GELU -> c_proj` with biases on both projections."""
 
     def __init__(
         self,
@@ -416,7 +416,7 @@ class MuseSparkOpenVisionMLP(MLP):
 
 
 class MuseSparkOpenVisionEncoderLayer(nn.Module):
-    """Pre-norm block: ``ln_1 -> attn -> +res -> ln_2 -> mlp -> +res``."""
+    """Pre-norm block: `ln_1 -> attn -> +res -> ln_2 -> mlp -> +res`."""
 
     def __init__(
         self,
@@ -460,7 +460,7 @@ class MuseSparkOpenVisionEncoderLayer(nn.Module):
 
 
 class MuseSparkOpenVisionEncoder(nn.Module):
-    """The 50-layer stack. Exists so the module path matches ``encoder.layers.{i}``."""
+    """The 50-layer stack. Exists so the module path matches `encoder.layers.{i}`."""
 
     def __init__(
         self,
@@ -492,9 +492,9 @@ class MuseSparkOpenVisionEncoder(nn.Module):
 
 
 class MuseSparkOpenVisionAdapter(nn.Module):
-    """``c_fc -> GELU -> c_proj -> GELU``, both projections unbiased.
+    """`c_fc -> GELU -> c_proj -> GELU`, both projections unbiased.
 
-    The trailing GELU is not a typo: the reference's ``simple_mlp`` activates the
+    The trailing GELU is not a typo: the reference's `simple_mlp` activates the
     output projection as well.
     """
 
@@ -550,7 +550,7 @@ class MuseSparkOpenVisionAdapter(nn.Module):
 class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
     """Packed variable-resolution NaViT tower, projected into the decoder's space.
 
-    ``forward`` returns **unnormed** rows; the decoder's ``embed_norm`` is the
+    `forward` returns **unnormed** rows; the decoder's `embed_norm` is the
     single application of the weightless RMSNorm for both text and vision.
     """
 
@@ -666,7 +666,7 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
         """Bound the two metadata objects this encoder uses.
 
         Full attention gets one sequence per clip; the loosest bound without
-        processor geometry is one clip per ``downsample_factor ** 2`` tokens,
+        processor geometry is one clip per `downsample_factor ** 2` tokens,
         since a clip contributes at least that many patches. Window attention
         gets one sequence per 32x32 window, and a window holds at least one
         patch, so it needs the full token budget.
@@ -709,12 +709,12 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
 
         The two metadata objects need **separate** maxima. A full-attention
         segment is a whole clip and can be as long as the token budget, but a
-        window is a ``window_size`` x ``window_size`` tile, so it can never hold
-        more than ``window_size ** 2`` patches no matter how large the budget
+        window is a `window_size` x `window_size` tile, so it can never hold
+        more than `window_size ** 2` patches no matter how large the budget
         is. Handing the window path the budget-sized maximum is not merely
         loose: this head size has no fused MHA kernel on this architecture, and
         the unfused path sizes its workspace from
-        ``max_num_requests * max_seq_len ** 2``. With one request declared per
+        `max_num_requests * max_seq_len ** 2`. With one request declared per
         token and a budget-sized maximum, a single 1564-patch image asked for
         405 GB and the tower raised instead of running.
         """
@@ -731,7 +731,7 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
 
     @property
     def attn_max_seq_len(self) -> int:
-        """Longest full-attention segment (one clip, ``grid_h * grid_w``
+        """Longest full-attention segment (one clip, `grid_h * grid_w`
         patches) this tower accepts. Exposed so request admission can reject
         an oversized item with a request-scoped error instead of the same
         check raising mid-forward and failing the whole batch."""
@@ -792,7 +792,7 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
     def _host_grid_rows(
         self, grid_thw: torch.Tensor, grid_thw_cpu: Optional[torch.Tensor]
     ) -> List[Tuple[int, int, int]]:
-        """Per-medium ``(t, h, w)`` on the host.
+        """Per-medium `(t, h, w)` on the host.
 
         The permutations, segment lengths and RoPE slices are all data-dependent
         shapes, so this geometry has to exist as Python ints. Reading it back off
@@ -814,7 +814,7 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
     def _positional_embedding(self, pos_xy: torch.Tensor) -> torch.Tensor:
         """Sample the 32x32 learned grid at the given normalized coordinates.
 
-        ``align_corners=False`` puts the learned samples at cell centres, which
+        `align_corners=False` puts the learned samples at cell centres, which
         is what the pixel-centre coordinate construction assumes.
         """
         grid_side = self.config.pos_emb_grid_size
@@ -832,10 +832,10 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
     ) -> torch.Tensor:
         """Pixel-centre sampling coordinates for one clip, reference layout.
 
-        ``indexing="xy"`` makes ``meshgrid(pos_h, pos_w)`` return ``[grid_w,
-        grid_h]`` tensors, so the flattened coordinate list runs width-outer and
-        each entry is ``(h_coord, w_coord)`` in a slot ``grid_sample`` reads as
-        ``(x, y)``. That is a transposition relative to the row-major patch
+        `indexing="xy"` makes `meshgrid(pos_h, pos_w)` return `[grid_w,
+        grid_h]` tensors, so the flattened coordinate list runs width-outer and
+        each entry is `(h_coord, w_coord)` in a slot `grid_sample` reads as
+        `(x, y)`. That is a transposition relative to the row-major patch
         order, and it is what the model was trained with -- replicated verbatim,
         not corrected.
         """
@@ -845,7 +845,7 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
         return torch.stack(torch.meshgrid(pos_h, pos_w, indexing="xy"), dim=-1).reshape(-1, 2)
 
     def _rope_slice(self, grid_h: int, grid_w: int, device: torch.device) -> torch.Tensor:
-        """RoPE rows for one clip in row-major patch order, ``[grid_h * grid_w, head_dim // 2, 2]``."""
+        """RoPE rows for one clip in row-major patch order, `[grid_h * grid_w, head_dim // 2, 2]`."""
         half = self.config.head_dim // 2
         if grid_h > self.max_rope_grid or grid_w > self.max_rope_grid:
             table = precompute_rope_freqs_cis(
@@ -871,17 +871,17 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
         """Encode a packed batch of images and video clips.
 
         Args:
-            pixel_values: ``[total_patches, patch_dim]``, patches of every medium
-                concatenated in request order, vectorized ``[t][c][py][px]``.
-            grid_thw: ``[num_media, 3]`` int32 ``(clips, grid_h, grid_w)``, the
+            pixel_values: `[total_patches, patch_dim]`, patches of every medium
+                concatenated in request order, vectorized `[t][c][py][px]`.
+            grid_thw: `[num_media, 3]` int32 `(clips, grid_h, grid_w)`, the
                 last two in **patch** units, per the input processor. A still image is one clip; video is
-                ``frames // patch_temporal`` clips.
-            grid_thw_cpu: host-resident copy of ``grid_thw``. Supplying it keeps
+                `frames // patch_temporal` clips.
+            grid_thw_cpu: host-resident copy of `grid_thw`. Supplying it keeps
                 the forward free of device-to-host syncs; without it the tower
-                reads ``grid_thw`` back and says so once.
+                reads `grid_thw` back and says so once.
 
         Returns:
-            ``[total_rows, hidden_size_of_decoder]``, unnormed.
+            `[total_rows, hidden_size_of_decoder]`, unnormed.
         """
         device = pixel_values.device
         rows = self._host_grid_rows(grid_thw, grid_thw_cpu)
@@ -980,7 +980,7 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
 
 
 def vision_layer_is_full_attention(layer_idx: int, cfg: MuseSparkOpenVisionConfig) -> bool:
-    """Re-exported for the weight mapper and tests; the schedule lives in the config."""
+    """Re-exported for the weight mapper; the schedule lives in the config."""
     return layer_uses_full_vision_attention(
         layer_idx, cfg.num_hidden_layers, cfg.sparse_attention_factor
     )

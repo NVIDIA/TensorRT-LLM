@@ -3,8 +3,8 @@
 """A text-only request must reach the decoder unchanged by the multimodal wrapper.
 
 The claim being pinned is narrow and exact: with no multimodal parameters, the
-wrapper hands the decoder the same ``input_ids`` it received, no
-``inputs_embeds``, and the same everything else. Not "similar", not "equivalent
+wrapper hands the decoder the same `input_ids` it received, no
+`inputs_embeds`, and the same everything else. Not "similar", not "equivalent
 after a lookup" -- the same object.
 
 The file also pins the wrapper's other contracts with the framework:
@@ -44,7 +44,7 @@ class _RecordingLLM(torch.nn.Module):
 def _wrapper_with(llm):
     """A wrapper instance whose only wired part is the piece under test.
 
-    Built with ``__new__`` on purpose: constructing the real thing would build a
+    Built with `__new__` on purpose: constructing the real thing would build a
     62-layer decoder and a 50-layer tower to exercise one branch that touches
     neither.
     """
@@ -109,7 +109,7 @@ def test_encoder_disable_controls_construction_and_weight_loading(monkeypatch, d
 def _attn(num_contexts, num_generations=0):
     """The attention-metadata fields the mixin's forward reads.
 
-    Both are real fields on ``AttentionMetadata``.
+    Both are real fields on `AttentionMetadata`.
     """
     return SimpleNamespace(num_contexts=num_contexts, num_generations=num_generations)
 
@@ -160,7 +160,7 @@ def test_an_empty_multimodal_list_is_also_the_text_path():
     """A text turn in a multimodal conversation carries an empty list.
 
     After the prefill that consumed the image, later turns arrive with
-    ``multimodal_params=[]``. That must take the same path as a request that
+    `multimodal_params=[]`. That must take the same path as a request that
     never had media, not a degenerate version of the vision path.
     """
     llm = _RecordingLLM()
@@ -269,9 +269,9 @@ class _StubTokenizer:
     """Tokenizes the way the real one does where it matters.
 
     Three properties are load-bearing for the marker splice and all three are
-    true of the checkpoint tokenizer: ``<image>`` and ``<video>`` are ORDINARY
+    true of the checkpoint tokenizer: `<image>` and `<video>` are ORDINARY
     TEXT (no added token exists for either), so each becomes a multi-id run;
-    the two runs differ; and ``><`` merges into a single token, so two adjacent
+    the two runs differ; and `><` merges into a single token, so two adjacent
     markers do NOT tokenize as two copies of one marker, which a splice that
     matched marker ids instead of marker text would get wrong.
     """
@@ -1441,7 +1441,7 @@ def _encoder_with_stub_tower():
 
 
 def _modality_data(modality, fills, side=2, patch_dim=3):
-    """One modality's packed tensors, item *i* filled with ``fills[i]``."""
+    """One modality's packed tensors, item *i* filled with `fills[i]`."""
     patches = side * side
     return {
         "pixel_values": torch.cat(
@@ -1575,7 +1575,7 @@ def test_an_empty_batch_still_returns_a_tensor():
 
 
 def _framed(modality, rows):
-    """One expanded item: start id, ``rows`` row-carrying ids, end id."""
+    """One expanded item: start id, `rows` row-carrying ids, end id."""
     from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
         _ITEM_FRAMES,
     )

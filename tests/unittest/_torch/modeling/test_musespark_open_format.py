@@ -141,7 +141,7 @@ def source_format_keys():
     (the loader derives it from the tower's module tree, which needs a built
     tower).
     """
-    keys = missing_in_range_keys([], NUM_LAYERS, 256, list(BF16_EXPERT_LAYERS))
+    keys = missing_in_range_keys([], NUM_LAYERS, list(BF16_EXPERT_LAYERS))
     vision = missing_vision_keys([], NUM_VISION_LAYERS)
     # The open export carries the projection once, under the bare alias.
     keys += [VISION_PROJECTION_ALIAS if ".vision_projection." in key else key for key in vision]
@@ -418,8 +418,8 @@ def test_rename_is_a_no_op_on_source_format():
 
 
 def test_interleave_rope_rows_inverts_the_half_layout():
-    """Ground truth: the open export stores row ``j`` of a head where the
-    source stored row ``2j`` (first half) / ``2(j - half) + 1`` (second half).
+    """Ground truth: the open export stores row `j` of a head where the
+    source stored row `2j` (first half) / `2(j - half) + 1` (second half).
     Restoring must put every source row back, for weights and biases alike."""
     heads, head_dim, in_dim = 3, 8, 5
     half = head_dim // 2
