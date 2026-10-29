@@ -127,6 +127,55 @@ public:
         }
     }
 
+    bool decodeRange(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
+        size_t numBasePages, PoolIndex poolIndex, size_t hotOffset, size_t numBytes,
+        cudaStream_t stream) noexcept override
+    {
+        try
+        {
+            GroupConfig const* const group = findGroup(layerGroupId);
+            if (group == nullptr || srcBasePtr == nullptr || pageIndices == nullptr || stream == nullptr
+                || poolIndex.value() < 0 || poolIndex >= group->copyPlans.size()
+                || numBasePages > std::numeric_limits<uint32_t>::max())
+            {
+                return false;
+            }
+            PoolCopyPlan const& plan = group->copyPlans.at(poolIndex);
+            if (numBytes == 0 || numBytes > plan.hotPageBytes || hotOffset > plan.hotPageBytes - numBytes
+                || numBytes > std::numeric_limits<uint32_t>::max())
+            {
+                return false;
+            }
+            if (numBasePages == 0)
+            {
+                return true;
+            }
+            // The concat cold page holds each hot pool's slot verbatim at coldPageOffset, so a hot byte range
+            // maps to the same range shifted by that offset.
+            PoolCopyArgs args{};
+            args.dstBase = reinterpret_cast<CUdeviceptr>(plan.hotBase + hotOffset);
+            args.dstStride = plan.hotPageBytes;
+            args.srcBase = reinterpret_cast<CUdeviceptr>(
+                static_cast<std::byte const*>(srcBasePtr) + plan.coldPageOffset + hotOffset);
+            args.srcStride = group->coldPageBytes;
+            args.bytesPerPage = static_cast<uint32_t>(numBytes);
+            args.pairs = pageIndices;
+            args.numPairs = static_cast<uint32_t>(numBasePages);
+            mCopier.launch(args, CopyDirection::kH2D, reinterpret_cast<CUstream>(stream));
+            return true;
+        }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_ERROR("Default cold-page range decoding failed: %s", error.what());
+            return false;
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("Default cold-page range decoding failed: unknown error");
+            return false;
+        }
+    }
+
 private:
     void configureImpl(PoolGroupDesc const* gpuDescs, PoolGroupIndex numGpuDescs)
     {
@@ -277,6 +326,13 @@ IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;
 LayerGroupId IKvCacheColdPageCodec::getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept
 {
     return layerGroupId;
+}
+
+bool IKvCacheColdPageCodec::decodeRange(LayerGroupId /*layerGroupId*/, void const* /*srcBasePtr*/,
+    PageIndexPair const* /*pageIndices*/, size_t /*numBasePages*/, PoolIndex /*poolIndex*/, size_t /*hotOffset*/,
+    size_t /*numBytes*/, cudaStream_t /*stream*/) noexcept
+{
+    return false;
 }
 
 std::unique_ptr<IKvCacheColdPageCodec> createDefaultKvCacheColdPageCodec()

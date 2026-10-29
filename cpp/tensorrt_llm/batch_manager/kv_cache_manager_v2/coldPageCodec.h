@@ -139,6 +139,15 @@ public:
     virtual bool decode(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) noexcept
         = 0;
+
+    //! Decodes one byte range of each cold page into hot pages.
+    //!
+    //! Restores `numBytes` bytes at `hotOffset` within each page's slot in hot pool `poolIndex`, so a caller can
+    //! restore pages one layer at a time and let each layer's readers start as soon as its bytes land. The pairs and
+    //! their location follow decode(). Returns false when the codec has no byte-addressable cold layout or the range
+    //! lies outside the pool's slot; the default implementation always returns false.
+    virtual bool decodeRange(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
+        size_t numBasePages, PoolIndex poolIndex, size_t hotOffset, size_t numBytes, cudaStream_t stream) noexcept;
 };
 
 //! Creates the lossless default codec that concatenates hot pools into one cold-page blob.

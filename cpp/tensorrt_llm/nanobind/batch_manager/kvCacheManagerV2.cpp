@@ -1955,7 +1955,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             // support is merged and its callers stop passing it; it is here only so this
             // change stands alone.
             [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding,
-                std::optional<std::vector<int>> groups)
+                std::optional<std::vector<int>> groups, bool deferOnboard)
             {
                 (void) isDecoding;
                 std::optional<CUstream> optStream;
@@ -1971,10 +1971,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     }
                 }
                 nb::gil_scoped_release rel;
-                return self.resume(optStream, std::move(selected));
+                return self.resume(optStream, std::move(selected), deferOnboard);
             },
             nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
-            nb::arg("optional_reuse_groups") = nb::none())
+            nb::arg("optional_reuse_groups") = nb::none(), nb::arg("defer_onboard") = false)
         .def(
             "get_page_priorities",
             [](kv::KvCache const& self, int layerGroupId, int beamIndex)
@@ -3367,6 +3367,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_scope"), nb::arg("input_tokens"), nb::arg("target"))
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_layerwise_onboard", &kv::KvCacheManager::setLayerwiseOnboard, nb::arg("enable"),
+            nb::arg("layer_groups"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "flush_onboard",
+            [](kv::KvCacheManager& self, intptr_t stream)
+            { return self.flushOnboard(reinterpret_cast<CUstream>(stream)); },
+            nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "wait_layer_onboard",
+            [](kv::KvCacheManager const& self, int layerId, intptr_t stream)
+            { self.waitLayerOnboard(layerId, reinterpret_cast<CUstream>(stream)); },
+            nb::arg("layer_id"), nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "wait_all_onboard",
+            [](kv::KvCacheManager& self, intptr_t stream) { self.waitAllOnboard(reinterpret_cast<CUstream>(stream)); },
+            nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "has_onboard_events", &kv::KvCacheManager::hasOnboardEvents, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,

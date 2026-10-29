@@ -4993,6 +4993,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Whether partially matched blocks that are in use can be reused after copying them."
     )
+
+    layerwise_host_onboard: bool = Field(
+        default=False,
+        description=
+        "With a host cache tier and the KV cache manager v2, issue the host-to-GPU "
+        "copies of reused context blocks in layer order on a dedicated stream, so "
+        "each layer's attention waits only for its own copies and the forward "
+        "overlaps the transfer. Takes effect only with an attention backend that "
+        "waits per layer (MiniMax-M3 MSA today) and no KV connector.",
+        status="prototype")
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
     max_gpu_total_bytes: NonNegativeInt = Field(

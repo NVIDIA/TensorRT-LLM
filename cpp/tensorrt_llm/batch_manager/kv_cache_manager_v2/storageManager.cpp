@@ -525,6 +525,14 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
+    if (!mLevels.empty())
+    {
+        flushPendingOnboard(std::nullopt);
+    }
+    mOnboardDoneEvents.clear();
+    mUnwaitedOnboardCopyEvents.clear();
+    mLayerOnboardEvents.clear();
+    _releaseOnboardResources();
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -787,6 +795,25 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 void StorageManager::copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
     SlotId srcSlotId, CUstream stream)
 {
+    if (srcLevel == kHotLevel && !mPendingOnboardPages.empty())
+    {
+        SharedPtr<Page> source;
+        for (auto const& entry : mPendingOnboardPages)
+        {
+            Page const* const page = entry.first;
+            if (page->lifeCycle == lifeCycle && page->slotId() == srcSlotId)
+            {
+                source = entry.second.page;
+                break;
+            }
+        }
+        if (source)
+        {
+            flushPendingOnboard(stream);
+            // The copy below reads the slot on `stream`.
+            source->readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+        }
+    }
     LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(dstLevel, srcLevel, lifeCycle);
     PageIndexPair const pageIndex{slotIdToPageIndexValue(dstSlotId), slotIdToPageIndexValue(srcSlotId)};
     submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, &pageIndex, 1, stream);
@@ -978,6 +1005,10 @@ void StorageManager::forceEvict(
 {
     auto evicted = mLevels.at(level).controller.evict(minNumPages);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
+    for (auto const& pages : evicted)
+    {
+        _flushIfAnyPending(pages);
+    }
 
     if (isLastLevel(level))
     {
@@ -1148,6 +1179,11 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
 
     auto evicted = ctrl.evict(numToEvict);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
+    for (auto const& pages : evicted)
+    {
+        // A dropped pending page would free a GPU slot its copy is still due to write.
+        _flushIfAnyPending(pages);
+    }
     TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>> acceptedPages(numLifeCycles());
 
     auto acceptFallenPages = [&](PoolGroupIndex pgIdx, SlotCount count)
@@ -1332,6 +1368,14 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         && std::any_of(
             srcPages.begin(), srcPages.end(), [](auto const& page) { return page->status() == PageStatus::LOCKED; }))
         throw LogicError("Cannot migrate a locked page between storage levels");
+
+    if (_canDeferOnboard(dstLevel, srcLevel, srcPages, updateSrc, defrag))
+    {
+        _deferOnboard(srcLevel, srcPages, migrationRecorder);
+        return std::nullopt;
+    }
+    // A pending page's GPU slot holds no data until its copy is issued.
+    _flushIfAnyPending(srcPages);
 
     SlotCount const numSlots = slotCountValueFromSize(srcPages.size());
     LifeCycleId const firstLifeCycle = srcPages.front()->lifeCycle;
@@ -2283,6 +2327,490 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     // have to be: _needAdjustment treats this as a prediction of the allocator's own output
     // and re-fires until the two agree.
     return normalizeToRatio(gpuStorage.allMediaBytes(slotCountList));
+}
+
+// ---------------------------------------------------------------------------
+// Layer-wise onboarding
+// ---------------------------------------------------------------------------
+
+void StorageManager::setLayerwiseOnboard(bool enable, int layerGroups)
+{
+    if (!enable)
+    {
+        TLLM_CHECK_WITH_INFO(!hasPendingOnboard(), "Cannot disable layer-wise onboarding with copies pending");
+        mLayerwiseOnboard = false;
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(layerGroups > 0, "layerGroups must be positive");
+    _buildLayerCopyPlans(layerGroups);
+    mLayerwiseOnboard = true;
+}
+
+void StorageManager::_buildLayerCopyPlans(int layerGroups)
+{
+    // Per lifecycle: each layer's buffers as (pool, offset, size), grouped into `layerGroups`
+    // contiguous layer runs. Coalesced buffers are laid out layer-major within each pool, so a run
+    // usually maps to one range per pool.
+    LifeCycleId const numLc = numLifeCycles();
+    TypedVec<LifeCycleId, std::map<LayerId, std::vector<LayerCopyRange>>> byLayer(numLc);
+    for (auto const& [bufferId, attr] : mBufferAttr)
+    {
+        byLayer.at(attr.lifeCycleId)[bufferId.layerId].push_back(
+            LayerCopyRange{attr.poolIndex, attr.offset, attr.size});
+    }
+    TypedVec<LifeCycleId, std::vector<LayerCopyStep>> plans(numLc);
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+    {
+        auto const& layers = byLayer.at(lc);
+        if (layers.empty())
+        {
+            continue;
+        }
+        PoolGroupIndex const hotPgIdx = getPoolGroupIndex(kHotLevel, lc);
+        auto const& slotSizes = slotSize(kHotLevel, hotPgIdx);
+        // A host-backed (sparse) pool in the hot level is read by its batch's sparse arena,
+        // which does not take the per-layer events: keep whole-page onboarding there.
+        bool hostBackedPool = false;
+        for (PoolIndex pool{0}; pool < slotSizes.size(); ++pool)
+        {
+            hostBackedPool |= poolMedium(kHotLevel, hotPgIdx, pool) != CacheTier::GPU_MEM;
+        }
+        if (hostBackedPool)
+        {
+            continue;
+        }
+        size_t const numLayers = layers.size();
+        size_t const numSteps = std::min(numLayers, static_cast<size_t>(layerGroups));
+        std::vector<LayerCopyStep> steps(numSteps);
+        size_t index = 0;
+        for (auto const& [layerId, ranges] : layers)
+        {
+            auto& step = steps.at(index * numSteps / numLayers);
+            step.layers.push_back(layerId);
+            step.ranges.insert(step.ranges.end(), ranges.begin(), ranges.end());
+            ++index;
+        }
+        TypedVec<PoolIndex, size_t> covered(slotSizes.size(), 0);
+        bool valid = true;
+        for (auto& step : steps)
+        {
+            std::sort(step.ranges.begin(), step.ranges.end(),
+                [](LayerCopyRange const& a, LayerCopyRange const& b)
+                { return std::tie(a.poolIndex, a.offset) < std::tie(b.poolIndex, b.offset); });
+            std::vector<LayerCopyRange> merged;
+            for (auto const& range : step.ranges)
+            {
+                if (range.poolIndex.value() < 0 || range.poolIndex >= slotSizes.size()
+                    || range.offset + range.numBytes > slotSizes.at(range.poolIndex))
+                {
+                    valid = false;
+                    break;
+                }
+                covered.at(range.poolIndex) += range.numBytes;
+                if (!merged.empty() && merged.back().poolIndex == range.poolIndex
+                    && merged.back().offset + merged.back().numBytes == range.offset)
+                {
+                    merged.back().numBytes += range.numBytes;
+                }
+                else
+                {
+                    merged.push_back(range);
+                }
+            }
+            step.ranges = std::move(merged);
+        }
+        // Every byte of the slot must belong to exactly one layer; otherwise keep whole-page copies.
+        for (PoolIndex pool{0}; valid && pool < slotSizes.size(); ++pool)
+        {
+            valid = covered.at(pool) == slotSizes.at(pool);
+        }
+        if (valid)
+        {
+            plans.at(lc) = std::move(steps);
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "Layer-wise onboarding disabled for lifecycle %d: its slot is not tiled by layer buffers", lc.value());
+        }
+    }
+    mLayerCopyPlans = std::move(plans);
+}
+
+void StorageManager::beginOnboardDeferral() noexcept
+{
+    ++mOnboardDeferralDepth;
+}
+
+void StorageManager::endOnboardDeferral() noexcept
+{
+    TLLM_CHECK_DEBUG(mOnboardDeferralDepth > 0);
+    --mOnboardDeferralDepth;
+}
+
+bool StorageManager::isOnboardPending(Page const& page) const
+{
+    return !mPendingOnboardPages.empty() && mPendingOnboardPages.count(&page) != 0;
+}
+
+template <typename Pages>
+void StorageManager::_flushIfAnyPending(Pages const& pages, std::optional<CUstream> waiter)
+{
+    if (mPendingOnboardPages.empty())
+    {
+        return;
+    }
+    for (auto const& page : pages)
+    {
+        if (page && isOnboardPending(*page))
+        {
+            flushPendingOnboard(waiter);
+            return;
+        }
+    }
+}
+
+bool StorageManager::_canDeferOnboard(CacheLevel dstLevel, CacheLevel srcLevel,
+    std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, bool defrag) const
+{
+    if (!deferringOnboard() || !updateSrc || defrag || dstLevel != kHotLevel || srcLevel == kHotLevel
+        || cacheTier(srcLevel) != CacheTier::HOST_MEM)
+    {
+        return false;
+    }
+    return std::all_of(srcPages.begin(), srcPages.end(),
+        [this](auto const& page)
+        {
+            return page->lifeCycle < mLayerCopyPlans.size() && !mLayerCopyPlans.at(page->lifeCycle).empty()
+                && page->status() != PageStatus::LOCKED;
+        });
+}
+
+void StorageManager::_deferOnboard(
+    CacheLevel srcLevel, std::vector<SharedPtr<Page>> const& srcPages, MigrationRecorder const& migrationRecorder)
+{
+    LayerGroupId const batchingLayerGroupId
+        = getMigrationBatchingLayerGroupId(kHotLevel, srcLevel, srcPages.front()->lifeCycle);
+    PoolGroupIndex const dstPgIdx = getPoolGroupIndex(kHotLevel, batchingLayerGroupId);
+    auto& dstPoolGroup = poolGroup(kHotLevel, dstPgIdx);
+    SlotCount const numSlots = slotCountValueFromSize(srcPages.size());
+    if (dstPoolGroup.numFreeSlots() < numSlots)
+    {
+        throw OutOfPagesError("Not enough free slots for migration");
+    }
+    auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
+    TLLM_CHECK_DEBUG(slotCountValueFromSize(dstSlots.size()) == numSlots);
+
+    // Nothing below can fail short of a CUDA error, so the pending state is committed page by page.
+    for (std::size_t i = 0; i < srcPages.size(); ++i)
+    {
+        auto const& page = srcPages.at(i);
+        TLLM_CHECK_DEBUG(!page->scheduledForEviction() && !isOnboardPending(*page));
+        mPendingOnboardPriorEvents.push_back(page->readyEvent);
+        mPendingOnboardPriorEvents.push_back(dstSlots.at(i).readyEvent);
+        mPendingOnboardMigrations[{srcLevel, page->lifeCycle}].push_back(
+            PageIndexPair{slotIdToPageIndexValue(dstSlots.at(i).slotId()), slotIdToPageIndexValue(page->slotId())});
+    }
+    if (migrationRecorder)
+    {
+        migrationRecorder(srcPages, dstSlots, srcLevel, kHotLevel);
+    }
+    std::set<std::pair<std::string, int>> emittedCacheLevelUpdates;
+    for (std::size_t i = 0; i < srcPages.size(); ++i)
+    {
+        auto const& page = srcPages.at(i);
+        bool const wasScheduled = page->scheduledForEviction();
+        if (wasScheduled)
+        {
+            excludeFromEviction(*page);
+        }
+        PendingOnboardPage pending;
+        pending.page = page;
+        pending.srcLevel = srcLevel;
+        pending.hostSlot = page->exchangeSlot(std::move(dstSlots.at(i)));
+        // Readers that do not take the per-layer events see the host source's readiness until the
+        // flush, which replaces it with the copy's completion. The GPU slot's own readiness (the
+        // offload that freed it) is waited only by the copy.
+        page->readyEvent = pending.hostSlot.readyEvent;
+        pending.deferredReadyEvent = page->readyEvent;
+        page->cacheLevel = kHotLevel;
+        if (mEventSink && page->isCommitted())
+        {
+            auto const& committed = static_cast<CommittedPage const&>(*page);
+            Block const* block = committed.block;
+            if (block && !block->isOrphan())
+            {
+                std::string const blockKey(reinterpret_cast<char const*>(block->key.data()), block->key.size());
+                if (emittedCacheLevelUpdates.insert({blockKey, committed.lifeCycle.value()}).second)
+                {
+                    mEventSink->addCacheLevelUpdated(block->key, srcLevel, kHotLevel, committed.lifeCycle);
+                }
+            }
+        }
+        mPendingOnboardPages.emplace(page.get(), std::move(pending));
+        if (wasScheduled)
+        {
+            scheduleForEviction(*page);
+        }
+    }
+}
+
+std::optional<CacheLevel> StorageManager::deferCopyFromPendingPage(
+    LifeCycleId lifeCycle, Slot const& dstSlot, Page const& src)
+{
+    auto const it = mPendingOnboardPages.find(&src);
+    if (it == mPendingOnboardPages.end())
+    {
+        return std::nullopt;
+    }
+    auto const& pending = it->second;
+    TLLM_CHECK_DEBUG(src.lifeCycle == lifeCycle);
+    mPendingOnboardCopyPriorEvents.push_back(dstSlot.readyEvent);
+    mPendingOnboardCopyPriorEvents.push_back(pending.hostSlot.readyEvent);
+    mPendingOnboardCopies[{pending.srcLevel, lifeCycle}].push_back(
+        PageIndexPair{slotIdToPageIndexValue(dstSlot.slotId()), slotIdToPageIndexValue(pending.hostSlot.slotId())});
+    return pending.srcLevel;
+}
+
+CUstream StorageManager::_onboardStream()
+{
+    if (mOnboardStream == nullptr)
+    {
+        // Highest priority: the copy kernel's CTAs are dispatched ahead of the forward it overlaps.
+        int leastPriority = 0;
+        int greatestPriority = 0;
+        cuCheck(cuCtxGetStreamPriorityRange(&leastPriority, &greatestPriority));
+        cuCheck(cuStreamCreateWithPriority(&mOnboardStream, CU_STREAM_NON_BLOCKING, greatestPriority));
+    }
+    return mOnboardStream;
+}
+
+bool StorageManager::flushPendingOnboard(std::optional<CUstream> waiter)
+{
+    if (waiter.has_value() && !mUnwaitedOnboardCopyEvents.empty())
+    {
+        // Private-slot copies issued by an earlier flush that had no stream to order them on.
+        for (auto const& event : mUnwaitedOnboardCopyEvents)
+        {
+            event.waitInStream(reinterpret_cast<CudaStream>(*waiter));
+        }
+        mUnwaitedOnboardCopyEvents.clear();
+    }
+    if (mPendingOnboardPages.empty())
+    {
+        TLLM_CHECK_DEBUG(mPendingOnboardMigrations.empty() && mPendingOnboardCopies.empty());
+        return false;
+    }
+    CUstream const stream = _onboardStream();
+    auto const cudaStream = reinterpret_cast<CudaStream>(stream);
+    auto handlesOf = [](std::vector<CachedCudaEvent> const& events)
+    {
+        std::vector<CUevent> handles;
+        handles.reserve(events.size());
+        for (auto const& event : events)
+        {
+            handles.push_back(event.handle());
+        }
+        return handles;
+    };
+
+    // Whole-page copies into private slots come first and gate only on their own slots: the caller
+    // writes new tokens into those slots, so its stream waits for them before any forward work.
+    if (!mPendingOnboardCopies.empty())
+    {
+        streamWaitEvents(cudaStream, handlesOf(mPendingOnboardCopyPriorEvents));
+        for (auto const& [key, pairs] : mPendingOnboardCopies)
+        {
+            LayerGroupId const batchingLayerGroupId
+                = getMigrationBatchingLayerGroupId(kHotLevel, key.first, key.second);
+            submitMigrationBatch(kHotLevel, key.first, batchingLayerGroupId, pairs.data(), pairs.size(), stream);
+        }
+        CachedCudaEvent copied(cudaStream);
+        if (waiter.has_value())
+        {
+            copied.waitInStream(reinterpret_cast<CudaStream>(*waiter));
+        }
+        else
+        {
+            mUnwaitedOnboardCopyEvents.push_back(std::move(copied));
+        }
+        mPendingOnboardCopies.clear();
+        mPendingOnboardCopyPriorEvents.clear();
+    }
+
+    // Layer-ordered migrations. The copy waits for the offloads that freed its GPU slots; readers
+    // wait only for the layers they read.
+    streamWaitEvents(cudaStream, handlesOf(mPendingOnboardPriorEvents));
+
+    struct Group
+    {
+        CacheLevel srcLevel;
+        LifeCycleId lifeCycle;
+        PageIndexPair const* pairs;
+        size_t numPairs;
+        void const* coldBase;
+    };
+
+    std::vector<Group> groups;
+    std::vector<PageIndexPair> allPairs;
+    for (auto const& [key, pairs] : mPendingOnboardMigrations)
+    {
+        allPairs.insert(allPairs.end(), pairs.begin(), pairs.end());
+    }
+    PageIndexPair const* pairBase = allPairs.data();
+    bool const deviceIndices = !mPendingOnboardMigrations.empty()
+        && mPageIndexLocations.at(mPendingOnboardMigrations.begin()->first.second) == PageIndexLocation::kDevice;
+    if (deviceIndices && !allPairs.empty())
+    {
+        size_t const bytes = allPairs.size() * sizeof(PageIndexPair);
+        if (bytes > mOnboardIndexBytes)
+        {
+            // Stream-ordered: every reader of the old buffer was issued on this stream.
+            if (mOnboardIndexBuffer != 0)
+            {
+                cuCheck(cuMemFreeAsync(mOnboardIndexBuffer, stream));
+            }
+            size_t const capacity = std::max<size_t>(bytes * 2, 64u << 10u);
+            cuCheck(cuMemAllocAsync(&mOnboardIndexBuffer, capacity, stream));
+            mOnboardIndexBytes = capacity;
+        }
+        copyToDeviceSyncSource(mOnboardIndexBuffer, allPairs.data(), allPairs.size(), stream);
+        pairBase = reinterpret_cast<PageIndexPair const*>(mOnboardIndexBuffer);
+    }
+    size_t offset = 0;
+    for (auto const& [key, pairs] : mPendingOnboardMigrations)
+    {
+        auto const [srcLevel, lifeCycle] = key;
+        TLLM_CHECK_DEBUG(mPageIndexLocations.at(lifeCycle)
+            == (deviceIndices ? PageIndexLocation::kDevice : PageIndexLocation::kHost));
+        LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(kHotLevel, srcLevel, lifeCycle);
+        PoolGroupIndex const coldPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
+        MemAddress const coldBase = mLevels.at(srcLevel).storage->getBaseAddress(coldPgIdx, PoolIndex{0}, SlotId{0});
+        groups.push_back(
+            Group{srcLevel, lifeCycle, pairBase + offset, pairs.size(), reinterpret_cast<void const*>(coldBase)});
+        offset += pairs.size();
+    }
+
+    // Steps of every lifecycle in order of their first layer, one event after each.
+    std::vector<std::pair<LifeCycleId, size_t>> order;
+    std::set<LifeCycleId> lifeCycles;
+    for (auto const& group : groups)
+    {
+        lifeCycles.insert(group.lifeCycle);
+    }
+    for (LifeCycleId lc : lifeCycles)
+    {
+        for (size_t step = 0; step < mLayerCopyPlans.at(lc).size(); ++step)
+        {
+            order.emplace_back(lc, step);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(),
+        [this](auto const& a, auto const& b)
+        {
+            return mLayerCopyPlans.at(a.first).at(a.second).layers.front()
+                < mLayerCopyPlans.at(b.first).at(b.second).layers.front();
+        });
+    for (auto const& [lc, stepIndex] : order)
+    {
+        LayerCopyStep const& step = mLayerCopyPlans.at(lc).at(stepIndex);
+        for (auto const& group : groups)
+        {
+            if (group.lifeCycle != lc)
+            {
+                continue;
+            }
+            for (auto const& range : step.ranges)
+            {
+                TLLM_CHECK_WITH_INFO(
+                    mColdPageCodec->decodeRange(lc, group.coldBase, group.pairs, group.numPairs, range.poolIndex,
+                        range.offset, range.numBytes, reinterpret_cast<cudaStream_t>(stream)),
+                    "Cold-page codec rejected a layer-wise onboarding range");
+            }
+        }
+        CachedCudaEvent const layerReady(cudaStream);
+        for (LayerId layer : step.layers)
+        {
+            mLayerOnboardEvents[layer].push_back(layerReady);
+        }
+    }
+    CachedCudaEvent const done(cudaStream);
+    mOnboardDoneEvents.push_back(done);
+
+    for (auto& entry : mPendingOnboardPages)
+    {
+        PendingOnboardPage& pending = entry.second;
+        Page& page = *pending.page;
+        if (page.readyEvent.handle() == pending.deferredReadyEvent.handle() || page.readyEvent.isClosed())
+        {
+            page.readyEvent = done;
+        }
+        else
+        {
+            // Readers recorded while the copy was pending (an unlock during the deferral).
+            std::vector<CachedCudaEvent> events{page.readyEvent, done};
+            page.readyEvent = mergeEvents(events);
+        }
+        pending.hostSlot.readyEvent = done;
+        releaseSlot(page.lifeCycle, pending.srcLevel, std::move(pending.hostSlot));
+    }
+    mPendingOnboardPages.clear();
+    mPendingOnboardMigrations.clear();
+    mPendingOnboardPriorEvents.clear();
+    return true;
+}
+
+void StorageManager::waitLayerOnboard(LayerId layerId, CUstream stream) const
+{
+    std::vector<CUevent> handles;
+    if (auto const it = mLayerOnboardEvents.find(layerId); it != mLayerOnboardEvents.end())
+    {
+        for (auto const& event : it->second)
+        {
+            handles.push_back(event.handle());
+        }
+    }
+    for (auto const& event : mUnwaitedOnboardCopyEvents)
+    {
+        handles.push_back(event.handle());
+    }
+    streamWaitEvents(reinterpret_cast<CudaStream>(stream), std::move(handles));
+}
+
+void StorageManager::waitAllOnboard(CUstream stream)
+{
+    flushPendingOnboard(stream);
+    std::vector<CUevent> handles;
+    for (auto const& event : mOnboardDoneEvents)
+    {
+        handles.push_back(event.handle());
+    }
+    for (auto const& event : mUnwaitedOnboardCopyEvents)
+    {
+        handles.push_back(event.handle());
+    }
+    streamWaitEvents(reinterpret_cast<CudaStream>(stream), std::move(handles));
+    mOnboardDoneEvents.clear();
+    mUnwaitedOnboardCopyEvents.clear();
+    mLayerOnboardEvents.clear();
+}
+
+void StorageManager::_releaseOnboardResources() noexcept
+{
+    if (mOnboardStream == nullptr)
+    {
+        return;
+    }
+    // Teardown: the stream may still be reading the index buffer.
+    cuStreamSynchronize(mOnboardStream);
+    if (mOnboardIndexBuffer != 0)
+    {
+        cuMemFree(mOnboardIndexBuffer);
+        mOnboardIndexBuffer = 0;
+        mOnboardIndexBytes = 0;
+    }
+    cuStreamDestroy(mOnboardStream);
+    mOnboardStream = nullptr;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
