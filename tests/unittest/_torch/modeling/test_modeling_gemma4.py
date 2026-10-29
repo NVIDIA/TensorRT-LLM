@@ -2852,6 +2852,25 @@ class TestGemma4HFComparison(unittest.TestCase):
         )
 
     @torch.no_grad()
+    def test_variable_window_probe_requires_backend_capability(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model = (
+            Gemma4ForCausalLM(ModelConfig(pretrained_config=config, attn_backend="TRTLLM"))
+            .to(config.torch_dtype)
+            .to("cuda")
+        )
+        attention = next(layer.self_attn for layer in model.model.layers if layer.is_sliding)
+
+        with unittest.mock.patch.object(
+            attention.attn,
+            "_is_variable_window_kernel_available",
+            None,
+        ):
+            self.assertFalse(model._supports_variable_window_attention(SimpleNamespace()))
+
+    @torch.no_grad()
     def test_sm107_variable_window_uses_dense_bidirectional_mask(self) -> None:
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
         config_dict["use_bidirectional_attention"] = "vision"
@@ -2868,6 +2887,10 @@ class TestGemma4HFComparison(unittest.TestCase):
         attn_metadata.padded_num_tokens = None
         attn_metadata.tokens_per_block = 32
         attn_metadata.use_paged_context_fmha = True
+        attn_metadata.max_num_requests = 1
+        attn_metadata.max_context_length = 4
+        attn_metadata.max_seq_len = 4
+        attn_metadata.kv_cache_manager = None
 
         with (
             unittest.mock.patch(
@@ -2877,12 +2900,8 @@ class TestGemma4HFComparison(unittest.TestCase):
                 "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
                 fake_metadata_type,
             ),
-            unittest.mock.patch(
-                "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
-                return_value=107,
-            ),
             unittest.mock.patch.object(
-                torch.ops.trtllm, "attention_supports_variable_window"
+                torch.ops.trtllm, "attention_supports_variable_window", return_value=False
             ) as support_op,
             unittest.mock.patch.object(
                 model, "get_attention_variable_window"
@@ -2900,7 +2919,7 @@ class TestGemma4HFComparison(unittest.TestCase):
             )
 
         self.assertIs(actual, output)
-        support_op.assert_not_called()
+        support_op.assert_called_once()
         get_variable_window.assert_not_called()
         get_attention_mask.assert_called_once_with(
             mm_token_type_ids=token_type_ids,
@@ -2912,7 +2931,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertIsNone(text_forward.call_args.kwargs["local_variable_window_token_ends"])
 
     @torch.no_grad()
-    def test_oversized_vision_window_uses_dense_mask(self) -> None:
+    def test_vision_window_wider_than_sliding_window_uses_variable_window(self) -> None:
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
         config_dict["use_bidirectional_attention"] = "vision"
         config_dict["sliding_window"] = 3
@@ -2930,10 +2949,9 @@ class TestGemma4HFComparison(unittest.TestCase):
         metadata.num_contexts = 1
         metadata.padded_num_tokens = None
         metadata.context_lens = torch.tensor([4])
-        metadata.kv_cache_params = None
-        expected_mask = model.get_attention_mask(
-            token_type_ids, metadata, effective_sliding_window=config.sliding_window
-        )
+        metadata.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=[4])
+        expected_starts = torch.tensor([2, 3, 4, 4], dtype=torch.int32, device="cuda")
+        expected_ends = torch.full((4,), 7, dtype=torch.int32, device="cuda")
 
         with (
             unittest.mock.patch(
@@ -2946,6 +2964,7 @@ class TestGemma4HFComparison(unittest.TestCase):
             unittest.mock.patch.object(
                 model, "_supports_variable_window_attention", return_value=True
             ),
+            unittest.mock.patch.object(model, "get_attention_mask") as get_attention_mask,
             unittest.mock.patch.object(model.model, "forward", return_value=output) as text_forward,
             unittest.mock.patch.object(model.logits_processor, "forward", return_value=output),
         ):
@@ -2955,11 +2974,14 @@ class TestGemma4HFComparison(unittest.TestCase):
                 mm_token_type_ids=token_type_ids,
             )
 
+        get_attention_mask.assert_not_called()
+        self.assertIsNone(text_forward.call_args.kwargs["local_attention_mask_data"])
         torch.testing.assert_close(
-            text_forward.call_args.kwargs["local_attention_mask_data"], expected_mask
+            text_forward.call_args.kwargs["local_variable_window_token_starts"], expected_starts
         )
-        self.assertIsNone(text_forward.call_args.kwargs["local_variable_window_token_starts"])
-        self.assertIsNone(text_forward.call_args.kwargs["local_variable_window_token_ends"])
+        torch.testing.assert_close(
+            text_forward.call_args.kwargs["local_variable_window_token_ends"], expected_ends
+        )
 
     @torch.no_grad()
     def test_generation_only_skips_bidirectional_mask_building(self) -> None:

@@ -1600,13 +1600,16 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             return False
         attention = sliding_layer.self_attn
         backend = attention.attn
+        kernel_probe = getattr(backend, "_is_variable_window_kernel_available", None)
+        if kernel_probe is None:
+            return False
         output_dtype = self.config.torch_dtype
         if attention._use_quantize_output():
             use_nvfp4_output = backend.use_nvfp4_output(
                 attn_metadata, PredefinedAttentionMask.CAUSAL
             )
             output_dtype = backend.get_quantize_output_dtype(use_nvfp4_output) or output_dtype
-        return backend._is_variable_window_kernel_available(
+        return kernel_probe(
             dtype=self.config.torch_dtype,
             output_dtype=output_dtype,
             metadata=attn_metadata,
@@ -1654,16 +1657,8 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                     attn_metadata=attn_metadata,
                     effective_sliding_window=self.config.sliding_window,
                 )
-                # A paged sliding cache cannot serve KV indices beyond its retained window.
-                # Media blob lengths are input-dependent, so this device-to-host check deliberately
-                # validates the packed batch once before passing its bounds to the kernel.
-                window = self.config.sliding_window
-                use_variable_window = (
-                    window is None or not torch.any(ends - starts + 1 > window).item()
-                )
-                if use_variable_window:
-                    local_variable_window_token_starts = starts
-                    local_variable_window_token_ends = ends
+                local_variable_window_token_starts = starts
+                local_variable_window_token_ends = ends
             if not use_variable_window:
                 local_attention_mask_data = self.get_attention_mask(
                     mm_token_type_ids=mm_token_type_ids,

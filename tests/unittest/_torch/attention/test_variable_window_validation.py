@@ -1,13 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest import mock
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -22,7 +19,7 @@ def _run_variable_window_attention(
     *,
     include_starts: bool = True,
     include_ends: bool = True,
-    force_fallback: bool = False,
+    attention_input_type: AttentionInputType = AttentionInputType.context_only,
 ) -> None:
     num_heads = 2
     num_kv_heads = 1
@@ -57,16 +54,11 @@ def _run_variable_window_attention(
         starts = torch.zeros(num_tokens, dtype=torch.int32, device=bounds_device)
         ends = torch.arange(num_tokens, dtype=torch.int32, device=bounds_device)
         forward_args = AttentionForwardArgs(
-            attention_input_type=AttentionInputType.context_only,
+            attention_input_type=attention_input_type,
             variable_window_token_starts=starts if include_starts else None,
             variable_window_token_ends=ends if include_ends else None,
         )
-        if force_fallback:
-            fallback = FallbackFmha(attention)
-            with mock.patch.object(attention._fmha_manager, "select", return_value=fallback):
-                attention.forward(qkv, None, None, metadata, forward_args=forward_args)
-        else:
-            attention.forward(qkv, None, None, metadata, forward_args=forward_args)
+        attention.forward(qkv, None, None, metadata, forward_args=forward_args)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
@@ -110,7 +102,7 @@ def test_variable_window_probe_rejects_invalid_head_size():
 )
 def test_variable_window_bounds_must_be_paired(include_starts, include_ends):
     with pytest.raises(
-        RuntimeError,
+        ValueError,
         match="variable_window_token_starts and variable_window_token_ends must be provided together",
     ):
         _run_variable_window_attention(
@@ -118,7 +110,18 @@ def test_variable_window_bounds_must_be_paired(include_starts, include_ends):
             bounds_device=torch.device("cuda:0"),
             include_starts=include_starts,
             include_ends=include_ends,
-            force_fallback=True,
+        )
+
+
+def test_variable_window_bounds_reject_generation_only_attention():
+    with pytest.raises(
+        ValueError,
+        match="variable-window bounds are supported only for context attention",
+    ):
+        _run_variable_window_attention(
+            head_dim=128,
+            bounds_device=torch.device("cuda:0"),
+            attention_input_type=AttentionInputType.generation_only,
         )
 
 
