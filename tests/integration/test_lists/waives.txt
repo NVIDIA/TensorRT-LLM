@@ -174,7 +174,6 @@ unittest/_torch/modules/mamba/test_flashinfer_gdn_decode.py SKIP (https://nvbugs
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
 unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe[deepseekv3-relu2-8-separated_routing] SKIP (https://nvbugs/6778221)
-unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)
 unittest/_torch/ray_orchestrator/multi_gpu/test_accuracy_with_allreduce_strategy.py::test_accuracy_with_allreduce_strategy[AUTO-Qwen3/Qwen3-8B] SKIP (https://nvbugs/6923016)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_qwen35_mxfp8 SKIP (https://nvbugs/7007647)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_qwen35_35b_bf16 SKIP (https://nvbugs/6907190)
