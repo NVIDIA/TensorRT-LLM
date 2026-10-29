@@ -2493,6 +2493,16 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
+    def _cancel_context_transfer(self, client_id: int) -> None:
+        """Request cleanup after a CTX result has left frontend routing.
+
+        This enqueues intent, not an acceptance or resource-release receipt.
+
+        Args:
+            client_id: Original frontend identity of the retained CTX request.
+        """
+        self.executor_request_queue.enqueue_context_transfer_cancel(client_id)
+
     def _start_mpi_progress_thread(self) -> None:
         """Start a native thread that keeps this rank's MPI sends moving.
 
@@ -2996,7 +3006,20 @@ class PyExecutor:
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
-            not self.disagg.has_retiring_gen_receives
+            not self.disagg.has_retiring_gen_receives and \
+            not self._has_pending_context_retirement()
+
+    def _has_pending_context_retirement(self) -> bool:
+        """Keep qualified source retirement live after the logical result leaves.
+
+        Returns:
+            Whether a TP-consensus-retired source claim still needs progress.
+        """
+        transfers = getattr(self, "async_transfer_manager", None)
+        return (getattr(self, "kv_cache_transceiver", None) is not None
+                and transfers is not None and any(
+                    self.disagg.supports_logical_context_cancellation(req)
+                    for req in transfers.requests_in_transfer().values()))
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -5568,6 +5591,7 @@ class PyExecutor:
 
         self._handle_control_request()
 
+        new_requests = self._progress_context_cancellations(new_requests)
         new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
@@ -7010,14 +7034,16 @@ class PyExecutor:
                              connector_pending: bool = False) -> bool:
         """Rank-local part of the drain=True gate (see _handle_control_request).
 
-        Transceiver KV transfers are waited for up to
-        _CONTROL_DRAIN_TRANSFER_TIMEOUT_S once the queues are empty; a KV
-        connector's pending loads and transfers are waited for without a bound.
+        Legacy transceiver transfers use _CONTROL_DRAIN_TRANSFER_TIMEOUT_S once
+        the queues are empty. Protected ownership must settle through its own
+        retirement policy; this control timeout cannot bypass it. Pending KV
+        connector loads and transfers also block the control action.
         """
-        # Generation-side receives that are still retiring count as active work.
+        # Protected transfers remain active work after logical completion.
         queues_busy = (len(self.active_requests) > 0
                        or len(self.waiting_queue) > 0
-                       or self.disagg.has_retiring_gen_receives)
+                       or self.disagg.has_retiring_gen_receives
+                       or self._has_pending_context_retirement())
         if not (queues_busy or connector_pending or transfers_in_flight > 0):
             return True
         if transfers_in_flight > 0 and not connector_pending and not queues_busy:
@@ -7046,9 +7072,9 @@ class PyExecutor:
     def _handle_control_request(self):
         """Fire the next pending control action at the next step boundary.
 
-        drain=True  (default): wait until ``active_requests``, ``waiting_queue``
-            and any KV transfers still in flight are done — exclusive engine
-            access with nothing holding KV built under the current weights.
+        drain=True (default): wait for request queues, protected ownership and
+            connector work to drain. Legacy transceiver transfers have a bounded
+            wait; expiry permits the action despite possible stale KV.
         drain=False: as soon as a fetched batch contains a control request,
             fire the action first, then continue forwarding requests.
         """
@@ -7073,11 +7099,13 @@ class PyExecutor:
         # flight, and the generation engine would decode weights-N KV under
         # weights-N+1. Wait for the transfers as well.
         #
-        # Bounded: a stuck or lost transfer must not park the control request
+        # Legacy transfers are bounded: a stuck or lost transfer must not park
+        # the control request
         # forever -- a refit that never fires hangs the whole training loop,
         # which is worse than the staleness this avoids. Past the deadline, warn
         # and proceed. A KV connector's pending loads and transfers are still
-        # waited for without a bound, as before.
+        # waited for without a bound. Protected ownership instead follows its
+        # retirement/fail-close policy and cannot be bypassed by this timeout.
         connector_pending = self._has_pending_connector_transfers()
         transfers_in_flight = self._num_inflight_kv_transfers()
         if pending.control_requires_drain:
@@ -8557,7 +8585,8 @@ class PyExecutor:
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
-        pending_retirement = self.disagg.has_retiring_gen_receives
+        pending_retirement = (self.disagg.has_retiring_gen_receives
+                              or self._has_pending_context_retirement())
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
                 and not self.is_shutdown
                 and not self._has_pending_connector_transfers()
@@ -8950,6 +8979,11 @@ class PyExecutor:
                                          new_requests_hint=new_requests_hint)
         self._cancel_queued_context_requests(waiting_queue)
 
+        # Cancellation must not wait for an execution slot. These requests use
+        # normal conversion/response routing, but leave before model scheduling.
+        cancelled_contexts = self._take_cancelled_context_requests(
+            waiting_queue)
+
         # 2b. GEN slot preemption: resume paused requests, then pause running
         # ones for at-risk waiting requests.
         preemption = getattr(self, "_gen_preemption", None)
@@ -8966,6 +9000,7 @@ class PyExecutor:
         # 3. Pop requests from waiting queue
         new_requests, placement = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests, all_rank_states)
+        new_requests = cancelled_contexts + new_requests
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -9093,7 +9128,21 @@ class PyExecutor:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
-                self.canceled_req_ids.append(req_item.id)
+                if req_item.cancel_context_client_id is None:
+                    self.canceled_req_ids.append(req_item.id)
+                else:
+                    # Never reinterpret a client ID as an executor ID. A late
+                    # abort applies only to its still-retained CTX transfer.
+                    transfers = getattr(self, "async_transfer_manager", None)
+                    if transfers is not None:
+                        for req in transfers.requests_in_transfer().values():
+                            if (req.py_client_id
+                                    == req_item.cancel_context_client_id
+                                    and self.disagg.
+                                    supports_logical_context_cancellation(req)):
+                                self.canceled_req_ids.append(
+                                    req.parent_request_id if req.
+                                    is_child else req.py_request_id)
             elif req_item.is_control_request:
                 self.control_requests.append(req_item)
                 if self.dist.rank == 0:
@@ -11781,6 +11830,109 @@ class PyExecutor:
             req for req in new_requests if req.py_request_id not in retired_ids
         ]
 
+    def _take_cancelled_context_requests(
+            self, waiting_queue: WaitingQueue) -> list[RequestQueueItem]:
+        """Extract qualified queued cancellations without consuming capacity.
+
+        Args:
+            waiting_queue: Rank-replicated requests not yet activated.
+
+        Returns:
+            CTX requests to convert and cancel before model scheduling.
+        """
+        if (not self.canceled_req_ids
+                or getattr(self, "kv_connector_manager", None) is not None
+                or not self.disagg.supports_logical_context_cancellation()):
+            return []
+        cancelled = set(self.canceled_req_ids)
+        selected = []
+        for item in waiting_queue:
+            if item.id not in cancelled or item.request is None:
+                continue
+            params = getattr(item.request, "py_disaggregated_params", None)
+            if (item.request.request_type
+                    == RequestType.REQUEST_TYPE_CONTEXT_ONLY
+                    and params is not None and params.schedule_style
+                    == DisaggScheduleStyle.CONTEXT_FIRST
+                    and type(params.disagg_request_id) is int
+                    and params.disagg_request_id >= 0):
+                selected.append(item)
+        waiting_queue.remove_by_ids({item.id for item in selected})
+        return selected
+
+    def _progress_context_cancellations(
+            self, new_requests: List[LlmRequest]) -> List[LlmRequest]:
+        """Cancel qualified model-idle CTX work without waiting for its I/O.
+
+        Retained transfers are visited even after their context result was
+        emitted. A previous overlap batch still owns model work and reaches
+        the ordinary post-forward cancellation boundary instead.
+
+        Args:
+            new_requests: Requests activated before this scheduling boundary.
+
+        Returns:
+            Newly activated requests that remain eligible for scheduling.
+        """
+        if (not self.canceled_req_ids or self.kv_cache_transceiver is None
+                or getattr(self, "kv_connector_manager", None) is not None):
+            return new_requests
+        previous = getattr(self, "previous_batch", None)
+        model_owned = ({
+            id(req)
+            for req in previous.scheduled_requests.all_requests()
+        } if previous is not None else set())
+        cancelled = set(self.canceled_req_ids)
+        transfers = self.async_transfer_manager.requests_in_transfer()
+        candidates = {id(req): req for req in self.active_requests}
+        candidates.update({id(req): req for req in transfers.values()})
+        completed = set()
+        deferred = set()
+        removed = set()
+        for request in candidates.values():
+            cancel_id = (request.parent_request_id
+                         if request.is_child else request.py_request_id)
+            if (cancel_id not in cancelled
+                    or not self.disagg.supports_logical_context_cancellation(
+                        request)):
+                continue
+            if (id(request) in model_owned or request.py_request_id in getattr(
+                    self, "inflight_req_ids", ())):
+                deferred.add(cancel_id)
+                continue
+            if not self.disagg.request_logical_context_cancellation(request):
+                deferred.add(cancel_id)
+                continue
+            completed.add(cancel_id)
+            if (request not in self.active_requests
+                    or request.state in (LlmRequestState.GENERATION_COMPLETE,
+                                         LlmRequestState.DISAGG_TRANS_ERROR)):
+                # Its prior result is immutable; only transfer obligations
+                # remain. The reaper, not this notification, retires them.
+                continue
+            request.py_kv_transfer_timed_out = False
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            response = request.create_response()
+            if response is not None:
+                response.result.cached_tokens = request.cached_tokens
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
+            self._pending_response_terminations.append(request)
+            removed.add(id(request))
+        self.active_requests[:] = [
+            req for req in self.active_requests if id(req) not in removed
+        ]
+        self.canceled_req_ids[:] = [
+            rid for rid in self.canceled_req_ids
+            if rid not in completed or rid in deferred
+        ]
+        # This profile is PP1/non-ADP. All TP ranks reach this same boundary;
+        # a request with a transfer claim remains protected at termination.
+        if removed:
+            self._flush_pending_transfer_responses()
+        return [req for req in new_requests if id(req) not in removed]
+
     def _try_cancel_request(self, request: LlmRequest) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
 
@@ -11820,6 +11972,11 @@ class PyExecutor:
         if (not self._kv_connector_moves_kv
                 and self.disagg.cancel_gen_logically(request)):
             return True
+        if (connector is None
+                and self.disagg.supports_logical_context_cancellation(request)):
+            if request.py_request_id in getattr(self, "inflight_req_ids", ()):
+                return False
+            return self.disagg.request_logical_context_cancellation(request)
 
         async_transfer_manager = getattr(self, "async_transfer_manager", None)
         if (getattr(request, "is_context_only_request", False) is True
@@ -11853,6 +12010,15 @@ class PyExecutor:
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
+                continue
+
+            if (self.kv_cache_transceiver is not None and
+                    self.disagg.supports_logical_context_cancellation(request)
+                    and request.state in (LlmRequestState.GENERATION_COMPLETE,
+                                          LlmRequestState.DISAGG_TRANS_ERROR)):
+                if not self.disagg.request_logical_context_cancellation(
+                        request):
+                    still_pending_canceled_ids.append(req_id)
                 continue
 
             is_cancelled = self._try_cancel_request(request)
