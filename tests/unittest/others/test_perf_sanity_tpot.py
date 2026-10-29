@@ -17,6 +17,7 @@
 import ast
 import importlib.util
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
 
@@ -130,7 +131,9 @@ def test_calculated_tpot_baseline_is_not_persisted_as_an_override(
     ]
     uploaded = []
     monkeypatch.setattr(regression_utils, "get_job_info", lambda: {"b_is_post_merge": True})
-    monkeypatch.setattr(regression_utils, "post_new_perf_data", uploaded.append)
+    monkeypatch.setattr(
+        regression_utils, "post_new_perf_data", lambda payload: uploaded.append(deepcopy(payload))
+    )
     stored_fields = {}
     for maximize, expected_baseline in ((True, 11.7), (False, 6.3)):
         monkeypatch.setattr(
@@ -146,11 +149,12 @@ def test_calculated_tpot_baseline_is_not_persisted_as_an_override(
             minimize_metrics=[] if maximize else metric_lists["MINIMIZE_METRICS"],
             regression_metrics=metric_lists["REGRESSION_METRICS"] if not maximize else [],
         )
-        assert f"baseline={expected_baseline:.4f}" in data[0]["s_regression_info"]
-        assert data[0]["b_is_regression"] is False
         assert uploaded[-1] == data
+        uploaded_record = uploaded[-1][0]
+        assert f"baseline={expected_baseline:.4f}" in uploaded_record["s_regression_info"]
+        assert uploaded_record["b_is_regression"] is False
         stored_fields = {
-            key: value for key, value in data[0].items() if key.startswith("d_baseline_")
+            key: value for key, value in uploaded_record.items() if key.startswith("d_baseline_")
         }
         assert not stored_fields
-    assert "diff=-42.86%" in data[0]["s_regression_info"]
+    assert "diff=-42.86%" in uploaded[-1][0]["s_regression_info"]
