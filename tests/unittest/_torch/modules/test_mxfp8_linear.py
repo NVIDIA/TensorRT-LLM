@@ -898,3 +898,105 @@ def test_mxfp8_fused_scales_follow_weight_rows_per_tp_rank(weight_mode, shard_ro
         # Dynamic MXFP8 activations cost about 1% relative error; a scale row
         # on the wrong weight row is off by at least a factor of two.
         assert rel < 0.05, (rank, float(rel))
+
+
+@pytest.mark.parametrize(
+    "m, n, num_sms, expected_tile_m",
+    [
+        (33, 4992, 148, 64),  # 39 weight tiles x 1 token tile
+        (128, 4992, 148, 64),  # 39 x 2 = 78 CTAs
+        (256, 4992, 148, 128),  # 39 x 4 = 156 > 148 with 64-row tiles
+        (256, 6144, 148, 128),  # 48 x 4 = 192 > 148; 48 x 2 = 96 fits
+        (256, 12288, 148, None),  # 96 x 2 = 192 > 148 even with 128-row tiles
+    ],
+)
+def test_mxfp8_decode_swap_ab_candidate_tactic(m, n, num_sms, expected_tile_m):
+    """The swap-AB tactic keeps one wave of CTAs and never splits K."""
+    tactic = custom_ops_module.MXFP8DecodeSwapAbGemm.candidate_tactic(m, n, num_sms)
+    if expected_tile_m is None:
+        assert tactic is None
+    else:
+        assert tactic == ((256, expected_tile_m), (2, 1), True, False, 1)
+
+
+def _mxfp8_linear(out_f: int, in_f: int) -> Linear:
+    weight = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    weight_e4m3, weight_scale = quant_bf16_to_mxfp8(weight, 32)
+    lin = Linear(
+        in_features=in_f,
+        out_features=out_f,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+    ).cuda()
+    lin.load_weights([{"weight": weight_e4m3, "weight_scale_inv": weight_scale}])
+    return lin
+
+
+@pytest.mark.skipif(
+    not linear_module._mxfp8_cutlass_op_available(),
+    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
+)
+@pytest.mark.parametrize("rows", (1024, 2048 + 72))
+def test_mxfp8_cublaslt_prefill_gemm_matches_native(monkeypatch, rows):
+    """TRTLLM_MXFP8_CUBLASLT_MIN_M routes large eager GEMMs to cuBLASLt, bit for bit."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    torch.manual_seed(0)
+    lin = _mxfp8_linear(512, 1024)
+    x = torch.randn(rows, 1024, dtype=torch.bfloat16, device="cuda")
+    expected = lin(x)
+
+    monkeypatch.setattr(linear_module, "_MXFP8_CUBLASLT_MIN_M", 1024)
+    monkeypatch.setitem(linear_module._MXFP8_CUBLASLT_STATE, "ok", None)
+    calls = []
+    real = linear_module._cublaslt_mxfp8_gemm
+    monkeypatch.setattr(
+        linear_module,
+        "_cublaslt_mxfp8_gemm",
+        lambda *args: calls.append(args[0].shape[0]) or real(*args),
+    )
+    output = lin(x)
+    assert calls == [rows]
+    if linear_module._MXFP8_CUBLASLT_STATE["ok"] is False:
+        pytest.skip("cuBLASLt MXFP8 GEMM is not available in this PyTorch build")
+    assert torch.equal(output, expected)
+    # Below the threshold the native op runs.
+    small = x[:72]
+    calls.clear()
+    lin(small)
+    assert calls == []
+
+
+@pytest.mark.skipif(
+    not linear_module._mxfp8_cutlass_op_available(),
+    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
+)
+@pytest.mark.parametrize("rows", (33, 72, 256))
+def test_mxfp8_decode_swap_ab_matches_default_tactic(monkeypatch, rows):
+    """TRTLLM_MXFP8_DECODE_SWAP_AB's fixed tactic is bitwise equal to the default decode-graph GEMM."""
+    if not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+        pytest.skip("FlashInfer CuTeDSL MXFP8 kernels are not available")
+    if custom_ops_module.get_sm_version() not in (100, 103):
+        pytest.skip("The swap-AB tactic targets sm_100 / sm_103")
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    torch.manual_seed(0)
+    lin = _mxfp8_linear(4992, 1024)
+    method = lin.quant_method
+    assert method.enable_flashinfer_auto()
+    method.tune_decode_graph_backends = True
+    x = torch.randn(rows, 1024, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        with flashinfer_mxfp8_decode_graph_capture():
+            return lin(x)
+
+    swap_ab = custom_ops_module.MXFP8DecodeSwapAbGemm
+    monkeypatch.setattr(swap_ab, "ENABLED", False)
+    expected = run()
+    monkeypatch.setattr(swap_ab, "ENABLED", True)
+    monkeypatch.setattr(swap_ab, "_tactic_cache", {})
+    output = run()
+    act = torch.empty((rows, 1024), dtype=torch.float8_e4m3fn, device="cuda")
+    tactic = swap_ab.tactic([act, None, lin.weight, None], torch.bfloat16)
+    assert tactic is not None and tactic[2] is True
+    assert torch.equal(output, expected)
