@@ -659,3 +659,134 @@ class TestDSparkWindows:
         self._prepare(meta, [3, 4], paused={1, 2})
         assert set(worker._req_to_slot) == {1, 2, 3, 4}
         assert len(set(worker._req_to_slot.values())) == 4
+
+
+# ---------------------------------------------------------------------------
+# Drafter state outside the KV cache: DFlash / standalone DSpark context slots
+# ---------------------------------------------------------------------------
+class TestDFlashSlots:
+    def _setup(self, num_slots=4):
+        import collections
+        from functools import partial
+
+        import torch
+
+        from tensorrt_llm._device_copy import DeviceCopyBuffer
+        from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
+
+        worker = object.__new__(DFlashWorker)
+        worker._ctx_buf_inited = True
+        worker._req_to_slot = {}
+        worker._req_ctx_pos = {}
+        worker._free_slots = collections.deque(range(num_slots))
+        worker._dummy_slot = num_slots
+        worker._graph_dummy_id_floor = 1 << 40
+        worker._ctx_len = torch.zeros(num_slots + 1, dtype=torch.long)
+        worker._ctx_len_host = [0] * (num_slots + 1)
+        worker._batch_to_slot_buffer = DeviceCopyBuffer(
+            torch.full((num_slots,), num_slots, dtype=torch.long)
+        )
+
+        def write_ctx_len(updates):  # CPU stand-in for the device scatter
+            for slot, value in updates.items():
+                worker._ctx_len_host[slot] = value
+                worker._ctx_len[slot] = value
+
+        worker._write_ctx_len = write_ctx_len
+        worker._assign_slot = partial(DFlashWorker._assign_slot, worker)
+        meta = object.__new__(DFlashSpecMetadata)
+        meta._batch_indices_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.int))
+        meta.batch_indices_cuda = meta._batch_indices_buffer.tensor
+        meta._dflash_worker = worker
+        return worker, meta
+
+    def _prepare(self, meta, request_ids, paused=frozenset()):
+        meta.request_ids = list(request_ids)
+        meta.num_generations = len(request_ids)
+        meta.paused_in_place_ids = frozenset(paused)
+        with patch("tensorrt_llm._torch.speculative.dflash.prefer_pinned", return_value=False):
+            meta.prepare()
+
+    def test_paused_requests_keep_their_slot(self):
+        worker, meta = self._setup()
+        self._prepare(meta, [11, 12])
+        slot = worker._req_to_slot[12]
+        worker._ctx_len[slot] = 77
+        worker._ctx_len_host[slot] = 77
+        worker._req_ctx_pos[12] = 900
+        # 12 paused in place: left out of the batch, drafter context kept.
+        self._prepare(meta, [11, 13], paused={12})
+        assert worker._req_to_slot[12] == slot and worker._req_ctx_pos[12] == 900
+        assert int(worker._ctx_len[slot]) == 77 and worker._ctx_len_host[slot] == 77
+        assert slot not in worker._free_slots
+        # Resumed: same slot, same context length, mapped at its batch row.
+        self._prepare(meta, [11, 12, 13])
+        assert worker._req_to_slot[12] == slot and int(worker._ctx_len[slot]) == 77
+        assert int(worker._batch_to_slot_buffer.tensor[1]) == slot
+
+    def test_finished_requests_release_their_slot(self):
+        worker, meta = self._setup()
+        self._prepare(meta, [11, 12])
+        slot = worker._req_to_slot[12]
+        worker._ctx_len[slot] = 77
+        worker._req_ctx_pos[12] = 900
+        self._prepare(meta, [11], paused={12})
+        # Finished (or cancelled) after the pause: neither batched nor paused.
+        self._prepare(meta, [11])
+        assert 12 not in worker._req_to_slot and 12 not in worker._req_ctx_pos
+        assert int(worker._ctx_len[slot]) == 0 and slot in worker._free_slots
+
+    def test_slots_cover_paused_requests(self):
+        # max_batch scheduled slots plus max_paused kept ones (here 2 + 2):
+        # nobody falls back to the shared dummy slot.
+        worker, meta = self._setup(num_slots=4)
+        self._prepare(meta, [1, 2])
+        with patch("tensorrt_llm._torch.speculative.dflash.logger") as log:
+            self._prepare(meta, [3, 4], paused={1, 2})
+        log.warning.assert_not_called()
+        assert set(worker._req_to_slot) == {1, 2, 3, 4}
+        assert len(set(worker._req_to_slot.values())) == 4
+
+    def _lazy_init(self, max_batch):
+        import torch
+
+        from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+        class _Stop(Exception):
+            pass
+
+        worker = object.__new__(DFlashWorker)
+        worker._validate_draft_attention_backend = Mock()
+        worker._ctx_buf_inited = False
+        worker._ctx_kv_manager = None
+        worker.spec_config = Mock(max_draft_len=7, tokens_per_gen_step=8)
+        # Stop once the slot bookkeeping is built, before any K/V allocation.
+        worker._draft_block_width = Mock(side_effect=_Stop)
+        attn_metadata = Mock(spec=["kv_cache_manager"])
+        attn_metadata.kv_cache_manager = Mock(max_seq_len=4096)
+        draft_model = Mock()
+        draft_model.config = Mock(max_position_embeddings=4096)
+        real_zeros = torch.zeros
+
+        def cpu_zeros(*args, device=None, **kwargs):
+            return real_zeros(*args, **kwargs)
+
+        with patch("tensorrt_llm._torch.speculative.dflash.torch.zeros", side_effect=cpu_zeros):
+            with pytest.raises(_Stop):
+                worker._lazy_init_ctx_buffers(
+                    draft_model, Mock(max_num_requests=max_batch), attn_metadata
+                )
+        return worker
+
+    def test_slot_pool_reserves_the_resident_headroom(self, monkeypatch):
+        monkeypatch.delenv("TLLM_GEN_PREEMPT_POLICY", raising=False)
+        worker = self._lazy_init(128)
+        assert worker._dummy_slot == 128 and len(worker._free_slots) == 128
+        assert worker._ctx_len.shape[0] == 129
+        for k, v in ON.items():
+            monkeypatch.setenv(k, v)
+        worker = self._lazy_init(128)
+        # 128 scheduled + 32 paused request slots, then the dummy slot.
+        assert worker._dummy_slot == 160 and sorted(worker._free_slots) == list(range(160))
+        assert worker._ctx_len.shape[0] == 161 and len(worker._ctx_len_host) == 161
+        assert worker._batch_to_slot_buffer.tensor.shape[0] == 128
