@@ -268,10 +268,12 @@ def test_cute_dsl_bf16_split_k_gemm_blackwell(split_k_slices, c_dtype):
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLBf16BlackwellGemmRunner
 
     torch.manual_seed(2026)
-    runner = CuteDSLBf16BlackwellGemmRunner()
+    runner = CuteDSLBf16BlackwellGemmRunner(output_dtype=c_dtype)
     act, weight, output = _gemm_operands(64, 256, 7168, c_dtype)
     base = (False, (128, 128), (1, 1))
     tactic = base + ("m", 1, split_k_slices)
+    # Large K and small N, so the full sweep offers split-K for either output dtype.
+    assert tactic in runner.get_valid_tactics([act, weight, output], None)
 
     # Direct split-K rounds each partial to the output dtype before the
     # atomic TMA ADD, so BF16 output needs tolerance for both rounding and
