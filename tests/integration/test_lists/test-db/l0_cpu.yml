@@ -80,7 +80,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
   # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py::test_k3_workspace_threshold_is_inclusive_and_two_shot_pads
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order

@@ -7,6 +7,8 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+native_ops = load_family_ops(__name__)
+
 
 class AttnResRmsnormFwd(OpWrapper):
     """Return rmsnorm(attn_res_fwd's bf16 mixture) * output_rms_weight as a new bf16 [T, 1, 7168] tensor.
@@ -93,7 +95,7 @@ class AttnResRmsnormFwd(OpWrapper):
         rms_eps: float,
         output_rms_eps: float,
     ) -> torch.Tensor:
-        return load_family_ops(__name__).k3_attn_res_rmsnorm_fwd(
+        return native_ops.k3_attn_res_rmsnorm_fwd(
             layer_residual,
             block_residual,
             res_weight,

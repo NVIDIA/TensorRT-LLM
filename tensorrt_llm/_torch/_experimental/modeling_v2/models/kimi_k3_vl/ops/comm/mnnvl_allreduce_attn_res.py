@@ -12,6 +12,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 
 from .mnnvl_workspace import MnnvlWorkspace
 
+native_ops = load_family_ops(__name__)
+
 
 class MnnvlAllreduceAttnRes(OpWrapper):
     """Return ``(normed, updated)``: ``updated = prefix_sum + allreduce(input)`` over ``workspace``'s TP group (the
@@ -140,7 +142,7 @@ class MnnvlAllreduceAttnRes(OpWrapper):
         output_rms_eps: float,
         workspace: MnnvlWorkspace,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        normed, updated = load_family_ops(__name__).mnnvl_allreduce_attn_res(
+        normed, updated = native_ops.mnnvl_allreduce_attn_res(
             input,
             prefix_sum,
             block_residual,

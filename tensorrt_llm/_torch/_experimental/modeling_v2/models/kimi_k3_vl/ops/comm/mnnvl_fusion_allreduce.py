@@ -13,6 +13,8 @@ from tensorrt_llm.functional import AllReduceFusionOp
 
 from .mnnvl_workspace import MnnvlWorkspace
 
+native_ops = load_family_ops(__name__)
+
 __all__ = ["MnnvlWorkspace", "mnnvl_fusion_allreduce", "required_buffer_bytes"]
 
 
@@ -199,7 +201,7 @@ class MnnvlFusionAllreduce(OpWrapper):
                 f"not {workspace.buffer_bytes}"
             )
         fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM if fused else AllReduceFusionOp.NONE
-        outputs = load_family_ops(__name__).k3_mnnvl_fusion_allreduce(
+        outputs = native_ops.k3_mnnvl_fusion_allreduce(
             input,
             norm_weight,
             residual,

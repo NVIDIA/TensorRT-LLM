@@ -158,6 +158,8 @@ from . import weights as _weights
 from .ops.ssm.k3_kda_attn import k3_kda_attn
 from .ops.ssm.k3_kda_verify import k3_kda_verify
 
+native_ops = load_family_ops(__name__)
+
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
@@ -641,10 +643,9 @@ def _apply_attn_res_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
-    attn_res_rmsnorm_op = load_family_ops(__name__).k3_attn_res_rmsnorm_fwd
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    output = attn_res_rmsnorm_op(
+    output = native_ops.k3_attn_res_rmsnorm_fwd(
         layer_kernel,
         block_kernel,
         proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
@@ -712,11 +713,10 @@ def _apply_attn_res_add_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
-    attn_res_add_rmsnorm_op = load_family_ops(__name__).k3_attn_res_add_rmsnorm_fwd
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     addend_kernel = addend.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    updated_prefix_sum, output = attn_res_add_rmsnorm_op(
+    updated_prefix_sum, output = native_ops.k3_attn_res_add_rmsnorm_fwd(
         layer_kernel,
         addend_kernel,
         block_kernel,

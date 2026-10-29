@@ -12,6 +12,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 
 from .mnnvl_workspace import MnnvlWorkspace
 
+native_ops = load_family_ops(__name__)
+
 __all__ = ["MnnvlWorkspace", "mnnvl_allgather_split", "required_buffer_bytes"]
 
 
@@ -136,7 +138,7 @@ class MnnvlAllgatherSplit(OpWrapper):
                 f"mnnvl_allgather_split: the call needs {need} bytes per Lamport buffer, the workspace has "
                 f"{workspace.buffer_bytes}"
             )
-        bf16_out, fp32_out = load_family_ops(__name__).mnnvl_allgather_split(
+        bf16_out, fp32_out = native_ops.mnnvl_allgather_split(
             input,
             bf16_columns,
             workspace.world_size,

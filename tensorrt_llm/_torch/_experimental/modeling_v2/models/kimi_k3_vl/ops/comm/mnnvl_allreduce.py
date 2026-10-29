@@ -14,6 +14,8 @@ from tensorrt_llm.mapping import Mapping
 
 from .mnnvl_fusion_allreduce import required_buffer_bytes
 
+native_ops = load_family_ops(__name__)
+
 
 class K3MnnvlAllReduce(MNNVLAllReduce):
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
@@ -57,7 +59,7 @@ class K3MnnvlAllReduce(MNNVLAllReduce):
         is_fusion = fusion_op != AllReduceFusionOp.NONE
         if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
             return None
-        outputs = load_family_ops(__name__).k3_mnnvl_fusion_allreduce(
+        outputs = native_ops.k3_mnnvl_fusion_allreduce(
             input,
             all_reduce_params.norm_weight,
             all_reduce_params.residual,
