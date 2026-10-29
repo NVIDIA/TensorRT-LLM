@@ -1,3 +1,4 @@
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1009,3 +1010,71 @@ class TestRequestLocalMediaPaths:
         ) as load:
             assert await self._load("https://example.com/img.png") == "loaded"
         load.assert_awaited_once_with("https://example.com/img.png")
+
+    @pytest.mark.asyncio
+    async def test_oversized_local_file_refused(self, monkeypatch, media_dirs):
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        path = allowed / "img.png"
+        monkeypatch.setattr(
+            "tensorrt_llm.inputs.media_io._MAX_RESPONSE_BYTES", path.stat().st_size - 1
+        )
+        with pytest.raises(ValueError, match="maximum allowed size"):
+            await self._load(f"file://{path}")
+
+    @pytest.mark.asyncio
+    async def test_audio_loaded_inside_allowed_directory(self, monkeypatch, media_dirs):
+        import numpy as np
+        import soundfile
+
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        path = allowed / "tone.wav"
+        soundfile.write(path, np.zeros(160, dtype=np.float32), 16000)
+        samples, sample_rate = await self._load(str(path), kind="audio_url")
+        assert sample_rate == 16000
+        assert len(samples) == 160
+
+    @pytest.mark.asyncio
+    async def test_symlink_inside_allowed_directory_loaded(self, monkeypatch, media_dirs):
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        (allowed / "alias.png").symlink_to(allowed / "img.png")
+        image = await self._load(f"file://{allowed}/alias.png")
+        assert tuple(image.shape) == (3, 8, 8)
+
+    @pytest.mark.asyncio
+    async def test_symlink_appearing_after_resolution_refused(self, monkeypatch, media_dirs):
+        """An entry resolved as a regular file but found to be a symlink when opened is refused."""
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        link = allowed / "link.png"  # points outside the allowed directory
+        real_realpath = os.path.realpath
+
+        def realpath_before_swap(path, *args, **kwargs):
+            if str(path) == str(link):
+                return str(link)
+            return real_realpath(path, *args, **kwargs)
+
+        monkeypatch.setattr(os.path, "realpath", realpath_before_swap)
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(f"file://{link}")
+
+    @pytest.mark.asyncio
+    async def test_fifo_refused_without_blocking(self, monkeypatch, media_dirs):
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        fifo = allowed / "pipe.png"
+        os.mkfifo(fifo)
+        with pytest.raises(ValueError, match="not a regular file"):
+            await self._load(f"file://{fifo}")
+
+    @pytest.mark.asyncio
+    async def test_misconfigured_directory_refused_generically(
+        self, monkeypatch, tmp_path, media_dirs
+    ):
+        missing = tmp_path / "missing"
+        monkeypatch.setenv(self._ENV, str(missing))
+        with pytest.raises(ValueError, match="Local media paths are not accepted") as excinfo:
+            await self._load(str(media_dirs[0] / "img.png"))
+        assert str(missing) not in str(excinfo.value)
