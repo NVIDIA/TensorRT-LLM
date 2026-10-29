@@ -1265,7 +1265,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                 latent_width,
                 generator,
             )
-        if self._cuda_graph_runners:
+        graphs_enabled = bool(getattr(self, "_cuda_graph_runners", None))
+        if graphs_enabled:
             # One graph per 256-row bucket instead of one per prompt length: the graph key
             # holds every input shape, and the text length varies per request.
             layout = pad_packed_sequence(layout, self.CUDA_GRAPH_SEQUENCE_MULTIPLE)
@@ -1366,7 +1367,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             _check_denoise_step(audio_velocity, "audio", index)
             video_velocity = video_velocity[:, condition_rows:].float()
             audio_velocity = audio_velocity.float()
-            if self._cuda_graph_runners:
+            if graphs_enabled:
                 # Graph outputs are weak references into the replay buffers, which the next
                 # replay overwrites; the scheduler keeps its own copy.
                 video_velocity = video_velocity.clone()
