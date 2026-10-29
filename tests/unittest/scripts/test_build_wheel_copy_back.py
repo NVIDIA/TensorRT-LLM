@@ -34,6 +34,7 @@ import os
 import shutil
 import stat
 import time
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -55,7 +56,8 @@ def build_wheel_module():
 
 @pytest.fixture
 def sync_tree(build_wheel_module):
-    return build_wheel_module.sync_tree
+    """sync_tree in copy mode; hard-link tests pass ``hard_link=True``."""
+    return partial(build_wheel_module.sync_tree, hard_link=False)
 
 
 @pytest.fixture(params=["tar", "copytree"])

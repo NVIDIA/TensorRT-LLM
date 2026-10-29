@@ -682,7 +682,7 @@ def link_or_copy_file(src: Path, dst: Path, hard_link: bool = True) -> bool:
 def sync_tree(src: Path,
               dst: Path,
               exclude: Sequence[str] = (),
-              hard_link: bool = False) -> None:
+              hard_link: bool = True) -> None:
     """Mirror the src directory into dst, touching only what changed.
 
     Replaces the rmtree+copytree pattern for artifact copy-back: files are
@@ -696,12 +696,13 @@ def sync_tree(src: Path,
     prove the content settled. exclude lists fnmatch patterns for entry names
     to skip.
 
-    With ``hard_link``, files are hard-linked to their source instead of
-    copied when src and dst are on the same filesystem (see
+    With ``hard_link`` (the default), files are hard-linked to their source
+    instead of copied when src and dst are on the same filesystem (see
     `link_or_copy_file`). A file that already shares its source's inode has
     the source's current content, so it is skipped. Once the source is
     replaced by a new file, the inodes differ and the file is linked again.
-    After one failed link, the rest of the tree is copied.
+    After one failed link, the rest of the tree is copied. Pass
+    ``hard_link=False`` when files in dst are edited in place after the sync.
     """
     import fnmatch
 
@@ -787,10 +788,10 @@ def sync_tree(src: Path,
                 pass
             if dst_file.is_dir() and not dst_file.is_symlink():
                 rmtree(dst_file)
-            # One failed link (e.g. src and dst on two mounts of the same
-            # filesystem) means the rest of the tree would fail too.
+            # `hard_link` is updated: if hard link failed (e.g. src and dst on two
+            # mounts of the same filesystem), the rest of the tree would fail too,
+            # so we should switch to real copy.
             hard_link = link_or_copy_file(src_file, dst_file, hard_link)
-            # Backdating a hard link would backdate its source.
             if not hard_link:
                 _demote_racy_mtime(dst_file, src_stat, now)
 
@@ -806,9 +807,14 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
     # examples: setup.py's root-level find_packages() ships the
     # examples.configs.database package from it.
     for tree in ("tensorrt_llm", "triton_kernels", "examples"):
-        sync_tree(project_dir / tree,
-                  staging_dir / tree,
-                  exclude=("__pycache__", "*.pyc"))
+        sync_tree(
+            project_dir / tree,
+            staging_dir / tree,
+            exclude=("__pycache__", "*.pyc"),
+            # Real copies: later steps such as stub generation rewrite files
+            # in the staging tree, and through a hard link that would edit
+            # the checkout.
+            hard_link=False)
     top_level_files = [
         "setup.py", "pyproject.toml", "constraints.txt", "LICENSE", "README.md"
     ]
@@ -1263,13 +1269,13 @@ def main(*,
     if cache_dir.exists():
         clear_folder(cache_dir)
 
-    # Build outputs are hard-linked into the package when possible. patchelf
-    # rewrites a file in place, so the files it edits after install are real
-    # copies: through a hard link, the edit would also change the source.
+    # Build outputs are hard-linked into the package when possible.
+    # patchelf rewrites a file in place, so the files that will be patched
+    # are copied, not hard linked.
     install_file = link_or_copy_file
     install_patched_file = partial(link_or_copy_file, hard_link=False)
-    install_tree = partial(sync_tree, hard_link=True)
-    install_patched_tree = sync_tree
+    install_tree = sync_tree
+    install_patched_tree = partial(sync_tree, hard_link=False)
     if skip_building_wheel and linking_install_binary:
 
         def symlink_remove_dst(src, dst):
@@ -1336,7 +1342,7 @@ def main(*,
                 # src and dst share a filesystem. Otherwise it copies the tree
                 # through one streamed tar pipeline, which is much faster than
                 # per-file copies on network filesystems.
-                sync_tree(resolved_src, dst_path, hard_link=True)
+                sync_tree(resolved_src, dst_path)
                 stamp.touch()
             else:
                 if dst_path.is_dir():
