@@ -477,10 +477,11 @@ def test_model_layers_named_by_other_layers_are_refused():
     check_compatible(doubled, doubled)
 
 
-def test_a_role_one_side_alone_transfers_leaves_the_model_layer_s_others_paired():
+def test_a_role_one_side_alone_transfers_pairs_only_where_that_side_rebuilds_it():
     """A CSA2 context-only worker keeps no sliding cache past its split: its boundary layer 20
-    holds only the global cache, layer 61, where the generation worker holds both, 60 and 61, and
-    rebuilds the sliding one. The global cache pairs; the sliding one is the receiver's own."""
+    holds only the global cache, layer 61, where the generation worker holds both, 60 and 61. A
+    generation worker that rebuilds the sliding one per request pairs the global cache; one that
+    does not would leave it unwritten, and is refused."""
     topology = Instance().ranks(0)[0]
     both = layout(topology, (60, 61), [("swa", kv(4), "attention"), ("global", kv(4), "attention")])
     full = _with_group(
@@ -495,9 +496,19 @@ def test_a_role_one_side_alone_transfers_leaves_the_model_layer_s_others_paired(
     context_only = _with_group(
         layout(topology, (61,), [("global", kv(4), "attention")]), model_layers=(20,)
     )
-    check_compatible(context_only, full)
-    check_compatible(full, context_only)
-    assert {(r.dst.layer, r.dst.role) for r in map_buffers(context_only, full)} == {(61, "global")}
+    with pytest.raises(
+        ValueError, match="model layer 20's swa buffers are transferred by one rank"
+    ):
+        check_compatible(context_only, full)
+    rebuilding = dataclasses.replace(full, request_rebuilt_roles=frozenset({"swa"}))
+    check_compatible(context_only, rebuilding)
+    check_compatible(rebuilding, context_only)
+    assert {(r.dst.layer, r.dst.role) for r in map_buffers(context_only, rebuilding)} == {
+        (61, "global")
+    }
+    assert_layouts_reshard([context_only], [rebuilding])
+    with pytest.raises(AssertionError, match="no source sends it"):
+        assert_layouts_reshard([context_only], [full])
 
 
 def test_layer_groups_keeping_other_windows_correspond():

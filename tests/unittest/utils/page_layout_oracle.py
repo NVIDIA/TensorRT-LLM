@@ -18,7 +18,9 @@ Each rank's page holds, at every byte of every tensor, the id of the global elem
 every source rank sends what ``layout_mapping.map_buffers`` gives it, every byte a destination rank
 holds of every buffer the sources transfer must have arrived exactly once, holding its own global
 element, and only from source ranks the destination pairs with (``layout_mapping.fan``); no run
-reaches past a pool slot, and no other byte of the destination's slots is written.
+reaches past a pool slot, and no other byte of the destination's slots is written. A buffer the
+destination transfers of a model layer the sources hold, of a role they transfer none of for it,
+is one the destination rebuilds per request (``PageLayout.request_rebuilt_roles``).
 
 Use it on hand-written layouts, or on the page layouts real managers build
 (``manager.get_page_table().page_layout``) to check a new cache's declarations across the
@@ -103,6 +105,11 @@ class Elements:
         return mem
 
 
+def _model_layer(page: PageLayout, groups: Dict[Tuple[int, int], int], buffer: BufferDesc) -> int:
+    group = page.layer_groups[groups[buffer.pool_group, buffer.layer]]
+    return group.model_layers[group.layers.index(buffer.layer)]
+
+
 def paired(src: RankTopology, dst: RankTopology) -> bool:
     """Whether the source rank's share overlaps the destination's along every dimension."""
     for dim in GRID_DIMENSIONS:
@@ -127,8 +134,26 @@ def assert_layouts_reshard(
     source_memory = [elements.memory(page) for page in sources]
     source_groups = [layer_group_of(page) for page in sources]
     sent = {(b.layer, b.role) for page in sources for b in page.buffers if b.transferred}
+    sent_models = {
+        (_model_layer(page, groups, b), b.role)
+        for page, groups in zip(sources, source_groups)
+        for b in page.buffers
+        if b.transferred
+    }
+    held_models = {model for model, _ in sent_models}
     for dst in destinations:
         dst_groups = layer_group_of(dst)
+        for buffer in dst.buffers:
+            model = _model_layer(dst, dst_groups, buffer)
+            if (
+                buffer.transferred
+                and model in held_models
+                and (model, buffer.role) not in sent_models
+            ):
+                assert buffer.role in dst.request_rebuilt_roles, (
+                    f"{dst.topology} buffer ({buffer.layer}, {buffer.role}) of model layer {model}: "
+                    "no source sends it, and the destination does not rebuild it"
+                )
         got = _slots(dst, dst_groups)
         writes = {pool: np.zeros(arr.size, dtype=np.int64) for pool, arr in got.items()}
         for src, memory, groups in zip(sources, source_memory, source_groups):

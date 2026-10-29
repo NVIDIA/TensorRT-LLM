@@ -3699,6 +3699,7 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype=self._page_dtype(),
             quant_mode=self._page_quant_mode(),
             rebuilds_untransferred=bool(rebuilt),
+            request_rebuilt_roles=self._page_request_rebuilt_roles(),
         )
         return ManagerLayout(
             page_layout=page_layout,
@@ -3859,6 +3860,13 @@ class KVCacheManagerV2(BaseResourceManager):
         nothing, lends them with the rest; where the source holds none of them, the importer
         rebuilds them. None by default; a manager naming any overrides that rebuild, or its page
         table is refused."""
+        return frozenset()
+
+    def _page_request_rebuilt_roles(self) -> frozenset[str]:
+        """Roles whose buffers this manager, receiving, rebuilds for some requests rather than
+        receiving them (``disagg_untransferred_buffers``), so a peer may hold none of them for a
+        model layer it holds: none by default. A peer missing any other role a model layer both
+        hold transfers is refused, rather than leaving the buffer unwritten."""
         return frozenset()
 
     def _page_dtype(self) -> str | None:

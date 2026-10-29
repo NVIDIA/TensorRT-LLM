@@ -1108,6 +1108,13 @@ class CSA2CacheManager(KVCacheManagerV2):
         start = getattr(request, "py_csa2_remote_tail_start", None)
         return request.prompt_len if start is None else start
 
+    def _page_request_rebuilt_roles(self) -> frozenset[str]:
+        """Under bounded replay on generation the generation worker rebuilds the sliding-window
+        caches past a request's split, which a context-only worker keeps none of."""
+        if getattr(self, "bounded_replay_on_generation", False):
+            return frozenset({str(CSA2CacheRole.SWA.role)})
+        return frozenset()
+
     def disagg_untransferred_buffers(self, request) -> frozenset[tuple[int, str]]:
         """Under remote-tail replay the generation worker rebuilds the sliding-window caches of the
         decoder and draft layers (model layers from the split on), so the transfer leaves them."""

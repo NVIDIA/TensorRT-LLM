@@ -726,6 +726,9 @@ class PageLayout:
             (``KVCacheManagerV2._page_derived_roles``). The lender, which invokes no rebuild, then
             lends every buffer, and where the source holds none of the derived ones, the importer
             invokes the rebuild (``attach_lender``).
+        request_rebuilt_roles: Roles whose buffers this rank, receiving, rebuilds for some requests
+            rather than receiving them (``KVCacheManagerV2._page_request_rebuilt_roles``), so a
+            peer may hold none of them for a model layer it holds.
 
     Raises:
         ValueError: If tokens_per_page, a slot width or a KV head count is not a positive integer; a
@@ -744,6 +747,7 @@ class PageLayout:
     device_region_index: Mapping[tuple[int, int], int] = field(default_factory=dict)
     staging_region_index: Mapping[int, int] = field(default_factory=dict)
     rebuilds_untransferred: bool = False
+    request_rebuilt_roles: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -770,6 +774,9 @@ class PageLayout:
         }
         object.__setattr__(self, "staging_region_index", _frozen(staging))
         object.__setattr__(self, "rebuilds_untransferred", bool(self.rebuilds_untransferred))
+        object.__setattr__(
+            self, "request_rebuilt_roles", frozenset(str(r) for r in self.request_rebuilt_roles)
+        )
         object.__setattr__(self, "layer_groups", tuple(self.layer_groups))
         object.__setattr__(self, "buffers", tuple(self.buffers))
         if self.quant_mode is not None and self.quant_mode not in _QUANT_MODES:
@@ -797,6 +804,7 @@ class PageLayout:
         device_region_index: Mapping[tuple[int, int], int] = _NO_ENTRIES,
         staging_region_index: Mapping[int, int] = _NO_ENTRIES,
         rebuilds_untransferred: bool = False,
+        request_rebuilt_roles: frozenset[str] = frozenset(),
     ) -> PageLayout:
         """The constructor's layout of these values, without its checks and conversions.
 
@@ -820,6 +828,7 @@ class PageLayout:
             device_region_index=_frozen(dict(device_region_index)),
             staging_region_index=_frozen(dict(staging_region_index)),
             rebuilds_untransferred=rebuilds_untransferred,
+            request_rebuilt_roles=frozenset(request_rebuilt_roles),
         )
         return layout
 
@@ -1030,6 +1039,7 @@ def layout_to_dict(layout: PageLayout) -> dict:
         "dtype": layout.dtype,
         "quant_mode": layout.quant_mode,
         "rebuilds_untransferred": layout.rebuilds_untransferred,
+        "request_rebuilt_roles": sorted(layout.request_rebuilt_roles),
     }
 
 
@@ -1088,4 +1098,5 @@ def layout_from_dict(data: Mapping) -> PageLayout:
         dtype=data["dtype"],
         quant_mode=data["quant_mode"],
         rebuilds_untransferred=data["rebuilds_untransferred"],
+        request_rebuilt_roles=frozenset(data["request_rebuilt_roles"]),
     )

@@ -377,6 +377,7 @@ class Manager:
     _page_head_split = KVCacheManagerV2._page_head_split
     _page_state_split = KVCacheManagerV2._page_state_split
     _page_derived_roles = KVCacheManagerV2._page_derived_roles
+    _page_request_rebuilt_roles = KVCacheManagerV2._page_request_rebuilt_roles
     rebuild_disagg_imported_cache = KVCacheManagerV2.rebuild_disagg_imported_cache
     model_has_recurrent_state = KVCacheManagerV2.model_has_recurrent_state
     disagg_state_slot = KVCacheManagerV2.disagg_state_slot
@@ -1330,6 +1331,42 @@ def test_layers_named_for_model_layers_the_stage_lacks_or_alike_are_refused():
     manager._page_layer_ids = lambda: {0: (6, 6), 1: (6, 7)}
     with pytest.raises(ValueError, match="internal layers 0 and 1 both name the key buffer"):
         manager.get_page_table()
+
+
+def stage_placed(pp_layers):
+    """A stage of a manager keeping a request-wide cache in a virtual layer of its own, attached
+    to the stage's first model layer."""
+
+    class Kind(enum.IntEnum):
+        MAIN = 0
+        POS = 1
+
+    n = len(pp_layers)
+    manager = Manager(
+        [kv_group(lids=range(n)), (AttentionLayerConfig, [n], [("req_pos", 48, None)])],
+        pp_layers=pp_layers,
+        mappers={"req_pos": "replicated"},
+    )
+    manager._layer_attn_to_layer_id = {
+        **{(model, Kind.MAIN): lid for lid, model in enumerate(pp_layers)},
+        (pp_layers[0], Kind.POS): n,
+    }
+    return manager.get_page_table().page_layout
+
+
+@pytest.mark.cpu_only
+def test_a_cache_attached_by_stage_is_refused_under_other_pipeline_splits():
+    """A cache attached to whichever model layer a stage holds first lies on another model layer
+    of each split: a generation stage of PP2 holding it on model layer 2, which the context
+    instance of PP1 holds without it, would never receive it, and is refused. Splits alike pair."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible
+
+    whole = stage_placed([0, 1, 2, 3])
+    first, last = stage_placed([0, 1]), stage_placed([2, 3])
+    check_compatible(whole, first)
+    with pytest.raises(ValueError, match="model layer 2's req_pos buffers are transferred by one"):
+        check_compatible(whole, last)
+    check_compatible(stage_placed([2, 3]), last)
 
 
 @pytest.mark.cpu_only
@@ -2688,7 +2725,8 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         "tokens_per_page pool_slot_bytes layer_groups buffers topology=RankTopology(tp_size=1, "
         "tp_rank=0, pp_size=1, pp_rank=0, cp_size=1, cp_rank=0, dp_size=1, dp_rank=0, "
         "attention_dp=False) total_kv_heads_by_layer={} dtype=None quant_mode=None "
-        "device_region_index={} staging_region_index={} rebuilds_untransferred=False"
+        "device_region_index={} staging_region_index={} rebuilds_untransferred=False "
+        "request_rebuilt_roles=frozenset()"
     )
     assert pinned_fields(LayerGroupDesc) == (
         "kind kept_window num_sink_blocks pool_group layers shard=ShardDesc(count=1, index=0) "

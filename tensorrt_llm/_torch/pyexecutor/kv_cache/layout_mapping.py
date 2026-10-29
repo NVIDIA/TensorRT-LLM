@@ -368,9 +368,11 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
     """Check that two ranks' pages correspond, whichever sends.
 
     Each role of a model layer both ranks transfer goes by the same global layers on both, so ranks
-    pair a model layer's buffers with its own however their pipeline stages split the model; a
-    role one side alone transfers, which its receiver rebuilds or the sender keeps for itself
-    (CSA2's context-only workers hold no sliding cache past their split), is left out. On
+    pair a model layer's buffers with its own however their pipeline stages split the model. A
+    role of such a model layer that one rank alone transfers is refused unless that rank rebuilds
+    it per request (``PageLayout.request_rebuilt_roles``: CSA2's generation workers rebuild the
+    sliding caches a context-only worker keeps none of past its split), rather than left
+    unwritten. On
     the layers both hold, every buffer either rank transfers the other transfers too, as the same
     tensors: the same names, axes and extents over all ranks, however each splits them, and
     elements of the same type where the tensors state one, in pages of as many sub-pages, in layer
@@ -438,6 +440,14 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
             problems.append(
                 f"model layer {model}'s {role} buffers in layers {sorted(names_a[model, role])} "
                 f"against {sorted(names_b[model, role])}"
+            )
+    both = {model for model, _ in names_a} & {model for model, _ in names_b}
+    for model, role in sorted(set(names_a) ^ set(names_b)):
+        holder = a if (model, role) in names_a else b
+        if model in both and role not in holder.request_rebuilt_roles:
+            problems.append(
+                f"model layer {model}'s {role} buffers are transferred by one rank only, which "
+                "does not rebuild them per request"
             )
     if paged and a.tokens_per_page != b.tokens_per_page:
         problems.append(f"pages of {a.tokens_per_page} tokens against {b.tokens_per_page}")
