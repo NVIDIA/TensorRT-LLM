@@ -47,7 +47,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          validate_mm_inputs)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
-from .prefix_token_cache import create_prefix_token_cache
+from .prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
 from .tokenization import tokenize_prompt
 
 N = TypeVar("N", bound=Type[nn.Module])
@@ -173,6 +173,11 @@ class BaseMultimodalInputProcessor(ABC):
     # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
+
+    # Set by `_init_tokenization_cache`; None (no cache) for a processor that
+    # never calls it.
+    _prefix_token_cache: Optional[PrefixTokenCache] = None
+    _prefix_token_cache_tokenizer: Optional[PreTrainedTokenizerBase] = None
 
     def get_mm_item_metadata(
         self,
