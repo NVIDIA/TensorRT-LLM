@@ -92,12 +92,15 @@ def _with_two_of_four_heads(manager: KVCacheManagerV2) -> KVCacheManagerV2:
     return manager
 
 
+@pytest.mark.cpu_only
 def test_v2_page_buffer_tensor_defaults() -> None:
     manager = _with_two_of_four_heads(object.__new__(KVCacheManagerV2))
 
-    # K/V split by head, head-major; the index-key side cache alike on every rank.
+    # K/V split by head, head-major; the index-key side cache spreads as its manager declares it
+    # (MiniMax M3 below), so the base declares none.
     assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
-    assert manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
+    with pytest.raises(ValueError, match="does not declare how its bytes spread"):
+        manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False)
 
 
 @pytest.mark.cpu_only
