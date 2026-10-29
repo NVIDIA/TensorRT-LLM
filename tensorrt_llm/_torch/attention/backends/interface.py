@@ -14,6 +14,8 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ...attention.backends.prims_ts.vc_attention.quantization import \
+        VCAttentionOperands
     from ...model_config import ModelConfig
     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
     from ...pyexecutor.kv_cache.mixed_precision_staging import \
@@ -1062,6 +1064,12 @@ class AttentionForwardArgs:
     # E4M3 with one scale each, folded into the softmax and output scales.
     qk_fp8_per_tensor: bool = False
     v_fp8_per_tensor: bool = False
+    # VC-Attention recipe of the PrimTS FMHA library. The caller prepares the
+    # operands (K in grouped token order, V as E4M3 tile residuals with its
+    # scale and means, under QK8 the rotated E4M3 Q and K with their block
+    # scales) and the library runs the matching plan on them.
+    vc_attention: bool = False
+    vc_operands: Optional["VCAttentionOperands"] = None
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False

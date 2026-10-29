@@ -544,6 +544,22 @@
           "status": "prototype",
           "title": "V Dtype",
           "type": "string"
+        },
+        "vc_attention": {
+          "default": false,
+          "description": "Run the recipe as VC-Attention on the TRTLLM backend. V is stored as E4M3 residuals around 128-token tile means with one scale per channel; fp8 Q/K are Hadamard-rotated with one scale per 128 tokens. Requires TLLM_FMHA_LIBS=+prims_ts.",
+          "status": "prototype",
+          "title": "Vc Attention",
+          "type": "boolean"
+        },
+        "vc_repair_budget": {
+          "default": 0.0,
+          "description": "Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the fastest setting measured at unchanged quality. vc_attention only.",
+          "exclusiveMaximum": 1.0,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Vc Repair Budget",
+          "type": "number"
         }
       },
       "title": "QuantAttentionConfig",
