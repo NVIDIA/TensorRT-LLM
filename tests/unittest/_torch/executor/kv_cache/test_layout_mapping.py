@@ -30,6 +30,7 @@ import pytest
 from utils.page_layout_oracle import assert_layouts_reshard
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
+    BufferRuns,
     check_compatible,
     fan,
     map_buffers,
@@ -352,6 +353,40 @@ def test_layouts_that_do_not_correspond_are_refused():
         check_compatible(base, dataclasses.replace(base, tokens_per_page=8))
     # Layers only one rank holds are not compared: they simply do not move.
     check_compatible(base, layout(topology, (1,), [("key", kv(8), "attention")]))
+
+
+def test_the_oracle_refuses_runs_into_bytes_no_transferred_tensor_holds(monkeypatch):
+    """Every transferred byte arriving once is not enough: a run into a local-only buffer, or one
+    past the slot, fails the oracle too."""
+    import utils.page_layout_oracle as oracle
+
+    topology = Instance().ranks(0)[0]
+    page = layout(topology, (0,), [("key", kv(4), "attention")])
+    width = page.pool_slot_bytes[0][0]
+    scratch = BufferDesc(0, "scratch", 0, 0, width, 8, transferred=False)
+    page = dataclasses.replace(
+        page, pool_slot_bytes={0: (width + 8,)}, buffers=(*page.buffers, scratch)
+    )
+    oracle.assert_layouts_reshard([page], [page])
+    sent = oracle.map_buffers
+
+    def also_writing(at: int):
+        def runs(src, dst, **kwargs):
+            out = sent(src, dst, **kwargs)
+            first = out[0]
+            extra = BufferRuns(
+                first.src, first.dst, np.array([0]), np.array([at]), np.array([4], dtype=np.int64)
+            )
+            return [*out, extra]
+
+        return runs
+
+    monkeypatch.setattr(oracle, "map_buffers", also_writing(width))
+    with pytest.raises(AssertionError, match="written, but no transferred tensor holds it"):
+        oracle.assert_layouts_reshard([page], [page])
+    monkeypatch.setattr(oracle, "map_buffers", also_writing(width + 6))
+    with pytest.raises(AssertionError):
+        oracle.assert_layouts_reshard([page], [page])
 
 
 def _with_group(page: PageLayout, **changes) -> PageLayout:

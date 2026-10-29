@@ -17,11 +17,13 @@
 Each rank's page holds, at every byte of every tensor, the id of the global element there. After
 every source rank sends what ``layout_mapping.map_buffers`` gives it, every byte a destination rank
 holds of every buffer the sources transfer must have arrived exactly once, holding its own global
-element, and only from source ranks the destination pairs with (``layout_mapping.fan``).
+element, and only from source ranks the destination pairs with (``layout_mapping.fan``); no run
+reaches past a pool slot, and no other byte of the destination's slots is written.
 
 Use it on hand-written layouts, or on the page layouts real managers build
 (``manager.get_page_table().page_layout``) to check a new cache's declarations across the
-topologies it is served with.
+topologies it is served with. It checks that the ranks' declarations agree with one another; that
+they describe what the kernels write is for tests running the kernels to show.
 """
 
 from typing import Dict, Sequence, Tuple
@@ -125,14 +127,18 @@ def assert_layouts_reshard(
                 src_pool = (runs.src.pool_group, runs.src.pool_index)
                 dst_pool = (runs.dst.pool_group, runs.dst.pool_index)
                 for s, d, n in zip(runs.src_offsets, runs.dst_offsets, runs.sizes):
+                    assert n > 0 and 0 <= s and s + n <= memory[src_pool].size, (src_pool, s, n)
+                    assert 0 <= d and d + n <= got[dst_pool].size, (dst.topology, dst_pool, d, n)
                     got[dst_pool][d : d + n] = memory[src_pool][s : s + n]
                     writes[dst_pool][d : d + n] += 1
+        expected = {pool: np.zeros(arr.size, dtype=bool) for pool, arr in got.items()}
         for buffer in dst.buffers:
             if not buffer.transferred or (buffer.layer, buffer.role) not in sent:
                 continue
             pool = (buffer.pool_group, buffer.pool_index)
             for tensor in buffer.tensors:
                 offsets, ids = elements.of(dst, buffer, tensor)
+                expected[pool][offsets] = True
                 where = (
                     f"{dst.topology} buffer ({buffer.layer}, {buffer.role}) tensor {tensor.name!r}"
                 )
@@ -146,3 +152,9 @@ def assert_layouts_reshard(
                     f"{where} byte {offsets[wrong[0]]}: element {got[pool][offsets[wrong[0]]]}, "
                     f"not {ids[wrong[0]]}"
                 )
+        for pool, arr in writes.items():
+            stray = np.flatnonzero((arr != 0) & ~expected[pool])
+            assert not stray.size, (
+                f"{dst.topology} pool {pool} byte {stray[0]}: written, but no transferred tensor "
+                "holds it"
+            )
