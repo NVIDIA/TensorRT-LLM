@@ -6767,6 +6767,18 @@ class TorchLlmArgs(BaseLlmArgs):
         # that require them.
         return self
 
+    @model_validator(mode="after")
+    def validate_watermark_config(self) -> 'TorchLlmArgs':
+        spec = self.speculative_config
+        if (self.watermark_config is not None and spec is not None
+                and spec.spec_dec_mode.is_dspark()):
+            raise ValueError(
+                "watermark_config is not supported with DSpark speculative "
+                "decoding: its ragged verification windows cannot be "
+                "watermarked. Use another speculation mode or drop "
+                "watermark_config.")
+        return self
+
     attn_backend: str = Field(
         default='TRTLLM',
         description="Attention backend to use.",

@@ -186,8 +186,9 @@ def test_eagle3_watermark_with_rejection_sampling(watermark_kwargs):
         ).is_watermarked
         for o in outputs
     )
-    # Accepted drafts carry less signal under rejection sampling, so expect a clear majority
-    # of the texts rather than all of them.
+    # Accepted drafts carry less signal (dual key) or none (target-only) under rejection sampling, so
+    # only part of the texts carry a detectable mark (a third to a half in calibration runs); require
+    # a quarter.
     assert flagged >= len(outputs) // 4, f"only {flagged}/{len(outputs)} outputs carry the mark"
 
 

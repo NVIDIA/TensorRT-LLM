@@ -158,6 +158,22 @@ def test_request_broadcaster_collects_conversation_params_with_none():
     assert target_items[1].request.py_conversation_params is None
 
 
+def test_request_broadcaster_delivers_watermark_opt_out():
+    source_items = [
+        RequestQueueItem(1, SimpleNamespace(py_conversation_params=None, py_watermarking=False)),
+        RequestQueueItem(2, SimpleNamespace(py_conversation_params=None)),
+    ]
+
+    py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
+
+    target_items = [RequestQueueItem(1, SimpleNamespace()), RequestQueueItem(2, SimpleNamespace())]
+    attach_py_objects_to_requests(target_items, py_request_objects)
+
+    # A non-root rank must see the opt-out, or it samples a different token than the leader.
+    assert target_items[0].request.py_watermarking is False
+    assert getattr(target_items[1].request, "py_watermarking", None) is None
+
+
 def test_request_broadcaster_requires_conversation_params_attr():
     source_items = [RequestQueueItem(1, SimpleNamespace())]
 

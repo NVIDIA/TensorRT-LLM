@@ -1244,6 +1244,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode=self.py_logprobs_mode,
             logprobs_simple_format=self.py_logprobs_simple_format,
             return_routed_experts=self.py_return_routed_experts,
+            watermarking=self.py_watermarking,
             embedding_bias=deepcopy(self.py_embedding_bias),
             position_ids=deepcopy(self.py_position_ids),
             guided_decoding_params=deepcopy(self.py_guided_decoding_params),

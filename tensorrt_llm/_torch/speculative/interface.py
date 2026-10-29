@@ -588,6 +588,8 @@ class SpecMetadata:
     # [max_num_requests] bool, rewritten every step: the requests whose tokens carry a
     # watermark in it (sampling, not greedy, not opted out, and sampling a token this step).
     watermark_enabled: Optional[torch.Tensor] = None
+    # Host-side "some request of this step carries a watermark" (reading the tensor would sync).
+    watermark_any_enabled: bool = False
     # Dual-key watermarking with rejection sampling: the drafts of the current step (target
     # vocabulary ids) and the seeds they were drawn with, so that the next draft token
     # continues from the right context. Shape [max_num_requests, max_draft_len], int64.
@@ -1058,6 +1060,7 @@ class SpecMetadata:
             samples_a_token(r) and handler.is_enabled(r.py_seq_slot)
             for r in requests
         ]
+        self.watermark_any_enabled = any(flags)
         flags += [False] * (self.watermark_enabled.shape[0] - len(flags))
         self.watermark_enabled.copy_(torch.tensor(flags,
                                                   dtype=torch.bool,
@@ -1263,6 +1266,7 @@ class SpecMetadata:
         # here before the shallow copy rather than lazily in each view.
         self.prepare_rejection_sampling_buffers()
         self.prepare_penalty_buffers()
+        self.prepare_watermark_buffers()
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
@@ -3483,12 +3487,20 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         if isinstance(logits, VocabShardedLogits):
             return logits.select_tokens(spec_metadata)
-        sampled_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
-            logits, spec_metadata, num_contexts, batch_size)
         # A watermarked sample must be committed to the slot's context state by whoever
-        # accepts the tokens; callers that do not do that cannot serve watermarked requests.
-        assert watermark_plans is None, (
-            "this sampling path does not support text watermarking")
+        # accepts the tokens; callers of this method do not, so they cannot serve a request
+        # that carries a watermark. Opted-out and greedy requests are sampled normally.
+        if (spec_metadata.watermark_handler is not None
+                and spec_metadata.watermark_any_enabled):
+            raise NotImplementedError(
+                "this sampling path does not support text watermarking: disable "
+                "watermark_config or set watermarking=False on the requests")
+        sampled_tokens, _ = self._sample_tokens_and_watermark_plans(
+            logits,
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            use_watermark=False)
         return sampled_tokens
 
     def _sample_tokens_and_watermark_plans(
@@ -3498,6 +3510,7 @@ class SpecWorkerBase(nn.Module, ABC):
         num_contexts: int,
         batch_size: int,
         draft_tokens: Optional[torch.Tensor] = None,
+        use_watermark: bool = True,
     ):
         """``_sample_tokens_for_batch`` that also applies the watermark.
 
@@ -3509,7 +3522,7 @@ class SpecWorkerBase(nn.Module, ABC):
         watermark_plans = None
         if isinstance(logits, VocabShardedLogits):
             # A sampled, watermarked row needs the whole distribution, not this rank's shard.
-            if (spec_metadata.watermark_handler is not None
+            if (use_watermark and spec_metadata.watermark_handler is not None
                     and not spec_metadata.is_all_greedy_sample):
                 logits = logits.gather()
             else:
@@ -3538,7 +3551,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
-            if spec_metadata.watermark_handler is not None:
+            if use_watermark and spec_metadata.watermark_handler is not None:
                 # Rows of watermarked requests replace the ordinary draw by the keyed
                 # Gumbel-max draw over the same filtered distribution.
                 watermark_plans = self._plan_watermark(spec_metadata,
