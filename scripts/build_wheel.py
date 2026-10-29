@@ -645,7 +645,44 @@ def _demote_racy_mtime(dst_file: Path, src_stat: Optional[os.stat_result],
         pass
 
 
-def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
+def link_or_copy_file(src: Path, dst: Path, hard_link: bool = True) -> bool:
+    """Install the file ``src`` at ``dst`` as a hard link, or as a copy.
+
+    A hard link shares the inode and data of ``src``, so it adds no disk use
+    or file count. Linking fails across filesystems (``EXDEV``, e.g. with a
+    ``--build_root`` on other storage), and then the file is copied, as it
+    always is when ``hard_link`` is False. ``dst`` may name a directory to
+    install into.
+
+    An existing ``dst`` is unlinked first, never written in place: a hard link
+    from an earlier install shares its inode with a build output, and writing
+    into it would change that build output too.
+
+    Returns:
+        Whether ``dst`` is a hard link to ``src``.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    if dst.is_dir():
+        dst = dst / src.name
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    if hard_link:
+        try:
+            # os.link does not follow a symlinked src on every platform.
+            os.link(src.resolve(), dst)
+            return True
+        except OSError:
+            pass
+    # copy2 keeps the source mtime, as a hard link does.
+    shutil.copy2(src, dst)
+    return False
+
+
+def sync_tree(src: Path,
+              dst: Path,
+              exclude: Sequence[str] = (),
+              hard_link: bool = False) -> None:
     """Mirror the src directory into dst, touching only what changed.
 
     Replaces the rmtree+copytree pattern for artifact copy-back: files are
@@ -658,6 +695,12 @@ def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
     written within _MTIME_RACE_WINDOW of the copy, whose mtimes cannot yet
     prove the content settled. exclude lists fnmatch patterns for entry names
     to skip.
+
+    With ``hard_link``, files are hard-linked to their source instead of
+    copied when src and dst are on the same filesystem (see
+    `link_or_copy_file`). A file that already is a hard link to its source is
+    always current and is skipped. After one failed link, the rest of the
+    tree is copied.
     """
     import fnmatch
 
@@ -690,7 +733,12 @@ def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
     elif dst.exists() and src == dst.resolve():
         return
 
-    if not dst.exists():
+    if hard_link:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        hard_link = src.stat().st_dev == dst.parent.stat().st_dev
+
+    # A missing dst that gets hard links is filled by the walk below.
+    if not dst.exists() and not hard_link:
         if not exclude and _tar_pipe_copy(src, dst):
             demote_racy_mtimes()
             return
@@ -724,10 +772,13 @@ def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
             try:
                 src_stat = src_file.stat()
                 dst_stat = dst_file.stat()
+                if os.path.samestat(src_stat, dst_stat):
+                    continue
                 # Trust the match only once the source mtime has aged past the
                 # race window; a just-written source can be rewritten again
                 # without the mtime moving, which would strand a stale copy.
-                if (src_stat.st_size == dst_stat.st_size
+                # With hard links, a matching copy is replaced by a link.
+                if (not hard_link and src_stat.st_size == dst_stat.st_size
                         and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3
                         and src_stat.st_mtime <= now - _MTIME_RACE_WINDOW):
                     continue
@@ -735,9 +786,12 @@ def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
                 pass
             if dst_file.is_dir() and not dst_file.is_symlink():
                 rmtree(dst_file)
-            # copy2: mtime must survive for the next sync's comparison.
-            shutil.copy2(src_file, dst_file)
-            _demote_racy_mtime(dst_file, src_stat, now)
+            # One failed link (e.g. src and dst on two mounts of the same
+            # filesystem) means the rest of the tree would fail too.
+            hard_link = link_or_copy_file(src_file, dst_file, hard_link)
+            # Backdating a hard link would backdate its source.
+            if not hard_link:
+                _demote_racy_mtime(dst_file, src_stat, now)
 
 
 def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
@@ -1208,19 +1262,13 @@ def main(*,
     if cache_dir.exists():
         clear_folder(cache_dir)
 
-    def safe_copy(src, dst):
-        """Copy a file, replacing a destination symlink with a real file."""
-        src_path = Path(src)
-        dst_path = Path(dst)
-        if dst_path.is_dir():
-            dst_path = dst_path / src_path.name
-        if dst_path.is_symlink():
-            dst_path.unlink()
-        return copy(src_path, dst_path)
-
-    install_file = safe_copy
-
-    install_tree = sync_tree
+    # Build outputs are hard-linked into the package when possible. patchelf
+    # rewrites a file in place, so the files it edits after install are real
+    # copies: through a hard link, the edit would also change the source.
+    install_file = link_or_copy_file
+    install_patched_file = partial(link_or_copy_file, hard_link=False)
+    install_tree = partial(sync_tree, hard_link=True)
+    install_patched_tree = sync_tree
     if skip_building_wheel and linking_install_binary:
 
         def symlink_remove_dst(src, dst):
@@ -1232,7 +1280,7 @@ def main(*,
                 os.remove(dst)
             os.symlink(src, dst)
 
-        install_file = symlink_remove_dst
+        install_file = install_patched_file = symlink_remove_dst
 
         def symlink_remove_dst_tree(src, dst):
             src = os.path.abspath(src)
@@ -1243,7 +1291,7 @@ def main(*,
                 os.remove(dst)
             os.symlink(src, dst)
 
-        install_tree = symlink_remove_dst_tree
+        install_tree = install_patched_tree = symlink_remove_dst_tree
 
     lib_dir.mkdir(parents=True, exist_ok=True)
     include_dir.mkdir(parents=True, exist_ok=True)
@@ -1258,7 +1306,7 @@ def main(*,
 
         # Helper function to resolve symlinks and copy actual content
         def copy_resolving_symlink(src_path, dst_path):
-            """Copy file or directory, resolving symlinks to copy actual content.
+            """Copy or hard-link a file or directory, resolving symlinks to their content.
 
             Skips the copy when dst already exists and a stamp file confirms the
             previous copy completed successfully, and the stamp is at least as new
@@ -1283,26 +1331,16 @@ def main(*,
                     rmtree(
                         dst_path)  # dst exists but no stamp — interrupted copy
                 stamp.unlink(missing_ok=True)
-                # Shell out to cp -rL: dereferences symlinks like copytree(symlinks=False)
-                # but uses kernel-level copy primitives, which is significantly faster
-                # than Python's file-by-file copytree on network-mounted filesystems.
-                # Fall back to copytree if cp is unavailable (non-Linux or minimal containers).
-                cp_bin = shutil.which("cp")
-                if cp_bin is not None:
-                    try:
-                        run([cp_bin, "-rL",
-                             str(resolved_src),
-                             str(dst_path)],
-                            check=True)
-                    except FileNotFoundError:
-                        copytree(resolved_src, dst_path, symlinks=False)
-                else:
-                    copytree(resolved_src, dst_path, symlinks=False)
+                # sync_tree dereferences symlinks and hard-links each file when
+                # src and dst share a filesystem. Otherwise it copies the tree
+                # through one streamed tar pipeline, which is much faster than
+                # per-file copies on network filesystems.
+                sync_tree(resolved_src, dst_path, hard_link=True)
                 stamp.touch()
             else:
                 if dst_path.is_dir():
                     dst_path = dst_path / src_path.name
-                copy(resolved_src, dst_path)
+                link_or_copy_file(resolved_src, dst_path)
 
         # Copy cuda_ptx directory (actual directory, not symlink)
         cuda_ptx_src = fmha_build_dir / "cuda_ptx"
@@ -1327,13 +1365,14 @@ def main(*,
         # Copy KernelParams.h (actual file)
         kernel_params_src = fmha_build_dir / "KernelParams.h"
         if kernel_params_src.exists():
-            copy(kernel_params_src, fmha_include_dir / "KernelParams.h")
+            link_or_copy_file(kernel_params_src,
+                              fmha_include_dir / "KernelParams.h")
 
         # Copy KernelParamsDecl.h (actual file)
         kernel_params_decl_src = fmha_build_dir / "KernelParamsDecl.h"
         if kernel_params_decl_src.exists():
-            copy(kernel_params_decl_src,
-                 fmha_include_dir / "KernelParamsDecl.h")
+            link_or_copy_file(kernel_params_decl_src,
+                              fmha_include_dir / "KernelParamsDecl.h")
 
     required_cuda_headers = [
         "cuda_fp16.h", "cuda_fp16.hpp", "cuda_bf16.h", "cuda_bf16.hpp",
@@ -1374,7 +1413,7 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
         ):
-            install_file(
+            install_patched_file(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
@@ -1385,15 +1424,16 @@ def main(*,
                 ucx_dir = lib_dir / "ucx"
                 if ucx_dir.exists():
                     clear_folder(ucx_dir)
-                install_tree("/usr/local/ucx/lib", ucx_dir)
+                install_patched_tree("/usr/local/ucx/lib", ucx_dir)
                 build_run(
                     f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
                 )
         # NIXL wrapper and libraries
         nixl_utils_dir = build_dir / "tensorrt_llm/executor/cache_transmission/nixl_utils"
         if os.path.exists(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so"):
-            install_file(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so",
-                         lib_dir / "libtensorrt_llm_nixl_wrapper.so")
+            install_patched_file(
+                nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so",
+                lib_dir / "libtensorrt_llm_nixl_wrapper.so")
             build_run(
                 f'patchelf --set-rpath \'$ORIGIN/nixl/\' {lib_dir / "libtensorrt_llm_nixl_wrapper.so"}'
             )
@@ -1407,7 +1447,7 @@ def main(*,
                     nixl_lib_path = "/opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu"
                 if not os.path.exists(nixl_lib_path):
                     nixl_lib_path = "/opt/nvidia/nvda_nixl/lib64"
-                install_tree(nixl_lib_path, nixl_dir)
+                install_patched_tree(nixl_lib_path, nixl_dir)
                 build_run(
                     f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
                 )

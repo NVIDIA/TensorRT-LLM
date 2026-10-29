@@ -19,6 +19,8 @@ sync_tree replaced an rmtree+copytree copy-back of build artifacts into the
 wheel. These tests pin the on-disk result of sync_tree to that of the old
 path across cold populate and incremental re-sync, so the optimization can
 never silently drop, stale, or corrupt a file relative to a clean recopy.
+With hard links, sync_tree must give the same tree, with each file sharing
+its source's inode.
 
 Small synthetic trees only (no build required), so this runs in well under a
 second on a CPU node.
@@ -26,6 +28,7 @@ second on a CPU node.
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import os
 import shutil
@@ -120,6 +123,13 @@ def assert_trees_equal(new_dir, old_dir):
     assert new_snap == old_snap
 
 
+def assert_hard_links(dst_dir: Path, src_dir: Path, linked: bool) -> None:
+    """Assert each file in dst_dir is, or is not, a hard link to its source."""
+    for rel, (kind, _, _) in snapshot(dst_dir).items():
+        if kind == "file":
+            assert os.path.samefile(dst_dir / rel, src_dir / rel) == linked, rel
+
+
 def build_tree(base):
     """Build a small tree covering where the two copy paths could differ.
 
@@ -142,15 +152,17 @@ def build_tree(base):
     (base / "pkg/stale.pyc").write_bytes(b"\x00")
 
 
-def test_cold_populate_matches_copytree(sync_tree, tmp_path):
-    """Cold sync (streamed tar populate) == old clean copytree."""
+@pytest.mark.parametrize("hard_link", [False, True])
+def test_cold_populate_matches_copytree(sync_tree, hard_link, tmp_path):
+    """Cold sync (streamed tar populate, or hard links) == old clean copytree."""
     src = tmp_path / "src"
     src.mkdir()
     build_tree(src)
     new_dir, old_dir = tmp_path / "new", tmp_path / "old"
-    sync_tree(src, new_dir)
+    sync_tree(src, new_dir, hard_link=hard_link)
     old_copy(src, old_dir)
     assert_trees_equal(new_dir, old_dir)
+    assert_hard_links(new_dir, src, linked=hard_link)
 
 
 def test_exclude_matches_ignore_patterns(sync_tree, tmp_path):
@@ -168,10 +180,15 @@ def test_exclude_matches_ignore_patterns(sync_tree, tmp_path):
     assert not (new_dir / "pkg/stale.pyc").exists()
 
 
-def test_incremental_converges_to_fresh_copy(sync_tree, tmp_path):
+@pytest.mark.parametrize("link_mode", ["copy", "hard_link", "link_fails"])
+def test_incremental_converges_to_fresh_copy(sync_tree, link_mode, monkeypatch, tmp_path):
     """Incremental re-sync after mutation must match a fresh full recopy.
 
-    Covers changed/added/deleted files and file<->dir type swaps.
+    Covers changed/added/deleted files and file<->dir type swaps. The re-sync
+    runs with copies, with hard links, and with hard links that fail as they
+    do across mounts (EXDEV) and must fall back to copies. The initial
+    populate always copies, as builds before hard links did, so hard_link
+    also covers replacing those copies by links.
     """
     src = tmp_path / "src"
     src.mkdir()
@@ -189,10 +206,22 @@ def test_incremental_converges_to_fresh_copy(sync_tree, tmp_path):
     (src / "pkg/emptydir").rmdir()  # dir -> file
     (src / "pkg/emptydir").write_bytes(b"now a file\n")
 
-    sync_tree(src, new_dir)  # incremental re-sync onto existing dst
+    if link_mode == "link_fails":
+
+        def fail_link(src_path, dst_path):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(os, "link", fail_link)
+    src_mtimes = {p: p.stat().st_mtime_ns for p in src.rglob("*") if p.is_file()}
+    # incremental re-sync onto existing dst
+    sync_tree(src, new_dir, hard_link=link_mode != "copy")
     old_dir = tmp_path / "old"
     old_copy(src, old_dir)  # ground truth
     assert_trees_equal(new_dir, old_dir)
+    assert_hard_links(new_dir, src, linked=link_mode == "hard_link")
+    # The sources were just written, so a copy gets a backdated mtime; a hard
+    # link must not, since that would backdate the source too.
+    assert {p: p.stat().st_mtime_ns for p in src.rglob("*") if p.is_file()} == src_mtimes
 
 
 def test_warm_noop_is_stable(sync_tree, tmp_path):
@@ -272,6 +301,29 @@ def test_same_src_dst_is_noop(sync_tree, tmp_path):
     before = snapshot(src)
     sync_tree(src, src)
     assert snapshot(src) == before
+
+
+def test_copy_over_hard_link_keeps_source(build_wheel_module, tmp_path):
+    """A copy installed over an earlier hard link must not change its source.
+
+    Files that patchelf edits after install are installed as copies. If dst
+    still is a hard link from an earlier install, writing the copy into it
+    would also rewrite the build output that shares its inode.
+    """
+    link_or_copy_file = build_wheel_module.link_or_copy_file
+    build_output = tmp_path / "libwrapper.so"
+    build_output.write_bytes(b"built\n")
+    lib_dir = tmp_path / "libs"
+    lib_dir.mkdir()
+    installed = lib_dir / build_output.name
+
+    # dst names a directory, so the file is installed into it
+    assert link_or_copy_file(build_output, lib_dir)
+    assert os.path.samefile(installed, build_output)
+
+    assert not link_or_copy_file(build_output, lib_dir, hard_link=False)
+    installed.write_bytes(b"patched\n")  # an in-place edit, as patchelf does
+    assert build_output.read_bytes() == b"built\n"
 
 
 @pytest.mark.parametrize(
