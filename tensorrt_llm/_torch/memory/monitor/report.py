@@ -157,6 +157,13 @@ def render(
                 "   <- incl. blocks awaiting release on other streams",
             )
         )
+    if torch_r.pools and len(torch_r.pools) > 1:
+        add("    by pool:")
+        for pool in torch_r.pools:
+            add(
+                f"      {pool.label:<26s}{_gib(pool.reserved)} reserved, "
+                f"{pool.allocated / _GIB:.2f} GiB allocated"
+            )
     add(_line("component counters", frame.nontorch_known))
     residual_suffix = ""
     if frame.residual_is_negative:

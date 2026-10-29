@@ -97,6 +97,17 @@ class Category(StrEnum):
     #: :attr:`UNATTRIBUTED_LIVE`.
     ACTIVATION = "activation"
 
+    #: Allocations made while building the model that are not its parameters
+    #: or registered buffers -- workspaces and caches the modules create.
+    MODEL_RUNTIME = "model.runtime"
+    #: Allocations made while creating the executor's remaining resources,
+    #: which includes warmup and CUDA graph capture.
+    EXECUTOR_RUNTIME = "executor.runtime"
+    GUIDED_DECODER = "guided_decoder"
+    #: Blocks in a CUDA graph's private pool, live or free. Free blocks there
+    #: are held for replay and cannot serve other allocations.
+    CUDA_GRAPHS = "cuda_graphs"
+
     #: A tag the category table does not recognise. Reported under its own
     #: name via the entry's ``owner`` rather than folded into a neighbouring
     #: category, so a missing mapping surfaces as a gap to fill instead of

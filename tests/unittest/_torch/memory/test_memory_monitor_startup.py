@@ -201,3 +201,89 @@ class TestStepsOnlyInStartupReports:
     def test_absent_otherwise(self):
         startup.record_stage("model", 100 * GIB, 99 * GIB)
         assert "Memory taken by each startup step" not in render(_frame(), _capability())
+
+
+class TestCreationStepsAreTagged:
+    """Each executor creation step tags what it allocates."""
+
+    def test_every_scoped_step_has_a_category(self):
+        # allocation_scope accepts exactly the steps that have a metric name;
+        # one without a category would report under its raw value.
+        from tensorrt_llm._torch.memory.monitor import _TAG_CATEGORIES
+        from tensorrt_llm._torch.pyexecutor.py_executor_creator import _ExecutorMemoryMonitor
+
+        missing = [
+            step.value
+            for step in _ExecutorMemoryMonitor.creation_stage_metric_names
+            if step.value not in _TAG_CATEGORIES
+        ]
+        assert not missing, f"creation steps without a category: {missing}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="reads a real allocator snapshot")
+    def test_observed_step_tags_its_allocations(self):
+        from tensorrt_llm._torch.memory.monitor import tagging
+        from tensorrt_llm._torch.pyexecutor.py_executor_creator import _ExecutorMemoryMonitor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        monitor = _ExecutorMemoryMonitor()
+        if not tagging.start_tagging_window():
+            pytest.skip("tagging unsupported here")
+        try:
+            with monitor.observe_creation_stage(ExecutorMemoryType.GUIDED_DECODER):
+                held = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+            by_tag = tagging.live_bytes_by_tag(tagging.freeze_tag_map())
+        finally:
+            tagging.stop_tagging_window()
+        try:
+            assert by_tag.get("guided_decoder", 0) >= 16 << 20
+        finally:
+            del held
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="reads a real allocator snapshot")
+    def test_tagged_step_is_reported_under_the_executors_name(self, monkeypatch):
+        from tensorrt_llm._torch.memory.monitor import _tag_entries, tagging
+
+        startup.set_stage_advice({"sampler": "Sampler"}, {})
+        if not tagging.start_tagging_window():
+            pytest.skip("tagging unsupported here")
+        try:
+            with tagging.tag("sampler"):
+                held = torch.empty(32 << 20, dtype=torch.uint8, device="cuda")
+            tagging.set_frozen_map(tagging.freeze_tag_map())
+        finally:
+            tagging.stop_tagging_window()
+        try:
+            entries = [e for e in _tag_entries() if e.category is Category.SAMPLER]
+            assert entries and entries[0].owner == "Sampler"
+            assert entries[0].size_bytes >= 32 << 20
+        finally:
+            tagging.set_frozen_map(tagging.TagSnapshot(supported=False))
+            del held
+
+
+class TestGroupMembers:
+    def test_a_group_lists_what_it_is_made_of(self):
+        frame = build_frame(
+            DeviceReading(total=180 * GIB, free=150 * GIB, process_used=30 * GIB),
+            TorchReading(reserved=2 * GIB, live=2 * GIB),
+            [
+                Entry(
+                    category=Category.EXECUTOR_RUNTIME,
+                    size_bytes=GIB,
+                    source=Source.TAG,
+                    placement=Placement.TORCH_DEFAULT,
+                    basis=Basis.LOGICAL,
+                    owner="Additional executor resources",
+                ),
+                Entry(
+                    category=Category.SAMPLER,
+                    size_bytes=GIB // 2,
+                    source=Source.TAG,
+                    placement=Placement.TORCH_DEFAULT,
+                    basis=Basis.LOGICAL,
+                    owner="Sampler",
+                ),
+            ],
+        )
+        text = render(frame, _capability())
+        assert "of which (GiB): Additional executor resources 1.00, Sampler 0.50" in text

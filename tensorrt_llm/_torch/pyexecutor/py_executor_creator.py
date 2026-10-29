@@ -202,7 +202,10 @@ class _ExecutorMemoryMonitor:
         monitor_process_pre = monitor_startup.begin_stage()
 
         try:
-            yield
+            # Tag what the step allocates so the memory monitor can name its
+            # owner; a no-op unless TLLM_MEM_MONITOR is set.
+            with monitor_tag(current_stage.value):
+                yield
         except Exception as e:
             monitor_startup.record_failed_stage(current_stage.value,
                                                 free_gpu_memory_bytes_pre,
@@ -1010,7 +1013,7 @@ def _create_py_executor(
                         f"Guided decoding is not supported for speculative decoding mode: {spec_config.spec_dec_mode.name}."
                     )
 
-    with allocation_scope(ExecutorMemoryType.SAMPLER), monitor_tag("SAMPLER"):
+    with allocation_scope(ExecutorMemoryType.SAMPLER):
         sampler = instantiate_sampler(
             model_engine,
             llm_args,

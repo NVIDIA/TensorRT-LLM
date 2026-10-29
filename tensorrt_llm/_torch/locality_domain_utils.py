@@ -454,6 +454,10 @@ def _initialize_locality_domain_resources_locked(
 
             locality_domain_mempool = torch.cuda.MemPool(manager.allocators[locality_domain_id])
             manager.mempools[(device_id, locality_domain_id)] = locality_domain_mempool
+            # Lets the memory monitor tell this pool from a CUDA graph's.
+            from .memory.monitor.pools import register_pool
+
+            register_pool(locality_domain_mempool.id, f"locality domain {locality_domain_id}")
 
         # The strict public split creates a third, non-localized green context
         # from the remainder resource. Its stream is owned by the

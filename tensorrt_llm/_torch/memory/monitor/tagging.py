@@ -65,6 +65,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 __all__ = [
+    "CUDA_GRAPHS",
     "UNTAGGED",
     "claim_module_memory",
     "clear_claims",
@@ -238,19 +239,27 @@ def freeze_tag_map() -> TagSnapshot:
     return TagSnapshot(supported=True, owners=owners)
 
 
-def _live_blocks() -> list[tuple[int, int]] | None:
-    """Sorted ``(address, size)`` of every live block, or ``None`` on failure."""
+#: Label for live blocks in a CUDA graph's private pool. Applied from the
+#: pool, not from a tag: capture happens inside a creation step whose tag
+#: would otherwise claim the graph's memory as that step's.
+CUDA_GRAPHS = "CUDA_GRAPHS"
+
+
+def _live_blocks() -> list[tuple[int, int, bool]] | None:
+    """Sorted ``(address, size, in_graph_pool)`` of every live block, or ``None``."""
+    from .pools import classify
+
     try:
         segments = torch.cuda.memory._snapshot()["segments"]
     except Exception:  # noqa: BLE001
         logger.debug("memory monitor: snapshot failed while reading tags")
         return None
-    blocks = [
-        (block["address"], block["size"])
-        for segment in segments
-        for block in segment["blocks"]
-        if block["state"] == "active_allocated"
-    ]
+    blocks = []
+    for segment in segments:
+        in_graph = classify(segment.get("segment_pool_id", (0, 0)))[0] == "graph"
+        for block in segment["blocks"]:
+            if block["state"] == "active_allocated":
+                blocks.append((block["address"], block["size"], in_graph))
     blocks.sort()
     return blocks
 
@@ -266,13 +275,13 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
     a measurement.
     """
     claims = _claimed_storages()
-    if not snapshot.supported and not claims:
-        return {}
-
     blocks = _live_blocks()
     if blocks is None:
         return {}
-    addresses = [address for address, _ in blocks]
+    in_graphs = any(graph for _, _, graph in blocks)
+    if not snapshot.supported and not claims and not in_graphs:
+        return {}
+    addresses = [address for address, _, _ in blocks]
 
     # Each snapshot block is one allocation, so a storage lies inside exactly
     # one block, and storages sharing a block (tied weights) claim it once.
@@ -280,13 +289,17 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
     for pointer, label in claims:
         position = bisect.bisect_right(addresses, pointer) - 1
         if position >= 0:
-            address, size = blocks[position]
+            address, size, _ = blocks[position]
             if pointer < address + size:
                 claimed.setdefault(address, label)
 
+    # Precedence: a claimed module, then the graph pool a block sits in, then
+    # the creation step's tag.
     totals: dict[str, int] = {UNTAGGED: 0}
-    for address, size in blocks:
-        label = claimed.get(address) or snapshot.owners.get(address, UNTAGGED)
+    for address, size, in_graph in blocks:
+        label = claimed.get(address)
+        if label is None:
+            label = CUDA_GRAPHS if in_graph else snapshot.owners.get(address, UNTAGGED)
         totals[label] = totals.get(label, 0) + size
     return totals
 
