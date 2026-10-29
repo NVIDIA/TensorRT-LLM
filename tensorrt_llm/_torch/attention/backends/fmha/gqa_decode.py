@@ -294,12 +294,17 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
             return None
         return gate[: params.num_tokens]
 
+    @staticmethod
+    def _counter_slots(metadata: "TrtllmAttentionMetadata") -> int:
+        """Size of the counter buffer (_ensure_counter_buffer)."""
+        return max(64, metadata.max_num_requests) * _COUNTER_SLOTS_PER_REQUEST
+
     def _ensure_counter_buffer(
         self, metadata: "TrtllmAttentionMetadata", device: torch.device
     ) -> None:
         """Counters of the segmented trtllm-gen calls: max(b * segments * heads, SMs) of them, more than the regular
         buffer holds. Zeroed once; the kernel resets them at the end of every launch."""
-        slots = max(64, metadata.max_num_requests) * _COUNTER_SLOTS_PER_REQUEST
+        slots = self._counter_slots(metadata)
         buf = self._counter_buffer
         if buf is None or buf.device != device or buf.numel() < slots:
             if torch.cuda.is_current_stream_capturing():
@@ -731,6 +736,22 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
 class GqaKvReplicaFmha(_GqaKvReplicaFmha):
     """KV-replica split with partials from the segmented trtllm-gen decode."""
 
+    @staticmethod
+    def _num_segments(num_requests: int, q_len: int) -> int:
+        """Local segments per member: two when the batch alone gives the KV-replica group too few CTAs."""
+        return 2 if (num_requests <= 2 or q_len == 1) else 1
+
+    def _takes(self, batch: int, q_len: int, metadata: "TrtllmAttentionMetadata") -> bool:
+        # One counter per (segment request, folded head) of the segment attention: b * segments x q_len x group
+        # heads, at the largest b * segments of a call in this cell (the segments drop from two to one above two
+        # requests).
+        requests = min(batch, metadata.max_num_requests)
+        segment_requests = max(
+            b * self._num_segments(b, q_len) for b in (requests, min(requests, 2))
+        )
+        group_heads = self._kv_replicas * self.attn.num_heads
+        return segment_requests * q_len * group_heads <= self._counter_slots(metadata)
+
     def _run_kv_replica(
         self,
         params,
@@ -745,8 +766,7 @@ class GqaKvReplicaFmha(_GqaKvReplicaFmha):
         gate,
     ) -> None:
         rows, hq, d = q.shape
-        # Two local segments per member when the batch alone gives the KV-replica group too few CTAs.
-        num_segments = 2 if (params.num_requests <= 2 or params.input_seq_length == 1) else 1
+        num_segments = self._num_segments(params.num_requests, params.input_seq_length)
         kv_replica_decode(
             exchange,
             q,
