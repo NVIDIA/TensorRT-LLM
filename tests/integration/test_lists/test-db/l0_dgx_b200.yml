@@ -241,6 +241,7 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_flux2_transformer_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_ulysses.py
+  - unittest/_torch/visual_gen/multi_gpu/test_block_causal_attention_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_async_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_ulysses.py
