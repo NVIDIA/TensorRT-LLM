@@ -19,7 +19,10 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
+from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import (
+    graph_phase_for_timestep,
+    vc_smooth_phase_for_timestep,
+)
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.visual_gen.sparse_attention import BaseSparseAttentionConfig
 
@@ -92,6 +95,20 @@ class BaseDiffusionModel(nn.Module):
         Subclasses should call ``super()`` unless they intentionally replace
         the shared registrations.
         """
+        quant_config = self.model_config.attention.quant_attention_config
+        if (
+            quant_config is not None
+            and quant_config.vc_attention
+            and not quant_config.vc_repair_budget
+        ):
+            # The tile-mean VC-Attention recipe switches its V-Smooth path by
+            # timestep while the tensor shapes stay the same, so each phase
+            # replays its own graph. The repair recipe does not follow the schedule.
+            runner.register_extra_key_fn(
+                "vc_smooth_phase",
+                lambda *args, **kwargs: vc_smooth_phase_for_timestep(kwargs.get("timestep")),
+            )
+
         sparse_config = self.model_config.attention.sparse_attention_config
         if not isinstance(sparse_config, BaseSparseAttentionConfig):
             return

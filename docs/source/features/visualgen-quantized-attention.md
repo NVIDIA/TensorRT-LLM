@@ -31,6 +31,8 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 | `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (FP8 QK) for Blackwell |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | PrimTS QK16PV8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | PrimTS FP8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
+| `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | VC-Attention-QK16 for Blackwell, V as E4M3 tile residuals with per-channel scales (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
+| `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | VC-Attention-QK8 for Blackwell, Hadamard-rotated E4M3 Q/K scaled per 128 tokens and the same V treatment (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
 | `CUDNN` | `fp8` | `fp8` | `(0, 0, 0)` | cuDNN FP8 |
 | `CUDNN` | `mxfp8` | `mxfp8` | `(0, 0, 0)` | cuDNN MXFP8 |
 | `CUTEDSL` | `bf16` | `fp8` | `(0, 0, 0)` | QK16PV8 |
@@ -40,7 +42,7 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 | `FLASHINFER` | `nvfp4` | `fp8` | `(0, 0, 0)` | NVFP4 Q/K |
 | `FLASHINFER` | `nvfp4` | `nvfp4` | `(0, 0, 0)` | NVFP4 Attention |
 
-The `TRTLLM` backend picks the kernel from the block sizes: SageAttention quantizes per block, and the `(0, 0, 0)` per-tensor recipes run on the PrimTS FMHA library, which `TLLM_FMHA_LIBS=+prims_ts` enables.
+The `TRTLLM` backend picks the kernel from the block sizes: SageAttention quantizes per block, and the `(0, 0, 0)` per-tensor recipes run on the PrimTS FMHA library, which `TLLM_FMHA_LIBS=+prims_ts` enables. VC-Attention keeps the block sizes at `(0, 0, 0)` because the recipe fixes them: fp8 Q/K are scaled per 128 tokens and V per channel.
 
 ### Choosing and Tuning a Recipe
 
@@ -53,6 +55,7 @@ Video quality is generally more sensitive to BMM1 accuracy than BMM2 accuracy, s
 - On B300/GB300, start with MXFP8 when optimizing the quality-throughput balance. SageAttention with FP8 Q/K remains an alternative when the `TRTLLM` backend is preferred for the surrounding workload.
 - For SageAttention with INT8 Q/K, the default `(2, 16, 1)` or `(1, 16, 1)` block-size recipes works well for most cases. Use `(1, 4, 1)` when video quality is not satisfactory.
 - The `CUDNN` backend requires Q/K and V to use the same format. Use `fp8` for per-tensor scaling or `mxfp8` for block scaling.
+- For VC-Attention (`vc_attention: true`), `vc_repair_budget: 0.005` (0.5% of the tokens as repair rows) runs faster than the default tile means at unchanged quality; `0.005` to `0.02` is the useful range.
 - For `CUTEDSL` MXFP8 or NVFP4 recipes, `v_block_size: 1` uses a separate V scale per head and channel, while `v_block_size: 0` uses one tensor-wide V scale. Try the per-channel variant when the tensor-wide scale loses quality.
 
 After a recipe meets the quality target, benchmark its end-to-end throughput with the production workload.
@@ -68,6 +71,8 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | `v_block_size` | int ≥ 0 | `0` | V block size on the hidden dimension. `0` = one tensor-wide V scale; `1` = one scale per channel. Keep `0` if `v_dtype` defines its own scaling format (e.g., `mxfp8` or `nvfp4`) |
 | `smooth_k` | bool | `False` | SageAttention only. Subtract the per-channel K mean before quantizing K. |
 | `smooth_v` | bool | `False` | SageAttention only. Subtract the per-channel V mean before quantizing V and add it back to the output. Applied where attention runs on the PrimTS kernels; see [SageAttention in the `TRTLLM` backend](#sageattention-in-the-trtllm-backend). |
+| `vc_attention` | bool | `false` | Run the recipe as VC-Attention on the `TRTLLM` backend (tile means restored in the kernel, V-Smooth over the denoising steps). The V-Smooth window is the top quarter of the normalized timestep range with four regroupings inside it; with CUDA graphs that phase is part of the graph key, so the regrouping, smoothing and plain steps replay separate graphs. `bf16` Q/K keeps BMM1 unquantized; `fp8` Q/K is Hadamard-rotated and scaled per 128 tokens. |
+| `vc_repair_budget` | float in `[0, 1)` | `0.0` | Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means. `0` restores the means. `vc_attention` only. |
 
 Routing (`tensorrt_llm/_torch/visual_gen/attention/backends/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
 
@@ -285,5 +290,5 @@ attention_config:
 ## Interaction With Other Features
 
 - **Linear-layer quantization** (`VisualGenArgs.quant_config`, e.g. FP8 block scales or NVFP4) is independent and can be combined with any attention recipe.
-- **Sparse attention.** On `CUTEDSL`, quantized attention and Video Sparse Attention (VSA) are mutually exclusive and rejected by the validator. On `TRTLLM`, Skip Softmax uses the same backend and the SageAttention unit tests exercise the two together.
+- **Sparse attention.** On `CUTEDSL`, quantized attention and Video Sparse Attention (VSA) are mutually exclusive and rejected by the validator. On `TRTLLM`, Skip Softmax uses the same backend and the SageAttention unit tests exercise the two together. VC-Attention (`vc_attention: true`) is rejected together with any `sparse_attention_config`.
 - **Parallelism.** SageAttention is covered by a multi-GPU Ulysses test (`tests/unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py`). The CuTe DSL dense backend produces LSE, so it also composes with Attention2D / Ring context parallelism; the TRTLLM Sage path does not expose LSE through this wrapper.
