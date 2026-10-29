@@ -194,6 +194,16 @@ class TestBaselineDelta:
         text = render(_typical(), _capability(), baseline=self._baseline())
         assert "nothing has grown since warmup" in text
 
+    def test_growth_too_small_to_print_is_not_named(self):
+        # Seen on a real run: "grew the most (+0.00 GiB)".
+        baseline = self._baseline()
+        for group in baseline:
+            if baseline[group] is not None and group is not Group.TORCH_CACHE:
+                baseline[group] -= 1 << 20
+        text = render(_typical(), _capability(), baseline=baseline)
+        assert "grew the most" not in text
+        assert "nothing has grown since warmup" in text
+
     def test_advice_follows_the_focus_group_when_something_went_wrong(self):
         text = render(
             _typical(),
