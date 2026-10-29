@@ -63,6 +63,7 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> 
         )
         server._health = SimpleNamespace(enter_graceful_shutdown=AsyncMock())
         server._health_task = None
+        server._metrics = SimpleNamespace(stop=AsyncMock())
         server._input_executor = ThreadPoolExecutor(max_workers=1)
         server._media_executor = ThreadPoolExecutor(max_workers=1)
         futures = [
@@ -74,6 +75,7 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> 
         else:
             await server.stop(grace=0)
         assert server._stopping
+        server._metrics.stop.assert_awaited_once()
         server._health.enter_graceful_shutdown.assert_awaited_once()
         assert all(future.result() for future in futures)
         for pool in (server._input_executor, server._media_executor):
@@ -537,6 +539,117 @@ def test_is_loopback_classifies_bind_hosts() -> None:
 
 class _StopLaunch(Exception):
     """Ends launch_server once the server would start accepting requests."""
+
+
+@pytest.mark.parametrize(
+    "request_stats,iteration_stats,output_dir,enabled",
+    [
+        (False, False, None, False),
+        (True, False, None, True),
+        (False, True, None, False),
+        (True, True, None, True),
+        ("false", False, None, False),
+        ("0", False, None, False),
+        ("off", True, None, False),
+        (False, False, "/unused/perf-metrics", True),
+    ],
+)
+@pytest.mark.parametrize("metrics_options", [{}, {"metrics_port": 0}])
+def test_metrics_listener_preserves_engine_collection_config(
+    monkeypatch: pytest.MonkeyPatch,
+    request_stats: bool | str,
+    iteration_stats: bool,
+    output_dir: str | None,
+    enabled: bool,
+    metrics_options: dict,
+) -> None:
+    """Schema coercion and file-output opt-in must match HTTP; ports never enable export."""
+    created = []
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    class Model:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs["return_perf_metrics"] == (
+                True if output_dir is not None else request_stats
+            )
+            assert kwargs["enable_iter_perf_stats"] is iteration_stats
+            self.llm_id = "test-instance"
+
+        def shutdown(self) -> None:
+            pass
+
+    class Metrics:
+        def __init__(self, llm, model, host, port, **kwargs) -> None:
+            created.append((host, port))
+
+        async def wait_for_collection(self) -> None:
+            pass
+
+    class Server:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def start(self) -> None:
+            raise _StopLaunch
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(oe_server, "PyTorchLLM", Model)
+    monkeypatch.setattr(oe_server, "OpenEngineMetrics", Metrics)
+    monkeypatch.setattr(oe_server, "OpenEngineServer", Server)
+    with pytest.raises(_StopLaunch):
+        oe_server.launch_server(
+            "127.0.0.1",
+            0,
+            {
+                "model": "test-model",
+                "backend": "pytorch",
+                "return_perf_metrics": request_stats,
+                "enable_iter_perf_stats": iteration_stats,
+                "perf_metrics_output_dir": output_dir,
+            },
+            **metrics_options,
+        )
+    assert created == (
+        [("127.0.0.1", metrics_options.get("metrics_port", 8001))] if enabled else []
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--openengine-metrics-port", "8001"], "requires --grpc --grpc-protocol openengine"),
+        (
+            ["--grpc", "--openengine-metrics-port", "8001"],
+            "requires --grpc --grpc-protocol openengine",
+        ),
+        (["--openengine-metrics-host", "0.0.0.0"], "requires --grpc --grpc-protocol openengine"),
+        (
+            [
+                "--grpc",
+                "--grpc-protocol",
+                "openengine",
+                "--port",
+                "8001",
+                "--openengine-metrics-port",
+                "8001",
+            ],
+            "must differ from --port",
+        ),
+    ],
+)
+def test_metrics_cli_rejects_incompatible_server_options(
+    arguments: list[str], message: str
+) -> None:
+    """Reject invalid metrics deployment combinations before attempting model load."""
+    from click.testing import CliRunner
+
+    from tensorrt_llm.commands.serve import serve
+
+    result = CliRunner().invoke(serve, ["nonexistent-model", *arguments])
+    assert result.exit_code == 2
+    assert message in result.output
 
 
 @pytest.mark.parametrize(
