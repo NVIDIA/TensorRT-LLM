@@ -4017,6 +4017,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 moving_average_decay=rebalance_cfg.moving_average_decay,
                 copy_based_rebalancing=rebalance_cfg.copy_based_rebalancing,
                 drop_unreferenced_on_rebalance=rebalance_cfg.drop_unreferenced_on_rebalance,
+                in_place_relocation=rebalance_cfg.in_place_relocation,
             ),
             cold_tier_offload_min_priority=(
                 DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY

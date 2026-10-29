@@ -20,6 +20,7 @@ import importlib
 import random
 import unittest
 
+import numpy as np
 import torch
 
 try:
@@ -64,8 +65,9 @@ def _pattern(seed: int, ordinal: int, lc: int) -> int:
 class _Arena:
     """A manager plus the bookkeeping needed to check its arena."""
 
-    def __init__(self, drop_unreferenced: bool, ratio: list[float]):
+    def __init__(self, drop_unreferenced: bool, ratio: list[float], in_place: bool = False):
         torch.zeros(1, device="cuda")  # the manager needs a current CUDA context
+        self.in_place = in_place
         layers = [
             kvm.AttentionLayerConfig(
                 layer_id=FULL_LAYER,
@@ -90,7 +92,9 @@ class _Arena:
             initial_pool_ratio=ratio,
             enable_partial_reuse=False,
             pool_rebalance=kvm.PoolRebalanceConfig(
-                copy_based_rebalancing=True, drop_unreferenced_on_rebalance=drop_unreferenced
+                copy_based_rebalancing=True,
+                drop_unreferenced_on_rebalance=drop_unreferenced,
+                in_place_relocation=in_place,
             ),
         )
         self.mgr = kvm.KVCacheManager(config)
@@ -106,6 +110,9 @@ class _Arena:
         self.live: dict[int, tuple] = {}  # seed -> (kv_cache, tokens)
         self.cached: list[int] = []  # seeds of closed, committed requests
         self.unverified_cached_blocks = 0  # matched but not admitted, so data not read back
+        # Caller-owned page-index buffers, bound as the PyTorch flow binds host_kv_cache_block_offsets
+        # rows: what the kernels would read. seed -> {lc: int32 array}
+        self.bufs: dict[int, dict[int, np.ndarray]] = {}
 
     # ---- memory access -------------------------------------------------------------------
 
@@ -126,6 +133,8 @@ class _Arena:
     def add_request(self, seed: int, commit: bool) -> object:
         tokens = _tokens(seed)
         kv = self.mgr.create_kv_cache(input_tokens=tokens, id=seed)
+        self.bufs[seed] = {lc: np.full(BLOCKS_PER_REQUEST, -2, dtype=np.int32) for lc in self.lcs.values()}
+        self.bind_bufs(seed, kv)
         assert kv.resume(self.stream), f"resume failed for request {seed}"
         assert kv.resize(len(tokens)), f"resize failed for request {seed}"
         for lc, idx in self.indices(kv).items():
@@ -145,19 +154,29 @@ class _Arena:
         for kv, _ in self.live.values():
             kv.suspend()
 
+    def bind_bufs(self, seed: int, kv):
+        for lc, buf in self.bufs[seed].items():
+            kv.set_base_page_index_buf(0, lc, memoryview(buf))
+
     def resume_all(self):
         for seed, (kv, _) in self.live.items():
             assert kv.resume(self.stream), f"resume failed for request {seed}"
+            self.bind_bufs(seed, kv)  # suspend() unbinds them, as in the PyTorch flow
 
     def rebalance(self, target_ratio: list[float]):
-        """Force a rebalance to target_ratio (pool-group order) with every request suspended."""
-        self.suspend_all()
+        """Force a rebalance to target_ratio (pool-group order): live requests are suspended
+        around adjust(), or stay active with in-place relocation."""
+        if self.in_place:
+            torch.cuda.synchronize()  # the executor's quiescence point
+        else:
+            self.suspend_all()
         intro.set_num_sampled_kv_caches(self.mgr, 1 << 20)
         intro.set_last_adjustment_time(self.mgr, 0.0)
         intro.set_target_ratio_list_gpu(self.mgr, target_ratio)
         self.mgr.adjust()
         torch.cuda.synchronize()
-        self.resume_all()
+        if not self.in_place:
+            self.resume_all()
 
     # ---- checks ---------------------------------------------------------------------------
 
@@ -178,6 +197,9 @@ class _Arena:
         windows = self.windows()
         for seed, (kv, _) in self.live.items():
             for lc, idx in self.indices(kv).items():
+                # What a kernel would read must match the cache's own view.
+                tc.assertEqual(self.bufs[seed][lc].tolist(), idx[:BLOCKS_PER_REQUEST],
+                               f"req {seed} lc {lc}: bound page-index buffer is stale")
                 b, e = windows[self.pg_of_lc[lc]]
                 for ordinal, slot in enumerate(idx):
                     tc.assertTrue(b <= slot < e, f"req {seed} lc {lc} block {ordinal}: {slot} not in [{b}, {e})")
@@ -246,8 +268,8 @@ class TestCopyBasedRebalancing(unittest.TestCase):
             arena.live[seed] = (kv, _tokens(seed))
         torch.cuda.synchronize()
 
-    def _run(self, drop_unreferenced: bool):
-        arena = _Arena(drop_unreferenced, ratio=[0.4, 0.6])
+    def _run(self, drop_unreferenced: bool, in_place: bool = False):
+        arena = _Arena(drop_unreferenced, ratio=[0.4, 0.6], in_place=in_place)
         try:
             self._populate(arena)
             arena.check_layout(self)
@@ -282,14 +304,14 @@ class TestCopyBasedRebalancing(unittest.TestCase):
             print(f"  full={full_share:.2f} windows {wb} -> {wa}: moved {moved} live blocks, {cached} cached blocks matched")
         self.assertGreater(sum(h[3] for h in history), 0, "no live block was ever copied")
 
-    def _drop_scenario(self, drop_unreferenced: bool) -> tuple[int, int, list, list]:
+    def _drop_scenario(self, drop_unreferenced: bool, in_place: bool = False) -> tuple[int, int, list, list]:
         """Cached blocks next to the SWA group's moving edge, with free holes to copy them into.
 
         SWA ids are issued from the top of its window down, so allocation order maps to distance
         from the moving edge (its begin): early cached, placeholders, live, then late cached nearest
         the edge. Closing the placeholders leaves holes inside the part that is kept.
         """
-        arena = _Arena(drop_unreferenced, ratio=[0.4, 0.6])
+        arena = _Arena(drop_unreferenced, ratio=[0.4, 0.6], in_place=in_place)
         try:
             for seed in range(100, 120):
                 arena.add_request(seed, commit=True).close()
@@ -319,9 +341,25 @@ class TestCopyBasedRebalancing(unittest.TestCase):
         finally:
             arena.close()
 
+    def test_in_place_rebalance_copies_live_blocks(self):
+        # Same workload, requests never suspended: their blocks are relocated while active and the
+        # bound page-index buffers rewritten (check_live compares them on every rebalance).
+        suspended = self._run(drop_unreferenced=False)
+        in_place = self._run(drop_unreferenced=False, in_place=True)
+        for (fs, wb, wa, moved_s, cached_s), (_, wb_i, wa_i, moved_i, cached_i) in zip(suspended, in_place):
+            print(f"  full={fs:.2f}: windows {wa} / in place {wa_i}; moved {moved_s} / {moved_i}; "
+                  f"cached matched {cached_s} / {cached_i}")
+        self.assertGreater(sum(h[3] for h in in_place), 0, "no live block was relocated in place")
+
     def test_drop_unreferenced(self):
-        before_k, after_k, wb, wa = self._drop_scenario(drop_unreferenced=False)
-        before_d, after_d, _, _ = self._drop_scenario(drop_unreferenced=True)
+        self._check_drop(in_place=False)
+
+    def test_drop_unreferenced_in_place(self):
+        self._check_drop(in_place=True)
+
+    def _check_drop(self, in_place: bool):
+        before_k, after_k, wb, wa = self._drop_scenario(drop_unreferenced=False, in_place=in_place)
+        before_d, after_d, _, _ = self._drop_scenario(drop_unreferenced=True, in_place=in_place)
         print(f"  windows {wb} -> {wa}")
         print(f"  cached blocks matched: copy {before_k} -> {after_k}, drop {before_d} -> {after_d}")
         self.assertEqual(before_k, 40 * BLOCKS_PER_REQUEST)

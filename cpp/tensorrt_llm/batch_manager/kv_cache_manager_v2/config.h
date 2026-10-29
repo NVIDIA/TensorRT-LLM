@@ -508,12 +508,22 @@ struct PoolRebalanceConfig
     // references (cached reusable blocks). Set once for the server.
     bool dropUnreferencedOnRebalance = false;
 
+    // With copy-based rebalancing: rebalance without suspending requests. adjust() then accepts
+    // ACTIVE caches, copies their locked blocks out of the space that changes owner on a stream
+    // ordered after the owners' prior work, and rewrites the owners' page indices in place.
+    // The caller must still be between iterations (no forward in flight).
+    bool inPlaceRelocation = false;
+
     void validate() const
     {
         if (dropUnreferencedOnRebalance && !copyBasedRebalancing)
         {
             throw std::invalid_argument(
                 "PoolRebalanceConfig: drop_unreferenced_on_rebalance requires copy_based_rebalancing");
+        }
+        if (inPlaceRelocation && !copyBasedRebalancing)
+        {
+            throw std::invalid_argument("PoolRebalanceConfig: in_place_relocation requires copy_based_rebalancing");
         }
         if (minSampledKvCaches < 0)
         {

@@ -1908,7 +1908,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::PoolRebalanceConfig* cfg, int minSampledKvCaches, double cooldownSecs, int targetRatioUpdateInterval,
                 float ratioTolerance, double movingAverageDecay, bool copyBasedRebalancing,
-                bool dropUnreferencedOnRebalance)
+                bool dropUnreferencedOnRebalance, bool inPlaceRelocation)
             {
                 new (cfg) kv::PoolRebalanceConfig();
                 cfg->minSampledKvCaches = minSampledKvCaches;
@@ -1918,12 +1918,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->movingAverageDecay = movingAverageDecay;
                 cfg->copyBasedRebalancing = copyBasedRebalancing;
                 cfg->dropUnreferencedOnRebalance = dropUnreferencedOnRebalance;
+                cfg->inPlaceRelocation = inPlaceRelocation;
                 cfg->validate();
             },
             nb::arg("min_sampled_kv_caches") = 2000, nb::arg("cooldown_secs") = 120.0,
             nb::arg("target_ratio_update_interval") = 100, nb::arg("ratio_tolerance") = 0.25f,
             nb::arg("moving_average_decay") = 0.9999, nb::arg("copy_based_rebalancing") = false,
-            nb::arg("drop_unreferenced_on_rebalance") = false)
+            nb::arg("drop_unreferenced_on_rebalance") = false, nb::arg("in_place_relocation") = false)
         .def_rw("min_sampled_kv_caches", &kv::PoolRebalanceConfig::minSampledKvCaches)
         .def_rw("cooldown_secs", &kv::PoolRebalanceConfig::cooldownSecs)
         .def_rw("target_ratio_update_interval", &kv::PoolRebalanceConfig::targetRatioUpdateInterval)
@@ -1931,6 +1932,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("moving_average_decay", &kv::PoolRebalanceConfig::movingAverageDecay)
         .def_rw("copy_based_rebalancing", &kv::PoolRebalanceConfig::copyBasedRebalancing)
         .def_rw("drop_unreferenced_on_rebalance", &kv::PoolRebalanceConfig::dropUnreferencedOnRebalance)
+        .def_rw("in_place_relocation", &kv::PoolRebalanceConfig::inPlaceRelocation)
         .def("validate", &kv::PoolRebalanceConfig::validate) DEF_COPY(kv::PoolRebalanceConfig);
 
     nb::class_<kv::KVCacheManagerConfig>(m, "KVCacheManagerConfig")

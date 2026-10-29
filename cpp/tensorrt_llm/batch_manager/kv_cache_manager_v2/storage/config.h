@@ -246,6 +246,7 @@ struct StorageConfig
     // Copy-based rebalancing: the GPU level is one arena of windows (PoolRebalanceConfig).
     bool gpuArena = false;
     bool dropUnreferencedOnRebalance = false;
+    bool inPlaceRelocation = false;
 
     // Map each LifeCycleId → its PoolGroupIndex.
     TypedVec<LifeCycleId, PoolGroupIndex> lifeCycleGrouping() const;

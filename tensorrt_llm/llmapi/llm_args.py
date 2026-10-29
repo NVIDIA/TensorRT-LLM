@@ -5135,11 +5135,22 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "With copy_based_rebalancing: drop, rather than copy, blocks that must move during a "
         "rebalance and that no request references (cached reusable blocks).")
 
+    in_place_relocation: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "With copy_based_rebalancing: rebalance without suspending running requests. Their "
+        "blocks are copied on the GPU between iterations and their block indices rewritten in "
+        "place. Not supported with enable_swa_scratch_reuse.")
+
     @model_validator(mode='after')
     def _validate_drop_requires_copy_based(self) -> 'KvPoolRebalanceConfig':
         if self.drop_unreferenced_on_rebalance and not self.copy_based_rebalancing:
             raise ValueError(
                 "drop_unreferenced_on_rebalance requires copy_based_rebalancing")
+        if self.in_place_relocation and not self.copy_based_rebalancing:
+            raise ValueError(
+                "in_place_relocation requires copy_based_rebalancing")
         return self
 
 

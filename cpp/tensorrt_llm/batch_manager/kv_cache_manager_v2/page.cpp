@@ -348,6 +348,7 @@ UniqPageLock::~UniqPageLock()
         {
             Page& p = *page();
             TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
+            TLLM_CHECK_DEBUG(mOwners.empty());
             // Set readyEvent to the merged finish events of all readers. For committed (read-only)
             // pages, this means the next reader will wait for prior reads to complete, which is
             // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
@@ -383,6 +384,38 @@ void UniqPageLock::notifyFinish(CachedCudaEvent event)
     }
 }
 
+void UniqPageLock::recordMigrationEvent(CachedCudaEvent const& event)
+{
+    // The copy stream already waited for every event being replaced here.
+    page()->readyEvent = event;
+    finishEvents.clear();
+    finishEvents.push_back(event);
+}
+
+Slot UniqPageLock::relocate(Slot&& slot)
+{
+    Page& p = *page();
+    TLLM_CHECK_DEBUG(!p.scheduledForEviction());
+    Slot source = p.exchangeSlot(std::move(slot));
+    // Each owner's page-index buffer (or the Batch row bound in its place) is written directly, so
+    // republishing the index is all an owner needs.
+    for (auto const& owner : mOwners)
+    {
+        int const old = owner.kvCache->updateBasePageIndex(
+            owner.beamIndex, owner.ordinal, owner.lifeCycle, slotIdToPageIndexValue(p.slotId()));
+        TLLM_CHECK_DEBUG(old == slotIdToPageIndexValue(source.slotId()));
+        (void) old;
+    }
+    return source;
+}
+
+void UniqPageLock::removeOwner(LockOwner const& owner)
+{
+    auto const it = std::find(mOwners.begin(), mOwners.end(), owner);
+    TLLM_CHECK_DEBUG(it != mOwners.end());
+    mOwners.erase(it);
+}
+
 SharedPtr<Page> const& UniqPageLock::page() const
 {
     TLLM_CHECK_DEBUG(holder && holder->page);
@@ -407,7 +440,11 @@ SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, Bea
     if (!skipWait)
         page()->readyEvent.waitInStream(reinterpret_cast<CudaStream>(kvCache.cudaStream()));
 
+    // Owners are tracked so that in-place relocation can republish a moved page's index to each.
+    mUniqLock->mOwners.push_back(mUser);
+    auto rollbackOwner = FuncGuard([this]() { mUniqLock->removeOwner(mUser); });
     acquirePageIndex();
+    rollbackOwner.cancel();
 }
 
 SharedPageLock::~SharedPageLock()
@@ -448,6 +485,7 @@ SharedPtr<Page> SharedPageLock::unlock()
     mUniqLock->notifyFinish(mUser.kvCache->finishEvent());
 
     releasePageIndex();
+    mUniqLock->removeOwner(mUser);
     auto p = page(); // copy shared_ptr before reset
     mUniqLock.reset();
     return p;
