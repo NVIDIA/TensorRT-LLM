@@ -127,6 +127,20 @@ _NVFP4_SHAPES: dict[str, object] = {
 }
 
 
+# The static NVFP4 / FP8 GEMMs on Blackwell need K >= 64 and N a multiple of 32, so a
+# forward through pre-quantized Linears widens every dimension that feeds one
+# (text_dim, time_embed_dim, hidden_size, ffn_dim and the attention inner dim).
+_STATIC_QUANT_SHAPES: dict[str, object] = _NVFP4_SHAPES | {
+    "attention_head_dim": 32,
+    "hidden_size": 64,
+    "ffn_dim": 64,
+    "text_dim": 64,
+    "time_embed_hidden_dim": 64,
+    "time_embed_dim": 64,
+    "rope_freq_dim": 4,
+}
+
+
 def _make_dynamic_nvfp4_model_config(**overrides: object) -> DiffusionModelConfig:
     return _make_model_config(
         quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
@@ -1855,14 +1869,14 @@ def _export_style_checkpoint(
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
 def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
     """A ModelOpt-style export goes through ``load_weights`` and one forward on the static path."""
-    layers = {"num_layers": 1, "num_refiner_layers": 1}
-    reference = h3.MiniMaxH3Transformer3DModel(_make_model_config(**(_NVFP4_SHAPES | layers)))
+    shapes = _STATIC_QUANT_SHAPES | {"num_layers": 1, "num_refiner_layers": 1}
+    reference = h3.MiniMaxH3Transformer3DModel(_make_model_config(**shapes))
     reference_state = {k: v.detach().cpu() for k, v in reference.state_dict().items()}
     del reference
 
     quant_config = QuantConfig(quant_algo=quant_algo, exclude_modules=list(_H3_MEDIA_PROJECTIONS))
     model = h3.MiniMaxH3Transformer3DModel(
-        _make_prequantized_nvfp4_model_config(quant_config=quant_config, **layers)
+        _make_prequantized_nvfp4_model_config(quant_config=quant_config, **shapes)
     ).to("cuda")
     assert not model.model_config.dynamic_weight_quant
     checkpoint = _export_style_checkpoint(reference_state, model, quant_algo)
@@ -1881,10 +1895,10 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
     device = "cuda"
     with torch.inference_mode():
         video, audio = model(
-            hidden_states=torch.randn(1, 2, _NVFP4_SHAPES["in_channels"], device=device),
-            audio_hidden_states=torch.randn(1, 1, _NVFP4_SHAPES["audio_in_channels"], device=device),
+            hidden_states=torch.randn(1, 2, shapes["in_channels"], device=device),
+            audio_hidden_states=torch.randn(1, 1, shapes["audio_in_channels"], device=device),
             encoder_hidden_states=torch.randn(
-                1, 2, _NVFP4_SHAPES["text_dim"], device=device, dtype=torch.bfloat16
+                1, 2, shapes["text_dim"], device=device, dtype=torch.bfloat16
             ),
             timestep=torch.tensor([1.0], device=device),
             conditioning_timesteps=torch.tensor([1.0], device=device),
@@ -1898,6 +1912,6 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
             text_indices=torch.tensor([0, 1], device=device),
             return_dict=False,
         )
-    assert video.shape == (1, 2, _NVFP4_SHAPES["in_channels"])
-    assert audio.shape == (1, 1, _NVFP4_SHAPES["audio_in_channels"])
+    assert video.shape == (1, 2, shapes["in_channels"])
+    assert audio.shape == (1, 1, shapes["audio_in_channels"])
     assert torch.isfinite(video).all() and torch.isfinite(audio).all()
