@@ -421,6 +421,7 @@ l0_cpu:
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_frontend_affinity.py
   - unittest/llmapi/test_serve_context_only_settings.py
+  - unittest/llmapi/test_serve_auto_reasoning_parser.py
   - unittest/llmapi/test_serve_multi_frontend_helpers.py
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
   - unittest/llmapi/test_serve_tokenization_owners.py
