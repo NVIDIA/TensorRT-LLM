@@ -14,6 +14,7 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.memory.monitor.startup import region as monitor_region
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
@@ -1436,12 +1437,12 @@ class PyTorchModelEngine(ModelEngine):
         if self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC":
             # Skip UB initialization for NCCL_SYMMETRIC - it uses NCCLWindowAllocator directly
             return False
-        ub.initialize_userbuffers_manager(self.mapping.tp_size,
-                                          self.mapping.pp_size,
-                                          self.mapping.cp_size,
-                                          self.mapping.rank,
-                                          self.mapping.gpus_per_node,
-                                          hidden_size * self.max_num_tokens * 2)
+        with monitor_region("userbuffers"):
+            ub.initialize_userbuffers_manager(
+                self.mapping.tp_size, self.mapping.pp_size,
+                self.mapping.cp_size, self.mapping.rank,
+                self.mapping.gpus_per_node,
+                hidden_size * self.max_num_tokens * 2)
 
         return True
 

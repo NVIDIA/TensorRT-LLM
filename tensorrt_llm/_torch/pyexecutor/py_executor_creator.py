@@ -199,7 +199,7 @@ class _ExecutorMemoryMonitor:
         """Catches OOM and prints instructive message."""
 
         free_gpu_memory_bytes_pre = torch.cuda.mem_get_info()[0]
-        monitor_process_pre = monitor_startup.begin_stage()
+        monitor_process_pre = monitor_startup.begin_stage(current_stage.value)
 
         try:
             # Tag what the step allocates so the memory monitor can name its

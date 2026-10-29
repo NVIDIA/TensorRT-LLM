@@ -37,10 +37,15 @@ device-wide usage.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 
 __all__ = [
     "MemoryPlan",
+    "Reading",
+    "RegionSample",
+    "region",
+    "residual_breakdown",
     "begin_stage",
     "StageSample",
     "advice_for_stage",
@@ -66,6 +71,9 @@ class StageSample:
     free_after: int | None  # None for the step that failed
     #: This process's growth over the step, from NVML; ``None`` if unknown.
     process_taken: int | None = None
+    #: Growth that neither PyTorch nor any component accounts for -- the
+    #: step's share of the "CUDA and library overhead" row.
+    residual_taken: int | None = None
 
     @property
     def device_taken(self) -> int | None:
@@ -82,7 +90,32 @@ class MemoryPlan:
     activation: int | None
 
 
+@dataclass(frozen=True)
+class Reading:
+    """This process's memory, split the way the report splits it."""
+
+    process: int  # NVML, this process
+    torch: int  # memory_reserved()
+    known: int  # what components account for outside PyTorch
+
+    @property
+    def residual(self) -> int:
+        return self.process - self.torch - self.known
+
+
+@dataclass(frozen=True)
+class RegionSample:
+    """Unexplained growth across a named piece of code, e.g. a library's init."""
+
+    name: str
+    stage: str | None
+    residual_taken: int
+
+
 _stages: list[StageSample] = []
+_regions: list[RegionSample] = []
+_first: Reading | None = None
+_active_stage: str | None = None
 _failed: StageSample | None = None
 _names: dict[str, str] = {}
 _advice: dict[str, str] = {}
@@ -106,9 +139,64 @@ def _process_used() -> int | None:
         return None
 
 
-def begin_stage() -> int | None:
-    """Read this process's usage as a step starts; pass it to the end call."""
-    return _process_used() if _on() else None
+def _known_outside_torch() -> int:
+    from .providers import collect_all
+    from .schema import Placement
+
+    return sum(
+        e.size_bytes
+        for e in collect_all()
+        if e.placement is Placement.NON_TORCH and e.counts_toward_total and e.size_bytes
+    )
+
+
+def _reading() -> Reading | None:
+    import torch
+
+    process = _process_used()
+    if process is None:
+        return None
+    try:
+        return Reading(process, torch.cuda.memory_reserved(), _known_outside_torch())
+    except Exception:  # noqa: BLE001 - never break startup over a reading
+        return None
+
+
+def begin_stage(stage: str | None = None) -> Reading | None:
+    """Read this process's memory as a step starts; pass it to the end call.
+
+    The first reading is kept as well: whatever is unexplained before the
+    first step -- the CUDA context, libraries initialised on import -- is
+    the earliest share of the overhead row.
+    """
+    global _first, _active_stage
+    if not _on():
+        return None
+    reading = _reading()
+    if _first is None:
+        _first = reading
+    _active_stage = stage
+    return reading
+
+
+@contextlib.contextmanager
+def region(name: str):
+    """Attribute unexplained memory that appears inside this block to ``name``.
+
+    For code that allocates outside PyTorch and keeps no account of its own,
+    such as a library creating its communicators. A no-op when the monitor
+    is off.
+    """
+    if not _on():
+        yield
+        return
+    before = _reading()
+    try:
+        yield
+    finally:
+        after = _reading() if before is not None else None
+        if after is not None:
+            _regions.append(RegionSample(name, _active_stage, after.residual - before.residual))
 
 
 def set_stage_advice(names: dict[str, str], advice: dict[str, str]) -> None:
@@ -118,19 +206,31 @@ def set_stage_advice(names: dict[str, str], advice: dict[str, str]) -> None:
 
 
 def record_stage(
-    stage: str, free_before: int, free_after: int, process_before: int | None = None
+    stage: str, free_before: int, free_after: int, process_before: Reading | None = None
 ) -> None:
+    global _active_stage
     if not _on():
         return
-    after = _process_used() if process_before is not None else None
-    taken = None if after is None else after - process_before
-    _stages.append(StageSample(stage, _names.get(stage, stage), free_before, free_after, taken))
+    after = _reading() if process_before is not None else None
+    process_taken = residual_taken = None
+    if after is not None:
+        process_taken = after.process - process_before.process
+        residual_taken = after.residual - process_before.residual
+    _stages.append(
+        StageSample(
+            stage, _names.get(stage, stage), free_before, free_after, process_taken, residual_taken
+        )
+    )
+    _active_stage = None
 
 
-def record_failed_stage(stage: str, free_before: int, process_before: int | None = None) -> None:
-    global _failed
+def record_failed_stage(
+    stage: str, free_before: int, process_before: Reading | None = None
+) -> None:
+    global _failed, _active_stage
     if _on():
         _failed = StageSample(stage, _names.get(stage, stage), free_before, None)
+        _active_stage = None
 
 
 def record_memory_plan(non_kv_peak: int, activation: int | None) -> None:
@@ -162,10 +262,13 @@ def advice_for_stage(stage: str) -> str | None:
 
 def clear() -> None:
     """Forget everything recorded. For tests."""
-    global _failed, _plan
+    global _failed, _plan, _first, _active_stage
     _stages.clear()
+    _regions.clear()
     _failed = None
     _plan = None
+    _first = None
+    _active_stage = None
     _names.clear()
     _advice.clear()
 
@@ -231,3 +334,29 @@ def render_plan_lines(
             "than profiling measured, or another process grew."
         )
     return out
+
+
+def residual_breakdown(current_residual: int) -> list[tuple[str, int]]:
+    """Split today's unexplained memory by when, and where, it appeared.
+
+    The parts sum to ``current_residual`` exactly: whatever the recorded
+    steps and regions do not cover is reported as having appeared after
+    startup (or, if negative, as released since). Each part is measured when
+    it happened, so a part freed later shows up as a negative remainder
+    rather than silently overstating what is held now.
+    """
+    if _first is None:
+        return []
+    parts = [("before the first startup step", _first.residual)]
+    for region_sample in _regions:
+        parts.append((region_sample.name, region_sample.residual_taken))
+    for sample in _stages:
+        if sample.residual_taken is None:
+            continue
+        inside = sum(r.residual_taken for r in _regions if r.stage == sample.stage)
+        parts.append(
+            (f"{sample.name} (other)" if inside else sample.name, sample.residual_taken - inside)
+        )
+    remainder = current_residual - sum(size for _, size in parts)
+    parts.append(("since startup" if remainder >= 0 else "released since startup", remainder))
+    return parts
