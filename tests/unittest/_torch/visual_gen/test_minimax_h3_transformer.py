@@ -1890,23 +1890,7 @@ def _export_style_checkpoint(
     not (torch.cuda.is_available() and get_sm_version() >= 100),
     reason="static NVFP4 / FP8 Linears need a Blackwell GPU",
 )
-@pytest.mark.parametrize(
-    "quant_algo",
-    [
-        QuantAlgo.NVFP4,
-        pytest.param(
-            QuantAlgo.FP8,
-            marks=pytest.mark.xfail(
-                condition=torch.cuda.is_available() and get_sm_version() == 107,
-                reason=(
-                    "cuBLASLt FP8 per-tensor scaled_mm returns NaN at M = 5, K = 64 on SM 107 "
-                    "(1.4.0rc1 container); NVFP4 twin passes; real-shape FP8 export ran on B200"
-                ),
-                strict=True,
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
 def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
     """A ModelOpt-style export goes through ``load_weights`` and one forward on the static path."""
     shapes = _STATIC_QUANT_SHAPES | {"num_layers": 1, "num_refiner_layers": 1}
