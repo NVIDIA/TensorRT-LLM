@@ -21,10 +21,9 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 
 from ..attention.backends import AttentionMetadata
-from ..pyexecutor.sampler.ops.flashinfer import sample_from_logits_op
 from .eagle3 import Eagle3OneModelWorker
 
 if TYPE_CHECKING:
@@ -313,9 +312,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
 
-        # sm>=100 (except 120/121): prepareCustomMask keeps padded 3D; no 1D repack.
+        # SM100 family: prepareCustomMask keeps padded 3D; no 1D repack.
         sm = get_sm_version()
-        self._needs_mask_repack = sm < 100 or sm in (120, 121)
+        self._needs_mask_repack = not is_sm_100f(sm)
 
         # No draft-side buffers needed: target-only rejection sampling does not
         # require unique draft logits, topk score indices, or draft prob indices.
@@ -783,14 +782,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         num_flat_tokens = logits.shape[0]
         if not spec_metadata.is_all_greedy_sample:
-            # Non-greedy: sample target tokens with per-request temperature/top_k/top_p.
-            top_ks = spec_metadata.top_ks[:num_flat_tokens]
+            # Non-greedy: sample target tokens with per-token sampling params.
             seed, offset = self._rng_state_per_token(spec_metadata, num_flat_tokens)
-            sampled = sample_from_logits_op(
+            sampled = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
                 logits,
                 spec_metadata.temperatures[:num_flat_tokens],
-                top_ks,
+                spec_metadata.top_ks[:num_flat_tokens],
                 spec_metadata.top_ps[:num_flat_tokens],
+                spec_metadata.min_ps[:num_flat_tokens],
                 seed=seed,
                 offset=offset,
             )
@@ -865,8 +865,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         Context tokens are sampled directly (they bypass the rejection kernel).
         Gen tokens are handled entirely by the rejection kernel, which samples
-        from the target distribution internally — so only the raw logits (not
-        pre-sampled token IDs) are passed to the kernel.
+        from the target distribution internally — so it is given the filtered
+        target probs, not pre-sampled token IDs.
         """
         if num_gens > self._max_batch_size:
             raise RuntimeError(
@@ -886,13 +886,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Context tokens bypass the rejection kernel — sample them directly.
         if num_contexts > 0:
-            top_ks_ctx = spec_metadata.top_ks[:num_contexts]
             seed_ctx, offset_ctx = self._rng_state_per_token(spec_metadata, num_contexts)
-            sampled_ctx = sample_from_logits_op(
+            sampled_ctx = self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
                 logits[:num_contexts],
                 spec_metadata.temperatures[:num_contexts],
-                top_ks_ctx,
+                spec_metadata.top_ks[:num_contexts],
                 spec_metadata.top_ps[:num_contexts],
+                spec_metadata.min_ps[:num_contexts],
                 seed=seed_ctx,
                 offset=offset_ctx,
             )
@@ -914,11 +915,20 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             target_logits_tree = logits[-num_gens * N :].reshape(-1, vocab_size)
             gen_slice = slice(num_contexts, num_contexts + num_gens)
-            temps = spec_metadata.request_temperatures[gen_slice]
-            top_ks_rej = spec_metadata.request_top_ks[gen_slice]
-            top_ps_rej = spec_metadata.request_top_ps[gen_slice]
+            # Every node of a request's tree is filtered with that request's params.
+            target_probs = self._compute_probs_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                target_logits_tree,
+                spec_metadata.request_temperatures[gen_slice].repeat_interleave(N),
+                spec_metadata.request_top_ks[gen_slice].repeat_interleave(N),
+                spec_metadata.request_top_ps[gen_slice].repeat_interleave(N),
+                spec_metadata.request_min_ps[gen_slice].repeat_interleave(N),
+            ).reshape(num_gens, N, vocab_size)
             seed_rej, offset_rej = self._rng_state_per_request(
-                spec_metadata, num_contexts, num_contexts + num_gens
+                spec_metadata,
+                num_contexts,
+                num_contexts + num_gens,
+                slot=spec_metadata.rng_accept_slot,
             )
 
             slot_storage = spec_tree_manager.slot_storage
@@ -932,13 +942,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             accept_index, accept_token_num, accept_token = (
                 self.tree_ops_converter.verify_dynamic_tree_rejection_out(
                     spec_metadata.draft_tokens.reshape(num_gens, N - 1).long(),
-                    target_logits_tree,
+                    target_probs,
                     retrieve_next_token,
                     retrieve_next_sibling,
                     tree_valid,
-                    temps,
-                    top_ks_rej,
-                    top_ps_rej,
                     num_gens,
                     self._max_path_len,
                     seed=seed_rej,

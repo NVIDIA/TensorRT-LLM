@@ -123,7 +123,10 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
                 "Check pynvml setup or GPU visibility."
             )
 
-        llm._collective_rpc("sleep", (sleep_tags,))
+        llm.release(sleep_tags)
+        status = llm.get_memory_status()
+        assert status.state == "parked"
+        assert status.parked_tags == sleep_tags
 
         mem_sleep = _per_device_gpu_memory()
         if process_gpu_memory_info_available:
@@ -136,7 +139,13 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
                     f"release_with_tag()"
                 )
 
-        llm._collective_rpc("wakeup", (sleep_tags,))
+        llm.resume([ExecutorMemoryType.MODEL_WEIGHTS_MAIN])
+        status = llm.get_memory_status()
+        assert status.state == "parked"
+        assert status.parked_tags == [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+
+        llm.resume()
+        assert llm.get_memory_status().state == "running"
 
         mem_wakeup = _per_device_gpu_memory()
         if process_gpu_memory_info_available:
@@ -168,7 +177,11 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
     Ensures that a partial tag set (KV_CACHE only) propagates correctly to
     rank-1's control listener and that generation still works after wakeup.
     """
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=16384)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        max_tokens=16384,
+        use_kv_cache_manager_v2=False,
+    )
 
     llm = LLM(
         model=_LLAMA_MODEL_PATH,
@@ -183,8 +196,24 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
         outputs_before = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
         generated_before = [o.outputs[0].text for o in outputs_before]
 
-        llm._collective_rpc("sleep", (sleep_tags,))
-        llm._collective_rpc("wakeup", (sleep_tags,))
+        mem_active = _per_device_gpu_memory()
+        llm.release(sleep_tags)
+        mem_sleep = _per_device_gpu_memory()
+        if process_gpu_memory_info_available:
+            active_devices = {dev for dev, size in mem_active.items() if size > 0}
+            assert len(active_devices) == 2
+            for dev in active_devices:
+                assert mem_sleep.get(dev, 0) < mem_active[dev], (
+                    f"GPU {dev} KV cache memory was not released by sleep()"
+                )
+
+        llm.resume(sleep_tags)
+        mem_wakeup = _per_device_gpu_memory()
+        if process_gpu_memory_info_available:
+            for dev in active_devices:
+                assert mem_wakeup.get(dev, 0) > mem_sleep.get(dev, 0), (
+                    f"GPU {dev} KV cache memory was not restored by wakeup()"
+                )
 
         outputs_after = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
         generated_after = [o.outputs[0].text for o in outputs_after]

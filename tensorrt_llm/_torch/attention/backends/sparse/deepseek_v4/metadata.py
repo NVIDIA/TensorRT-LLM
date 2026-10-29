@@ -194,6 +194,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self.compress_ratio_set
         }
 
+        # Device scalar batch size for the shape-static compressed_mask graph.
+        self.batch_size_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (1,),
+            dtype=torch.int,
+            cache_name="batch_size_cuda",
+            capture_graph=capture_graph,
+        )
+
         # compressed_mask_cuda: per-token bool mask for postprocess scatter.
         # Precomputed from new_comp_kv_lens to skip padded generation slots.
         self.compressed_mask_cuda = {
@@ -231,6 +240,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+
+        # Absolute token positions feed the PrimTS sparse MLA FMHA (window
+        # lengths and the fused output RoPE). The DSA base allocates them only
+        # for the fp8_ds_mla layout, so provide them for every DSv4 cache mode.
+        if getattr(self, "token_positions_cuda", None) is None:
+            self.token_positions_cuda = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name="token_positions_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
 
         # Compute max_compressed_indices for CUDA graph compatibility.
         # For ratio=4, the indexer selects index_topk compressed tokens.
@@ -299,6 +320,28 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
             for compress_ratio in self.compress_ratio_set
+        }
+        # Live per-source lengths for the dual-pool FMHA libraries, derived once
+        # per step next to sparse_mla_topk_lens: SWA rows live per token
+        # (min(pos + 1, window)) and compressed rows live per compress ratio
+        # (sparse_mla_topk_lens[ratio] - window). Shape: [max_num_tokens].
+        self.sparse_mla_swa_lens = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_tokens,),
+            cache_name="sparse_mla_swa_lens",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.sparse_mla_extra_lens = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name=f"sparse_mla_extra_lens_{compress_ratio}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self.compress_ratio_set
+            if compress_ratio > 1
         }
 
         # cached_token_lens_cuda: number of tokens already cached per request
@@ -495,7 +538,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
             token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
 
-        if self.use_fp8_ds_mla:
+        if self.token_positions_cuda is not None:
             self.token_positions_cuda[: token_positions.shape[0]] = token_positions
 
         self._prepare_deepseek_v4_indices_compiled(
@@ -507,6 +550,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.compressed_local_indices_cuda,
             self.sparse_mla_topk_lens,
             self._compress_ratios_sorted,
+            self.sparse_mla_swa_lens,
+            self.sparse_mla_extra_lens,
         )
 
     @staticmethod
@@ -520,8 +565,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compressed_local_indices_buf: torch.Tensor,
         sparse_mla_topk_lens_bufs: Dict[int, torch.Tensor],
         compress_ratios: list,
+        swa_lens_buf: torch.Tensor,
+        extra_lens_bufs: Dict[int, torch.Tensor],
     ):
-        """Build SWA indices, compressed indices, and topk_lens in one fused graph."""
+        """Build SWA indices, compressed indices, topk_lens and live lengths in one fused graph."""
         device = token_positions.device
         num_tokens = token_positions.shape[0]
 
@@ -559,6 +606,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For ratio>1, the SWA region always occupies exactly window_size (128)
         # slots. Invalid SWA positions are padded with -1 in the index buffer.
         kv_lens = token_positions + 1
+        swa_lens_buf[:num_tokens] = kv_lens.clamp(max=window_size).to(torch.int32)
         for compress_ratio in compress_ratios:
             if compress_ratio == 1:
                 total_count = kv_lens.clamp(max=window_size)
@@ -571,6 +619,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             else:
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
             sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
+            if compress_ratio > 1:
+                extra_lens_bufs[compress_ratio][:num_tokens] = compressed_count.to(torch.int32)
 
     def _build_cache_buffer_data_pointers(
         self, manager: "DeepseekV4CacheManager", compress_ratios_by_layer: list[int]
@@ -825,12 +875,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
         self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda, ctx_output_sizes)
 
+        self.batch_size_cuda.fill_(num_requests)
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
             self.cu_new_comp_kv_cuda,
             self.compressed_mask_cuda,
-            num_requests,
-            self.num_total_compressed_tokens,
+            self.batch_size_cuda,
             self._compress_ratios_sorted,
         )
 
@@ -943,12 +993,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.prepare_compressed_kv_metadata(kv_lens, cached_tokens, ctx_output_sizes)
 
+        self.batch_size_cuda.fill_(batch_size)
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
             self.cu_new_comp_kv_cuda,
             self.compressed_mask_cuda,
-            batch_size,
-            self.num_total_compressed_tokens,
+            self.batch_size_cuda,
             self._compress_ratios_sorted,
         )
 
@@ -1063,29 +1113,40 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         new_comp_kv_lens_bufs: Dict[int, torch.Tensor],
         cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
         compressed_mask_bufs: Dict[int, torch.Tensor],
-        batch_size: int,
-        num_total_compressed_tokens: Dict[int, int],
+        batch_size: torch.Tensor,
         compress_ratios: list,
     ):
         """Compute per-token compressed_mask on device (graph-safe, no .item()).
 
-        For each token in [0, total_tokens), determine which sequence it
-        belongs to via searchsorted on cu_new_comp_kv, then compare its
-        within-sequence offset against the actual new_comp_kv_len.
+        For each token slot, determine which sequence it belongs to via
+        searchsorted on cu_new_comp_kv, then compare its within-sequence offset
+        against the actual new_comp_kv_len.
         Context tokens (offset < actual) are always True.
         Generation tokens whose offset >= actual new_comp are padding → False.
+
+        Every shape is a buffer capacity and ``batch_size`` is a [1] int32
+        device tensor, so one compiled graph serves every batch composition.
+        Python-int sizes are 0/1-specialized by dynamo, which recompiled this
+        function for each (batch_size, per-ratio total_tokens) combination.
+        Entries past ``num_total_compressed_tokens[ratio]`` are written but
+        never read.
         """
         device = new_comp_kv_lens_bufs[compress_ratios[0]].device
+        last_seq = (batch_size - 1).clamp(min=0)
         for compress_ratio in compress_ratios:
-            total_tokens = num_total_compressed_tokens[compress_ratio]
-            new_comp = new_comp_kv_lens_bufs[compress_ratio][:batch_size]
-            cu = cu_new_comp_kv_bufs[compress_ratio][: batch_size + 1]
+            new_comp = new_comp_kv_lens_bufs[compress_ratio]
+            cu = cu_new_comp_kv_bufs[compress_ratio]
+            mask = compressed_mask_bufs[compress_ratio]
 
-            token_idx = torch.arange(total_tokens, dtype=torch.int32, device=device)
-            seq_idx = torch.searchsorted(cu[1:], token_idx, right=True)
-            seq_idx = seq_idx.clamp_(max=batch_size - 1)
+            # Stale entries past batch_size would break searchsorted's ordering.
+            req_idx = torch.arange(new_comp.shape[0], dtype=torch.int32, device=device)
+            cu_valid = torch.where(req_idx < batch_size, cu[1:], torch.iinfo(torch.int32).max)
+
+            token_idx = torch.arange(mask.shape[0], dtype=torch.int32, device=device)
+            seq_idx = torch.searchsorted(cu_valid, token_idx, right=True)
+            seq_idx = torch.minimum(seq_idx, last_seq.to(seq_idx.dtype))
             offset_in_seq = token_idx - cu[seq_idx]
-            compressed_mask_bufs[compress_ratio][:total_tokens] = offset_in_seq < new_comp[seq_idx]
+            mask.copy_(offset_in_seq < new_comp[seq_idx])
 
     @staticmethod
     def _compute_ctx_compressed_position_ids(

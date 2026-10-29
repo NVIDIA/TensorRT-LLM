@@ -215,6 +215,15 @@ that file for the current config/backend combinations. Consult the
 for the supported attention shapes; do not infer support from algorithm
 registration alone.
 
+| Algorithm | Sparse backend | Metadata | Cache manager |
+|---|---|---|---|
+| `csa2` | `CSA2TrtllmAttention`, with hardware-selected Flash helpers | `CSA2TrtllmMetadata` | `CSA2CacheManager` (V2) |
+
+CSA2 implements DeepSeek-V4.1 compressed sparse MLA. Its module adapter owns
+compression and shared KV/index sources; per-phase query tiles feed selected
+rows to attention. See the [CSA2 implementation guide](backends/sparse/csa2/README.md)
+for SM90, SM100-family and SM120/121 routing, persistent cache formats, and replay.
+
 Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
 Algorithms lower their live routing state to an algorithm-neutral
 `BlockSparseForwardInputs`, nested at
@@ -223,6 +232,24 @@ BSR routes or an exact packed bitmask. Optional K/V summaries enable proxy
 routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
+
+The contiguous block-sparse path also consumes the SageAttention recipe in
+`AttentionForwardArgs`. Prediction sees the original Q/K/V. The attention core
+then quantizes the Q/K/V of a block-sparse call before FMHA selection, with
+TensorRT-LLM's Sage quantization kernel (`attention/kernels/sage_quant.py`),
+and passes the result in `AttentionForwardArgs.sage_quantized`. Q/K get
+per-block scales and V per-sequence channel scales; the summaries of proxy
+routes get one scale per K mean and reuse the original V channel scales and K
+mean. `PrimsTSBlockSparseFmha` serves Sage only with these inputs and passes
+all scales to PrimTS; the attention op ignores them and quantizes dense
+SageAttention inside its kernels. The recipe and quantized dtypes are part of
+the plan key. Paged block-sparse attention rejects Sage. With
+`sage_attn_smooth_v`, V and its summaries also subtract the per-sequence V
+mean, which PrimTS adds back to the output. The attention op cannot, so the
+core also quantizes dense contiguous calls with V smoothing, and
+`PrimsTSBlockSparseFmha` serves dense calls with core-quantized inputs through
+a dense plan; the attention op serves the rest without V smoothing and logs a
+warning once.
 
 `PrimsTSBlockSparseFmha` keeps its planned wrappers in the attention metadata
 (`TrtllmAttentionMetadata.fmha_plan_caches`), like the FlashInfer wrappers and
@@ -268,6 +295,9 @@ The core contract is:
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
   chunked prefill limits that workspace to the current KV chunk (default
   `True`)
+- `runtime_workspace_fixed_bytes(model_config, mapping, **capacities)` — retained
+  workspace sized by serving capacity rather than admitted attended-KV length
+  (default `0`)
 
 `**kwargs` is only a temporary compatibility path. It is merged into
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
@@ -292,6 +322,18 @@ from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
 NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
 so it also returns `False` from
 `runtime_workspace_is_chunked_prefill_bounded`.
+
+CSA2 also gathers the complete compressed prefix during index prefill and
+declares a conservative gather rate even with chunked prefill. Its native
+index descriptor/radix arena follows maximum batch, draft width and sequence
+length, so it declares a separate fixed reserve for an eager arena and, when
+enabled, a shared CUDA graph arena. The estimator conservatively reserves the
+full arena capacity alongside the profiled peak: a decode arena may first be
+allocated after peak prefill, so its final retained bytes cannot safely be
+subtracted from that earlier peak.
+The attended-KV admission cap applies to the prefix gather, independently of
+the fixed graph arena. Projection, native/provider scratch and transient logits
+still require representative peak-memory profiling.
 
 ### 2.4 Capability reference
 
@@ -386,6 +428,21 @@ A backend may support the score computation you want, but still be the wrong
 fit because it assumes a different KV-cache layout or a different decode-time
 update pattern.
 
+CSA2 uses model-native cache ownership and the following policies when block
+reuse is enabled (Encoder SWA is `PRIVATE` when reuse is disabled):
+
+| Storage | Ownership and format | Reuse policy |
+|---|---|---|
+| GLOBAL main/index | KV-source layers; 288-byte main and 68-byte index records sharing physical pages | `REQUIRED` |
+| Encoder SWA | Per layer; 528-byte E4M3 rows | `REQUIRED`, or `OPTIONAL` with Encoder replay |
+| Decoder SWA | Per layer; same row format | `PRIVATE` for eligible bounded replay; ordinary lifecycle for full prefill |
+| Ratio-two compressor state | Source owners; FP32 partial-group values/scores | Managed with the owner's page lifecycle |
+
+`CSA2TrtllmMetadata.prepare()` publishes owner tables, compression inputs,
+visibility and SWA read/write slots. Live accepted-length updates refresh
+captured buffers in place. Graph clones share reserved index arenas and query
+tiles; eager shape eviction must preserve every graph-owned allocation.
+
 #### 3.2.1 Common paged-KV model
 
 When KV cache is enabled, all current `_torch` backends use paged KV cache.
@@ -422,7 +479,11 @@ the selected library.
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
 defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
 block-sparse PrimTS remains enabled by default because a dense fallback cannot
-preserve its routing semantics. Delta entries update the
+preserve its routing semantics. The PrimTS sparse MLA library
+(`prims_ts_sparse_mla`) is also enabled by default: it serves only DeepSeek-V4
+generation on SM100 and sits ahead of the TRTLLM-Gen libraries, so DeepSeek-V4
+decode on B200/GB200 runs on it unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
+removes it. Delta entries update the
 default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
@@ -482,12 +543,23 @@ The FMHA package is split by role:
   for non-MLA mixed batches.
 - `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
   cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
-  batch state, cache storage, and kernels live in `fp4_mla/`.
+  batch state, cache storage, and kernels live in `fp4_mla/`. Disaggregated
+  serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
+  HP-tail roles; before its first forward, the generation worker rebuilds the
+  derived V-scale and packed-V sidecars from the imported cache
+  (`rebuild_disagg_imported_cache`).
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+  With an FP8 KV cache it passes `mla_bmm1_scale` / `mla_bmm2_scale` to the
+  kernel as device tensors (element 0 of each), so the scales need no host
+  read and stay valid under CUDA graph replay.
+- `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
+  PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
+  it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
+  removes it.
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
@@ -678,7 +750,7 @@ Working rules:
 | `tensorrt_llm/_torch/attention/qk_norm_attention.py` | QK-norm attention module logic and fused QK-norm/RoPE/gate dispatch |
 | `tensorrt_llm/_torch/attention/cross_attention.py` | Encoder-decoder cross-attention module logic and cross-KV cache reuse |
 | `tensorrt_llm/_torch/attention/rotary_embedding.py` | Unfused RoPE and mRoPE modules shared across the attention stack |
-| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and unfused fallbacks |
+| `tensorrt_llm/_torch/attention/kernels/` | Attention-owned fused kernels; callers own enablement checks and decide what to do when a kernel does not apply |
 | `tensorrt_llm/_torch/attention/backends/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention/backends/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention/backends/trtllm.py` | TRTLLM backend execution and metadata |

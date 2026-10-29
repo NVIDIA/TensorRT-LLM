@@ -131,6 +131,17 @@ def run_user_buffer_tests(build_dir: _pl.Path, nprocs=2, timeout=300):
                      timeout=timeout)
 
 
+def run_kv_cache_manager_v2_numa_tests(build_dir, timeout=600):
+
+    tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
+    mgpu_env = get_multi_gpu_env()
+
+    # A single process that opens several GPUs: the case needs two devices on
+    # different NUMA nodes, not several ranks.
+    numa_test = ["./kvCacheManagerV2HostMemNumaTest"]
+    _cpp.run_command(numa_test, cwd=tests_dir, env=mgpu_env, timeout=timeout)
+
+
 def run_nccl_utils_tests(build_dir: _pl.Path, nprocs=2, timeout=300):
     tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
     mgpu_env = get_multi_gpu_env()
@@ -155,6 +166,14 @@ def test_mpi_utils(build_google_tests, build_dir):
 
     if platform.system() != "Windows":
         run_mpi_utils_tests(build_dir, timeout=300)
+
+
+@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
+                         indirect=True)
+def test_kv_cache_manager_v2_numa(build_google_tests, build_dir):
+
+    if platform.system() != "Windows":
+        run_kv_cache_manager_v2_numa_tests(build_dir, timeout=600)
 
 
 @skip_no_nvls

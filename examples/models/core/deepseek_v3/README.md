@@ -697,6 +697,7 @@ DeepGEMM-related behavior can be controlled by the following environment variabl
 | `TRTLLM_DG_JIT_DEBUG` | When set to `1`, enable JIT debugging. |
 | `TRTLLM_DG_JIT_USE_NVCC` | When set to `1`, use NVCC instead of NVRTC to compile the kernel, which has slightly better performance but requires CUDA Toolkit (>=12.3) and longer compilation time.|
 | `TRTLLM_DG_JIT_DUMP_CUBIN` | When set to `1`, dump the cubin file. This is only effective with NVRTC since NVCC will always dump the cubin file. NVRTC-based JIT will store the generated kernels in memory by default. If you want to persist the kernels across multiple runs, you can either use this variable or use NVCC. |
+| `TRTLLM_DG_CACHE_DIR` | Sets the root directory for TensorRT-LLM DeepGEMM JIT artifacts. Temporary files are stored under `tmp/`, and compiled kernels are stored under `cache/` when `TRTLLM_DG_JIT_DUMP_CUBIN=1` or NVCC is used. |
 
 #### MOE GEMM Optimization
 

@@ -14,8 +14,16 @@
 
 # WARNING: Do not add entries unless required for resource maintenance.
 #
-# Add one exact stage name or '*' wildcard pattern and its reason per line:
-# <stage-or-pattern> | <reason>
-#
 # Blank lines and lines starting with '#' are ignored. No active entries mean
 # that no stages are skipped for resource maintenance.
+#
+# The first non-empty, non-comment line is the shared maintenance reason:
+# Reason: <resource maintenance reason>
+#
+# Add one stage name or '*' wildcard pattern per subsequent line:
+# <stage-name-or-pattern>
+#
+# Example:
+# Reason: The H100 cluster is under maintenance.
+# H100_PCIe-*
+# DGX_H100-*

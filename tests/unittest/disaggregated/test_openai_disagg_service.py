@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ConversationAwareADPRouter,
     RankState,
 )
+from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
 from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -62,6 +63,7 @@ from tensorrt_llm.serve.openai_protocol import (
     _deserialize_first_gen_logits,
     _serialize_first_gen_log_probs,
     _serialize_first_gen_logits,
+    to_llm_disaggregated_params,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (
@@ -116,6 +118,72 @@ async def test_conditional_disagg_uses_selected_server_match_length():
 
     assert server == "gen:8000"
     assert need_context is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_tail", "num_tokens", "expected_need_context"),
+    [
+        (False, 32, True),
+        (True, 32, False),
+        (True, 33, True),
+    ],
+)
+async def test_conditional_disagg_remote_tail_allows_cold_local_prefill(
+    remote_tail, num_tokens, expected_need_context
+):
+    service = _make_service("context_first")
+    service._config.bounded_replay_on_generation = remote_tail
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 0,
+                "num_tokens": num_tokens,
+            },
+        )
+    )
+    service._gen_router = router
+    request = CompletionRequest(model="model", prompt=[1] * num_tokens)
+
+    server, need_context = await service._check_conditional_disagg(request, 123)
+
+    assert server == "gen:8000"
+    assert need_context is expected_need_context
+
+
+@pytest.mark.asyncio
+async def test_remote_tail_cold_local_prefill_skips_context_worker(monkeypatch):
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("context_first")
+    service._config.bounded_replay_on_generation = True
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 0,
+                "num_tokens": 32,
+            },
+        )
+    )
+    service._gen_router = router
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response("ok", finish_reason="stop")
+    )
+    request = CompletionRequest(model="model", prompt=[1] * 32)
+
+    await service._send_disagg_request_ctx_first(request)
+
+    service._ctx_client.send_request.assert_not_awaited()
+    gen_request = service._gen_client.send_request.call_args.args[0]
+    assert gen_request.disaggregated_params is None
 
 
 @pytest.mark.asyncio
@@ -214,6 +282,15 @@ def _make_chat_response(
             )
         ],
     )
+
+
+def test_remote_tail_marker_requires_generation_after_context_stop():
+    service = _make_service("context_first")
+    response = _make_completion_response("", finish_reason="stop")
+    response.choices[0].disaggregated_params.first_gen_tokens = [17]
+    response.choices[0].disaggregated_params.remote_tail_start = 64
+
+    assert service._need_gen(response)
 
 
 async def _mock_streaming_response(chunks):
@@ -895,6 +972,69 @@ async def test_context_retry_preserves_generation_reservation_id():
     assert gen_call.args[0].disaggregated_params.ctx_request_id == 202
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_gen_request_carries_orig_elapsed(monkeypatch, schedule_style):
+    """Only a context-first GEN request carries orig_elapsed_s."""
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(schedule_style)
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client.send_request = AsyncMock(
+        side_effect=lambda req, *a, **k: _make_completion_response(
+            "",
+            finish_reason="length",
+            disagg_request_id=req.disaggregated_params.disagg_request_id,
+            context_only=True,
+        )
+    )
+    service._gen_client.send_request = AsyncMock(
+        side_effect=lambda req, *a, **k: _make_completion_response(
+            "done",
+            finish_reason="stop",
+            disagg_request_id=req.disaggregated_params.disagg_request_id,
+            context_only=False,
+        )
+    )
+    hooks = mock.Mock()
+    # ServerArrivalTimeMiddleware stamps arrivals on the global steady clock.
+    hooks.request_arrival_time = get_global_steady_clock_now_in_seconds() - 5.0
+
+    await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"), hooks)
+
+    gen_req = service._gen_client.send_request.call_args.args[0]
+    elapsed = gen_req.disaggregated_params.orig_elapsed_s
+    if schedule_style == "generation_first":
+        assert elapsed is None
+        assert (
+            "orig_elapsed_s"
+            not in gen_req.model_dump(mode="json", exclude_unset=True)["disaggregated_params"]
+        )
+        return
+    assert 5.0 <= elapsed < 60.0
+    # On the wire (the client sends exclude_unset=True) ...
+    wire = gen_req.model_dump(mode="json", exclude_unset=True)
+    assert wire["disaggregated_params"]["orig_elapsed_s"] == elapsed
+    # ... and through to the LLM API params the GEN executor reads.
+    assert to_llm_disaggregated_params(gen_req.disaggregated_params).orig_elapsed_s == elapsed
+    # The context request does not carry it.
+    ctx_req = service._ctx_client.send_request.call_args.args[0]
+    assert ctx_req.disaggregated_params.orig_elapsed_s is None
+
+
+def test_orig_elapsed_arrival_fallback():
+    before = get_global_steady_clock_now_in_seconds()
+    assert OpenAIDisaggregatedService._get_arrival_time(None) >= before
+    assert OpenAIDisaggregatedService._get_arrival_time(mock.Mock()) >= before
+    hooks = SimpleNamespace(request_arrival_time=12.5)
+    assert OpenAIDisaggregatedService._get_arrival_time(hooks) == 12.5
+    req = CompletionRequest(model="m", prompt="p")
+    OpenAIDisaggregatedService._stamp_orig_elapsed(req, 0.0)  # no disaggregated_params: no-op
+    assert req.disaggregated_params is None
+
+
 def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():
     ctx_usage = UsageInfo(
         prompt_tokens=128,
@@ -1184,3 +1324,111 @@ class TestFirstGenLogitsSerializeRoundtrip:
     def test_deserialize_missing_key_raises(self):
         with pytest.raises(ValueError, match="missing required key"):
             _deserialize_first_gen_logits([{"data": "abc", "shape": [1]}])
+
+
+@pytest.fixture
+def generation_first_stream_service():
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_gen_first_context_failure_closes_unstarted_stream(
+    generation_first_stream_service, error_type
+):
+    service = generation_first_stream_service
+    gen_response = AsyncMock()
+    gen_response.__aiter__.side_effect = AssertionError("GEN consumer must not start")
+    service._gen_client.send_request.return_value = gen_response
+    service._ctx_client.send_request.side_effect = error_type("CTX interrupted")
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    with pytest.raises(error_type):
+        await service._send_disagg_request(request)
+
+    gen_response.__aiter__.assert_not_called()
+    gen_response.aclose.assert_awaited_once_with()
+    # The HTTP clients own their router accounting; the service only closes GEN.
+    service._ctx_router.finish_request.assert_not_called()
+    service._gen_router.finish_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_close_before_read_stops_unstarted_consumer(
+    generation_first_stream_service,
+):
+    service = generation_first_stream_service
+    gen_response = AsyncMock()
+    gen_response.__aiter__.side_effect = AssertionError("GEN consumer must not start")
+    service._gen_client.send_request.return_value = gen_response
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+
+    response = await service._send_disagg_request(request)
+    await response.aclose()
+    await response.aclose()
+
+    gen_response.__aiter__.assert_not_called()
+    gen_response.aclose.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_cancellation_closes_running_stream(generation_first_stream_service):
+    service = generation_first_stream_service
+    gen_started = asyncio.Event()
+    gen_closed = asyncio.Event()
+    ctx_started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def gen_chunks():
+        try:
+            gen_started.set()
+            await blocked.wait()
+            yield b"data: [DONE]\n\n"
+        finally:
+            gen_closed.set()
+
+    async def ctx_response(*args, **kwargs):
+        ctx_started.set()
+        await blocked.wait()
+
+    service._gen_client.send_request.return_value = gen_chunks()
+    service._ctx_client.send_request.side_effect = ctx_response
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    pending = asyncio.create_task(service._send_disagg_request(request))
+    try:
+        await asyncio.wait_for(gen_started.wait(), timeout=1)
+        await asyncio.wait_for(ctx_started.wait(), timeout=1)
+    finally:
+        pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert gen_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_close_after_chunk_closes_running_stream(generation_first_stream_service):
+    service = generation_first_stream_service
+    gen_closed = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def gen_chunks():
+        try:
+            yield b'data: "first"\n\n'
+            await blocked.wait()
+        finally:
+            gen_closed.set()
+
+    service._gen_client.send_request.return_value = gen_chunks()
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    response = await service._send_disagg_request(request)
+    assert await asyncio.wait_for(response.__anext__(), timeout=1) == b'data: "first"\n\n'
+    await response.aclose()
+
+    assert gen_closed.is_set()

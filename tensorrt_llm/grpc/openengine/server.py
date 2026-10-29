@@ -11,14 +11,18 @@ import signal
 import socket
 import tempfile
 import threading
+import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import click
 import grpc
 import uvloop
+from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._frontend_processes import (
     FrontendStartupCancelled,
@@ -28,9 +32,11 @@ from tensorrt_llm.serve._frontend_processes import (
     _terminate_attached_frontends,
 )
 
+from ._health import OpenEngineHealthServicer
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
+from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .servicer import OpenEngineInferenceServicer
 
 __all__ = ["OpenEngineServer", "launch_server"]
@@ -39,6 +45,8 @@ __all__ = ["OpenEngineServer", "launch_server"]
 # responses are not rejected at the transport layer. Bounded (not unlimited) so
 # it still guards against pathological payloads.
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+_HEALTH_CHECK_INTERVAL_SECONDS = 1.0
+_HEALTH_CHECK_TIMEOUT_SECONDS = 5.0
 _SERVER_OPTIONS = [
     ("grpc.max_receive_message_length", _MAX_MESSAGE_BYTES),
     ("grpc.max_send_message_length", _MAX_MESSAGE_BYTES),
@@ -52,11 +60,7 @@ _SERVER_OPTIONS = [
 ]
 
 
-def _format_bind_address(host: str, port: int) -> str:
-    """Format a host and port as a gRPC bind address."""
-    if ":" in host and not (host.startswith("[") and host.endswith("]")):
-        host = f"[{host}]"
-    return f"{host}:{port}"
+_format_bind_address = _format_host_port
 
 
 def _is_loopback(host: str) -> bool:
@@ -94,6 +98,7 @@ class OpenEngineServer:
         port: Port on which the server listens. Use zero to select a free port.
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
+        subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
 
     def __init__(
@@ -105,30 +110,52 @@ class OpenEngineServer:
         *,
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
+        subagent_affinity_auth_key: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
+        self._llm = llm
+        self._frontend = frontend
+        self._stopping = False
+        self._health_task: asyncio.Task | None = None
+        self._engine_health_task: asyncio.Task[bool] | None = None
+        self._health_refresh_lock = asyncio.Lock()
+        self._inference_serving = False
+        self._engine_healthy = False
+        self._fatal_engine_failure = False
         options = list(_SERVER_OPTIONS)
         options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
         self._server = grpc.aio.server(options=options)
+        self._input_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="openengine_input"
+        )
+        self._media_executor = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="openengine_media"
+        )
+        self._health = OpenEngineHealthServicer()
+        health_pb2_grpc.add_HealthServicer_to_server(self._health, self._server)
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(
-            llm, model, kv_transfer_backend=kv_transfer_backend, frontend=frontend
+            llm,
+            model,
+            kv_transfer_backend=kv_transfer_backend,
+            frontend=frontend,
+            subagent_affinity_auth_key=subagent_affinity_auth_key,
+            input_executor=self._input_executor,
+            media_executor=self._media_executor,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
         # Abort and GetLoad see the same requests Generate is serving.
-        openengine_pb2_grpc.add_ControlServicer_to_server(
-            OpenEngineControlServicer(
-                llm,
-                model,
-                inference,
-                kv_transfer_backend=kv_transfer_backend,
-                frontend=frontend,
-                instance_id=instance_id,
-            ),
-            self._server,
+        self._control = OpenEngineControlServicer(
+            llm,
+            model,
+            inference,
+            kv_transfer_backend=kv_transfer_backend,
+            frontend=frontend,
+            instance_id=instance_id,
         )
+        openengine_pb2_grpc.add_ControlServicer_to_server(self._control, self._server)
         bind_address = _format_bind_address(host, port)
         # Plaintext h2c with no authentication: any client that can reach this
         # port can run inference and call Control.Abort. It is meant to be
@@ -142,15 +169,98 @@ class OpenEngineServer:
             )
         # grpc.aio raises RuntimeError itself when the bind fails, naming the
         # address, so there is no zero return to check for.
-        bound_port = self._server.add_insecure_port(bind_address)
+        try:
+            bound_port = self._server.add_insecure_port(bind_address)
+        except BaseException:
+            self._input_executor.shutdown(wait=True, cancel_futures=True)
+            self._media_executor.shutdown(wait=True, cancel_futures=True)
+            raise
         if port == 0:
             self.port = bound_port
 
     async def start(self) -> None:
         """Start accepting OpenEngine requests."""
+        if events_config(self._llm) is not None:
+            capacity = await asyncio.to_thread(self._llm._executor.get_kv_cache_capacity)
+            if not capacity.get("kvEventsEnabled", False):
+                raise KvEventsUnavailableError(
+                    "KV events are configured but the loaded engine has no streaming publisher; "
+                    "set kv_cache_config.use_kv_cache_manager_v2: true and use a supported model"
+                )
         await self._server.start()
+        await self._health.set("liveness", health_pb2.HealthCheckResponse.SERVING)
+        await self._refresh_inference_health()
+        self._health_task = asyncio.create_task(self._monitor_inference_health())
         address = _format_bind_address(self.host, self.port)
         logger.info(f"OpenEngine server started on {address}")
+
+    async def _refresh_inference_health(self) -> None:
+        async with self._health_refresh_lock:
+            ready = False
+            if not self._stopping:
+                try:
+                    ready = await self._check_engine_health()
+                    self._engine_healthy = ready
+                    if ready and self._frontend is not None:
+                        status = await self._frontend.request("status")
+                        ready = bool(status["ready"] and not status["stopping"])
+                except (RuntimeError, ValueError, OSError, CoordinationError) as error:
+                    logger.warning(f"OpenEngine inference health check failed: {error}")
+                    self._engine_healthy = False
+                executor = getattr(self._llm, "_executor", None)
+                if executor is not None and (
+                    getattr(executor, "_fatal_error", None) is not None
+                    or getattr(executor, "_engine_dead", False)
+                ):
+                    self._fatal_engine_failure = True
+            if self._stopping:
+                return
+            ready = ready and not self._fatal_engine_failure
+            if ready != self._inference_serving:
+                self._inference_serving = ready
+                await self._health.set(
+                    "inference",
+                    health_pb2.HealthCheckResponse.SERVING
+                    if ready
+                    else health_pb2.HealthCheckResponse.NOT_SERVING,
+                )
+            if self._fatal_engine_failure:
+                await self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
+
+    async def _check_engine_health(self) -> bool:
+        task = self._engine_health_task
+        if task is not None:
+            if not task.done():
+                return False
+            self._engine_health_task = None
+            # The timed-out result is stale; start a fresh check instead.
+            task.exception()
+
+        task = asyncio.create_task(asyncio.to_thread(self._control._engine_is_healthy))
+        self._engine_health_task = task
+        task.add_done_callback(self._consume_engine_health_result)
+        done, _ = await asyncio.wait((task,), timeout=_HEALTH_CHECK_TIMEOUT_SECONDS)
+        if not done:
+            logger.warning("OpenEngine inference health check timed out")
+            return False
+        self._engine_health_task = None
+        return task.result()
+
+    @staticmethod
+    def _consume_engine_health_result(task: asyncio.Task[bool]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _monitor_inference_health(self) -> None:
+        while not self._stopping:
+            await asyncio.sleep(_HEALTH_CHECK_INTERVAL_SECONDS)
+            try:
+                await self._refresh_inference_health()
+            except Exception as error:
+                logger.error(f"OpenEngine inference health monitor failed: {error}")
+                self._engine_healthy = False
+                self._inference_serving = False
+                await self._health.set("inference", health_pb2.HealthCheckResponse.NOT_SERVING)
 
     async def stop(self, grace: float = 5.0) -> None:
         """Stop accepting OpenEngine requests.
@@ -158,7 +268,18 @@ class OpenEngineServer:
         Args:
             grace: Maximum time in seconds to allow active RPCs to finish.
         """
-        await self._server.stop(grace=grace)
+        self._stopping = True
+        try:
+            await self._health.enter_graceful_shutdown()
+            if self._health_task is not None:
+                self._health_task.cancel()
+                await asyncio.gather(self._health_task, return_exceptions=True)
+            await self._server.stop(grace=grace)
+        finally:
+            await asyncio.gather(
+                asyncio.to_thread(self._input_executor.shutdown, wait=True, cancel_futures=True),
+                asyncio.to_thread(self._media_executor.shutdown, wait=True, cancel_futures=True),
+            )
         logger.info("OpenEngine server stopped")
 
     async def wait_for_termination(self) -> None:
@@ -184,6 +305,8 @@ def launch_server(
     llm_args: dict[str, Any],
     served_model_name: str | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
+    enable_load_metrics: bool = False,
+    subagent_affinity_auth_key: str | None = None,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -193,7 +316,10 @@ def launch_server(
         llm_args: Arguments for LLM initialization.
         served_model_name: Model name accepted by Generate. Defaults to the model path.
         report_failure: Records a child exit before startup readiness.
+        enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
+        subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
+    _warn_if_python_protobuf()
 
     async def serve() -> None:
         logger.info("Initializing TensorRT-LLM OpenEngine server...")
@@ -243,13 +369,21 @@ def launch_server(
         }
 
         def healthy() -> bool:
-            try:
-                return not stop_event.is_set() and bool(llm._check_health())
-            except (RuntimeError, ValueError, OSError):
-                return False
+            return (
+                not stop_event.is_set()
+                and server is not None
+                and server._engine_healthy
+                and not server._fatal_engine_failure
+            )
+
+        def terminal_engine_failure() -> bool:
+            executor = getattr(llm, "_executor", None)
+            return executor is not None and (
+                getattr(executor, "_fatal_error", None) is not None
+                or getattr(executor, "_engine_dead", False)
+            )
 
         async def supervise() -> None:
-            group_was_ready = False
             while not stop_event.is_set():
                 if mode.is_attached_frontend and os.getppid() != parent_pid:
                     fail("OpenEngine launcher parent exited")
@@ -257,8 +391,16 @@ def launch_server(
                 if any(child.poll() is not None for child in children):
                     fail("An OpenEngine frontend exited; stopping the serving group")
                     return
-                if not healthy():
-                    fail("OpenEngine engine health check failed")
+                if server is None:
+                    engine_ready = await asyncio.wait_for(
+                        asyncio.to_thread(llm._check_health),
+                        timeout=_HEALTH_CHECK_TIMEOUT_SECONDS,
+                    )
+                    if server is None and not engine_ready:
+                        fail("OpenEngine engine health check failed during startup")
+                        return
+                if terminal_engine_failure():
+                    fail("OpenEngine terminal engine failure")
                     return
                 if frontend is not None:
                     try:
@@ -268,10 +410,6 @@ def launch_server(
                     if status["stopping"]:
                         stop_event.set()
                         return
-                    if group_was_ready and not status["ready"]:
-                        fail("OpenEngine frontend group became unavailable")
-                        return
-                    group_was_ready = status["ready"]
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=1.0)
                 except asyncio.TimeoutError:
@@ -282,13 +420,21 @@ def launch_server(
                 fail(f"OpenEngine supervision failed: {error}")
 
         try:
+            llm_args["_enable_routing_load"] = enable_load_metrics
+            # A new incarnation fences every node's metadata after a restart.
+            # The executor starts node discovery only when streaming is enabled.
+            llm_args["_openengine_discovery"] = {
+                "engine_id": str(uuid.uuid4()),
+                "host": host,
+                "port": port,
+            }
             llm = PyTorchLLM(**llm_args)
             if stop_event.is_set():
                 if failure is not None:
                     raise RuntimeError(failure)
                 return
             logger.info("Model loaded successfully")
-            instance_id = str(llm.llm_id)
+            instance_id = llm_args["_openengine_discovery"]["engine_id"]
             if mode.is_launcher:
                 directory = tempfile.TemporaryDirectory(prefix="tllm-openengine-")
                 longest_name = max("coordinator", f"frontend-{mode.num_frontends - 1}", key=len)
@@ -344,6 +490,7 @@ def launch_server(
                 model=model,
                 frontend=frontend,
                 instance_id=instance_id,
+                subagent_affinity_auth_key=subagent_affinity_auth_key,
             )
             _disable_gc_if_requested()
             await server.start()
@@ -352,6 +499,7 @@ def launch_server(
             _signal_frontend_ready(mode)
             if coordinator is not None:
                 coordinator.ready = True
+                await server._refresh_inference_health()
             await stop_event.wait()
         finally:
             startup_cancelled.set()

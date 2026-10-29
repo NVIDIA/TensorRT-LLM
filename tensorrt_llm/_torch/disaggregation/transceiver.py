@@ -18,14 +18,14 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     RxSessionBase,
@@ -42,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
@@ -62,12 +63,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManager,
-    MambaHybridCacheManagerV2,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvtx_range
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
@@ -194,7 +192,7 @@ def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
 
 def _validate_fp4_mla_bridge_profile(
     mapping: Mapping,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: KVCacheManagerV2,
     cache_transceiver_config: CacheTransceiverConfig,
 ) -> bool:
     """Select the bridge only for its explicit no-retry FP4-MLA deployment cell."""
@@ -230,6 +228,45 @@ def _validate_fp4_mla_bridge_profile(
     return True
 
 
+def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
+    """This rank's (paged, STATE) KV bytes in a chunk, as the mappers move them.
+
+    Per view, the valid block count (one slot for STATE) times the view's transferable slot
+    region. The sum is expected_write_bytes: verified-reuse admission compares the sender's
+    attested bytes against it. The pair also feeds kv_cache_size. So count the bytes the
+    mappers move, never physical slot bytes: a coalesced pool carries one view per role class
+    (summing slot_bytes per view would double count the slot) and ignored-role buffers occupy
+    slot offsets no view transfers.
+
+    Bounce sizing (bounce/impl.py block_bytes_per_group) counts physical slot bytes once per
+    pool, ignored-role regions included; keep the two accountings in mind together when
+    changing either.
+    """
+    if page_table is None:
+        return 0, 0
+    paged_bytes = state_bytes = 0
+    for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
+        if block_ids is None or block_ids.size == 0:
+            continue
+        n = int((block_ids >= 0).sum())
+        if n == 0:
+            continue
+        lg = page_table.layer_groups[lg_id]
+        for pool_idx, pv in enumerate(lg.pool_views):
+            if (lg_id, pool_idx) in chunk.excluded_pool_views:
+                continue
+            # The view's byte regions within one slot (all of its layers).
+            view_bytes = get_pool_view_slot_bytes(pv)
+            if lg.kind == CacheKind.STATE:
+                # STATE: one slot per request; the transfer covers each
+                # view region once regardless of the block count.
+                state_bytes += view_bytes
+            else:
+                # Paged: n blocks, each covering the view's regions.
+                paged_bytes += n * view_bytes
+    return paged_bytes, state_bytes
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
     @property
     def consumes_transfer_buffer(self) -> bool:
@@ -239,9 +276,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self,
         mapping: Mapping,
         dist: Distributed,
-        kv_cache_manager: KVCacheManager,
+        kv_cache_manager: KVCacheManagerV2,
         cache_transceiver_config: CacheTransceiverConfig,
     ):
+        if not isinstance(kv_cache_manager, KVCacheManagerV2):
+            raise ValueError(
+                "KvCacheTransceiverV2 does not support KV cache manager V1. "
+                f"Selected manager: {type(kv_cache_manager).__name__}. "
+                "Use a compatible KVCacheManagerV2 configuration for "
+                "transceiver_runtime='PYTHON'; enabling "
+                "use_kv_cache_manager_v2=True does not override incompatible "
+                "model features. To use V1, select transceiver_runtime='CPP' "
+                "with use_kv_cache_manager_v2=False for a model that supports V1."
+            )
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._dist: Distributed = dist
@@ -353,13 +400,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The transfer worker is already live by this point.
             self._transfer_worker.shutdown()
             raise
-        # _chunk_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
-        # except under attention DP where the local count already is the total.
-        # Helix CP ranks hold disjoint block sets, so they scale the request
-        # total the same way TP shards do (metric only).
-        self._kv_size_rank_factor = (
-            1 if mapping.enable_attention_dp else max(1, mapping.tp_size * mapping.cp_size)
-        )
+        self._kv_size_rank_factor = self._kv_size_rank_factor_for(mapping)
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -392,23 +433,100 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return endpoint
         return cast(str, self._dist.broadcast(None, 0))
 
+    @staticmethod
+    def _kv_size_rank_factor_for(mapping) -> int:
+        """Number of TP ranks that receive each request's KV.
+
+        Every TP rank receives the same number of bytes, split or replicated, so the TP
+        total is tp_size times this rank's bytes; under attention DP one DP rank holds the
+        request. Helix CP ranks receive different paged bytes, so CP is scaled per request
+        (see _request_kv_bytes).
+        """
+        return 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
+
+    def _request_kv_bytes(self, req: LlmRequest, paged_bytes: int, state_bytes: int) -> int:
+        """KV bytes the request's transfer moves into the TP and CP ranks of this PP stage.
+
+        A metric only. The C++ transceiver can sum what every rank received, PP stages
+        included. This computes that sum for this PP stage alone from this rank's paged
+        and STATE bytes (_chunk_bytes_by_kind), with no collective. Both scale by the
+        TP factor. Each CP rank also holds a STATE (recurrent) slot of the same size, so
+        STATE bytes scale by the CP size too. Paged bytes follow the prompt blocks each
+        CP rank holds instead (_request_paged_bytes).
+        """
+        tp_paged = paged_bytes * self._kv_size_rank_factor
+        tp_state = state_bytes * self._kv_size_rank_factor
+        return self._request_paged_bytes(req, tp_paged) + tp_state * self._mapping.cp_size
+
+    def _request_paged_bytes(self, req: LlmRequest, paged_bytes: int) -> int:
+        """Request-total paged bytes, given this CP rank's paged bytes times the TP factor.
+
+        Helix deals prompt blocks round-robin over the CP ranks, so this rank holds
+        ceil(prompt_len / tpb) of the ceil(total_input_len_cp / tpb) blocks (prompt_len
+        is the rank-local slice) and the shares differ by up to one block. Scaling the
+        per-block bytes by the global block count gives the request total. A CP rank that
+        owns no block has no paged bytes; responses come from CP rank 0, which owns block 0.
+        """
+        if paged_bytes == 0 or self._mapping.cp_size == 1:
+            return paged_bytes
+        tpb = self._reuse_adapter.tokens_per_block
+        local_blocks = (req.prompt_len + tpb - 1) // tpb
+        global_blocks = (req.total_input_len_cp + tpb - 1) // tpb
+        if local_blocks == 0:
+            return paged_bytes
+        return paged_bytes * global_blocks // local_blocks
+
     def _init_sync_policy(self):
         m = self._mapping
+        # The ctx side never syncs over CP: helix pairs a cp=1 context instance
+        # with a cp=N generation instance (see attention/peer.py check_peer_compatible),
+        # so on the context side the CP group is always a single rank.
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
-        self._gen_need_sync = not (m.world_size == 1 or (m.enable_attention_dp and m.pp_size == 1))
-        pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-        self._gen_allgather: Callable = (
-            pp_allgather if m.enable_attention_dp else self._dist.allgather
-        )
+        if m.enable_attention_dp:
+            # DP groups schedule independently, but the PP or helix CP ranks of
+            # one DP group share the same requests, so gen-side consensus spans
+            # that group (like the C++ transceiver's mGroupDataComm). Without it
+            # a CP rank can start decoding before its partner received the KV and
+            # the helix all-to-all deadlocks.
+            #
+            # Invariant: check_gen_transfer_status gathers over this group, and
+            # besides the per-iteration poll the executor also enters it from
+            # receive_gen_init, only on ranks that admitted gen-init requests.
+            # The CP ranks of one DP group must therefore admit the same requests
+            # in the same iteration. Equal KV capacity is not enough: a client
+            # cancel or transfer timeout retires a request rank-locally, so one
+            # CP rank can have room before its peer. The pp=1 loops intersect
+            # the admitted ids over CP first
+            # (DisaggTransferCoordinator.align_gen_admission_across_cp).
+            # The PP loop does not, so _check_compatible rejects attention-DP
+            # with both helix CP and pp_size > 1.
+            #
+            # Non-DP tp x cp gathers over the world behind the same predicate and
+            # goes through the same step, which lines up its CP ranks but not its
+            # TP ranks; a rank-local cancel or timeout can still skew those, as it
+            # can without CP.
+            self._gen_need_sync = m.pp_size * m.cp_size > 1
+            self._gen_allgather: Callable = self._dp_group_allgather
+        else:
+            self._gen_need_sync = m.world_size > 1
+            self._gen_allgather = self._dist.allgather
+
+    def _dp_group_allgather(self, obj):
+        """Allgather over the CP ranks, then the PP ranks, of this DP group.
+
+        Under attention-DP, _check_compatible keeps cp_size or pp_size at 1, so
+        at most one of the two gathers runs.
+        """
+        m = self._mapping
+        gathered = list(self._dist.cp_allgather(obj)) if m.cp_size > 1 else [obj]
+        if m.pp_size > 1:
+            gathered = [x for part in self._dist.pp_allgather(gathered) for x in part]
+        return gathered
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
-            self._kv_cache_manager, MambaHybridCacheManagerV2
-        ):
-            layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
@@ -504,8 +622,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             if self._kv_cache_manager.local_num_mamba_layers > 0:
                 return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
-        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
         return None
 
     def _create_chunk(self, req: LlmRequest) -> Chunk:
@@ -536,7 +652,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
+        remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
+        transfer_len = remote_tail_start if remote_tail_start is not None else req.prompt_len
+        prompt_blocks = (transfer_len + tpb - 1) // tpb
+        remote_tail_split = getattr(req, "py_csa2_remote_tail_split", None)
+        excluded_pool_views = set()
+        if remote_tail_split is not None:
+            exclude = getattr(self._kv_cache_manager, "remote_tail_excluded_pool_views", None)
+            if exclude is None:
+                raise ValueError("remote-tail replay requires a CSA2 cache manager")
+            excluded_pool_views = exclude(self._page_table, remote_tail_split)
 
         is_gen_only = req.is_generation_only_request
         cached_per_lg = (
@@ -563,8 +688,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return Chunk(
             block_ids_per_layer_groups=groups,
             kind_per_layer_group=kinds,
-            token_range=TokenRange(start=0, end=req.prompt_len),
+            token_range=TokenRange(start=0, end=transfer_len),
             is_last=True,
+            excluded_pool_views=excluded_pool_views,
         )
 
     @staticmethod
@@ -582,42 +708,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         window[:n] = ordinals[:n]
         window[: min(cached_blocks, prompt_blocks)] = -1
         return window
-
-    def _chunk_num_bytes(self, chunk: Chunk) -> int:
-        """Local-rank KV bytes covered by a chunk: per view, the valid block count times the view's
-        transferable slot region. Populates kv_cache_size (and the perf-metric timestamps that gate
-        on it) and is the exact expected-write total the verified-reuse admission checks attested
-        sender bytes against, so it must count what the mappers move, never physical slot bytes: a
-        coalesced pool carries one view per role class (summing slot_bytes per view would double
-        count the slot) and ignored-role buffers occupy slot offsets no view transfers.
-
-        Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
-        computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
-        every pool view of a group. The pool-0-only sizing gap for multi-pool attention groups is
-        tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
-        """
-        pt = self._page_table
-        if pt is None:
-            return 0
-        total = 0
-        for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
-            if block_ids is None or block_ids.size == 0:
-                continue
-            n = int((block_ids >= 0).sum())
-            if n == 0:
-                continue
-            lg = pt.layer_groups[lg_id]
-            for pv in lg.pool_views:
-                # The view's byte regions within one slot (all of its layers).
-                view_bytes = get_pool_view_slot_bytes(pv)
-                if lg.kind == CacheKind.STATE:
-                    # STATE: one slot per request; the transfer covers each
-                    # view region once regardless of the block count.
-                    total += view_bytes
-                else:
-                    # Attention: n blocks, each covering the view's regions.
-                    total += n * view_bytes
-        return total
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
@@ -666,11 +756,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return ready_ids
 
     def _gen_consensus(self, local_ids: list) -> list:
-        sync_size = (
-            self._mapping.pp_size if self._mapping.enable_attention_dp else self._mapping.world_size
-        )
-        all_ranks = self._gen_allgather(local_ids) if self._gen_need_sync else [local_ids]
-        return _find_consensus_request_ids(all_ranks, sync_size)
+        if not self._gen_need_sync:
+            return list(local_ids)
+        all_ranks = self._gen_allgather(local_ids)
+        return _find_consensus_request_ids(all_ranks, len(all_ranks))
 
     @staticmethod
     def _union(all_lists: List[List[int]]) -> set:
@@ -1040,6 +1129,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 kind_per_layer_group=whole.kind_per_layer_group,
                 token_range=TokenRange(start=chunk_start * tpb, end=chunk_end_token),
                 is_last=is_last_chunk,
+                excluded_pool_views=whole.excluded_pool_views,
             ),
         )
 
@@ -1109,10 +1199,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         fetches = None
         try:
             extent = self._create_cache_extent(req)
+            paged_bytes, state_bytes = _chunk_bytes_by_kind(self._page_table, extent.local)
             fetches = self._open_peer_source(req)
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
-            fetches.fetch(extent, expected_write_bytes=self._chunk_num_bytes(extent.local))
+            fetches.fetch(extent, expected_write_bytes=paged_bytes + state_bytes)
             session = self._legacy_session(fetches)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
@@ -1123,9 +1214,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # blocking path has no cross-rank outcome consensus).
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
-                req.set_kv_cache_size(
-                    self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
-                )
+                req.set_kv_cache_size(self._request_kv_bytes(req, paged_bytes, state_bytes))
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
@@ -1187,8 +1276,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             return
         extent = self._create_cache_extent(req)
-        chunk_bytes = self._chunk_num_bytes(extent.local)
-        req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor
+        paged_bytes, state_bytes = _chunk_bytes_by_kind(self._page_table, extent.local)
+        req.py_kv_cache_xfer_bytes = self._request_kv_bytes(req, paged_bytes, state_bytes)
         fetches = self._open_peer_source(req)
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
@@ -1199,7 +1288,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
-            fetches.fetch(extent, expected_write_bytes=chunk_bytes)
+            fetches.fetch(extent, expected_write_bytes=paged_bytes + state_bytes)
         except Exception:
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
@@ -1462,17 +1551,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         V2 scheduler can deadlock under high concurrency (e.g., benchmark
         fill-phase).
 
-        No-op for V1 managers (which lack ``get_history_length``) and for
-        V2 caches with only full-context life cycles (where the watermark
-        has no allocation effect).
         """
-        get_history = getattr(self._kv_cache_manager, "get_history_length", None)
-        if get_history is None:
-            return
-        prompt_len = getattr(req, "prompt_len", None)
+        prompt_len = getattr(req, "py_csa2_remote_tail_start", None)
+        if prompt_len is None:
+            prompt_len = getattr(req, "prompt_len", None)
         if not prompt_len or prompt_len <= 0:
             return
-        history = get_history(req)
+        history = self._kv_cache_manager.get_history_length(req)
         if history is None:
             # Cache was already released (e.g., cancelled mid-transfer); nothing to verify.
             return
@@ -1574,11 +1659,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._wait_reqs[rid]
 
     def _check_compatible(self):
-        if self._mapping.cp_size != 1 and not self._mapping.has_cp_helix():
+        m = self._mapping
+        if m.cp_size != 1 and not m.has_cp_helix():
             raise ValueError(
                 f"KvCacheTransceiverV2: _check_compatible: unsupported context parallelism "
-                f"(cp_size={self._mapping.cp_size}, cp_type={self._mapping.cp_config.get('cp_type')}); "
+                f"(cp_size={m.cp_size}, cp_type={m.cp_config.get('cp_type')}); "
                 f"only cp_size == 1 or helix CP is supported"
+            )
+        # Under attention-DP the gen-side completion consensus spans the helix CP
+        # ranks of a DP group, so they must admit the same gen-init requests in
+        # the same iteration. The pp=1 executor loops align that admission
+        # (DisaggTransferCoordinator.align_gen_admission_across_cp). The PP loop
+        # does not: under attention-DP with tp_size > 1, each rank of the first
+        # PP stage schedules and admits on its own
+        # (PyExecutor._pp_schedule_and_propagate), so a CP rank can admit a
+        # request its peers did not and hang alone in the gen transfer status
+        # collective. With tp_size == 1 only rank 0 schedules and the CP ranks
+        # follow it, but the check rejects that case too to keep one rule; it
+        # costs nothing, since attention-DP then has a single DP rank.
+        # KVCacheManagerV2 rejects the same combination at construction; lift
+        # both checks together.
+        if m.enable_attention_dp and m.has_cp_helix() and m.pp_size > 1:
+            raise ValueError(
+                "KvCacheTransceiverV2 does not support attention-DP with helix "
+                f"context parallelism when pp_size > 1 (got pp_size={m.pp_size}). "
+                "Set pipeline_parallel_size=1 or enable_attention_dp=False."
             )
 
     def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:
@@ -1595,7 +1700,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"the Python bounce buffer (kv_cache_bounce_size_mb="
                 f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
             )
-        if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             blockers.append("a Mamba/hybrid cache manager")
         # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees
         # a piece short of the whole prompt, so a prompt that fits one chunk would slip past it.
@@ -1606,8 +1711,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # rebases it onto that request's page and frees ours, which an earlier chunk's
         # in-flight read may still be sourcing from.
         if (
-            isinstance(self._kv_cache_manager, KVCacheManagerV2)
-            and self._kv_cache_manager.enable_block_reuse
+            self._kv_cache_manager.enable_block_reuse
             and self._kv_cache_manager.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
         ):
             blockers.append(

@@ -136,6 +136,16 @@ Qwen/Qwen3.8-Flash-Next:
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: MTP
     accuracy: 87.57
+  # FP8 KV cache, measured on the built-in implementation: TEP4 on GB300, no MTP,
+  # TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 87.33
+  # NVFP4 KV cache, measured on the built-in implementation: ADP4 on GB300, no MTP,
+  # TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    accuracy: 87.21
 Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
@@ -164,13 +174,6 @@ nvidia/MiniMax-M3-NVFP4:
     spec_dec_algo: Eagle3
     accuracy: 84.747
 
-moonshotai/Kimi-K2-Instruct:
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 87.65
-moonshotai/Kimi-K2-Thinking:
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 85.83
 moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8

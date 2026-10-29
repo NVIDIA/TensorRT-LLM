@@ -155,6 +155,10 @@ public:
         // optional for separate QKV input, currently only used for context MLA
         T const* k_ptr = nullptr;
         T const* v_ptr = nullptr;
+        // Separate V has shape [tokens, numKvHeads * headDimV] with unit feature stride.
+        // The physical byte stride is used by context FMHA or its FP8/NVFP4 input quantizer.
+        // Zero uses the layout-derived token stride.
+        int64_t v_stride_in_bytes = 0;
 
         // Helix parallelism params.
         int32_t const* helix_position_offsets = nullptr;
@@ -255,6 +259,7 @@ public:
         int32_t spec_decoding_max_generation_length = 1;
         int64_t* spec_decoding_bl_tree_mask_offset = nullptr;
         uint32_t* spec_decoding_bl_tree_mask = nullptr;
+        int64_t spec_decoding_bl_tree_mask_capacity = 0;
         int32_t* spec_bl_tree_first_sparse_mask_offset_kv = nullptr;
         // optional when fuse_fp4_quant is enabled
         int32_t start_token_idx_sf = 0;
@@ -615,7 +620,7 @@ private:
     static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
 
     int mSM = tensorrt_llm::common::getSMVersion();
-    bool mUseTllmGen = (mSM >= 100) && (mSM != 120) && (mSM != 121);
+    bool mUseTllmGen = tensorrt_llm::common::isSM100Family(mSM);
     bool mForceMultiBlockWarned = false;
     int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();

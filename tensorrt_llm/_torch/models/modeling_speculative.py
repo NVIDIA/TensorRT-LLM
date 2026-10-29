@@ -29,6 +29,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -166,10 +167,9 @@ def markov_prev_embeddings(prev_tokens: torch.Tensor,
     """``markov_w1[prev_tokens]`` with out-of-vocab anchors masked to zero.
 
     The anchor is the last accepted token, which on the one-model rejection path
-    comes from flashinfer's ``chain_speculative_sampling``: it pads non-accepted
-    positions with ``-1`` and returns an out-of-range id for a row whose
-    ``relu(target - draft)`` residual has no mass. Mask like modules/embedding.py
-    does, so such a row contributes no bias instead of tripping a device assert.
+    comes from ``trtllm::chain_speculative_sampling``: it pads non-accepted
+    positions with ``-1``. Mask like modules/embedding.py does, so such a
+    position contributes no bias instead of tripping a device assert.
 
     Args:
         prev_tokens: previous token ids (draft vocab), any shape.
@@ -272,31 +272,6 @@ def dspark_markov_chain(
             prev = next_token_fn(step_logits).long()
         sampled.append(prev)
     return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
-
-
-def dspark_markov_chain_logits(base_logits: torch.Tensor,
-                               first_prev_tokens: torch.Tensor,
-                               markov_w1: torch.Tensor,
-                               markov_w2: torch.Tensor,
-                               argmax_fn=None) -> torch.Tensor:
-    """Raw-tensor entry to :func:`dspark_markov_chain`, corrected logits only.
-
-    For drafters that keep the Markov head as plain checkpoint tensors rather
-    than a :class:`VanillaMarkov` module (the DFlash path). ``markov_w2`` may
-    already be sliced down to this rank's TP vocab shard, in which case
-    ``argmax_fn`` must map a shard-local row back to a full-vocab token id.
-    """
-
-    def _step_bias(prev_tokens, step_hidden):
-        del step_hidden
-        return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
-
-    _, corrected = dspark_markov_chain(base_logits,
-                                       first_prev_tokens,
-                                       _step_bias,
-                                       next_token_fn=argmax_fn,
-                                       cast_bias_to_logits=True)
-    return corrected
 
 
 class VanillaMarkov(nn.Module):
@@ -501,30 +476,37 @@ def build_markov_head(*, markov_head_type: str, vocab_size: int,
 
 
 class DSparkConfidenceHead(nn.Module):
-    """Per-position acceptance-confidence predictor (DeepSpec
-    AcceptRatePredictor).
+    """Per-position acceptance-confidence predictor.
 
-    Input features are the backbone hidden state, optionally concatenated with
-    the Markov head's previous-token embedding. Output is a single logit per
-    position.
+    Emits one raw logit per position. :meth:`apply_sts` converts logits to
+    calibrated conditional acceptance probabilities.
     """
 
     def __init__(self,
                  *,
                  hidden_size: int,
                  markov_rank: int = 0,
-                 with_markov: bool = False):
+                 with_markov: bool = False,
+                 bias: bool = False,
+                 block_size: int = 0):
         super().__init__()
         self.with_markov = bool(with_markov)
         input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
-        # The checkpoint stores ``proj`` as a bias-free bf16 weight, but the
-        # confidence score is computed in fp32 (mirrors the DeepSpec reference
-        # ``Linear(input_dim, 1, dtype=torch.float32)`` with the fp32 matmul).
-        self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
+        self.proj = nn.Linear(input_dim,
+                              1,
+                              bias=bool(bias),
+                              dtype=torch.float32)
+        self.register_buffer(
+            "sts_temperatures",
+            torch.ones(max(int(block_size), 1), dtype=torch.float32),
+            persistent=False,
+        )
+        self._sts_temperatures_host: Optional[torch.Tensor] = None
 
     def forward(self,
                 hidden_states: torch.Tensor,
                 prev_embeddings: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return raw, uncalibrated logits with shape ``[..., block]``."""
         if self.with_markov:
             assert prev_embeddings is not None
             features = torch.cat(
@@ -536,20 +518,57 @@ class DSparkConfidenceHead(nn.Module):
         # fp32 matmul for a stable confidence score (mirrors the reference).
         return self.proj(features.float()).squeeze(-1)
 
+    def apply_sts(self, confidence_logits: torch.Tensor) -> torch.Tensor:
+        """Convert raw logits to calibrated acceptance probabilities."""
+        temperatures = self.sts_temperatures
+        if temperatures.device != confidence_logits.device:
+            if confidence_logits.device.type == "cpu":
+                temperatures = self._host_sts_temperatures()
+            else:
+                temperatures = temperatures.to(confidence_logits.device)
+        return torch.sigmoid(confidence_logits.float() / temperatures)
 
-def confident_prefix_length(confidence_logits: torch.Tensor, *, block_size: int,
-                            threshold: float) -> int:
-    """First position k where ``sigmoid(confidence_k) < threshold``.
+    def _host_sts_temperatures(self) -> torch.Tensor:
+        """Return a lazily materialized CPU mirror of the STS table."""
+        cached = self._sts_temperatures_host
+        if cached is None:
+            cached = self.sts_temperatures.detach().to("cpu")
+            self._sts_temperatures_host = cached
+        return cached
 
-    Returns ``block_size`` when threshold<=0 (no truncation) or all positions
-    are confident. Assumes batch size 1 (functional-first scope).
-    """
-    if threshold <= 0.0:
-        return int(block_size)
-    below = confidence_logits.sigmoid() < threshold
-    if not bool(below[0].any().item()):
-        return int(block_size)
-    return int(torch.nonzero(below[0], as_tuple=False)[0].item())
+    @torch.no_grad()
+    def load_sts_temperatures(self, temperatures: torch.Tensor) -> None:
+        """Update the fixed-address STS table in place."""
+        flat = temperatures.reshape(-1).to(device=self.sts_temperatures.device,
+                                           dtype=torch.float32)
+        if flat.numel() != self.sts_temperatures.numel():
+            raise ValueError(
+                f"STS temperature table has {flat.numel()} entries but the confidence "
+                f"head expects {self.sts_temperatures.numel()} (one per block position)"
+            )
+        if not bool(torch.all(flat > 0.0)):
+            raise ValueError("STS temperatures must be strictly positive")
+        self.sts_temperatures.copy_(flat)
+        self._sts_temperatures_host = None
+
+    def load_weights(self, weights: list) -> None:
+        """Load every confidence-head checkpoint parameter strictly."""
+        (module_weights, ) = weights
+        expected = dict(self.named_parameters())
+        unexpected = [key for key in module_weights if key not in expected]
+        missing = [key for key in expected if key not in module_weights]
+        if unexpected:
+            raise ValueError(
+                f"DSpark confidence head checkpoint has unsupported key(s) {sorted(unexpected)}; "
+                f"the module exposes {sorted(expected)}. A checkpoint bias requires constructing "
+                "DSparkConfidenceHead(bias=True); silently dropping it would bias every score."
+            )
+        if missing:
+            raise ValueError(
+                f"DSpark confidence head checkpoint is missing key(s) {sorted(missing)}"
+            )
+        for name, param in expected.items():
+            param.data.copy_(module_weights[name][:])
 
 
 class Eagle3Attention(Attention):
@@ -1420,6 +1439,10 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None and mtp_repeat_count > 1:
+            for layer_idx in range(mtp_num_layers):
+                dwdp_manager.add_repeated_layer(layer_idx + start_layer_idx)
         self.owns_lm_head = lm_head_quant_config is not None
         if self.owns_lm_head:
             if getattr(model_config.pretrained_config, "tie_word_embeddings",
@@ -1552,7 +1575,9 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
         moe_backend=_get_requested_draft_moe_backend(model_config, spec_config),
-        mapping=model_config.mapping,
+        # The drafter runs on every row; keep it TP where the TP group shares
+        # requests (helix + attention DP at tp_size 1).
+        mapping=model_config.mapping.mapping_for_full_rows(),
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
@@ -1717,7 +1742,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             MistralConfigLoader
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
-                            mapping=model_config.mapping,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             moe_backend=requested_draft_moe_backend,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
@@ -1738,7 +1764,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
                             moe_backend=requested_draft_moe_backend,
-                            mapping=model_config.mapping,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1756,7 +1783,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
                         moe_backend=requested_draft_moe_backend,
-                        mapping=model_config.mapping,
+                        mapping=model_config.mapping.mapping_for_full_rows(),
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1798,13 +1825,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
-                model_config.mapping,
+                model_config.mapping.mapping_for_full_rows(),
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
                 # draft_model.model.d2t on every forward.
                 self.spec_worker.set_draft_model(self.draft_model)
+                self.spec_worker.set_target_model(self)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
@@ -1832,6 +1860,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
+        if getattr(attn_metadata, "csa2_remote_tail_mode", None) == "source":
+            # The context worker intentionally stopped at the encoder/decoder
+            # boundary. Produce a disposable token for the existing context-only
+            # completion machinery, but do not run an embedded draft worker from
+            # an encoder-boundary activation. The handoff strips this token.
+            return self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                False,
+            )
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
@@ -1840,12 +1879,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
+            # The target logits, in the layout the worker's acceptance reads.
+            logits = self.spec_worker.target_logits(
                 hidden_states[spec_metadata.gather_ids],
                 self.lm_head,
+                self.logits_processor,
                 attn_metadata,
-                True,
+                spec_metadata,
+                self.draft_model,
             )
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pickle
 import sys
 import traceback
@@ -11,6 +14,8 @@ from torch import nn
 import tensorrt_llm
 from tensorrt_llm._torch.modules.embedding import Embedding, LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    nccl_window_tensor_scope
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -28,9 +33,11 @@ def run_single_rank(tensor_parallel_size, single_rank_forward_func, input,
                     weights, vocab_size, hidden_size, dtype):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
+    input = input.cuda()
     try:
-        single_rank_forward_func(input, vocab_size, hidden_size, dtype,
-                                 tensor_parallel_size, rank, weights)
+        with nccl_window_tensor_scope(input):
+            single_rank_forward_func(input, vocab_size, hidden_size, dtype,
+                                     tensor_parallel_size, rank, weights)
     except Exception:
         traceback.print_exc()
         raise

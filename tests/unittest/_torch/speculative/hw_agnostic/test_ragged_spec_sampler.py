@@ -361,6 +361,7 @@ def test_rejection_preserves_sampling_params_and_caps_acceptance(monkeypatch, ra
     worker = _make_worker(0.0)
     widths = [2, 4] if ragged else [4, 4]
     metadata = _penalty_mapping_meta([4, 2, 9], widths if ragged else None)
+    metadata.rng_accept_slot = 2 * worker.max_draft_len + 1
     metadata.dummy_slot_row = 9
     rows = 1 + sum(widths)
     metadata.temperatures = torch.arange(rows, dtype=torch.float32) + 0.5
@@ -388,7 +389,7 @@ def test_rejection_preserves_sampling_params_and_caps_acceptance(monkeypatch, ra
 
     worker._sample_tokens_for_batch = lambda *args: torch.tensor([7])
     worker._compute_probs_from_logits = compute_probs
-    worker._rng_state_per_request = lambda *args: (None, None)
+    worker._rng_state_per_request = lambda *args, slot: (None, None)
     monkeypatch.setattr(interface_ops, "rejection_sampling_one_model", rejection)
     draft_probs = torch.full((2, 3, 8), 1 / 8)
     original_probs = draft_probs.clone()
@@ -486,7 +487,7 @@ def test_rejection_retains_request_local_bonus_distribution(
         worker._d2t = torch.tensor([1, 2])
     worker._sample_tokens_for_batch = lambda *args: torch.tensor([3])
     worker._compute_probs_from_logits = lambda mode, scores, *params: scores.softmax(-1)
-    worker._rng_state_per_request = lambda *args: (None, None)
+    worker._rng_state_per_request = lambda *args, slot: (None, None)
     calls = {}
 
     def rejection(**kwargs):
@@ -505,6 +506,7 @@ def test_rejection_retains_request_local_bonus_distribution(
     for local_windows in [windows, windows[::-1]]:
         lens = torch.tensor(local_windows * trials, dtype=torch.int32)
         metadata = _penalty_mapping_meta([5, *slots.tolist()], lens.tolist() if ragged else None)
+        metadata.rng_accept_slot = 2 * worker.max_draft_len + 1
         metadata.dummy_slot_row = 9
         metadata.runtime_draft_len = width
         metadata.enable_penalty = False
@@ -608,6 +610,10 @@ def cpu_sampler(monkeypatch):
 
     sampler._copy_to_host = copy_to_host
     sampler._record_sampler_event = record_event
+    sampler._async_worker_active = lambda: True
+    sampler._store_scatter = None
+    sampler._slot_table_buffer = None
+    sampler._store_copies_done = None
     return sampler, transfers
 
 

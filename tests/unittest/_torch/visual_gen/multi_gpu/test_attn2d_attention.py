@@ -14,11 +14,12 @@
 # limitations under the License.
 """Multi-GPU tests for Attention2DAttention.
 
-These tests use torch.multiprocessing.spawn to launch multiple processes internally.
+Multi-GPU tests run their logic on the rank pool in _worker_pool.py.
 Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py -v
 """
 
+import contextlib
 import math
 import os
 
@@ -29,15 +30,18 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.visual_gen.attention_backend import Attention2DAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
-from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.backends import Attention2DAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
+    _flash_attn_fwd as _fa4_fwd,
+)
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+
+from ._worker_pool import run_distributed
 
 # FA4 kernel availability (separate from the combine kernel used by Attention2DAttention)
 _flash_attn4_available = _fa4_fwd is not None
@@ -52,6 +56,16 @@ def _cleanup_mpi_env():
 # =============================================================================
 # Test-only inner backend: VanillaAttention with LSE output
 # =============================================================================
+
+
+@contextlib.contextmanager
+def _ieee_fp32_matmul():
+    saved = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = saved
 
 
 class _LSEVanillaAttention(nn.Module):
@@ -119,14 +133,17 @@ class _LSEVanillaAttention(nn.Module):
         k_t = k.transpose(1, 2).float()  # [B, H_kv, S_k, D]
         v_t = v.transpose(1, 2).float()  # [B, H_kv, S_k, D]
         k_t, v_t = self._expand_kv_heads(k_t, v_t)
-        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.scale  # [B, H, S_q, S_k]
         key_padding_mask = kwargs.get("key_padding_mask")
         self.saw_key_padding_mask = self.saw_key_padding_mask or key_padding_mask is not None
-        if key_padding_mask is not None:
-            scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
-        lse = torch.logsumexp(scores, dim=-1)  # [B, H, S_q]
-        attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v_t)  # [B, H, S_q, D]
+        # NGC PyTorch images set TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1. This stub must be exact
+        # fp32 attention so the comparison isolates the gather/all_to_all/combine path.
+        with _ieee_fp32_matmul():
+            scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.scale  # [B, H, S_q, S_k]
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
+            lse = torch.logsumexp(scores, dim=-1)  # [B, H, S_q]
+            attn = torch.softmax(scores, dim=-1)
+            out = torch.matmul(attn, v_t)  # [B, H, S_q, D]
         return out.to(q.dtype).transpose(1, 2).contiguous(), lse
 
 
@@ -135,48 +152,11 @@ class _LSEVanillaAttention(nn.Module):
 # =============================================================================
 
 
-def _init_worker(rank: int, world_size: int, backend: str, port: int):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    if backend == "nccl" and torch.cuda.is_available():
-        torch.cuda.set_device(rank % torch.cuda.device_count())
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    else:
-        dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-
-
-def _cleanup():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port):
-    try:
-        _init_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed: {e}")
-        raise
-    finally:
-        _cleanup()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-
-    backend = "nccl" if use_cuda else "gloo"
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
+    run_distributed(
+        world_size, test_fn, dist_backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
 
 
@@ -207,7 +187,7 @@ def _make_process_groups(rank, world_size, row_size, col_size):
 
 
 # =============================================================================
-# Test logic (module-level for mp.spawn pickling)
+# Test logic (module-level so the pool can pickle it by reference)
 # =============================================================================
 
 

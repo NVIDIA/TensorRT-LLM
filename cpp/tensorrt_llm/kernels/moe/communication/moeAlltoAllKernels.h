@@ -45,14 +45,16 @@ static constexpr size_t kCftCounterStrideU64 = kCftCounterStride / sizeof(uint64
 static constexpr int kCftMbarrierSlotBytes = 64;
 
 // Fixed-size peer metadata passed by value to the CFT combine push kernel.
-struct CftPeerLeIds
+struct CftCombinePeerInfo
 {
     uint32_t ids[kMaxRanks];
+    uint32_t* completion_flags[kMaxRanks];
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
-// Default completion-flag wait budget: 300 s at an assumed 2 GHz clock64 rate.
-static constexpr int64_t kDefaultTimeoutCycles = 300ll * 2000ll * 1000ll * 1000ll;
+// Nominal clock64 rate used to convert timeout seconds to SM cycles.
+static constexpr int64_t kAssumedClockHz = 2000ll * 1000ll * 1000ll;
+static constexpr int64_t kDefaultTimeoutCycles = 300ll * kAssumedClockHz;
 
 // Default per-block dynamic shared-memory cap on sm_90+; larger requests must opt in via
 // cudaFuncAttributeMaxDynamicSharedMemorySize.
@@ -92,8 +94,8 @@ struct DispatchKernelPointers
     int* local_token_counter; // Atomic counter for completed tokens
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
-    int* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
+    int* topk_target_ranks;   // target rank per k, -1 for invalid or duplicate routes
+    int* topk_target_indices; // dst index per k, -1 for invalid or duplicate routes
 
     // Optional: Statistics for EPLB
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
@@ -120,25 +122,25 @@ struct DispatchKernelPointers
     // The local rank's own bit must always be set; this is checked at launch time.
     uint64_t active_rank_mask[kRankMaskWords];
 
-    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
 
-// Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
+// Gather one contribution slice per expert rank.
 struct CombineKernelPointers
 {
-    // Payload pointers
-    void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
-    void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
+    void* output;
+    // Fence: peer input slices. CFT: peer contributions in the local receive inbox.
+    uint8_t const* source_buffers[kMaxRanks];
 
-    // Completion flags for synchronization (fence-based path)
+    // Combine readiness flags shared by the fence and CFT paths.
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int const* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
-    int const* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
+    int const* topk_target_ranks;   // target rank per k, -1 for invalid or duplicate routes
+    int const* topk_target_indices; // dst index per k, -1 for invalid or duplicate routes
 
     // ---- CFT combine (counted-write) fields. Unused by the fence combine path. ----
     // Local LE combine counters: per receive-slot HW-incremented byte counters.
@@ -150,7 +152,7 @@ struct CombineKernelPointers
     // completion flag writes/waits to/from inactive peers.
     uint64_t active_rank_mask[kRankMaskWords];
 
-    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
 
@@ -180,8 +182,8 @@ struct MoeA2ADispatchParams
     int* send_counters;       // [ep_size] atomic counters - tracks tokens sent to each target rank
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
                             // per k, -1 for duplicates
-    int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
-                            // per k, -1 for duplicates
+    int* topk_target_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
+                              // per k, -1 for duplicates
 
     // Distributed aux data and recv buffers
     // Each rank owns recv_counters[parity][source_rank]. The two parity banks
@@ -222,21 +224,12 @@ struct MoeA2ADispatchParams
     // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
-    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     // CUDA stream
     cudaStream_t stream;
 };
-
-// Resolve the completion-flag wait budget, in clock64() cycles.
-//
-// No collective separates a rank's first-touch JIT/autotune work from its dispatch
-// launch, so this device-side budget is in effect a deadline on the slowest peer's
-// host-side progress. Warmup therefore uses a larger budget than steady state.
-// Overridable via TRTLLM_MOE_A2A_TIMEOUT_SEC / TRTLLM_MOE_A2A_WARMUP_TIMEOUT_SEC.
-// See nvbugs/6482566.
-int64_t moeA2AGetTimeoutCycles(bool is_warmup);
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
@@ -279,8 +272,8 @@ struct MoeA2ACombineParams
     uint32_t* flag_val;     // The value of the flag for this round (stored on the local rank)
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
                             // per k, -1 for duplicates
-    int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
-                            // per k, -1 for duplicates
+    int* topk_target_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
+                              // per k, -1 for duplicates
     // Local recv_counters[parity][source_rank]. The two parity banks alternate
     // between A2A rounds.
     int const* recv_counters;
@@ -288,17 +281,17 @@ struct MoeA2ACombineParams
     // Distributed aux data and recv buffers
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
-    void const* recv_buffers[kMaxRanks];   // Per-rank receive buffers (only for single payload)
+    uint8_t* combine_input_buffers[kMaxRanks]; // Expert-output/staging region on each rank
 
     // ---- CFT combine (counted-write) path. Gated by use_cft_for_combine. ----
     // When true, moe_a2a_combine_launch takes the CFT push+reduce path and the base fence
     // combine below is bypassed. The base fence combine is unaffected when false.
     bool use_cft_for_combine;
     uint32_t cft_peer_le_ids[kMaxRanks];    // LE ID per target rank
-    uint64_t cft_le_combine_payload_base;   // LE byte offset for combine payload (region C)
+    uint64_t cft_combine_recv_offset;       // LE byte offset of the combine receive inbox
     uint64_t cft_le_combine_counter_base;   // LE byte offset for combine counters
     uint64_t* cft_le_combine_counters;      // Direct pointer to local LE combine counters
-    void* cft_le_combine_recv;              // Direct pointer to local LE combine payload region (C)
+    uint8_t* cft_combine_recv_payload;      // Local CFT receive inbox, including the self contribution
     uint64_t* cft_combine_counter_baseline; // [ep_size * max_tokens_per_rank] regular device memory
     int combine_counter_ep_stride = 0;      // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
 
@@ -312,7 +305,7 @@ struct MoeA2ACombineParams
     // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}};
 
-    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    // Host-selected wait budget in clock64() cycles.
     int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     // CUDA stream

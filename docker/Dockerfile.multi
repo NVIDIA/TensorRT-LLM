@@ -18,8 +18,17 @@ ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=26.09-py3
 ARG TRITON_BASE_TAG=26.09-py3
 ARG DEVEL_IMAGE=devel
+# Tag of ${BASE_IMAGE} whose CUDA forward-compatibility driver (/usr/local/cuda-<ver>/compat)
+# replaces the base image's own; it must ship the same CUDA toolkit version as BASE_TAG. The
+# 26.09-py3 compat driver (615.71.09) runs the trtllm-gen context FMHA kernels ~10% slower on
+# GB200 than the 26.08-py3 one (615.65.02). Set it equal to BASE_TAG to keep the base image's own.
+ARG CUDA_COMPAT_TAG=26.08-py3
+
+FROM ${BASE_IMAGE}:${CUDA_COMPAT_TAG} AS cuda_compat
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
+
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb
 
 # Add NVIDIA EULA and AI Terms labels
 LABEL com.nvidia.eula="https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/"
@@ -72,11 +81,19 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
          --cuda_libs --polygraphy --mpi4py --pytorch
 
+ARG BASE_TAG
+ARG CUDA_COMPAT_TAG
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    --mount=type=bind,from=cuda_compat,source=/usr/local,target=/tmp/cuda_compat_usr_local \
+    if [ "${CUDA_COMPAT_TAG}" != "${BASE_TAG}" ]; then \
+        bash /opt/docker/common/install_cuda_compat.sh /tmp/cuda_compat_usr_local; \
+    fi
+
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+      export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
     # numpy is deliberately absent from this list: the base image's scipy and pandas import
     # it, and constraints.txt no longer carries a pin that would put it back.
@@ -156,32 +173,45 @@ COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt co
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG GIT_COMMIT
+ARG TRT_LLM_VER
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     --mount=type=secret,id=github_clone_token \
     if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+      export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
     # Authenticates `git submodule update` and the CMake FetchContent clones
     # (3rdparty/fetch_content.json) that this build pulls from github.com.
     . docker/common/github_auth.sh && \
+    set -- ${BUILD_WHEEL_ARGS} && \
+    if [ "${BUILD_WHEEL_SCRIPT}" = "scripts/build_wheel.py" ] && [ -n "${TRT_LLM_VER}" ]; then \
+      set -- "$@" --version-override "${TRT_LLM_VER}"; \
+    fi && \
     TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
-    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    python3 ${BUILD_WHEEL_SCRIPT} "$@"
 
 FROM ${DEVEL_IMAGE} AS release
+
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb
 
 WORKDIR /app/tensorrt_llm
 ARG GITHUB_MIRROR=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
     if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+      export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
     TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
     test -n "${TRTLLM_WHEEL}" && \
     pip install "${TRTLLM_WHEEL}[mx,openengine]"
+
+# Expose wheel-bundled editor schemas without importing CUDA-linked Python modules.
+RUN ln -sT "$(python3 -c 'from importlib.metadata import distribution; print(distribution("tensorrt_llm").locate_file("tensorrt_llm/schemas"))')" /app/tensorrt_llm/schemas && \
+    test -f /app/tensorrt_llm/schemas/trtllm-serve-config.schema.json && \
+    test -f /app/tensorrt_llm/schemas/trtllm-serve-disagg-config.schema.json && \
+    test -f /app/tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.json
 
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=docs,target=/mnt/ctx/docs \
@@ -214,6 +244,13 @@ ARG TRT_LLM_VER
 ARG TARGETARCH
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
+
+# Check installed metadata without importing CUDA-linked modules.
+RUN --mount=type=bind,source=docker/common/validate_wheel_metadata.py,target=/tmp/validate_wheel_metadata.py \
+    --mount=type=bind,source=tensorrt_llm/version.py,target=/tmp/trtllm_source_version.py \
+    python3 /tmp/validate_wheel_metadata.py \
+        --expected-version "${TRT_LLM_VER}" --expected-commit "${GIT_COMMIT}" \
+        --source-version-file /tmp/trtllm_source_version.py
 
 # Generate OSS attribution file for release image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \

@@ -474,7 +474,11 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             fifoEntry128ByteIndexBase += singleProtoTransfer128ByteCount;
 
             // ensure that we can over-write shmem in next iteration
-            // (it must be fully read by all threads when doing S2G above)
+            // (it must be fully read by all threads when doing S2G above).
+            // The next iteration refills shmem with cp.async.bulk, an async-proxy
+            // write that must be ordered after the sanitize/protoPack stores and the
+            // S2G loads above, which go through the generic proxy.
+            tensorrt_llm::common::fence_view_async_shared();
             __syncwarp();
         }
         if (fifoEntry128ByteIndexBase > 0)
@@ -538,6 +542,12 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 
             LL128Proto::protoUnpack(
                 shmem, tail, singlePacked128ByteCount, fifoEntry128ByteIndexBase, loaded128ByteCount, laneId);
+
+            // protoUnpack restores the words displaced by the LL128 flags through the generic proxy. Make
+            // those writes visible to the async proxy before cp.async.bulk reads the same buffer for S2G;
+            // otherwise the store can copy a flag (the FIFO step) in place of a restored data word.
+            tensorrt_llm::common::fence_view_async_shared();
+            __syncwarp();
 
             // note: fields are already unpacked in shared memory
             s2gAllFields<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>(params.recvFields, dataIndex, shmem, laneId);

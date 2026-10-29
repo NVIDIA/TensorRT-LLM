@@ -26,9 +26,12 @@
 #include <atomic>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <torch/extension.h>
 #include <torch/types.h>
+#include <unordered_map>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -39,13 +42,29 @@ namespace torch_ext
 namespace moe_comm
 {
 
-// Whether the engine is in its startup warmup phase, which uses a larger
-// completion-flag budget. See moeA2AGetTimeoutCycles().
-static std::atomic<bool> gInWarmup{false};
+// Process-wide completion-flag budget copied into subsequent dispatch/combine launch arguments,
+// so a captured CUDA graph keeps the budget that was current at capture.
+//
+// No collective separates a rank's first-touch JIT/autotune work from its dispatch launch, so
+// this device-side budget is in effect a deadline on the slowest peer's host-side progress.
+// Python raises it during warmup (tensorrt_llm/_torch/moe/fused_moe/moe_comm_timeout_guard.py).
+static std::atomic<int64_t> gTimeoutCycles{tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles};
 
-void moeA2ASetWarmupOp(bool in_warmup)
+// Set the budget of subsequent launches in seconds; 0 restores the default.
+void moeA2ASetTimeoutOp(int64_t timeoutSec)
 {
-    gInWarmup.store(in_warmup, std::memory_order_relaxed);
+    constexpr int64_t kMaxTimeoutSec = 24 * 60 * 60;
+    TORCH_CHECK(timeoutSec >= 0 && timeoutSec <= kMaxTimeoutSec, "MoE all-to-all timeout must be in 0..",
+        kMaxTimeoutSec, " seconds (0 restores the default), got ", timeoutSec);
+    int64_t const timeoutCycles = timeoutSec == 0 ? tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles
+                                                  : timeoutSec * tensorrt_llm::kernels::moe_comm::kAssumedClockHz;
+    gTimeoutCycles.store(timeoutCycles, std::memory_order_relaxed);
+}
+
+// Return the budget of subsequent launches in seconds.
+int64_t moeA2AGetTimeoutOp()
+{
+    return gTimeoutCycles.load(std::memory_order_relaxed) / tensorrt_llm::kernels::moe_comm::kAssumedClockHz;
 }
 
 static constexpr size_t CACHELINE_ALIGNMENT = 128;
@@ -114,6 +133,16 @@ inline size_t alignOffset(size_t offset, size_t alignment)
     return (offset + alignment - 1) & ~(alignment - 1);
 }
 
+MoeA2AWorkspaceLayout const& readWorkspaceLayout(torch::Tensor const& metainfo)
+{
+    CHECK_CPU(metainfo);
+    CHECK_TYPE(metainfo, torch::kInt64);
+    CHECK_CONTIGUOUS(metainfo);
+    TORCH_CHECK(metainfo.dim() == 1 && metainfo.numel() == NUM_METAINFO_FIELDS,
+        "metainfo must contain the complete MoE A2A workspace layout");
+    return *reinterpret_cast<MoeA2AWorkspaceLayout const*>(metainfo.data_ptr<int64_t>());
+}
+
 inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
 {
     return maskTensor.has_value() && maskTensor.value().defined();
@@ -145,170 +174,187 @@ inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTens
         ") as active");
 }
 
-// Calculate auxiliary data offsets
-MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNumExperts, bool canUseCft)
-{
-    // TODO: Use lambdas to encapsulate offset and alignment for each entry, which is less error prone and easier to
-    // read.
-    constexpr size_t kSizeOfInt32 = sizeof(int32_t);
-
-    MoeA2ADataOffsets offsets{};
-    size_t offset = 0;
-
-    // flag_val
-    offsets[FLAG_VAL_OFFSET_INDEX] = offset;
-    offset += kSizeOfInt32;
-
-    // local_token_counter
-    offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX] = offset;
-    offset += kSizeOfInt32;
-
-    // send_counters
-    offsets[SEND_COUNTERS_OFFSET_INDEX] = offset;
-    offset += epSize * kSizeOfInt32;
-
-    // recv_counters[parity][source_rank] stores the token count received from source_rank.
-    // The two parity banks alternate between A2A rounds.
-    offsets[RECV_COUNTERS_OFFSET_INDEX] = offset;
-    offset += 2 * epSize * kSizeOfInt32;
-
-    // dispatch completion flags
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX] = offset;
-    offset += epSize * kSizeOfInt32;
-
-    // combine completion flags
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[COMBINE_COMPLETION_FLAGS_OFFSET_INDEX] = offset;
-    offset += epSize * kSizeOfInt32;
-
-    // topk_target_ranks: [maxNumTokens, kMaxTopK]
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[TOPK_TARGET_RANKS_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
-        * kSizeOfInt32;
-
-    // topk_send_indices: [maxNumTokens, kMaxTopK]
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[TOPK_SEND_INDICES_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
-        * kSizeOfInt32;
-
-    // eplb gathered stats: [epSize, eplbStatsNumExperts]
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[EPLB_GATHERED_STATS_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(epSize) * static_cast<size_t>(eplbStatsNumExperts) * kSizeOfInt32;
-
-    // Counted write counters: each 8B counter must be kCftCounterStride-aligned, so that
-    // concurrent counter updates do not contend for the same L2 port.
-    using tensorrt_llm::kernels::moe_comm::kCftCounterStride;
-
-    // CFT-only regions; unused offsets stay 0 to keep the field count fixed.
-    if (canUseCft)
-    {
-        // dispatch counted write counters: [ep_size] uint64_t, kCftCounterStride stride
-        offset = alignOffset(offset, kCftCounterStride);
-        offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] = offset;
-        offset += epSize * kCftCounterStride;
-
-        // combine counted write counters (CFT combine path): per receive-slot uint64
-        // counters, [ep_size * maxNumTokens], kCftCounterStride stride to avoid L2 XBAR camping.
-        offset = alignOffset(offset, kCftCounterStride);
-        offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] = offset;
-        offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokens) * kCftCounterStride;
-
-        // dispatch counter baseline: [ep_size] uint64
-        offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-        offsets[DISPATCH_COUNTER_BASELINE_OFFSET_INDEX] = offset;
-        offset += static_cast<size_t>(epSize) * sizeof(uint64_t);
-
-        // combine counter baseline: [ep_size * maxNumTokens] uint64
-        offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-        offsets[COMBINE_COUNTER_BASELINE_OFFSET_INDEX] = offset;
-        offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokens) * sizeof(uint64_t);
-    }
-
-    // payload data
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[PAYLOAD_DATA_OFFSET_INDEX] = offset;
-
-    // Stable combine slot stride (a count, not a byte offset).
-    offsets[MAX_NUM_TOKENS_INDEX] = maxNumTokens;
-
-    return offsets;
-}
-
-// Initialize auxiliary data in workspace
-// This function sets up the initial values for flag_val and completion_flags
-//
-// Inputs:
-//   - workspace: [ep_size, size_per_rank] unified virtual memory workspace
-//   - epRank: Current expert parallel rank
-//   - epSize: Total expert parallel size
-//   - maxNumTokens: Maximum number of tokens supported
-//   - eplbStatsNumExperts: (Optional) Number of experts used for EPLB stats
-//
-// Returns:
-//   - metainfo: Tensor containing offsets for auxiliary data
-torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens,
-    torch::optional<int64_t> eplbStatsNumExperts, bool canUseCftCountedWrites)
+// All offsets and capacities are per rank. Payload capacities are padded so
+// the following phase's control buffers remain aligned.
+MoeA2AWorkspaceLayout calculateWorkspaceLayout(int64_t epSize, int64_t maxNumTokens, int64_t topK,
+    int64_t dispatchBytes, int64_t combineInputBytes, int64_t combineRecvBytes, int64_t eplbStatsNumExperts,
+    bool canUseCft)
 {
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
+    using tensorrt_llm::kernels::moe_comm::kMaxTopK;
+    using tensorrt_llm::kernels::moe_comm::kCftCounterStride;
+    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "Invalid EP size: ", epSize);
+    TORCH_CHECK(maxNumTokens > 0 && maxNumTokens <= std::numeric_limits<int32_t>::max(),
+        "Invalid allocation-time token capacity: ", maxNumTokens);
+    TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "Invalid top_k: ", topK);
+    TORCH_CHECK(eplbStatsNumExperts >= 0 && eplbStatsNumExperts <= std::numeric_limits<int32_t>::max(),
+        "Invalid EPLB expert capacity: ", eplbStatsNumExperts);
+    TORCH_CHECK(canUseCft || combineRecvBytes == 0, "A combine receive payload requires CFT support");
 
-    // Validate inputs
-    CHECK_TH_CUDA(workspace);
-    CHECK_TYPE(workspace, torch::kUInt8);
-    TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
-    TORCH_CHECK(workspace.size(0) == epSize, "workspace first dimension must equal epSize");
-    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
-    TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
-
-    int64_t eplbStatsNumExpertsValue = eplbStatsNumExperts.value_or(0);
-    TORCH_CHECK(eplbStatsNumExpertsValue >= 0, "eplbStatsNumExperts must be positive if not None.");
-
-    // Calculate auxiliary data offsets
-    MoeA2ADataOffsets offsets
-        = calculateOffsets(epSize, maxNumTokens, static_cast<int>(eplbStatsNumExpertsValue), canUseCftCountedWrites);
-
-    // Initialize workspace to zero, then mark both recv-counter parities empty.
-    workspace[epRank].zero_();
-    uint8_t* rankWorkSpacePtr = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
-    cudaMemsetAsync(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX], 0xFF,
-        2 * static_cast<size_t>(epSize) * sizeof(int32_t), at::cuda::getCurrentCUDAStream());
-
-    // Return metainfo as a tensor containing offsets
-    torch::Tensor metainfo = torch::empty(
-        {static_cast<int64_t>(NUM_METAINFO_FIELDS)}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-
-    for (int i = 0; i < static_cast<int>(NUM_METAINFO_FIELDS); i++)
+    auto alignedBytes = [](int64_t bytes)
     {
-        metainfo[i] = static_cast<int64_t>(offsets[i]);
+        TORCH_CHECK(bytes >= 0 && bytes <= std::numeric_limits<int64_t>::max() - kWorkspaceAlignment,
+            "Invalid workspace payload capacity: ", bytes);
+        return static_cast<int64_t>(alignOffset(bytes, kWorkspaceAlignment));
+    };
+    dispatchBytes = alignedBytes(dispatchBytes);
+    combineInputBytes = alignedBytes(combineInputBytes);
+    combineRecvBytes = alignedBytes(combineRecvBytes);
+
+    MoeA2AWorkspaceLayout layout{};
+    int64_t offset = 0;
+    auto reserve = [&](MoeA2AMetaInfoIndex index, int64_t bytes, int64_t alignment = sizeof(int32_t))
+    {
+        TORCH_CHECK(
+            offset <= std::numeric_limits<int64_t>::max() - alignment, "Workspace layout alignment overflows int64");
+        offset = static_cast<int64_t>(alignOffset(offset, alignment));
+        TORCH_CHECK(bytes >= 0 && bytes <= std::numeric_limits<int64_t>::max() - offset,
+            "Workspace layout size overflows int64");
+        layout[index] = offset;
+        offset += bytes;
+    };
+    int64_t const rankCountsBytes = epSize * sizeof(int32_t);
+    int64_t const combineSlots = epSize * maxNumTokens;
+
+    reserve(FLAG_VAL_OFFSET_INDEX, sizeof(uint32_t));
+
+    // Dispatch writes these counters and routes; combine reuses the completed routes.
+    reserve(LOCAL_TOKEN_COUNTER_OFFSET_INDEX, sizeof(int32_t));
+    reserve(SEND_COUNTERS_OFFSET_INDEX, rankCountsBytes);
+    reserve(RECV_COUNTERS_OFFSET_INDEX, 2 * rankCountsBytes);
+    reserve(DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX, rankCountsBytes, CACHELINE_ALIGNMENT);
+    if (canUseCft)
+    {
+        reserve(DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX, epSize * kCftCounterStride, kCftCounterStride);
+        reserve(DISPATCH_COUNTER_BASELINE_OFFSET_INDEX, epSize * sizeof(uint64_t), CACHELINE_ALIGNMENT);
+    }
+    reserve(TOPK_TARGET_RANKS_OFFSET_INDEX, maxNumTokens * topK * sizeof(int32_t), CACHELINE_ALIGNMENT);
+    reserve(TOPK_TARGET_INDICES_OFFSET_INDEX, maxNumTokens * topK * sizeof(int32_t), CACHELINE_ALIGNMENT);
+    reserve(EPLB_GATHERED_STATS_OFFSET_INDEX, epSize * eplbStatsNumExperts * sizeof(int32_t), CACHELINE_ALIGNMENT);
+    reserve(DISPATCH_PAYLOAD_OFFSET_INDEX, dispatchBytes, kWorkspaceAlignment);
+    layout[DISPATCH_PAYLOAD_SIZE_INDEX] = dispatchBytes;
+
+    // Fence pulls from combine input; CFT pushes into the separate receive inbox.
+    reserve(COMBINE_COMPLETION_FLAGS_OFFSET_INDEX, rankCountsBytes, CACHELINE_ALIGNMENT);
+    if (canUseCft)
+    {
+        reserve(COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX, combineSlots * kCftCounterStride, kCftCounterStride);
+        reserve(COMBINE_COUNTER_BASELINE_OFFSET_INDEX, combineSlots * sizeof(uint64_t), CACHELINE_ALIGNMENT);
+    }
+    reserve(COMBINE_INPUT_OFFSET_INDEX, combineInputBytes, kWorkspaceAlignment);
+    layout[COMBINE_INPUT_SIZE_INDEX] = combineInputBytes;
+    if (canUseCft)
+    {
+        reserve(COMBINE_RECV_OFFSET_INDEX, combineRecvBytes, kWorkspaceAlignment);
+        layout[COMBINE_RECV_SIZE_INDEX] = combineRecvBytes;
     }
 
+    layout[MAX_NUM_TOKENS_INDEX] = maxNumTokens;
+    layout[TOP_K_INDEX] = topK;
+    layout[EP_SIZE_INDEX] = epSize;
+    layout[EPLB_STATS_NUM_EXPERTS_INDEX] = eplbStatsNumExperts;
+    layout[CFT_ENABLED_INDEX] = canUseCft;
+    layout[WORKSPACE_SIZE_INDEX] = offset;
+    return layout;
+}
+
+torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, int64_t topK, int64_t dispatchBytes,
+    int64_t combineInputBytes, int64_t combineRecvBytes, torch::optional<int64_t> eplbStatsNumExperts, bool canUseCft)
+{
+    auto const layout = calculateWorkspaceLayout(epSize, maxNumTokens, topK, dispatchBytes, combineInputBytes,
+        combineRecvBytes, eplbStatsNumExperts.value_or(0), canUseCft);
+    auto metainfo
+        = torch::empty({NUM_METAINFO_FIELDS}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    std::copy(layout.begin(), layout.end(), metainfo.data_ptr<int64_t>());
+    return metainfo;
+}
+
+// Initialize control state after allocation; layout construction itself is CPU-only.
+void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize)
+{
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    TORCH_CHECK(workspace.dim() == 2 && workspace.size(0) == epSize && workspace.stride(1) == 1,
+        "workspace must have shape [ep_size, bytes_per_rank] with contiguous rank slices");
+    TORCH_CHECK(epRank >= 0 && epRank < epSize, "Invalid EP rank");
+    auto const& layout = readWorkspaceLayout(metainfo);
+    TORCH_CHECK(layout[EP_SIZE_INDEX] == epSize, "Workspace layout EP size mismatch");
+    auto const expected = calculateWorkspaceLayout(epSize, layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
+        layout[DISPATCH_PAYLOAD_SIZE_INDEX], layout[COMBINE_INPUT_SIZE_INDEX], layout[COMBINE_RECV_SIZE_INDEX],
+        layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX]);
+    TORCH_CHECK(layout == expected, "Workspace layout metadata is inconsistent");
+    TORCH_CHECK(layout[DISPATCH_PAYLOAD_SIZE_INDEX] > 0 && layout[COMBINE_INPUT_SIZE_INDEX] > 0,
+        "Dispatch and combine input payload capacities must be positive");
+    TORCH_CHECK(!layout[CFT_ENABLED_INDEX] || layout[COMBINE_RECV_SIZE_INDEX] > 0,
+        "CFT requires a combine receive payload capacity");
+    TORCH_CHECK(workspace.size(1) >= layout[WORKSPACE_SIZE_INDEX], "Workspace needs ", layout[WORKSPACE_SIZE_INDEX],
+        " bytes per rank, got ", workspace.size(1));
+
+    workspace[epRank].narrow(0, 0, layout[WORKSPACE_SIZE_INDEX]).zero_();
+    uint8_t* rankWorkspace = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
+    cudaMemsetAsync(rankWorkspace + layout[RECV_COUNTERS_OFFSET_INDEX], 0xFF,
+        2 * static_cast<size_t>(epSize) * sizeof(int32_t), at::cuda::getCurrentCUDAStream());
     // Synchronize among ranks. Under a non-MPI orchestrator (Ray) MpiComm throws
     // "MPI is disabled, DON'T USE MPI" from mpiUtils.h, which made the whole
     // NVLinkOneSided strategy unusable there; fall back to the Torch process
     // group the Ray workers already initialise, as pg_utils does elsewhere.
     cudaDeviceSynchronize();
     moeA2ABarrier();
-
-    return metainfo;
 }
 
 // ============================================================================
 // CFT Handle-Based Counted Writes Initialization
 // ============================================================================
 
-// Static CftLeManager — one per process, bound to a single workspace.
+using CftLeManager = tensorrt_llm::kernels::moe_comm::CftLeManager;
+
+// One CftLeManager per workspace, keyed by this rank's workspace region. Each
+// workspace has its own MNNVL allocation handle, so it needs its own logical
+// endpoint.
 //
-// The manager owns a logical endpoint bound to the workspace's MNNVL
-// allocation, so it must be destroyed before that allocation is freed and its
-// virtual address is recycled; otherwise a later binding could resolve to an
-// endpoint left over from a dead allocation. The Python NVLinkOneSided
-// teardown calls moe_a2a_cft_release while the workspace is still alive.
-// MoeAlltoAll otherwise retains its shared workspaces for the process
-// lifetime, so the manager normally survives until static destruction.
-static std::unique_ptr<tensorrt_llm::kernels::moe_comm::CftLeManager> g_cft_manager;
+// A manager owns a logical endpoint bound to its workspace's MNNVL allocation,
+// so it must be destroyed before that allocation is freed and its virtual
+// address is recycled; otherwise a later binding at the same address could
+// resolve to an endpoint left over from a dead allocation. The Python
+// NVLinkOneSided teardown calls moe_a2a_cft_release while the workspace is
+// still alive, which destroys the manager and erases its entry. MoeAlltoAll
+// otherwise retains its shared workspaces for the process lifetime, so a
+// manager normally survives until static destruction.
+//
+// g_cft_managers_mutex guards every access to the map and to the managers in
+// it. No pointer into a manager escapes the lock: dispatch and combine copy the
+// peer LE ids out under it (copyCftPeerLeIds), so a release cannot leave them
+// holding a destroyed manager. Releasing a workspace while a dispatch or
+// combine on it is still running remains a caller error, as it is for the
+// workspace memory itself.
+static std::unordered_map<CUdeviceptr, std::unique_ptr<CftLeManager>> g_cft_managers;
+static std::mutex g_cft_managers_mutex;
+
+static bool hasInitializedCftManager(CUdeviceptr workspaceRankPtr)
+{
+    std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
+    auto const it = g_cft_managers.find(workspaceRankPtr);
+    return it != g_cft_managers.end() && it->second->isInitialized();
+}
+
+// Copy the peer LE ids of this workspace's manager into dst. Returns false when
+// the workspace has no initialized manager.
+template <typename LeId>
+static bool copyCftPeerLeIds(CUdeviceptr workspaceRankPtr, int64_t epSize, LeId* dst)
+{
+    std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
+    auto const it = g_cft_managers.find(workspaceRankPtr);
+    if (it == g_cft_managers.end() || !it->second->isInitialized())
+    {
+        return false;
+    }
+    auto const* leIds = it->second->getAllLeIds();
+    for (int64_t i = 0; i < epSize; ++i)
+    {
+        dst[i] = static_cast<LeId>(leIds[i]);
+    }
+    return true;
+}
 
 // Initialize CFT Logical Endpoints by binding the LE to the MNNVL workspace.
 // The workspace memory IS the LE backing store — fabric.try_put.counted writes land
@@ -357,23 +403,20 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
 
-    if (g_cft_manager && g_cft_manager->isInitialized())
+    if (hasInitializedCftManager(workspaceRankPtr))
     {
-        TORCH_CHECK(g_cft_manager->getLocalBackingPtr() == workspaceRankPtr,
-            "CFT logical endpoints are already bound to a different workspace. Only one workspace "
-            "per process may use CFT counted writes.");
         return;
     }
 
-    g_cft_manager = std::make_unique<tensorrt_llm::kernels::moe_comm::CftLeManager>();
+    auto manager = std::make_unique<CftLeManager>();
 
-    TORCH_CHECK(g_cft_manager->loadApis(),
+    TORCH_CHECK(manager->loadApis(),
         "CftLeManager: Failed to load LE driver APIs. The installed driver does not export the "
         "CUDA logical endpoint API that CFT requires.");
 
     int localDevIdx = -1;
     TORCH_CHECK(cudaGetDevice(&localDevIdx) == cudaSuccess, "cudaGetDevice failed during CFT initialization");
-    TORCH_CHECK(g_cft_manager->createEndpointExternal(localDevIdx,
+    TORCH_CHECK(manager->createEndpointExternal(localDevIdx,
                     static_cast<CUmemGenericAllocationHandle>(workspaceMemHandle), workspaceRankPtr,
                     static_cast<size_t>(workspaceSizePerRank), static_cast<int>(epRank), static_cast<int>(epSize)),
         "CftLeManager: Failed to create LE endpoint bound to workspace on device ", localDevIdx);
@@ -381,7 +424,7 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     auto allgatherFn = [](void const* sendBuf, void* recvBuf, size_t bytesPerRank)
     { moeA2AAllgatherBytes(sendBuf, recvBuf, bytesPerRank); };
 
-    TORCH_CHECK(g_cft_manager->exchangeEndpoints(allgatherFn), "CftLeManager: Failed to exchange LE endpoints");
+    TORCH_CHECK(manager->exchangeEndpoints(allgatherFn), "CftLeManager: Failed to exchange LE endpoints");
 
     cudaError_t initErr = cudaDeviceSynchronize();
     if (initErr != cudaSuccess)
@@ -402,15 +445,19 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     {
         moeA2ABarrier();
     }
+    std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
+    bool const inserted = g_cft_managers.try_emplace(workspaceRankPtr, std::move(manager)).second;
+    TORCH_CHECK(inserted, "CFT logical endpoints were initialized concurrently for the same workspace");
 }
 
 // Release the CFT logical endpoint before its backing workspace is freed.
 //
-// Idempotent, and a no-op unless the manager is actually bound to this
-// workspace's rank region: the caller passes the workspace it is tearing down,
-// and a manager bound to some other allocation must outlive that teardown.
-// Destroying the manager here — rather than at static destruction — keeps the
-// endpoint from outliving the virtual address it is bound to.
+// Idempotent, and only touches the manager bound to this workspace's rank
+// region: the caller passes the workspace it is tearing down, and managers bound
+// to other workspaces must outlive that teardown. Destroying the manager here --
+// rather than at static destruction -- keeps the endpoint from outliving the
+// virtual address it is bound to, and erasing the entry lets a later
+// allocation at the same address bind a fresh endpoint.
 void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
 {
     CHECK_TH_CUDA(workspace);
@@ -418,29 +465,19 @@ void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
     TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
     TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "epRank must be in the range [0, epSize)");
 
-    if (!g_cft_manager)
-    {
-        return;
-    }
-
-    // An uninitialized manager holds no endpoint (initialization threw part
-    // way through); drop it unconditionally so a retry starts clean.
-    if (!g_cft_manager->isInitialized())
-    {
-        g_cft_manager.reset();
-        return;
-    }
-
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
-    if (g_cft_manager->getLocalBackingPtr() != workspaceRankPtr)
+
+    std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
+    auto const it = g_cft_managers.find(workspaceRankPtr);
+    if (it == g_cft_managers.end())
     {
         return;
     }
-
     // ~CftLeManager runs destroy(): unbind, destroy the local and imported
-    // endpoints, and release the reserved LE id block.
-    g_cft_manager.reset();
+    // endpoints, and release the reserved LE id block. Then drop the entry.
+    it->second.reset();
+    g_cft_managers.erase(it);
 }
 
 // MoE All-to-All Dispatch Operation
@@ -491,15 +528,12 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     TORCH_CHECK(tokenSelectedExperts.dim() == 2, "tokenSelectedExperts must be a 2D tensor");
     TORCH_CHECK(tokenSelectedExperts.size(1) == topK, "tokenSelectedExperts must have topK columns");
 
-    CHECK_CPU(metainfo);
-    CHECK_TYPE(metainfo, torch::kInt64);
-    TORCH_CHECK(metainfo.dim() == 1, "metainfo must be a 1D tensor");
-    TORCH_CHECK(metainfo.size(0) == static_cast<int64_t>(NUM_METAINFO_FIELDS),
-        "metainfo must have NUM_METAINFO_FIELDS elements");
-    MoeA2ADataOffsets const& offsets = *reinterpret_cast<MoeA2ADataOffsets const*>(metainfo.data_ptr<int64_t>());
+    auto const& offsets = readWorkspaceLayout(metainfo);
 
     int64_t localNumTokens = tokenSelectedExperts.size(0);
     TORCH_CHECK(runtimeMaxTokensPerRank > 0, "runtimeMaxTokensPerRank must be positive");
+    TORCH_CHECK(runtimeMaxTokensPerRank <= offsets[MAX_NUM_TOKENS_INDEX],
+        "runtimeMaxTokensPerRank exceeds the allocation-time token capacity");
     TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
@@ -538,7 +572,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // Record the cacheline aligned start offset for each payload's recv buffer.
     // 1. We assume the base workspace ptr of each rank is aligned (checked in this OP)
-    // 2. offsets[PAYLOAD_DATA_OFFSET_INDEX] is aligned (ensured in calculateOffsets)
+    // 2. offsets[DISPATCH_PAYLOAD_OFFSET_INDEX] is aligned (fixed by the workspace layout)
     // 3. We align the currentOffset during update.
     // In this way, it is guaranteed that the recv buffer is (over-)aligned, sufficient for 128bit vectorized ld/st.
 
@@ -547,7 +581,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     std::vector<size_t> payloadRecvBufferOffsets;
 
     // Start offset for the first payload
-    size_t currentOffset = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+    size_t currentOffset = static_cast<size_t>(offsets[DISPATCH_PAYLOAD_OFFSET_INDEX]);
     for (auto const& payload : inputPayloads)
     {
         CHECK_CONTIGUOUS(payload);
@@ -594,14 +628,18 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
     TORCH_CHECK(workspace.size(0) == epSize, "workspace first dimension must equal epSize");
 
-    // Validate workspace size - must include space for auxiliary data + payloads
-    int64_t sizePerRank = workspace.size(1);
-    int64_t requiredSize = static_cast<int64_t>(currentOffset);
-    TORCH_CHECK(sizePerRank >= requiredSize,
-        "Workspace size per rank insufficient for dispatch. "
-        "Need at least ",
-        requiredSize, " bytes (", offsets[PAYLOAD_DATA_OFFSET_INDEX], " for auxiliary data + payloads), but got ",
-        sizePerRank);
+    TORCH_CHECK(epSize == offsets[EP_SIZE_INDEX] && topK == offsets[TOP_K_INDEX],
+        "Dispatch EP size/top_k differs from its workspace layout");
+    TORCH_CHECK(localNumTokens <= runtimeMaxTokensPerRank, "Local token count exceeds the runtime capacity");
+    TORCH_CHECK(eplbStatsNumExperts <= offsets[EPLB_STATS_NUM_EXPERTS_INDEX],
+        "EPLB statistics exceed their workspace capacity");
+    TORCH_CHECK(!useCftCountedWrites || offsets[CFT_ENABLED_INDEX], "Workspace was allocated without CFT support");
+    TORCH_CHECK(workspace.size(1) >= offsets[WORKSPACE_SIZE_INDEX], "Workspace is smaller than its layout");
+    int64_t const combinePayloadOffset = offsets[COMBINE_INPUT_OFFSET_INDEX];
+    int64_t const payloadCapacity = offsets[DISPATCH_PAYLOAD_SIZE_INDEX];
+    TORCH_CHECK(currentOffset <= static_cast<size_t>(offsets[DISPATCH_PAYLOAD_OFFSET_INDEX] + payloadCapacity),
+        "Dispatch payload exceeds its workspace capacity: need ",
+        currentOffset - offsets[DISPATCH_PAYLOAD_OFFSET_INDEX], " bytes, capacity ", payloadCapacity);
 
     // Get base workspace pointer
     uint8_t* workspacePtr = workspace.data_ptr<uint8_t>();
@@ -639,7 +677,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
     params.send_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[SEND_COUNTERS_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
-    params.topk_send_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_SEND_INDICES_OFFSET_INDEX]);
+    params.topk_target_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_INDICES_OFFSET_INDEX]);
 
     for (int target_rank = 0; target_rank < epSize; target_rank++)
     {
@@ -697,15 +735,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     // CFT handle-based counted writes
     if (useCftCountedWrites)
     {
-        TORCH_CHECK(g_cft_manager && g_cft_manager->isInitialized(),
-            "CFT counted writes requested but moe_a2a_cft_initialize has not been called");
-
         // Fill peer LE IDs
-        auto const* leIds = g_cft_manager->getAllLeIds();
-        for (int i = 0; i < static_cast<int>(epSize); i++)
-        {
-            params.cft_peer_le_ids[i] = leIds[i];
-        }
+        TORCH_CHECK(copyCftPeerLeIds(reinterpret_cast<CUdeviceptr>(rankWorkSpacePtr), epSize, params.cft_peer_le_ids),
+            "CFT counted writes requested but moe_a2a_cft_initialize has not been called for this workspace");
 
         // LE payload offsets = workspace payload offsets (LE IS the workspace).
         // No separate LE layout — fabric.try_put.counted writes directly into workspace recv_buffers.
@@ -735,8 +767,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     }
 
     params.stream = at::cuda::getCurrentCUDAStream();
-    params.timeout_cycles
-        = tensorrt_llm::kernels::moe_comm::moeA2AGetTimeoutCycles(gInWarmup.load(std::memory_order_relaxed));
+    params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
 
     // Prepare for dispatch (zero counters/indices and increment flag_val)
     moe_a2a_prepare_dispatch_launch(params);
@@ -752,23 +783,12 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
     {
         auto const& payload = inputPayloads[payload_idx];
-        void* recvDataPtr;
-        if (useCftCountedWrites)
-        {
-            // LE IS workspace — recv data is at the same workspace offset regardless of CFT.
-            recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
-        }
-        else
-        {
-            recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
-        }
+        void* recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
         auto recvTensor = torch::from_blob(
             recvDataPtr, {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]}, payload.options());
         recvTensors.push_back(recvTensor);
     }
 
-    // Compute aligned offset after dispatch payloads for combine payload region
-    int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(currentOffset, CACHELINE_ALIGNMENT));
     torch::Tensor eplbGatheredStats;
     if (enableEplb)
     {
@@ -788,9 +808,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 // MoE All-to-All Combine Operation
 // Combine the per-rank expert outputs into the originating tokens' buffers on the local rank.
 //
-// The payload may be external or a view of the normal combine workspace region. Callers that place
-// the MoE output directly in the workspace pass payloadInWorkspace=true to skip staging; callers
-// that cannot choose the MoE output tensor leave it false and prepareCombine stages the payload.
+// The payload may be external or a view of the combine input region. Recognize the input
+// region by its address; payloadInWorkspace=true additionally requires that zero-copy path.
+// Other sources, including dispatch payload views, are staged when needed.
 // Fence combine reads from 'combinePayloadOffset'. CFT combine stages the local slice and receives
 // peer slices in a dedicated counted-write region before reduction.
 torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
@@ -843,12 +863,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     }
     // use_low_precision is passed through to the kernel via params.use_low_precision; dtype is not mutated.
 
-    CHECK_CPU(metainfo);
-    CHECK_TYPE(metainfo, torch::kInt64);
-    TORCH_CHECK(metainfo.dim() == 1, "metainfo must be a 1D tensor");
-    TORCH_CHECK(metainfo.size(0) == static_cast<int64_t>(NUM_METAINFO_FIELDS),
-        "metainfo must have NUM_METAINFO_FIELDS elements");
-    MoeA2ADataOffsets const& offsets = *reinterpret_cast<MoeA2ADataOffsets const*>(metainfo.data_ptr<int64_t>());
+    auto const& offsets = readWorkspaceLayout(metainfo);
 
     // Validate workspace and set synchronization pointers
     CHECK_TH_CUDA(workspace);
@@ -857,22 +872,24 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     uint8_t* workspacePtr = workspace.data_ptr<uint8_t>();
     int64_t sizePerRank = workspace.size(1);
     uint8_t* rankWorkSpacePtr = workspacePtr + epRank * workspace.stride(0);
-    TORCH_CHECK(combinePayloadOffset >= 0, "combinePayloadOffset must be non-negative");
+    TORCH_CHECK(epSize == offsets[EP_SIZE_INDEX] && topK == offsets[TOP_K_INDEX],
+        "Combine EP size/top_k differs from its workspace layout");
+    TORCH_CHECK(sizePerRank >= offsets[WORKSPACE_SIZE_INDEX], "Workspace is smaller than its layout");
+    TORCH_CHECK(!useCftCountedWrites || offsets[CFT_ENABLED_INDEX], "Workspace was allocated without CFT support");
+    int64_t const regionSize = offsets[COMBINE_INPUT_SIZE_INDEX];
+    TORCH_CHECK(combinePayloadOffset == offsets[COMBINE_INPUT_OFFSET_INDEX],
+        "combinePayloadOffset must address the fixed combine source region");
+    TORCH_CHECK(runtimeMaxTokensPerRank <= offsets[MAX_NUM_TOKENS_INDEX],
+        "runtimeMaxTokensPerRank exceeds the allocation-time token capacity");
     uint8_t* combinePayloadPtr = rankWorkSpacePtr + combinePayloadOffset;
     // If the caller claims the payload is in the workspace, ensure it really is: a mismatch would
     // otherwise silently fall back to staging and lose the zero-copy path the caller asked for.
-    if (payloadInWorkspace)
-    {
-        TORCH_CHECK(payload.data_ptr() == combinePayloadPtr,
-            "payload_in_workspace is true but 'payload' dataptr does not match combinePayloadOffset");
-    }
-
+    bool const inputIsWorkspace = payload.data_ptr() == combinePayloadPtr;
+    TORCH_CHECK(!payloadInWorkspace || inputIsWorkspace,
+        "payload_in_workspace is true but payload does not address the combine input region");
     int64_t payloadSize = payload.numel() * payload.element_size();
-    TORCH_CHECK(combinePayloadOffset + payloadSize <= sizePerRank,
-        "Workspace size per rank insufficient for combine. "
-        "Need at least ",
-        combinePayloadOffset + payloadSize, " bytes (", combinePayloadOffset, " for offset + ", payloadSize,
-        " for payload), but got ", sizePerRank);
+    TORCH_CHECK(payloadSize <= regionSize, "Combine payload exceeds its fixed workspace region: need ", payloadSize,
+        " bytes, capacity ", regionSize);
 
     // Create output tensor (local on current rank), no need for initialization
     // Typically, newly allocated GPU torch tensors are at least 16-byte aligned.
@@ -896,11 +913,11 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.wire_bytes_per_token
         = static_cast<int>(elementsPerToken) * (useLowPrecision ? 1 : static_cast<int>(payload.element_size()));
     params.workspace_stride_per_token
-        = useLowPrecision && !payloadInWorkspace ? params.wire_bytes_per_token : params.source_stride_per_token;
+        = useLowPrecision && !inputIsWorkspace ? params.wire_bytes_per_token : params.source_stride_per_token;
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
-    params.topk_send_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_SEND_INDICES_OFFSET_INDEX]);
+    params.topk_target_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_INDICES_OFFSET_INDEX]);
     params.recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
 
     for (int target_rank = 0; target_rank < epSize; target_rank++)
@@ -908,7 +925,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         uint8_t* target_workspace_ptr = workspacePtr + target_rank * workspace.stride(0);
         params.completion_flags[target_rank]
             = reinterpret_cast<uint32_t*>(target_workspace_ptr + offsets[COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]);
-        params.recv_buffers[target_rank] = target_workspace_ptr + combinePayloadOffset;
+        params.combine_input_buffers[target_rank] = target_workspace_ptr + combinePayloadOffset;
     }
 
     // CFT requires the payload to be 16B-aligned (fabric.try_put.counted operates on 16B chunks).
@@ -918,29 +935,25 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
             " bytes per token; CFT counted writes require 16-byte alignment");
     }
 
-    // ---- CFT combine wiring (counted writes). Sets up dedicated receive region C,
-    // per-slot combine counters, and single-buffer baselines. Fence combine ignores these. ----
+    // CFT receives peer pushes and the local contribution into a dedicated local inbox.
+    // Fence combine instead reads the peer combine input buffers directly.
     params.use_cft_for_combine = useCftCountedWrites;
     if (useCftCountedWrites)
     {
-        TORCH_CHECK(g_cft_manager && g_cft_manager->isInitialized(),
-            "CFT counted writes requested but moe_a2a_cft_initialize has not been called");
-        auto const* leIds = g_cft_manager->getAllLeIds();
-        for (int i = 0; i < static_cast<int>(epSize); i++)
-        {
-            params.cft_peer_le_ids[i] = leIds[i];
-        }
+        TORCH_CHECK(copyCftPeerLeIds(reinterpret_cast<CUdeviceptr>(rankWorkSpacePtr), epSize, params.cft_peer_le_ids),
+            "CFT counted writes requested but moe_a2a_cft_initialize has not been called for this workspace");
 
         // Dedicated combine receive region: prepare writes the local slice and fabric pushes write peer slices.
-        int64_t combineRecvRegionOffset = alignOffset(combinePayloadOffset + payloadSize, CACHELINE_ALIGNMENT);
-        TORCH_CHECK(combineRecvRegionOffset + payloadSize <= sizePerRank,
-            "CFT combine: workspace too small for combine receive region C: need ",
-            combineRecvRegionOffset + payloadSize, " bytes, got ", sizePerRank);
-        params.cft_le_combine_payload_base = static_cast<uint64_t>(combineRecvRegionOffset);
+        int64_t const combineRecvRegionOffset = offsets[COMBINE_RECV_OFFSET_INDEX];
+        int64_t const receiveBytes = epSize * runtimeMaxTokensPerRank * params.wire_bytes_per_token;
+        TORCH_CHECK(receiveBytes <= offsets[COMBINE_RECV_SIZE_INDEX],
+            "CFT combine receive payload exceeds its workspace capacity: need ", receiveBytes, " bytes, capacity ",
+            offsets[COMBINE_RECV_SIZE_INDEX]);
+        params.cft_combine_recv_offset = static_cast<uint64_t>(combineRecvRegionOffset);
         params.cft_le_combine_counter_base = offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX];
         params.cft_le_combine_counters
             = reinterpret_cast<uint64_t*>(rankWorkSpacePtr + offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX]);
-        params.cft_le_combine_recv = reinterpret_cast<void*>(rankWorkSpacePtr + combineRecvRegionOffset);
+        params.cft_combine_recv_payload = rankWorkSpacePtr + combineRecvRegionOffset;
 
         {
             int const staticMaxTokens = static_cast<int>(offsets[MAX_NUM_TOKENS_INDEX]);
@@ -979,7 +992,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     }
     else
     {
-        params.prepare_num_tokens = payloadInWorkspace ? 0 : params.ep_size * params.max_tokens_per_rank;
+        params.prepare_num_tokens = inputIsWorkspace ? 0 : params.ep_size * params.max_tokens_per_rank;
     }
 
     params.cft_push_payload = params.use_low_precision ? combinePayloadPtr : params.source_payload;
@@ -989,8 +1002,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         = params.use_cft_for_combine ? params.wire_bytes_per_token : params.workspace_stride_per_token;
 
     params.stream = at::cuda::getCurrentCUDAStream();
-    params.timeout_cycles
-        = tensorrt_llm::kernels::moe_comm::moeA2AGetTimeoutCycles(gInWarmup.load(std::memory_order_relaxed));
+    params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
 
     moe_a2a_prepare_combine_launch(params);
 
@@ -1019,12 +1031,7 @@ void moeA2ASanitizeExpertIdsOp(torch::Tensor& expert_ids, torch::Tensor& workspa
     int runtime_max_tokens_per_rank = static_cast<int>(expert_ids.size(1));
     int top_k = static_cast<int>(expert_ids.size(2));
 
-    CHECK_CPU(metainfo);
-    CHECK_TYPE(metainfo, torch::kInt64);
-    TORCH_CHECK(metainfo.dim() == 1, "metainfo must be a 1D tensor");
-    TORCH_CHECK(metainfo.size(0) == static_cast<int64_t>(NUM_METAINFO_FIELDS),
-        "metainfo must have NUM_METAINFO_FIELDS elements");
-    MoeA2ADataOffsets const& offsets = *reinterpret_cast<MoeA2ADataOffsets const*>(metainfo.data_ptr<int64_t>());
+    auto const& offsets = readWorkspaceLayout(metainfo);
 
     uint8_t* rankWorkSpacePtr = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
     int* recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
@@ -1036,8 +1043,8 @@ void moeA2ASanitizeExpertIdsOp(torch::Tensor& expert_ids, torch::Tensor& workspa
 }
 
 // Return a workspace-backed tensor for combine payload region using from_blob
-torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize,
-    int64_t runtimeMaxTokensPerRank, int64_t combinePayloadOffset, c10::ScalarType outDtype, int64_t hiddenSize)
+torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, torch::Tensor const& metainfo,
+    int64_t epRank, int64_t epSize, int64_t runtimeMaxTokensPerRank, c10::ScalarType outDtype, int64_t hiddenSize)
 {
     CHECK_TH_CUDA(workspace);
     CHECK_TYPE(workspace, torch::kUInt8);
@@ -1050,10 +1057,14 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
     int64_t sizePerRank = workspace.size(1); // bytes
     int64_t elementSize = static_cast<int64_t>(c10::elementSize(outDtype));
     int64_t bytesNeeded = epSize * runtimeMaxTokensPerRank * hiddenSize * elementSize;
-    TORCH_CHECK(combinePayloadOffset >= 0, "combine_payload_offset must be non-negative");
-    TORCH_CHECK(combinePayloadOffset + bytesNeeded <= sizePerRank,
-        "workspace does not have enough space for combine payload tensor. combine payload offset=",
-        combinePayloadOffset, ", payload size needed=", bytesNeeded, ", workspace size per rank=", sizePerRank);
+    auto const& layout = readWorkspaceLayout(metainfo);
+    TORCH_CHECK(epSize == layout[EP_SIZE_INDEX], "Combine view EP size differs from its workspace layout");
+    TORCH_CHECK(runtimeMaxTokensPerRank <= layout[MAX_NUM_TOKENS_INDEX],
+        "Combine view exceeds the allocation-time token capacity");
+    TORCH_CHECK(sizePerRank >= layout[WORKSPACE_SIZE_INDEX], "Workspace is smaller than its layout");
+    int64_t const combinePayloadOffset = layout[COMBINE_INPUT_OFFSET_INDEX];
+    TORCH_CHECK(bytesNeeded <= layout[COMBINE_INPUT_SIZE_INDEX], "Combine view exceeds its input region: need ",
+        bytesNeeded, " bytes, capacity ", layout[COMBINE_INPUT_SIZE_INDEX]);
 
     uint8_t* base = workspace.data_ptr<uint8_t>();
     uint8_t* rankBase = base + epRank * workspace.stride(0);
@@ -1062,17 +1073,6 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
     auto options = workspace.options().dtype(outDtype);
     torch::Tensor t = torch::from_blob(dataPtr, {epSize * runtimeMaxTokensPerRank, hiddenSize}, options);
     return t;
-}
-
-// Return the size of auxiliary data in workspace
-int64_t moeA2AGetAuxDataSizeOp(
-    int64_t epSize, int64_t maxNumTokens, torch::optional<int64_t> eplbStatsNumExperts, bool canUseCftCountedWrites)
-{
-    int64_t eplbStatsNumExpertsValue = eplbStatsNumExperts.value_or(0);
-    TORCH_CHECK(eplbStatsNumExpertsValue >= 0, "eplbStatsNumExperts must be positive if not None.");
-    MoeA2ADataOffsets offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxNumTokens),
-        static_cast<int>(eplbStatsNumExpertsValue), canUseCftCountedWrites);
-    return static_cast<int64_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
 }
 
 } // namespace moe_comm
@@ -1110,21 +1110,20 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
     module.def("moe_a2a_cft_release(Tensor(a!) workspace, int ep_rank) -> ()");
-    module.def(
-        "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
-        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False) -> Tensor");
+    module.def("moe_a2a_initialize(Tensor(a!) workspace, Tensor metainfo, int ep_rank, int ep_size) -> ()");
     module.def(
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");
     module.def(
-        "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, int ep_rank, int ep_size, int "
-        "runtime_max_tokens_per_rank, "
-        "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
-    module.def("moe_a2a_set_warmup(bool in_warmup) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetWarmupOp);
+        "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, Tensor metainfo, int ep_rank, int ep_size, "
+        "int runtime_max_tokens_per_rank, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
+    module.def("moe_a2a_set_timeout(int timeout_sec) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetTimeoutOp);
+    module.def("moe_a2a_get_timeout() -> int", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetTimeoutOp);
     module.def(
-        "moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens, int? eplb_stats_num_experts=None, "
-        "bool can_use_cft_counted_writes=False) -> int",
-        &tensorrt_llm::torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
+        "moe_a2a_get_workspace_layout(int ep_size, int max_num_tokens_per_rank, int top_k, "
+        "int dispatch_payload_bytes, int combine_input_bytes, int combine_recv_bytes, "
+        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False) -> Tensor",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2AGetWorkspaceLayoutOp);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)

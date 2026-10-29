@@ -56,14 +56,12 @@ worker_config:
       enable_padding: true
       max_batch_size: 256
     kv_cache_config:
-      use_kv_cache_manager_v2: false
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
       dtype: fp8
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 1024
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
@@ -82,7 +80,6 @@ worker_config:
     enable_attention_dp: false
     cuda_graph_config: null
     kv_cache_config:
-      use_kv_cache_manager_v2: false
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
       dtype: fp8
@@ -90,7 +87,6 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 1024
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512

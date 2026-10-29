@@ -46,7 +46,8 @@ from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+                        skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
+                        skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
                             LlmapiAccuracyTestHarness,
@@ -105,9 +106,10 @@ def compute_disagg_acceptance_length(serve_url: str) -> float:
     polled directly. Only generation workers are asked: the drafter runs
     during decode, so context workers report no speculative iterations.
 
-    Requires ``enable_iter_perf_stats`` on the generation workers, plus
-    ``iter_stats_max_iterations: -1`` so the server's stats buffer (default
-    1000 iterations) does not silently drop the earlier part of a long run.
+    Requires ``enable_iter_perf_stats`` and ``max_stats_len: -1`` on the
+    generation workers so the engine's stats buffer does not silently drop the
+    earlier part of a long run. When the server metrics collector is enabled,
+    ``iter_stats_max_iterations: -1`` must also be set for its snapshot buffer.
     """
     info = requests.get(f"{serve_url}/cluster_info", timeout=10)
     info.raise_for_status()
@@ -377,18 +379,12 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(ctx_ports):
         env = base_env.copy()
-        cache_transceiver_config_backend = ctx_server_config.get(
-            "cache_transceiver_config", {}).get("backend", "DEFAULT")
-        # NIXL backend ignores this env-var fallback; skip it.
-        if cache_transceiver_config_backend != "NIXL":
-            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
-        if cache_transceiver_config_backend == "NIXL":
-            env["UCX_MM_ERROR_HANDLING"] = "y"
+        env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
@@ -414,17 +410,11 @@ def launch_disaggregated_llm(
         env = base_env.copy()
         if gen_extra_env:
             env.update(gen_extra_env)
-        cache_transceiver_config_backend = gen_server_config.get(
-            "cache_transceiver_config", {}).get("backend", "DEFAULT")
-        # NIXL backend ignores this env-var fallback; skip it.
-        if cache_transceiver_config_backend != "NIXL":
-            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
-        if cache_transceiver_config_backend == "NIXL":
-            env["UCX_MM_ERROR_HANDLING"] = "y"
+        env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
@@ -698,7 +688,7 @@ def run_parallel_test(model_name: str,
                       test_sets: List[LlmapiAccuracyTestHarness],
                       ctx_model: str = None,
                       gen_model: str = None,
-                      cache_transceiver_backend: str = "DEFAULT",
+                      cache_transceiver_backend: str = "NIXL",
                       trust_remote_code: bool = False,
                       quant_algo: str = None,
                       kv_cache_quant_algo: str = None,
@@ -721,7 +711,6 @@ def run_parallel_test(model_name: str,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
             "backend": cache_transceiver_backend,
-            "max_tokens_in_buffer": 4096
         }
     }
     gen_server_config = {
@@ -731,7 +720,6 @@ def run_parallel_test(model_name: str,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
             "backend": cache_transceiver_backend,
-            "max_tokens_in_buffer": 4096
         }
     }
     if max_batch_size is not None:
@@ -785,7 +773,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096,
             },
         }
         gen_server_config = {
@@ -793,7 +780,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096,
             },
         }
         disaggregated_server_config = {
@@ -818,26 +804,79 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
+    @skip_no_rubin
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_nvfp4_kv_cache_nixl(self):
+        """FP4 MLA: the generation worker decodes from an imported NVFP4 cache."""
+        kv_cache_config = {
+            "dtype": "nvfp4",
+            "use_kv_cache_manager_v2": True,
+            "enable_block_reuse": False,
+            "free_gpu_memory_fraction": 0.75,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 8192,
+        }
+        speculative_config = {"decoding_type": "MTP", "max_draft_len": 3}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+            "speculative_config": speculative_config,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "enable_chunked_prefill": False,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+            "speculative_config": speculative_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                disaggregated_server_config, ctx_server_config,
+                gen_server_config,
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
+        ) as llm:
+            # The DuckLLM args do not carry the served quantization, so set
+            # the specs the accuracy reference lookup matches on.
+            llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            llm.args.speculative_config = MTPDecodingConfig(max_draft_len=3)
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
     @pytest.mark.skip_less_device(8)
     @skip_pre_hopper
-    def test_gen_only_spec_dec(self):
+    def test_symmetric(self):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {
             "disable_overlap_scheduler": False,
             "enable_iter_perf_stats": True,
             "iter_stats_max_iterations": -1,
+            "max_stats_len": -1,
         }
         cache_transceiver_config = {
             "backend": "NIXL",
-            "max_tokens_in_buffer": 4096,
             "transceiver_runtime": "PYTHON",
         }
         ctx_server_config["cache_transceiver_config"] = cache_transceiver_config
         gen_server_config["cache_transceiver_config"] = cache_transceiver_config
-        gen_server_config["speculative_config"] = {
-            "decoding_type": "MTP",
-            "max_draft_len": 2
-        }
+        speculative_config = {"decoding_type": "MTP", "max_draft_len": 2}
+        ctx_server_config["speculative_config"] = speculative_config
+        gen_server_config["speculative_config"] = speculative_config
         disaggregated_server_config = {
             "hostname": "localhost",
             "backend": "pytorch",
@@ -855,7 +894,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
             assert_acceptance_length(
-                "disagg::TestDeepSeekV3Lite::test_gen_only_spec_dec",
+                "disagg::TestDeepSeekV3Lite::test_symmetric",
                 compute_disagg_acceptance_length(llm.serve_url))
 
     @skip_pre_blackwell
@@ -896,6 +935,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
+            "use_kv_cache_manager_v2": True,
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
@@ -905,16 +945,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
-            # DEFAULT drops the per-test UCX pinning but still runs UCX, since
-            # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
-            # backend but NIXL. Transport coverage is unchanged by this move.
-            # CPP is explicit: this test runs on UCX (see the DEFAULT note
-            # above), and DeepSeek's Python preference would otherwise be
-            # adopted verbatim and fail at creation on a non-NIXL backend.
+            # NIXL (not DEFAULT) skips the harness's TRTLLM_USE_UCX_KVCACHE=1
+            # fallback; the Python transceiver requires NIXL.
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "CPP",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
         }
         gen_server_config = {
@@ -933,9 +968,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "CPP",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "enable_attention_dp": enable_attention_dp,
         }
@@ -949,9 +983,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                # A helix transfer deadlock must fail the test, not hold the
+                # 8-GPU slot until the class-level pytest timeout.
+                request_timeout_s=DEFAULT_ACC_EVALUATION_TIMEOUT,
+        ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(8)
@@ -964,12 +1004,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ctx_server_config["cache_transceiver_config"] = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096
         }
         gen_server_config["cache_transceiver_config"] = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096
         }
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
@@ -1019,7 +1057,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
@@ -1031,7 +1068,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             }
         }
         if mtp_nextn > 0:
@@ -1153,7 +1189,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
         }
@@ -1162,7 +1197,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
         }
@@ -1202,10 +1236,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     # pre-existing case stays Blackwell-only as before.
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
-                             ids=["cache_mgr_v1", "cache_mgr_v2"])
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                             ids=["cache_mgr_v2"])
     def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2, mocker):
-        """GPT-OSS disagg, NIXL Python transceiver (v2), KV cache manager v1 and v2 (ctx tp2 + gen tp2)."""
+        """GPT-OSS disagg, NIXL Python transceiver (v2), KV cache manager V2 (ctx tp2 + gen tp2)."""
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -1214,7 +1248,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "kv_cache_config": {
@@ -1229,7 +1262,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "kv_cache_config": {
@@ -1260,8 +1292,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
 
     @pytest.mark.skip_less_device(8)
-    # Two-model eagle3 (eagle3_one_model=False) is being removed (#18721),
-    # so only the one-model path is covered here.
     @parametrize_with_ids("overlap_scheduler", [True, False])
     # Dual TP4 120B-model startup (weights + Eagle3 draft checkpoint loaded
     # on both ctx and gen servers) plus a full, unmocked GSM8K eval (1319
@@ -1290,7 +1320,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "kv_cache_config": {
@@ -1306,7 +1335,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "kv_cache_config": {
@@ -1347,20 +1375,16 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     def test_nixl_backend(self):
-        # transceiver_runtime is left at 'auto', which resolves to the Python
-        # transceiver (the global default) on the NIXL backend.
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         disaggregated_server_config = {
@@ -1391,7 +1415,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
             },
             "kv_cache_config": kv_cache_config,
         }
@@ -1400,7 +1423,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
             },
             "kv_cache_config": kv_cache_config,
         }
@@ -1433,7 +1455,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
             },
             "enable_chunked_prefill": True,
             "max_num_tokens": 256,
@@ -1444,7 +1465,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
             },
             "max_batch_size": max_batch_size,
         }
@@ -1487,10 +1507,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
+            "use_kv_cache_manager_v2": True,
         }
+        # NIXL (not DEFAULT) skips the harness's TRTLLM_USE_UCX_KVCACHE=1
+        # fallback; the Python transceiver requires NIXL.
         cache_transceiver_config = {
-            "backend": "DEFAULT",
-            "max_tokens_in_buffer": 8192,
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
@@ -1533,9 +1556,15 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "urls": ["localhost:8002"]
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                # A helix transfer deadlock must fail the test, not hold the
+                # 8-GPU slot until the class-level pytest timeout.
+                request_timeout_s=DEFAULT_ACC_EVALUATION_TIMEOUT,
+        ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @skip_pre_blackwell
@@ -1573,65 +1602,20 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=disable_overlap_scheduler)
 
     @pytest.mark.skip_less_device(2)
-    def test_gen_first(self):
-        """Gen-first dense-model smoke test on KVCacheManagerV2 + NIXL python."""
+    @pytest.mark.parametrize("enable_block_reuse", [False, True],
+                             ids=["no_reuse", "block_reuse"])
+    def test_gen_first(self, enable_block_reuse):
+        """Gen-first default V2 accuracy with and without block reuse."""
         kv_cache_config = {
-            "enable_block_reuse": False,
-            "use_kv_cache_manager_v2": True,
-        }
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
-            },
-            "kv_cache_config": kv_cache_config,
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
-            },
-            "kv_cache_config": kv_cache_config,
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "port": 8000,
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
-            },
-            "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
-            },
-            "schedule_style": "generation_first",
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU"])
-
-    @pytest.mark.skip_less_device(2)
-    def test_gen_first_kv_cache_v1(self):
-        """Gen-first smoke test on the legacy V1 KV cache manager with block reuse."""
-        transceiver_runtime = "PYTHON"
-        transceiver_backend = "NIXL"
-        kv_cache_config = {
-            "enable_block_reuse": True,
+            "enable_block_reuse": enable_block_reuse,
             "enable_partial_reuse": False,
-            "use_kv_cache_manager_v2": False,
         }
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": transceiver_backend,
-                "transceiver_runtime": transceiver_runtime,
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "kv_cache_config": kv_cache_config,
         }
@@ -1639,8 +1623,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": transceiver_backend,
-                "transceiver_runtime": transceiver_runtime,
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "kv_cache_config": kv_cache_config,
         }
@@ -1675,9 +1659,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     def test_mixed_ctx_gen_model(self, ctx_pp, gen_tp):
         ctx_model = self.FP4_MODEL
         gen_model = self.FP8_MODEL
-        # Explicit NIXL so the launcher does not force the UCX env fallback;
-        # with the NIXL backend, transceiver_runtime='auto' resolves to the
-        # Python transceiver (the global default).
         return run_parallel_test("Qwen3/Qwen3-30B-A3B",
                                  ctx_model,
                                  ctx_pp=ctx_pp,
@@ -1718,7 +1699,6 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
@@ -1730,7 +1710,6 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         disaggregated_server_config = {
@@ -1784,34 +1763,25 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
 class TestGPTOSS20B(LlmapiAccuracyTestHarness):
-    # Beam-search disagg coverage: GPT-OSS is not a hybrid-Mamba model, so
-    # (unlike Qwen3.5, see TestQwen3_5_4B) it never hits the hybrid-linear
-    # max_beam_width > 1 rejection in
-    # _util.py's _validate_or_fallback_kv_cache_manager_v2. That gate still
-    # rejects KVCacheManagerV2 with max_beam_width > 1 in general, so V2 is
-    # disabled explicitly below.
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
 
     @pytest.mark.skip_less_device(2)
     def test_beam_search(self):
         max_beam_width = 2
-        kv_cache_config = {"use_kv_cache_manager_v2": False}
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "max_beam_width": max_beam_width,
-            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
+                "transceiver_runtime": "PYTHON",
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "max_beam_width": max_beam_width,
-            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
+                "transceiver_runtime": "PYTHON",
             }
         }
         disaggregated_server_config = {
@@ -1851,11 +1821,8 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
         """Disaggregated GSM8K accuracy for Kimi-K2.5 (NVFP4).
 
         ctx and gen servers are each TP4 (8 GPUs total). The cache transceiver
-        uses backend=NIXL + transceiver_runtime=PYTHON: NIXL is required so the
-        disagg test harness skips its TRTLLM_USE_UCX_KVCACHE=1 fallback (which
-        would make the effective backend UCX and force the C++ transceiver),
-        letting the ctx->gen MLA-latent KV transfer run over the Python (v2)
-        transceiver. GSM8K is text-only, so requests run through the DeepSeek-V3
+        uses backend=NIXL + transceiver_runtime=PYTHON for ctx->gen MLA-latent
+        KV transfer. GSM8K is text-only, so requests run through the DeepSeek-V3
         MLA backbone (no vision).
         Kimi-K2.5 ships custom HF modeling code (auto_map in config.json), so
         trust_remote_code must be set on both servers or executor init fails at
@@ -1876,7 +1843,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "enable_attention_dp": True,
@@ -1893,7 +1859,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "enable_attention_dp": True,
@@ -1928,7 +1893,6 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     def _make_configs(self, use_py_transceiver: bool = False):
         cache_transceiver_config = {
             "backend": "NIXL",
-            "max_tokens_in_buffer": 8192,
         }
         if use_py_transceiver:
             cache_transceiver_config["transceiver_runtime"] = "PYTHON"
@@ -2050,7 +2014,6 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def _make_configs(self, use_py_transceiver: bool):
         cache_transceiver_config = {
             "backend": "NIXL",
-            "max_tokens_in_buffer": 8192,
         }
         if use_py_transceiver:
             cache_transceiver_config["transceiver_runtime"] = "PYTHON"
@@ -2163,7 +2126,6 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 8192,
         }
         kv_cache_config = {
             "enable_block_reuse": snapshot_policy is not None,
@@ -2243,8 +2205,8 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
 
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
-                             ids=["cache_mgr_v1"])
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                             ids=["cache_mgr_v2"])
     def test_nvfp4_nixl(self, use_kv_cache_manager_v2):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.7,
@@ -2253,6 +2215,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         }
         cache_transceiver_config = {
             "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
         }
         moe_config = {"backend": "CUTEDSL"}
         speculative_config = {
@@ -2325,11 +2288,9 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         # NVFP4 weights ~71 GB/rank at TP=2, leaving ~107 GB for KV on B200.
         # TRTLLM backend required: it is the backend supporting V4-Flash MXFP4.
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
-        # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2382,7 +2343,6 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2458,18 +2418,15 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         warm up for a phase that never runs.
         """
         model_path = self.MODEL_PATH
-        # V4 uses the pure-Python KVCacheManagerV2, so the transceiver has to
-        # be the Python one; NIXL (not DEFAULT) skips the
-        # TRTLLM_USE_UCX_KVCACHE=1 fallback.
+        # V4 uses the pure-Python KVCacheManagerV2 and Python transceiver.
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         # The drafter runs between target steps and its hidden-state capture
         # needs a whole-sequence prefill, hence no overlap scheduler and no
         # chunked prefill on either worker -- the same pairing the aggregate
-        # TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm uses.
+        # TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm uses.
         common_server_config = {
             "attn_backend": "TRTLLM",
             "tensor_parallel_size": 4,
@@ -2597,11 +2554,9 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         # TRTLLM backend: the CUTLASS FP8 block-scale path is Hopper-only.
         # Compact batching keeps KV cache ~1 GB/rank (default ~100 GB requires fully-clean GPU memory).
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
-        # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2659,10 +2614,10 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2"
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
-                             ids=["cache_mgr_v1"])
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                             ids=["cache_mgr_v2"])
     def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
-        """Test with KV cache manager v1, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+        """Test with KV cache manager v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         max_num_tokens = 8192
         moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
         ctx_server_config = {
@@ -2675,7 +2630,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
@@ -2692,7 +2646,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,

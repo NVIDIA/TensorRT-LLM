@@ -10,7 +10,7 @@ reached through the ``interfaces`` Protocols.
 
 import os
 import time
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
@@ -26,6 +26,8 @@ from .admission import DisaggTransferAdmissionController
 from .interfaces import ActiveRequestRegistry, ExecutorEffects
 
 if TYPE_CHECKING:
+    import torch
+
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 
@@ -77,6 +79,10 @@ class DisaggTransferCoordinator:
     disaggregation is off.
     """
 
+    # Class-level default, so a coordinator assembled without ``__init__``
+    # keeps the blocking receive fence.
+    _defer_unready_gen_receives = False
+
     def __init__(
         self,
         *,
@@ -91,6 +97,7 @@ class DisaggTransferCoordinator:
         draft_kv_cache_manager=None,
         admission_controller: Optional[DisaggTransferAdmissionController] = None,
         is_kv_manager_v2: bool = False,
+        defer_unready_gen_receives: bool = False,
     ) -> None:
         self._transceiver = transceiver
         self._transfers = transfer_manager
@@ -114,6 +121,16 @@ class DisaggTransferCoordinator:
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
+        # When a forward is still in flight at admission, as under the overlap
+        # scheduler, an asynchronous receive whose admission readiness event
+        # has not completed is published by a later poll instead of blocking
+        # the executor thread on that event.
+        self._defer_unready_gen_receives = defer_unready_gen_receives
+        # Prepared generation requests awaiting publication, in admission
+        # order, each with the readiness event its cache admission recorded.
+        self._unpublished_gen_receives: Dict[
+            int, Tuple[LlmRequest, Optional["torch.cuda.Event"]]
+        ] = {}
 
     # -- loop head -----------------------------------------------------------
 
@@ -209,6 +226,8 @@ class DisaggTransferCoordinator:
         """Poll receive-side transfers and their timeouts; rank-synchronized."""
         if not uses_async_gen_transfer():
             return
+        if self._defer_unready_gen_receives:
+            self._publish_ready_gen_receives()
         # Gen-transfer status performs cross-rank consensus internally. Enter
         # it symmetrically; ranks with no ready local future contribute an
         # empty ready set.
@@ -310,6 +329,39 @@ class DisaggTransferCoordinator:
         if deferred_requests:
             self._effects.revert_ctx_alloc(deferred_requests)
 
+    @nvtx_range("align_gen_admission_across_cp")
+    def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
+        """Keep only the gen-init requests that every CP rank of the group admitted.
+
+        In async-transfer mode ``receive_gen_init`` ends with the gen transfer
+        status collective, entered only on ranks that admitted something, and in
+        sync mode with the failure gather (``_align_sync_receive_failures_across_cp``),
+        so the CP ranks must admit the same requests in the same iteration. Equal
+        KV capacity does not guarantee that: KV cache manager V1 deals helix
+        blocks round-robin from CP rank 0, so that rank can hold one more block
+        per request, and a client cancel or a transfer timeout retires a request
+        rank-locally, so one CP rank can have room before its peer. The pp=1
+        loops call this on every rank every iteration; the dropped requests give
+        back their V2 KV and are retried on a later iteration. Under
+        attention-DP, a request passes the intersection only if every CP rank
+        routed it to the same DP rank. ``ADPRouter.gather_all_rank_states``
+        gives the CP ranks the same loads. ``ADPRouter.create`` does not build
+        ``KVCacheAwareADPRouter`` under helix CP, because each CP rank probes
+        its own prefix matches and they can differ.
+        """
+        if self._dist.cp_size == 1:
+            return admitted
+        local_ids = [request.py_request_id for request in admitted]
+        common_ids = set(local_ids)
+        # small_payload: at most one iteration's gen-init request ids.
+        for peer_ids in self._dist.cp_allgather(local_ids, small_payload=True):
+            common_ids.intersection_update(peer_ids)
+        if len(common_ids) == len(local_ids):
+            return admitted
+        aligned = [request for request in admitted if request.py_request_id in common_ids]
+        self.revert_deferred_gen_init(admitted, aligned)
+        return aligned
+
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
         return (
@@ -326,6 +378,10 @@ class DisaggTransferCoordinator:
         start their KV receive in the configured transfer mode."""
         if not admitted:
             return
+        defer_unready = self._defer_unready_gen_receives and uses_async_gen_transfer()
+        # Take the admission readiness events first, so preparing resources
+        # does not block this thread on them; publication polls them instead.
+        fences = self._take_receive_fences(admitted) if defer_unready else {}
         self._effects.prepare_gen_resources(admitted)
 
         # gen_only_no_context has no CTX worker, so mark each request as
@@ -341,18 +397,118 @@ class DisaggTransferCoordinator:
             # prepared request is left in DISAGG_GENERATION_INIT.
             for req in admitted:
                 self._transceiver.request_and_receive_sync(req)
+            self._align_sync_receive_failures_across_cp(admitted)
             self._check_transfer_errors("generation requests")
             return
 
-        for req in admitted:
-            self._transceiver.request_and_receive_async(req)
-
-        if self._transceiver.kv_transfer_timeout_ms is not None:
+        if defer_unready:
             for req in admitted:
-                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                    req.py_kv_transfer_start_time = time.monotonic()
+                self._unpublished_gen_receives[req.py_request_id] = (
+                    req,
+                    fences.get(req.py_request_id),
+                )
+            self._publish_ready_gen_receives()
+            # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
+            # every admitted request ends in the same state on every rank and
+            # the scheduler does not admit it again.
+            for req in admitted:
+                if req.py_request_id in self._unpublished_gen_receives:
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        else:
+            for req in admitted:
+                self._transceiver.request_and_receive_async(req)
+            self._stamp_gen_transfer_start(admitted)
 
         self.reap_gen_receives(0)
+
+    def _align_sync_receive_failures_across_cp(self, admitted: List[LlmRequest]) -> None:
+        """Fail on this CP rank every request whose blocking receive failed on any CP rank.
+
+        This is a CP collective. A blocking receive settles each request on its
+        own rank, with no cross-rank consensus like the one ``reap_gen_receives``
+        runs on the asynchronous path. If one CP rank fails a request and its
+        peer receives it, the peer decodes it alone and the helix all-to-all sees
+        different batches. TP ranks are not aligned here: without attention DP a
+        request can still fail on one TP rank and survive on another, as it can
+        without CP.
+
+        Every CP rank reaches the gather with the same ``admitted`` requests: the
+        pp=1 loops align them with ``align_gen_admission_across_cp``, and the PP
+        loop broadcasts CP rank 0's schedule to its peers. The exception is the PP
+        loop under attention DP with tp_size > 1, where each first-stage rank
+        schedules on its own (``PyExecutor._pp_schedule_and_propagate``), so the
+        gather is skipped there. KvCacheTransceiverV2 and KVCacheManagerV2 reject
+        that layout under helix. The C++ transceiver with KV cache manager V1
+        accepts it, so there a sync failure can still split the CP ranks.
+        """
+        if self._dist.cp_size == 1 or (
+            self._enable_attention_dp and self._dist.tp_size > 1 and self._dist.pp_size > 1
+        ):
+            return
+        local_failed_ids = [
+            req.py_request_id for req in admitted if req.state == LlmRequestState.DISAGG_TRANS_ERROR
+        ]
+        # small_payload: at most one iteration's gen-init request ids.
+        failed_ids = {
+            rid
+            for peer_ids in self._dist.cp_allgather(local_failed_ids, small_payload=True)
+            for rid in peer_ids
+        }
+        failed_on_a_peer_only = [
+            req
+            for req in admitted
+            if req.py_request_id in failed_ids and req.state != LlmRequestState.DISAGG_TRANS_ERROR
+        ]
+        if failed_on_a_peer_only:
+            logger.warning(
+                "Failing generation requests whose KV receive failed on a peer CP rank: "
+                f"{[req.py_request_id for req in failed_on_a_peer_only]}"
+            )
+        for req in failed_on_a_peer_only:
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
+
+    def _take_receive_fences(
+        self, requests: List[LlmRequest]
+    ) -> Dict[int, Optional["torch.cuda.Event"]]:
+        """Take each request's admission readiness event from the cache manager."""
+        take = getattr(self._kv_cache_manager, "take_disagg_receive_ready", None)
+        if take is None:
+            return {}
+        return {req.py_request_id: take(req) for req in requests}
+
+    def _publish_ready_gen_receives(self) -> None:
+        """Start the asynchronous receive of each waiting request whose
+        admission readiness event has completed.
+
+        RDMA cannot observe stream ordering, so a destination is published
+        only after the event its admission recorded. The event is polled,
+        never waited on, so the next forward's host work stays overlapped with
+        the GPU; and it is never re-recorded, since a newer event would also
+        cover every later forward.
+        """
+        published = []
+        for request_id, (req, ready) in list(self._unpublished_gen_receives.items()):
+            if req.state not in (
+                LlmRequestState.DISAGG_GENERATION_INIT,
+                LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            ):
+                # Failed or finished before publication; nothing to start.
+                del self._unpublished_gen_receives[request_id]
+                continue
+            if ready is not None and not ready.query():
+                continue
+            del self._unpublished_gen_receives[request_id]
+            self._transceiver.request_and_receive_async(req)
+            published.append(req)
+        self._stamp_gen_transfer_start(published)
+
+    def _stamp_gen_transfer_start(self, requests: List[LlmRequest]) -> None:
+        """Start the transfer-timeout clock of each receive now in flight."""
+        if self._transceiver.kv_transfer_timeout_ms is None:
+            return
+        for req in requests:
+            if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                req.py_kv_transfer_start_time = time.monotonic()
 
     def poll_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
@@ -534,7 +690,7 @@ class DisaggTransferCoordinator:
                 return
             # Create the response while the state is still TRANS_IN_PROGRESS
             # (required by C++ createResult).
-            response = request.create_response(False, self._dist.rank)
+            response = request.create_response()
             if response:
                 response.result.cached_tokens = request.cached_tokens
                 attach_ctx_usage(request, response)
@@ -628,6 +784,7 @@ class DisaggTransferCoordinator:
         """Drop per-request cancellation bookkeeping once the request is freed."""
         self._timed_out_ctx_cancelled_ids.discard(request_id)
         self._timed_out_gen_cancelled_ids.discard(request_id)
+        self._unpublished_gen_receives.pop(request_id, None)
 
     @nvtx_range("cancel_timed_out_gen_transfers")
     def _cancel_timed_out_gen_transfers(self) -> None:
@@ -807,6 +964,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         self, candidates: List[LlmRequest], admitted: List[LlmRequest]
     ) -> None:
         return None
+
+    def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
+        return admitted
 
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
         return None

@@ -19,6 +19,8 @@ def build_modeling_bringup_prompts(
     *,
     include_slurm_environment: bool = False,
     replan_on_qa: bool = False,
+    concurrent: bool = False,
+    max_parallel: int | None = None,
 ) -> PromptBundle:
     """Build modeling-bringup prompts for one validated ``task.yaml``.
 
@@ -30,6 +32,19 @@ def build_modeling_bringup_prompts(
     matrix) is appended only when ``replan_on_qa`` is set — it is designed
     around the post-QA replan sub-cycle, so without ``--replan-on-qa`` the
     agents run on the base flat-plan prompts.
+
+    The concurrent-DAG protocol (PlanDrafter emits a machine-readable
+    ``## Execution Graph`` block, and coder/reviewer/qa work exactly one
+    assigned node per turn with NO shared ``## Stages & Goals`` table) is
+    appended only when ``concurrent`` is set. ``concurrent`` and
+    ``replan_on_qa`` are mutually distinct modes: ``concurrent`` takes
+    precedence, so if both are passed the concurrent extensions are wired
+    and the Stage/Goal ones are not.
+
+    On the concurrent path, ``max_parallel`` (when supplied) additionally
+    appends a soft "Concurrency budget" block to the PlanDrafter prompt so it
+    sizes the Execution Graph against the scheduler's ``--max-parallel`` cap.
+    Ignored off the concurrent path.
     """
     prompts = DEFAULT_PROMPTS.with_extensions(
         plan_drafter=plan_drafter_extra.SYSTEM_PROMPT_EXTENSION,
@@ -38,7 +53,23 @@ def build_modeling_bringup_prompts(
         reviewer=reviewer_extra.SYSTEM_PROMPT_EXTENSION,
         qa=qa_extra.SYSTEM_PROMPT_EXTENSION,
     )
-    if replan_on_qa:
+    if concurrent:
+        prompts = prompts.with_extensions(
+            plan_drafter=plan_drafter_extra.CONCURRENT_EXTENSION,
+            plan_reviewer=plan_reviewer_extra.CONCURRENT_EXTENSION,
+            coder=coder_extra.CONCURRENT_EXTENSION,
+            reviewer=reviewer_extra.CONCURRENT_EXTENSION,
+            qa=qa_extra.CONCURRENT_EXTENSION,
+        )
+        # The concurrent DAG is throttled to ``--max-parallel`` at runtime, so
+        # teach the PlanDrafter (only) that budget to size the Execution Graph
+        # against. Injected only when a value is supplied; the CLI always passes
+        # ``args.max_parallel`` (default 8) on the ``--concurrent`` path.
+        if max_parallel is not None:
+            prompts = prompts.with_extensions(
+                plan_drafter=plan_drafter_extra.concurrent_budget_guidance(max_parallel),
+            )
+    elif replan_on_qa:
         prompts = prompts.with_extensions(
             plan_drafter=plan_drafter_extra.STAGE_GOAL_EXTENSION,
             plan_reviewer=plan_reviewer_extra.STAGE_GOAL_EXTENSION,

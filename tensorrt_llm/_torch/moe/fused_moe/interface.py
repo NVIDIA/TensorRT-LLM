@@ -142,6 +142,7 @@ def moe_custom_op(
     output_dtype: Optional[torch.dtype],
     all_rank_num_tokens: Optional[List[int]],
     use_dp_padding: Optional[bool],
+    routing_aux: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     moe_layer = extract_extra_attrs(layer_idx)
 
@@ -155,6 +156,9 @@ def moe_custom_op(
         output_dtype=output_dtype,
         all_rank_num_tokens=all_rank_num_tokens,
         use_dp_padding=use_dp_padding,
+        **({
+            "routing_aux": routing_aux
+        } if routing_aux is not None else {}),
     )
 
     if do_finalize:
@@ -174,6 +178,7 @@ def _(
     output_dtype,
     all_rank_num_tokens,
     use_dp_padding,
+    routing_aux=None,
 ):
     moe_layer = extract_extra_attrs(layer_idx)
     hidden_states = x if x_sf is None else Fp4QuantizedTensor(
@@ -223,6 +228,21 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
     # ``MoESchedulerKind``, defined in this module, and ``impl_blocks`` is
     # imported *by* this module.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
+    supports_routing_aux: bool = False
+    # Set by callers that compose a ``FUSED_COMM`` backend's globally combined
+    # routed output themselves; read through ``returns_global_routed_output``.
+    accepts_global_routed_output: bool = False
+
+    @property
+    def returns_global_routed_output(self) -> bool:
+        """Whether ``forward`` returns the routed output already combined
+        across the attention-TP group on every rank.
+
+        Callers with ``reduce_results=False`` skip their routed all-reduce
+        exactly when this is True; otherwise the output is a rank partial for
+        that all-reduce. Layers that own their communication return False.
+        """
+        return False
 
     @classmethod
     @abstractmethod
@@ -799,6 +819,11 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        if kwargs.get(
+                "routing_aux") is not None and not self.supports_routing_aux:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per-token routing auxiliary data"
+            )
         router_logits = self._maybe_get_perfect_router_logits(router_logits)
         if self.register_to_config and is_torch_compiling():
             # Routed-expert MoE LoRA is fused into torch.ops.trtllm.fused_moe
@@ -831,6 +856,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 output_dtype,
                 all_rank_num_tokens,
                 use_dp_padding,
+                routing_aux=kwargs.get("routing_aux"),
             )
             if do_finalize:
                 return res[0]

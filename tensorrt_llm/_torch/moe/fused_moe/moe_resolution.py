@@ -28,18 +28,16 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .activation import (
-    ActivationParamShape,
-    MoEActivation,
-    SwigluActivation,
-    activation_constant_names,
+from .activation import MoEActivation, SwigluActivation, activation_constant_names
+from .cutedsl import (
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
 )
-from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-from .fused_moe_cute_dsl_fc12 import TrtllmCutedslFusedFc12Nvfp4Impl
-from .fused_moe_cutlass import CutlassFusedMoE
+from .cutlass import CUTLASS_LEAVES
+from .fused_moe_cute_dsl_b12x import CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
-from .fused_moe_densegemm import TrtllmCutedslDenseGemmNvfp4Impl
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase
@@ -50,6 +48,7 @@ from .impl_contract import (
     MoERejection,
     MoERejectReason,
     MoEResolutionReport,
+    activation_rejection_detail,
     canonical_activation,
     canonical_quant,
     canonical_routing,
@@ -99,10 +98,14 @@ MoEImplClass = type[MoE] | type[MoEImplBase] | type[VanillaMoE]
 # ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` / ``MegaMoECuteDsl`` aliases, so
 # what is ranked here reads the same as what a resolution report prints.
 IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
-    CuteDslB12xFusedMoE,  # SM120/121 NVFP4 decode only -- narrowest, so first
+    # The SM120/121 b12x leaves, one format each -- narrowest, so first.
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     TrtllmCutedslMegaMoeNvfp4Impl,
-    CuteDslFusedMoE,
+    # Disjoint ``quant`` segments, so the order between the two does not matter.
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
     # for the same format because the opt-in flag is what selects it: with the
@@ -127,7 +130,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     MarlinCudaNvfp4Impl,
     MarlinCudaW4a16Nvfp4Impl,
     TritonFusedMoE,
-    CutlassFusedMoE,  # widest coverage, hence the fallback
+    *CUTLASS_LEAVES,
     VanillaMoE,  # reference implementation, never preferred
 )
 
@@ -135,10 +138,19 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
 # ``moe_backend`` literal and a pinned identity reach the same class for the
 # DeepGEMM families, so a run reports one name either way.
 BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
-    "CUTLASS": frozenset({CutlassFusedMoE}),
+    # Includes the two ``fp8_block_scales`` leaves, whose technique is not
+    # ``cutlass``: the literal serves FP8 block scales on SM90 and SM120/121.
+    "CUTLASS": frozenset(CUTLASS_LEAVES),
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl}),
-    "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
+    "CUTEDSL": frozenset(
+        {
+            CuteDslB12xNvfp4FusedMoE,
+            CuteDslB12xW4a16Nvfp4FusedMoE,
+            TrtllmCutedslGroupedGemmNvfp4Impl,
+            TrtllmCutedslGroupedGemmBf16Impl,
+        }
+    ),
     "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({TrtllmCutedslDenseGemmNvfp4Impl}),
@@ -187,8 +199,9 @@ def backend_family_of(impl_cls: MoEImplClass) -> Optional[str]:
     return None
 
 
-# Widest coverage; default degradation target.
-FALLBACK_IMPL: MoEImplClass = CutlassFusedMoE
+# Default degradation target: the Cutlass leaves, whose coverage is the
+# widest between them.
+FALLBACK_IMPLS: tuple[MoEImplClass, ...] = CUTLASS_LEAVES
 
 
 def _legacy_backend_name(impl_cls: MoEImplClass) -> str:
@@ -379,6 +392,7 @@ def build_moe_deployment(
         eplb_enabled=eplb_enabled,
         # Routed-expert LoRA only; attention-only LoRA stays False.
         moe_lora_enabled=has_moe_lora_targets(lora_config),
+        force_dynamic_quantization=model_config.force_dynamic_quantization,
         # Same expression the impls use to set ``use_fused_finalize``; any
         # LoRA counts, not just routed-expert LoRA.
         fused_finalize_enabled=(
@@ -410,8 +424,9 @@ def _candidates_for(backend: str) -> List[MoEImplClass]:
     if family is None:
         raise ValueError(f"Unsupported moe backend: {backend}")
     candidates = [impl_cls for impl_cls in IMPL_PRIORITY if impl_cls in family]
-    if FALLBACK_IMPL not in family and normalized not in NO_FALLBACK_BACKENDS:
-        candidates.append(FALLBACK_IMPL)
+    # A request for CUTLASS already holds every fallback leaf.
+    if family.isdisjoint(FALLBACK_IMPLS) and normalized not in NO_FALLBACK_BACKENDS:
+        candidates.extend(FALLBACK_IMPLS)
     return candidates
 
 
@@ -462,14 +477,6 @@ def _candidates_for_impl_id(query: MoEImplQuery) -> List[MoEImplClass]:
     return ranked
 
 
-#: ABI register name -> the ``MoEActivationSupport`` field declaring its shape.
-_CONSTANT_SHAPE_FIELDS: Dict[str, str] = {
-    "alpha": "alpha_beta",
-    "beta": "alpha_beta",
-    "clamp": "limit",
-}
-
-
 def _reject_unsupported_activation(
     candidate: MoEImplClass, problem: MoEProblem
 ) -> Optional[MoERejection]:
@@ -487,39 +494,12 @@ def _reject_unsupported_activation(
     ``PER_EXPERT_TENSOR`` to ``UNIFORM_SCALAR``; no instance turns a shape into
     ``UNSUPPORTED``, so no instance refuses a constant its class admits.
     """
-    support = getattr(candidate, "activation_support", None)
-    if support is None:
+    detail = activation_rejection_detail(candidate, problem)
+    if detail is None:
         return None
-
-    kind = problem.activation_type
-    if kind not in support.kinds:
-        executes = ", ".join(sorted(k.name for k in support.kinds))
-        return MoERejection(
-            _legacy_backend_name(candidate),
-            MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{candidate.__name__} does not execute {kind.name} (executes: {executes})",
-        )
-
-    if problem.clamp_after_silu and not support.clamp_after_silu:
-        return MoERejection(
-            _legacy_backend_name(candidate),
-            MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{candidate.__name__} does not implement post-SiLU clamping",
-        )
-
-    # Sorted so the rejection names the same register every run.
-    for constant in sorted(problem.activation_constants):
-        field = _CONSTANT_SHAPE_FIELDS.get(constant)
-        if field is None:
-            continue
-        if getattr(support, field) is ActivationParamShape.UNSUPPORTED:
-            return MoERejection(
-                _legacy_backend_name(candidate),
-                MoERejectReason.ACTIVATION_UNSUPPORTED,
-                f"{candidate.__name__} kernels take no activation {constant}, "
-                f"which this layer's {kind.name} supplies",
-            )
-    return None
+    return MoERejection(
+        _legacy_backend_name(candidate), MoERejectReason.ACTIVATION_UNSUPPORTED, detail
+    )
 
 
 def resolve_moe_impl(
@@ -638,6 +618,7 @@ def resolve_moe_impl(
         selected_by=selected_by,
         requested=requested,
         env_fingerprint=deployment.env.fingerprint(),
+        requested_impls=frozenset(_legacy_backend_name(impl_cls) for impl_cls in requested_impls),
     )
 
     location = "" if layer_idx is None else f" [layer_idx={layer_idx}]"
@@ -646,6 +627,7 @@ def resolve_moe_impl(
         raise ValueError(
             f"MoE backend {requested} was requested with degradation disallowed "
             f"but cannot serve this layer{location}. {report.describe()}"
+            f" Each candidate's reason: {report.describe_rejections()}"
         )
 
     if winner_cls is None:
@@ -660,12 +642,20 @@ def resolve_moe_impl(
         )
     elif report.degraded:
         cause = report.degraded_from
+        others = ", ".join(
+            f"{rejection.legacy_backend}={rejection.reason.value}"
+            for rejection in report.requested_rejections
+            if rejection is not cause
+        )
         logger.warning(
             f"MoE backend {requested} cannot serve this layer{location} "
-            f"({cause.reason.value}: {cause.detail}); running "
-            f"{winner_cls.__name__} instead. Full trail: {report.describe()}"
+            f"({'no candidate was considered' if cause is None else cause.describe()}); "
+            f"running {winner_cls.__name__} instead."
+            + (f" Also turned down: {others}." if others else "")
         )
     else:
+        # Only the undegraded path reaches here, so ``describe()`` is built at
+        # most once per resolution: the warnings above carry their own text.
         logger.debug(report.describe())
 
     return report

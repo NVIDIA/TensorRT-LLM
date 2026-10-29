@@ -37,9 +37,14 @@ Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
     : manager(mgr)
     , lifeCycle(lc)
     , cacheLevel(level)
-    , priority(prio)
     , nodeRef(std::nullopt)
+    , mPriority(prio)
 {
+}
+
+bool Page::isPrivate() const
+{
+    return !isCommitted() && !requiresPrefixCoverage(manager->lifeCycles()[lifeCycle]);
 }
 
 Page::~Page()
@@ -47,6 +52,7 @@ Page::~Page()
     KVCM2_POISON_ON_EXCEPT(
         [this]()
         {
+            manager->cancelRetentionExpiry(*this);
             TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
                 "Page destroyed while still held or scheduled for eviction");
             if (hasValidSlot())
@@ -91,6 +97,35 @@ SharedPtr<PageHolder> Page::hold()
         }
     }
     return h;
+}
+
+void Page::claimRetention(std::optional<Priority> priority, std::optional<std::chrono::milliseconds> duration)
+{
+    manager->cancelRetentionExpiry(*this);
+    if (priority.has_value())
+    {
+        manager->updatePriority(*this, *priority);
+    }
+    mRetentionDuration = duration;
+}
+
+void Page::inheritRetention(Page const& source)
+{
+    claimRetention(source.mPriority, source.mRetentionDuration);
+}
+
+bool Page::hasRetentionConsumers() const
+{
+    auto const h = holder.lock();
+    // A pending partial copy protects the source bytes but does not claim its retention policy.
+    return h && (!h->uniqLock.expired() || h.useCount() > mPartialCopyHolders + 1);
+}
+
+FuncGuard<std::function<void()>> Page::borrowRetentionForCopy()
+{
+    FuncGuard<std::function<void()>> guard([self = sharedFromThis()]() { --self->mPartialCopyHolders; });
+    ++mPartialCopyHolders;
+    return guard;
 }
 
 SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
@@ -160,6 +195,8 @@ UncommittedPage::UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc,
     , ordinal(ord)
     , beamIndex(bi)
 {
+    auto const retention = kvc.getRetention(ord);
+    claimRetention(retention.retentionPriority, retention.durationMs);
 }
 
 UncommittedPage::~UncommittedPage()
@@ -214,7 +251,19 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
     this->readyEvent = std::move(readyEv);
 
-    auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
+    bool const isSsm = std::holds_alternative<SsmLifeCycle>(manager->getLifeCycle(lifeCycle));
+    auto const committedPriority = isSsm ? kvCache->getPriority(blk->ordinal(), lifeCycle) : priority();
+    auto committed
+        = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, committedPriority);
+    if (isSsm)
+    {
+        auto const retention = kvCache->getRetention(blk->ordinal());
+        committed->claimRetention(retention.retentionPriority, retention.durationMs);
+    }
+    else
+    {
+        committed->inheritRetention(*this);
+    }
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
@@ -252,6 +301,7 @@ PageHolder::~PageHolder()
             // If it's a committed page, schedule for eviction (if evictable).
             if (page->isCommitted())
             {
+                manager->scheduleRetentionExpiry(*page);
                 if (!page->scheduledForEviction())
                     manager->scheduleForEviction(*page);
 
@@ -259,8 +309,11 @@ PageHolder::~PageHolder()
                 // page with a larger recorded token count) is unreachable for reuse, so keeping it
                 // in the eviction LRU would just pin a slot until memory pressure hits.
                 auto* cp = static_cast<CommittedPage*>(page.get());
-                if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
+                if (page->scheduledForEviction()
+                    && (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp)))
+                {
                     manager->excludeFromEviction(*page);
+                }
             }
             else
             {
@@ -531,6 +584,15 @@ void SharedPageLock::acquirePageIndex()
 
 void SharedPageLock::releasePageIndex()
 {
+    if (mUser.ordinal == kBadBlockOrdinal)
+    {
+        // SSM state has one live page per beam and no attention page-index
+        // entry. updateBasePageIndex deliberately returns BAD for this ordinal.
+        auto const& lc = page()->manager->lifeCycles().getLifeCycle(mUser.lifeCycle);
+        auto const* attention = std::get_if<AttnLifeCycle>(&lc);
+        TLLM_CHECK_DEBUG(std::holds_alternative<SsmLifeCycle>(lc) || (attention && attention->allowsCheckpoint()));
+        return;
+    }
     int oldBaseIndex
         = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, kBadPageIndex.value());
     // SSM pages use kBadBlockOrdinal, for which updateBasePageIndex returns kBadPageIndex.
@@ -717,7 +779,9 @@ void ScratchSlotLock::unlock()
 {
     TLLM_CHECK_DEBUG(mSlot.hasValidSlot());
     mSlot.readyEvent = mOwner->finishEvent();
-    mOwner->storageManager()->releaseSlot(mLifeCycle, kHotLevel, std::move(mSlot));
+    // Slot's implicit move leaves its optional ID engaged. Transfer ownership
+    // explicitly so destruction cannot release this physical slot a second time.
+    mOwner->storageManager()->releaseSlot(mLifeCycle, kHotLevel, detachSlot());
     TLLM_CHECK_DEBUG(!mSlot.hasValidSlot());
 }
 

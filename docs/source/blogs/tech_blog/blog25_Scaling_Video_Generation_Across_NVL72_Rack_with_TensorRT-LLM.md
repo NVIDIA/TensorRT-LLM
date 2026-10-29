@@ -166,7 +166,7 @@ Rank r holds Q_r (fixed) and K/V block for step i
   running output merged after each step  -->  final O_r
 ```
 
-**Online-softmax merge.** Each step yields a partial output and a log-sum-exp (LSE) statistic; [`RingAttention`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py) merges them with a streaming softmax recurrence in **fp32**, block by block, until the result matches one global attention pass.
+**Online-softmax merge.** Each step yields a partial output and a log-sum-exp (LSE) statistic; [`RingAttention`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention/backends/parallel.py) merges them with a streaming softmax recurrence in **fp32**, block by block, until the result matches one global attention pass.
 
 **Overlapping communication and compute.** The K/V exchange for the next block is posted with non-blocking point-to-point (`batch_isend_irecv`) *before* the current block's FA4 kernel runs, so the neighbor transfer overlaps with attention compute. Even ranks send-then-recv and odd ranks recv-then-send to avoid deadlock; the final ring step skips the exchange entirely.
 
@@ -191,7 +191,7 @@ So **Q expands by `col_size`** (a row holds `col_size` ranks → $S/\text{row si
 
 Members of a **row (Q) group** end up with identical Q but **disjoint** K/V slices; members of a **column (K/V) group** share identical K/V but hold different Q.
 
-**Local Attention.** The inner backend ([`Attention2DAttention`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py)) runs attention with LSE returning a partial output $[B, S/\text{row size}, H, D]$ and a log-sum-exp (LSE) statistic $[B, H, S/\text{row size}]$. The LSE records the softmax normalizer for that partial pass.
+**Local Attention.** The inner backend ([`Attention2DAttention`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention/backends/parallel.py)) runs attention with LSE returning a partial output $[B, S/\text{row size}, H, D]$ and a log-sum-exp (LSE) statistic $[B, H, S/\text{row size}]$. The LSE records the softmax normalizer for that partial pass.
 
 **Merge phase.** The `col_size` ranks that share the same Q each attended over a **disjoint slice of K/V** (above: ranks `0`, `1`, `2` all hold queries `{0,1,2}` but keys `{0,3}`, `{1,4}`, `{2,5}` respectively). Their FA4 outputs are partial results for the **same query positions** over **complementary key spans**, so they must be combined **within that row group** to recover the full softmax. For `col_size = 3`, the partial results are spread across 3 GPUs. These are combined into the final output as follows: 
 
@@ -462,7 +462,7 @@ Future directions:
 
 - VisualGen runtime: [`tensorrt_llm/_torch/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen)  
   - Mesh: [`mapping.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/mapping.py)  
-  - Parallelism wrappers: [`attention_backend/parallel.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py)  
+  - Parallelism wrappers: [`attention/backends/parallel.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention/backends/parallel.py)  
   - Pipeline base: [`pipeline.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/pipeline.py)  
   - Config models: [`config.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/config.py)  
   - Parallel VAE: [`modules/vae/parallel_vae_interface.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/modules/vae/parallel_vae_interface.py)  

@@ -35,6 +35,7 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
 from tensorrt_llm._torch.modules.linear import (
     Linear,
     MXFP8LinearMethod,
+    TensorParallelMode,
     WeightMode,
     WeightsLoadingConfig,
     _load_kv_cache_scales,
@@ -43,6 +44,7 @@ from tensorrt_llm._torch.modules.linear import (
     get_quant_method,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -293,6 +295,7 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
         dtype=torch.bfloat16,
     )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
@@ -344,6 +347,7 @@ def test_mxfp8_compile_skips_context_dispatch(
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
         dtype=torch.bfloat16,
     )
     result = method.apply(module, torch.empty((2, 4), dtype=torch.bfloat16), bias=None)
@@ -366,6 +370,7 @@ def test_mxfp8_auto_fallback_does_not_rearm_native_autotuning(monkeypatch):
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
         dtype=torch.bfloat16,
     )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
@@ -449,6 +454,7 @@ def test_mxfp8_native_autotuner_dispatch(monkeypatch):
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
+        _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
         dtype=torch.bfloat16,
     )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
@@ -789,3 +795,106 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
     static_x.copy_(replay_x)
     graph.replay()
     torch.testing.assert_close(graph_output, native(replay_x), rtol=2e-2, atol=2e-2)
+
+
+def _even_rows(rows: int, rank: int, tp_size: int) -> tuple[int, int]:
+    """Row range of `rank` when `rows` are split evenly over `tp_size` ranks."""
+    return rank * rows // tp_size, (rank + 1) * rows // tp_size
+
+
+def test_mxfp8_fused_scales_missing_shard_scale_names_the_shard() -> None:
+    """A fused load fails when one shard carries no scale, naming that shard."""
+    module = Mock(spec=Linear)
+    module.load_shard = Mock(side_effect=lambda weights, label, device, name: weights.get(label))
+    scale = torch.ones(32, 8, dtype=torch.uint8)
+    weights = [{"weight_scale_inv": scale}, {}, {"weight_scale_inv": scale}]
+    with pytest.raises(ValueError, match="weight_scale_inv for shard 'k'"):
+        MXFP8LinearMethod()._load_fused_weight_scales(module, weights, ("q", "k", "v"))
+    assert [c.kwargs["name"] for c in module.load_shard.call_args_list] == ["q", "k"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 Linear load path requires CUDA")
+@pytest.mark.parametrize(
+    "weight_mode,shard_rows,override",
+    [
+        # Eight Q heads and four K/V heads of 32 rows, evenly split over TP4.
+        (WeightMode.FUSED_QKV_LINEAR, {"q": 256, "k": 128, "v": 128}, None),
+        # K/V heads duplicated for TP4 (two heads repeated), then split evenly.
+        (WeightMode.FUSED_QKV_LINEAR, {"q": 256, "k": 128, "v": 128}, "duplicated_kv"),
+        # One K/V head replicated whole on every rank, Q split by override.
+        (WeightMode.FUSED_QKV_LINEAR, {"q": 256, "k": 32, "v": 32}, "replicated_kv"),
+        (WeightMode.FUSED_GATE_UP_LINEAR, {"gate": 256, "up": 256}, None),
+        # Uneven gate rows with an up projection replicated on every rank.
+        (WeightMode.FUSED_GATE_UP_LINEAR, {"gate": 256, "up": 32}, "uneven"),
+    ],
+)
+def test_mxfp8_fused_scales_follow_weight_rows_per_tp_rank(weight_mode, shard_rows, override):
+    """Each rank keeps the UE8M0 scale rows of exactly the weight rows it loads.
+
+    Scale exponents differ per row, so a scale row paired with another row's
+    weights changes the output by powers of two.
+    """
+    torch.manual_seed(0)
+    tp_size, in_f = 4, 256
+    names = list(shard_rows)
+    # FP8 weights travel as uint8 views: byte-level slicing and comparison.
+    sources = {}
+    for name, rows in shard_rows.items():
+        w = (torch.randn(rows, in_f) * 2).to(torch.float8_e4m3fn).view(torch.uint8)
+        exponents = torch.randint(121, 134, (rows, 1)) + torch.randint(-1, 2, (rows, in_f // 32))
+        sources[name] = (w, exponents.to(torch.uint8))
+    if override == "duplicated_kv":
+        # What the HF weight mappers hand the loader for two KV heads on TP4.
+        for name in ("k", "v"):
+            w, s = sources[name]
+            sources[name] = tuple(
+                torch.cat([t[head * 32 : (head + 1) * 32] for head in (0, 0, 1, 1)]) for t in (w, s)
+            )
+    uneven_gate = [(0, 96), (96, 160), (160, 224), (224, 256)]
+    x = torch.randn(16, in_f, dtype=torch.bfloat16, device="cuda")
+    qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+
+    for rank in range(tp_size):
+        if override == "replicated_kv":
+            ranges = {"q": _even_rows(256, rank, tp_size), "k": (0, 32), "v": (0, 32)}
+        elif override == "uneven":
+            ranges = {"gate": uneven_gate[rank], "up": (0, 32)}
+        else:
+            ranges = {name: _even_rows(sources[name][0].shape[0], rank, tp_size) for name in names}
+        lin = Linear(
+            in_features=in_f,
+            out_features=sum(w.shape[0] for w, _ in sources.values()),
+            bias=False,
+            dtype=torch.bfloat16,
+            mapping=Mapping(world_size=tp_size, rank=rank, tp_size=tp_size),
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=qc,
+            weights_loading_config=WeightsLoadingConfig(weight_mode=weight_mode),
+            reduce_output=False,
+            override_tp_sharding=ranges if override in ("replicated_kv", "uneven") else None,
+        ).cuda()
+        lin.load_weights(
+            [
+                {
+                    "weight": sources[name][0].view(torch.float8_e4m3fn),
+                    "weight_scale_inv": sources[name][1],
+                }
+                for name in names
+            ]
+        )
+
+        expected_w = torch.cat([sources[n][0][slice(*ranges[n])] for n in names])
+        expected_s = torch.cat([sources[n][1][slice(*ranges[n])] for n in names])
+        assert torch.equal(lin.weight.view(torch.uint8).cpu(), expected_w), rank
+        stored = expected_s.cuda()
+        if lin.quant_method.use_cutlass:
+            stored = torch.ops.trtllm.block_scale_interleave(stored)
+        assert torch.equal(lin.weight_scale.view(torch.uint8).flatten(), stored.flatten()), rank
+
+        dequant = dequant_mxfp8_weight(expected_w.view(torch.float8_e4m3fn), expected_s, 32)
+        ref = x.float() @ dequant.cuda().t()
+        out = lin(x).float()
+        rel = (out - ref).norm() / ref.norm().clamp_min(1e-6)
+        # Dynamic MXFP8 activations cost about 1% relative error; a scale row
+        # on the wrong weight row is off by at least a factor of two.
+        assert rel < 0.05, (rank, float(rel))

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -5,13 +8,30 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from tensorrt_llm.functional import AllReduceParams
+from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import allgather
 from .linear import Linear, TensorParallelMode
+
+
+def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
+                              output_dtype: torch.dtype | None) -> torch.Tensor:
+    """Compute ``input @ weight.T`` with an optional output dtype override.
+
+    None keeps the model dtype. An FP32 override stores the result directly
+    in FP32 without first rounding it to the BF16/FP16 model dtype.
+    """
+    out_features = weight.shape[0]
+    output_shape = (*input.shape[:-1], out_features)
+    input_2d = input.reshape(-1, input.shape[-1])
+    mm_kwargs = {}
+    if output_dtype is not None and output_dtype != weight.dtype:
+        mm_kwargs["out_dtype"] = output_dtype
+    output = torch.mm(input_2d, weight.t(), **mm_kwargs)
+    return output.view(output_shape)
 
 
 class LMHead(Linear):
@@ -23,6 +43,11 @@ class LMHead(Linear):
         dtype (Optional[torch.dtype]): type of the parameters.
         mapping (Optional[Mapping]): parallelism configuration.
             If not provided, the embedding is not parallelized.
+        output_dtype (Optional[torch.dtype]): dtype of the logits written by
+            the GEMM. None keeps the parameter dtype. torch.float32 keeps the
+            weights and inputs in the parameter dtype but writes the float32
+            accumulator directly, so logits are not rounded to bf16/fp16.
+            Only supported for unquantized, non-ROW-parallel heads.
     """
 
     def __init__(
@@ -36,6 +61,8 @@ class LMHead(Linear):
         reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
         quant_config=None,
+        output_dtype: Optional[torch.dtype] = None,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
@@ -79,6 +106,7 @@ class LMHead(Linear):
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
             quant_config=quant_config,
+            allreduce_strategy=allreduce_strategy,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -119,6 +147,22 @@ class LMHead(Linear):
             self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
             self.register_parameter("bias", None)
 
+        if output_dtype is not None:
+            if self.has_any_quant:
+                raise NotImplementedError(
+                    "LMHead output_dtype is only supported for unquantized "
+                    f"LM heads (quant_algo={quant_config.quant_algo})")
+            if self.tp_mode == TensorParallelMode.ROW:
+                raise NotImplementedError(
+                    "LMHead output_dtype does not support ROW tensor-parallel "
+                    "mode")
+        self.output_dtype = output_dtype
+
+    def _writes_output_dtype(self) -> bool:
+        """Whether the GEMM must store a dtype different from its weights."""
+        return (self.output_dtype is not None
+                and self.output_dtype != self.weight.dtype)
+
     @property
     def vocab_size_padded(self) -> int:
         if self.tp_mode == TensorParallelMode.COLUMN and self.gather_output:
@@ -141,8 +185,8 @@ class LMHead(Linear):
             slice_width = ceil_div(self.out_features, tp_size)
             slice_start = tp_rank * slice_width
             slice_end = min((tp_rank + 1) * slice_width, self.out_features)
-            output = F.linear(input, self.weight[slice_start:slice_end, :],
-                              None)
+            weight = self.weight[slice_start:slice_end, :]
+            output = _matmul_with_output_dtype(input, weight, self.output_dtype)
         else:
             output = super().forward(input, all_reduce_params=all_reduce_params)
         if (self.tp_mode == TensorParallelMode.COLUMN and self.gather_output
@@ -150,6 +194,21 @@ class LMHead(Linear):
             output = output[..., :-self.padding_size]
 
         return output
+
+    def apply_linear(self,
+                     input: torch.Tensor,
+                     bias: Optional[torch.Tensor],
+                     lora_params: Optional[dict] = None,
+                     layer_idx: Optional[int] = None) -> torch.Tensor:
+        """Project hidden states in the configured GEMM output dtype."""
+        # Linear.forward runs the GEMM through apply_linear for the COLUMN and
+        # non-parallel modes, so the TP all-gather and the vocab-padding slice
+        # in forward() apply unchanged to the output_dtype logits.
+        if self._writes_output_dtype():
+            assert bias is None, "LMHead has no bias"
+            return _matmul_with_output_dtype(input, self.weight,
+                                             self.output_dtype)
+        return super().apply_linear(input, bias, lora_params, layer_idx)
 
     def skip_forward(
             self,
@@ -206,7 +265,7 @@ def pre_comm_embedding_ops(
             vocab_end_index,
         )
     else:
-        # flashinfer's rejection kernel (chain_speculative_sampling) pads non-accepted
+        # The rejection kernel (trtllm::chain_speculative_sampling) pads non-accepted
         # tokens with -1. When the full vocab is local (non-TP or ROW TP), mask
         # out-of-range ids (e.g. -1) over [0, weight.shape[0]) to avoid an OOB
         # embedding lookup.
@@ -270,6 +329,7 @@ class Embedding(LMHead):
         reduce_output: bool = True,
         enable_torch_compile_for_embedding: Optional[bool] = False,
         use_custom_cublas_mm: bool = False,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
@@ -280,6 +340,7 @@ class Embedding(LMHead):
             gather_output=gather_output,
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            allreduce_strategy=allreduce_strategy,
         )
 
         self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding

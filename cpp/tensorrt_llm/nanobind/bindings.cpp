@@ -30,8 +30,10 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
+#include "tensorrt_llm/common/cudaArchitectures.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftSupport.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
@@ -53,6 +55,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -106,6 +109,22 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
                 tensorrt_llm::mpi::MpiComm::setSession(world.split(color, rank));
             });
 
+    nb::class_<tensorrt_llm::mpi::MpiProgressThread>(m, "MpiProgressThread",
+        "Native thread that issues a non-matching MPI_Iprobe every interval to keep the MPI progress engine "
+        "running without the GIL. Requires MPI_THREAD_MULTIPLE; stop it before MPI is finalized.")
+        .def(
+            "__init__",
+            [](tensorrt_llm::mpi::MpiProgressThread* self, int64_t fortran_handle, int64_t interval_us, int probe_tag)
+            {
+                new (self) tensorrt_llm::mpi::MpiProgressThread(
+                    tensorrt_llm::mpi::MpiProgressThread::commFromFortranHandle(fortran_handle),
+                    std::chrono::microseconds(interval_us), probe_tag);
+            },
+            nb::arg("fortran_handle"), nb::arg("interval_us"), nb::arg("probe_tag"))
+        .def("stop", &tensorrt_llm::mpi::MpiProgressThread::stop, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("is_running", &tensorrt_llm::mpi::MpiProgressThread::isRunning)
+        .def_prop_ro("num_probes", &tensorrt_llm::mpi::MpiProgressThread::getNumProbes);
+
     nb::class_<tr::CudaStream>(m, "CudaStream")
         .def(
             "__init__",
@@ -149,6 +168,27 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
+    buildInfo.attr("CFT_COUNTED_WRITES") = nb::bool_(static_cast<bool>(TLLM_CFT_HAS_CUDA_13_4_SUPPORT));
+
+    auto const toTuple = [](std::vector<int> const& architectures)
+    {
+        nb::list list;
+        for (int const sm : architectures)
+        {
+            list.append(sm);
+        }
+        return nb::tuple(list);
+    };
+    buildInfo.attr("CUDA_ARCHITECTURES") = toTuple(tensorrt_llm::common::getBuiltCudaArchitectures());
+    buildInfo.attr("SUPPORTED_CUDA_ARCHITECTURES") = toTuple(tensorrt_llm::common::getSupportedCudaArchitectures());
+    buildInfo.def("is_cuda_architecture_built", &tensorrt_llm::common::isCudaArchitectureBuilt, nb::arg("sm_version"),
+        "Whether a GPU of SM version `sm_version` (e.g. 90) is one this build was configured for.");
+    buildInfo.def("is_cuda_architecture_supported", &tensorrt_llm::common::isCudaArchitectureSupported,
+        nb::arg("sm_version"),
+        "Whether a GPU of SM version `sm_version` (e.g. 90) is one TensorRT-LLM provides optimized kernels for.");
+    buildInfo.def("check_cuda_architecture_supported", &tensorrt_llm::common::checkCudaArchitectureSupported,
+        nb::arg("device"),
+        "Raises if the GPU `device` is not one of the CUDA architectures this build was configured for.");
 
     nb::class_<tb::PeftCacheManagerConfig>(m, "PeftCacheManagerConfig")
         .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,

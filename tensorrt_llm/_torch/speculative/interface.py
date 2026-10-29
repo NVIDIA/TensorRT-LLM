@@ -47,45 +47,34 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .spec_tail_kernels import strict_accept
+from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
 
 def rejection_sampling_one_model(
     draft_probs: torch.Tensor,
     draft_token_ids: torch.Tensor,
     target_probs: torch.Tensor,
-    deterministic: bool = True,
-    seed: Optional[int] = None,
-    offset: Optional[int] = None,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # chain_speculative_sampling requires flashinfer>=0.6.4. This entry point can
-    # be reached independently of SpecWorkerBase.__init__ (e.g. via
-    # _can_use_rejection_sampling), so re-check here to fail with a clear message
-    # instead of a cryptic flashinfer error.
-    if not IS_FLASHINFER_AVAILABLE or Version(
-            flashinfer.__version__) < Version("0.6.4"):
-        raise RuntimeError(
-            "Rejection sampling for one-model speculative decoding requires flashinfer>=0.6.4"
-        )
-    batch_size = draft_token_ids.shape[0]
-    device = draft_token_ids.device
-    output_accepted_token_num = torch.zeros(batch_size,
-                                            dtype=torch.int32,
-                                            device=device)
-    output_emitted_draft_token_num = torch.zeros(batch_size,
-                                                 dtype=torch.int32,
-                                                 device=device)
-    accepted_tokens, _, output_emitted_draft_token_num = flashinfer.sampling.chain_speculative_sampling(
-        draft_probs,
-        draft_token_ids,
-        target_probs,
-        maybe_output_accepted_token_num=output_accepted_token_num,
-        maybe_output_emitted_draft_token_num=output_emitted_draft_token_num,
-        deterministic=deterministic,
-        generator=None,
-        seed=seed,
-        offset=offset,
-    )
-    return accepted_tokens, output_emitted_draft_token_num + 1
+    """Verify each request's linear draft against the target distribution.
+
+    Args:
+        draft_probs: ``[batch, D, vocab]`` float32 proposal distributions.
+        draft_token_ids: ``[batch, D]`` int32 draft tokens.
+        target_probs: ``[batch, D + 1, vocab]`` float32 target distributions.
+        seed, offset: ``[batch]`` int64 Philox state, one per request; the
+            offset names the request's own subsequence.
+    Returns:
+        ``accepted_tokens [batch, D + 1]`` (the accepted draft tokens, the
+        corrected or bonus token, then ``-1``) and the number of tokens each
+        request emits, ``[batch]``.
+    """
+    return torch.ops.trtllm.chain_speculative_sampling(draft_probs,
+                                                       draft_token_ids,
+                                                       target_probs, seed,
+                                                       offset)
 
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
@@ -155,8 +144,8 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
         return None
     spec_mode = spec_config.spec_dec_mode
     if not spec_mode.use_one_engine():
-        # Two-model drafting runs the draft as its own engine over its own
-        # request view, so nothing here is shifted against the target prompt.
+        # Drafter-based modes keep no draft KV in the target's request view,
+        # so nothing here is shifted against the target prompt.
         return None
     if spec_mode.is_mtp_vanilla():
         # Known limitation: an internal chunk lacks target_hidden[i + k], so reuse
@@ -249,7 +238,7 @@ def get_force_num_accepted_tokens() -> int:
     variable as an integer.
 
     Used by speculative decoding paths that operate on Python lists/slices and
-    therefore require an integer count (e.g. the two-model path in
+    therefore require an integer count (e.g. draft-token verification in
     ``TorchSampler``). For the one-model path, see
     :func:`get_force_num_accepted_tokens_float`, which supports fractional
     synthetic acceptance rates.
@@ -449,16 +438,22 @@ class SpeculativeDecodingMode(IntEnum):
 
 
 # Philox seed for requests that did not set ``SamplingParams.seed``. Fixed
-# rather than advanced per step so a run is reproducible: a request's stream is
-# separated from other rows' by the kernel's per-row subsequence and from every
-# other unseeded request's, past or present, by the offset (see
-# ``SpecMetadata._rng_window_counter``), which leaves the seed free to be a
+# rather than advanced per step so a run is reproducible: a row's stream is
+# separated from every other row's -- its own request's other rows, and every
+# other unseeded request's, past or present -- by the offset (see
+# ``SpecMetadata._take_rng_window_offsets``), which leaves the seed free to be a
 # constant.
 DEFAULT_SAMPLING_SEED = 42
 
 # Key in ``SpecMetadata._rng_window_counter`` for the window counter shared by
 # all unseeded requests. A string so it cannot collide with a slot id.
 _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
+
+# Philox offsets between consecutive slots of an offset window. The fused
+# kernel and the acceptance kernels need only distinct offsets, but the
+# flashinfer ops read a single offset and draw several values per row from it,
+# so each slot leaves them room before the next one starts.
+_RNG_SLOT_SPAN = 32
 
 
 @dataclass
@@ -496,8 +491,6 @@ class SpecMetadata:
     host_position_ids: Optional[torch.Tensor] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
-    # The number of accepted draft tokens for each request.
-    num_accepted_draft_tokens: Optional[torch.Tensor] = None
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
@@ -571,7 +564,7 @@ class SpecMetadata:
     # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
     # advanced choice gates group collectives, so all ranks must take the same
     # path even though their batches (and thus local flags) differ. Set by
-    # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
+    # ``sync_group_all_greedy_sample`` before the CUDA graph key is built and
     # re-applied by ``_scan_one_model_sampling`` on every rescan. AND is safe:
     # a greedy rank pulled onto the advanced path still samples greedily via
     # its sentinel params.
@@ -647,10 +640,9 @@ class SpecMetadata:
     # step counter -- keeps a seeded request reproducible regardless of which
     # batch it lands in.
     #
-    # NB: the pinned flashinfer reads only element 0 of each tensor, separating
-    # rows by blockIdx.x, so these per-row values are carried end-to-end but
-    # not yet honored per request. See
-    # https://github.com/flashinfer-ai/flashinfer/pull/2345.
+    # The fused kernel and the acceptance kernels honor these per row. The
+    # flashinfer ops behind the non-fused advanced sampling modes read only
+    # element 0.
     request_seeds: Optional[torch.Tensor] = None
     request_offsets: Optional[torch.Tensor] = None
     # Count of RNG windows already handed out. Seeded requests are counted per
@@ -674,16 +666,16 @@ class SpecMetadata:
     # A slot's counter is reset when a different request takes the slot over
     # (see ``_rng_slot_owner``), so a seeded request always starts at the
     # beginning of its stream: with a fixed seed it reproduces bit-exactly
-    # regardless of which slot it lands on or that slot's history. (Batch
-    # composition can still perturb it, because the kernel's per-row
-    # subsequence follows the batch row.)
+    # regardless of which slot it lands on or that slot's history.
     #
     # Unseeded requests all share DEFAULT_SAMPLING_SEED, so a per-slot counter
     # would give two requests on never-used slots the same (seed, offset) and
     # hence the same tokens whenever they also share a batch row. SlotManager
     # hands serial requests a fresh slot each time, so that is the common
     # low-concurrency case. The shared counter guarantees every unseeded
-    # request an offset window no earlier request has used.
+    # request an offset window no earlier request has used, and it counts from
+    # UNSEEDED_OFFSET_BASE so that a user seed equal to DEFAULT_SAMPLING_SEED
+    # does not replay those windows either.
     _rng_window_counter: dict = field(default_factory=dict)
     # seq_slot -> py_request_id mapping to track offset slot ownership.
     _rng_slot_owner: dict = field(default_factory=dict)
@@ -768,12 +760,31 @@ class SpecMetadata:
         self.context_prompt_lookahead_tokens[:num_contexts].copy_(
             tokens_cpu, non_blocking=True)
 
+    @property
+    def _rng_target_slots(self) -> int:
+        return (self.max_total_draft_tokens +
+                1 if self.is_spec_dec_tree else self.max_draft_len + 1)
+
+    def rng_draft_slot(self, draft_step: int) -> int:
+        """Window slot of a draft launch, or of a block sampler's first row."""
+        return self._rng_target_slots + draft_step
+
+    @property
+    def rng_accept_slot(self) -> int:
+        """Window slot of the acceptance kernel."""
+        return self._rng_target_slots + self.max_draft_len
+
     def _take_rng_window_offsets(self, requests: list["LlmRequest"],
                                  seeded: list[bool]) -> list[int]:
         """
         Hand each request the base of a fresh Philox offset window.
+
+        A window holds one ``_RNG_SLOT_SPAN``-wide slot per row the request
+        samples in a step: its target rows first, then its draft steps, then
+        the acceptance kernel. Distinct slots are what keep those rows' draws
+        apart.
         """
-        window = self.max_draft_len + 1
+        window = (self.rng_accept_slot + 1) * _RNG_SLOT_SPAN
         offsets: list[int] = []
         for request, is_seeded in zip(requests, seeded):
             # Dummy/padding requests (no slot) never have their output kept;
@@ -787,11 +798,13 @@ class SpecMetadata:
                 if self._rng_slot_owner.get(key) != request.py_request_id:
                     self._rng_slot_owner[key] = request.py_request_id
                     self._rng_window_counter[key] = 0
+                base = 0
             else:
                 key = _UNSEEDED_RNG_WINDOW_KEY
+                base = fused_sampling.UNSEEDED_OFFSET_BASE
             step = self._rng_window_counter.get(key, 0)
             self._rng_window_counter[key] = step + 1
-            offsets.append(step * window)
+            offsets.append(base + step * window)
         return offsets
 
     def _populate_request_rng_state(
@@ -813,12 +826,11 @@ class SpecMetadata:
         take one or the other.
 
         A request that specified no seed gets ``DEFAULT_SAMPLING_SEED`` and an
-        offset window from the counter shared by all unseeded requests. Its
-        stream is then separated from the other rows' by the kernel's per-row
-        subsequence and from every other unseeded request's, including its own
-        earlier steps, by the offset -- so unseeded requests sample
-        independently of each other, just reproducibly for a given traffic
-        history.
+        offset window from the counter shared by all unseeded requests. Each of
+        its rows takes its own slot of that window, so its streams are separated
+        from each other and from every other unseeded request's, including its
+        own earlier steps -- unseeded requests sample independently of each
+        other, just reproducibly for a given traffic history.
         """
         from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
             request_random_seed
@@ -837,7 +849,8 @@ class SpecMetadata:
         for seed, offset, num_tokens in zip(request_seeds, request_offsets,
                                             num_tokens_per_request):
             flat_seeds.extend(seed for _ in range(num_tokens))
-            flat_offsets.extend(offset for _ in range(num_tokens))
+            flat_offsets.extend(offset + row * _RNG_SLOT_SPAN
+                                for row in range(num_tokens))
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
@@ -873,6 +886,11 @@ class SpecMetadata:
                                                  pin_memory=prefer_pinned()),
                                     non_blocking=True)
 
+        # An all-greedy batch runs the argmax graph, which reads none of these
+        # buffers. The offset windows above still advance, so skipping the
+        # copies changes no later batch's streams.
+        if self.is_all_greedy_sample:
+            return
         _upload(self.request_seeds, request_seeds)
         _upload(self.request_offsets, request_offsets)
         _upload(self.seeds, flat_seeds)
@@ -880,7 +898,7 @@ class SpecMetadata:
 
     def prepare_rejection_sampling_buffers(self):
         """
-        Allocate the slot-indexed buffers used by one-model rejection sampling.
+        Allocate slot state and batch scratch for one-model rejection sampling.
 
         Idempotent and gated on ``use_rejection_sampling``.
         """
@@ -913,10 +931,12 @@ class SpecMetadata:
                                               device='cuda')
         # full_draft_probs (d2t-expanded) is read only when draft and target
         # vocabularies differ; skip it otherwise. Zero-filled once.
+        # This scratch is indexed by generation batch position after gathering
+        # draft_probs by slot, so it needs neither the slot pool nor a dummy row.
         if (self.full_draft_probs is None and self.vocab_size > 0
                 and self.draft_vocab_size not in (0, self.vocab_size)):
             self.full_draft_probs = torch.zeros(
-                (num_slot_rows, self.max_draft_len, self.vocab_size),
+                (self.max_num_requests, self.max_draft_len, self.vocab_size),
                 dtype=torch.float32,
                 device='cuda')
 
@@ -1144,6 +1164,11 @@ class SpecMetadata:
         if self.is_cuda_graph:
             return self
 
+        # Slot-indexed state persists across steps that may run eagerly or under
+        # different graphs, so every view must share one allocation: allocate it
+        # here before the shallow copy rather than lazily in each view.
+        self.prepare_rejection_sampling_buffers()
+        self.prepare_penalty_buffers()
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
@@ -1184,7 +1209,8 @@ class SpecMetadata:
             LlmRequestState, get_request_tokens_per_gen_step)
         from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
             GREEDY_TEMPERATURE_THRESHOLD
-        from tensorrt_llm.sampling_params import SamplingParams
+        from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
+            SamplingMode, resolve_row_params)
 
         # Sentinel temperature for greedy / temperature-disabled rows. Must stay
         # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
@@ -1194,8 +1220,6 @@ class SpecMetadata:
         DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
         # Very large values disable topk.
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
-        DISABLE_TOPP_VAL = 1.0
-        DISABLE_MINP_VAL = 0.0
 
         def _normalize_request_sampling_params(
             *,
@@ -1204,32 +1228,24 @@ class SpecMetadata:
             top_p: Optional[float],
             min_p: Optional[float],
         ) -> tuple[float, int, float, float, bool]:
-            """Convert request sampling params into normalized per-request scalars."""
-            # min_p participates in the greedy classification and must: a request whose
-            # ONLY knob is min_p is not greedy (params_imply_greedy_decoding treats
-            # 0 < min_p < 1 as an active sampling knob), and min_p == 1.0 is explicit
-            # greedy. Omitting it here would classify a min_p-only request as greedy, send
-            # it down the argmax fast path, and drop min_p silently -- and since this flag
-            # is part of the CUDA graph key, it would also pick the wrong graph variant.
-            is_greedy = SamplingParams.params_imply_greedy_decoding(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                min_p=min_p,
-                use_beam_search=False)
+            """Convert request sampling params into normalized per-request scalars.
 
-            use_top_k = not is_greedy and top_k is not None and top_k > 0
-
+            Interpreted as TorchSampler does (resolve_row_params); greedy rows
+            take the sentinels above, and a disabled top_k takes
+            DISABLE_TOPK_VAL rather than 0.
+            """
+            row = resolve_row_params(temperature=temperature,
+                                     top_k=top_k,
+                                     top_p=top_p,
+                                     min_p=min_p)
+            is_greedy = row.mode is SamplingMode.GREEDY
             # The sentinel is one-hot under softmax, so it must not reach a
-            # non-greedy row; those resolve 1.0, as resolve_sampling_strategy does.
-            normalized_temperature = (DISABLE_TEMP_VAL if is_greedy else
-                                      (temperature or 1.0))
-            normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
-            normalized_top_p = (DISABLE_TOPP_VAL
-                                if is_greedy or top_p is None else top_p)
-            # Unlike top_p, min_p's neutral value is 0.0, not 1.0.
-            normalized_min_p = (DISABLE_MINP_VAL
-                                if is_greedy or min_p is None else min_p)
+            # non-greedy row.
+            normalized_temperature = (DISABLE_TEMP_VAL
+                                      if is_greedy else row.temperature)
+            normalized_top_k = row.top_k if row.top_k > 0 else DISABLE_TOPK_VAL
+            normalized_top_p = row.top_p
+            normalized_min_p = row.min_p
 
             return (
                 normalized_temperature,
@@ -1565,6 +1581,52 @@ class SpecMetadata:
         self._sampling_params_signature[0] = None
         self._sampling_params_signature[1] = None
 
+    def remap_expanded_sampling_params(self, req_idx: torch.Tensor,
+                                       num_tokens: int) -> None:
+        """Repack per-logits-row sampling state after device window selection.
+
+        Device window selection can redistribute a fixed token budget among
+        requests immediately before replay. The expanded sampling buffers must
+        follow the resulting token owners.
+        """
+        if num_tokens <= 0:
+            return
+        owners = req_idx[:num_tokens].to(torch.long)
+        pairs = (
+            (self.request_temperatures, self.temperatures),
+            (self.request_top_ks, self.top_ks),
+            (self.request_top_ps, self.top_ps),
+            (self.request_min_ps, self.min_ps),
+            (self.request_seeds, self.seeds),
+            (self.request_offsets, self.offsets),
+        )
+        for request_values, expanded_values in pairs:
+            if request_values is None or expanded_values is None:
+                continue
+            if expanded_values.numel() < num_tokens:
+                raise RuntimeError(
+                    "device-selected DSpark layout exceeds the captured "
+                    "sampling-parameter buffer")
+            torch.index_select(request_values,
+                               0,
+                               owners,
+                               out=expanded_values[:num_tokens])
+
+        if self.request_offsets is not None and self.offsets is not None:
+            if self.qo_indptr is None:
+                raise RuntimeError(
+                    "device-selected DSpark sampling requires ragged row starts"
+                )
+            row_slots = torch.arange(num_tokens,
+                                     device=owners.device,
+                                     dtype=torch.int64)
+            row_slots -= self.qo_indptr.index_select(0, owners)
+            self.offsets[:num_tokens].add_(row_slots * _RNG_SLOT_SPAN)
+
+        # The expanded cache now follows the device-selected layout. Force the
+        # next host-prepared iteration to restore its own row expansion.
+        self._sampling_params_signature[1] = None
+
 
 class AuxiliarySpeculativeStateHandler(Protocol):
     """Model-side state that verification writes once per draft token.
@@ -1697,6 +1759,25 @@ class SpecWorkerBase(nn.Module, ABC):
     def _forward_impl(self, *args, **kwargs):
         """Worker-specific forward logic, called by SpecWorkerBase.forward."""
 
+    def target_logits(self, hidden_states: torch.Tensor, lm_head,
+                      logits_processor, attn_metadata, spec_metadata,
+                      draft_model) -> torch.Tensor:
+        """The target logits of the gathered rows ``hidden_states``, which
+        the model hands to ``forward`` as ``logits``: fp32 [rows, vocab].
+
+        A worker whose acceptance reads another layout overrides this. If its
+        ``forward`` then returns this TP rank's vocabulary shard as
+        ``"logits"``, it also returns ``"logits_vocab_shard": True``, and the
+        engine gathers the logits (on every TP rank together, so not under
+        attention DP) before any logits post-processor sees them; the
+        post-processors get a read-only view, since the acceptance already
+        ran inside ``forward``. Such a worker applies a guided decoder's
+        bitmask to its shard at the shard's column offset, or rejects guided
+        decoding.
+        """
+        return logits_processor.forward(hidden_states, lm_head, attn_metadata,
+                                        True)
+
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         """Restore attn-metadata spec-dec state if a failure skipped it.
 
@@ -1815,6 +1896,21 @@ class SpecWorkerBase(nn.Module, ABC):
         when the draft and target vocabularies differ; stays None otherwise.
         """
         self._d2t = getattr(getattr(draft_model, "model", None), "d2t", None)
+
+    def set_target_model(self, target_model: nn.Module) -> None:
+        """Called at construction with the target model that owns this worker.
+
+        Workers that select target tokens from a vocab-sharded head override
+        this and decide after loading; see :attr:`target_vocab_parallel_head`.
+        """
+        del target_model
+
+    @property
+    def target_vocab_parallel_head(self) -> Optional[VocabParallelHead]:
+        """The head whose vocab-shard logits this worker's
+        :meth:`target_logits` returns, as :class:`VocabShardedLogits`, in
+        place of the gathered target logits. None to receive gathered logits."""
+        return None
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         """
@@ -1968,7 +2064,8 @@ class SpecWorkerBase(nn.Module, ABC):
         acceptance is disabled).
 
         Args:
-            logits: [num_tokens, vocab_size] - Target model logits
+            logits: [num_tokens, vocab_size] - Target model logits, or their
+                vocab shard as ``VocabShardedLogits``
             draft_tokens: [num_gens, runtime_draft_len] - Previously predicted draft tokens
             num_contexts: Number of context requests
             batch_size: Total number of requests
@@ -1982,12 +2079,25 @@ class SpecWorkerBase(nn.Module, ABC):
         # spec_metadata.runtime_draft_len, because callers may slice a wider
         # runtime token layout down to the K draft tokens used for acceptance.
         runtime_draft_len = draft_tokens.shape[-1]
-        num_gens = batch_size - num_contexts
 
-        if logits.dim() == 1:
+        if isinstance(logits, torch.Tensor) and logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
-        # Allocate return buffers
+        # Sample tokens using per-request sampling parameters
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
+
+        if spec_metadata is None or not spec_metadata.is_ragged_verify:
+            # Context requests accept the sampled token only; generation
+            # requests count the leading draft tokens equal to the target's.
+            accepted_tokens, num_accepted_tokens = strict_accept(
+                target_tokens, draft_tokens, num_contexts, batch_size)
+            return accepted_tokens, self._apply_force_accepted_tokens(
+                num_accepted_tokens,
+                num_contexts,
+                runtime_draft_len,
+                spec_metadata=spec_metadata)
+
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
                                       dtype=torch.int,
                                       device=logits.device)
@@ -1995,45 +2105,30 @@ class SpecWorkerBase(nn.Module, ABC):
                                          dtype=torch.int,
                                          device=logits.device)
 
-        # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
-
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
-        # Generation requests: verify draft tokens against target tokens
-        if spec_metadata is not None and spec_metadata.is_ragged_verify:
-            from .ragged_helpers import (count_accepted_ragged,
-                                         scatter_ragged_to_padded)
-            verify_lens = spec_metadata.verify_lens
-            total = spec_metadata.total_verify_tokens
-            qo_indptr = spec_metadata.qo_indptr
-            if verify_lens is None or total is None or qo_indptr is None:
-                raise RuntimeError("ragged verification metadata is incomplete")
-            gen_target_tokens = scatter_ragged_to_padded(
-                target_tokens[num_contexts:num_contexts + total],
-                verify_lens=verify_lens,
-                qo_indptr=qo_indptr,
-                max_len=runtime_draft_len + 1)
-            # verify_lens counts tokens (bonus position included), so a
-            # request drafted verify_lens - 1 positions. Masking past that is
-            # what stops a stale padded slot from comparing equal and crediting
-            # an acceptance the target never made.
-            num_accepted_tokens[num_contexts:] += count_accepted_ragged(
-                draft_tokens=draft_tokens,
-                target_tokens=gen_target_tokens[:, :runtime_draft_len],
-                verify_lens=verify_lens - 1)
-        else:
-            gen_target_tokens = target_tokens[num_contexts:].reshape(
-                num_gens, runtime_draft_len + 1)
-
-            # Compare draft tokens with target tokens using cumulative product
-            # Counts consecutive matches from the start
-            num_accepted_tokens[num_contexts:] += torch.cumprod((
-                draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
-                                                                dim=-1).sum(1)
-
+        # Generation requests: verify the ragged draft windows
+        from .ragged_helpers import (count_accepted_ragged,
+                                     scatter_ragged_to_padded)
+        verify_lens = spec_metadata.verify_lens
+        total = spec_metadata.total_verify_tokens
+        qo_indptr = spec_metadata.qo_indptr
+        if verify_lens is None or total is None or qo_indptr is None:
+            raise RuntimeError("ragged verification metadata is incomplete")
+        gen_target_tokens = scatter_ragged_to_padded(
+            target_tokens[num_contexts:num_contexts + total],
+            verify_lens=verify_lens,
+            qo_indptr=qo_indptr,
+            max_len=runtime_draft_len + 1)
+        # verify_lens counts tokens (bonus position included), so a
+        # request drafted verify_lens - 1 positions. Masking past that is
+        # what stops a stale padded slot from comparing equal and crediting
+        # an acceptance the target never made.
+        num_accepted_tokens[num_contexts:] += count_accepted_ragged(
+            draft_tokens=draft_tokens,
+            target_tokens=gen_target_tokens[:, :runtime_draft_len],
+            verify_lens=verify_lens - 1)
         accepted_tokens[num_contexts:, :runtime_draft_len +
                         1] = gen_target_tokens
 
@@ -2044,14 +2139,13 @@ class SpecWorkerBase(nn.Module, ABC):
             runtime_draft_len,
             spec_metadata=spec_metadata)
 
-        if spec_metadata is not None and spec_metadata.is_ragged_verify:
-            # The synthetic-acceptance override caps at the batch-wide
-            # runtime_draft_len; under ragged a request may have verified
-            # fewer positions, and accepting past its window would commit
-            # tokens the target never produced.
-            num_accepted_tokens[num_contexts:] = torch.minimum(
-                num_accepted_tokens[num_contexts:],
-                spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
+        # The synthetic-acceptance override caps at the batch-wide
+        # runtime_draft_len; under ragged a request may have verified
+        # fewer positions, and accepting past its window would commit
+        # tokens the target never produced.
+        num_accepted_tokens[num_contexts:] = torch.minimum(
+            num_accepted_tokens[num_contexts:],
+            spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
 
     def _apply_occurrence_penalties(
@@ -2320,10 +2414,8 @@ class SpecWorkerBase(nn.Module, ABC):
         """Zero the logits rows belonging to CUDA-graph padding requests.
 
         A padding request decodes from an uninitialized KV/hidden state, so its
-        logits can be non-finite and its probs degenerate. flashinfer's
-        ``chain_speculative_sampling`` then rejects at a position whose
-        ``relu(target - draft)`` residual has no mass, reads an uninitialized
-        shared-memory slot and emits an out-of-range token id. Zeroed logits are legal.
+        logits can be non-finite and its probs NaN, which no acceptance kernel
+        can sample from. Zeroed logits are legal.
 
         Padding requests are the ones ``populate_sampling_params_for_one_model``
         routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
@@ -2382,13 +2474,12 @@ class SpecWorkerBase(nn.Module, ABC):
         min_ps = spec_metadata.request_min_ps[:batch_size]
 
         # One row per request here, matching the request_* slices above.
-        # Slot 0 of the step's offset window belongs to the target sampler, so
-        # draft step i takes 1 + i. Callers that do not pass a draft_step run
-        # this sampler once per step and take the first draft slot.
-        seed, offset = self._rng_state_per_request(spec_metadata,
-                                                   end=batch_size,
-                                                   step_offset=1 +
-                                                   (draft_step or 0))
+        # Callers that do not pass a draft_step run this sampler once per step
+        # and take the first draft slot.
+        seed, offset = self._rng_state_per_request(
+            spec_metadata,
+            end=batch_size,
+            slot=spec_metadata.rng_draft_slot(draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             # The proposal stored below is read back by next iteration's
             # rejection kernel, so a padding row must not poison it either.
@@ -2678,15 +2769,17 @@ class SpecWorkerBase(nn.Module, ABC):
 
             full_draft_tokens = draft_tokens.to(torch.int32).contiguous()
 
-            # One entry per gen request; slot 0 of the step's offset window.
-            seed, offset = self._rng_state_per_request(spec_metadata,
-                                                       num_contexts, batch_size)
+            # One entry per gen request.
+            seed, offset = self._rng_state_per_request(
+                spec_metadata,
+                num_contexts,
+                batch_size,
+                slot=spec_metadata.rng_accept_slot)
 
             gen_accepted, gen_num_accepted = rejection_sampling_one_model(
                 draft_probs=full_draft_probs,
                 draft_token_ids=full_draft_tokens,
                 target_probs=target_probs,
-                deterministic=True,
                 seed=seed,
                 offset=offset,
             )
@@ -2724,7 +2817,8 @@ class SpecWorkerBase(nn.Module, ABC):
         start: int = 0,
         end: Optional[int] = None,
         repeat: int = 1,
-        step_offset: int = 0,
+        *,
+        slot: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Philox (seed, offset) laid out one entry per request row.
 
@@ -2732,21 +2826,20 @@ class SpecWorkerBase(nn.Module, ABC):
         the gen slice); ``repeat`` expands each request to the ``K`` rows a
         block sampler flattens it into.
 
-        ``step_offset`` picks a slot inside this decoding step's offset window
-        (see ``_populate_request_rng_state``). The target sampler and the
-        rejection kernel leave it at 0; the draft loop passes ``1 +
-        draft_step`` so each of its launches draws a distinct stream -- with a
-        fixed user seed the offset is the only thing separating them, since
-        every draft launch restarts the kernel's per-row subsequence at 0.
-
+        ``slot`` picks the slot of this step's offset window the rows draw from
+        (see ``SpecMetadata._take_rng_window_offsets``); the ``repeat`` rows of
+        one request take consecutive slots from there.
         """
         seeds = spec_metadata.request_seeds[start:end]
-        offsets = spec_metadata.request_offsets[start:end]
-        if step_offset:
-            offsets = offsets + step_offset
+        offsets = (spec_metadata.request_offsets[start:end] +
+                   slot * _RNG_SLOT_SPAN)
         if repeat > 1:
             seeds = seeds.repeat_interleave(repeat)
-            offsets = offsets.repeat_interleave(repeat)
+            row_slots = torch.arange(repeat,
+                                     dtype=torch.int64,
+                                     device=offsets.device)
+            offsets = (offsets.repeat_interleave(repeat) +
+                       row_slots.repeat(offsets.numel()) * _RNG_SLOT_SPAN)
         return seeds, offsets
 
     def _rng_state_per_token(
@@ -2892,14 +2985,17 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts:batch_size].repeat_interleave(K)
 
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
-        # A block sampler emits all K draft positions in one launch, so the
-        # kernel's per-row subsequence already separates them and they share
-        # the first draft slot of the step's offset window.
-        seed, offset = self._rng_state_per_request(spec_metadata,
-                                                   num_contexts,
-                                                   batch_size,
-                                                   repeat=K,
-                                                   step_offset=1)
+        # A block sampler emits all K draft positions in one launch; they take
+        # the step's K draft slots.
+        assert K <= spec_metadata.max_draft_len, (
+            f"{K} draft rows per request exceed max_draft_len="
+            f"{spec_metadata.max_draft_len}")
+        seed, offset = self._rng_state_per_request(
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            repeat=K,
+            slot=spec_metadata.rng_draft_slot(0))
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
             flat_logits = self._zero_padding_rows(flat_logits, spec_metadata,
@@ -3201,7 +3297,9 @@ class SpecWorkerBase(nn.Module, ABC):
         Supports both greedy and non-greedy sampling.
 
         Args:
-            logits: [num_tokens, vocab_size] - Logits to sample from
+            logits: [num_tokens, vocab_size] - Logits to sample from, or their
+                vocab shard as ``VocabShardedLogits`` when the worker selects
+                tokens vocab-parallel for this batch's sampling mode
             spec_metadata: Metadata containing sampling parameters
             num_contexts: Number of context requests in the batch
             batch_size: Number of requests in the batch
@@ -3209,6 +3307,8 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
+        if isinstance(logits, VocabShardedLogits):
+            return logits.select_tokens(spec_metadata)
         if not spec_metadata.is_all_greedy_sample:
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured

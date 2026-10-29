@@ -26,11 +26,22 @@ from cutlass import Int32
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
 from ...mask import kv_tile_is_fully_visible
+from ...stage import FmhaStage
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
+from ..fmha_decode_constants import KV_KIND_V
 from .helpers_common import (
+    Constexpr,
+    _TASK_CACHE_KV_RAW_TILE_BASE,
+    _TASK_CACHE_KV_VALID_TILE_END,
+    _TASK_CACHE_KV_WINDOW_START,
     _TASK_CACHE_SEQ_LEN_KV,
+    _clamp_valid_tile_idx,
     _decode_gen_task_cache,
+    _is_last_loop_iteration,
     _logical_head_batch,
+    _logical_q_group_idx,
+    _q_group_token_base,
+    _softmax_tile_idx,
 )
 
 
@@ -336,4 +347,151 @@ def _runtime_split_kv_global_tile_idx(
         _logical_cta_kv_idx(cfg, stage_info)
         * _runtime_local_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
         + local_tile_idx
+    )
+
+
+@cute.jit
+def _local_kv_tile_idx_for_section(
+    cfg: Constexpr[FmhaDecodeConfig],
+    stage_info: StageInfo,
+    inst_id: Constexpr[int],
+    kv_kind: Constexpr[int],
+    section: Constexpr[FmhaStage],
+) -> Int32:
+    """Return the local K/V tile index implied by the TS HEAD/LOOP/TAIL cadence.
+
+    The schedule names whether a producer is K0/K1/V0/V1, while the phase
+    defines where that logical tile sits in the staggered decode pipeline:
+
+    - HEAD produces only initial K tiles.
+    - LOOP produces V for the current MMA iteration and K for the next one.
+    - TAIL drains the final V tiles after the last loop iteration.
+    """
+    num_insts_kv = Int32(cfg.num_insts_kv)
+    if cutlass.const_expr(section == FmhaStage.Head):
+        return Int32(inst_id)
+    if cutlass.const_expr(section == FmhaStage.Loop):
+        base = stage_info.loop_offset * num_insts_kv + Int32(inst_id)
+        if cutlass.const_expr(kv_kind == KV_KIND_V):
+            return base
+        return base + num_insts_kv
+    return stage_info.loop_end * num_insts_kv + Int32(inst_id)
+
+
+@cute.jit
+def resolve_keeps_tile_context(
+    cfg: Constexpr[FmhaDecodeConfig],
+    stage_info: StageInfo,
+    *,
+    inst_id: Constexpr[int],
+    seqlens_kv: cute.Pointer | None,
+    max_seq_len_kv: Int32,
+    seq_len_q: Int32,
+    q_group_idx: Int32 | None,
+    local_tile_idx: Int32 | None = None,
+):
+    """Resolve one score tile's logical position and boundary-mask state.
+
+    Every user of a softmax instance's dense tiles (the S resource, and the
+    load warp copying a dense Sage plan's K scales for the tile) derives the
+    tile's token range from the same sequence-length sources, so the
+    resolution lives outside the S resource; block-sparse routes take their
+    origins from the prepared record instead. ``local_tile_idx`` defaults to
+    the softmax's tile; a producer passes the tile it loads.
+    """
+    task_cache = _decode_gen_task_cache(stage_info)
+    if cutlass.const_expr(seqlens_kv is None):
+        seq_len_kv = Int32(max_seq_len_kv)
+    else:
+        seq_len_kv = _load_runtime_seq_len_kv(
+            seqlens_kv,
+            max_seq_len_kv,
+            stage_info,
+            Int32(0),
+            Int32(0),
+        )
+
+    logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, q_group_idx)
+    q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
+    element_mask_end_idx = seq_len_kv
+    if cutlass.const_expr(cfg.uses_uniform_causal_mask):
+        element_mask_end_idx = seq_len_kv - seq_len_q + q_token_base + Int32(1)
+
+    use_runtime_kv_domain = seqlens_kv is not None or cfg.uses_runtime_q_kv_union
+    if cutlass.const_expr(local_tile_idx is None):
+        local_tile_idx = _softmax_tile_idx(cfg, stage_info, inst_id)
+    if cutlass.const_expr(not use_runtime_kv_domain):
+        effective_tile_idx = _static_split_kv_global_tile_idx(
+            cfg, stage_info, local_tile_idx
+        )
+        effective_total_kv_tiles = Int32(cfg.total_kv_tiles)
+        tile_idx = _clamp_valid_tile_idx(cfg, effective_tile_idx)
+        tile_idx = tile_idx + Int32(cfg.static_num_skipped_kv_tiles)
+        window_start_idx = Int32(cfg.static_window_start_idx)
+    elif cutlass.const_expr(cfg.use_paged_kv and not cfg.use_split_kv):
+        effective_tile_idx = (
+            Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tile_idx
+        )
+        effective_total_kv_tiles = Int32(task_cache[_TASK_CACHE_KV_VALID_TILE_END])
+        tile_idx = effective_tile_idx
+        window_start_idx = Int32(task_cache[_TASK_CACHE_KV_WINDOW_START])
+    else:
+        effective_tile_idx = _runtime_split_kv_global_tile_idx(
+            cfg,
+            stage_info,
+            local_tile_idx,
+            seq_len_kv,
+            seq_len_q,
+            q_token_base,
+        )
+        effective_total_kv_tiles = _runtime_total_kv_tiles(
+            cfg, seq_len_kv, seq_len_q, q_token_base
+        )
+        tile_idx = _runtime_clamp_valid_tile_idx(
+            cfg,
+            effective_tile_idx,
+            seq_len_kv,
+            seq_len_q,
+            q_token_base,
+        )
+        tile_idx = tile_idx + _num_skipped_kv_tiles(
+            cfg, seq_len_kv, seq_len_q, q_token_base
+        )
+        window_start_idx = _sliding_window_start_idx(
+            cfg, seq_len_kv, seq_len_q, q_token_base
+        )
+
+    tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
+    is_valid_effective_tile = effective_tile_idx < effective_total_kv_tiles
+    is_masked_final_wave = False
+    if cutlass.const_expr(not use_runtime_kv_domain and not cfg.use_split_kv):
+        if cutlass.const_expr(cfg.has_odd_kv_tail and inst_id == 1):
+            is_masked_final_wave = _is_last_loop_iteration(stage_info)
+    tile_has_valid_scores = (
+        is_valid_effective_tile
+        and (tile_offset_k < seq_len_kv)
+        and not is_masked_final_wave
+    )
+    tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
+        cfg,
+        tile_offset_k,
+        seq_len_kv,
+        seq_len_q,
+        q_token_base,
+        tile_has_valid_scores,
+    )
+    # Flattened SQ=1 QToken-KvBlock-Sparse-Attention routes use their compacted causal length as
+    # seq_len_kv. At or above the 2048-token budget this marks all first
+    # sixteen KV128 tiles unmasked; only the optional 0--3-token tail in a
+    # seventeenth tile reaches the boundary-mask specialization.
+    return (
+        seq_len_kv,
+        logical_q_group_idx,
+        element_mask_end_idx,
+        tile_offset_k,
+        window_start_idx,
+        is_valid_effective_tile,
+        is_masked_final_wave,
+        tile_is_unmasked,
+        tile_has_valid_scores,
     )

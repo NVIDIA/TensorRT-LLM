@@ -200,6 +200,7 @@ class _ConnectorReq:
         self.is_first_context_chunk = True
         self.py_connector_allocation_reported = False
         self.py_connector_served_position = 0
+        self.py_served_prefix_end = 0
         self.context_current_position = 0
         self.prepopulated_prompt_len = 0
         self.context_chunk_size = prompt_len

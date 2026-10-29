@@ -115,7 +115,7 @@ def lora_setup(root_dir, cpp_resources_dir, python_exe):
 @pytest.fixture(scope="session")
 def build_google_tests(request, build_type):
 
-    cuda_arch = f"{request.param}-real"
+    cuda_arch = f"{request.param}"
 
     _logger.info(f"Using CUDA arch: {cuda_arch}")
 
@@ -129,6 +129,11 @@ def build_google_tests(request, build_type):
         nixl_root="/opt/nvidia/nvda_nixl",
         skip_building_wheel=True,
         extra_make_targets=["google-tests"],
+        # The DLFW base image ships no libnvrtc_static.a, so the default
+        # CUDA::nvrtc_static target does not exist. The wheel builds get
+        # NVRTC_DYNAMIC_LINKING=ON implicitly (via ENABLE_BOLT_COMPATIBLE);
+        # this test-time build has no BOLT, so ask for it explicitly.
+        nvrtc_dynamic_linking=True,
     )
 
 
@@ -139,7 +144,7 @@ def build_kv_cache_compression_tests(request, build_type):
     The binary uses NO_TLLM_LINKAGE, so this skips the full-library
     build that build_google_tests pays for.
     """
-    cuda_arch = f"{request.param}-real"
+    cuda_arch = f"{request.param}"
 
     _logger.info(f"Using CUDA arch: {cuda_arch}")
 
@@ -152,6 +157,9 @@ def build_kv_cache_compression_tests(request, build_type):
         nixl_root="/opt/nvidia/nvda_nixl",
         skip_building_wheel=True,
         configure_only=True,
+        # Same reason as build_google_tests: no libnvrtc_static.a in the DLFW
+        # base image, and this build has no BOLT to turn dynamic linking on.
+        nvrtc_dynamic_linking=True,
     )
 
     build_dir = _cpp.find_build_dir(build_type)

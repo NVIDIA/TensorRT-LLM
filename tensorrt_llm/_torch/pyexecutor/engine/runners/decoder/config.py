@@ -23,7 +23,6 @@ class DecoderRunnerConfig(RunnerConfig):
     dtype: torch.dtype
     enable_attention_dp: bool
     disable_overlap_scheduler: bool
-    is_encode_only: bool
     is_spec_decode: bool
     spec_config: DecodingBaseConfig | None
     max_draft_len: int
@@ -43,6 +42,7 @@ class DecoderRunnerConfig(RunnerConfig):
     torch_compile_enabled: bool
     torch_compile_piecewise_cuda_graph: bool
     torch_compile_prefill_only: bool
+    compile_only_piecewise_graphs: bool
     use_mrope: bool
     is_multimodal: bool
     mm_encoder_cache_enabled: bool

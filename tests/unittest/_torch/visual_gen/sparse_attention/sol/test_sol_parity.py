@@ -31,15 +31,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol import predictor as sol_predictor
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol import predictor as sol_predictor
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.backend import (
     SOLCuTeDSLAttention,
     SOLTrtllmAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.predictor import (
     SolPredictorOutputs,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import sol_attn_backend
@@ -106,17 +106,16 @@ def _mixed_proxy_reference(
                 weights = torch.exp(logits - logits.amax(dim=1, keepdim=True))
                 exact_weights = weights[:, : exact_tokens.numel()]
                 proxy_weights = weights[:, exact_tokens.numel() :]
+                for proxy_offset, block_idx in enumerate(proxy_blocks):
+                    tokens_in_block = min(_BLOCK, k.shape[1] - block_idx * _BLOCK)
+                    proxy_weights[:, proxy_offset] *= tokens_in_block
                 numerator = exact_weights @ v[batch_idx, exact_tokens, head_idx].float()
                 if proxy_blocks:
                     numerator += (
                         proxy_weights @ outputs.v_summary[batch_idx, proxy_blocks, head_idx].float()
                     )
                 denominator = exact_weights.sum(dim=1, keepdim=True)
-                for proxy_offset, block_idx in enumerate(proxy_blocks):
-                    tokens_in_block = min(_BLOCK, k.shape[1] - block_idx * _BLOCK)
-                    denominator += proxy_weights[:, proxy_offset : proxy_offset + 1] * (
-                        tokens_in_block
-                    )
+                denominator += proxy_weights.sum(dim=1, keepdim=True)
                 reference[batch_idx, q_begin:q_end, head_idx] = (numerator / denominator).to(
                     q.dtype
                 )

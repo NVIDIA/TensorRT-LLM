@@ -502,7 +502,6 @@ class PenaltyHandler:
         request_num_steps: torch.Tensor,
         request_num_beams: torch.Tensor | None = None,
         predecessor_beams: torch.Tensor | None = None,
-        is_draft_batch: bool = False,
     ) -> None:
         """Advance the occurrence state for this step and apply the penalties to ``logits``.
 
@@ -529,12 +528,8 @@ class PenaltyHandler:
                 row -> beam mapping matches ``request_offsets``. ``predecessor_beams``
                 must still hold the *previous* step's parent map, i.e. this must run
                 before the step's beam sampling overwrites it.
-            is_draft_batch: draft batches share this sampler but draw ``py_seq_slot``
-                from a separate numbering space that collides with target slots, so
-                penalizing them would read/write an unrelated target request's
-                occurrence state; skip them like the pending-steps tracking.
         """
-        if is_draft_batch or not requests or self._num_active_slots == 0:
+        if not requests or self._num_active_slots == 0:
             return
 
         # Cheap per-batch scan so the vocab-sized workspace is only allocated when this

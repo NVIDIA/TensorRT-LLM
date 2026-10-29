@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,69 +23,98 @@
 
 using namespace tensorrt_llm::runtime;
 
-TEST(IBufferTest, bufferCastOrNullForOptionalWithValue)
+TEST(IBufferTest, getBufferPtr)
 {
-    std::optional<IBuffer::SharedPtr> buffer = std::make_optional(BufferManager::cpu(16, TRTDataType<float>::value));
-    auto ptr = bufferCastOrNull<float>(buffer);
-    static_assert(std::is_same<decltype(ptr), float*>::value);
-    ASSERT_TRUE(ptr != nullptr);
+    auto buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    auto* ptr = buffer->getBufferPtr<float>();
+    static_assert(std::is_same_v<decltype(ptr), float*>);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(ptr, buffer->data());
+    ptr[0] = 3.0F;
+    EXPECT_EQ(buffer->getBufferRange<float>()[0], 3.0F);
 }
 
-TEST(IBufferTest, bufferCastOrNullForOptionalWithoutValue)
-{
-    std::optional<IBuffer::SharedPtr> buffer = std::nullopt;
-    auto ptr = bufferCastOrNull<float>(buffer);
-    static_assert(std::is_same<decltype(ptr), float*>::value);
-    ASSERT_TRUE(ptr == nullptr);
-}
-
-TEST(IBufferTest, bufferCastOrNullForSharedPtrWithValue)
-{
-    IBuffer::SharedPtr buffer = BufferManager::cpu(16, TRTDataType<float>::value);
-    auto ptr = bufferCastOrNull<float>(buffer);
-    static_assert(std::is_same<decltype(ptr), float*>::value);
-    ASSERT_TRUE(ptr != nullptr);
-}
-
-TEST(IBufferTest, bufferCastOrNullForSharedPtrWithoutValue)
-{
-    IBuffer::SharedPtr buffer{nullptr};
-    auto ptr = bufferCastOrNull<float>(buffer);
-    static_assert(std::is_same<decltype(ptr), float*>::value);
-    ASSERT_TRUE(ptr == nullptr);
-}
-
-TEST(IBufferTest, bufferCastOrNullForOptionalWithConstValue)
-{
-    std::optional<IBuffer::SharedConstPtr> buffer
-        = std::make_optional(BufferManager::cpu(16, TRTDataType<float>::value));
-    auto ptr = bufferCastOrNull<float>(buffer);
-    static_assert(std::is_same<decltype(ptr), float const*>::value);
-    ASSERT_TRUE(ptr != nullptr);
-}
-
-TEST(IBufferTest, bufferCastOrNullForOptionalWithoutConstValue)
-{
-    std::optional<IBuffer::SharedConstPtr> buffer = std::nullopt;
-    auto ptr = bufferCastOrNull<float>(buffer);
-    static_assert(std::is_same<decltype(ptr), float const*>::value);
-    ASSERT_TRUE(ptr == nullptr);
-}
-
-TEST(IBufferTest, bufferCastOrNullForSharedPtrWithConstValue)
+TEST(IBufferTest, getConstBufferPtr)
 {
     IBuffer::SharedConstPtr buffer = BufferManager::cpu(16, TRTDataType<float>::value);
-    auto ptr = bufferCastOrNull<float>(buffer);
-    static_assert(std::is_same<decltype(ptr), float const*>::value);
-    ASSERT_TRUE(ptr != nullptr);
+    auto* ptr = buffer->getBufferPtr<float>();
+    static_assert(std::is_same_v<decltype(ptr), float const*>);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(ptr, buffer->data());
 }
 
-TEST(IBufferTest, bufferCastOrNullForSharedPtrWithoutConstValue)
+TEST(IBufferTest, getBufferPtrWithConstElementType)
 {
-    IBuffer::SharedConstPtr buffer{nullptr};
-    auto ptr = bufferCastOrNull<float>(buffer);
-    static_assert(std::is_same<decltype(ptr), float const*>::value);
-    ASSERT_TRUE(ptr == nullptr);
+    auto buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    auto* ptr = buffer->getBufferPtr<float const>();
+    static_assert(std::is_same_v<decltype(ptr), float const*>);
+    EXPECT_EQ(ptr, buffer->data());
+}
+
+TEST(IBufferTest, typedAccessRejectsMismatchedDataType)
+{
+    IBuffer::SharedPtr buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    IBuffer::SharedConstPtr constBuffer = buffer;
+    EXPECT_THROW(static_cast<void>(buffer->getBufferPtr<int32_t>()), std::bad_cast);
+    EXPECT_THROW(static_cast<void>(constBuffer->getBufferPtr<int32_t>()), std::bad_cast);
+    EXPECT_THROW(static_cast<void>(buffer->getBufferRange<int32_t>()), std::bad_cast);
+    EXPECT_THROW(static_cast<void>(constBuffer->getBufferRange<int32_t>()), std::bad_cast);
+}
+
+TEST(IBufferTest, getBufferRange)
+{
+    auto buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    auto range = buffer->getBufferRange<float>();
+    static_assert(std::is_same_v<decltype(range), std::span<float>>);
+    EXPECT_EQ(range.size(), buffer->getSize());
+    EXPECT_EQ(range.data(), buffer->getBufferPtr<float>());
+    range.back() = 7.0F;
+    EXPECT_EQ(buffer->getBufferPtr<float>()[buffer->getSize() - 1], 7.0F);
+}
+
+TEST(IBufferTest, getConstBufferRange)
+{
+    IBuffer::SharedPtr buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    IBuffer::SharedConstPtr constBuffer = buffer;
+    auto range = constBuffer->getBufferRange<float>();
+    auto constElementRange = buffer->getBufferRange<float const>();
+    static_assert(std::is_same_v<decltype(range), std::span<float const>>);
+    static_assert(std::is_same_v<decltype(constElementRange), std::span<float const>>);
+    EXPECT_EQ(range.size(), buffer->getSize());
+    EXPECT_EQ(range.data(), constElementRange.data());
+    buffer->getBufferPtr<float>()[0] = 5.0F;
+    EXPECT_EQ(range[0], 5.0F);
+}
+
+TEST(IBufferTest, getPointerBufferRange)
+{
+    IBuffer::SharedPtr buffer = BufferManager::cpu(2, TRTDataType<void*>::value);
+    IBuffer::SharedConstPtr constBuffer = buffer;
+    auto range = buffer->getBufferRange<void*>();
+    auto constRange = constBuffer->getBufferRange<void*>();
+    static_assert(std::is_same_v<decltype(range), std::span<void*>>);
+    static_assert(std::is_same_v<decltype(constRange), std::span<void* const>>);
+    int value = 42;
+    range[0] = &value;
+    EXPECT_EQ(constRange[0], &value);
+    EXPECT_EQ(range.size(), buffer->getSize());
+}
+
+TEST(IBufferTest, typedAccessEmptyBuffer)
+{
+    IBuffer::SharedPtr buffer = BufferManager::cpu(0, TRTDataType<float>::value);
+    IBuffer::SharedConstPtr constBuffer = buffer;
+    EXPECT_EQ(buffer->getBufferPtr<float>(), nullptr);
+    EXPECT_EQ(constBuffer->getBufferPtr<float>(), nullptr);
+    EXPECT_TRUE(buffer->getBufferRange<float>().empty());
+    EXPECT_TRUE(constBuffer->getBufferRange<float>().empty());
+
+    buffer->resize(16);
+    EXPECT_NE(buffer->getBufferPtr<float>(), nullptr);
+    EXPECT_EQ(buffer->getBufferRange<float>().size(), 16);
+    buffer->resize(0);
+    EXPECT_EQ(buffer->getBufferPtr<float>(), nullptr);
+    EXPECT_TRUE(buffer->getBufferRange<float>().empty());
 }
 
 TEST(IBufferTest, accessDataPtrEmptyInit)

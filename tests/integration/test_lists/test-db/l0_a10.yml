@@ -22,6 +22,7 @@ l0_a10:
   - unittest/_torch/test_fused_relu2.py
   - unittest/_torch/test_mnnvl_alltoall_workspace.py
   - unittest/_torch/test_mnnvl_memory_lifecycle.py
+  - unittest/_torch/test_dlpack_utils.py
   - unittest/_torch/test_mnnvl_utils.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
@@ -39,12 +40,10 @@ l0_a10:
   - unittest/_torch/disaggregation/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/kv_cache/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_capacity_only.py
+  - unittest/_torch/executor/kv_cache/sharing
+  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_branch_snapshot.py
   - unittest/_torch/executor/test_kv_cache_layout.py
   - unittest/_torch/executor/test_kv_connector_v2_prefix_real_manager.py
-  - unittest/_torch/executor/test_mooncake_store_cli.py
-  - unittest/_torch/executor/test_mooncake_store_common.py
-  - unittest/_torch/executor/test_mooncake_store_donor.py
-  - unittest/_torch/executor/test_mooncake_store_master.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/executor/test_resource_manager.py
   - unittest/_torch/executor/test_seq_slot_sizing.py
@@ -61,15 +60,16 @@ l0_a10:
   - unittest/inputs/test_prefix_token_cache.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
+  - unittest/others/test_cuda_architecture_check.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_tracing.py
   - unittest/grpc/test_grpc_optional.py
   - unittest/grpc/smg/test_smg.py
-  # The one OpenEngine test needing a GPU: it builds a real LLM, because a
-  # stubbed engine would accept whatever its fake generate_async accepts and so
-  # would agree with an advertisement the real engine rejects. Any GPU will do
-  # -- the model is TinyLlama-1.1B -- so it sits with the other gateway tests.
+  # OpenEngine capability conformance needs real loaded models: a stub would
+  # accept whatever its fake generate_async tolerates and could agree with a
+  # false advertisement by construction. The image case uses Qwen3-VL-2B.
   - unittest/grpc/openengine/test_capability_conformance.py
+  - unittest/grpc/openengine/test_multimodal_conformance.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py
@@ -85,9 +85,8 @@ l0_a10:
   # Only files with at least one non-cpu_only test belong here: this stage runs
   # unittests with `-m not cpu_only`, and one pytest invocation is made per
   # entry, so a file whose tests are all cpu_only collects nothing and errors.
-  # The fully-cpu_only ones (test_config_database_sync, test_periodic_junit,
-  # test_prepare_dataset, test_test_to_stage_mapping) are covered by
-  # l0_cpu.yml, which lists unittest/tools as a directory.
+  # Files whose tests are all cpu_only are covered by l0_cpu.yml, which lists
+  # unittest/tools as a directory.
   - unittest/tools/test_host_profiler.py
   - unittest/tools/test_infra_dry_run_pipeline.py
   - unittest/tools/test_infra_dry_run_pytest.py
@@ -134,12 +133,14 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch
   # visual_gen
   - unittest/_torch/visual_gen/test_profiler.py
+  - unittest/_torch/visual_gen/test_sleep_gpu.py
   - unittest/visual_gen/test_executor_shared_tensor_ipc.py
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline_config.py
+  - unittest/_torch/visual_gen/test_qwen_image_layered_pipeline_config.py
   # llmapi
   - unittest/llmapi/test_rlhf_utils.py
   - unittest/llmapi/test_llm_args.py
@@ -165,9 +166,7 @@ l0_a10:
   # by hand. test_connector_runs_on_kv_cache_manager_v2 is what makes the V2
   # entries meaningful -- the creator silently falls back to the V1 manager for
   # combinations it cannot serve, so without it every V2 id below could pass
-  # while running V1. test_connector_priorities[kv_cache_manager_v2] is
-  # xfail(strict=True) in the suite, not omitted here, so the retention gap
-  # stays counted. The two e2e cases below are the only multi-layer-group ones
+  # while running V1. The two e2e cases below are the only multi-layer-group ones
   # that move bytes -- the rest drive a MagicMock and assert routing.
   # test_connector_vswa_e2e_gemma3 is the interleaved-attention run (Gemma-3
   # asks for KVCacheManagerV2 itself, and its layer groups come out different
@@ -216,7 +215,6 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[kv_cache_manager_v2-True]
   - llmapi/test_llm_api_connector.py::test_connector_multi_request[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
-  - llmapi/test_llm_api_connector.py::test_connector_warns_that_retention_is_ignored_on_v2[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-host_offloading]
   - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-beam_search]
@@ -233,17 +231,22 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[alone-False]
   - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[traffic-True]
   - llmapi/test_llm_api_connector.py::test_connector_cancel_drains_real_prefix_load[traffic-False]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_holds_pages_until_the_save_reads_them[True]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_holds_pages_until_the_save_reads_them[False]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_is_asked_once_and_shrinks_the_forward_pass[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_under_chunked_prefill[kv_cache_manager_v2-offer_inside_chunk]
   - llmapi/test_llm_api_connector.py::test_connector_prefix_under_chunked_prefill[kv_cache_manager_v2-offer_past_chunk]
   - llmapi/test_llm_api_connector.py::test_connector_uniform_sliding_window[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_sliding_window_prefix_is_backed_by_real_pages[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_capacity_only_connector_accepts_multigroup_retention[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_multi_pool_e2e_persistent_cache
   - llmapi/test_llm_api_connector.py::test_connector_vswa_e2e_gemma3
   - llmapi/test_llm_api_connector.py::test_connector_vswa_out_of_window_blocks_reach_the_connector
   - llmapi/test_llm_api_connector.py::test_connector_transfers_only_in_window_blocks_to_the_sliding_group[gemma3_interleaved]
   - llmapi/test_llm_api_connector.py::test_connector_transfers_only_in_window_blocks_to_the_sliding_group[qwen3_forced_windows]
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_cross_engine_prefix_reuse
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_chunked_prefill_survives_a_small_cache
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules

@@ -2,28 +2,164 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
 
+from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    DisaggPrefillMultimodalInputs,
     MultimodalInput,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
+    MultimodalParams,
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
+    select_multimodal_fields,
 )
-from tensorrt_llm.inputs.multimodal_data import VideoData
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
-    MultimodalEncoderItemMetadata,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("axis", [0, 1, -1])
+@pytest.mark.parametrize(
+    "indices,is_view",
+    [
+        ([0, 1], True),
+        ([2, 0], False),
+        ([1, 1, 0], False),
+        ([], True),
+        ([-2, -1], True),
+        ([2], True),
+    ],
+)
+def test_batched_item_partition_selects_items_and_preserves_views(
+    axis: int, indices: list[int], is_view: bool
+) -> None:
+    values = torch.arange(9).reshape(3, 3)
+    selected = MultimodalItemPartition(item_axis=axis).select(values, indices)
+    expected = values[indices] if axis == 0 else values[:, indices]
+
+    torch.testing.assert_close(selected, expected)
+    shares_storage = selected.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+    assert shares_storage is is_view
+
+
+@pytest.mark.parametrize("targeted", [False, True])
+def test_audio_geometry_stays_on_cpu_during_nested_device_staging(targeted: bool) -> None:
+    audio = {
+        "input_audio_features": torch.zeros(3, 4, 2),
+        "audio_num_clips": torch.tensor([2, 1]),
+        "audio_output_lengths": torch.tensor([4, 2, 3]),
+    }
+    params = MultimodalParams(multimodal_data={"video": {"audio": audio}})
+    targets = [f"video.audio.{name}" for name in audio] if targeted else None
+
+    params.to_device("multimodal_data", "meta", target_keywords=targets)
+
+    staged = params.multimodal_data["video"]["audio"]
+    assert staged["input_audio_features"].device.type == "meta"
+    for name in ("audio_num_clips", "audio_output_lengths"):
+        assert staged[name] is audio[name]
+        assert staged[name].device.type == "cpu"
+
+
+@pytest.mark.parametrize("axis", [0, 1, -1])
+@pytest.mark.parametrize(
+    ("indices", "is_view"),
+    [
+        ([2, 0], False),
+        ([1, 2], True),
+        ([1, 1, 0], False),
+        ([], True),
+        ([-1], True),
+        ([-2, -1], True),
+        ([-1, 0], False),
+    ],
+)
+def test_item_partition_selects_packed_items_and_preserves_contiguous_views(
+    axis: int, indices: list[int], is_view: bool
+) -> None:
+    values = torch.arange(12).reshape(6, 2)
+    if axis != 0:
+        values = values.T
+    layout = MultimodalItemPartition(item_axis=axis, item_lengths=(2, 3, 1))
+
+    selected = layout.select(values, indices)
+
+    items = torch.split(values, (2, 3, 1), dim=axis)
+    expected = (
+        torch.cat([items[i] for i in indices], dim=axis) if indices else values.narrow(axis, 0, 0)
+    )
+    torch.testing.assert_close(selected, expected)
+    if is_view:
+        assert selected.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+    else:
+        assert selected.untyped_storage().data_ptr() != values.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("sequence_type", [list, tuple])
+def test_field_layout_selects_item_sequences(sequence_type) -> None:
+    values = sequence_type(["a", "b", "c"])
+    assert MultimodalItemPartition().select(values, [2, 0]) == sequence_type(["c", "a"])
+
+
+def test_field_layout_keeps_shared_and_unlisted_values_even_when_sizes_match() -> None:
+    shared = torch.arange(3)
+    unlisted = ["a", "b", "c"]
+    data = {
+        "frames": torch.arange(6).reshape(3, 2),
+        "shared": shared,
+        "other": unlisted,
+        "nullable_mask": None,
+    }
+
+    selected = select_multimodal_fields(
+        data,
+        {
+            "frames": MultimodalItemPartition(),
+            "shared": MultimodalItemPartition(item_axis=None),
+            "optional_mask": MultimodalItemPartition(),
+            "nullable_mask": MultimodalItemPartition(),
+        },
+        [2, 0],
+    )
+
+    torch.testing.assert_close(selected["frames"], data["frames"][[2, 0]])
+    assert selected["shared"] is shared
+    assert selected["other"] is unlisted
+    assert "optional_mask" not in selected
+    assert selected["nullable_mask"] is None
+    assert data["frames"].shape == (3, 2)
+
+
+def test_packed_field_layout_rejects_inconsistent_lengths() -> None:
+    with pytest.raises(ValueError, match="Packed field size"):
+        MultimodalItemPartition(item_lengths=(2, 3)).select(torch.zeros(4, 2), [0])
+
+
+@pytest.mark.parametrize("index", [-4, 3])
+@pytest.mark.parametrize("packed", [False, True])
+def test_item_partition_rejects_out_of_bounds_indices(index: int, packed: bool) -> None:
+    lengths = (2, 3, 1) if packed else None
+    values = torch.zeros(6 if packed else 3, 2)
+    with pytest.raises(IndexError):
+        MultimodalItemPartition(item_lengths=lengths).select(values, [index])
+
+
+def test_media_modalities_match_io_and_validation_contract() -> None:
+    assert MEDIA_MODALITIES == get_args(MediaModality) == ("image", "video", "audio")
+    assert set(MEDIA_MODALITIES) == set(MEDIA_IO_REGISTRY)
 
 
 class _ItemMetadataFakeProcessor:
@@ -36,14 +172,17 @@ class _ItemMetadataFakeProcessor:
         return [101, 102], {
             "multimodal_data": {
                 "image": {},
-                "multimodal_embedding_lengths": self.existing_embedding_lengths,
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", i) for i in range(len(self.existing_embedding_lengths))],
+                    output_embedding_lengths=self.existing_embedding_lengths,
+                ),
             }
         }
 
-    def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+    def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
         assert prompt_token_ids == [101, 102]
         assert "image" in multimodal_data
-        return MultimodalEncoderItemMetadata(
+        return MultimodalItemMetadata(
             item_refs=[("image", 0)],
             encoder_token_lengths=[4],
             output_embedding_lengths=[2],
@@ -66,14 +205,21 @@ def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
 
     multimodal_data = extra["multimodal_data"]
     item_metadata = multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
-    assert item_metadata == MultimodalEncoderItemMetadata(
+    assert item_metadata == MultimodalItemMetadata(
         item_refs=[("image", 0)],
         encoder_token_lengths=[4],
         output_embedding_lengths=[2],
     )
-    assert multimodal_data["multimodal_embedding_lengths"] == [2]
+    assert "multimodal_embedding_lengths" not in multimodal_data
     assert "multimodal_item_refs" not in multimodal_data
     assert "multimodal_encoder_token_lengths" not in multimodal_data
+
+    params = MultimodalParams(multimodal_data=multimodal_data)
+    params.to_handle("multimodal_data")
+    assert isinstance(
+        params.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY],
+        MultimodalItemMetadata,
+    )
 
 
 def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
@@ -83,31 +229,209 @@ def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 
+def test_removed_encoder_metadata_hook_fails_before_processing() -> None:
+    class OldMetadataProcessor(_ItemMetadataFakeProcessor):
+        def get_mm_encoder_item_metadata(
+            self, prompt_token_ids: list[int], multimodal_data: dict
+        ) -> None:
+            raise AssertionError("The removed hook must not be called")
+
+    with pytest.raises(TypeError, match=r"implement get_mm_item_metadata\(\)"):
+        create_input_processor_with_hash(OldMetadataProcessor([2]))
+
+
 def test_mm_item_metadata_none_falls_back_to_non_item_path():
-    # A processor whose get_mm_encoder_item_metadata returns None does not
-    # participate in item scheduling; routing falls through with no item
-    # metadata attached (no capability flag drives this).
+    # Generic item order does not imply that physical encoder costs or
+    # item scheduling are supported.
     class NoMetadataProcessor(_ItemMetadataFakeProcessor):
-        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
             return None
 
     input_processor = create_input_processor_with_hash(NoMetadataProcessor([2]))
 
     _, extra = input_processor({"prompt": "unused"}, sampling_params=None)
 
-    assert MULTIMODAL_ENCODER_ITEM_METADATA_KEY not in extra["multimodal_data"]
+    metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.item_refs == (("image", 0),)
+    assert metadata.encoder_token_lengths is None
+    assert metadata.output_embedding_lengths == (2,)
 
 
 def test_mm_item_metadata_rejects_wrong_return_type():
     # A non-None, non-metadata return is a genuine contract violation.
     class BadMetadataProcessor(_ItemMetadataFakeProcessor):
-        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
             return ("image", 0)
 
     input_processor = create_input_processor_with_hash(BadMetadataProcessor([2]))
 
     with pytest.raises(TypeError, match="must return a"):
         input_processor({"prompt": "unused"}, sampling_params=None)
+
+
+@pytest.mark.parametrize(
+    "selected, expected_refs, expected_costs, expected_lengths",
+    [
+        ([3, 0, 2], [("audio", 0), ("image", 0), ("image", 1)], [40, 20, 30], [4, 2, 3]),
+        ([2, 0], [("image", 0), ("image", 1)], [30, 20], [3, 2]),
+        ([], [], [], []),
+    ],
+)
+def test_mm_item_metadata_selection_rebases_refs_without_mutating_source(
+    selected, expected_refs, expected_costs, expected_lengths
+) -> None:
+    metadata = MultimodalItemMetadata(
+        [("image", 1), ("video", 0), ("image", 0), ("audio", 0)],
+        [20, 50, 30, 40],
+        [2, 5, 3, 4],
+    )
+
+    subset = metadata.select(selected)
+
+    assert subset == MultimodalItemMetadata(expected_refs, expected_costs, expected_lengths)
+    assert metadata.item_refs == (("image", 1), ("video", 0), ("image", 0), ("audio", 0))
+    assert metadata.encoder_token_lengths == (20, 50, 30, 40)
+    assert metadata.output_embedding_lengths == (2, 5, 3, 4)
+    assert subset is not metadata
+
+
+@pytest.mark.parametrize("indices", [[3, 0, 2], [2, 0], [-1, 0], [], [1, 1]])
+def test_item_metadata_selection_keeps_partitions_in_payload_order(indices) -> None:
+    metadata = MultimodalItemMetadata(
+        [("image", 1), ("audio", 0), ("image", 0), ("audio", 1)],
+        output_embedding_lengths=[3, 1, 2, 4],
+        input_partitions={
+            "image": {"pixels": MultimodalItemPartition(item_lengths=(2, 3))},
+            "audio": {
+                "features": MultimodalItemPartition(1, (1, 4)),
+                "shared": MultimodalItemPartition(item_axis=None),
+            },
+        },
+    )
+    metadata.validate()
+    values = {"image": torch.arange(5), "audio": torch.arange(10).reshape(2, 5)}
+    selected = metadata.select(indices)
+    selected.validate()
+    assert selected.encoder_token_lengths is None
+    assert metadata.input_partitions["image"]["pixels"].item_lengths == (2, 3)
+    assert metadata.input_partitions["audio"]["features"].item_lengths == (1, 4)
+    for modality, partitions in selected.input_partitions.items():
+        local_indices = [
+            metadata.item_refs[i][1] for i in indices if metadata.item_refs[i][0] == modality
+        ]
+        name = "pixels" if modality == "image" else "features"
+        source_partition = metadata.input_partitions[modality][name]
+        value = source_partition.select(values[modality], local_indices)
+        # A second selection uses the view's local item indices and lengths.
+        first = partitions[name].select(value, [0])
+        expected = source_partition.select(values[modality], local_indices[:1])
+        torch.testing.assert_close(first, expected)
+
+
+def test_unknown_item_costs_and_rows_remain_explicit() -> None:
+    metadata = MultimodalItemMetadata([("audio", 0)])
+    metadata.validate()
+    params = MultimodalParams(multimodal_data={MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata})
+    assert params.item_metadata is metadata
+    assert params.item_metadata.encoder_token_lengths is None
+    with pytest.raises(ValueError, match="requires item output embedding lengths"):
+        params.get_item_layout()
+
+
+@pytest.mark.parametrize("modality", MEDIA_MODALITIES)
+def test_prepared_metadata_fills_unknown_model_rows(modality) -> None:
+    partitions = {modality: {"features": MultimodalItemPartition()}}
+    original = MultimodalItemMetadata([(modality, 0)], input_partitions=partitions)
+
+    class Processor(_ItemMetadataFakeProcessor):
+        def __call__(self, inputs, sampling_params):
+            return [101, 102], {
+                "multimodal_data": {
+                    modality: {},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [(modality, 0)], output_embedding_lengths=[2]
+                    ),
+                }
+            }
+
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
+            return original
+
+    _, extra = create_input_processor_with_hash(Processor(None))({"prompt": "unused"}, None)
+    params = MultimodalParams(multimodal_data=extra["multimodal_data"])
+    assert params.get_item_layout() == (((modality, 0),), (2,))
+    assert params.item_metadata.encoder_token_lengths is None
+    assert params.item_metadata.input_partitions is partitions
+    assert original.output_embedding_lengths is None
+    assert "multimodal_embedding_lengths" not in params.multimodal_data
+    assert (
+        MultimodalParams(multimodal_data=params.multimodal_data).item_metadata
+        is params.item_metadata
+    )
+
+
+@pytest.mark.parametrize("lengths", [[2, 3], [-1], ["2"]])
+def test_prepared_metadata_validates_model_rows(lengths) -> None:
+    class Processor(_ItemMetadataFakeProcessor):
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
+            return MultimodalItemMetadata([("image", 0)], output_embedding_lengths=lengths)
+
+    with pytest.raises((TypeError, ValueError)):
+        create_input_processor_with_hash(Processor([2]))({"prompt": "unused"}, None)
+
+
+def test_item_metadata_roundtrips_with_shared_tensor_handles() -> None:
+    import pickle
+
+    values = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+    metadata = MultimodalItemMetadata(
+        [("audio", 0), ("audio", 1)],
+        output_embedding_lengths=[2, 3],
+        input_partitions={"audio": {"features": MultimodalItemPartition(1, (2, 3))}},
+    )
+    params = MultimodalParams(
+        multimodal_data={
+            "audio": {"features": values},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        }
+    )
+    params.to_handle("multimodal_data")
+    assert params.item_metadata is metadata
+    restored = pickle.loads(pickle.dumps(params))
+    restored.to_tensor("multimodal_data")
+    torch.testing.assert_close(restored.multimodal_data["audio"]["features"], values)
+    assert restored.item_metadata == metadata
+    assert restored.encoder_state is None
+
+
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_generic_metadata_keeps_mixed_order_without_encoder_costs(precomputed) -> None:
+    from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+
+    class Processor(_ItemMetadataFakeProcessor):
+        get_mm_item_metadata = BaseMultimodalInputProcessor.get_mm_item_metadata
+
+        def __call__(self, inputs, sampling_params):
+            refs = [(entry["modality"], entry["index"]) for entry in inputs["mm_item_order"]]
+            return [101, 102], {
+                "multimodal_data": {
+                    "image": {},
+                    "audio": {},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        refs, output_embedding_lengths=[1, 1]
+                    ),
+                    **({"multimodal_embedding": torch.zeros(2, 4)} if precomputed else {}),
+                }
+            }
+
+    order = [{"modality": "audio", "index": 0}, {"modality": "image", "index": 0}]
+    _, extra = create_input_processor_with_hash(Processor(None))(
+        {"prompt": "unused", "mm_item_order": order}, None
+    )
+    metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.item_refs == (("audio", 0), ("image", 0))
+    assert metadata.encoder_token_lengths is None
+    assert metadata.output_embedding_lengths == (1, 1)
 
 
 def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
@@ -137,7 +461,20 @@ def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
     )
 
 
-def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
+@pytest.mark.parametrize("cached_cumsum", [None, torch.tensor([0, 1], dtype=torch.int64)])
+def test_existing_mm_cumsum_preserves_storage_and_backfills_block_alignment(
+    cached_cumsum: torch.Tensor | None,
+) -> None:
+    processor = SimpleNamespace(mm_bidirectional_blocks=True)
+    data = {"multimodal_embed_mask_cumsum": cached_cumsum}
+
+    maybe_compute_mm_embed_cumsum([10, 101], {"multimodal_data": data}, processor)
+
+    assert data["multimodal_embed_mask_cumsum"] is cached_cumsum
+    assert data["mm_bidirectional_blocks"] is True
+
+
+def test_tokenized_multimodal_builds_metadata_from_final_embedding_slots():
     """Final expanded prompt layout wins over dummy-placeholder metadata."""
 
     class FakeProcessor:
@@ -160,7 +497,9 @@ def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
             return expanded_ids, {
                 "multimodal_data": {
                     # Stale dummy-placeholder value; recomputed to [3] downstream.
-                    "multimodal_embedding_lengths": [999],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=None
+                    ),
                 }
             }
 
@@ -193,7 +532,9 @@ def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
     )
 
     assert prompt_token_ids == [10, 101, 102, 200, 103, 20]
-    assert extra["multimodal_data"]["multimodal_embedding_lengths"] == [3]
+    assert extra["multimodal_data"][
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+    ].output_embedding_lengths == (3,)
 
 
 class _KwargsHashFakeProcessor:
@@ -213,6 +554,328 @@ class _KwargsHashFakeProcessor:
 
     def get_mm_special_token_ids(self):
         return None
+
+
+_CONTENT_HASH_SNAPSHOT = {
+    "image": [
+        1704823964,
+        362764787,
+        1556099772,
+        -86050102,
+        551081767,
+        1806967272,
+        -1857978322,
+        -1074313326,
+    ],
+    "video": [
+        -839685430,
+        -760767140,
+        -2055508912,
+        -1577466732,
+        1582489614,
+        1138227298,
+        1889150221,
+        1556646618,
+    ],
+    "audio": [
+        -1693994058,
+        897664400,
+        754889986,
+        -1726904048,
+        -495512501,
+        952543145,
+        -87795905,
+        -419978698,
+    ],
+}
+_UUID_HASH_SNAPSHOT = {
+    "image": [
+        1777607066,
+        -1240710263,
+        -116192886,
+        1440160746,
+        120140059,
+        -2062281779,
+        960024653,
+        2041693752,
+    ],
+    "video": [
+        2070136680,
+        -523271134,
+        1570526135,
+        1209057230,
+        1458965967,
+        334689758,
+        1673654996,
+        -1634814920,
+    ],
+    "audio": [
+        -1172540155,
+        -1149723152,
+        1994549875,
+        -2028680509,
+        93572480,
+        1551260061,
+        -1949652498,
+        -1123551599,
+    ],
+}
+
+
+def test_mixed_hashing_uses_processor_metadata_without_frontend_order() -> None:
+    class Processor(_KwargsHashFakeProcessor):
+        multimodal_hashing_supported = None
+
+        def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+            return [10, 101, 102, 20, 101, 102, 30], {"multimodal_data": {"image": {}, "video": {}}}
+
+        def get_num_tokens_per_video(self, *, video: VideoData, **kwargs: object) -> int:
+            return 2
+
+        def get_mm_item_metadata(
+            self,
+            prompt_token_ids: list[int],
+            multimodal_data: dict,
+            mm_item_order: list[dict[str, object]] | None = None,
+        ) -> MultimodalItemMetadata:
+            return MultimodalItemMetadata([("video", 0), ("image", 0)], [16, 8], [2, 2])
+
+    processor = Processor()
+    wrapped = create_input_processor_with_hash(processor)
+    inputs = {
+        "prompt": "unused",
+        "multi_modal_data": {
+            "image": [np.array([1], dtype=np.uint8)],
+            "video": [VideoData(frames=[np.full((2, 2, 3), 2, dtype=np.uint8)], metadata={})],
+        },
+    }
+
+    # Exercise both the first hashing probe and a subsequent enabled request.
+    for _ in range(2):
+        _, extra = wrapped(inputs, None)
+        assert processor.multimodal_hashing_supported is True
+        mm_input = extra["multimodal_input"]
+        assert mm_input.multimodal_hashes == [
+            _CONTENT_HASH_SNAPSHOT["video"],
+            _CONTENT_HASH_SNAPSHOT["image"],
+        ]
+        assert mm_input.multimodal_positions == [1, 4]
+        metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+        assert metadata.item_refs == (("video", 0), ("image", 0))
+        assert metadata.encoder_token_lengths == (16, 8)
+        assert metadata.output_embedding_lengths == (2, 2)
+
+
+@pytest.mark.parametrize("hashing_enabled", [False, True])
+def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool) -> None:
+    class Processor(_KwargsHashFakeProcessor):
+        multimodal_hashing_supported = hashing_enabled
+
+        def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+            return [10, 101, 102, 20, 101, 102, 30], {
+                "multimodal_data": {
+                    "image": {},
+                    "video": {},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("video", 0), ("image", 0)], output_embedding_lengths=[2, 2]
+                    ),
+                }
+            }
+
+        def get_num_tokens_per_video(self, *, video: list[np.ndarray], **kwargs: object) -> int:
+            return 2
+
+        def get_mm_item_metadata(
+            self, prompt_token_ids: list[int], multimodal_data: dict, mm_item_order=None
+        ) -> MultimodalItemMetadata:
+            return MultimodalItemMetadata([("video", 0), ("image", 0)], [4, 4], [2, 2])
+
+    processor = Processor()
+    inputs = {
+        "prompt": "unused",
+        "multi_modal_data": {
+            "image": [np.array([1], dtype=np.uint8)],
+            "video": [VideoData(frames=[np.full((2, 2, 3), 2, dtype=np.uint8)], metadata={})],
+        },
+        "mm_item_order": [{"modality": "image", "index": 0}, {"modality": "video", "index": 0}],
+    }
+
+    with pytest.raises(ValueError, match="item references do not match the prompt item order"):
+        create_input_processor_with_hash(processor)(inputs, None)
+
+    assert processor.multimodal_hashing_supported is hashing_enabled
+
+
+def _process_mm_contract(
+    modalities: list[str],
+    token_ids: list[int],
+    explicit_ids: list[int] | None,
+    special_ids: list[int] | None,
+    *,
+    hashing_enabled: bool = True,
+    use_uuids: bool = False,
+    frontend_order: bool = True,
+) -> tuple[list[int], dict]:
+    item_refs = [(modality, 0) for modality in modalities]
+    num_items = len(item_refs)
+
+    class Processor(_KwargsHashFakeProcessor):
+        multimodal_hashing_supported = hashing_enabled
+        mm_bidirectional_blocks = True
+
+        def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+            return list(token_ids), {
+                "multimodal_data": {
+                    **{modality: {} for modality in modalities},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        item_refs, output_embedding_lengths=[2] * num_items
+                    ),
+                }
+            }
+
+        def get_num_tokens_per_image(self, *, image: np.ndarray) -> int:
+            return 2 + len(special_ids or [])
+
+        def get_num_tokens_per_video(self, *, video: list[np.ndarray], **kwargs: object) -> int:
+            return 2
+
+        def get_num_tokens_per_audio(self, *, audio: AudioData) -> int:
+            return 2
+
+        def get_mm_token_ids(self) -> torch.Tensor | None:
+            return torch.tensor(explicit_ids) if explicit_ids is not None else None
+
+        def get_mm_special_token_ids(self) -> torch.Tensor | None:
+            return torch.tensor(special_ids) if special_ids is not None else None
+
+        def get_mm_item_metadata(
+            self, prompt_token_ids: list[int], multimodal_data: dict, mm_item_order=None
+        ) -> MultimodalItemMetadata:
+            return MultimodalItemMetadata(item_refs, [4] * num_items, [2] * num_items)
+
+    media = {
+        "image": [np.array([1], dtype=np.uint8)],
+        "video": [VideoData(frames=[np.full((2, 2, 3), 2, dtype=np.uint8)], metadata={})],
+        "audio": [AudioData(samples=np.array([0.25, -0.5], dtype=np.float32), sample_rate=16000)],
+    }
+    inputs = {
+        "prompt": "unused",
+        "multi_modal_data": {key: value for key, value in media.items() if key in modalities},
+        "mm_item_order": [
+            {"modality": modality, "index": 0, "placeholder": f"<{modality}>"}
+            for modality in modalities
+        ],
+    }
+    if not frontend_order:
+        inputs.pop("mm_item_order")
+    if use_uuids:
+        inputs["multi_modal_uuids"] = {modality: [f"{modality}-id"] for modality in modalities}
+
+    return create_input_processor_with_hash(Processor())(inputs, None)
+
+
+@pytest.mark.parametrize("hashing_enabled", [False, True], ids=["fallback", "hashing"])
+@pytest.mark.parametrize(
+    "modalities,token_ids,explicit_ids,special_ids,expected_cumsum,expected_runs",
+    [
+        (["image"], [10, 101, 102, 20], None, None, [0, 1, 2, 2], ([0, 1], [1], [2])),
+        (["image"], [10, 101, 102, 20], [101, 102], None, [0, 1, 2, 2], ([0, 1], [1], [2])),
+        (
+            ["image"],
+            [10, 101, 200, 102, 20],
+            [101, 102],
+            [200],
+            [0, 1, 1, 2, 2],
+            ([0, 1], [1], [3]),
+        ),
+        (["video"], [10, 101, 20, 102, 30], None, None, [0, 1, 1, 2, 2], ([0, 2], [1, 3], [1, 1])),
+        (["audio"], [10, 101, 102, 20], [101, 102], None, [0, 1, 2, 2], ([0, 1], [1], [2])),
+        (
+            ["video", "image", "audio"],
+            [10, 101, 102, 20, 101, 102, 30, 101, 102, 40],
+            [101, 102],
+            None,
+            [0, 1, 2, 2, 3, 4, 4, 5, 6, 6],
+            ([0, 1, 2, 3], [1, 4, 7], [2, 2, 2]),
+        ),
+    ],
+    ids=[
+        "out-of-vocab-image",
+        "explicit-image-tokens",
+        "image-framing-token",
+        "video-interleaved-text",
+        "audio",
+        "mixed-prompt-order",
+    ],
+)
+def test_multimodal_input_contract_snapshot(
+    modalities: list[str],
+    token_ids: list[int],
+    explicit_ids: list[int] | None,
+    special_ids: list[int] | None,
+    expected_cumsum: list[int],
+    expected_runs: tuple[list[int], list[int], list[int]],
+    hashing_enabled: bool,
+) -> None:
+    """Pin framework metadata independently of model-specific media encoding."""
+    actual_token_ids, extra = _process_mm_contract(
+        modalities, token_ids, explicit_ids, special_ids, hashing_enabled=hashing_enabled
+    )
+    item_refs = [(modality, 0) for modality in modalities]
+    num_items = len(item_refs)
+
+    assert actual_token_ids == token_ids
+    data = extra["multimodal_data"]
+    cumsum = data["multimodal_embed_mask_cumsum"]
+    assert cumsum.dtype == torch.int64
+    assert cumsum.device.type == "cpu"
+    assert cumsum.tolist() == expected_cumsum
+    assert data["mm_bidirectional_blocks"] is True
+    assert "multimodal_embedding_lengths" not in data
+    assert data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] == MultimodalItemMetadata(
+        item_refs, [4] * num_items, [2] * num_items
+    )
+    if not hashing_enabled:
+        assert "multimodal_input" not in extra
+        return
+
+    mm_input = extra["multimodal_input"]
+    hashes = _CONTENT_HASH_SNAPSHOT
+    assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
+    assert mm_input.multimodal_uuids is None
+    assert mm_input.multimodal_positions == [1 + 3 * index for index in range(num_items)]
+    assert mm_input.multimodal_lengths == [2 + len(special_ids or [])] * num_items
+    assert (
+        mm_input.multimodal_item_run_cu_offsets,
+        mm_input.multimodal_run_positions,
+        mm_input.multimodal_run_lengths,
+    ) == expected_runs
+    if special_ids:
+        assert data["special_token_offsets"] == [1]
+
+
+@pytest.mark.parametrize("use_uuids", [False, True], ids=["content", "uuid"])
+@pytest.mark.parametrize("frontend_order", [False, True], ids=["record-order", "frontend-order"])
+def test_hashes_and_uuids_follow_common_item_refs(use_uuids: bool, frontend_order: bool) -> None:
+    modalities = ["video", "image", "audio"]
+    _, extra = _process_mm_contract(
+        modalities,
+        [10, 101, 102, 20, 101, 102, 30, 101, 102, 40],
+        [101, 102],
+        None,
+        use_uuids=use_uuids,
+        frontend_order=frontend_order,
+    )
+    mm_input = extra["multimodal_input"]
+    hashes = _UUID_HASH_SNAPSHOT if use_uuids else _CONTENT_HASH_SNAPSHOT
+    assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
+    assert mm_input.multimodal_uuids == (
+        [f"{modality}-id" for modality in modalities] if use_uuids else None
+    )
+    assert mm_input.multimodal_positions == [1, 4, 7]
+    assert extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY].item_refs == tuple(
+        (modality, 0) for modality in modalities
+    )
 
 
 def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
@@ -385,30 +1048,79 @@ def test_find_mm_token_lengths_rejects_undecoded_video_string():
         )
 
 
-def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
-    """Typed EPD handoff converts back to legacy MultimodalInput fields."""
-    handoff = DisaggPrefillMultimodalInputs(
-        prompt_token_ids=[10, 1001, 1002, 2000, 1003, 20],
+def test_attached_embeddings_share_item_metadata_and_prompt_layout():
+    """Sparse E/P inputs use the same params as local encoder results."""
+    handles = [{"tensor_size": (3, 16)}]
+    metadata = MultimodalItemMetadata([("video", 0)], output_embedding_lengths=[3])
+    params = MultimodalParams.from_embeddings(
+        handles,
+        metadata,
         multimodal_lengths=[4],
         multimodal_positions=[1],
-        multimodal_embedding_lengths=[3],
-        multimodal_item_run_cu_offsets=[0, 1],
-        multimodal_run_positions=[1],
-        multimodal_run_lengths=[4],
+        multimodal_hashes=[[1, 2, 3, 4]],
+        multimodal_item_run_cu_offsets=[0, 2],
+        multimodal_run_positions=[1, 4],
+        multimodal_run_lengths=[2, 2],
         special_token_offsets=[2],
-        item_types=[0],
     )
 
-    multimodal_input = handoff.to_multimodal_input([[1, 2, 3, 4]])
+    assert params.item_metadata is metadata
+    assert params.get_item_layout() == ((("video", 0),), (3,))
+    assert params.multimodal_data["multimodal_embedding"] is handles
+    assert "multimodal_embedding_lengths" not in params.multimodal_data
+    assert params.multimodal_data["special_token_offsets"] == [2]
+    assert params.multimodal_input.multimodal_positions == [1]
+    assert params.multimodal_input.multimodal_lengths == [4]
+    assert params.multimodal_input.multimodal_item_run_cu_offsets == [0, 2]
+    assert params.multimodal_input.multimodal_run_positions == [1, 4]
+    assert params.multimodal_input.multimodal_run_lengths == [2, 2]
+    assert params.encoder_state is None
+    assert params.encoder_event is None
 
-    assert multimodal_input.multimodal_positions == [1]
-    assert multimodal_input.multimodal_lengths == [4]
-    assert multimodal_input.multimodal_item_run_cu_offsets == [0, 1]
-    assert multimodal_input.multimodal_run_positions == [1]
-    assert multimodal_input.multimodal_run_lengths == [4]
-    assert handoff.multimodal_embedding_lengths == [3]
-    assert handoff.special_token_offsets == [2]
-    assert handoff.item_types == [0]
+
+@pytest.mark.parametrize("modality", ["image", "video", "audio"])
+def test_attached_embeddings_accept_tensors_without_cache_hashes(modality):
+    embedding = torch.ones(3, 16)
+    params = MultimodalParams.from_embeddings(
+        [embedding],
+        MultimodalItemMetadata([(modality, 0)], output_embedding_lengths=[3]),
+        multimodal_positions=[1],
+        multimodal_lengths=[3],
+    )
+
+    assert params.multimodal_input is None
+    assert params.item_metadata.item_refs == ((modality, 0),)
+    assert params.multimodal_data["multimodal_embedding"][0] is embedding
+    assert params.item_metadata.encoder_token_lengths is None
+
+
+@pytest.mark.parametrize("with_hashes", [False, True])
+@pytest.mark.parametrize(
+    "updates,match",
+    [
+        ({"multimodal_positions": [-1]}, "non-negative"),
+        ({"multimodal_positions": []}, "length|align"),
+        ({"multimodal_lengths": [0]}, "positive"),
+        ({"multimodal_run_lengths": [2]}, "sum"),
+        ({"special_token_offsets": [-1]}, "non-negative"),
+        ({"embeddings": []}, "align"),
+    ],
+)
+def test_attached_embeddings_validate_prompt_and_item_alignment(with_hashes, updates, match):
+    kwargs = dict(
+        embeddings=[{"tensor_size": (3, 16)}],
+        item_metadata=MultimodalItemMetadata([("audio", 0)], output_embedding_lengths=[3]),
+        multimodal_positions=[1],
+        multimodal_lengths=[3],
+        multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=[1],
+        multimodal_run_lengths=[3],
+    )
+    if with_hashes:
+        kwargs["multimodal_hashes"] = [[1] * 8]
+    kwargs.update(updates)
+    with pytest.raises(ValueError, match=match):
+        MultimodalParams.from_embeddings(**kwargs)
 
 
 def test_multimodal_input_rejects_invalid_prompt_spans():
@@ -480,3 +1192,35 @@ def test_runtime_data_requires_cumsum():
     """embed_mask_cumsum is required."""
     with pytest.raises(TypeError):
         MultimodalRuntimeData(past_seen_token_num=0, chunk_end_pos=5)
+
+
+def test_normalized_params_keep_one_order_and_output_length_record():
+    refs = [("audio", 0), ("image", 0)]
+    costs = [4, 8]
+    rows = [2, 3]
+    metadata = MultimodalItemMetadata(refs, costs, rows)
+    data = {
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+    }
+    params = MultimodalParams(
+        multimodal_data=data,
+    )
+    refs.reverse()
+    costs[0] = 100
+    rows[0] = 100
+
+    assert params.item_metadata is metadata
+    assert "multimodal_embedding_lengths" not in data
+    assert metadata.item_refs == (("audio", 0), ("image", 0))
+    assert metadata.encoder_token_lengths == (4, 8)
+    assert metadata.output_embedding_lengths == (2, 3)
+    with pytest.raises(TypeError):
+        metadata.output_embedding_lengths[0] = 100
+    with pytest.raises(AttributeError):
+        metadata.encoder_token_lengths = (100, 8)
+
+
+def test_params_do_not_infer_item_layout_from_raw_buckets():
+    params = MultimodalParams(multimodal_data={"audio": {}, "image": {}})
+    assert params.item_metadata is None
+    assert params.get_item_layout() == ((), ())

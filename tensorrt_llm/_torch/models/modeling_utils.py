@@ -366,18 +366,40 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 remove_weights(layer)
 
 
+def layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
+                               moe_name: str) -> QuantConfig | None:
+    """The ``quant_config_dict`` entry of the MoE module named ``moe_name``.
+
+    An entry naming the module itself answers first. ``ModelConfig`` injects
+    one per MoE layer for DeepSeek-V4 and MiniMax-M3 exactly because the
+    checkpoint's fine-grained per-linear expert keys do not describe the module
+    as a whole, and it appends it to an insertion-ordered dict, so those keys
+    would otherwise shadow it.
+
+    Failing that, all linear layers inside a MoE share one quant config, so the
+    first key that contains the module name answers for the whole module.
+    """
+    own_entry = quant_config_dict.get(moe_name)
+    if own_entry is not None:
+        return own_entry
+    for key, quant_config in quant_config_dict.items():
+        if moe_name in key:
+            return quant_config
+    return None
+
+
 def apply_layerwise_quant_config(
         model_config: ModelConfig,
         named_modules: Iterator[tuple[str, nn.Module]]) -> None:
     quant_config_dict = model_config.quant_config_dict
     if quant_config_dict is not None:
         for name, module in named_modules:
+            if getattr(module, '_skip_layerwise_quant_config', False):
+                continue
             if isinstance(module, (MoE, VanillaMoE)):
-                for n, q in quant_config_dict.items():
-                    # all linear layers inside FusedMoE share the same quant config
-                    if name in n:
-                        module.quant_config = q
-                        break
+                q = layerwise_moe_quant_config(quant_config_dict, name)
+                if q is not None:
+                    module.quant_config = q
             elif isinstance(module, Linear):
                 weight_mode = module.weights_loading_config.weight_mode
                 prefix_name = '.'.join(name.split('.')[:-1])
@@ -463,6 +485,37 @@ def apply_quant_config_exclude_modules(
                     # update to their child backend.
                     if hasattr(module, '_weights_created'):
                         module._weights_created = False
+
+
+def moe_experts_quant_config(model_config: ModelConfig,
+                             experts_prefix: str) -> QuantConfig | None:
+    """The final quantization of the MoE experts at ``experts_prefix``.
+
+    What a model passes to ``create_moe`` as ``override_quant_config``: what
+    the ``__post_init__`` passes would leave on the layer, i.e. its
+    ``quant_config_dict`` entry (by the match ``apply_layerwise_quant_config``
+    uses), then the ``exclude_modules`` match, which wins.
+
+    Args:
+        model_config: The model's configuration.
+        experts_prefix: The experts module name, e.g.
+            ``"model.layers.3.mlp.experts"``.
+
+    Returns:
+        The experts' quantization, or ``None`` when it is the model-level
+        ``quant_config``.
+    """
+    override = None
+    if model_config.quant_config_dict is not None:
+        override = layerwise_moe_quant_config(model_config.quant_config_dict,
+                                              experts_prefix)
+    global_quant_config = model_config.quant_config
+    if (global_quant_config is not None
+            and global_quant_config.is_module_excluded_from_quantization(
+                experts_prefix)):
+        override = QuantConfig(
+            kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+    return override
 
 
 class PostInitCaller(type):
@@ -571,13 +624,20 @@ class DecoderModelForCausalLM(nn.Module,
         # Quant config for lm_head (applies to both the attention-DP replicated
         # and TP lm_head below); None keeps it unquantized.
         lm_head_quant_config = self._resolve_lm_head_quant_config(config)
+        # The LM head sees every row; under helix + attention DP at tp_size 1
+        # the TP group shares requests, so it stays vocab-parallel. A tied LM
+        # head shares the embedding weight, so it keeps the embedding layout.
+        tied = getattr(config.pretrained_config, "tie_word_embeddings", False)
+        lm_head_mapping = (config.mapping
+                           if tied else config.mapping.mapping_for_full_rows())
 
-        if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
+        if lm_head_mapping.enable_attention_dp and not lm_head_mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 quant_config=lm_head_quant_config,
+                output_dtype=config.lm_head_output_dtype,
             )
         else:
             if (hasattr(config, 'lora_config')
@@ -600,13 +660,14 @@ class DecoderModelForCausalLM(nn.Module,
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
-                mapping=config.mapping,
+                mapping=lm_head_mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=config.lm_head_gather_output,
                 reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
                 quant_config=lm_head_quant_config,
+                output_dtype=config.lm_head_output_dtype,
             )
 
             if self.has_custom_lm_head:
@@ -622,10 +683,13 @@ class DecoderModelForCausalLM(nn.Module,
 
         # use embedding weights in lm_head if tie word embedding is enabled
         if getattr(config.pretrained_config, 'tie_word_embeddings', False):
-            assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
-                "lm_head and vocab embedding should use the same TP size")
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
+            # Replicated weights have the same layout even when ADP's embedding
+            # retains the owner mapping and the LM head uses a singleton mapping.
+            if self.lm_head.tp_mode is not None:
+                assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
+                    "lm_head and vocab embedding should use the same TP size")
             self.lm_head.weight = self.model.embed_tokens.weight
             if config.mapping.is_last_pp_rank():
                 self.model.keep_embed_tokens = True
@@ -702,9 +766,10 @@ class DecoderModelForCausalLM(nn.Module,
             pretrained_config: Any = None) -> Optional[Literal["V1", "V2"]]:
         """Return the model's preferred KV cache manager version.
 
-        The preference is adopted only when the user leaves
-        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Return
-        ``None`` to use the built-in V1 fallback.
+        The preference is adopted only when the user explicitly sets
+        ``kv_cache_config.use_kv_cache_manager_v2`` to ``"auto"``. The default
+        is ``True`` and does not consult this preference. Return ``None`` to
+        use the built-in V1 fallback for ``"auto"``.
 
         Args:
             pretrained_config: The loaded Hugging Face config. Shared model
@@ -722,9 +787,10 @@ class DecoderModelForCausalLM(nn.Module,
 
         Subclasses can override this to pin a specific transceiver
         implementation ('CPP' or 'PYTHON') that is adopted verbatim when the
-        user leaves ``cache_transceiver_config.transceiver_runtime`` at its
-        default 'auto'; unsupported configurations then fail loudly at
-        transceiver creation rather than being rerouted. Return None to
+        user explicitly sets ``cache_transceiver_config.transceiver_runtime``
+        to 'auto'. The default is 'PYTHON' and does not consult this preference.
+        Unsupported configurations fail loudly at transceiver creation rather
+        than being rerouted. Return None to
         defer to the global default: the Python transceiver, falling back to
         C++ only for conditions decidable from the transceiver config itself
         (non-NIXL backend or an infinite ``kv_transfer_timeout_ms``) — other
@@ -1457,6 +1523,26 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+_TORCH_COMPILE_WRAPPER_ATTR = "_orig_mod"
+
+
+def strip_torch_compile_wrapper(name: str) -> str:
+    """Drop the ``torch.compile`` wrapper segments from a module path.
+
+    ``torch.compile(module)`` returns an ``OptimizedModule`` whose only child
+    is the original module under the attribute ``_orig_mod``, so every path
+    below the compiled scope gains a ``_orig_mod`` component in
+    ``named_modules()`` / ``named_parameters()`` -- e.g.
+    ``model._orig_mod.layers.0.mlp`` for a checkpoint key prefix of
+    ``model.layers.0.mlp``. The wrapper owns no parameters of its own, so
+    removing the component gives back the path the checkpoint uses.
+    """
+    if _TORCH_COMPILE_WRAPPER_ATTR not in name:
+        return name
+    return '.'.join(part for part in name.split('.')
+                    if part != _TORCH_COMPILE_WRAPPER_ATTR)
+
+
 def _get_load_weights_num_workers() -> Optional[int]:
     """Return the per-rank module-loading worker limit, or None for the default.
 
@@ -1578,6 +1664,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
+            # A torch.compile wrapper in the tree (refit into a compiled
+            # engine) inserts `_orig_mod` into the path; checkpoint keys
+            # never carry it.
+            name = strip_torch_compile_wrapper(name)
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
                 return
@@ -1728,8 +1818,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
-        if len(module._parameters) == 0 or weight_mapper.should_skip_module(
-                name):
+        if len(module._parameters) == 0:
+            return
+        # A torch.compile wrapper in the tree (refit into a compiled engine)
+        # inserts `_orig_mod` into the path; checkpoint keys never carry it.
+        name = strip_torch_compile_wrapper(name)
+        if weight_mapper.should_skip_module(name):
             return
 
         names = name.split('.')

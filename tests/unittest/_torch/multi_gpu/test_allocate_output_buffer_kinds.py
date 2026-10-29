@@ -36,6 +36,7 @@ from tensorrt_llm._torch.distributed import (
     AllReduceStrategy,
     userbuffers_allreduce_finalize,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -102,6 +103,31 @@ def _run_allreduce_default(tp_size, tp_rank, seq_len, hidden_size):
 
     expected = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
     torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+    return True
+
+
+def _run_allreduce_symmetric_default(tp_size, tp_rank, seq_len, hidden_size):
+    """NCCL_SYMMETRIC copies a plain input into an operation-owned window."""
+    dtype = torch.bfloat16
+    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
+    input_tensor = torch.ones(seq_len, hidden_size, dtype=dtype, device="cuda")
+    norm_weight = torch.ones(hidden_size, dtype=dtype, device="cuda")
+    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
+
+    with discard_nccl_window_tensor_outputs(input_tensor):
+        result = allreduce(
+            input_tensor, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE)
+        )
+        torch.testing.assert_close(result, torch.full_like(result, tp_size), atol=1e-2, rtol=1e-2)
+
+    with discard_nccl_window_tensor_outputs(input_tensor):
+        result = allreduce(
+            input_tensor,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM, norm_weight=norm_weight
+            ),
+        )
+        torch.testing.assert_close(result, torch.ones_like(result), atol=1e-2, rtol=1e-2)
     return True
 
 
@@ -179,19 +205,20 @@ def _run_allreduce_nccl_window(tp_size, tp_rank, seq_len, hidden_size):
     mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
 
     ref = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
-    out, actual_kind_int = _allocate(ref, int(BufferKind.NCCL_WINDOW), mapping.tp_group)
+    with discard_nccl_window_tensor_outputs(ref):
+        out, actual_kind_int = _allocate(ref, int(BufferKind.NCCL_WINDOW), mapping.tp_group)
 
-    if actual_kind_int != int(BufferKind.NCCL_WINDOW):
-        # Window allocation not available in this environment; skip gracefully.
-        return _SKIP
+        if actual_kind_int != int(BufferKind.NCCL_WINDOW):
+            # Window allocation not available in this environment; skip gracefully.
+            return _SKIP
 
-    out.fill_(1.0)
+        out.fill_(1.0)
 
-    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
-    result = allreduce(out, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
+        allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
+        result = allreduce(out, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
 
-    expected = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
-    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+        expected = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
     return True
 
 
@@ -214,6 +241,20 @@ def test_allreduce_default_buffer(seq_len, hidden_size, mpi_pool_executor):
     )
     for r in results:
         assert r is True, r
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_allreduce_symmetric_releases_internal_windows(mpi_pool_executor):
+    tp_size = mpi_pool_executor.num_workers
+    results = list(
+        mpi_pool_executor.map(
+            run_single_rank,
+            *zip(*[(tp_size, _run_allreduce_symmetric_default, 256, 4096)] * tp_size),
+        )
+    )
+    for result in results:
+        assert result is True, result
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")

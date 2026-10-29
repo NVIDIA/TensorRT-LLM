@@ -22,9 +22,9 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
+from utils.util import skip_num_gpus_less_than, skip_single_gpu
 
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     Attention2DAttention,
     RingAttention,
     UlyssesAttention,
@@ -34,11 +34,13 @@ from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
 from tensorrt_llm.visual_gen.args import ParallelConfig
 
+from ._worker_pool import run_distributed
+
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
     )
-    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
         _flash_attn_combine as _fa_combine,
     )
 
@@ -55,43 +57,10 @@ def _cleanup_mpi_env():
     os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
-def _init_distributed_worker(
-    rank: int, world_size: int, backend: str = "nccl", port: int = 29500
-) -> None:
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-
-def _cleanup_distributed() -> None:
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
-    try:
-        _init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size, **kwargs)
-    finally:
-        _cleanup_distributed()
-
-
 def _run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, "nccl", test_fn, port, kwargs),
-            nprocs=world_size,
-            join=True,
-        )
-    )
+    run_distributed(world_size, test_fn, dist_backend="nccl", preload=("tensorrt_llm",), **kwargs)
 
 
 def _test_qwen_image_attention_parallel_topology(
@@ -163,13 +132,13 @@ def _test_qwen_image_attention_parallel_topology(
 @pytest.mark.parametrize(
     "world_size,parallel,backend,topology",
     [
-        pytest.param(2, {"tp_size": 2}, "VANILLA", "tp", marks=pytest.mark.gpu2, id="tp2"),
+        pytest.param(2, {"tp_size": 2}, "VANILLA", "tp", marks=skip_single_gpu, id="tp2"),
         pytest.param(
             4,
             {"ring_size": 2, "ulysses_size": 2},
             "FA4",
             "ring",
-            marks=pytest.mark.gpu4,
+            marks=skip_num_gpus_less_than(4),
             id="ring2_ulysses2",
         ),
         pytest.param(
@@ -177,7 +146,7 @@ def _test_qwen_image_attention_parallel_topology(
             {"attn2d_size": (2, 1), "ulysses_size": 2},
             "FA4",
             "attn2d",
-            marks=pytest.mark.gpu4,
+            marks=skip_num_gpus_less_than(4),
             id="attn2d_2x1_ulysses2",
         ),
     ],

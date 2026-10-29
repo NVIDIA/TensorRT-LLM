@@ -21,11 +21,11 @@ log-probs) build on:
 
 * the per-request queries that read an ``LlmRequest``'s sampling config into
   :class:`UtilsSamplingParams`, plus the predicates over it
-  (``top_p_decay_active``, ``_request_sampling_params_cachable``);
+  (``top_p_decay_active``);
 * the shared step/beam index constants and beam-width accessors;
 * tensor helpers (``int_tensor``, ``add_token``);
 * plain data types passed *between* modules that no single feature owns --
-  :class:`RequestSeeds` (seed manager -> strategy impls) and
+  :class:`RequestSeeds` (seed manager -> sampler) and
   :class:`_BatchedSamplingResult` (sampler -> log-probs).
 
 That last group follows the package's dependency rule: a type shared across
@@ -33,7 +33,7 @@ features belongs here, so that a lower-layer module never has to import a
 higher-layer one to name it. A type owned by a single feature belongs with that
 feature instead -- the ``*Store`` classes all live in their own modules.
 
-Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
+Resolving a request's sampling params lives in ``sampling_resolution``.
 """
 
 from dataclasses import dataclass, field
@@ -59,7 +59,7 @@ class SampleType(Enum):
 
     A batch is dispatched to the simplest tier its requests allow:
 
-    - ``FAST``: only temperature / top_p / top_k. Sampled inside the graph.
+    - ``FAST``: only temperature / top_p / top_k / min_p. Sampled inside the graph.
     - ``FULL``: every sampling feature. Sampled eagerly after the forward.
 
     There is deliberately no argmax tier: greedy sampling is two cheap kernels,
@@ -173,11 +173,9 @@ def _get_max_beam_width(request: LlmRequest) -> int:
 def request_random_seed(request: LlmRequest) -> Optional[int]:
     """The request's user-specified ``SamplingParams.seed``, if any.
 
-    Deliberately kept out of ``UtilsSamplingParams``: that struct backs the
-    sampling-strategy cache key, and a per-request seed there would make every
-    seeded request its own strategy group, defeating batched sampling. The seed
-    does not change *which* distribution is sampled, only the RNG stream, so it
-    is read separately and applied as per-row RNG state.
+    Deliberately kept out of ``UtilsSamplingParams``: the seed does not change
+    *which* distribution is sampled, only the RNG stream, so it is read
+    separately and applied as per-row RNG state.
 
     The C++ ``SamplingConfig.randomSeed`` is ``uint64``, so a user seed in
     ``[2**63, 2**64)`` (e.g. from ``random.getrandbits(64)``) does not fit the
@@ -229,27 +227,14 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     )
 
 
-def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
-    return not params.use_beam_search
-
-
 @dataclass(kw_only=True)
 class RequestSeeds:
-    """Per-request RNG state for user-specified ``SamplingParams.seed``.
+    """Per-row Philox state for one sampling call.
 
-    Threaded alongside ``generator`` through the strategy impls and handed to
-    the flashinfer sampling ops as their stateless ``seed``/``offset`` pair.
-    Both tensors are int64 and 1-D with one entry per group row, matching the
-    per-row shape flashinfer documents; a row whose request did not specify a
-    seed carries the sampler's global seed, so unseeded requests keep their
-    previous behavior only in distribution, not token-for-token (see
-    ``_SeedManager``).
-
-    NB: the pinned flashinfer (0.6.15) accepts these per-row tensors but reads
-    only element 0 of each, separating rows by ``blockIdx.x``. The per-row
-    values below are therefore carried end-to-end but not yet honored for
-    batched requests; see the warning on ``_SeedManager`` and the upstream fix
-    at https://github.com/flashinfer-ai/flashinfer/pull/2345.
+    Handed to the fused sampling op as its ``seed``/``offset`` pair. Both
+    tensors are int64 and 1-D with one entry per group row. A row whose request
+    did not specify a seed carries the sampler's global seed and an offset from
+    the shared unseeded counter (see ``_SeedManager``).
 
     ``offset`` advances per request per sampling step, which is what makes a
     seeded request's stream depend on how many tokens it has drawn rather than
@@ -285,10 +270,9 @@ class _BatchedSamplingResult:
     # Next tokens for all requests:
     next_tokens_cuda_int: torch.Tensor
 
-    # Processed and raw logprobs buffer. The tensor is sized to accommodate logprobs for all requests currently being
-    # processed by the sampler and slice(0, processed_logprobs_end) contains processed logprobs, ordered consistently
-    # with processed_logprobs_reqs_indices. Excludes beam search requests, which have a separate path for logprobs
-    # handling.
+    # Processed logprobs for single-beam token rows, ordered consistently with
+    # processed_logprobs_reqs_indices after excluding beam-search requests.
+    # Raw logprobs are selected directly from logits; beam search uses its own history.
     logprobs_cuda: torch.Tensor | None = None
 
     # Requests requesting processed logprobs (incl. beam-search requests), same ordering as req_indices.
@@ -299,6 +283,7 @@ class _BatchedSamplingResult:
     # Requests requesting raw logprobs (incl. beam-search requests), ordered consistently with original
     # (unpermuted) requests
     raw_logprobs_reqs_indices: list[int] = field(default_factory=list)
-    # Indices into logits tensor, ordered consistently with raw_logprobs_reqs_indices.
-    # Excludes beam search requests, which have a separate path for logprobs handling.
+    # Indices into logits for the single-beam subset of raw_logprobs_reqs_indices,
+    # preserving request order. Multi-beam requests only need their sampled token IDs
+    # scattered; their logprob values come from beam search.
     raw_logprobs_logit_indices_cuda: torch.Tensor | None = None

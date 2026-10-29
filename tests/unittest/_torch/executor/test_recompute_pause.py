@@ -23,6 +23,10 @@ class _StubRequest:
 
 def _make_executor(handler: Mock | None) -> PyExecutor:
     executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
+    executor.sampler = Mock()
+    executor.model_engine = None
+    executor.draft_model_engine = None
     executor._disagg_pp_termination_handler = handler
     executor._pending_recompute_pause_ids = set()
     executor.inflight_req_ids = ReqIdsSet()
@@ -57,6 +61,7 @@ def test_recompute_pause_skips_request_finished_during_overlap() -> None:
     executor._pause_recompute_paused_requests(scheduled_batch)
 
     executor.resource_manager.free_resources.assert_called_once_with(request)
+    executor.sampler.release_request.assert_called_once_with(request)
     request.reset_for_recompute.assert_not_called()
 
 
@@ -77,6 +82,7 @@ def test_recompute_pause_defers_reset_until_pp_consensus() -> None:
 
     handler.terminate.assert_called_once_with(request)
     assert events == []
+    executor.sampler.release_request.assert_not_called()
     assert request.py_request_id in executor._pending_recompute_pause_ids
     assert request.py_request_id in executor.inflight_req_ids
     assert request.py_request_id in executor.result_wait_queues
@@ -86,6 +92,7 @@ def test_recompute_pause_defers_reset_until_pp_consensus() -> None:
 
     executor._on_disagg_pp_termination(request)
 
+    executor.sampler.release_request.assert_called_once_with(request)
     assert events == ["free", "reset"]
     assert request.py_request_id not in executor._pending_recompute_pause_ids
     assert request.py_request_id not in executor.inflight_req_ids
@@ -104,6 +111,7 @@ def test_terminal_request_does_not_recompute_after_pp_consensus() -> None:
     executor._on_disagg_pp_termination(request)
 
     executor.resource_manager.free_resources.assert_called_once_with(request)
+    executor.sampler.release_request.assert_called_once_with(request)
     request.reset_for_recompute.assert_not_called()
     assert request.py_request_id not in executor._pending_recompute_pause_ids
     assert request.py_request_id not in executor.inflight_req_ids

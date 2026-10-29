@@ -70,6 +70,8 @@ class _ShortFakeKVCache:
 
 def test_minimax_cache_indices_support_block_count_limit() -> None:
     manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.layer_specs = None
+    manager.kv_factor = 2
     manager.kv_cache_map = {7: _FakeKVCache(), 8: _ShortFakeKVCache()}
 
     assert manager._get_batch_cache_indices_by_pool_id([7]) == [[4, 5, 6, -1]]
@@ -79,6 +81,12 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
         [4, 5, 6, -1],
         [7, 8, -1, -1],
     ]
+    assert manager._get_batch_cache_indices_by_pool_id([7], index_scale=3, kv_factor=2) == [
+        [4, 5, 6, -1]
+    ]
+    assert manager.get_batch_cache_indices([7, 8]) == [[4, 5, 6, -1], [7, 8, -1, -1]]
+    assert manager.get_batch_cache_indices([7], num_blocks_per_seq=[2]) == [[4, 5]]
+    assert manager.get_batch_cache_indices([7], raw_indices=True) == [[4, 5, 6, -1]]
     assert manager.get_block_ids_per_seq([7]).tolist() == [[4, 5, 6, 0]]
     assert manager.get_block_ids_per_seq([7, 8]).tolist() == [
         [4, 5, 6, 0],
@@ -95,13 +103,19 @@ def test_v2_disagg_role_mapper_kind_defaults() -> None:
     }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "implementation,expected_main_mapper",
-    [("triton", MapperKind.NHD), ("msa", MapperKind.HND)],
+    "implementation,cache_dtype,expected_main_mapper",
+    [
+        ("triton", DataType.BF16, MapperKind.HND),
+        ("msa", DataType.BF16, MapperKind.HND),
+        ("triton", DataType.NVFP4, MapperKind.NHD),
+    ],
 )
 def test_minimax_disagg_role_mapper_kinds(
     monkeypatch: pytest.MonkeyPatch,
     implementation: str,
+    cache_dtype: DataType,
     expected_main_mapper: MapperKind,
 ) -> None:
     def fake_base_init(self: KVCacheManagerV2, *args: Any, **kwargs: Any) -> None:
@@ -114,6 +128,7 @@ def test_minimax_disagg_role_mapper_kinds(
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     manager = MiniMaxM3KVCacheManagerV2(
         num_layers=0,
+        dtype=cache_dtype,
         sparse_layer_ids=[],
         disable_index_value_layer_ids=[],
         sparse_attention_config=SimpleNamespace(
@@ -126,6 +141,18 @@ def test_minimax_disagg_role_mapper_kinds(
         Role.ALL: expected_main_mapper,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+    if implementation == "triton":
+        fp8_manager = MiniMaxM3KVCacheManagerV2(
+            num_layers=0,
+            dtype=DataType.FP8,
+            sparse_layer_ids=[],
+            disable_index_value_layer_ids=[],
+            sparse_attention_config=SimpleNamespace(
+                implementation="triton", indexer_kv_dtype="bf16"
+            ),
+        )
+        assert fp8_manager.get_disagg_role_mapper_kinds()[Role.ALL] == MapperKind.NHD
+        assert fp8_manager._dense_native_layer_ids == ()
 
 
 def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:
@@ -236,7 +263,7 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     try:
         lg = build_page_table_from_manager(manager).layer_groups[0]
         assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.NHD)
+        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
         idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
         assert kv_view.pool_role == frozenset({str(Role.KEY), str(Role.VALUE)})
         assert idx_view.pool_role == frozenset({str(Role.INDEX_KEY)})
@@ -260,7 +287,7 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     try:
         lg = build_page_table_from_manager(manager).layer_groups[0]
         assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.NHD)
+        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
         idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
         assert kv_view.pool_idx != idx_view.pool_idx
         starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
@@ -449,7 +476,7 @@ def _initialize_cache(
             continue
 
         for layer_idx in manager.pp_layers:
-            kv = manager.get_buffers(layer_idx)
+            kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())
             if manager.dtype == DataType.NVFP4:
                 sparse = layer_idx in manager.sparse_layer_ids
                 assert kv.dtype == (torch.int8 if sparse else torch.float8_e4m3fn)
@@ -462,7 +489,9 @@ def _initialize_cache(
                 layout=manager._main_kv_mapper_kind,
             )
 
-            index_key = manager.get_index_k_buffer(layer_idx)
+            index_key = manager.get_index_k_buffer(
+                layer_idx, kv_layout=manager._main_kv_layout_name()
+            )
             if index_key is not None:
                 index_tensor = index_key.unsqueeze(1)
                 _fill_position_dependent(
@@ -508,7 +537,9 @@ def _verify_cache(
                 gen_indices = _valid_indices(manager, gen_request_id, layer_idx)
                 assert gen_indices
 
-                gen_kv = manager.get_buffers(layer_idx)[gen_indices]
+                gen_kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())[
+                    gen_indices
+                ]
                 head_axis = 2 if manager._main_kv_mapper_kind == MapperKind.HND else 3
                 local_heads = gen_kv.shape[head_axis]
                 first_global_head = _first_global_head(manager)
@@ -526,7 +557,9 @@ def _verify_cache(
                         ctx_indices = _valid_indices(
                             ctx_manager, ctx_request_ids[req_idx], layer_idx
                         )
-                        ctx_kv = ctx_manager.get_buffers(layer_idx)
+                        ctx_kv = ctx_manager.get_buffers(
+                            layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
+                        )
                         if manager._main_kv_mapper_kind == MapperKind.HND:
                             actual = gen_kv[:, kv_idx, local_head, :, :]
                             expected = ctx_kv[ctx_indices, kv_idx, ctx_local_head, :, :]
@@ -535,7 +568,9 @@ def _verify_cache(
                             expected = ctx_kv[ctx_indices, kv_idx, :, ctx_local_head, :]
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-                index_key = manager.get_index_k_buffer(layer_idx)
+                index_key = manager.get_index_k_buffer(
+                    layer_idx, kv_layout=manager._main_kv_layout_name()
+                )
                 if index_key is not None:
                     ctx_manager, _ = _find_ctx_source(
                         ctx_managers,
@@ -546,7 +581,9 @@ def _verify_cache(
                         global_head=0,
                     )
                     ctx_indices = _valid_indices(ctx_manager, ctx_request_ids[req_idx], layer_idx)
-                    ctx_index_key = ctx_manager.get_index_k_buffer(layer_idx)
+                    ctx_index_key = ctx_manager.get_index_k_buffer(
+                        layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
+                    )
                     assert ctx_index_key is not None
                     torch.testing.assert_close(
                         index_key[gen_indices],

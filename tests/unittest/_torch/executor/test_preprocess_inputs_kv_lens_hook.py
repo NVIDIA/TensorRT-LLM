@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""_preprocess_inputs calls on_update_kv_lens once per step.
+"""preprocess_inputs calls on_update_kv_lens once per step.
 
 Under the overlap scheduler with speculative decoding the runner corrects
 kv_lens_cuda and calls the hook after the correction; the call before it is
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 
 KV_LENS = torch.tensor([10, 20, 30], dtype=torch.int32)
 KV_LENS_OFFSETS = torch.tensor([1, 2, 0], dtype=torch.int32)
@@ -21,7 +21,7 @@ NUM_TOKENS = KV_LENS.numel() * TOKENS_PER_REQUEST
 
 
 class _Metadata:
-    """The slice of TrtllmAttentionMetadata that _preprocess_inputs touches."""
+    """The slice of TrtllmAttentionMetadata that preprocess_inputs touches."""
 
     def __init__(self):
         self.kv_cache_manager = object()
@@ -39,10 +39,12 @@ class _Metadata:
 
 
 def _run_preprocess_inputs(metadata, *, spec_decode, overlap):
-    engine = object.__new__(DecoderRunner)
+    engine = object.__new__(DecoderInputPreparer)
     engine._config = SimpleNamespace(disable_overlap_scheduler=not overlap)
-    engine.previous_pos_id_offsets_cuda = torch.arange(NUM_TOKENS, dtype=torch.int32)
-    engine.previous_kv_lens_offsets_cuda = KV_LENS_OFFSETS.clone()
+    engine._buffers = SimpleNamespace(
+        previous_pos_id_offsets_cuda=torch.arange(NUM_TOKENS, dtype=torch.int32),
+        previous_kv_lens_offsets_cuda=KV_LENS_OFFSETS.clone(),
+    )
     engine.mapping = SimpleNamespace(has_cp_helix=lambda: False)
     engine.guided_decoder = None
     inputs = {
@@ -50,7 +52,7 @@ def _run_preprocess_inputs(metadata, *, spec_decode, overlap):
         "position_ids": torch.zeros(1, NUM_TOKENS, dtype=torch.int32),
         "attn_metadata": metadata,
     }
-    engine._preprocess_inputs(inputs, enable_spec_decode=spec_decode, runtime_draft_len=0)
+    engine.preprocess_inputs(inputs, enable_spec_decode=spec_decode, runtime_draft_len=0)
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import (
     ColdPageQuantizationCompressionConfig,
     KvCacheCompressionConfig,
@@ -81,6 +82,8 @@ def _factory_model_engine(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         mapping=SimpleNamespace(has_cp_helix=lambda: helix),
+        cuda_graph_batch_sizes=[],
+        cuda_graph_padding_enabled=False,
         spec_config=spec_config,
         model=SimpleNamespace(
             model_config=SimpleNamespace(
@@ -95,6 +98,7 @@ def _v2_manager(*, is_draft: bool):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELF
     manager.enable_block_reuse = False
     manager.kv_compression_manages_history = False
     manager.is_draft = is_draft
@@ -214,7 +218,8 @@ class TestBaseABC:
 
 
 class TestResourceManagerAPI:
-    def test_target_update_receives_metadata_before_final_compression(self):
+    @pytest.mark.parametrize("skip_target", [False, True])
+    def test_update_preserves_other_managers_and_metadata(self, skip_target: bool) -> None:
         calls = []
         metadata = MagicMock(name="attention_metadata")
         draft = MagicMock(name="draft_kv_cache_manager")
@@ -232,13 +237,13 @@ class TestResourceManagerAPI:
         )
         batch = _batch(generation=[_req(1)])
 
-        manager.update_resources(batch, metadata, 2.0)
+        manager.update_resources(batch, metadata, 2.0, skip_kv_cache_manager=skip_target)
 
-        assert calls == [
-            ("draft", (batch,)),
-            ("target", (batch, metadata, 2.0)),
-            ("compression", (batch,)),
-        ]
+        expected = [("draft", (batch,))]
+        if not skip_target:
+            expected.append(("target", (batch, metadata, 2.0)))
+        expected.append(("compression", (batch,)))
+        assert calls == expected
 
     def test_real_v2_target_receives_relocation_metadata(self):
         from tensorrt_llm._torch.pyexecutor.kv_cache import (
@@ -254,7 +259,9 @@ class TestResourceManagerAPI:
         with patch.object(kv_cache_v2_module, "_update_kv_cache_draft_token_location") as relocate:
             manager.update_resources(batch, metadata, 2.0)
 
-        relocate.assert_called_once_with(target, batch, metadata, 2.0)
+        relocate.assert_called_once_with(
+            target, batch, metadata, 2.0, include_finished_requests=True
+        )
 
     def test_prepare_fires_init_on_first_chunk_only(self, fake_kv_cache_manager):
         rec = []
@@ -380,7 +387,6 @@ class TestKvCacheCreatorLifecycle:
         creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
         creator._llm_args = SimpleNamespace(kv_cache_compression_config=config)
         creator._model_engine = _factory_model_engine(pretrained_config=pretrained_config)
-        creator._draft_model_engine = None
         creator._is_encoder_decoder = MagicMock(return_value=False)
         creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
         target_manager = object()
@@ -479,7 +485,6 @@ def test_build_routes_compression_manager_by_capabilities(
     pretrained_config = object()
     creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)
     creator._model_engine = _factory_model_engine(pretrained_config=pretrained_config)
-    creator._draft_model_engine = None
     creator._kv_connector_manager = None
     creator._is_kv_cache_manager_v2 = True
     creator._fp8_ctx_mla_kv_len_cap = None

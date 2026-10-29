@@ -64,7 +64,8 @@ __all__ = [
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
 # communicator started in PyExecutor.start_worker(); rank-0 is the entry
 # point, so routing through the rank-0 RPC shim is correct.
-_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset(
+    {"get_memory_status", "sleep", "wakeup"})
 
 
 def _check_collective_rpc_guard(
@@ -102,6 +103,9 @@ def _check_collective_rpc_guard(
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
     WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
+    # Total wait for the worker futures in an orderly shutdown. Generous
+    # enough for the teardown of a large engine.
+    _WORKER_SHUTDOWN_TIMEOUT_S = 180.0
 
     def __init__(
         self,
@@ -168,8 +172,6 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         _llm_args = worker_kwargs.get("llm_args", None)
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
-        _backend = None if _llm_args is None else _llm_args.backend
-        self._is_pytorch_backend = _backend == "pytorch"
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 
@@ -1083,6 +1085,28 @@ class GenerationExecutorProxy(GenerationExecutor):
         # instead of blocking on each, and skip the ones still pending.
         if self._engine_dead:
             concurrent.futures.wait(self.mpi_futures, timeout=5.0)
+        else:
+            # A worker that dies *after* delivering its results (e.g. a segfault
+            # in its own teardown) queues no error, so _engine_dead is still
+            # False. Bound the wait with one deadline shared by all futures so
+            # that cannot wedge shutdown; pre_shutdown has already asked the
+            # workers to quit.
+            _, pending = concurrent.futures.wait(
+                self.mpi_futures, timeout=self._WORKER_SHUTDOWN_TIMEOUT_S)
+            if pending:
+                stuck = [
+                    i for i, f in enumerate(self.mpi_futures) if f in pending
+                ]
+                logger.warning(
+                    f"MPI worker future(s) {stuck} did not complete within "
+                    f"{self._WORKER_SHUTDOWN_TIMEOUT_S}s of shutdown; treating "
+                    "the worker world as dead")
+                # Route the rest of teardown through the dead-engine path:
+                # skip the stuck futures, bound the dispatcher join and
+                # abandon (rather than join) the session.
+                self._mark_engine_dead(
+                    TimeoutError(
+                        f"MPI worker future(s) {stuck} timed out on shutdown"))
 
         for f in self.mpi_futures:
             if self._engine_dead and not f.done():
@@ -1269,12 +1293,45 @@ class GenerationExecutorProxy(GenerationExecutor):
             return {}
 
         try:
-            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote(
+                timeout=1.0)
             if isinstance(capacity, str):
                 capacity = json.loads(capacity)
             return capacity if isinstance(capacity, dict) else {}
         except (RPCError, json.JSONDecodeError) as e:
             logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
+
+    def get_openengine_discovery(self) -> dict:
+        """Get startup OpenEngine discovery through its dedicated worker RPC."""
+        if self.rpc_client is None:
+            return {}
+        try:
+            discovery = self.rpc_client.fetch_openengine_discovery_async(
+            ).remote(timeout=1.0)
+            if isinstance(discovery, str):
+                discovery = json.loads(discovery)
+            return discovery if isinstance(discovery, dict) else {}
+        except (RPCError, json.JSONDecodeError) as error:
+            logger.debug(
+                f"Error fetching OpenEngine discovery via RPC: {error}")
+            return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Get a primary/GPU KV cache load snapshot via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get kv cache load")
+            return {}
+
+        try:
+            load = self.rpc_client.fetch_kv_cache_load_async().remote(
+                timeout=1.0)
+            if isinstance(load, str):
+                load = json.loads(load)
+            return load if isinstance(load, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache load via RPC: {e}")
             return {}
 
     def get_disaggregated_params(self) -> dict:

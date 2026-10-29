@@ -16,7 +16,7 @@ from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend import trtllm as visual_trtllm
+from tensorrt_llm._torch.visual_gen.attention.backends import trtllm as visual_trtllm
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
 
@@ -81,6 +81,7 @@ def _make_wrapper(cls=visual_trtllm.TrtllmAttention, *, quant_attention_config=N
     attention.quant_attention_config = quant_attention_config
     attention.layer_idx = 0
     attention.sparse_params = None
+    attention.is_dense_layer = False
     attention.metadata = visual_trtllm.TrtllmAttentionMetadata(
         device=torch.device("cpu"), attention_metadata_state={}
     )

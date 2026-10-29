@@ -735,7 +735,7 @@ def deepgemm_fp8_group_blockwise_gemm(
 
     # Transform SFA and SFB into compute-required layout
 
-    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb),
+    deep_gemm.m_grouped_fp8_gemm_nt_masked((a, sfa), (b, sfb),
                                            d,
                                            masked_m,
                                            expected_m,
@@ -998,7 +998,6 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
         For DeepGemm with has_deepseek_fp8_block_scales:
         - Quantization is deferred to run_moe (after permutation)
         - WAR: FP8 block scales doesn't support permutation of quantized inputs
-        - Similar to CuteDslFusedMoE (see fused_moe_cute_dsl.py:242-253)
         """
         x_sf = None
         if self.has_deepseek_fp8_block_scales:
@@ -1032,8 +1031,6 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
 
         Returns:
             final_hidden_states tensor.
-
-        Note: Similar to CuteDslFusedMoE.run_moe_fp8_block_scales (fused_moe_cute_dsl.py:360-434)
         """
         x = ctx.x
         token_selected_experts = ctx.token_selected_experts

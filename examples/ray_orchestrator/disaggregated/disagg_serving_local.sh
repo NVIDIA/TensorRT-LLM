@@ -8,8 +8,8 @@ ATTACH_MODE=false
 MODEL_DIR="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TP_SIZE=1
 TRANSCEIVER_BACKEND="NIXL"
-TRANSCEIVER_RUNTIME="CPP"
-USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--transceiver_backend UCX|NIXL] [--transceiver_runtime CPP|PYTHON] [--help]"
+TRANSCEIVER_RUNTIME="PYTHON"
+USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--transceiver_backend DEFAULT|NIXL] [--transceiver_runtime auto|PYTHON] [--help]"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -44,8 +44,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --attach             Attach to existing ray cluster (skip ray start/stop)"
             echo "  --model model_dir    Model directory (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)"
             echo "  --tp_size N          Tensor parallel size (default: 1)"
-            echo "  --transceiver_backend UCX|NIXL  Cache-transceiver backend (default: NIXL)"
-            echo "  --transceiver_runtime CPP|PYTHON  Cache transceiver runtime (default: CPP)"
+            echo "  --transceiver_backend DEFAULT|NIXL  Cache-transceiver backend (default: NIXL)"
+            echo "  --transceiver_runtime auto|PYTHON  Cache transceiver runtime (default: PYTHON)"
             echo "  --help, -h           Show this help message"
             exit 0
             ;;
@@ -63,20 +63,14 @@ if [[ "$BACKEND" != "ray" && "$BACKEND" != "mpi" ]]; then
     exit 1
 fi
 
-if [[ "$TRANSCEIVER_RUNTIME" != "CPP" && "$TRANSCEIVER_RUNTIME" != "PYTHON" ]]; then
-    echo "Error: Cache transceiver runtime must be either 'CPP' or 'PYTHON'"
+if [[ "$TRANSCEIVER_RUNTIME" != "auto" && "$TRANSCEIVER_RUNTIME" != "PYTHON" ]]; then
+    echo "Error: Cache transceiver runtime must be 'auto' or 'PYTHON'"
     echo "$USAGE"
     exit 1
 fi
 
-if [[ "$TRANSCEIVER_BACKEND" != "UCX" && "$TRANSCEIVER_BACKEND" != "NIXL" ]]; then
-    echo "Error: Cache-transceiver backend must be either 'UCX' or 'NIXL'"
-    echo "$USAGE"
-    exit 1
-fi
-
-if [[ "$TRANSCEIVER_BACKEND" != "NIXL" && "$TRANSCEIVER_RUNTIME" == "PYTHON" ]]; then
-    echo "Error: The Python cache-transceiver runtime requires the NIXL backend"
+if [[ "$TRANSCEIVER_BACKEND" != "DEFAULT" && "$TRANSCEIVER_BACKEND" != "NIXL" ]]; then
+    echo "Error: Cache-transceiver backend must be 'DEFAULT' or 'NIXL'"
     echo "$USAGE"
     exit 1
 fi
@@ -96,7 +90,6 @@ if [[ "$BACKEND" == "ray" ]]; then
 cache_transceiver_config:
     backend: "$TRANSCEIVER_BACKEND"
     transceiver_runtime: "$TRANSCEIVER_RUNTIME"
-    max_tokens_in_buffer: 2048
 disable_overlap_scheduler: true
 # Ray executor configuration
 orchestrator_type: "ray"
@@ -107,7 +100,6 @@ else
 cache_transceiver_config:
     backend: "$TRANSCEIVER_BACKEND"
     transceiver_runtime: "$TRANSCEIVER_RUNTIME"
-    max_tokens_in_buffer: 2048
 disable_overlap_scheduler: true
 # Using default executor MPI (no orchestrator_type specified)
 EOF

@@ -114,7 +114,8 @@ class BlockSparseForwardInputs:
     Exactly one routing representation is present. Canonical BSR uses
     ``block_indptr`` and ``block_indices``; packed bitmask routing uses
     ``exact_block_bits``. Paired K/V summaries enable proxy routes without
-    encoding an algorithm name in this shared carrier.
+    encoding an algorithm name in this shared carrier. Both summaries are
+    block means over the tokens present, including a partial final block.
     """
 
     q_block_size: int

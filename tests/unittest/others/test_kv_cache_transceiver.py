@@ -8,6 +8,8 @@ import sys
 import time
 import uuid
 import weakref
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -20,19 +22,19 @@ os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
-    create_kv_cache_transceiver,
-    maybe_enable_fabric_memory_for_python_transceiver)
+from tensorrt_llm._torch.disaggregation import \
+    kv_cache_transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import \
+    create_kv_cache_transceiver
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import \
-    MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -43,34 +45,6 @@ DEFAULT_KV_TRANSFER_TIMEOUT_S = (
     CacheTransceiverConfig.model_fields["kv_transfer_timeout_ms"].default /
     1000.0)
 KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "runtime,manager_cls,initial_value,expected_value",
-    [
-        ("PYTHON", KVCacheManager, None, "1"),
-        ("PYTHON", KVCacheManager, "0", "0"),
-        ("PYTHON", KVCacheManagerV2, None, None),
-        ("CPP", KVCacheManager, None, None),
-        # "auto" is resolved to PYTHON/CPP by serving before this helper runs;
-        # callers that construct CacheTransceiverConfig directly must resolve
-        # it first — the helper deliberately leaves "auto" untouched.
-        ("auto", KVCacheManager, None, None),
-    ],
-)
-def test_maybe_enable_fabric_memory_for_python_transceiver(
-        monkeypatch, runtime, manager_cls, initial_value, expected_value):
-    env_name = "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"
-    if initial_value is None:
-        monkeypatch.delenv(env_name, raising=False)
-    else:
-        monkeypatch.setenv(env_name, initial_value)
-    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime)
-
-    maybe_enable_fabric_memory_for_python_transceiver(config, manager_cls)
-
-    assert os.environ.get(env_name) == expected_value
 
 
 @pytest.mark.parametrize("transceiver_runtime", ["CPP", "auto"])
@@ -88,6 +62,87 @@ def test_cpp_transceiver_rejects_mixed_mamba_manager(transceiver_runtime):
                                     attention_type=AttentionTypeCpp.DEFAULT,
                                     cache_transceiver_config=config,
                                     mamba_cache_manager=mixed_manager)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("runtime", [None, "CPP", "auto"])
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
+@pytest.mark.parametrize("manager_cls",
+                         [KVCacheManagerV2, MambaHybridCacheManagerV2])
+def test_cpp_transceiver_rejects_v2_manager(monkeypatch, runtime, backend,
+                                            manager_cls) -> None:
+    config = CacheTransceiverConfig(backend=backend,
+                                    transceiver_runtime=runtime)
+    manager = object.__new__(manager_cls)
+    constructor = Mock()
+    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver",
+                        constructor)
+    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
+    monkeypatch.setattr(transceiver_module,
+                        "_disagg_inflight_cancel_enabled_cache", None)
+
+    with pytest.raises(ValueError,
+                       match=r"kv_cache_config.use_kv_cache_manager_v2=False"):
+        create_kv_cache_transceiver(
+            mapping=None,
+            dist=None,
+            kv_cache_manager=manager,
+            attention_type=AttentionTypeCpp.DEFAULT,
+            cache_transceiver_config=config,
+            mamba_cache_manager=(manager if manager_cls
+                                 is MambaHybridCacheManagerV2 else None))
+
+    constructor.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("runtime,manager_cls", [
+    ("CPP", KVCacheManager),
+    (None, KVCacheManager),
+    ("PYTHON", KVCacheManagerV2),
+])
+def test_transceiver_accepts_compatible_manager(monkeypatch, runtime,
+                                                manager_cls) -> None:
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime)
+    manager = object.__new__(manager_cls)
+    cpp_constructor = Mock()
+    python_constructor = Mock()
+    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver",
+                        cpp_constructor)
+    monkeypatch.setitem(
+        sys.modules, "tensorrt_llm._torch.disaggregation.transceiver",
+        SimpleNamespace(KvCacheTransceiverV2=python_constructor))
+    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
+    monkeypatch.setattr(transceiver_module,
+                        "_disagg_inflight_cancel_enabled_cache", None)
+
+    result = create_kv_cache_transceiver(
+        mapping=None,
+        dist=None,
+        kv_cache_manager=manager,
+        attention_type=AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config=config)
+
+    expected = python_constructor if runtime == "PYTHON" else cpp_constructor
+    unused = cpp_constructor if runtime == "PYTHON" else python_constructor
+    assert result is expected.return_value
+    expected.assert_called_once()
+    unused.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
+def test_python_transceiver_backend_error_explains_v1(backend) -> None:
+    config = CacheTransceiverConfig(backend=backend)
+
+    with pytest.raises(
+            ValueError,
+            match=r"transceiver_runtime='CPP'.*use_kv_cache_manager_v2=False"):
+        create_kv_cache_transceiver(mapping=None,
+                                    dist=None,
+                                    kv_cache_manager=None,
+                                    attention_type=AttentionTypeCpp.DEFAULT,
+                                    cache_transceiver_config=config)
 
 
 def create_kv_cache_manager(mapping,
@@ -176,9 +231,8 @@ def ctx_gen_kv_cache_dtype(request):
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
                          ids=["mha", "mla"])
-@pytest.mark.parametrize("backend_runtime", [("NIXL", None), ("UCX", None),
-                                             ("NIXL", "PYTHON")],
-                         ids=["NIXL", "UCX", "PYTHON"])
+@pytest.mark.parametrize("backend_runtime", [("NIXL", None), ("UCX", None)],
+                         ids=["NIXL", "UCX"])
 def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
                                              attention_type, backend_runtime):
     backend, transceiver_runtime = backend_runtime
@@ -415,6 +469,7 @@ def test_cancel_request_in_transmission(attention_type):
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
 
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
@@ -486,6 +541,7 @@ def test_async_transfer_keeps_llm_request_alive():
     kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
@@ -612,7 +668,10 @@ def test_kv_transfer_timeout_warns_once_per_request(capfd):
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(
-        backend="DEFAULT", max_tokens_in_buffer=512, kv_transfer_timeout_ms=100)
+        backend="DEFAULT",
+        transceiver_runtime="CPP",
+        max_tokens_in_buffer=512,
+        kv_transfer_timeout_ms=100)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
                                                   AttentionTypeCpp.DEFAULT,
@@ -661,6 +720,7 @@ def test_kv_transfer_timeout_silent_when_unset(capfd):
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
@@ -698,6 +758,7 @@ def test_context_transfer_bounded_poll_keeps_request_in_progress(capfd):
 
     cache_transceiver_config = CacheTransceiverConfig(
         backend="DEFAULT",
+        transceiver_runtime="CPP",
         max_tokens_in_buffer=512,
         kv_transfer_timeout_ms=100,
         kv_transfer_sender_future_timeout_ms=10)
@@ -767,357 +828,3 @@ def test_context_transfer_bounded_poll_keeps_request_in_progress(capfd):
                 == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
 
     wait_for_transfer_completion(poll_transfers, transfers_done)
-
-
-def create_hybrid_cache_manager(mapping,
-                                dtype,
-                                mamba_conv_dtype=torch.float16,
-                                mamba_ssm_dtype=torch.float16):
-    """Create a mixed hybrid manager for Python transceiver tests.
-
-    This manager handles both KV cache (attention layers) and Mamba cache (RNN layers).
-
-    Args:
-        mapping: The mapping configuration.
-        dtype: KV cache dtype (DataType enum).
-        mamba_conv_dtype: Mamba conv states dtype (torch dtype).
-        mamba_ssm_dtype: Mamba SSM states dtype (torch dtype).
-    """
-    num_mamba_layers = 1
-    num_attention_layers = 1
-
-    # Attention at layer 0, Mamba at layer 1
-    attention_layer_mask = [True, False]
-    mamba_layer_mask = [False, True]
-
-    return MixedMambaHybridCacheManager(
-        # Mamba cache parameters
-        mamba_d_state=16,
-        mamba_d_conv=4,
-        mamba_num_heads=4,
-        mamba_n_groups=1,
-        mamba_head_dim=64,
-        mamba_num_layers=num_mamba_layers,
-        mamba_layer_mask=mamba_layer_mask,
-        mamba_cache_dtype=mamba_conv_dtype,
-        mamba_ssm_cache_dtype=mamba_ssm_dtype,
-        kv_cache_config=KvCacheConfig(
-            max_tokens=256,
-            enable_block_reuse=False,
-        ),
-        kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.
-        SELF,
-        num_layers=num_attention_layers,
-        layer_mask=attention_layer_mask,
-        num_kv_heads=1,
-        head_dim=1,
-        tokens_per_block=8,
-        max_seq_len=256,
-        max_batch_size=1,
-        mapping=mapping,
-        dtype=dtype,
-    )
-
-
-def fill_hybrid_cache_buffers(hybrid_cache_manager):
-    """Fill both KV and Mamba cache buffers with random values for testing."""
-    with torch.no_grad():
-        kv_buffer = hybrid_cache_manager.get_buffers(0)
-        random_kv = torch.rand(kv_buffer.shape,
-                               dtype=torch.float32,
-                               device=kv_buffer.device)
-        kv_buffer.copy_(random_kv)
-
-        conv_buffer = hybrid_cache_manager.get_conv_states(1)
-        random_conv = torch.rand(conv_buffer.shape,
-                                 dtype=conv_buffer.dtype,
-                                 device=conv_buffer.device)
-        conv_buffer.copy_(random_conv)
-
-        ssm_buffer = hybrid_cache_manager.get_ssm_states(1)
-        random_ssm = torch.rand(ssm_buffer.shape,
-                                dtype=ssm_buffer.dtype,
-                                device=ssm_buffer.device)
-        ssm_buffer.copy_(random_ssm)
-
-
-@pytest.fixture(scope="function")
-def hybrid_dtypes(request):
-    """
-    Returns (kv_dtype, mamba_conv_dtype, mamba_ssm_dtype) based on the parametrized string.
-
-    KV dtype: fp8, bf16
-    Conv dtype: bf16, fp32
-    SSM dtype: bf16, fp32
-    """
-    kv_dtype_str, conv_dtype_str, ssm_dtype_str = request.param
-
-    # Map KV dtype strings to DataType enum
-    kv_dtype_map = {
-        "fp8": DataType.FP8,
-        "bf16": DataType.BF16,
-    }
-
-    # Map Mamba dtype strings to torch dtype
-    torch_dtype_map = {
-        "fp8": torch.float8_e4m3fn,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }
-
-    return kv_dtype_map[kv_dtype_str], torch_dtype_map[
-        conv_dtype_str], torch_dtype_map[ssm_dtype_str]
-
-
-@pytest.mark.timeout(120)
-@pytest.mark.parametrize(
-    "hybrid_dtypes",
-    [
-        # (kv_dtype, conv_dtype, ssm_dtype)
-        ("bf16", "bf16", "bf16"),
-        ("bf16", "bf16", "fp32"),
-        ("bf16", "fp32", "bf16"),
-        ("bf16", "fp32", "fp32"),
-        ("fp8", "bf16", "bf16"),
-        ("fp8", "bf16", "fp32"),
-        ("fp8", "fp32", "bf16"),
-        ("fp8", "fp32", "fp32"),
-    ],
-    ids=[
-        "kv_bf16-conv_bf16-ssm_bf16",
-        "kv_bf16-conv_bf16-ssm_fp32",
-        "kv_bf16-conv_fp32-ssm_bf16",
-        "kv_bf16-conv_fp32-ssm_fp32",
-        "kv_fp8-conv_bf16-ssm_bf16",
-        "kv_fp8-conv_bf16-ssm_fp32",
-        "kv_fp8-conv_fp32-ssm_bf16",
-        "kv_fp8-conv_fp32-ssm_fp32",
-    ],
-    indirect=["hybrid_dtypes"],
-)
-def test_hybrid_cache_transceiver_single_process(hybrid_dtypes, request):
-    mapping = Mapping(world_size=1, rank=0)
-    kv_dtype, mamba_conv_dtype, mamba_ssm_dtype = hybrid_dtypes
-
-    # Create hybrid cache managers (combines KV + Mamba) for context and generation
-    hybrid_cache_manager_ctx = create_hybrid_cache_manager(
-        mapping, kv_dtype, mamba_conv_dtype, mamba_ssm_dtype)
-    request.addfinalizer(hybrid_cache_manager_ctx.shutdown)
-    hybrid_cache_manager_gen = create_hybrid_cache_manager(
-        mapping, kv_dtype, mamba_conv_dtype, mamba_ssm_dtype)
-    request.addfinalizer(hybrid_cache_manager_gen.shutdown)
-
-    cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512)
-    dist = Distributed.get(mapping)
-
-    # Create transceivers - the hybrid manager serves as both kv_cache_manager and mamba_cache_manager
-    cache_transceiver_ctx = create_kv_cache_transceiver(
-        mapping,
-        dist,
-        hybrid_cache_manager_ctx,
-        AttentionTypeCpp.DEFAULT,
-        cache_transceiver_config,
-        mamba_cache_manager=hybrid_cache_manager_ctx)
-    request.addfinalizer(cache_transceiver_ctx.shutdown)
-
-    cache_transceiver_gen = create_kv_cache_transceiver(
-        mapping,
-        dist,
-        hybrid_cache_manager_gen,
-        AttentionTypeCpp.DEFAULT,
-        cache_transceiver_config,
-        mamba_cache_manager=hybrid_cache_manager_gen)
-    request.addfinalizer(cache_transceiver_gen.shutdown)
-
-    # Fill both KV and Mamba cache buffers with random data
-    fill_hybrid_cache_buffers(hybrid_cache_manager_ctx)
-
-    # Init ctx request
-    sampling_params = SamplingParams()
-    ctx_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(256)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
-    ctx_request.py_disaggregated_params = tensorrt_llm.DisaggregatedParams(
-        request_type="context_only",
-        disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
-
-    # Prepare resources for hybrid manager (handles both KV and Mamba)
-    scheduled_ctx = ScheduledRequests()
-    scheduled_ctx.context_requests_last_chunk = [ctx_request]
-    hybrid_cache_manager_ctx.prepare_resources(scheduled_ctx)
-
-    # Send ctx request (sends both KV and Mamba states)
-    cache_transceiver_ctx.respond_and_send_async(ctx_request)
-
-    # Init gen request
-    gen_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(256)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-        context_phase_params=ctx_request.context_phase_params)
-    gen_request.py_disaggregated_params = tensorrt_llm.DisaggregatedParams(
-        request_type="generation_only",
-        disagg_request_id=ctx_request.py_disaggregated_params.disagg_request_id,
-        ctx_request_id=ctx_request.request_id,
-        ctx_dp_rank=ctx_request.context_phase_params.ctx_dp_rank,
-        ctx_info_endpoint=ctx_request.context_phase_params.disagg_info_endpoint,
-        first_gen_tokens=ctx_request.context_phase_params.first_gen_tokens,
-        draft_tokens=ctx_request.context_phase_params.draft_tokens)
-
-    # Prepare resources for hybrid manager on gen side
-    scheduled_gen = ScheduledRequests()
-    scheduled_gen.context_requests_last_chunk = [gen_request]
-    hybrid_cache_manager_gen.prepare_resources(scheduled_gen)
-
-    cache_transceiver_gen.request_and_receive_async(gen_request)
-
-    completed_ctx_ids = set()
-    expected_ctx_id = get_context_completed_request_id(ctx_request, "PYTHON")
-
-    def poll_transfers():
-        completed, failed = cache_transceiver_ctx.check_context_transfer_status(
-            1)
-        assert failed == []
-        completed_ctx_ids.update(completed)
-        cache_transceiver_gen.check_gen_transfer_status(1)
-
-    def transfers_done():
-        return (expected_ctx_id in completed_ctx_ids and gen_request.state
-                == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
-
-    wait_for_transfer_completion(poll_transfers, transfers_done)
-
-    assert torch.equal(
-        hybrid_cache_manager_gen.get_buffers(0),
-        hybrid_cache_manager_ctx.get_buffers(0)), "different kv-cache values"
-
-    # The transceiver copies a single request's state between
-    # independently-allocated slots on each side, so we check the
-    # request's own slot instead of the full state buffer (which has
-    # extra padding-dummy slots that only the ctx side touched).
-    slot_ctx = hybrid_cache_manager_ctx.mamba_cache_index[
-        ctx_request.py_request_id]
-    slot_gen = hybrid_cache_manager_gen.mamba_cache_index[
-        gen_request.py_request_id]
-    assert torch.equal(
-        hybrid_cache_manager_gen.get_conv_states(1)[slot_gen],
-        hybrid_cache_manager_ctx.get_conv_states(1)[slot_ctx]), (
-            "different mamba conv states")
-
-    assert torch.equal(
-        hybrid_cache_manager_gen.get_ssm_states(1)[slot_gen],
-        hybrid_cache_manager_ctx.get_ssm_states(1)[slot_ctx]), (
-            "different mamba ssm states")
-    shutdown_transceivers(cache_transceiver_gen, cache_transceiver_ctx)
-
-
-@pytest.mark.timeout(120)
-def test_hybrid_cache_transceiver_cancel_request(request):
-
-    mapping = Mapping(world_size=1, rank=0)
-    dtype = DataType.HALF
-
-    hybrid_cache_manager_ctx = create_hybrid_cache_manager(mapping, dtype)
-    request.addfinalizer(hybrid_cache_manager_ctx.shutdown)
-    hybrid_cache_manager_gen = create_hybrid_cache_manager(mapping, dtype)
-    request.addfinalizer(hybrid_cache_manager_gen.shutdown)
-
-    cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512)
-    dist = Distributed.get(mapping)
-
-    cache_transceiver_ctx = create_kv_cache_transceiver(
-        mapping,
-        dist,
-        hybrid_cache_manager_ctx,
-        AttentionTypeCpp.DEFAULT,
-        cache_transceiver_config,
-        mamba_cache_manager=hybrid_cache_manager_ctx)
-    request.addfinalizer(cache_transceiver_ctx.shutdown)
-
-    cache_transceiver_gen = create_kv_cache_transceiver(
-        mapping,
-        dist,
-        hybrid_cache_manager_gen,
-        AttentionTypeCpp.DEFAULT,
-        cache_transceiver_config,
-        mamba_cache_manager=hybrid_cache_manager_gen)
-    request.addfinalizer(cache_transceiver_gen.shutdown)
-
-    fill_hybrid_cache_buffers(hybrid_cache_manager_ctx)
-
-    # Init ctx request
-    sampling_params = SamplingParams()
-    ctx_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(256)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
-    ctx_request.py_disaggregated_params = tensorrt_llm.DisaggregatedParams(
-        request_type="context_only",
-        disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
-
-    scheduled_ctx = ScheduledRequests()
-    scheduled_ctx.context_requests_last_chunk = [ctx_request]
-    hybrid_cache_manager_ctx.prepare_resources(scheduled_ctx)
-
-    # Send ctx request
-    cache_transceiver_ctx.respond_and_send_async(ctx_request)
-
-    # Init gen request
-    gen_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(256)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-        context_phase_params=ctx_request.context_phase_params)
-    gen_request.py_disaggregated_params = tensorrt_llm.DisaggregatedParams(
-        request_type="generation_only",
-        disagg_request_id=ctx_request.py_disaggregated_params.disagg_request_id,
-        ctx_request_id=ctx_request.request_id,
-        ctx_dp_rank=ctx_request.context_phase_params.ctx_dp_rank,
-        ctx_info_endpoint=ctx_request.context_phase_params.disagg_info_endpoint,
-        first_gen_tokens=ctx_request.context_phase_params.first_gen_tokens,
-        draft_tokens=ctx_request.context_phase_params.draft_tokens)
-
-    scheduled_gen = ScheduledRequests()
-    scheduled_gen.context_requests_last_chunk = [gen_request]
-    hybrid_cache_manager_gen.prepare_resources(scheduled_gen)
-
-    # Try to receive gen request
-    cache_transceiver_gen.request_and_receive_async(gen_request)
-
-    generation_cancelled = [False]
-
-    def cancel_generation_transfer():
-        generation_cancelled[0] = cache_transceiver_gen.cancel_request(
-            gen_request)
-
-    wait_for_transfer_completion(cancel_generation_transfer,
-                                 lambda: generation_cancelled[0])
-    assert cache_transceiver_gen.check_gen_transfer_complete()
-
-    context_cancelled = [False]
-
-    def cancel_context_transfer():
-        context_cancelled[0] = cache_transceiver_ctx.cancel_request(ctx_request)
-
-    wait_for_transfer_completion(cancel_context_transfer,
-                                 lambda: context_cancelled[0])
-    shutdown_transceivers(cache_transceiver_gen, cache_transceiver_ctx)

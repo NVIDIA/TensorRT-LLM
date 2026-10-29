@@ -5,7 +5,7 @@
 The binding is stateless on the Python side: every piece of state it reads
 is an explicit argument. The test builds that state for real — a caller-
 owned paged KV pool, pool pointer/mapping tensors, block-offset tables
-(hand-filled for single-layer pools, produced by a real KVCacheManager for
+(hand-filled for single-layer pools, produced by a real KVCacheManagerV2 for
 the multi-layer case), and the int32 host/device length tensors — and
 compares against fp32 torch references. The certified configurations
 exercised:
@@ -109,7 +109,7 @@ exercised:
       new-token pass, folded together by the downstream trtllm merge op and
       checked against a single-pass full-range fp32 reference.
 4. Standard GQA over one paged pool shared by 4 layers: pool, layer->pool
-   mapping, and block offsets produced by a real multi-layer KVCacheManager
+   mapping, and block offsets produced by a real multi-layer KVCacheManagerV2
    and consumed by the op as-is, with local_layer_idx 0-3 selecting mapping
    rows. Per-layer outputs, bit-exact per-layer appends, sibling-layer
    isolation, and a doctored-mapping call pinning the pool-base shift to
@@ -157,29 +157,83 @@ exercised:
    mask). Covered on the three shipped bf16 geometries: bitwise equivalence
    with the packed path when nothing is cached; cached prefixes across the
    page grid, chunked prefill loops, and mixed cached/fresh/generation
-   batches; the same over a real 4-layer KVCacheManager pool, where the read
+   batches; the same over a real 4-layer KVCacheManagerV2 pool, where the read
    now also goes through the layer base shift; and the gpt-oss cell — sinks
    plus a 128-token window over a cached prefix past the window, with the
    attended key set read out one-hot and the read page set measured page by
    page. Wrong batch states (the flag left off, context_lengths carrying the
    full KV length or 0, a replaced in-window cached page) are gated far
    outside the tolerance band.
+10. GQA 24/4/256 (Qwen3.8-27B) over an fp8-e4m3 pool at s = 1.0: which
+   operands each context path reads, settled bitwise (packed: bf16 q rows,
+   never the pool; paged: e4m3, so the flag is not output-inert over fp8),
+   the kv-scale semantics off 1.0 (append within one e4m3 code point,
+   read-side dequant against a dequant-skipping rival), the quant_mode bits a
+   mixed-precision checkpoint passes (384/1152/4224/4480 bit-identical to 128,
+   4352 the control), and a torn-append positive control.
+11. predicted_tokens_per_seq > 1 in the standard configuration: the
+   within-block mask read out one-hot at P = 2, 3, 4 over a bf16 pool at
+   24/2/256 and 24/4/256 and an fp8 one at 24/4/256 (bottom-right causal,
+   later siblings bitwise zero, mask_type inert, a page-crossing block,
+   consecutive steps), with the full-block model as the measured rival; the
+   entry's cells gate P up to 8 (the target's max_draft_len 7) against `reference`.
+12. qwen4_exp's full-attention cell, GQA 24/2/256 over a bf16 pool on the
+   paged-context path: the cached-prefix rival, the sparse / skip-softmax
+   group measured bitwise inert, and local_layer_idx over its 48-row mapping
+   -- the engine's two-pool hybrid arrangement at all twelve driven rows, a
+   real 48-layer manager's identity rows, and a bitwise A/B of a single-layer
+   pool against mapping row 47.
+13. The no-KV-cache (encoder-only) mode qwen4_exp's vision tower runs: all
+   three cache-addressing tensors None, one context sequence per frame (an
+   image, or one frame group of a video), MHA 16/16 at head_size 72 and 128,
+   the merged-segment rival, the cache
+   arguments that are inert there, the workspace high-water mark over the
+   mmmu serving shapes, and the two boundaries (update_kv_cache=False is
+   rejected; head_size 72 has no generation phase).
+14. The same full-attention cell over an NVFP4 pool (e2m1 data and e4m3 block
+   scales in a second pool, unit fp32 [3] second-level scales, bf16 output):
+   the pool and its block scales bitwise as the append writes them, and the
+   output against `reference` over the NVFP4 values (the cells).
+The cells at the end drive the entry's own `reference` and `_compare` over the
+configurations the targets run.
 """
 
 import math
+import zlib
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
+import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention,
+    MLA_CONTEXT,
+    MLA_GENERATION,
+    QM_FP8_KV_CACHE,
+    QM_NVFP4_KV_CACHE,
+    QWEN4_DENSE,
+    QWEN4_VISION,
+    STANDARD,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention as op,
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+__extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
+from _validating import (  # noqa: E402,F401 — needs the path declared above
+    ULP,
+    assert_within_ulp,
+    certifying,
+    validating,
+)
 
 assert torch.cuda.is_available(), "thop_attention requires a CUDA device"
 
@@ -200,6 +254,7 @@ MASK_CAUSAL = 1  # AttentionMaskType.causal
 MASK_PADDING = 0  # AttentionMaskType.padding: no mask (bidirectional)
 
 QUANT_MODE_FP8_KV_CACHE = 128  # QuantMode.FP8_KV_CACHE (sole bit set)
+QUANT_MODE_NVFP4_KV_CACHE = 8192  # QuantMode.NVFP4_KV_CACHE (sole bit set)
 
 # fp8-e4m3 KV-pool decode tolerance. The reference dequantizes the mirrored
 # e4m3 pool content and puts q through the same e4m3 round-trip the kernel
@@ -250,6 +305,135 @@ FP8_MLA_ATOL = 2**-3
 FP8_MLA_RTOL = 2**-4
 
 
+# NVFP4: one e4m3 block scale per this many values; e2m1 magnitudes by code
+# and the round-to-nearest-even steps between them (inclusive where the upper
+# neighbour is the even code).
+NVFP4_BLOCK = 16
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1_STEPS = ((0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False))
+E2M1_STEPS += ((3.5, True), (5.0, False))
+
+
+def _nvfp4_quantize(rows: torch.Tensor, global_scale: torch.Tensor):
+    """[n, D] rows -> (packed e2m1 bytes [n, D/2], e4m3 scale bytes [n, D/16]):
+    the attention op's append, in torch (`cvt_warp_fp16_to_fp4`)."""
+    n, d = rows.shape
+    x = rows.float().reshape(n, d // NVFP4_BLOCK, NVFP4_BLOCK)
+    block_max = x.abs().amax(-1)
+    sixth = torch.tensor(6.0, dtype=torch.float32, device=rows.device).reciprocal()
+    code = (global_scale * (block_max * sixth)).to(torch.float8_e4m3fn)
+    out_scale = torch.where(
+        block_max != 0,
+        (code.float() * global_scale.reciprocal()).reciprocal(),
+        torch.zeros_like(block_max),
+    )
+    scaled = x * out_scale[..., None]
+    magnitude = scaled.abs()
+    codes = torch.zeros(scaled.shape, dtype=torch.int32, device=rows.device)
+    for threshold, inclusive in E2M1_STEPS:
+        codes += (magnitude >= threshold if inclusive else magnitude > threshold).to(torch.int32)
+    codes |= torch.signbit(scaled).to(torch.int32) << 3
+    # 0 x inf, in a block whose scale underflows to zero: the conversion makes +6.
+    codes = torch.where(torch.isnan(scaled), torch.full_like(codes, 0x7), codes)
+    codes = codes.reshape(n, d // 2, 2)
+    return (codes[..., 0] | (codes[..., 1] << 4)).to(torch.uint8), code.view(torch.uint8)
+
+
+def _nvfp4_dequantize(packed: torch.Tensor, scales: torch.Tensor, global_scale) -> torch.Tensor:
+    """Inverse of `_nvfp4_quantize`: fp32 [n, D]."""
+    lut = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    lut = torch.cat([lut, -lut])
+    raw = packed.long()
+    values = torch.stack([lut[raw & 0xF], lut[raw >> 4]], -1).flatten(-2)
+    scale = scales.view(torch.float8_e4m3fn).float().repeat_interleave(NVFP4_BLOCK, -1)
+    return values * scale / global_scale
+
+
+def _nvfp4_roundtrip(kv: torch.Tensor, global_scale) -> torch.Tensor:
+    """[T, Hkv, D] bf16 -> the bf16 values an NVFP4 pool returns for them."""
+    t, h, d = kv.shape
+    packed, scales = _nvfp4_quantize(kv.reshape(t * h, d), global_scale)
+    return _nvfp4_dequantize(packed, scales, global_scale).reshape(t, h, d).to(kv.dtype)
+
+
+def _check_nvfp4_cache(env, request_id: int) -> None:
+    """An NVFP4 pool holds each token's e2m1 bytes and its block scales -- K's
+    token-major, V's in four-token groups -- bitwise as the append writes them."""
+    tpb, hkv, d = env.tokens_per_block, env.num_kv_heads, env.head_dim
+    groups = d // NVFP4_BLOCK
+    for role, history in ((0, env.k_history[request_id]), (1, env.v_history[request_id])):
+        seq = torch.cat(history)
+        total = seq.shape[0]
+        packed, scales = _nvfp4_quantize(
+            seq.reshape(total * hkv, d), env.kv_scale_orig_quant[1 + role]
+        )
+        packed = packed.reshape(total, hkv, d // 2)
+        scales = scales.reshape(total, hkv, groups)
+        for j, page in enumerate(env.pages[request_id]):
+            n = min(tpb, total - j * tpb)
+            if n <= 0:
+                break
+            rows = slice(j * tpb, j * tpb + n)
+            got = env.kv_cache[page, role, :, :n].permute(1, 0, 2)
+            assert torch.equal(got, packed[rows]), f"request {request_id} role {role} page {j}"
+            sf_page = env.kv_block_scales[page, role]
+            if role == 0:
+                got_sf = sf_page[:, :n].permute(1, 0, 2)
+            else:
+                grouped = sf_page.reshape(hkv, tpb // 4, groups, 4).permute(0, 1, 3, 2)
+                got_sf = grouped.reshape(hkv, tpb, groups)[:, :n].permute(1, 0, 2)
+            assert torch.equal(got_sf, scales[rows]), (
+                f"request {request_id} role {role} page {j}: block scales"
+            )
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """A softmax chain, so the band is the longest in this catalog.
+
+    Attention accumulates twice -- once over the KV range inside the
+    softmax, once over the same range in the value product -- and the
+    kernel splits both differently from a single fp32 pass. 8 ulp
+    element-wise against the row scale and 4 of relative RMS, the same band
+    a two-GEMM MoE chain gets, and for the same reason.
+
+    Scored in bf16 ulp whatever the output dtype: on the fp8 paths the
+    operands are e4m3 and the accumulation is bf16-limited, so fp32's ulp
+    would measure the container. The standard configuration's fp8 paths
+    also round the softmax probabilities to e4m3, which this band does not
+    absorb (5-6 ulp RMS measured); `reference(e4m3_probabilities=True)`
+    models it instead. Measured on sm_103: the qwen4_exp, encoder and fp8
+    context cells use at most 0.25 of the element gate and 0.16 of the RMS
+    one; the fp8 200-token decode, whose KV range spans tiles, 0.58 of both.
+    """
+    assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
+
+
+def _compare_fp8_mla(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """The MLA context cells' band: the fp8 MLA band per element, and
+    `_compare`'s 4 ulp of relative RMS in aggregate.
+
+    `_compare`'s 8-ulp element gate states an accumulation-order difference
+    and nothing else. Over the fp8 pool the kernel also rounds the softmax
+    probabilities to e4m3 before the value product -- an MMA operand that
+    `reference(e4m3_inputs=True)` does not round -- and that error does not
+    shrink with the output's own scale (see FP8_MLA_ATOL above). Gated
+    against the row maximum it also depends on the head count: a row holds
+    `num_heads * v_head_dim` outputs, so at 16 heads the yardstick is the
+    largest of 2048 values instead of 16384, smaller and noisier, while the
+    per-element error is unchanged. The 16-head cell crossed the 8-ulp gate
+    by 1%, on one element of 135168 (0.0316 of the row scale against
+    0.03125); the 128-head cell passing it is one input that happened to,
+    not a derivation. So the element gate is the one this file derives for
+    the fp8 MLA FMHA and applies to every other fp8 context case, and the
+    aggregate keeps `_compare`'s RMS bound, which a row's width does not
+    move.
+    """
+    torch.testing.assert_close(out, ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
+    err = (out.float() - ref.float()).pow(2).mean().sqrt()
+    rel_rms = (err / ref.float().pow(2).mean().sqrt().clamp_min(1e-9)).item()
+    assert rel_rms <= 4.0 * ULP[torch.bfloat16], f"relative RMS {rel_rms:.3e} exceeds 4 bf16 ulp"
+
+
 class _PagedAttnEnv:
     """Real op state: caller-owned paged KV pool + explicit metadata tensors.
 
@@ -290,26 +474,46 @@ class _PagedAttnEnv:
         self.page_ring = page_ring
         self.rings: dict[int, List[int]] = {}
 
-        # Single-layer, single-pool paged KV cache (HND layout).
+        # Single-layer, single-pool paged KV cache (HND layout). An NVFP4 pool
+        # holds e2m1 pairs, and its e4m3 block scales live in a second pool
+        # whose pointer is the third axis of the pool pointers.
+        self.nvfp4 = bool(quant_mode & QUANT_MODE_NVFP4_KV_CACHE)
         self.kv_cache = torch.zeros(
             num_blocks,
             2,
             num_kv_heads,
             tokens_per_block,
-            head_dim,
-            dtype=pool_dtype,
+            head_dim // 2 if self.nvfp4 else head_dim,
+            dtype=torch.uint8 if self.nvfp4 else pool_dtype,
             device="cuda",
         )
-        self.pool_pointers = torch.zeros(1, 2, dtype=torch.int64, device="cpu")
-        self.pool_pointers[0, 0] = self.kv_cache.data_ptr()
+        if self.nvfp4:
+            self.kv_block_scales = torch.zeros(
+                num_blocks,
+                2,
+                num_kv_heads,
+                tokens_per_block,
+                head_dim // NVFP4_BLOCK,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            self.pool_pointers = torch.zeros(1, 2, 2, dtype=torch.int64, device="cpu")
+            self.pool_pointers[0, 0, 0] = self.kv_cache.data_ptr()
+            self.pool_pointers[0, 0, 1] = self.kv_block_scales.data_ptr()
+        else:
+            self.pool_pointers = torch.zeros(1, 2, dtype=torch.int64, device="cpu")
+            self.pool_pointers[0, 0] = self.kv_cache.data_ptr()
         # KV-cache scaling factor s: dequant = quantized * s. Mirrors the
         # production construction (quant_orig = s, orig_quant = 1/s, both
-        # fp32 [1] CUDA); None = unquantized pool, scale args passed as None.
+        # fp32 [1] CUDA, [3] -- q, K, V -- over an NVFP4 pool); None =
+        # unquantized pool, scale args passed as None.
         if kv_scaling_factor is None:
             self.kv_scale_quant_orig: Optional[torch.Tensor] = None
             self.kv_scale_orig_quant: Optional[torch.Tensor] = None
         else:
-            factor = torch.full((1,), kv_scaling_factor, dtype=torch.float32, device="cuda")
+            factor = torch.full(
+                (3 if self.nvfp4 else 1,), kv_scaling_factor, dtype=torch.float32, device="cuda"
+            )
             self.kv_scale_quant_orig = factor
             self.kv_scale_orig_quant = 1.0 / factor
         self.pool_mapping = torch.zeros(1, 2, dtype=torch.int32, device="cpu")
@@ -363,6 +567,9 @@ class _PagedAttnEnv:
         ctx_lens_override: Optional[List[int]] = None,
         max_seq_len_override: Optional[int] = None,
         use_paged_context_fmha: bool = False,
+        predicted_tokens_per_seq: int = 1,
+        alias_pages: bool = False,
+        op_overrides: Optional[Dict] = None,
     ) -> torch.Tensor:
         """One thop_attention call over explicitly constructed batch state.
 
@@ -376,6 +583,15 @@ class _PagedAttnEnv:
         count rather than the registered prompt length.
         use_paged_context_fmha=True selects the paged-context execution path
         (see the paged-context section).
+        predicted_tokens_per_seq > 1 makes each generation sequence contribute
+        that many q rows (one speculative-decoding step); seq_lens then carries
+        P for a generation row, which is also its new-token count, so the page
+        bookkeeping and the K/V mirror need no special case.
+        alias_pages points every entry of a sequence's offsets row at its first
+        physical page -- the torn-append arming sequence, used only as a control
+        that the pool comparison can see a racing append.
+        op_overrides replaces named arguments of the op call itself, for cases
+        that sweep an argument this helper does not otherwise expose.
         """
         ns = len(request_ids)
         kv_lens = []  # cached + new, per sequence
@@ -389,8 +605,9 @@ class _PagedAttnEnv:
             # K page offset of page p is 2*p, V is 2*p + 1 (single-layer pool).
             row = self.block_offsets[0, len(kv_lens) - 1]
             for j, p in enumerate(self.pages[rid]):
-                row[0, j] = 2 * p
-                row[1, j] = 2 * p + 1
+                page = self.pages[rid][0] if alias_pages else p
+                row[0, j] = 2 * page
+                row[1, j] = 2 * page + 1
         if seq_lens_override is not None:
             kv_lens = list(seq_lens_override)
         if ctx_lens_override is not None:
@@ -408,7 +625,7 @@ class _PagedAttnEnv:
             dtype=qkv.dtype,
             device=qkv.device,
         )
-        thop_attention(
+        op_kwargs = dict(
             q=qkv,
             k=None,  # packed QKV rides inside q
             v=None,
@@ -437,7 +654,7 @@ class _PagedAttnEnv:
             attention_sinks=attention_sinks,
             is_fused_qkv=True,
             update_kv_cache=True,
-            predicted_tokens_per_seq=1,
+            predicted_tokens_per_seq=predicted_tokens_per_seq,
             local_layer_idx=0,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -495,6 +712,9 @@ class _PagedAttnEnv:
             num_contexts=num_contexts,
             num_ctx_tokens=num_ctx_tokens,
         )
+        op_kwargs.update(op_overrides or {})
+        with validating(op):
+            op(**op_kwargs)
         torch.cuda.synchronize()
 
         # Record the K/V slices just appended to the cache, per request.
@@ -523,12 +743,17 @@ class _PagedAttnEnv:
         q_transform=None,
         kv_transform=None,
         window: Optional[int] = None,
+        full_block: bool = False,
     ) -> torch.Tensor:
         """fp32 SDPA over each sequence's full K/V history (must be called
         after call_op so the history includes this call's K/V). q_transform /
         kv_transform, when given, map the bf16 q / K/V history first (e.g.
         the e4m3 round-trip a quantized cache imposes). window, when given,
-        additionally drops keys older than the sliding window."""
+        additionally drops keys older than the sliding window.
+        full_block=True is the rival model for a predicted_tokens_per_seq > 1
+        call -- every q row of a sequence sees its whole cached+new range, i.e.
+        a draft row also sees its later siblings -- and exists only to be gated
+        against."""
         q_w = self.num_heads * self.head_dim
         outs = []
         start = 0
@@ -548,7 +773,7 @@ class _PagedAttnEnv:
                 )
                 for i in range(sl):
                     lo = 0 if window is None else max(0, cached + i + 1 - window)
-                    mask[i, lo : cached + i + 1] = True
+                    mask[i, lo : skv if full_block else cached + i + 1] = True
             else:  # padding: every query attends to every key
                 assert window is None, "sliding window certified for causal only"
                 mask = None
@@ -593,7 +818,11 @@ class _PagedAttnEnv:
 
     def check_cache(self, request_id: int) -> None:
         """The paged cache must hold exactly the expected rows, bitwise (the
-        bf16 K/V fed so far, or their scaled e4m3 casts for an fp8 pool)."""
+        bf16 K/V fed so far, or their scaled e4m3 casts for an fp8 pool, or
+        their NVFP4 bytes and block scales for an NVFP4 pool)."""
+        if self.nvfp4:
+            _check_nvfp4_cache(self, request_id)
+            return
         got_k, got_v, exp_k, exp_v = self.cache_pages_content(request_id)
         assert torch.equal(got_k.view(torch.uint8), exp_k.view(torch.uint8)), (
             f"K cache mismatch: request {request_id}"
@@ -688,14 +917,8 @@ def test_rejects_non_divisible_head_counts() -> None:
     raising, having computed only the first (6 // 4) * 4 = 4 head columns
     and left the other two all-zero (the decode path does raise, from
     xqaDispatcher: 'numQHeads should be multiple of numKVHeads')."""
-    torch.manual_seed(50)
-    env = _PagedAttnEnv(num_heads=6, num_kv_heads=4, head_dim=128)
-    env.add_request(0, 16)
-    try:
-        env.call_op(env.random_qkv(16), [16], 1, [0], MASK_CAUSAL)
-    except AssertionError:
-        return
-    raise AssertionError("6q/4kv geometry was not rejected by the wrapper")
+    with pytest.raises(AssertionError, match="must be a multiple of"):
+        op.is_valid(num_heads=6, num_kv_heads=4)
 
 
 # ─── Standard configuration, multi-layer shared pool ───────────────────
@@ -708,7 +931,7 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 class _MultiLayerPagedAttnEnv:
-    """Real multi-layer op state: a trtllm KVCacheManager hosting one paged
+    """Real multi-layer op state: a trtllm KVCacheManagerV2 hosting one paged
     pool shared by several layers, whose pool pointers, layer->pool mapping,
     and block offsets the op consumes exactly as produced. The pool element
     type follows the manager dtype (bf16, or fp8-e4m3 with the same quant
@@ -744,7 +967,7 @@ class _MultiLayerPagedAttnEnv:
         self.max_seq_len = max_seq_len
         self.quant_mode = quant_mode
 
-        self.mgr = KVCacheManager(
+        self.mgr = KVCacheManagerV2(
             KvCacheConfig(
                 max_tokens=num_blocks * tokens_per_block,
                 enable_block_reuse=False,
@@ -787,6 +1010,9 @@ class _MultiLayerPagedAttnEnv:
         for idx in range(num_layers):
             view = self.mgr.get_buffers(idx, kv_layout="HND")
             assert view is not None
+            page_scale = self.mgr.get_layer_page_index_scale(idx)
+            assert page_scale == num_layers * 2
+            view = view[:: page_scale // 2]
             view.zero_()
             self.layer_views.append(view)
         # Auto-resized in place by the op on first call.
@@ -807,7 +1033,8 @@ class _MultiLayerPagedAttnEnv:
 
     def add_decode_token(self, request_id: int) -> None:
         """Extend the manager's allocation by one generated token."""
-        self.mgr.impl.add_token(request_id)
+        cache = self.mgr.kv_cache_map[request_id]
+        assert cache.resize(cache.capacity + 1)
 
     def refresh_offsets(self, request_ids: List[int], num_contexts: int) -> None:
         """Copy the manager-produced block offsets for this batch to device."""
@@ -834,6 +1061,7 @@ class _MultiLayerPagedAttnEnv:
         pool_pointers: Optional[torch.Tensor] = None,
         block_offsets: Optional[torch.Tensor] = None,
         local_layer_idx: Optional[int] = None,
+        predicted_tokens_per_seq: int = 1,
     ) -> torch.Tensor:
         """One thop_attention call for one layer of the shared pool.
 
@@ -857,6 +1085,10 @@ class _MultiLayerPagedAttnEnv:
         that coincide in a single-pool layout: layer_idx is this env's own
         layer (its K/V history and buffer view), while local_layer_idx is the
         row of the composed mapping. Across pools they differ.
+
+        predicted_tokens_per_seq > 1 makes each generation sequence contribute
+        that many token-major q rows; seq_lens then carries P for a generation
+        row, which is also its new-token count.
         """
         ns = len(request_ids)
         kv_lens = [self.cached_len(layer_idx, rid) + new for rid, new in zip(request_ids, seq_lens)]
@@ -879,96 +1111,97 @@ class _MultiLayerPagedAttnEnv:
             dtype=qkv.dtype,
             device=qkv.device,
         )
-        thop_attention(
-            q=qkv,
-            k=None,  # packed QKV rides inside q
-            v=None,
-            output=output,
-            output_sf=None,
-            workspace_=self.workspace,
-            sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
-            host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
-            host_total_kv_lens=torch.tensor(
-                [sum(kv_lens[:num_contexts]), sum(kv_lens[num_contexts:])],
-                dtype=torch.int32,
-            ),
-            context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
-            host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
-            host_request_types=torch.tensor(req_types, dtype=torch.int32),
-            max_context_q_len_override=None,
-            kv_cache_block_offsets=block_offsets,
-            host_kv_cache_pool_pointers=pool_pointers,
-            host_kv_cache_pool_mapping=pool_mapping,
-            cache_indirection=None,
-            kv_scale_orig_quant=self.kv_scale_orig_quant,
-            kv_scale_quant_orig=self.kv_scale_quant_orig,
-            out_scale=None,
-            rotary_inv_freq=None,
-            rotary_cos_sin=None,
-            latent_cache=None,
-            q_pe=None,
-            block_ids_per_seq=None,
-            attention_sinks=None,
-            is_fused_qkv=True,
-            update_kv_cache=True,
-            predicted_tokens_per_seq=1,
-            local_layer_idx=local_layer_idx,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_dim,
-            tokens_per_block=self.tokens_per_block,
-            max_num_requests=self.max_batch,
-            max_context_length=self.max_seq_len,
-            max_seq_len=self.max_seq_len,
-            attention_window_size=(
-                self.max_seq_len if attention_window_size is None else attention_window_size
-            ),
-            beam_width=1,
-            mask_type=MASK_CAUSAL,
-            quant_mode=self.quant_mode,
-            q_scaling=1.0,
-            position_embedding_type=0,  # no in-kernel RoPE
-            rope_dim=0,
-            rope_base=10000.0,
-            rope_scale_type=0,
-            rope_scale=1.0,
-            rope_short_m_scale=1.0,
-            rope_long_m_scale=1.0,
-            rope_max_positions=1024,
-            rope_original_max_positions=1024,
-            use_paged_context_fmha=use_paged_context_fmha,
-            attention_input_type=0,  # mixed
-            is_mla_enable=False,
-            chunked_prefill_buffer_batch_size=1,
-            q_lora_rank=None,
-            kv_lora_rank=None,
-            qk_nope_head_dim=None,
-            qk_rope_head_dim=None,
-            v_head_dim=None,
-            rope_append=None,
-            mrope_rotary_cos_sin=None,
-            mrope_position_deltas=None,
-            helix_position_offsets=None,
-            helix_is_inactive_rank=None,
-            attention_chunk_size=None,
-            softmax_stats_tensor=None,
-            is_spec_decoding_enabled=False,
-            use_spec_decoding=False,
-            is_spec_dec_tree=False,
-            spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
-            spec_decoding_packed_mask=None,
-            spec_decoding_bl_tree_mask_offset=None,
-            spec_decoding_bl_tree_mask=None,
-            spec_bl_tree_first_sparse_mask_offset_kv=None,
-            sparse_kv_indices=None,
-            sparse_kv_offsets=None,
-            sparse_attn_indices=None,
-            sparse_attn_offsets=None,
-            sparse_attn_indices_block_size=0,
-            num_contexts=num_contexts,
-            num_ctx_tokens=num_ctx_tokens,
-        )
+        with validating(op):
+            op(
+                q=qkv,
+                k=None,  # packed QKV rides inside q
+                v=None,
+                output=output,
+                output_sf=None,
+                workspace_=self.workspace,
+                sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
+                host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
+                host_total_kv_lens=torch.tensor(
+                    [sum(kv_lens[:num_contexts]), sum(kv_lens[num_contexts:])],
+                    dtype=torch.int32,
+                ),
+                context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
+                host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
+                host_request_types=torch.tensor(req_types, dtype=torch.int32),
+                max_context_q_len_override=None,
+                kv_cache_block_offsets=block_offsets,
+                host_kv_cache_pool_pointers=pool_pointers,
+                host_kv_cache_pool_mapping=pool_mapping,
+                cache_indirection=None,
+                kv_scale_orig_quant=self.kv_scale_orig_quant,
+                kv_scale_quant_orig=self.kv_scale_quant_orig,
+                out_scale=None,
+                rotary_inv_freq=None,
+                rotary_cos_sin=None,
+                latent_cache=None,
+                q_pe=None,
+                block_ids_per_seq=None,
+                attention_sinks=None,
+                is_fused_qkv=True,
+                update_kv_cache=True,
+                predicted_tokens_per_seq=predicted_tokens_per_seq,
+                local_layer_idx=local_layer_idx,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                tokens_per_block=self.tokens_per_block,
+                max_num_requests=self.max_batch,
+                max_context_length=self.max_seq_len,
+                max_seq_len=self.max_seq_len,
+                attention_window_size=(
+                    self.max_seq_len if attention_window_size is None else attention_window_size
+                ),
+                beam_width=1,
+                mask_type=MASK_CAUSAL,
+                quant_mode=self.quant_mode,
+                q_scaling=1.0,
+                position_embedding_type=0,  # no in-kernel RoPE
+                rope_dim=0,
+                rope_base=10000.0,
+                rope_scale_type=0,
+                rope_scale=1.0,
+                rope_short_m_scale=1.0,
+                rope_long_m_scale=1.0,
+                rope_max_positions=1024,
+                rope_original_max_positions=1024,
+                use_paged_context_fmha=use_paged_context_fmha,
+                attention_input_type=0,  # mixed
+                is_mla_enable=False,
+                chunked_prefill_buffer_batch_size=1,
+                q_lora_rank=None,
+                kv_lora_rank=None,
+                qk_nope_head_dim=None,
+                qk_rope_head_dim=None,
+                v_head_dim=None,
+                rope_append=None,
+                mrope_rotary_cos_sin=None,
+                mrope_position_deltas=None,
+                helix_position_offsets=None,
+                helix_is_inactive_rank=None,
+                attention_chunk_size=None,
+                softmax_stats_tensor=None,
+                is_spec_decoding_enabled=False,
+                use_spec_decoding=False,
+                is_spec_dec_tree=False,
+                spec_decoding_generation_lengths=None,
+                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_packed_mask=None,
+                spec_decoding_bl_tree_mask_offset=None,
+                spec_decoding_bl_tree_mask=None,
+                spec_bl_tree_first_sparse_mask_offset_kv=None,
+                sparse_kv_indices=None,
+                sparse_kv_offsets=None,
+                sparse_attn_indices=None,
+                sparse_attn_offsets=None,
+                sparse_attn_indices_block_size=0,
+                num_contexts=num_contexts,
+                num_ctx_tokens=num_ctx_tokens,
+            )
         torch.cuda.synchronize()
 
         if record:
@@ -1038,14 +1271,16 @@ class _MultiLayerPagedAttnEnv:
         assert self.kv_scale_orig_quant is not None
         return (kv.float() * self.kv_scale_orig_quant).to(pool_dtype)
 
-    def check_caches(self, request_ids: List[int]) -> None:
+    def check_caches(self, request_ids: List[int], layers: Optional[List[int]] = None) -> None:
         """Every layer's slabs must hold exactly the expected rows, bitwise
         (the bf16 K/V fed to that layer, or their scaled e4m3 casts for an
         fp8 pool), at the pages the manager assigned (offsets are
-        layer-agnostic and count slabs: one page = num_layers * 2 slabs)."""
+        layer-agnostic and count slabs: one page = num_layers * 2 slabs).
+        layers restricts the check to the layers that were driven: an undriven
+        layer has no history to compare against."""
         tpb = self.tokens_per_block
         slabs_per_page = self.num_layers * 2
-        for layer_idx in range(self.num_layers):
+        for layer_idx in range(self.num_layers) if layers is None else layers:
             view = self.layer_views[layer_idx]
             for s, rid in enumerate(request_ids):
                 k_seq = self.expected_cache(torch.cat(self.k_history[layer_idx, rid]))
@@ -1187,16 +1422,16 @@ def test_bf16_two_pool_layer_routing_gqa_d64() -> None:
 SINK_HQ, SINK_HKV, SINK_D = 64, 8, 64
 
 
-def _sink_env(**kwargs) -> _PagedAttnEnv:
-    return _PagedAttnEnv(num_heads=SINK_HQ, num_kv_heads=SINK_HKV, head_dim=SINK_D, **kwargs)
+def _sink_env(num_heads: int = SINK_HQ, num_kv_heads: int = SINK_HKV, **kwargs) -> _PagedAttnEnv:
+    return _PagedAttnEnv(num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=SINK_D, **kwargs)
 
 
-def _sinks(low: float, high: float, seed: int) -> torch.Tensor:
+def _sinks(low: float, high: float, seed: int, num_heads: int = SINK_HQ) -> torch.Tensor:
     """One fp32 sink logit per q head, spread over [low, high] so every head
     carries a different value (a kernel indexing sinks by kv head, or by a
     shifted head index, cannot match the reference)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    return torch.empty(SINK_HQ, dtype=torch.float32, device="cuda").uniform_(
+    return torch.empty(num_heads, dtype=torch.float32, device="cuda").uniform_(
         low, high, generator=gen
     )
 
@@ -1565,12 +1800,25 @@ def test_sinks_reject_bad_dtype_and_layout() -> None:
         "too many elements": torch.cat([good, other]),
         "empty": torch.empty(0, dtype=torch.float32, device="cuda"),
     }
+    # One good call before the guard assertions. Not decoration: this file has a
+    # pre-existing order dependence inside the sinks group. Removing *any* of
+    # its members makes test_bf16_paged_context_gpt_oss_sinks_and_window die
+    # with an illegal instruction and take twenty later tests down as setup
+    # errors. Measured on the unmodified file: dropping two sinks tests gives 20
+    # errors, dropping two tests from outside the group gives none. Asserting
+    # the guard directly, as below, would otherwise remove this test's only op
+    # call and trip it.
+    env.call_op(qkv, [16], 1, [0], MASK_CAUSAL, attention_sinks=good, record=False)
+
+    # The guard is asserted against `is_valid` rather than by driving a whole
+    # paged call and expecting it to abort partway. A guard is a claim about
+    # arguments; firing it from inside `call_op` leaves the environment
+    # half-advanced -- output allocated, cache bookkeeping moved on, no op call
+    # behind either.
     for label, sinks in bad_layouts.items():
-        try:
-            env.call_op(qkv, [16], 1, [0], MASK_CAUSAL, attention_sinks=sinks, record=False)
-        except AssertionError:
-            continue
-        raise AssertionError(f"{label} attention_sinks was not rejected by the wrapper")
+        with pytest.raises(AssertionError, match="attention_sinks must be contiguous"):
+            op.is_valid(num_heads=SINK_HQ, num_kv_heads=SINK_HKV, attention_sinks=sinks)
+        del label
 
 
 # ─── Cyclic sliding window (attention_window_size < max_seq_len) + sinks ─
@@ -2300,8 +2548,11 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
        point and is read straight back from there).
     3. use_paged_context_fmha=False on a context call with a cached prefix is
        silently wrong — no exception, an answer far off the reference.
-    4. context_lengths on a context row must be this call's new-token count.
-       The sequence's full KV length and 0 are both far off.
+    4. context_lengths on a context row must be this call's new-token count;
+       0 is far off. A larger value is not probed: the context FMHA then
+       writes past the output buffer, which holds this call's new tokens
+       only (compute-sanitizer memcheck: invalid global writes), and corrupts
+       whatever lies beyond it.
 
     The wrong batch states of (3) and (4) also corrupt the pool, so every
     rival runs against its own freshly prepared copy of one fixed state:
@@ -2387,22 +2638,21 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
         base,
         "cached-prefix context at use_paged_context_fmha=False",
     )
-    for ctx_len in (cached + new, 0):
-        cenv, cq = prepared()
-        _assert_far_outside(
-            cenv.call_op(
-                cq,
-                [new],
-                1,
-                [0],
-                MASK_CAUSAL,
-                record=False,
-                ctx_lens_override=[ctx_len],
-                use_paged_context_fmha=True,
-            ),
-            base,
-            f"context_lengths={ctx_len}",
-        )
+    cenv, cq = prepared()
+    _assert_far_outside(
+        cenv.call_op(
+            cq,
+            [new],
+            1,
+            [0],
+            MASK_CAUSAL,
+            record=False,
+            ctx_lens_override=[0],
+            use_paged_context_fmha=True,
+        ),
+        base,
+        "context_lengths=0",
+    )
 
     # (2) page by page. Pages 0-1 hold the cached prefix and must be read;
     # page 2 holds only tokens 64..83, which this call appends itself.
@@ -2427,7 +2677,7 @@ def test_bf16_paged_context_multilayer_shared_pool() -> None:
     """The paged-context read goes through the same layer base shift the
     append does.
 
-    One pool shared by 4 layers — real KVCacheManager state, GQA 32q/8kv d128
+    One pool shared by 4 layers — real KVCacheManagerV2 state, GQA 32q/8kv d128
     — with every layer served a fresh context chunk, then a context chunk over
     its own cached prefix, then a decode step. Each layer's output is gated
     against that layer's own history, so a read landing in a sibling's slabs
@@ -2626,6 +2876,7 @@ MLA_TOKENS_PER_BLOCK = 64
 MLA_PAGE32 = 32
 MLA_MAX_SEQ_LEN = 1024
 POSITION_EMBEDDING_TYPE_YARN = 8  # PositionEmbeddingType.yarn (MLA models)
+POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX = 2  # PositionEmbeddingType.rope_gpt_neox (Kimi K3's MLA)
 # q-LoRA rank. DeepSeek-V3 down-projects q through a rank-1536 q_a_proj;
 # checkpoints with "q_lora_rank": null (deepseek-v3-lite) have no q-LoRA at
 # all and pass 0. Both are covered — see the inertness cases at the end.
@@ -2801,9 +3052,11 @@ class _MlaPagedEnv:
         pool_dtype: torch.dtype = torch.bfloat16,
         quant_mode: int = 0,
         kv_scaling_factor: Optional[float] = None,
+        position_embedding_type: int = POSITION_EMBEDDING_TYPE_YARN,
     ) -> None:
         self.num_heads = num_heads
         self.max_batch = max_batch
+        self.position_embedding_type = position_embedding_type
         self.tokens_per_block = tokens_per_block
         self.q_lora_rank = q_lora_rank
         self.max_seq_len = max_blocks_per_seq * tokens_per_block
@@ -2987,103 +3240,104 @@ class _MlaPagedEnv:
     ) -> None:
         ns = len(kv_lens)
         req_types = [0 if i < num_contexts else 1 for i in range(ns)]
-        thop_attention(
-            q=q,
-            k=k,
-            v=v,
-            output=output,
-            output_sf=None,
-            workspace_=self.workspace,
-            sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
-            host_past_key_value_lengths=torch.tensor(
-                kv_lens if host_past_lens is None else host_past_lens,
-                dtype=torch.int32,
-            ),
-            host_total_kv_lens=torch.tensor(
-                [sum(kv_lens[:num_contexts]), sum(kv_lens[num_contexts:])],
-                dtype=torch.int32,
-            ),
-            context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
-            host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
-            host_request_types=torch.tensor(req_types, dtype=torch.int32),
-            max_context_q_len_override=None,
-            kv_cache_block_offsets=self.block_offsets,
-            host_kv_cache_pool_pointers=self.pool_pointers,
-            host_kv_cache_pool_mapping=self.pool_mapping,
-            cache_indirection=None,
-            kv_scale_orig_quant=self.kv_scale_orig_quant,
-            kv_scale_quant_orig=self.kv_scale_quant_orig,
-            out_scale=None,
-            rotary_inv_freq=self.rotary_inv_freq,
-            rotary_cos_sin=self.rotary_cos_sin,
-            latent_cache=latent_cache,
-            q_pe=q_pe,
-            block_ids_per_seq=None,
-            attention_sinks=None,
-            is_fused_qkv=k is None,
-            update_kv_cache=True,
-            predicted_tokens_per_seq=predicted_tokens_per_seq,
-            local_layer_idx=0,
-            num_heads=self.num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            tokens_per_block=self.tokens_per_block,
-            max_num_requests=self.max_batch,
-            max_context_length=self.max_seq_len,
-            max_seq_len=self.max_seq_len,
-            attention_window_size=self.max_seq_len,
-            beam_width=1,
-            mask_type=mask_type,
-            quant_mode=self.quant_mode,
-            q_scaling=self.q_scaling,
-            position_embedding_type=POSITION_EMBEDDING_TYPE_YARN,
-            rope_dim=QK_ROPE_HEAD_DIM,
-            rope_base=self.rope_scalars.rope_base,
-            rope_scale_type=self.rope_scalars.rope_scale_type,
-            rope_scale=self.rope_scalars.rope_scale,
-            rope_short_m_scale=self.rope_scalars.rope_short_m_scale,
-            rope_long_m_scale=self.rope_scalars.rope_long_m_scale,
-            rope_max_positions=self.rope_scalars.rope_max_positions,
-            rope_original_max_positions=self.rope_scalars.rope_original_max_positions,
-            use_paged_context_fmha=False,
-            attention_input_type=attention_input_type,
-            is_mla_enable=True,
-            chunked_prefill_buffer_batch_size=1,
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=KV_LORA_RANK,
-            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
-            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-            v_head_dim=v_head_dim,
-            rope_append=True,
-            mrope_rotary_cos_sin=None,
-            mrope_position_deltas=None,
-            helix_position_offsets=None,
-            helix_is_inactive_rank=None,
-            attention_chunk_size=None,
-            softmax_stats_tensor=softmax_stats_tensor,
-            is_spec_decoding_enabled=False,
-            use_spec_decoding=False,
-            is_spec_dec_tree=False,
-            spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
-            spec_decoding_packed_mask=None,
-            spec_decoding_bl_tree_mask_offset=None,
-            spec_decoding_bl_tree_mask=None,
-            spec_bl_tree_first_sparse_mask_offset_kv=None,
-            sparse_kv_indices=None,
-            sparse_kv_offsets=None,
-            sparse_attn_indices=None,
-            sparse_attn_offsets=None,
-            sparse_attn_indices_block_size=0,
-            cu_q_seqlens=cu_q_seqlens,
-            cu_kv_seqlens=cu_kv_seqlens,
-            fmha_scheduler_counter=fmha_scheduler_counter,
-            mla_bmm1_scale=mla_bmm1_scale,
-            mla_bmm2_scale=mla_bmm2_scale,
-            quant_q_buffer=quant_q_buffer,
-            num_contexts=num_contexts,
-            num_ctx_tokens=num_ctx_tokens,
-        )
+        with validating(op):
+            op(
+                q=q,
+                k=k,
+                v=v,
+                output=output,
+                output_sf=None,
+                workspace_=self.workspace,
+                sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
+                host_past_key_value_lengths=torch.tensor(
+                    kv_lens if host_past_lens is None else host_past_lens,
+                    dtype=torch.int32,
+                ),
+                host_total_kv_lens=torch.tensor(
+                    [sum(kv_lens[:num_contexts]), sum(kv_lens[num_contexts:])],
+                    dtype=torch.int32,
+                ),
+                context_lengths=torch.tensor(ctx_lens, dtype=torch.int32, device="cuda"),
+                host_context_lengths=torch.tensor(ctx_lens, dtype=torch.int32),
+                host_request_types=torch.tensor(req_types, dtype=torch.int32),
+                max_context_q_len_override=None,
+                kv_cache_block_offsets=self.block_offsets,
+                host_kv_cache_pool_pointers=self.pool_pointers,
+                host_kv_cache_pool_mapping=self.pool_mapping,
+                cache_indirection=None,
+                kv_scale_orig_quant=self.kv_scale_orig_quant,
+                kv_scale_quant_orig=self.kv_scale_quant_orig,
+                out_scale=None,
+                rotary_inv_freq=self.rotary_inv_freq,
+                rotary_cos_sin=self.rotary_cos_sin,
+                latent_cache=latent_cache,
+                q_pe=q_pe,
+                block_ids_per_seq=None,
+                attention_sinks=None,
+                is_fused_qkv=k is None,
+                update_kv_cache=True,
+                predicted_tokens_per_seq=predicted_tokens_per_seq,
+                local_layer_idx=0,
+                num_heads=self.num_heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                tokens_per_block=self.tokens_per_block,
+                max_num_requests=self.max_batch,
+                max_context_length=self.max_seq_len,
+                max_seq_len=self.max_seq_len,
+                attention_window_size=self.max_seq_len,
+                beam_width=1,
+                mask_type=mask_type,
+                quant_mode=self.quant_mode,
+                q_scaling=self.q_scaling,
+                position_embedding_type=self.position_embedding_type,
+                rope_dim=QK_ROPE_HEAD_DIM,
+                rope_base=self.rope_scalars.rope_base,
+                rope_scale_type=self.rope_scalars.rope_scale_type,
+                rope_scale=self.rope_scalars.rope_scale,
+                rope_short_m_scale=self.rope_scalars.rope_short_m_scale,
+                rope_long_m_scale=self.rope_scalars.rope_long_m_scale,
+                rope_max_positions=self.rope_scalars.rope_max_positions,
+                rope_original_max_positions=self.rope_scalars.rope_original_max_positions,
+                use_paged_context_fmha=False,
+                attention_input_type=attention_input_type,
+                is_mla_enable=True,
+                chunked_prefill_buffer_batch_size=1,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=KV_LORA_RANK,
+                qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+                qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+                v_head_dim=v_head_dim,
+                rope_append=True,
+                mrope_rotary_cos_sin=None,
+                mrope_position_deltas=None,
+                helix_position_offsets=None,
+                helix_is_inactive_rank=None,
+                attention_chunk_size=None,
+                softmax_stats_tensor=softmax_stats_tensor,
+                is_spec_decoding_enabled=False,
+                use_spec_decoding=False,
+                is_spec_dec_tree=False,
+                spec_decoding_generation_lengths=None,
+                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_packed_mask=None,
+                spec_decoding_bl_tree_mask_offset=None,
+                spec_decoding_bl_tree_mask=None,
+                spec_bl_tree_first_sparse_mask_offset_kv=None,
+                sparse_kv_indices=None,
+                sparse_kv_offsets=None,
+                sparse_attn_indices=None,
+                sparse_attn_offsets=None,
+                sparse_attn_indices_block_size=0,
+                cu_q_seqlens=cu_q_seqlens,
+                cu_kv_seqlens=cu_kv_seqlens,
+                fmha_scheduler_counter=fmha_scheduler_counter,
+                mla_bmm1_scale=mla_bmm1_scale,
+                mla_bmm2_scale=mla_bmm2_scale,
+                quant_q_buffer=quant_q_buffer,
+                num_contexts=num_contexts,
+                num_ctx_tokens=num_ctx_tokens,
+            )
         torch.cuda.synchronize()
 
     def call_context(
@@ -3642,6 +3896,123 @@ YARN_TABLE_MIN_SEPARATION = 10.0
 # scale tensors are the caller's only defence (None is read as 1.0).
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_mla_context_bf16_page64() -> None:
+    """Kimi K3's MLA context calls (the generic path's prefill): bf16 latent
+    pool (quant_mode 0), page 64, the per-rank head counts 6 / 12 / 24 / 96
+    (TP16 / TP8 / TP4 / one rank), q_lora_rank 1536, q_scaling 1.0,
+    position_embedding_type 2 (rope_gpt_neox, what its MLA passes) and its
+    NoPE rope table -- every (cos, sin) pair (1, 0), written over the
+    backend's table -- so the in-kernel "rotation" is a copy.
+
+    1. Fresh prefill (latent_cache given): the output within the bf16 band of
+       the fp32 causal reference, the appended rows [compressed_kv | k_pe]
+       bit for bit, and no page outside the requests' written.
+    2. Cached-KV context (latent_cache=None): explicit K / V over cached
+       prefixes, bottom-right causal, within the same band; nothing mutated.
+    """
+    for heads in (6, 12, 24, 96):
+        torch.manual_seed(500 + heads)
+        env = _MlaPagedEnv(
+            num_heads=heads,
+            tokens_per_block=MLA_TOKENS_PER_BLOCK,
+            q_lora_rank=Q_LORA_RANK_DSV3,
+            q_scaling=1.0,
+            position_embedding_type=POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX,
+        )
+        table = env.rotary_cos_sin.reshape(-1)
+        table[0::2] = 1.0
+        table[1::2] = 0.0
+
+        lens = [65, 130]  # one token into page 2, and two full pages plus two tokens
+        for rid, ln in enumerate(lens):
+            env.add_request(rid, ln)
+        q, k, v, latent = _random_context_inputs(sum(lens), heads)
+        pre = (q.clone(), k.clone(), v, latent.clone())
+        out = env.call_context([0, 1], lens, q, k, v, latent)
+        torch.testing.assert_close(out, env.context_reference(lens, *pre), rtol=RTOL, atol=ATOL)
+        for rid in (0, 1):
+            env.check_cache(rid)
+            rows = torch.cat(env.latent_rows[rid])
+            pooled = torch.cat([env.pool[p] for p in env.pages[rid]])[: rows.shape[0]]
+            assert torch.equal(pooled, rows), (
+                f"identity-rope rows not bitwise (H={heads}, request {rid})"
+            )
+        env.check_unwritten_pool_zero([0, 1])
+
+        cached_lens, new_lens = [64, 129], [7, 64]
+        kv_lens = [c + n for c, n in zip(cached_lens, new_lens)]
+        for rid, (n, total) in zip((2, 3), zip(new_lens, kv_lens)):
+            env.add_request(rid, n)
+            env.reserve_cache_pages(rid, total)
+        q2 = torch.randn(sum(new_lens), heads * QK_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        k2, packed_kv = _random_explicit_kv(sum(kv_lens), heads)
+        v2 = _v_split_view(packed_kv, heads)
+        operands = (q2.clone(), k2.clone(), v2.clone())
+        pool_before = env.pool.clone()
+        out2 = env.call_context_no_append([2, 3], new_lens, kv_lens, q2, k2, v2)
+        ref2, _ = _explicit_kv_reference(
+            q2, k2, v2, new_lens, kv_lens, MASK_CAUSAL, heads, softmax_scale=env.softmax_scale
+        )
+        torch.testing.assert_close(out2, ref2, rtol=RTOL, atol=ATOL)
+        for got, want in zip((q2, k2, v2), operands):
+            assert torch.equal(got, want)
+        assert torch.equal(env.pool, pool_before), "the no-append context call touched the pool"
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_mla_generation_bf16_page64() -> None:
+    """Kimi K3's MLA generation calls (the generic path's decode steps above
+    the fused decode kernels' bounds): latent MQA over the bf16 pool, page 64,
+    6 heads per rank (TP16 attention) and 96 (one rank), one query row per
+    request (no speculation) and 8 (DSpark's token plus 7 drafts, bottom-right
+    causal), two steps each over histories of one exact page and of 31
+    tokens. Within the bf16 band of the fp32 latent-MQA reference; the pool is
+    only read. (At 24 heads per rank, TP4, the trtllm-gen FMHA kernel
+    selection raises for these calls; the contract records it.)
+    """
+    for heads in (6, 96):
+        for p in (1, 8):
+            torch.manual_seed(700 + heads + p)
+            env = _MlaPagedEnv(
+                num_heads=heads,
+                tokens_per_block=MLA_TOKENS_PER_BLOCK,
+                q_lora_rank=Q_LORA_RANK_DSV3,
+                q_scaling=1.0,
+                position_embedding_type=POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX,
+            )
+            table = env.rotary_cos_sin.reshape(-1)
+            table[0::2] = 1.0
+            table[1::2] = 0.0
+            lens = [64, 31]
+            for rid, ln in enumerate(lens):
+                env.add_request(rid, ln)
+            q, k, v, latent = _random_context_inputs(sum(lens), heads)
+            env.call_context([0, 1], lens, q, k, v, latent)
+            for _ in range(2):
+                for rid in (0, 1):
+                    for _ in range(p):
+                        env.append_decode_latent(
+                            rid,
+                            torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
+                        )
+                pool_before = env.pool.clone()
+                fused_q = (
+                    torch.randn(2 * p, heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda")
+                    * 0.3
+                )
+                out = env.call_generation([0, 1], fused_q, predicted_tokens_per_seq=p)
+                ref = env.generation_reference([0, 1], fused_q, predicted_tokens_per_seq=p)
+                torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
+                assert _bitwise_equal(pool_before, env.pool), (
+                    f"the MLA generation call wrote to the pool (H={heads}, P={p})"
+                )
+
+
 def _fp8_mla_env(
     num_heads: int = MLA_NUM_HEADS_H128,
     kv_scaling_factor: Optional[float] = 1.0,
@@ -4168,8 +4539,11 @@ def test_fp8_mla_r1_cell_context_prefill_h128() -> None:
     _assert_table_pins_the_append(env, rival, 0, pre[3], lens[0])
 
 
-def test_fp8_mla_r1_cell_generation_decode_h128() -> None:
-    """Latent-MQA decode at the complete R1 cell over the fp8-e4m3 pool.
+def _fp8_mla_r1_generation_decode(num_heads: int, p: int = 1) -> None:
+    """Latent-MQA decode at the complete R1 cell over the fp8-e4m3 pool, at
+    `num_heads` (128 at attention DP; the deepseek default target splits them
+    over attention TP) and `p` query rows per sequence (`max_draft_len + 1`
+    under MTP). Every MLA generation cell runs it from `test_certified_cells`.
 
     Nothing is rotated in this phase, so of the cell's three axes only
     q_scaling has an effect here — it reaches the kernel through the caller's
@@ -4177,33 +4551,40 @@ def test_fp8_mla_r1_cell_generation_decode_h128() -> None:
     scale. Histories of 64 (two exact pages, first decode token opens page 2)
     and 31 (first decode token takes page 0's last slot, second opens page 1),
     two steps. Gated against a reference at q_scaling = 1.0 (observed 4.2x the
-    fp8 band, where the matching reference uses 0.20).
+    fp8 band at P = 1, where the matching reference uses 0.20).
     """
-    env = _fp8_r1_env()
+    env = _fp8_r1_env(num_heads=num_heads)
     prefill = [64, 31]
     _fp8_mla_prefill(env, prefill, 951)
     for rid in (0, 1):
         env.check_cache(rid)
     for _ in range(2):
         for rid in (0, 1):
-            env.append_decode_latent(
-                rid,
-                torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
-            )
+            for _ in range(p):
+                env.append_decode_latent(
+                    rid,
+                    torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
+                )
         pool_before = env.pool.clone()
         fused_q = (
-            torch.randn(2, env.num_heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.3
+            torch.randn(2 * p, env.num_heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda")
+            * 0.3
         )
-        out = env.call_generation([0, 1], fused_q)
+        out = env.call_generation([0, 1], fused_q, predicted_tokens_per_seq=p)
         torch.testing.assert_close(
             out,
-            env.generation_reference([0, 1], fused_q),
+            env.generation_reference([0, 1], fused_q, predicted_tokens_per_seq=p),
             rtol=FP8_MLA_RTOL,
             atol=FP8_MLA_ATOL,
         )
         _assert_far_outside_band(
             out,
-            env.generation_reference([0, 1], fused_q, softmax_scale=1.0 / math.sqrt(QK_HEAD_DIM)),
+            env.generation_reference(
+                [0, 1],
+                fused_q,
+                softmax_scale=1.0 / math.sqrt(QK_HEAD_DIM),
+                predicted_tokens_per_seq=p,
+            ),
             2.0,
             "fp8 R1-cell MLA decode against a q_scaling = 1.0 reference",
             FP8_MLA_ATOL,
@@ -5265,3 +5646,2290 @@ def test_mla_rejects_null_q_lora_rank() -> None:
         assert "bad optional access" in str(exc), f"unexpected message: {exc}"
     else:
         raise AssertionError("q_lora_rank=None was accepted on the MLA path")
+
+
+# ─── GQA 24/x/256 and the encoder-only mode: shared helpers ────────────
+
+
+def _history(env, rid: int, layer: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The K/V one request's cache holds (for one layer of a shared pool)."""
+    if layer is None:
+        return torch.cat(env.k_history[rid]), torch.cat(env.v_history[rid])
+    return torch.cat(env.k_history[layer, rid]), torch.cat(env.v_history[layer, rid])
+
+
+def _op_reference(
+    env,
+    qkv: torch.Tensor,
+    seq_lens: List[int],
+    request_ids: List[int],
+    causal: bool = True,
+    e4m3: bool = False,
+    layer: Optional[int] = None,
+    nvfp4: bool = False,
+) -> torch.Tensor:
+    """`op.reference` over the history the env mirrored for these requests.
+
+    nvfp4=True reads K and V as an NVFP4 pool returns them (the history
+    through `_nvfp4_roundtrip`) before the e4m3 arithmetic `e4m3` selects.
+
+    Call it after the op call, so each history ends with this call's K/V:
+    `reference`'s bottom-right alignment then puts this call's q rows at the
+    end of it. causal=False on a generation call is the full-block rival --
+    every draft row seeing its later siblings. e4m3=True is the standard
+    configuration's fp8 arithmetic: q, K, V and the softmax probabilities all
+    e4m3 operands.
+    """
+    hq, hkv, d = env.num_heads, env.num_kv_heads, env.head_dim
+    ks, vs = zip(*(_history(env, rid, layer) for rid in request_ids))
+    if nvfp4:
+        ks = tuple(_nvfp4_roundtrip(k, env.kv_scale_orig_quant[1]) for k in ks)
+        vs = tuple(_nvfp4_roundtrip(v, env.kv_scale_orig_quant[2]) for v in vs)
+    return op.reference(
+        qkv[:, : hq * d],
+        torch.cat(ks).reshape(-1, hkv * d),
+        torch.cat(vs).reshape(-1, hkv * d),
+        list(seq_lens),
+        [k.shape[0] for k in ks],
+        num_heads=hq,
+        num_kv_heads=hkv,
+        qk_head_dim=d,
+        v_head_dim=d,
+        softmax_scale=1.0 / math.sqrt(d),
+        causal=causal,
+        e4m3_inputs=e4m3,
+        e4m3_probabilities=e4m3,
+    )
+
+
+def _packed_reference(
+    qkv: torch.Tensor,
+    seg_lens: List[int],
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    causal: bool,
+) -> torch.Tensor:
+    """`op.reference` over each segment's own packed rows and nothing else:
+    what the no-KV-cache mode computes, and the rival a cached-prefix call
+    must be separated from (its prefix ignored)."""
+    q_w, kv_w = num_heads * head_dim, num_kv_heads * head_dim
+    return op.reference(
+        qkv[:, :q_w],
+        qkv[:, q_w : q_w + kv_w],
+        qkv[:, q_w + kv_w :],
+        list(seg_lens),
+        list(seg_lens),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        qk_head_dim=head_dim,
+        v_head_dim=head_dim,
+        softmax_scale=1.0 / math.sqrt(head_dim),
+        causal=causal,
+    )
+
+
+def _std_onehot_qkv(
+    env: _PagedAttnEnv, n_tokens: int, positions: List[int], t0: int
+) -> torch.Tensor:
+    """Packed QKV that turns the op into an attention-weight read-out: K is all
+    zero, so every unmasked logit is 0 and the softmax is uniform over exactly
+    the attended set, and V[t] = e_{t - t0}, so output column d of a query row
+    IS the weight that row gives key t0 + d. 1.0 and 0.0 are both exact in
+    e4m3, so the probe survives the quantized pool unchanged."""
+    q_w = env.num_heads * env.head_dim
+    kv_w = env.num_kv_heads * env.head_dim
+    qkv = torch.zeros(n_tokens, q_w + 2 * kv_w, dtype=torch.bfloat16, device="cuda")
+    qkv[:, :q_w] = torch.randn(n_tokens, q_w, dtype=torch.bfloat16, device="cuda")
+    v = torch.zeros(n_tokens, env.num_kv_heads, env.head_dim, dtype=torch.bfloat16, device="cuda")
+    for i, t in enumerate(positions):
+        d = t - t0
+        if 0 <= d < env.head_dim:
+            v[i, :, d] = 1.0
+    qkv[:, q_w + kv_w :] = v.reshape(n_tokens, kv_w)
+    return qkv
+
+
+def _assert_draft_row_weights(
+    out: torch.Tensor,
+    env: _PagedAttnEnv,
+    row: int,
+    last_key: int,
+    label: str,
+    weight_rtol: float,
+) -> None:
+    """Under the one-hot probe, output column d of `row` is the weight it gives
+    key d. A bottom-right-aligned causal block puts the last attended key at
+    `last_key`: every column above it must be an exact zero (a later sibling
+    contributing anything at all is the failure this exists to catch) and every
+    column at or below it carries the uniform 1 / (last_key + 1)."""
+    w = out.view(-1, env.num_heads, env.head_dim)[row].float()
+    assert bool((w[:, last_key + 1 :] == 0).all()), (
+        f"{label}: keys above {last_key} carry weight {w[:, last_key + 1 :].abs().max().item():.4g}"
+    )
+    torch.testing.assert_close(
+        w[:, : last_key + 1],
+        torch.full_like(w[:, : last_key + 1], 1.0 / (last_key + 1)),
+        rtol=weight_rtol,
+        atol=0.0,
+        msg=lambda m: f"{label}: attended weights are not uniform\n{m}",
+    )
+
+
+# ─── Standard configuration over an fp8-e4m3 pool at GQA 24/4/256 ──────
+#
+# The Qwen3.8-27B full-attention layer -- 24 query / 4 kv heads, head_size 256,
+# tokens_per_block 32, causal, no sinks or window -- served with an fp8 KV
+# cache at s = 1.0. Its cells gate packed and paged context, decode,
+# P = 2..4 and a mixed step against `op.reference`; what is here is what a
+# cell cannot carry: the operand dtype each context path reads (settled
+# bitwise), the scale semantics off s = 1.0, the rivals each claim is
+# separated from, and the quant_mode bits a mixed-precision checkpoint hands
+# the op.
+
+STD_FP8_HQ, STD_FP8_HKV, STD_FP8_D = 24, 4, 256
+STD_FP8_TPB = 32
+
+# How far a rival model has to sit outside a band to count as separated.
+FP8_STD_MIN_SEPARATION = 3.0
+
+
+def _e4m3_round_trip(scale: float = 1.0):
+    """The round trip an fp8 KV pool imposes on whatever passes through it:
+    quantize by kv_scale_orig_quant (= 1/s), dequantize by kv_scale_quant_orig
+    (= s). Returns a callable usable as reference()'s q_transform/kv_transform."""
+
+    def _apply(x: torch.Tensor) -> torch.Tensor:
+        return (x.float() * (1.0 / scale)).to(torch.float8_e4m3fn).float() * scale
+
+    return _apply
+
+
+def _e4m3_code_distance(got: torch.Tensor, expected: torch.Tensor) -> Tuple[int, int]:
+    """(bytes that differ, largest distance in e4m3 code points).
+
+    e4m3's byte encoding is sign | 4-bit exponent | 3-bit mantissa, so within
+    one sign the magnitude code is monotone in the value and adjacent codes are
+    exactly one ulp apart -- which makes "at most one ulp" a bit-level claim
+    rather than a tolerance.
+    """
+    g = got.contiguous().view(torch.uint8).to(torch.int16)
+    e = expected.contiguous().view(torch.uint8).to(torch.int16)
+    assert torch.equal(g >> 7, e >> 7), "sign bits differ -- not an ulp comparison"
+    return int((g != e).sum()), int(((g & 0x7F) - (e & 0x7F)).abs().max())
+
+
+def _std_fp8_env(**kwargs) -> _PagedAttnEnv:
+    """The 24/4/256 cell over an fp8-e4m3 pool at the production kv scale."""
+    kwargs.setdefault("num_heads", STD_FP8_HQ)
+    kwargs.setdefault("num_kv_heads", STD_FP8_HKV)
+    kwargs.setdefault("head_dim", STD_FP8_D)
+    kwargs.setdefault("tokens_per_block", STD_FP8_TPB)
+    kwargs.setdefault("num_blocks", 128)
+    kwargs.setdefault("max_blocks_per_seq", 16)
+    kwargs.setdefault("pool_dtype", torch.float8_e4m3fn)
+    kwargs.setdefault("quant_mode", QUANT_MODE_FP8_KV_CACHE)
+    kwargs.setdefault("kv_scaling_factor", 1.0)
+    return _PagedAttnEnv(**kwargs)
+
+
+def test_fp8_std_packed_context_does_not_read_the_pool() -> None:
+    """The packed context path at 24/4/256 reads the bf16 q rows, not the fp8
+    pool: inside `_compare` of the bf16-KV reference, while the
+    "context sees the quantized cache" model -- K/V round-tripped through
+    e4m3 -- sits 26.0x outside the bf16 band (sm_103)."""
+    torch.manual_seed(400)
+    env = _std_fp8_env()
+    env.add_request(0, 48)  # crosses a 32-token page boundary
+    env.add_request(1, 17)
+    qkv = env.random_qkv(65)
+    out = env.call_op(qkv, [48, 17], 2, [0, 1], MASK_CAUSAL)
+    _compare(out, _op_reference(env, qkv, [48, 17], [0, 1]))
+    _assert_far_outside_band(
+        out,
+        env.reference(qkv, [48, 17], [0, 1], [0, 0], MASK_CAUSAL, kv_transform=_e4m3_round_trip()),
+        FP8_STD_MIN_SEPARATION,
+        "packed context FMHA at 24/4/256 read the fp8 pool",
+        ATOL,
+        RTOL,
+    )
+    env.check_cache(0)
+    env.check_cache(1)
+    env.check_unwritten_pool_zero()
+
+
+def test_fp8_std_kv_scale_semantics() -> None:
+    """The two kv_scale_* tensors at 24/4/256, swept off the production 1.0.
+
+    The append mirror is exact arithmetic -- e4m3(k / s), fp32 multiply then
+    round-to-nearest cast -- so it is asserted at the bit level: bit-exact at
+    the power-of-2 scale, at most one e4m3 code point off at 1.5 (first
+    measured: 0.6% of the bytes, every one exactly one ulp).
+
+    The read side is what needs a scale at all, and s != 1.0 is where it
+    becomes observable: a model that keeps the write-side quantization but
+    skips the read-side dequant -- the forgotten kv_scale_quant_orig -- sits
+    15.1x (s = 2.0) and 10.8x (s = 1.5) outside the decode band on sm_103. At
+    s = 1.0 the two coincide, which is why the sweep exists.
+
+    The correct model is gated two ways. At s = 2.0, `_compare` against
+    `op.reference` over e4m3(q/s)*s, the stored pool rows times s, and e4m3
+    probabilities -- measured bitwise-exact on sm_103. At s = 1.5 no model of
+    the kernel's probability rounding tried fits that band (448, 448/s, 448*s,
+    448/s**2, fp32: 4.2 ulp RMS at best), so the fp8 decode band of the
+    q/K/V round-trip model gates it: a non-power-of-2 scale is outside every
+    cell.
+    """
+    for scale, max_inexact_bytes in ((2.0, 0), (1.5, 1000)):
+        torch.manual_seed(410)
+        env = _std_fp8_env(kv_scaling_factor=scale)
+        env.add_request(0, 48)
+        qkv = env.random_qkv(48)
+        env.call_op(qkv, [48], 1, [0], MASK_CAUSAL)
+        got_k, got_v, exp_k, exp_v = env.cache_pages_content(0)
+        for name, got, exp in (("K", got_k, exp_k), ("V", got_v, exp_v)):
+            differing, ulps = _e4m3_code_distance(got, exp)
+            assert differing <= max_inexact_bytes, (
+                f"s={scale}: {differing} {name} bytes differ from the "
+                f"e4m3(k/s) mirror, allowed {max_inexact_bytes}"
+            )
+            assert ulps <= 1, f"s={scale}: {name} append is {ulps} e4m3 ulps off the mirror"
+        cached = [env.cached_len(0)]
+        qkv_d = env.random_qkv(1)
+        out_d = env.call_op(qkv_d, [1], 0, [0], MASK_CAUSAL)
+        if scale == 2.0:
+            # What the decode attended: q through the same scaled round trip,
+            # and the pool rows exactly as stored, times s.
+            got_k, got_v, _, _ = env.cache_pages_content(0)
+            q_w = env.num_heads * env.head_dim
+            kv_w = env.num_kv_heads * env.head_dim
+            q_hat = _e4m3_round_trip(scale)(qkv_d[:, :q_w]).to(torch.bfloat16)
+            ref = op.reference(
+                q_hat,
+                (got_k.float() * scale).reshape(-1, kv_w),
+                (got_v.float() * scale).reshape(-1, kv_w),
+                [1],
+                [got_k.shape[0]],
+                num_heads=env.num_heads,
+                num_kv_heads=env.num_kv_heads,
+                qk_head_dim=env.head_dim,
+                v_head_dim=env.head_dim,
+                softmax_scale=1.0 / math.sqrt(env.head_dim),
+                e4m3_probabilities=True,
+            )
+            _compare(out_d, ref)
+        else:
+            torch.testing.assert_close(
+                out_d,
+                env.reference(
+                    qkv_d,
+                    [1],
+                    [0],
+                    cached,
+                    MASK_CAUSAL,
+                    q_transform=_e4m3_round_trip(scale),
+                    kv_transform=_e4m3_round_trip(scale),
+                ),
+                rtol=FP8_DECODE_RTOL,
+                atol=FP8_DECODE_ATOL,
+            )
+        _assert_far_outside_band(
+            out_d,
+            env.reference(
+                qkv_d,
+                [1],
+                [0],
+                cached,
+                MASK_CAUSAL,
+                q_transform=_e4m3_round_trip(scale),
+                # write-side quantization kept, read-side dequant dropped
+                kv_transform=lambda x, s=scale: (x.float() / s).to(torch.float8_e4m3fn).float(),
+            ),
+            FP8_STD_MIN_SEPARATION,
+            f"s={scale}: decode ignored kv_scale_quant_orig",
+            FP8_DECODE_ATOL,
+            FP8_DECODE_RTOL,
+        )
+
+
+def _std_peaked_qkv(env: _PagedAttnEnv, n_tokens: int, hot: int) -> Tuple[torch.Tensor, ...]:
+    """Packed QKV whose softmax collapses onto one key.
+
+    Every K row is zero except row `hot`, which is a large constant vector, and
+    q is that same vector -- so every query row that can see `hot` gives it a
+    weight of 1 to within fp32, and its output IS that row's V. The V operand's
+    dtype is then readable bit for bit out of `output`.
+    """
+    q_w = env.num_heads * env.head_dim
+    kv_w = env.num_kv_heads * env.head_dim
+    qkv = torch.zeros(n_tokens, q_w + 2 * kv_w, dtype=torch.bfloat16, device="cuda")
+    key = torch.full((env.head_dim,), 6.0, dtype=torch.bfloat16, device="cuda")
+    qkv[:, :q_w] = key.repeat(env.num_heads)
+    k = torch.zeros(n_tokens, env.num_kv_heads, env.head_dim, dtype=torch.bfloat16, device="cuda")
+    k[hot] = key
+    qkv[:, q_w : q_w + kv_w] = k.reshape(n_tokens, kv_w)
+    v = torch.randn(n_tokens, env.num_kv_heads, env.head_dim, dtype=torch.bfloat16, device="cuda")
+    qkv[:, q_w + kv_w :] = v.reshape(n_tokens, kv_w)
+    return qkv, v
+
+
+def test_fp8_std_paged_context_operands_are_e4m3() -> None:
+    """What the paged-context FMHA sees over an fp8 pool, settled bitwise.
+
+    The peaked-softmax readout returns exactly e4m3(V) on the paged path and
+    exactly the untouched bf16 V on the packed one, in the same process, from
+    the same inputs; the two candidate answers are asserted more than 0.05
+    apart, so the comparison is not vacuous.
+
+    Equality is elementwise float equality rather than a byte compare: a V
+    element that underflows to e4m3's negative zero comes back +0.0, because
+    the kernel's fp32 accumulator starts at zero and 0.0 + (-0.0) is +0.0.
+    """
+    groups = STD_FP8_HQ // STD_FP8_HKV
+    for use_paged, want_e4m3 in ((True, True), (False, False)):
+        torch.manual_seed(420)
+        env = _std_fp8_env()
+        env.add_request(0, 48)
+        qkv, v = _std_peaked_qkv(env, 48, hot=10)
+        out = env.call_op(qkv, [48], 1, [0], MASK_CAUSAL, use_paged_context_fmha=use_paged)
+        row = out.view(48, STD_FP8_HQ, STD_FP8_D)[47]  # sees the hot key causally
+        for h in range(STD_FP8_HQ):
+            v_head = v[10, h // groups]
+            wanted = _e4m3_round_trip()(v_head).to(torch.bfloat16) if want_e4m3 else v_head
+            assert torch.equal(row[h].float(), wanted.float()), (
+                f"use_paged_context_fmha={use_paged}: head {h}'s V operand is not "
+                f"{'e4m3' if want_e4m3 else 'bf16'} (max abs diff "
+                f"{(row[h].float() - wanted.float()).abs().max().item():.4g})"
+            )
+        gap = (
+            (v[10].float() - _e4m3_round_trip()(v[10]).to(torch.bfloat16).float())
+            .abs()
+            .max()
+            .item()
+        )
+        assert gap > 0.05, f"bf16 V and e4m3(V) differ by only {gap:.4g}"
+
+
+def test_fp8_std_paged_context_flag_is_not_inert_over_an_fp8_pool() -> None:
+    """With nothing cached the flag is bitwise inert over a bf16 pool -- and is
+    not over an fp8 one.
+
+    The pool content is bitwise identical either way (the append does not care
+    about the flag), but over fp8 the paged output reads K/V through e4m3: the
+    packed output stays inside `_compare` of the bf16-KV reference, the paged
+    one sits 26.2x outside the bf16 band around it (sm_103).
+    """
+    for pool_dtype, quant_mode, scale, expect_same in (
+        (torch.bfloat16, 0, None, True),
+        (torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, False),
+    ):
+        runs = []
+        for use_paged in (False, True):
+            torch.manual_seed(430)
+            env = _std_fp8_env(
+                pool_dtype=pool_dtype, quant_mode=quant_mode, kv_scaling_factor=scale
+            )
+            env.add_request(0, 48)
+            env.add_request(1, 17)
+            qkv = env.random_qkv(65)
+            out = env.call_op(
+                qkv, [48, 17], 2, [0, 1], MASK_CAUSAL, use_paged_context_fmha=use_paged
+            )
+            runs.append((out, env.kv_cache.clone(), _op_reference(env, qkv, [48, 17], [0, 1])))
+        packed, paged = runs
+        assert _bitwise_equal(packed[1], paged[1]), (
+            f"pool_dtype={pool_dtype}: the append moved with use_paged_context_fmha"
+        )
+        same = _bitwise_equal(packed[0], paged[0])
+        assert same == expect_same, (
+            f"pool_dtype={pool_dtype}: packed and paged context outputs "
+            f"{'differ' if not same else 'agree'}, expected the opposite"
+        )
+        _compare(packed[0], packed[2])
+        if not expect_same:
+            _assert_far_outside_band(
+                paged[0],
+                paged[2],
+                FP8_STD_MIN_SEPARATION,
+                "paged-context output over an fp8 pool matched the bf16-KV model",
+                ATOL,
+                RTOL,
+            )
+
+
+def test_fp8_std_paged_context_bf16_kv_rival() -> None:
+    """The paged-context cells over the fp8 pool are separated from the bf16-KV
+    model the bf16-pool paged-context surface is certified on.
+
+    At 24/4/256 and 32/8/128, a fresh 48-row context call and a 33-row one over
+    that 48-token prefix are each inside `_compare` of the e4m3-operand
+    reference, and outside the *bf16* band around the bf16-KV one by 22.0x /
+    11.9x and 22.9x / 12.0x on sm_103. The decode that follows is gated too,
+    and the append stays bit-exact against the e4m3 mirror.
+    """
+    for i, (num_heads, num_kv_heads, head_dim) in enumerate(
+        [(STD_FP8_HQ, STD_FP8_HKV, STD_FP8_D), (32, 8, 128)]
+    ):
+        torch.manual_seed(440 + i)
+        env = _std_fp8_env(num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim)
+        env.add_request(0, 96)  # served by two context calls: 48 + 33, then decode
+        for new_tokens in (48, 33):
+            cached = [env.cached_len(0)]
+            qkv = env.random_qkv(new_tokens)
+            out = _paged_ctx_call(env, qkv, [new_tokens], 1, [0])
+            _compare(out, _op_reference(env, qkv, [new_tokens], [0], e4m3=True))
+            _assert_far_outside_band(
+                out,
+                env.reference(qkv, [new_tokens], [0], cached, MASK_CAUSAL),
+                FP8_STD_MIN_SEPARATION,
+                f"{num_heads}/{num_kv_heads}/{head_dim} paged context over "
+                f"{cached[0]} cached tokens matched the bf16-KV model",
+                ATOL,
+                RTOL,
+            )
+            env.check_cache(0)
+        qkv_d = env.random_qkv(1)
+        out_d = env.call_op(qkv_d, [1], 0, [0], MASK_CAUSAL, use_paged_context_fmha=True)
+        _compare(out_d, _op_reference(env, qkv_d, [1], [0], e4m3=True))
+        env.check_cache(0)
+        env.check_unwritten_pool_zero()
+
+
+def test_fp8_std_quant_mode_extra_bits() -> None:
+    """A mixed-precision checkpoint served with an fp8 KV cache does not hand
+    the op a bare 128, and the standard configuration reads only the KV-cache
+    bit.
+
+    Bit-identical to 128 across a context prefill, a decode step, a P = 2
+    generation call and the whole pool: 384 (| FP8_QDQ), 1152
+    (| FP8_1x128_128x128), 4224 (NVFP4 | FP8_KV_CACHE) and 4480 (NVFP4 |
+    FP8_QDQ | FP8_KV_CACHE). 4352 (NVFP4 | FP8_QDQ, the same extra bits without
+    the KV-cache one) is the control: it must differ everywhere the pool is
+    read while leaving the packed context output bitwise unchanged. Bits nobody
+    tried stay unknown, not inert.
+    """
+    runs: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for quant_mode in (128, 384, 1152, 4224, 4480, 4352):
+        torch.manual_seed(480)
+        env = _std_fp8_env()
+        env.quant_mode = quant_mode
+        env.add_request(0, 48)
+        env.add_request(1, 17)
+        out_ctx = env.call_op(env.random_qkv(65), [48, 17], 2, [0, 1], MASK_CAUSAL)
+        out_dec = env.call_op(env.random_qkv(2), [1, 1], 0, [0, 1], MASK_CAUSAL)
+        out_p2 = env.call_op(
+            env.random_qkv(4), [2, 2], 0, [0, 1], MASK_CAUSAL, predicted_tokens_per_seq=2
+        )
+        runs[quant_mode] = (out_ctx, out_dec, out_p2, env.kv_cache.clone())
+    base = runs[128]
+    for quant_mode in (384, 1152, 4224, 4480):
+        for what, got, want in zip(("context", "decode", "P=2", "pool"), runs[quant_mode], base):
+            assert _bitwise_equal(got, want), (
+                f"quant_mode {quant_mode} is not bit-identical to 128: {what}"
+            )
+    control = runs[4352]
+    assert _bitwise_equal(control[0], base[0]), (
+        "quant_mode 4352 changed the packed context output, which never reads the pool"
+    )
+    for what, got, want in zip(("decode", "P=2", "pool"), control[1:], base[1:]):
+        assert not _bitwise_equal(got, want), (
+            f"quant_mode 4352 (no FP8-KV bit) is bit-identical to 128 on {what}: "
+            f"the comparison cannot see a quant_mode change at all"
+        )
+
+
+def test_fp8_std_append_race_control() -> None:
+    """Positive control, not a certification.
+
+    Every append assertion here rests on comparing pool bytes, so the
+    comparison has to be able to see this entry's documented intermittent
+    defect: a call whose new tokens do not map to distinct physical slots races
+    and leaves different bytes on identical repeats. Armed at 24/4/256 over the
+    fp8 pool by aliasing all three pages of a 96-token prefill onto one, four
+    identical seeded repeats should not all agree (a race need not show, so
+    agreement skips rather than fails) -- while the certified geometry
+    reproduces bitwise.
+    """
+
+    def repeat_pools(alias: bool) -> List[torch.Tensor]:
+        pools = []
+        for _ in range(4):
+            torch.manual_seed(490)
+            env = _std_fp8_env()
+            env.add_request(0, 96)
+            env.call_op(env.random_qkv(96), [96], 1, [0], MASK_CAUSAL, alias_pages=alias)
+            pools.append(env.kv_cache.clone())
+        return pools
+
+    certified = repeat_pools(alias=False)
+    for i in range(1, 4):
+        assert _bitwise_equal(certified[i], certified[0]), (
+            f"the certified 24/4/256 fp8 append is not reproducible: repeat {i}"
+        )
+    armed = repeat_pools(alias=True)
+    if all(_bitwise_equal(armed[i], armed[0]) for i in range(1, 4)):
+        pytest.skip("the armed append happened to reproduce bitwise in all four repeats")
+
+
+# ─── predicted_tokens_per_seq > 1 in the standard configuration ────────
+#
+# One speculative-decoding step: each generation sequence contributes P q rows
+# (its draft chain), token-major. On sm_103 a linear draft leaves every
+# spec_decoding_* tensor None and is_spec_decoding_enabled False, so the
+# within-block mask has to come from predicted_tokens_per_seq alone. The cells
+# gate P = 1..8 against `op.reference`; these read the mask out directly and
+# measure the rival at P = 2..4.
+
+# One configuration per pool the cells certify P over: qwen4_exp's 24/2/256
+# over bf16, and 24/4/256 over bf16 and over fp8 at s = 1.0. The weight
+# tolerance is the bf16 one-hot bound over a bf16 pool; over fp8 the softmax
+# probabilities are an e4m3 MMA operand and carry its 2**-4 relative error --
+# the zeros stay exactly zero, which is the part that pins the mask.
+_DRAFT_POOLS = [
+    ("bf16 24/2/256", 2, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
+    ("bf16 24/4/256", 4, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
+    ("fp8 24/4/256", 4, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
+    ("fp8 24/2/256", 2, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
+]
+
+
+def _draft_env(num_kv_heads: int, pool_dtype, quant_mode: int, scale) -> _PagedAttnEnv:
+    return _std_fp8_env(
+        num_kv_heads=num_kv_heads,
+        pool_dtype=pool_dtype,
+        quant_mode=quant_mode,
+        kv_scaling_factor=scale,
+    )
+
+
+@pytest.mark.parametrize("pool", _DRAFT_POOLS, ids=[c[0] for c in _DRAFT_POOLS])
+def test_std_predicted_tokens_mask_is_bottom_right_causal(pool) -> None:
+    """The within-block mask, read out rather than inferred.
+
+    Cache rows carrying a one-hot V turn the output into the attention-weight
+    vector. Draft row t of a sequence with L cached tokens attends keys
+    [0, L + t] uniformly and its later siblings' columns come back bitwise
+    zero, at P = 2, 3, 4. Rows are token-major within a sequence, all P tokens
+    are appended, and mask_type 0 and 1 are bitwise identical.
+    """
+    _, hkv, pool_dtype, quant_mode, scale, weight_rtol = pool
+    for p in (2, 3, 4):
+        torch.manual_seed(450 + p)
+        env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+        cached = 40
+        env.add_request(0, cached)
+        env.add_request(1, cached)
+        prefill = torch.cat([_std_onehot_qkv(env, cached, list(range(cached)), 0)] * 2)
+        env.call_op(prefill, [cached, cached], 2, [0, 1], MASK_CAUSAL)
+        gen = torch.cat([_std_onehot_qkv(env, p, [cached + t for t in range(p)], 0)] * 2)
+        out = env.call_op(gen, [p, p], 0, [0, 1], MASK_CAUSAL, predicted_tokens_per_seq=p)
+        for n in range(2 * p):
+            _assert_draft_row_weights(
+                out,
+                env,
+                n,
+                cached + (n % p),
+                f"{pool[0]} P={p} row {n} (sequence {n // p}, draft {n % p})",
+                weight_rtol,
+            )
+        assert env.cached_len(0) == cached + p and env.cached_len(1) == cached + p
+        env.check_cache(0)
+        env.check_cache(1)
+        env.check_unwritten_pool_zero()
+        # mask_type is not what produces the within-block mask.
+        gen2 = torch.cat([_std_onehot_qkv(env, p, [cached + p + t for t in range(p)], 0)] * 2)
+        out_causal = env.call_op(
+            gen2, [p, p], 0, [0, 1], MASK_CAUSAL, predicted_tokens_per_seq=p, record=False
+        )
+        out_padding = env.call_op(gen2, [p, p], 0, [0, 1], MASK_PADDING, predicted_tokens_per_seq=p)
+        assert _bitwise_equal(out_causal, out_padding), (
+            f"{pool[0]} P={p}: mask_type 0 and 1 differ in the standard configuration"
+        )
+
+
+@pytest.mark.parametrize("pool", _DRAFT_POOLS, ids=[c[0] for c in _DRAFT_POOLS])
+def test_std_predicted_tokens_full_block_rival(pool) -> None:
+    """Realistic inputs at P = 2, 3, 4 (and a mixed step at P = 3): inside
+    `_compare` of the bottom-right causal reference, while the full-block
+    model -- every draft row seeing its later siblings -- sits outside the
+    band by, at P = 2, 3, 4 and the mixed step on sm_103: 45x, 89x, 113x, 75x
+    (bf16 24/2/256); 61x, 59x, 118x, 104x (bf16 24/4/256); 4.8x, 6.2x, 11.3x,
+    10.0x (fp8 24/4/256, in the fp8 decode band). At P = 1 the two coincide."""
+    name, hkv, pool_dtype, quant_mode, scale, _ = pool
+    fp8 = pool_dtype == torch.float8_e4m3fn
+    atol, rtol = (FP8_DECODE_ATOL, FP8_DECODE_RTOL) if fp8 else (ATOL, RTOL)
+    for p in (2, 3, 4):
+        torch.manual_seed(460 + p)
+        env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+        env.add_request(0, 70)
+        env.add_request(1, 35)
+        _paged_ctx_call(env, env.random_qkv(105), [70, 35], 2, [0, 1])
+        gen = env.random_qkv(2 * p)
+        out = env.call_op(
+            gen,
+            [p, p],
+            0,
+            [0, 1],
+            MASK_CAUSAL,
+            predicted_tokens_per_seq=p,
+            use_paged_context_fmha=True,
+        )
+        _compare(out, _op_reference(env, gen, [p, p], [0, 1], e4m3=fp8))
+        _assert_far_outside_band(
+            out,
+            _op_reference(env, gen, [p, p], [0, 1], causal=False, e4m3=fp8),
+            FP8_STD_MIN_SEPARATION,
+            f"{name} P={p}: a draft row saw its later siblings",
+            atol,
+            rtol,
+        )
+
+    # A context row ahead of two draft blocks of different histories.
+    torch.manual_seed(470)
+    p = 3
+    env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+    env.add_request(0, 31)
+    env.add_request(1, 64)
+    env.add_request(2, 20)
+    _paged_ctx_call(env, env.random_qkv(95), [31, 64], 2, [0, 1])
+    mixed = env.random_qkv(20 + 2 * p)
+    out = _paged_ctx_call(env, mixed, [20, p, p], 1, [2, 0, 1], predicted_tokens_per_seq=p)
+    _compare(out, _op_reference(env, mixed, [20, p, p], [2, 0, 1], e4m3=fp8))
+    _assert_far_outside_band(
+        out[20:],
+        _op_reference(env, mixed, [20, p, p], [2, 0, 1], causal=False, e4m3=fp8)[20:],
+        FP8_STD_MIN_SEPARATION,
+        f"{name} mixed step: a draft row saw its later siblings",
+        atol,
+        rtol,
+    )
+
+
+@pytest.mark.parametrize("pool", _DRAFT_POOLS, ids=[c[0] for c in _DRAFT_POOLS])
+def test_std_predicted_tokens_page_crossing_and_consecutive_steps(pool) -> None:
+    """A draft block that starts mid-page and crosses a page boundary (31
+    cached, P = 3, pages of 32), read out one-hot; then three consecutive
+    P = 4 steps over a growing history, so the block lands at several offsets,
+    each inside `_compare`."""
+    name, hkv, pool_dtype, quant_mode, scale, weight_rtol = pool
+    fp8 = pool_dtype == torch.float8_e4m3fn
+    torch.manual_seed(471)
+    p = 3
+    env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+    cached = 31
+    env.add_request(0, cached)
+    env.call_op(_std_onehot_qkv(env, cached, list(range(cached)), 0), [cached], 1, [0], MASK_CAUSAL)
+    out = env.call_op(
+        _std_onehot_qkv(env, p, [cached + t for t in range(p)], 0),
+        [p],
+        0,
+        [0],
+        MASK_CAUSAL,
+        predicted_tokens_per_seq=p,
+    )
+    for n in range(p):
+        _assert_draft_row_weights(
+            out, env, n, cached + n, f"{name} page-crossing draft row {n}", weight_rtol
+        )
+    env.check_cache(0)
+    env.check_unwritten_pool_zero()
+
+    torch.manual_seed(472)
+    env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+    env.add_request(0, 100)
+    env.call_op(env.random_qkv(100), [100], 1, [0], MASK_CAUSAL)
+    for _ in range(3):
+        gen = env.random_qkv(4)
+        out = env.call_op(gen, [4], 0, [0], MASK_CAUSAL, predicted_tokens_per_seq=4)
+        _compare(out, _op_reference(env, gen, [4], [0], e4m3=fp8))
+    env.check_cache(0)
+    env.check_unwritten_pool_zero()
+
+
+# ─── qwen4_exp's full-attention cell: GQA 24/2/256 over a bf16 pool ────
+#
+# 24 query / 2 kv heads / head_size 256, tokens_per_block 32, causal, no sinks
+# or window, the paged-context path on, P up to 4. 2 kv heads put 12 query heads
+# in a group where 24/4 puts 6, which moves the compiled decode kernel's q-tile
+# (VarSeqQ16 against VarSeqQ8), so 24/2/256 is certified as a triple of its own.
+# Every rival here is a reference model computed on the host, never a second
+# deliberately wrong call.
+
+QWEN_HQ, QWEN_HKV, QWEN_D = 24, 2, 256
+QWEN_TPB = 32
+
+# How far a rival model has to sit outside the bf16 band. Measured on sm_103:
+# 45x-118x (a draft row seeing its later siblings), 183x (a context call's
+# cached prefix dropped), 17.8x-582x (an encoder's frame segmentation dropped).
+QWEN_MIN_SEPARATION = 3.0
+
+
+def _qwen_bf16_env(**kwargs) -> _PagedAttnEnv:
+    """The checkpoint's full-attention cell over a bf16 paged pool."""
+    kwargs.setdefault("num_heads", QWEN_HQ)
+    kwargs.setdefault("num_kv_heads", QWEN_HKV)
+    kwargs.setdefault("head_dim", QWEN_D)
+    kwargs.setdefault("tokens_per_block", QWEN_TPB)
+    kwargs.setdefault("num_blocks", 128)
+    kwargs.setdefault("max_blocks_per_seq", 16)
+    return _PagedAttnEnv(**kwargs)
+
+
+def test_bf16_gqa24_2_cached_prefix_rival() -> None:
+    """A 96-token request served by two paged-context calls, 48 then 33 over
+    the 48-token prefix: each inside `_compare`, and the second far outside
+    the band around the prefix-ignored model -- every row seeing only this
+    call's own 33 tokens, which is what a call that never reached the pool
+    computes (183x on sm_103). On the fresh call the two coincide."""
+    torch.manual_seed(523)
+    env = _qwen_bf16_env()
+    env.add_request(0, 96)
+    for new_tokens in (48, 33):
+        cached = env.cached_len(0)
+        qkv = env.random_qkv(new_tokens)
+        out = _paged_ctx_call(env, qkv, [new_tokens], 1, [0])
+        _compare(out, _op_reference(env, qkv, [new_tokens], [0]))
+        if cached:
+            _assert_far_outside_band(
+                out,
+                _packed_reference(qkv, [new_tokens], QWEN_HQ, QWEN_HKV, QWEN_D, causal=True),
+                QWEN_MIN_SEPARATION,
+                f"the {cached}-token cached prefix never reached the FMHA",
+                ATOL,
+                RTOL,
+            )
+        env.check_cache(0)
+    env.check_unwritten_pool_zero()
+
+
+def test_bf16_gqa24_2_sparse_group_is_inert() -> None:
+    """The sparse / skip-softmax arguments, at and off their inert values.
+
+    In the standard configuration nothing in the group moves a byte: each of
+    nine settings -- the four index/offset tensors filled with a real
+    8-key-per-row selection, a non-zero sparse_attn_indices_block_size, a
+    num_sparse_topk, sparse_attn_kv_lens, and the two skip-softmax thresholds
+    with and without a stats buffer -- returns output bitwise identical to the
+    all-inert call. So a caller passing something here is not silently getting
+    sparse attention either.
+
+    A negative result needs a control: the same byte comparison over arguments
+    the op does read (q_scaling 2.0, mask_type 0) must fail.
+    """
+    torch.manual_seed(522)
+    env = _qwen_bf16_env()
+    env.add_request(0, 40)
+    qkv = env.random_qkv(40)
+
+    def again(mask_type: int = MASK_CAUSAL, **overrides) -> torch.Tensor:
+        # record=False throughout: the history mirror is what would turn a
+        # repeat into a cached-prefix call, and these stay one fresh prefill.
+        return env.call_op(
+            qkv,
+            [40],
+            1,
+            [0],
+            mask_type,
+            record=False,
+            use_paged_context_fmha=True,
+            op_overrides=overrides,
+        )
+
+    base = again()
+    assert _bitwise_equal(again(), base), (
+        "the identical call is not reproducible, so no byte comparison below means anything"
+    )
+
+    keep = 8  # a selection that could not reproduce full causal attention
+    attn_idx = torch.tensor([list(range(keep))] * 40, dtype=torch.int32, device="cuda").reshape(-1)
+    attn_off = torch.tensor([keep * i for i in range(41)], dtype=torch.int32, device="cuda")
+    off_inert = {
+        "sparse_attn_indices + sparse_attn_offsets": dict(
+            sparse_attn_indices=attn_idx, sparse_attn_offsets=attn_off
+        ),
+        "... + sparse_attn_indices_block_size": dict(
+            sparse_attn_indices=attn_idx,
+            sparse_attn_offsets=attn_off,
+            sparse_attn_indices_block_size=1,
+        ),
+        "... + num_sparse_topk": dict(
+            sparse_attn_indices=attn_idx,
+            sparse_attn_offsets=attn_off,
+            sparse_attn_indices_block_size=1,
+            num_sparse_topk=keep,
+        ),
+        "sparse_kv_indices + sparse_kv_offsets": dict(
+            sparse_kv_indices=attn_idx, sparse_kv_offsets=attn_off
+        ),
+        "num_sparse_topk alone": dict(num_sparse_topk=8),
+        "sparse_attn_indices_block_size alone": dict(sparse_attn_indices_block_size=64),
+        "sparse_attn_kv_lens": dict(
+            sparse_attn_kv_lens=torch.zeros(1, dtype=torch.int32, device="cuda")
+        ),
+        "skip_softmax thresholds": dict(
+            skip_softmax_threshold_scale_factor_prefill=0.9,
+            skip_softmax_threshold_scale_factor_decode=0.9,
+        ),
+        "skip_softmax thresholds + stat": dict(
+            skip_softmax_threshold_scale_factor_prefill=0.9,
+            skip_softmax_threshold_scale_factor_decode=0.9,
+            skip_softmax_stat=torch.zeros(40, QWEN_HQ, 2, dtype=torch.float32, device="cuda"),
+        ),
+    }
+    for label, overrides in off_inert.items():
+        assert _bitwise_equal(again(**overrides), base), (
+            f"{label} changed the output: the sparse / skip-softmax group is not inert here"
+        )
+    assert not _bitwise_equal(again(q_scaling=2.0), base), (
+        "q_scaling 2.0 is bitwise identical to 1.0: this case's byte comparison is blind"
+    )
+    assert not _bitwise_equal(again(mask_type=MASK_PADDING), base), (
+        "mask_type 0 is bitwise identical to 1 on a 40-token context call: "
+        "this case's byte comparison is blind"
+    )
+
+
+# ─── local_layer_idx over qwen4_exp's 48-row mapping ───────────────────
+#
+# The 48-layer tower carries a full-attention layer every fourth position, and
+# the target passes the layer's `layer_offsets` entry, so it drives rows 3, 7,
+# ..., 47. Two arrangements, because the mapping's two columns move
+# independently and only one of them is the row index:
+#
+#   * the engine's own -- a 48-row mapping whose twelve attention rows sit on
+#     pool 0 at layer-in-pool 0..11 and whose other 36 rows name a second pool,
+#     so the row index (to 47) and the layer-in-pool column (to 11) differ;
+#   * a real 48-layer KVCacheManager, whose identity mapping drives both to 47.
+#
+# Both assert the pair a single-layer pool cannot: the named layer's slabs
+# moved, AND every sibling layer's slabs are bitwise untouched.
+
+QWEN_NUM_LAYERS = 48
+QWEN_ATTN_LAYERS = list(range(3, QWEN_NUM_LAYERS, 4))
+
+
+def _qwen_layer_pools(
+    attn_blocks: int = 48,
+    other_blocks: int = 32,
+    max_seq_len: int = 256,
+    max_batch: int = 4,
+    **pool_kw,
+) -> Tuple[_MultiLayerPagedAttnEnv, _MultiLayerPagedAttnEnv]:
+    """The two pools of the hybrid mapping, at the full-attention cell.
+
+    The second holds the 36 rows this cell never drives; it exists so those
+    rows name a real, distinct pool base and the untouched assertion has
+    somewhere to look. Both managers take the same max_seq_len and max_batch,
+    which makes their block-offset tables concatenable into the per-pool table
+    the op indexes by the mapping's pool column. `pool_kw` (dtype, quant_mode,
+    kv_scaling_factor) goes to both.
+    """
+    kw = dict(
+        num_heads=QWEN_HQ,
+        num_kv_heads=QWEN_HKV,
+        head_dim=QWEN_D,
+        tokens_per_block=QWEN_TPB,
+        max_seq_len=max_seq_len,
+        max_batch=max_batch,
+        **pool_kw,
+    )
+    attn = _MultiLayerPagedAttnEnv(num_layers=len(QWEN_ATTN_LAYERS), num_blocks=attn_blocks, **kw)
+    other = _MultiLayerPagedAttnEnv(
+        num_layers=QWEN_NUM_LAYERS - len(QWEN_ATTN_LAYERS), num_blocks=other_blocks, **kw
+    )
+    return attn, other
+
+
+def _compose_engine_mapping(
+    attn: _MultiLayerPagedAttnEnv, other: _MultiLayerPagedAttnEnv
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool pointers, the 48-row layer->pool mapping and the per-pool block
+    offsets of the hybrid arrangement. Row i is what local_layer_idx=i selects:
+    rows 3, 7, ..., 47 are pool 0 at layer-in-pool 0..11, every other row is
+    pool 1. Recompose after each refresh_offsets: offsets are concatenated by
+    value."""
+    pool_pointers = torch.zeros(2, 2, dtype=torch.int64, device="cpu")
+    pool_pointers[0] = attn.mgr.kv_cache_pool_pointers[0]
+    pool_pointers[1] = other.mgr.kv_cache_pool_pointers[0]
+    attn_rows = set(QWEN_ATTN_LAYERS)
+    rows, in_attn, in_other = [], 0, 0
+    for i in range(QWEN_NUM_LAYERS):
+        if i in attn_rows:
+            rows.append([0, in_attn])
+            in_attn += 1
+        else:
+            rows.append([1, in_other])
+            in_other += 1
+    mapping = torch.tensor(rows, dtype=torch.int32, device="cpu")
+    offsets = torch.cat([attn.block_offsets, other.block_offsets], dim=0)
+    return pool_pointers, mapping, offsets
+
+
+def _assert_only_this_layer_moved(
+    env: _MultiLayerPagedAttnEnv,
+    snapshot: List[torch.Tensor],
+    layer: int,
+    label: str,
+) -> None:
+    """This layer's slabs moved, and every other layer's slabs are bitwise as
+    they were. The complement's size is asserted too, so the sibling loop
+    cannot pass by being empty."""
+    assert not _bitwise_equal(snapshot[layer], env.layer_views[layer]), (
+        f"{label}: the named layer's slabs did not move at all"
+    )
+    siblings = [m for m in range(env.num_layers) if m != layer]
+    assert len(siblings) == env.num_layers - 1 and siblings, f"{label}: empty complement"
+    for m in siblings:
+        assert _bitwise_equal(snapshot[m], env.layer_views[m]), (
+            f"{label}: the call wrote layer {m}'s slabs as well as its own"
+        )
+
+
+def test_bf16_gqa24_2_layer_index_engine_48_row_mapping() -> None:
+    """24/2/256 at the twelve local_layer_idx values the target drives.
+
+    Each of rows 3, 7, ..., 47 runs a fresh context chunk, a context chunk
+    over its own cached prefix on the paged-context path, and generation at
+    P = 1 and 2. Each call is inside `_compare` of its own layer's history,
+    so a read landing in a sibling's slabs cannot pass; each append moves its
+    own layer's slabs and leaves the other eleven bitwise untouched; and the
+    36-layer second pool comes back bitwise as it started.
+    """
+    torch.manual_seed(530)
+    attn, other = _qwen_layer_pools()
+    other_before = [v.clone() for v in other.layer_views]
+    _, mapping, _ = _compose_engine_mapping(attn, other)
+    assert mapping.shape == (QWEN_NUM_LAYERS, 2)
+    assert [mapping[row].tolist() for row in QWEN_ATTN_LAYERS] == [
+        [0, k] for k in range(len(QWEN_ATTN_LAYERS))
+    ], "the twelve driven rows are pool 0, layer-in-pool 0..11"
+
+    attn.add_request(0, 96)  # the manager allocates the whole prompt up front
+    attn.add_request(1, 40)
+    attn.refresh_offsets([0, 1], num_contexts=2)
+    ptrs, mapping, offsets = _compose_engine_mapping(attn, other)
+    assert int(ptrs[0, 0]) != int(ptrs[1, 0]), "the two pools must have distinct bases"
+
+    for chunk in ([64, 25], [32, 15]):
+        for layer, row in enumerate(QWEN_ATTN_LAYERS):
+            qkv = attn.random_qkv(sum(chunk))
+            snapshot = [v.clone() for v in attn.layer_views]
+            out = attn.call_op(
+                layer,
+                qkv,
+                chunk,
+                2,
+                [0, 1],
+                pool_mapping=mapping,
+                pool_pointers=ptrs,
+                block_offsets=offsets,
+                local_layer_idx=row,
+                use_paged_context_fmha=True,
+                ctx_lens=chunk,
+            )
+            _compare(out, _op_reference(attn, qkv, chunk, [0, 1], layer=layer))
+            _assert_only_this_layer_moved(
+                attn, snapshot, layer, f"context chunk {chunk} at local_layer_idx {row}"
+            )
+    attn.check_caches([0, 1])
+
+    for p in (1, 2):
+        for _ in range(p):
+            attn.add_decode_token(0)
+            attn.add_decode_token(1)
+        attn.refresh_offsets([0, 1], num_contexts=0)
+        ptrs, mapping, offsets = _compose_engine_mapping(attn, other)
+        for layer, row in enumerate(QWEN_ATTN_LAYERS):
+            gen = attn.random_qkv(2 * p)
+            snapshot = [v.clone() for v in attn.layer_views]
+            out = attn.call_op(
+                layer,
+                gen,
+                [p, p],
+                0,
+                [0, 1],
+                pool_mapping=mapping,
+                pool_pointers=ptrs,
+                block_offsets=offsets,
+                local_layer_idx=row,
+                use_paged_context_fmha=True,
+                predicted_tokens_per_seq=p,
+            )
+            _compare(out, _op_reference(attn, gen, [p, p], [0, 1], layer=layer))
+            _assert_only_this_layer_moved(
+                attn, snapshot, layer, f"P={p} decode at local_layer_idx {row}"
+            )
+    attn.check_caches([0, 1])
+
+    for before, after in zip(other_before, other.layer_views):
+        assert _bitwise_equal(before, after), (
+            "a call on a pool-0 row wrote the pool the mapping's other 36 rows name"
+        )
+
+
+def test_bf16_gqa24_2_layer_index_identity_48_layer_pool() -> None:
+    """The same question with the mapping's other column moved: a real 48-layer
+    KVCacheManager's identity rows take local_layer_idx and the layer-in-pool
+    column to 47 together, so the pool-base shift runs 47 * kv_factor slabs
+    deep. Rows 0, 3, 23 and 47 over context, cached-prefix context and P = 2
+    generation, each inside `_compare` of its own history, with the
+    moved/untouched pair over all 48 layers."""
+    torch.manual_seed(532)
+    env = _MultiLayerPagedAttnEnv(
+        num_layers=QWEN_NUM_LAYERS,
+        num_heads=QWEN_HQ,
+        num_kv_heads=QWEN_HKV,
+        head_dim=QWEN_D,
+        tokens_per_block=QWEN_TPB,
+        num_blocks=24,
+        max_seq_len=128,
+    )
+    assert env.pool_mapping.tolist() == [[0, i] for i in range(QWEN_NUM_LAYERS)], (
+        "a real 48-layer manager produces identity mapping rows"
+    )
+    driven = [0, 3, 23, 47]
+
+    env.add_request(0, 64)
+    env.refresh_offsets([0], num_contexts=1)
+    for chunk in ([40], [24]):
+        for layer in driven:
+            qkv = env.random_qkv(sum(chunk))
+            snapshot = [v.clone() for v in env.layer_views]
+            out = env.call_op(
+                layer, qkv, chunk, 1, [0], use_paged_context_fmha=True, ctx_lens=chunk
+            )
+            _compare(out, _op_reference(env, qkv, chunk, [0], layer=layer))
+            _assert_only_this_layer_moved(
+                env, snapshot, layer, f"context chunk {chunk} at identity row {layer}"
+            )
+    env.check_caches([0], layers=driven)
+
+    p = 2
+    for _ in range(p):
+        env.add_decode_token(0)
+    env.refresh_offsets([0], num_contexts=0)
+    for layer in driven:
+        gen = env.random_qkv(p)
+        snapshot = [v.clone() for v in env.layer_views]
+        out = env.call_op(
+            layer, gen, [p], 0, [0], use_paged_context_fmha=True, predicted_tokens_per_seq=p
+        )
+        _compare(out, _op_reference(env, gen, [p], [0], layer=layer))
+        _assert_only_this_layer_moved(env, snapshot, layer, f"P={p} decode at identity row {layer}")
+    env.check_caches([0], layers=driven)
+
+
+def test_bf16_gqa24_2_layer_index_ab_single_layer_vs_row_47() -> None:
+    """A/B: the same call, once in a single-layer pool and once at row 47.
+
+    Identical operands and identical layer content either side, and every
+    other op argument equal (max_seq_len, max_context_length,
+    attention_window_size, max_num_requests, tokens_per_block), so the only
+    variable is where the call's slice lives -- a one-layer pool at base, or
+    layer-in-pool 11 of a twelve-layer pool selected by mapping row 47 of 48.
+    The outputs are bitwise equal on both the paged-context prefill and the
+    decode that reads the history back.
+
+    The control is the degeneracy itself: the same decode sent to row 43
+    (layer-in-pool 10), whose slabs hold no history, must not come back equal.
+    """
+    torch.manual_seed(531)
+    single = _qwen_bf16_env()
+    single.add_request(0, 64)
+    qkv = single.random_qkv(64)
+    out_single = _paged_ctx_call(single, qkv, [64], 1, [0])
+    qkv_d = single.random_qkv(1)
+    out_single_d = _paged_ctx_call(single, qkv_d, [1], 0, [0])
+    single.check_cache(0)
+
+    attn, other = _qwen_layer_pools(attn_blocks=64, other_blocks=64, max_seq_len=512)
+    assert attn.max_seq_len == single.max_seq_len
+    deep_layer, deep_row = len(QWEN_ATTN_LAYERS) - 1, QWEN_ATTN_LAYERS[-1]
+    assert deep_row == 47
+    attn.add_request(0, 64)
+    attn.refresh_offsets([0], num_contexts=1)
+    ptrs, mapping, offsets = _compose_engine_mapping(attn, other)
+    tables = dict(pool_mapping=mapping, pool_pointers=ptrs, block_offsets=offsets)
+    out_multi = attn.call_op(
+        deep_layer,
+        qkv,
+        [64],
+        1,
+        [0],
+        local_layer_idx=deep_row,
+        use_paged_context_fmha=True,
+        ctx_lens=[64],
+        **tables,
+    )
+    attn.add_decode_token(0)
+    attn.refresh_offsets([0], num_contexts=0)
+    ptrs, mapping, offsets = _compose_engine_mapping(attn, other)
+    tables = dict(pool_mapping=mapping, pool_pointers=ptrs, block_offsets=offsets)
+    out_multi_d = attn.call_op(
+        deep_layer,
+        qkv_d,
+        [1],
+        0,
+        [0],
+        local_layer_idx=deep_row,
+        use_paged_context_fmha=True,
+        **tables,
+    )
+    attn.check_caches([0], layers=[deep_layer])
+
+    for what, a, b in (
+        ("paged-context prefill", out_single, out_multi),
+        ("decode", out_single_d, out_multi_d),
+    ):
+        assert _bitwise_equal(a, b), (
+            f"{what}: a single-layer pool and layer-in-pool 11 of a twelve-layer "
+            f"pool at mapping row 47 disagree (max|delta| "
+            f"{(a.float() - b.float()).abs().max().item():.6g})"
+        )
+
+    wrong_row = QWEN_ATTN_LAYERS[-2]
+    wrong = attn.call_op(
+        deep_layer - 1,
+        qkv_d,
+        [1],
+        0,
+        [0],
+        local_layer_idx=wrong_row,
+        use_paged_context_fmha=True,
+        record=False,
+        **tables,
+    )
+    assert not _bitwise_equal(wrong, out_single_d), (
+        f"a decode routed to mapping row {wrong_row}, whose slabs hold no history, "
+        f"is bitwise identical to the correct one: this A/B cannot see a wrong layer index"
+    )
+
+
+# ─── Encoder-only: the op with no KV cache at all ──────────────────────
+#
+# A vision tower has no KV cache: one bidirectional pass over each frame's
+# patch tokens. The op is told so by receiving no cache addressing at all --
+# kv_cache_block_offsets, host_kv_cache_pool_pointers and
+# host_kv_cache_pool_mapping all None -- with update_kv_cache still True.
+# Frame segmentation is the batch: one context sequence per frame, and
+# mask_type 0 makes each frame's tokens attend to exactly their own frame.
+
+# The segment shapes the multimodal runtime drives, read off the runtime-value
+# dump of the gate that printed `mmmu_val average accuracy: 58.33`: 170
+# distinct segment sizes from 256 to 12544, totals to 22144 rows, 1, 2, 4 and
+# 5 segments per call. These are its four largest calls plus the two
+# multi-segment counts; only a call's total, count and maximum are in the dump,
+# so the splits realize those triples with lengths a 2x2-merged grid produces.
+_ENCODER_SERVING_SEGMENTS: List[List[int]] = [
+    [5580],
+    [8160],
+    [728, 728, 460, 288],
+    [480, 480, 400, 352, 180],
+    [8000, 1008],
+    [12544, 9600],
+]
+
+# What `workspace_` grows to across that sequence, from empty: the op sizes it
+# in place per call and never shrinks it, and the dump's largest recorded size
+# is this figure.
+_ENCODER_SERVING_WORKSPACE = 33732608
+
+
+def _encoder_call(
+    qkv: torch.Tensor,
+    seg_lens: List[int],
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    mask_type: int,
+    workspace: torch.Tensor,
+    **overrides,
+) -> torch.Tensor:
+    """One context-phase call with every KV-cache argument absent, batch state
+    as the vision tower builds it (`max_num_requests` = the segment count)."""
+    ns = len(seg_lens)
+    total = sum(seg_lens)
+    output = torch.empty(total, num_heads * head_dim, dtype=qkv.dtype, device="cuda")
+    op_kwargs = dict(
+        q=qkv,
+        k=None,
+        v=None,
+        output=output,
+        output_sf=None,
+        workspace_=workspace,
+        sequence_length=torch.tensor(seg_lens, dtype=torch.int32, device="cuda"),
+        host_past_key_value_lengths=torch.tensor(seg_lens, dtype=torch.int32),
+        host_total_kv_lens=torch.tensor([total, 0], dtype=torch.int32),
+        context_lengths=torch.tensor(seg_lens, dtype=torch.int32, device="cuda"),
+        host_context_lengths=torch.tensor(seg_lens, dtype=torch.int32),
+        host_request_types=torch.tensor([0] * ns, dtype=torch.int32),
+        max_context_q_len_override=None,
+        # The three whose absence selects the no-KV-cache mode.
+        kv_cache_block_offsets=None,
+        host_kv_cache_pool_pointers=None,
+        host_kv_cache_pool_mapping=None,
+        cache_indirection=None,
+        kv_scale_orig_quant=None,
+        kv_scale_quant_orig=None,
+        out_scale=None,
+        rotary_inv_freq=None,
+        rotary_cos_sin=None,
+        latent_cache=None,
+        q_pe=None,
+        block_ids_per_seq=None,
+        attention_sinks=None,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+        predicted_tokens_per_seq=1,
+        local_layer_idx=0,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_dim,
+        tokens_per_block=None,
+        max_num_requests=ns,
+        max_context_length=max(seg_lens),
+        max_seq_len=max(seg_lens),
+        attention_window_size=max(seg_lens),
+        beam_width=1,
+        mask_type=mask_type,
+        quant_mode=0,
+        q_scaling=1.0,
+        position_embedding_type=0,
+        rope_dim=0,
+        rope_base=10000.0,
+        rope_scale_type=0,
+        rope_scale=1.0,
+        rope_short_m_scale=1.0,
+        rope_long_m_scale=1.0,
+        rope_max_positions=1024,
+        rope_original_max_positions=1024,
+        use_paged_context_fmha=False,
+        attention_input_type=0,
+        is_mla_enable=False,
+        chunked_prefill_buffer_batch_size=1,
+        q_lora_rank=None,
+        kv_lora_rank=None,
+        qk_nope_head_dim=None,
+        qk_rope_head_dim=None,
+        v_head_dim=None,
+        rope_append=None,
+        mrope_rotary_cos_sin=None,
+        mrope_position_deltas=None,
+        helix_position_offsets=None,
+        helix_is_inactive_rank=None,
+        attention_chunk_size=None,
+        softmax_stats_tensor=None,
+        is_spec_decoding_enabled=False,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        spec_decoding_generation_lengths=None,
+        spec_decoding_position_offsets_for_cpp=None,
+        spec_decoding_packed_mask=None,
+        spec_decoding_bl_tree_mask_offset=None,
+        spec_decoding_bl_tree_mask=None,
+        spec_bl_tree_first_sparse_mask_offset_kv=None,
+        sparse_kv_indices=None,
+        sparse_kv_offsets=None,
+        sparse_attn_indices=None,
+        sparse_attn_offsets=None,
+        sparse_attn_indices_block_size=0,
+        num_contexts=ns,
+        num_ctx_tokens=total,
+    )
+    op_kwargs.update(overrides)
+    with validating(op):
+        op(**op_kwargs)
+    torch.cuda.synchronize()
+    return output
+
+
+def _merged_rival(
+    qkv: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    mask_type: int,
+    q_chunk: int = 1024,
+) -> torch.Tensor:
+    """The answer with the frame segmentation dropped -- every row attending
+    to every row of the call, as one sequence -- in fp32 SDPA, query rows in
+    blocks of `q_chunk` so a 22144-row call does not ask for one 16 x 22144 x
+    22144 score matrix. A rival model only: the chunking changes no row's
+    arithmetic."""
+    n = qkv.shape[0]
+    w = num_heads * head_dim
+    q = qkv[:, :w].view(n, num_heads, head_dim).transpose(0, 1).float()
+    k = qkv[:, w : 2 * w].view(n, num_heads, head_dim).transpose(0, 1).float()
+    v = qkv[:, 2 * w :].view(n, num_heads, head_dim).transpose(0, 1).float()
+    mask = None
+    if mask_type == MASK_CAUSAL:
+        mask = torch.ones(n, n, dtype=torch.bool, device=qkv.device).tril()
+    parts = [
+        F.scaled_dot_product_attention(
+            q[:, first : first + q_chunk],
+            k,
+            v,
+            attn_mask=None if mask is None else mask[first : first + q_chunk],
+        )
+        for first in range(0, n, q_chunk)
+    ]
+    return torch.cat(parts, dim=1).transpose(0, 1).reshape(n, -1).to(qkv.dtype)
+
+
+def test_encoder_no_kv_cache_segmentation_is_the_batch() -> None:
+    """The frame segmentation is the whole of the correctness here and nothing
+    else in the call would report its absence, so every multi-segment shape is
+    gated against the merged-segment model -- the same rows run as one
+    sequence, what a caller who drops `num_contexts` gets.
+
+    Three frames of 27, 9 and 41 rows at head_size 72 and 128 under both masks,
+    each inside `_compare`, the rival 315x / 495x (d72 padding / causal) and
+    390x / 582x (d128) outside the band on sm_103; then the mmmu dump's
+    multi-segment calls at 72 under padding, where the cells hold the accuracy
+    and this holds the rival: 107x, 114x, 67x and 17.8x for four, five, two
+    (9008 rows) and two (22144 rows) frames.
+    """
+    for head_dim in (72, 128):
+        torch.manual_seed(520)
+        workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+        seg_lens = [27, 9, 41]
+        qkv = torch.randn(sum(seg_lens), 48 * head_dim, dtype=torch.bfloat16, device="cuda")
+        for mask_type in (MASK_PADDING, MASK_CAUSAL):
+            out = _encoder_call(qkv, seg_lens, 16, 16, head_dim, mask_type, workspace)
+            _compare(
+                out,
+                _packed_reference(qkv, seg_lens, 16, 16, head_dim, mask_type == MASK_CAUSAL),
+            )
+            _assert_far_outside_band(
+                out,
+                _merged_rival(qkv, 16, head_dim, mask_type),
+                QWEN_MIN_SEPARATION,
+                f"D={head_dim} mask={mask_type}: the frame segmentation was ignored",
+                ATOL,
+                RTOL,
+            )
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    for seg_lens in _ENCODER_SERVING_SEGMENTS:
+        if len(seg_lens) == 1:
+            continue
+        torch.manual_seed(900)
+        qkv = torch.randn(sum(seg_lens), 48 * 72, dtype=torch.bfloat16, device="cuda")
+        out = _encoder_call(qkv, seg_lens, 16, 16, 72, MASK_PADDING, workspace)
+        _assert_far_outside_band(
+            out,
+            _merged_rival(qkv, 16, 72, MASK_PADDING),
+            QWEN_MIN_SEPARATION,
+            f"{seg_lens}: the frame segmentation was ignored",
+            ATOL,
+            RTOL,
+        )
+        del qkv, out
+        torch.cuda.empty_cache()
+
+
+def test_encoder_no_kv_cache_cache_arguments_are_inert() -> None:
+    """Arguments that address a cache cannot matter when there is none:
+    tokens_per_block 32 (against None) and use_paged_context_fmha True (there
+    is no pool for the context FMHA to read) return bitwise the same output."""
+    for head_dim in (72, 128):
+        torch.manual_seed(521)
+        workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+        seg_lens = [27, 9, 41]
+        qkv = torch.randn(sum(seg_lens), 48 * head_dim, dtype=torch.bfloat16, device="cuda")
+        plain = _encoder_call(qkv, seg_lens, 16, 16, head_dim, MASK_PADDING, workspace)
+        for label, overrides in (
+            ("tokens_per_block=32", dict(tokens_per_block=32)),
+            ("use_paged_context_fmha=True", dict(use_paged_context_fmha=True)),
+        ):
+            got = _encoder_call(
+                qkv, seg_lens, 16, 16, head_dim, MASK_PADDING, workspace, **overrides
+            )
+            assert _bitwise_equal(got, plain), (
+                f"D={head_dim}: {label} changed a call that owns no KV cache"
+            )
+
+
+def test_encoder_no_kv_cache_workspace_high_water() -> None:
+    """`workspace_` over the mmmu serving sequence, from empty: sized in place
+    per call, never shrunk, and topping out at the largest size the runtime
+    dump records -- which a tower that preallocates it must cover."""
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    sizes = []
+    for seg_lens in _ENCODER_SERVING_SEGMENTS:
+        torch.manual_seed(900)
+        qkv = torch.randn(sum(seg_lens), 48 * 72, dtype=torch.bfloat16, device="cuda")
+        _encoder_call(qkv, seg_lens, 16, 16, 72, MASK_PADDING, workspace)
+        sizes.append(workspace.numel())
+    assert sizes == sorted(sizes), f"workspace_ did not grow monotonically: {sizes}"
+    assert sizes[-1] == _ENCODER_SERVING_WORKSPACE, (
+        f"workspace_ grew to {sizes[-1]} bytes over the serving shapes, expected "
+        f"{_ENCODER_SERVING_WORKSPACE}; the sequence was {sizes}"
+    )
+
+
+def test_encoder_no_kv_cache_boundaries() -> None:
+    """The two things that are not how to ask for the no-KV-cache mode.
+
+    `update_kv_cache=False` is rejected outright, so the mode is selected by
+    the absence of the three addressing tensors and nothing else. And
+    head_size 72 exists only in the context phase: a context call over a paged
+    pool computes it correctly (a fallback kernel takes it), while a
+    generation-phase call raises. Both raises are host-side RuntimeErrors, not
+    a process abort -- a correct call after each one is still right.
+    """
+    torch.manual_seed(530)
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    seg_lens = [20]
+    qkv = torch.randn(20, 48 * 72, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="KV cache update cannot be disabled now"):
+        _encoder_call(qkv, seg_lens, 16, 16, 72, MASK_PADDING, workspace, update_kv_cache=False)
+
+    env = _PagedAttnEnv(
+        num_heads=16,
+        num_kv_heads=16,
+        head_dim=72,
+        tokens_per_block=32,
+        num_blocks=64,
+        max_blocks_per_seq=8,
+    )
+    env.add_request(0, 40)
+    ctx = env.random_qkv(40)
+    _compare(env.call_op(ctx, [40], 1, [0], MASK_CAUSAL), _op_reference(env, ctx, [40], [0]))
+    env.check_cache(0)
+    with pytest.raises(RuntimeError, match="unsupported head_size 72"):
+        env.call_op(env.random_qkv(1), [1], 0, [0], MASK_CAUSAL, record=False)
+
+    _compare(
+        _encoder_call(qkv, seg_lens, 16, 16, 72, MASK_PADDING, workspace),
+        _packed_reference(qkv, seg_lens, 16, 16, 72, causal=False),
+    )
+
+
+# ─── The entry's own cell list ──────────────────────────────────────────
+
+
+def _cell_standard(cell) -> None:
+    """A gpt-oss cell: GQA with sinks, with or without a sliding window.
+
+    Driven against `op.reference` rather than this file's `_sink_reference`,
+    which is the point of the cell list: the entry states what the op computes
+    and CI drives that statement. The two are cross-checked against each other
+    first, because a reference that disagrees with a reference is a different
+    failure from a kernel that moved.
+    """
+    spec = cell.spec
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    window = spec["window"]
+    heads = dict(num_heads=spec["num_heads"], num_kv_heads=spec["num_kv_heads"])
+    assert spec["head_size"] == SINK_D, spec["head_size"]
+    env = (
+        _sink_env(**heads, attention_window_size=window, num_blocks=96, max_blocks_per_seq=16)
+        if window
+        else _sink_env(**heads)
+    )
+    n_tokens = 200 if window else 48
+    sink = _sinks(-2.0, 4.0, seed=zlib.crc32(cell.why.encode()) % 1000, num_heads=spec["num_heads"])
+    env.add_request(0, n_tokens)
+    qkv = env.random_qkv(n_tokens)
+    out = _paged_ctx_call(env, qkv, [n_tokens], 1, [0], attention_sinks=sink)
+
+    hq, hkv, dim = env.num_heads, env.num_kv_heads, env.head_dim
+    q = qkv[:, : hq * dim]
+    k = torch.cat(env.k_history[0]).reshape(-1, hkv * dim)
+    v = torch.cat(env.v_history[0]).reshape(-1, hkv * dim)
+    ref = op.reference(
+        q,
+        k,
+        v,
+        [n_tokens],
+        [k.shape[0]],
+        num_heads=hq,
+        num_kv_heads=hkv,
+        qk_head_dim=dim,
+        v_head_dim=dim,
+        softmax_scale=1.0 / math.sqrt(dim),
+        causal=True,
+        attention_sinks=sink,
+        window=window,
+    )
+    local = _sink_reference(env, qkv, [n_tokens], [0], [0], sink, window=window)
+    torch.testing.assert_close(
+        ref.float(),
+        local.float(),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=lambda m: f"op.reference disagrees with _sink_reference\n{m}",
+    )
+    _compare(out, ref)
+
+
+def _cell_mla_context(cell) -> None:
+    """The deepseek MLA context cell, on the no-append flavour.
+
+    The appending flavour ropes q and k inside the call, and `reference` does
+    not model rope -- it is masked softmax attention over explicit K/V, and the
+    rope belongs to the entries beside this one. The no-append flavour takes
+    q/k already roped by the caller, which is the form the reference states, so
+    that is the one a cell can gate.
+
+    The two scale factors under quant_mode 128 -- `s**2` inside the softmax
+    scale and `s` on the output -- default to 1.0 on this flavour, which is why
+    only `e4m3_inputs` is set here.
+
+    Gated by `_compare_fp8_mla`, not `_compare`: see its docstring for why
+    the fp8 pool needs the fp8 MLA element band.
+    """
+    env = _fp8_r1_env(num_heads=cell.spec["num_heads"])
+    cached_lens, new_lens = [96, 31, 0], [32, 9, 25]
+    kv_lens = [c + n for c, n in zip(cached_lens, new_lens)]
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    for rid, total in enumerate(kv_lens):
+        env.add_request(rid, new_lens[rid])
+        env.reserve_cache_pages(rid, total)
+    k, v = _fp8_pool_backed_kv(env, cached_lens, new_lens)
+    q = torch.randn(sum(new_lens), env.num_heads * QK_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    out = env.call_context_no_append([0, 1, 2], new_lens, kv_lens, q, k, v)
+
+    ref = op.reference(
+        q,
+        k,
+        v,
+        new_lens,
+        kv_lens,
+        num_heads=cell.spec["num_heads"],
+        num_kv_heads=cell.spec["num_kv_heads"],
+        qk_head_dim=QK_HEAD_DIM,
+        v_head_dim=V_HEAD_DIM,
+        softmax_scale=env.softmax_scale,
+        causal=True,
+        e4m3_inputs=True,
+    )
+    local = _fp8_no_append_reference(env, q, k, v, new_lens, kv_lens)
+    torch.testing.assert_close(
+        ref.float(),
+        local.float(),
+        rtol=FP8_MLA_RTOL,
+        atol=FP8_MLA_ATOL,
+        msg=lambda m: f"op.reference disagrees with _fp8_no_append_reference\n{m}",
+    )
+    _compare_fp8_mla(out, ref)
+
+
+def _seed(cell) -> None:
+    """A cell's own seed, stable across processes (str hash is not)."""
+    torch.manual_seed(zlib.crc32(cell.why.encode()))
+
+
+def _cell_paged(cell, arm) -> None:
+    """A standard-configuration cell over a single-layer paged pool.
+
+    A first, uncertified context call fills each sequence's `cached` tokens;
+    the certified call then appends `new` rows per sequence (P for a generation
+    row) and is gated against `op.reference` over the history it should have
+    attended. Over an fp8 or NVFP4 pool every operand that call reads went through
+    e4m3, except on the packed context path, which never reads the pool.
+    """
+    spec = cell.spec
+    arm(op)
+    _seed(cell)
+    fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
+    nvfp4 = bool(spec["quant_mode"] & QUANT_MODE_NVFP4_KV_CACHE)
+    env = _PagedAttnEnv(
+        num_heads=spec["num_heads"],
+        num_kv_heads=spec["num_kv_heads"],
+        head_dim=spec["head_size"],
+        tokens_per_block=spec["tokens_per_block"],
+        num_blocks=spec["num_blocks"],
+        max_batch=spec["max_num_requests"],
+        max_blocks_per_seq=16,
+        pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
+        quant_mode=spec["quant_mode"],
+        kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
+    )
+    cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
+    p, paged = spec["predicted_tokens_per_seq"], spec["use_paged_context_fmha"]
+    assert all(n == p for n in new[nc:]), "a generation row carries P q rows"
+    assert paged or not any(cached[:nc]), "a cached prefix needs the paged-context path"
+    rids = list(range(len(new)))
+    for rid in rids:
+        env.add_request(rid, cached[rid] + (new[rid] if rid < nc else 0))
+    prior = [rid for rid in rids if cached[rid]]
+    if prior:
+        hist = [cached[rid] for rid in prior]
+        env.call_op(
+            env.random_qkv(sum(hist)),
+            hist,
+            len(prior),
+            prior,
+            MASK_CAUSAL,
+            ctx_lens_override=hist,
+            use_paged_context_fmha=paged,
+        )
+    qkv = env.random_qkv(sum(new))
+    out = env.call_op(
+        qkv,
+        list(new),
+        nc,
+        rids,
+        spec["mask_type"],
+        ctx_lens_override=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
+        use_paged_context_fmha=paged,
+        predicted_tokens_per_seq=p,
+    )
+    # One e4m3 flag covers the whole call: the packed path's context rows read
+    # bf16, its generation rows e4m3, so a cell never mixes the two there.
+    assert not (fp8 and not paged and 0 < nc < len(rids))
+    assert not (nvfp4 and not paged), "an NVFP4 cell runs the paged-context path"
+    e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
+    causal = spec["mask_type"] == MASK_CAUSAL
+    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3, nvfp4=nvfp4))
+    for rid in rids:
+        env.check_cache(rid)
+    env.check_unwritten_pool_zero()
+
+
+def _cell_layered(cell, arm) -> None:
+    """A qwen4_exp cell at one row of a 48-row mapping.
+
+    `hybrid48` is the engine's arrangement (rows 3, 7, ..., 47 on pool 0 at
+    layer-in-pool 0..11, the other 36 rows on pool 1); `identity48` a real
+    48-layer manager's single pool. The history goes in through the same row
+    by an uncertified context call. Beside `_compare`: the call moved its own
+    layer's slabs and no sibling's, and the second pool stayed untouched.
+    """
+    spec = cell.spec
+    arm(op)
+    _seed(cell)
+    row, p = spec["local_layer_idx"], spec["predicted_tokens_per_seq"]
+    cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
+    assert all(cached), "the history call drives every sequence of the cell"
+    fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
+    pool_kw = (
+        dict(dtype=DataType.FP8, quant_mode=spec["quant_mode"], kv_scaling_factor=spec["kv_scale"])
+        if fp8
+        else {}
+    )
+    if spec["pool_layout"] == "hybrid48":
+        env, other = _qwen_layer_pools(max_batch=spec["max_num_requests"], **pool_kw)
+        layer = QWEN_ATTN_LAYERS.index(row)
+    else:
+        env = _MultiLayerPagedAttnEnv(
+            num_layers=QWEN_NUM_LAYERS,
+            num_heads=spec["num_heads"],
+            num_kv_heads=spec["num_kv_heads"],
+            head_dim=spec["head_size"],
+            tokens_per_block=spec["tokens_per_block"],
+            num_blocks=24,
+            max_batch=spec["max_num_requests"],
+            max_seq_len=128,
+            **pool_kw,
+        )
+        other, layer = None, row
+
+    def tables() -> Dict:
+        if other is None:
+            return {}
+        ptrs, mapping, offsets = _compose_engine_mapping(env, other)
+        return dict(pool_pointers=ptrs, pool_mapping=mapping, block_offsets=offsets)
+
+    other_before = [] if other is None else [v.clone() for v in other.layer_views]
+    rids = list(range(len(new)))
+    for rid in rids:
+        env.add_request(rid, cached[rid] + (new[rid] if rid < nc else 0))
+    env.refresh_offsets(rids, num_contexts=len(rids))
+    hist = list(cached)
+    env.call_op(
+        layer,
+        env.random_qkv(sum(hist)),
+        hist,
+        len(rids),
+        rids,
+        local_layer_idx=row,
+        use_paged_context_fmha=True,
+        ctx_lens=hist,
+        **tables(),
+    )
+    if nc == 0:
+        for rid in rids:
+            for _ in range(p):
+                env.add_decode_token(rid)
+    env.refresh_offsets(rids, num_contexts=nc)
+    qkv = env.random_qkv(sum(new))
+    snapshot = [v.clone() for v in env.layer_views]
+    out = env.call_op(
+        layer,
+        qkv,
+        list(new),
+        nc,
+        rids,
+        local_layer_idx=row,
+        use_paged_context_fmha=True,
+        ctx_lens=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
+        predicted_tokens_per_seq=p,
+        **tables(),
+    )
+    _compare(out, _op_reference(env, qkv, list(new), rids, layer=layer, e4m3=fp8))
+    env.check_caches(rids, layers=[layer])
+    _assert_only_this_layer_moved(env, snapshot, layer, cell.why)
+    for before, after in zip(other_before, [] if other is None else other.layer_views):
+        assert _bitwise_equal(before, after), "a pool-0 row wrote the second pool"
+
+
+def _cell_encoder(cell, arm) -> None:
+    """The no-KV-cache mode: one context sequence per frame, no cache
+    addressing, gated against `op.reference` over each frame's own rows."""
+    spec = cell.spec
+    arm(op)
+    _seed(cell)
+    seg_lens = list(spec["seg_lens"])
+    h, hkv, d = spec["num_heads"], spec["num_kv_heads"], spec["head_size"]
+    qkv = torch.randn(sum(seg_lens), (h + 2 * hkv) * d, dtype=torch.bfloat16, device="cuda")
+    workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+    out = _encoder_call(qkv, seg_lens, h, hkv, d, spec["mask_type"], workspace)
+    causal = spec["mask_type"] == MASK_CAUSAL
+    _compare(out, _packed_reference(qkv, seg_lens, h, hkv, d, causal=causal))
+    del qkv, out
+    torch.cuda.empty_cache()
+
+
+#: The qwen4_exp full-attention call over an fp8-e4m3 pool at the production kv
+#: scale 1.0 (fp32 [1] scale tensors, quant_mode 128): what the trunk layers and
+#: the MTP draft layer pass when the engine serves an fp8 KV cache. Same chosen
+#: pool sizes as `QWEN4_DENSE`.
+_QWEN4_FP8 = dict(QWEN4_DENSE, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
+#: The same call over an NVFP4 pool: e2m1 data and a second pool of e4m3 block
+#: scales, fp32 [3] unit kv scales, `[1, 2, 2]` pool pointers, bf16 output --
+#: what the trunk layers and the MTP draft layer pass when the engine serves an
+#: NVFP4 KV cache. Same chosen pool sizes as `QWEN4_DENSE`.
+_QWEN4_NVFP4 = dict(QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
+#: `QWEN4_DENSE` and `_QWEN4_FP8` for a verify step of up to 32 requests, the captured-batch
+#: ceiling: one block-offset row per request and pages for 32 histories (the largest cell
+#: needs 133 of the 144).
+_QWEN4_DENSE_G32 = dict(QWEN4_DENSE, max_num_requests=32, num_blocks=144)
+_QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
+
+
+def _spread(batch: int, longest: int) -> tuple[int, ...]:
+    """`batch` histories rising evenly from 1 to `longest` tokens: one-page, page-boundary
+    and multi-page sequences in one verify step."""
+    return tuple(1 + (longest - 1) * i // (batch - 1) for i in range(batch))
+
+
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek MLA context: explicit k/v, qk 576 -> v 128, fp8 pool",
+            spec=dict(
+                input_type=MLA_CONTEXT,
+                num_heads=128,
+                num_kv_heads=128,
+                head_size=576,
+                v_head_dim=128,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        Cell(
+            why="deepseek MLA generation: one kv head, latent 576 -> 512, fp8 pool",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=128,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        # The per-rank head counts the deepseek default target runs under
+        # attention TP: the same two MLA code paths as the cells above, at the
+        # 128 heads split 2, 4 or 8 ways.
+        Cell(
+            why="deepseek default at attention TP8: MLA context, 16 heads per rank",
+            spec=dict(
+                input_type=MLA_CONTEXT,
+                num_heads=16,
+                num_kv_heads=16,
+                head_size=576,
+                v_head_dim=128,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        Cell(
+            why="deepseek default at attention TP2: MLA generation, 64 heads per rank",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=64,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        Cell(
+            why="deepseek default at attention TP8: MLA generation, 16 heads per rank",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=16,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        # MTP3 under attention TP: the verify step's taller query block (draft
+        # length 3 + 1 rows per sequence) at a split head count. The P > 1 mask
+        # itself is pinned at 128 heads by the MTP cases in the test.
+        Cell(
+            why="deepseek default MTP3 at attention TP8: MLA generation, 16 heads, P=4",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=16,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+    ),
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=64,
+                num_kv_heads=8,
+                head_size=64,
+                v_head_dim=64,
+                sinks=True,
+                window=128,
+                quant_mode=0,
+            ),
+        ),
+        Cell(
+            why="gpt-oss full layer: the same heads with no window",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=64,
+                num_kv_heads=8,
+                head_size=64,
+                v_head_dim=64,
+                sinks=True,
+                window=None,
+                quant_mode=0,
+            ),
+        ),
+        # The per-rank head counts the gpt-oss default target runs under
+        # attention TP: the same code path as the two cells above, at the
+        # head counts a rank holds after the split.
+        Cell(
+            why="gpt-oss default at attention TP8: 8q/1kv per rank, 128-token window",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=8,
+                num_kv_heads=1,
+                head_size=64,
+                v_head_dim=64,
+                sinks=True,
+                window=128,
+                quant_mode=0,
+            ),
+        ),
+    ),
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+        Cell(
+            why="qwen4_exp prefill: GQA 24q/2kv d256, bf16 pool, paged context; "
+            "a fresh 70-row sequence beside 33 rows over a 48-token cached prefix",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(0, 48),
+                new=(70, 33),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp decode P=1: one row per generation sequence over "
+            "page-crossing histories (70, 35)",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(70, 35),
+                new=(1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp MTP verify P=2 (max_draft_len 1): draft row t attends "
+            "[0, L-P+t], bottom-right causal within the block",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(70, 35),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp MTP verify P=3 (max_draft_len 2): a separate decode "
+            "compile, P reaches the kernel as maxSeqLenQ",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(70, 35),
+                new=(3, 3),
+                num_contexts=0,
+                predicted_tokens_per_seq=3,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp MTP verify P=4 (max_draft_len 3)",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(70, 35),
+                new=(4, 4),
+                num_contexts=0,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp MTP verify P={p} (max_draft_len {p - 1})"
+                + (": the target's ceiling" if p == 8 else ""),
+                spec=dict(
+                    QWEN4_DENSE,
+                    cached=(70, 35),
+                    new=(p, p),
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (5, 6, 7, 8)
+        ),
+        Cell(
+            why="qwen4_exp P=8 G=1: one draft block from row 95, across the page edge at 96",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(95,),
+                new=(8,),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        # The trtllm-gen launch picks its generation kernel by batch size at P 5..8, so each P
+        # is also driven at 32 requests and at one batch in 17..20, with histories of every
+        # page shape in the step.
+        *(
+            Cell(
+                why=f"qwen4_exp bf16 batch P={p} G=32: 32 blocks over histories 1..218, "
+                f"{32 * p} q rows",
+                spec=dict(
+                    _QWEN4_DENSE_G32,
+                    cached=_spread(32, 218),
+                    new=(p,) * 32,
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (5, 6, 7, 8)
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp bf16 batch P={p} G={g}: {g} blocks over histories 200..1, "
+                f"{g * p} q rows",
+                spec=dict(
+                    _QWEN4_DENSE_G32,
+                    cached=tuple(reversed(_spread(g, 200))),
+                    new=(p,) * g,
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p, g in ((5, 17), (6, 18), (7, 19), (8, 20))
+        ),
+        Cell(
+            why="qwen4_exp mixed step: a fresh 20-row context ahead of two P=2 "
+            "draft blocks, generation rows token-major after the context rows",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(0, 70, 35),
+                new=(20, 2, 2),
+                num_contexts=1,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp mixed step P=8: a fresh 20-row context ahead of two P=8 "
+            "draft blocks over histories 70 and 35",
+            spec=dict(
+                QWEN4_DENSE,
+                cached=(0, 70, 35),
+                new=(20, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp hybrid pool: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11), P=2 verify",
+            spec=dict(
+                QWEN4_DENSE,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp P=8 hybrid pool: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11), P=8 verify",
+            spec=dict(
+                QWEN4_DENSE,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp vision tower: no KV cache, MHA 16/16 d72, padding mask, "
+            "frames of 27/9/41 rows each attending only to itself",
+            spec=dict(QWEN4_VISION, seg_lens=(27, 9, 41)),
+        ),
+        Cell(
+            why="mmmu serving shape: one 5580-row frame, the 62x90 patch grid",
+            spec=dict(QWEN4_VISION, seg_lens=(5580,)),
+        ),
+        Cell(
+            why="mmmu serving shape: one 8160-row frame, the largest single-segment call",
+            spec=dict(QWEN4_VISION, seg_lens=(8160,)),
+        ),
+        Cell(
+            why="mmmu serving shape: 2204 rows in four frames",
+            spec=dict(QWEN4_VISION, seg_lens=(728, 728, 460, 288)),
+        ),
+        Cell(
+            why="mmmu serving shape: 1892 rows in five frames, the most segments per call",
+            spec=dict(QWEN4_VISION, seg_lens=(480, 480, 400, 352, 180)),
+        ),
+        Cell(
+            why="mmmu serving shape: 9008 rows in two frames",
+            spec=dict(QWEN4_VISION, seg_lens=(8000, 1008)),
+        ),
+        Cell(
+            why="mmmu serving shape: 22144 rows in two frames, the largest call; its "
+            "12544-row frame is the longest segment",
+            spec=dict(QWEN4_VISION, seg_lens=(12544, 9600)),
+        ),
+        # qwen4_exp's own geometry over an fp8 pool: the kv head count changes the compiled
+        # decode kernel, so the 24/4/256 cells above do not cover it.
+        Cell(
+            why="qwen4_exp fp8 pool paged-context prefill, 24/2/256: a fresh 48-row "
+            "sequence beside 33 rows over a 48-token e4m3 prefix",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 48),
+                new=(48, 33),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 pool decode P=1, 24/2/256: histories 200 and 48 span "
+            "pages and KV tiles",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(200, 48),
+                new=(1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        *(
+            Cell(
+                why=f"qwen4_exp fp8 pool MTP verify P={p}, 24/2/256 (max_draft_len {p - 1})",
+                spec=dict(
+                    _QWEN4_FP8,
+                    cached=(70, 35),
+                    new=(p, p),
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                ),
+            )
+            for p in (2, 4, 5, 6, 7, 8)
+        ),
+        Cell(
+            why="qwen4_exp fp8 pool mixed step P=3, 24/2/256: a 20-row context ahead "
+            "of two P=3 blocks over histories 31 and 64",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 31, 64),
+                new=(20, 3, 3),
+                num_contexts=1,
+                predicted_tokens_per_seq=3,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 pool mixed step P=8, 24/2/256: a 20-row context ahead "
+            "of two P=8 blocks over histories 31 and 64",
+            spec=dict(
+                _QWEN4_FP8,
+                cached=(0, 31, 64),
+                new=(20, 8, 8),
+                num_contexts=1,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        # KV stays within one 128-key tile (histories to 119 plus 8 rows), where the e4m3
+        # probability model of `reference` is the kernel's own at any batch.
+        Cell(
+            why="qwen4_exp fp8 batch P=8 G=32: 32 blocks over histories 1..119, 256 q rows",
+            spec=dict(
+                _QWEN4_FP8_G32,
+                cached=_spread(32, 119),
+                new=(8,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 hybrid pool P=2: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11) over e4m3 slabs",
+            spec=dict(
+                _QWEN4_FP8,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp fp8 hybrid pool P=8: row 47 of the 48-row two-pool mapping "
+            "(pool 0, layer-in-pool 11) over e4m3 slabs",
+            spec=dict(
+                _QWEN4_FP8,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(64, 25),
+                new=(8, 8),
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool paged-context prefill, 24/2/256: a fresh 48-row "
+            "sequence beside 33 rows over a 48-token e2m1 prefix",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 48),
+                new=(48, 33),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool decode P=1, 24/2/256: histories 200 and 48",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(200, 48),
+                new=(1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool MTP verify P=2, 24/2/256 (max_draft_len 1)",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(70, 35),
+                new=(2, 2),
+                num_contexts=0,
+                predicted_tokens_per_seq=2,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool MTP verify P=4, 24/2/256 (max_draft_len 3)",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(70, 35),
+                new=(4, 4),
+                num_contexts=0,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool mixed step P=1: a 20-row context ahead of two "
+            "1-row sequences over histories 31 and 64",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 31, 64),
+                new=(20, 1, 1),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="qwen4_exp nvfp4 pool mixed step P=4: a 20-row context ahead of two 4-row blocks",
+            spec=dict(
+                _QWEN4_NVFP4,
+                cached=(0, 31, 64),
+                new=(20, 4, 4),
+                num_contexts=1,
+                predicted_tokens_per_seq=4,
+            ),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811
+    """Drive every configuration the entry claims.
+
+    An MLA generation cell is not compared to `reference`: its output lives in
+    latent space, reconstructed from the paged cache, and the entry's
+    `reference` takes explicit K/V. It runs the latent-space decode check
+    `_fp8_mla_r1_generation_decode` at the cell's head count instead, after
+    `is_valid`.
+
+    The cells that state their batch as `cached`/`new` (or `seg_lens`, with no
+    KV cache) arm `certifying`, so their run is also proof that the entry's
+    own `__call__` and `reference` were the ones exercised.
+    """
+    spec = cell.spec
+    kind = spec["input_type"]
+    if spec.get("kv_cache") == "none":
+        _cell_encoder(cell, certifying)
+    elif "pool_layout" in spec:
+        _cell_layered(cell, certifying)
+    elif "cached" in spec:
+        _cell_paged(cell, certifying)
+    elif kind == STANDARD:
+        _cell_standard(cell)
+    elif kind == MLA_CONTEXT:
+        _cell_mla_context(cell)
+    else:
+        with validating(op):
+            op.is_valid(num_heads=cell.spec["num_heads"], num_kv_heads=cell.spec["num_kv_heads"])
+        _fp8_mla_r1_generation_decode(
+            cell.spec["num_heads"], cell.spec.get("predicted_tokens_per_seq", 1)
+        )

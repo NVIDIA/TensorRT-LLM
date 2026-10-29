@@ -7,7 +7,7 @@ set -ex
 source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 
 if [ -n "${GITHUB_MIRROR}" ]; then
-  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+  export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 
 # Use latest stable version from https://pypi.org/project/torch/#history

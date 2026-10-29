@@ -15,6 +15,62 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 def _register_fake():
+    from .._experimental.modeling_v2.models.kimi_k3_vl.ops import \
+        _native as _native
+
+    @torch.library.register_fake("trtllm::rotate_rows_")
+    def rotate_rows_(self: torch.Tensor, shift: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::scatter_kv_slots_")
+    def scatter_kv_slots_(
+        pool: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dst: torch.Tensor,
+        dst2: Optional[torch.Tensor] = None,
+        src: Optional[torch.Tensor] = None,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::block_causal_layout_")
+    def block_causal_layout_(
+        table: torch.Tensor,
+        private_pages: torch.Tensor,
+        causal_block_pages: torch.Tensor,
+        causal_block_offsets: torch.Tensor,
+        seq_len_kv: torch.Tensor,
+        own_slots: torch.Tensor,
+        current_private_src: torch.Tensor,
+        current_private_dst: torch.Tensor,
+        committed_private_src: torch.Tensor,
+        committed_private_dst: torch.Tensor,
+        staged_slots: Optional[torch.Tensor],
+        refill_src: Optional[torch.Tensor],
+        refill_dst: Optional[torch.Tensor],
+        causal_block_size: int,
+        tokens_per_page: int,
+        past: int,
+        fixed_tokens: int,
+        window_tokens: int,
+        num_pages: int,
+        drop_pages: int,
+        kv_factor: int,
+        kv_offset: int,
+        rows_per_page: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::copy_kv_slots_")
+    def copy_kv_slots_(
+        pool: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        num_layers: int,
+        num_heads: int,
+        tokens_per_page: int,
+    ) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
@@ -103,6 +159,7 @@ def _register_fake():
         return None
 
     @torch.library.register_fake("trtllm::allreduce_pg")
+    @torch.library.register_fake("trtllm::allreduce_pg_by_name")
     def _(
         input: torch.Tensor,
         residual: Optional[torch.Tensor],
@@ -120,6 +177,11 @@ def _register_fake():
     ):
         return allreduce(input, residual, norm_weight, scale, bias, workspace,
                          group, strategy, op, eps, trigger_completion_at_end)
+
+    @torch.library.register_fake("trtllm::allreduce_pg_warmup_by_name")
+    def _(token: torch.Tensor, group: List[int], rank: int,
+          group_name: str) -> torch.Tensor:
+        return token
 
     # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
@@ -261,6 +323,7 @@ def _register_fake():
         return input.new_empty(output_shape)
 
     @torch.library.register_fake("trtllm::allgather_pg")
+    @torch.library.register_fake("trtllm::allgather_pg_by_name")
     def _(input, sizes, group, process_group):
         return allgather(input, sizes, group)
 
@@ -317,6 +380,26 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::dsv3_router_latent_gemm_op")
+    def _(input: torch.Tensor, gate_weight: torch.Tensor,
+          down_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        for tensor in (input, gate_weight, down_weight):
+            torch._check(tensor.is_cuda and tensor.device == input.device)
+            torch._check(tensor.dim() == 2 and tensor.dtype == torch.bfloat16)
+            torch._check(tensor.is_contiguous())
+            torch._check(tensor.stride(0) == 7168)
+            torch._check(tensor.stride(1) == 1)
+            torch._check(tensor.storage_offset() % 8 == 0)
+        torch._check(input.shape[0] >= 1)
+        torch._check(input.shape[0] <= 16)
+        torch._check(input.shape[1] == 7168)
+        torch._check(gate_weight.shape[0] == 896)
+        torch._check(gate_weight.shape[1] == 7168)
+        torch._check(down_weight.shape[0] == 3584)
+        torch._check(down_weight.shape[1] == 7168)
+        return (input.new_empty((input.shape[0], 896), dtype=torch.float32),
+                input.new_empty((input.shape[0], 3584), dtype=torch.bfloat16))
+
     @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
@@ -362,6 +445,11 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::inplace_slice_copy")
     def _(dest, src, dim1_start, dim1_end):
+        pass
+
+    @torch.library.register_fake("trtllm::dwdp_fabric_gather")
+    def _(dst_ptrs, src_ptrs, lines, row_starts, blocks_per_row, threads):
+        # Copies through raw device pointers; no return value.
         pass
 
     @torch.library.register_fake("trtllm::indexer_topk_prefill")
@@ -517,6 +605,8 @@ def _register_fake():
         topk: int,
         route_scale: float,
         is_hash: bool,
+        image_mask: Optional[torch.Tensor] = None,
+        vision_bias: Optional[torch.Tensor] = None,
     ) -> None:
         # In-place operation, no return value.
         pass
@@ -763,13 +853,11 @@ def _register_fake():
     @torch.library.register_fake("trtllm::moe_a2a_initialize")
     def _(
         workspace: torch.Tensor,
+        metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
-        max_num_tokens_per_rank: int,
-        eplb_stats_num_experts: Optional[int] = None,
-        can_use_cft_counted_writes: bool = False,
-    ) -> torch.Tensor:
-        return torch.empty((10, ), dtype=torch.int64, device="cpu")
+    ) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::moe_a2a_sanitize_expert_ids")
     def _(
@@ -784,10 +872,10 @@ def _register_fake():
     @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
     def _(
         workspace: torch.Tensor,
+        metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
         runtime_max_tokens_per_rank: int,
-        combine_payload_offset: int,
         out_dtype: torch.dtype,
         hidden_size: int,
     ) -> torch.Tensor:
@@ -944,6 +1032,20 @@ def _register_fake():
     ) -> torch.Tensor:
         return logits.new_empty(logits.shape, dtype=torch.float32)
 
+    @torch.library.register_fake("trtllm::chain_speculative_sampling")
+    def _(
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_probs: torch.Tensor,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_draft = draft_token_ids.shape
+        return (
+            draft_token_ids.new_empty((batch_size, num_draft + 1)),
+            draft_token_ids.new_empty((batch_size, )),
+        )
+
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
     def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
@@ -952,6 +1054,25 @@ def _register_fake():
         return logits.new_empty((batch_size, num_mtp_modules + 1),
                                 dtype=torch.int32), logits.new_empty(
                                     (batch_size, ), dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::sage_quantize")
+    def _(query: Optional[torch.Tensor],
+          key: torch.Tensor,
+          value: torch.Tensor,
+          cu_seqlens_q: Optional[torch.Tensor],
+          cu_seqlens_kv: torch.Tensor,
+          q_quant: Optional[torch.Tensor],
+          k_quant: torch.Tensor,
+          v_quant: torch.Tensor,
+          q_scale: Optional[torch.Tensor],
+          k_scale: torch.Tensor,
+          v_scale: torch.Tensor,
+          k_mean: Optional[torch.Tensor],
+          v_mean: Optional[torch.Tensor],
+          q_block_size: int,
+          k_block_size: int,
+          reuse_stats: bool = False) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128")
     def _(input: torch.Tensor, use_ue8m0: bool = False):
@@ -1333,6 +1454,7 @@ def _register_fake():
         return [create_output_tensor(i) for i in input_list]
 
     @torch.library.register_fake("trtllm::allgather_list_pg")
+    @torch.library.register_fake("trtllm::allgather_list_pg_by_name")
     def _(input_list, sizes, group, process_group):
         return allgather_list(input_list, sizes, group)
 
@@ -1351,6 +1473,29 @@ def _register_fake():
     @torch.library.register_fake("trtllm::reducescatter_pg")
     def _(input, sizes, group, process_group):
         return reducescatter(input, sizes, group)
+
+    @torch.library.register_fake("trtllm::reducescatter_pg_by_name")
+    def _(input, sizes, group, rank, group_name):
+        shape = list(input.shape)
+        shape[0] = input.shape[0] // len(
+            group) if sizes is None else sizes[rank]
+        return input.new_empty(shape)
+
+    @torch.library.register_fake("trtllm::reducescatter_list")
+    @torch.library.register_fake("trtllm::reducescatter_list_pg")
+    def _(input_list, sizes, group, process_group=None):
+        return [reducescatter(value, sizes, group) for value in input_list]
+
+    @torch.library.register_fake("trtllm::reducescatter_list_pg_by_name")
+    def _(input_list, sizes, group, rank, group_name):
+
+        def create_output(value):
+            shape = list(value.shape)
+            shape[0] = (value.shape[0] //
+                        len(group) if sizes is None else sizes[rank])
+            return value.new_empty(shape)
+
+        return [create_output(value) for value in input_list]
 
     @torch.library.register_fake("trtllm::block_scale_interleave")
     def _(sf: torch.Tensor):
@@ -1428,6 +1573,17 @@ def _register_fake():
             return base.transpose(1, 2) if layout == 0 else base
 
         return (_mk(q_in), _mk(k_in), _mk(v_in))
+
+    @torch.library.register_fake("trtllm::ulysses_packed_qkv_post_unscatter")
+    def _(qkv_in, layout=0):
+        P, B, Sp, qkv_count, H, D = qkv_in.shape
+        assert qkv_count == 3
+
+        def _mk():
+            base = qkv_in.new_empty((B, P * Sp, H, D))
+            return base.transpose(1, 2) if layout == 0 else base
+
+        return (_mk(), _mk(), _mk())
 
     @torch.library.register_fake("trtllm::helix_post_process")
     def _(gathered_o, gathered_stats, scale):

@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA storage constants, backend selection, and kernel tuning policy."""
 
+import functools
 import importlib.util
+import inspect
 import os
 from typing import Any, Literal, Optional
 
@@ -127,6 +129,33 @@ def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
     return _env_enabled_default(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, False)
 
 
+FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
+# Packed decode: each request owns a 128-row-padded block of [query token, head]
+# Q rows, the kernel splits KV across grid.z tasks and reads per-row causal
+# bounds, so no Q padding/copies, no Q replication, and Helix stays split.
+_FP4_MLA_PACKED_MAX_M = 1024
+_FP4_MLA_PACKED_MAX_SPLITS = 16
+_FP4_MLA_PACKED_MIN_TILES_PER_SPLIT = 2
+_FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
+
+
+def _fp4_mla_packed_q_enabled() -> bool:
+    """Whether decode uses the packed per-request Q layout (mufu16 CuTe DSL only)."""
+    return (
+        _env_enabled_default(FP4_MLA_PACKED_Q_ENV, True)
+        and _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
+        and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+    )
+
+
+def _fp4_mla_packed_rows_per_seq(num_heads: int, query_len: int) -> int:
+    """Rows one request owns in the packed Q layout, or 0 when packing is off."""
+    if not _fp4_mla_packed_q_enabled() or num_heads <= 0 or query_len <= 0:
+        return 0
+    rows = _ceil_div(num_heads * query_len, FP4_MLA_SCALE_ROW_GROUP) * FP4_MLA_SCALE_ROW_GROUP
+    return rows if rows <= _FP4_MLA_PACKED_MAX_M else 0
+
+
 def _env_int(name: str) -> Optional[int]:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -138,16 +167,39 @@ def _fp4_mla_attention_backend() -> str:
     backend = os.getenv(FP4_MLA_ATTENTION_BACKEND_ENV)
     if backend:
         return backend.lower()
-    return _FP4_MLA_CUTEDSL_BACKEND if get_sm_version() == 107 else "triton"
+    if get_sm_version() == 107 and _cutedsl_backend_available():
+        return _FP4_MLA_CUTEDSL_BACKEND
+    return "triton"
 
 
+# Modules the FP4 MLA CuTe DSL kernels import.
+_CUTEDSL_REQUIRED_MODULES = (
+    "cutlass.cute",
+    "cutlass.experimental",
+    "cuda.bindings.driver",
+)
+
+
+def _cutedsl_dsl_supports_fp4_mla_kernels() -> bool:
+    """Whether the installed CuTe DSL has the descriptor API the kernels use.
+
+    The kernels build tcgen05 shared-memory descriptors with a K-segment
+    offset, which the public nvidia-cutlass-dsl release does not provide.
+    """
+    from cutlass.experimental.primitives import Tcgen05SmemDesc
+
+    return "k_segment_offset" in inspect.signature(Tcgen05SmemDesc.build).parameters
+
+
+@functools.cache
 def _cutedsl_backend_available() -> bool:
     try:
-        return all(
-            importlib.util.find_spec(module) is not None
-            for module in ("ctm", "cutlass", "cuda.bindings.driver")
-        )
-    except ModuleNotFoundError:
+        if not all(
+            importlib.util.find_spec(module) is not None for module in _CUTEDSL_REQUIRED_MODULES
+        ):
+            return False
+        return _cutedsl_dsl_supports_fp4_mla_kernels()
+    except ImportError:
         return False
 
 

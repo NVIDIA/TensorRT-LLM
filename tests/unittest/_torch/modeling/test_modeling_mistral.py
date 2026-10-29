@@ -25,6 +25,7 @@ from tensorrt_llm._torch.models import modeling_mistral
 from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.models import modeling_utils
@@ -475,7 +476,7 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0, False)
+                key = KeyType(batch_size=1, draft_len=0)
                 graph_runner.capture(key, lambda inputs: mistral.forward(**inputs), inputs)
 
                 for _ in range(2):
@@ -721,13 +722,11 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     processor = object.__new__(MistralHFInputProcessor)
     processor._vision_geometry = lambda: (14, 2, 3, 1024)
 
-    metadata = processor.get_mm_encoder_item_metadata(
-        [], {"image": {"image_sizes": [[28, 56], [56, 56]]}}
-    )
+    metadata = processor.get_mm_item_metadata([], {"image": {"image_sizes": [[28, 56], [56, 56]]}})
 
-    assert metadata.item_refs == [("image", 0), ("image", 1)]
-    assert metadata.encoder_token_lengths == [8, 16]
-    assert metadata.output_embedding_lengths == [2, 4]
+    assert metadata.item_refs == (("image", 0), ("image", 1))
+    assert metadata.encoder_token_lengths == (8, 16)
+    assert metadata.output_embedding_lengths == (2, 4)
 
 
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
