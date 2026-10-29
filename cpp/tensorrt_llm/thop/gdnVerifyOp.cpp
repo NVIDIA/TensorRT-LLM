@@ -43,25 +43,53 @@ void checkCudaInt32(at::Tensor const& t, char const* name)
         " must be a contiguous CUDA int32 tensor");
 }
 
+//! A [replay slots] int32 bookkeeping row of the replay history; the slot stride may differ from 1.
+void checkReplayRow(at::Tensor const& t, char const* name)
+{
+    TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kInt && t.dim() == 1, name,
+        " must be a one-dimensional CUDA int32 tensor");
+}
+
+//! Whether the dimensions after the leading slot dimension are packed.
+bool hasPackedSlotRows(at::Tensor const& t)
+{
+    int64_t expected = 1;
+    for (int64_t d = t.dim() - 1; d > 0; --d)
+    {
+        if (t.size(d) != 1 && t.stride(d) != expected)
+        {
+            return false;
+        }
+        expected *= t.size(d);
+    }
+    return true;
+}
+
 } // namespace
 
 //! Replay + gated RMSNorm of one MTP target-verify step of a gated DeltaNet layer (see gdnVerifyKernels.h).
 //! Updates ssm_states (checkpoint commit), old_u, old_k and old_g in place and returns the norm output
-//! [N*T, HV*128], FP8 E4M3 when fp8_scale is given, else bf16.
+//! [N*T, HV*128], FP8 E4M3 when fp8_scale is given, else bf16. The history and its bookkeeping are addressed by
+//! replay_indices, which default to state_indices; their slot strides may be those of a pool page.
 at::Tensor gdnVerify(at::Tensor const& qkv, at::Tensor const& z, at::Tensor const& a, at::Tensor const& b,
     at::Tensor const& logA, at::Tensor const& dtBias, at::Tensor const& normWeight,
     std::optional<at::Tensor> const& fp8Scale, double normEps, at::Tensor& ssmStates, at::Tensor const& stateIndices,
     at::Tensor& oldU, at::Tensor& oldK, at::Tensor& oldG, at::Tensor const& cacheBufIdx,
-    at::Tensor const& prevNumAcceptedTokens)
+    at::Tensor const& prevNumAcceptedTokens, std::optional<at::Tensor> const& replayIndices)
 {
     constexpr int64_t kDim = tk::kGdnVerifyHeadDim;
     constexpr int64_t kHist = tk::kGdnVerifyHistory;
     TORCH_CHECK(tensorrt_llm::common::getSMVersion() >= 90, "gdn_verify needs SM90+");
 
     checkCudaInt32(stateIndices, "state_indices");
-    checkCudaInt32(cacheBufIdx, "cache_buf_idx");
-    checkCudaInt32(prevNumAcceptedTokens, "prev_num_accepted_tokens");
+    checkReplayRow(cacheBufIdx, "cache_buf_idx");
+    checkReplayRow(prevNumAcceptedTokens, "prev_num_accepted_tokens");
     int64_t const numRequests = stateIndices.size(0);
+    if (replayIndices.has_value())
+    {
+        checkCudaInt32(*replayIndices, "replay_indices");
+        TORCH_CHECK(replayIndices->numel() == numRequests, "replay_indices must hold one slot per request");
+    }
     TORCH_CHECK(numRequests > 0 && qkv.dim() == 2 && qkv.size(0) % numRequests == 0,
         "qkv must be [num_requests * num_tokens, channels]");
     int64_t const numTokens = qkv.size(0) / numRequests;
@@ -70,18 +98,22 @@ at::Tensor gdnVerify(at::Tensor const& qkv, at::Tensor const& z, at::Tensor cons
 
     checkCudaBf16(oldU, "old_u");
     checkCudaBf16(oldK, "old_k");
-    TORCH_CHECK(
-        oldU.is_contiguous() && oldU.dim() == 5 && oldU.size(1) == 2 && oldU.size(2) == kHist && oldU.size(4) == kDim,
-        "old_u must be a contiguous [slots, 2, 16, HV, 128] tensor");
-    TORCH_CHECK(
-        oldK.is_contiguous() && oldK.dim() == 5 && oldK.size(1) == 2 && oldK.size(2) == kHist && oldK.size(4) == kDim,
-        "old_k must be a contiguous [slots, 2, 16, HK, 128] tensor");
+    TORCH_CHECK(hasPackedSlotRows(oldU) && oldU.dim() == 5 && oldU.size(1) == 2 && oldU.size(2) == kHist
+            && oldU.size(4) == kDim,
+        "old_u must be a [slots, 2, 16, HV, 128] tensor with packed slot rows");
+    TORCH_CHECK(hasPackedSlotRows(oldK) && oldK.dim() == 5 && oldK.size(1) == 2 && oldK.size(2) == kHist
+            && oldK.size(4) == kDim && oldK.stride(0) % 8 == 0
+            && reinterpret_cast<uintptr_t>(oldK.data_ptr()) % 16 == 0,
+        "old_k must be a [slots, 2, 16, HK, 128] tensor with packed, 16-byte aligned slot rows");
     int64_t const numVHeads = oldU.size(3);
     int64_t const numKHeads = oldK.size(3);
     TORCH_CHECK(numVHeads % numKHeads == 0, "the value heads must be a multiple of the key heads");
-    TORCH_CHECK(oldG.is_cuda() && oldG.scalar_type() == at::kFloat && oldG.is_contiguous()
+    TORCH_CHECK(oldG.is_cuda() && oldG.scalar_type() == at::kFloat && hasPackedSlotRows(oldG)
             && oldG.sizes() == at::IntArrayRef({oldU.size(0), 2, numVHeads, kHist}),
-        "old_g must be a contiguous float32 [slots, 2, HV, 16] tensor");
+        "old_g must be a float32 [slots, 2, HV, 16] tensor with packed slot rows");
+    TORCH_CHECK(oldK.size(0) == oldU.size(0) && cacheBufIdx.size(0) == oldU.size(0)
+            && prevNumAcceptedTokens.size(0) == oldU.size(0),
+        "the history and its bookkeeping must have the same replay slots");
 
     checkCudaBf16(qkv, "qkv");
     TORCH_CHECK(qkv.size(1) >= (2 * numKHeads + numVHeads) * kDim && qkv.stride(1) == 1 && qkv.stride(0) % 8 == 0
@@ -137,11 +169,17 @@ at::Tensor gdnVerify(at::Tensor const& qkv, at::Tensor const& z, at::Tensor cons
     params.ssmStates = ssmStates.data_ptr();
     params.ssmSlotStride = ssmStates.stride(0);
     params.stateIndices = stateIndices.data_ptr<int32_t>();
+    params.replayIndices = replayIndices.has_value() ? replayIndices->data_ptr<int32_t>() : params.stateIndices;
     params.oldU = oldU.data_ptr();
     params.oldK = oldK.data_ptr();
     params.oldG = oldG.data_ptr<float>();
     params.cacheBufIdx = cacheBufIdx.data_ptr<int32_t>();
     params.prevNumAcceptedTokens = prevNumAcceptedTokens.data_ptr<int32_t>();
+    params.oldUSlotStride = oldU.stride(0);
+    params.oldKSlotStride = oldK.stride(0);
+    params.oldGSlotStride = oldG.stride(0);
+    params.cacheBufIdxStride = cacheBufIdx.stride(0);
+    params.prevNumAcceptedTokensStride = prevNumAcceptedTokens.stride(0);
     params.out = out.data_ptr();
     params.outStride = out.stride(0);
     params.numRequests = static_cast<int>(numRequests);
@@ -161,7 +199,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "gdn_verify(Tensor qkv, Tensor z, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor norm_weight, "
         "Tensor? fp8_scale, float norm_eps, Tensor(a!) ssm_states, Tensor state_indices, Tensor(b!) old_u, "
-        "Tensor(c!) old_k, Tensor(d!) old_g, Tensor cache_buf_idx, Tensor prev_num_accepted_tokens) -> Tensor");
+        "Tensor(c!) old_k, Tensor(d!) old_g, Tensor cache_buf_idx, Tensor prev_num_accepted_tokens, "
+        "Tensor? replay_indices=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

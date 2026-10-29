@@ -1002,7 +1002,13 @@ def test_layer_payload_preserves_storage_and_strides(kind, layer):
             assert payload.intermediate_ssm is None
             assert payload.cache_buf_idx is state.cache_buf_idx
             assert payload.prev_num_accepted_tokens is state.prev_num_accepted_tokens
-            for name in ("old_x", "old_B", "old_dt", "old_dA_cumsum"):
+            history = ("old_x", "old_B", "old_dt")
+            if kind == "replay":
+                history += ("old_dA_cumsum",)
+            else:
+                # GDN's cached replay embeds beta in its history; it keeps no dA cumsum.
+                assert payload.old_dA_cumsum is None
+            for name in history:
                 pairs.append((getattr(payload, name), getattr(state, name)[layer]))
         else:
             pairs.append((payload.intermediate_ssm, state.intermediate_ssm[layer]))
@@ -1081,7 +1087,10 @@ def test_mamba_seed_reset_matches_between_intermediate_and_replay(replay_cls):
     original = intermediate.rand_seed.clone()
     replay.prev_num_accepted_tokens.fill_(7)
     replay.cache_buf_idx.fill_(1)
-    for buffer in (replay.old_x, replay.old_B, replay.old_dt, replay.old_dA_cumsum):
+    history = [replay.old_x, replay.old_B, replay.old_dt]
+    if replay_cls is ReplayHistory:
+        history.append(replay.old_dA_cumsum)
+    for buffer in history:
         buffer.fill_(4)
     slots = torch.tensor([3, 1])
     for state in (intermediate, replay):
@@ -1091,7 +1100,7 @@ def test_mamba_seed_reset_matches_between_intermediate_and_replay(replay_cls):
     torch.testing.assert_close(intermediate.rand_seed[[0, 2, 4]], original[[0, 2, 4]])
     assert replay.prev_num_accepted_tokens.tolist() == [7, 0, 7, 0, 7]
     assert replay.cache_buf_idx.tolist() == [1, 0, 1, 0, 1]
-    for buffer in (replay.old_x, replay.old_B, replay.old_dt, replay.old_dA_cumsum):
+    for buffer in history:
         assert torch.count_nonzero(buffer[:, slots]) == 0
         assert torch.all(buffer[:, [0, 2, 4]] == 4)
     for state in (intermediate, replay):

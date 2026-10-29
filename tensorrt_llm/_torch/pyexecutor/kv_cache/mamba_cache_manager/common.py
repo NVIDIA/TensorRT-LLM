@@ -359,11 +359,14 @@ def _promote_mamba_state_kernel(
     accepted_position_source_ptr,
     num_accepted_tokens_ptr,
     blk_ptr,
+    replay_idx_ptr,
     replay_pnat_ptr,
     replay_cache_buf_idx_ptr,
     dummy_request_mask_ptr,
     num_gens,
     count,
+    replay_pnat_stride,
+    replay_cache_buf_idx_stride,
     src_s_layer,
     src_s_row,
     src_s_step,
@@ -395,13 +398,16 @@ def _promote_mamba_state_kernel(
         if (layer == 0) & (tile == 0):
             num_accepted_tokens = tl.load(num_accepted_tokens_ptr + g)
             is_dummy_request = tl.load(dummy_request_mask_ptr + g)
-            pnat = tl.load(replay_pnat_ptr + blk)
-            cache_buf_idx = tl.load(replay_cache_buf_idx_ptr + blk)
+            replay_slot = tl.load(replay_idx_ptr + g).to(tl.int64)
+            pnat_ptr = replay_pnat_ptr + replay_slot * replay_pnat_stride
+            cache_buf_idx_ptr = replay_cache_buf_idx_ptr + replay_slot * replay_cache_buf_idx_stride
+            pnat = tl.load(pnat_ptr)
+            cache_buf_idx = tl.load(cache_buf_idx_ptr)
             wrote_checkpoint = pnat + REPLAY_STEP_WIDTH > REPLAY_HISTORY_SIZE
             next_pnat = tl.where(wrote_checkpoint, num_accepted_tokens, pnat + num_accepted_tokens)
             next_cache_buf_idx = tl.where(wrote_checkpoint, 1 - cache_buf_idx, cache_buf_idx)
-            tl.store(replay_pnat_ptr + blk, next_pnat, mask=~is_dummy_request)
-            tl.store(replay_cache_buf_idx_ptr + blk, next_cache_buf_idx, mask=~is_dummy_request)
+            tl.store(pnat_ptr, next_pnat, mask=~is_dummy_request)
+            tl.store(cache_buf_idx_ptr, next_cache_buf_idx, mask=~is_dummy_request)
 
     # int64 throughout: per-layer strides are O(1e8), so layer*stride overflows
     # int32 and would corrupt addresses / fault.
@@ -426,6 +432,7 @@ def _promote_mamba_state_triton(
     dummy_request_mask: Optional[torch.Tensor] = None,
     replay_step_width: int = 0,
     replay_history_size: int = 0,
+    replay_indices: Optional[torch.Tensor] = None,
     BLOCK: int = 2048,
 ) -> None:
     """Scatter each generation request's accepted draft-step recurrent state
@@ -451,6 +458,10 @@ def _promote_mamba_state_triton(
         replay_pnat, replay_cache_buf_idx, dummy_request_mask: Optional replay
             metadata. When supplied together, the kernel advances PNAT and the
             active history buffer while promoting the convolution state.
+            ``replay_pnat`` and ``replay_cache_buf_idx`` may be strided.
+        replay_indices: ``[num_gens]`` rows of ``replay_pnat`` and
+            ``replay_cache_buf_idx`` to advance; ``None`` means
+            ``dst_state_indices``.
 
     For each gen ``g``::
 
@@ -478,14 +489,19 @@ def _promote_mamba_state_triton(
         assert replay_cache_buf_idx.dtype == torch.int32
         assert dummy_request_mask.dtype == torch.bool
         assert dummy_request_mask.numel() >= num_gens
+        if replay_indices is None:
+            replay_indices = dst_state_indices
+        assert replay_indices.numel() >= num_gens
     else:
         # Compile-time-disabled pointer arguments still require tensors.
         num_accepted_tokens = accepted_position_source
         assert replay_cache_buf_idx is None
         assert dummy_request_mask is None
+        assert replay_indices is None
         replay_pnat = dst_state_indices
         replay_cache_buf_idx = dst_state_indices
         dummy_request_mask = dst_state_indices
+        replay_indices = dst_state_indices
     count = 1
     for s in dst.shape[2:]:
         count *= s
@@ -502,11 +518,14 @@ def _promote_mamba_state_triton(
         accepted_position_source,
         num_accepted_tokens,
         dst_state_indices,
+        replay_indices,
         replay_pnat,
         replay_cache_buf_idx,
         dummy_request_mask,
         num_gens,
         count,
+        replay_pnat.stride(0),
+        replay_cache_buf_idx.stride(0),
         intermediate.stride(0),
         intermediate.stride(1),
         intermediate.stride(2),
