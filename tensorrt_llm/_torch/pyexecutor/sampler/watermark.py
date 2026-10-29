@@ -82,37 +82,6 @@ def _owner_ref(request: LlmRequest) -> Callable[[], Optional[LlmRequest]]:
         return lambda: request
 
 
-class PinnedStager:
-    """Copies small host lists to a device buffer without allocating pinned memory per step.
-
-    Allocating pinned host memory synchronizes with the device, which can deadlock a tensor
-    parallel step whose ranks are inside a collective. The staging buffers are allocated once
-    and reused round-robin; a buffer is rewritten only after its previous copy has finished.
-    """
-
-    def __init__(self, capacity: int, dtype: torch.dtype, depth: int = 4):
-        self._dtype = dtype
-        self._buffers = [
-            torch.empty(capacity, dtype=dtype, pin_memory=prefer_pinned()) for _ in range(depth)
-        ]
-        self._events: list[Optional[torch.cuda.Event]] = [None] * depth
-        self._next = 0
-
-    def copy_to(self, values: list, dest: torch.Tensor) -> None:
-        """Write ``values`` to the leading entries of ``dest`` (device) and zero-fill nothing else."""
-        index = self._next
-        self._next = (index + 1) % len(self._buffers)
-        event = self._events[index]
-        if event is not None:
-            event.synchronize()
-        count = len(values)
-        buffer = self._buffers[index]
-        buffer[:count] = torch.tensor(values, dtype=self._dtype)
-        dest[:count].copy_(buffer[:count], non_blocking=True)
-        event = self._events[index] = torch.cuda.Event()
-        event.record()
-
-
 @dataclass
 class WatermarkRows:
     """Seeds and masks for the windows of one sampling call (``B`` requests, ``K1`` positions)."""
