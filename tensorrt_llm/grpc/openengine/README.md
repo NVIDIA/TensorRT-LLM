@@ -140,16 +140,12 @@ and continue with IDs above `token_id_offset`; a router can normalize those
 tokens using identities it sent in `MediaItem.uuid`. Native block hashes, parent chains, and removals retain
 their existing meaning. Cache hashing continues to include image content.
 
-The publisher retains at most `max_entries` digest-to-UUID associations and skips
-UUIDs longer than 256 UTF-8 bytes. Conflicting hints mark a digest ambiguous until
-its entry is evicted or the publisher restarts, without failing inference.
-Every registration refreshes the entry's LRU position, including ambiguous entries,
-so a frequently registered digest can remain ambiguous for the publisher's lifetime.
-An agreeing registration does not restore a hint after a conflict. Missing, evicted,
-or ambiguous hints omit the UUID while retaining the image-routing metadata. Consumers
-must ignore unmapped image stores while continuing to process removals. Routing
-identities must refer to stable media content. This extension does not change the
-OpenEngine schema.
+Native multimodal token contexts carry the optional UUID alongside the digest,
+including continuation blocks. The publisher reads this identity directly from
+native events; items without a UUID omit it. Consumers must ignore image stores
+without a usable identity while continuing to process removals. Routing identities
+must refer to stable media content. This extension does not change the OpenEngine
+schema.
 
 ### Node-local discovery
 

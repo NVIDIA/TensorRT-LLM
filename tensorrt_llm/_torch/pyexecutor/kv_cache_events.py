@@ -29,10 +29,10 @@ import threading
 import time
 import traceback
 from abc import ABC, abstractmethod
-from collections import OrderedDict, deque
+from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import msgspec
 import zmq
@@ -561,9 +561,6 @@ class _StreamingEventSource:
         self._block_size = block_size
         self._include_mm_keys = mm_token_id_offset is not None
         self._mm_token_id_offset = mm_token_id_offset
-        self._uuid_capacity = max_entries
-        self._uuids: OrderedDict[bytes, str | None] = OrderedDict()
-        self._uuid_lock = threading.Lock()
         self._event_sink = kv_cache_manager_v2_runtime.StreamingEventSink(
             max_entries=max_entries,
             mm_token_id_offset=mm_token_id_offset,
@@ -572,27 +569,6 @@ class _StreamingEventSource:
     @property
     def event_sink(self) -> kv_cache_manager_v2_runtime.StreamingEventSink:
         return self._event_sink
-
-    def remember_multimodal_uuids(self, items: Iterable[tuple[bytes, str]]) -> None:
-        """Retain bounded routing hints without changing native cache keys."""
-        for digest, uuid in items:
-            if len(uuid.encode("utf-8")) > 256:
-                continue
-            with self._uuid_lock:
-                if digest in self._uuids and self._uuids[digest] != uuid:
-                    # Keep conflicting hints ambiguous until their bounded entry is evicted.
-                    self._uuids[digest] = None
-                else:
-                    self._uuids[digest] = uuid
-                self._uuids.move_to_end(digest)
-                while len(self._uuids) > self._uuid_capacity:
-                    self._uuids.popitem(last=False)
-
-    def _multimodal_key(self, key: tuple) -> MultimodalKey:
-        digest = bytes(key[0])
-        with self._uuid_lock:
-            uuid = self._uuids.get(digest)
-        return MultimodalKey(hash=digest.hex(), start_offset=key[1], uuid=uuid)
 
     def set_target_life_cycle(self, life_cycle_id: int) -> None:
         self._event_sink.set_target_life_cycle(life_cycle_id)
@@ -603,7 +579,14 @@ class _StreamingEventSource:
             if isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockStoredData):
                 mm_keys = (
                     [
-                        [self._multimodal_key(key) for key in block_keys]
+                        [
+                            MultimodalKey(
+                                hash=bytes(key[0]).hex(),
+                                start_offset=key[1],
+                                uuid=key[2] if len(key) >= 3 else None,
+                            )
+                            for key in block_keys
+                        ]
                         for block_keys in event.mm_keys
                     ]
                     if self._include_mm_keys
@@ -686,10 +669,6 @@ class StreamingKVCacheEventManager:
     def start(self) -> None:
         """Bind the publisher's sockets and start its background thread."""
         self._publisher.start()
-
-    def remember_multimodal_uuids(self, items: Iterable[tuple[bytes, str]]) -> None:
-        """Associate native MM digests with optional request identities."""
-        self._event_source.remember_multimodal_uuids(items)
 
     def get_source_descriptor(self) -> dict[str, str | int] | None:
         """Describe a live ZMQ publisher for OpenEngine node discovery."""
