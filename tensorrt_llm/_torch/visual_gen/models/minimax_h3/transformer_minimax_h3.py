@@ -245,6 +245,7 @@ class MiniMaxH3Attention(Attention):
             key,
             value,
             key_padding_mask=key_padding_mask,
+            discard_padded_queries=True,
             timestep=timestep,
         )
         return self.to_out[0](hidden_states)
@@ -285,6 +286,7 @@ class MiniMaxH3Attention(Attention):
             compute_k,
             compute_v,
             key_padding_mask=key_padding_mask,
+            discard_padded_queries=True,
             timestep=timestep,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
@@ -477,6 +479,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
         self._supports_key_padding_mask = model_config.attention.backend.upper() in (
             "VANILLA",
             "FA4",
+            "TRTLLM",
+            "FLASHINFER",
         )
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
@@ -512,10 +516,13 @@ class MiniMaxH3TokenRefiner(nn.Module):
         if pad:
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
-                    "Padded token-refiner sequences require key_padding_mask support; use VANILLA or FA4."
+                    "Padded token-refiner sequences require key_padding_mask support; "
+                    "use VANILLA, FA4, TRTLLM or FLASHINFER."
                 )
-            valid = hidden_states.new_ones((hidden_states.shape[0], seq_len), dtype=torch.bool)
-            key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
+            # Backends cache mask plans using the tensor mutation counter.
+            with torch.inference_mode(False):
+                valid = hidden_states.new_ones((hidden_states.shape[0], seq_len), dtype=torch.bool)
+                key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
             hidden_states = _pad_tensor_dim(hidden_states, 1, pad)
         hidden_states = self.sharder.shard(hidden_states, dim=1)
         for block in self.refiner_blocks:
@@ -666,7 +673,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
         # Only VANILLA supports arbitrary padding between packed modalities.
-        self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
+        self._supports_key_padding_mask = self._attn_backend in (
+            "VANILLA",
+            "FA4",
+            "TRTLLM",
+            "FLASHINFER",
+        )
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
         if quant_algo is not None and not (
@@ -997,19 +1009,23 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     "Padded packed sequences (negative token_tags) need an attention "
                     "backend that honours key_padding_mask; the "
                     f"{self._attn_backend} backend cannot express it. Use "
-                    "VANILLA or FA4."
+                    "VANILLA, FA4, TRTLLM or FLASHINFER."
                 )
-            # FA4 expresses padding through seqused_k, which requires valid
-            # tokens to form a prefix. Ulysses appends padding in this layout.
-            if self._attn_backend == "FA4" and bool(
+            # FA4 seqused_k and TRTLLM prefix trimming require trailing padding.
+            # Ulysses appends padding in this layout.
+            if self._attn_backend in ("FA4", "TRTLLM") and bool(
                 ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
             ):
                 raise NotImplementedError(
-                    "FA4 requires trailing packed-row padding; use VANILLA for interior padding."
+                    f"{self._attn_backend} requires trailing packed-row padding; use VANILLA for interior padding."
                 )
-            key_padding_mask = (
-                (token_tags_for_mask >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
-            )
+            # Preserve a mutation counter for shared backend mask-plan caches.
+            with torch.inference_mode(False):
+                key_padding_mask = (
+                    (token_tags_for_mask >= 0)
+                    .unsqueeze(0)
+                    .expand(packed_hidden_states.shape[0], -1)
+                )
 
         padded_sequence_length = packed_hidden_states.shape[1]
         packed_hidden_states = self.sharder.shard(packed_hidden_states, dim=1)

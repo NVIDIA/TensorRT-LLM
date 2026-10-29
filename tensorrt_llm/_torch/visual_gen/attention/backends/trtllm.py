@@ -444,6 +444,57 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
         return q, k, v
 
+    @torch.compiler.disable
+    def _forward_padded_self_attention(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        key_padding_mask: torch.Tensor,
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Attend to a valid prefix; callers explicitly discard padded query rows.
+
+        Ulysses still needs the padded output shape for its return collective.
+        Cache prefix lengths across layers sharing the same request mask to avoid
+        repeating the device-to-host synchronization in every attention block.
+        """
+        if key_padding_mask.dtype != torch.bool or key_padding_mask.shape != q.shape[:2]:
+            raise ValueError("TRTLLM padding mask must be boolean with shape [batch, sequence].")
+        state = self.metadata._metadata_state
+        cached = state.get("padding_prefix_lengths")
+        version = None if torch.is_inference(key_padding_mask) else key_padding_mask._version
+        if (
+            version is None
+            or cached is None
+            or cached[0] is not key_padding_mask
+            or cached[1] != version
+        ):
+            mask = key_padding_mask.cpu()
+            lengths = mask.sum(dim=1).tolist()
+            expected = torch.arange(mask.shape[1]).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+            if not torch.equal(mask, expected):
+                raise ValueError("TRTLLM padded self-attention requires trailing padding.")
+            state["padding_prefix_lengths"] = (key_padding_mask, version, lengths)
+        else:
+            lengths = cached[2]
+        outputs = []
+        for batch_idx, length in enumerate(lengths):
+            if length == 0:
+                output = q.new_zeros((1, q.shape[1], self.num_heads * self.head_dim))
+            else:
+                output = self.forward(
+                    q=q[batch_idx : batch_idx + 1, :length],
+                    k=k[batch_idx : batch_idx + 1, :length] if k is not None else None,
+                    v=v[batch_idx : batch_idx + 1, :length] if v is not None else None,
+                    batch_size=1,
+                    seq_len=length,
+                    timestep=timestep,
+                )
+                output = torch.nn.functional.pad(output, (0, 0, 0, q.shape[1] - length))
+            outputs.append(output)
+        return torch.cat(outputs, dim=0)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -456,6 +507,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         sparse_backend_args: Optional[SparseBackendForwardArgs] = None,
         timestep: Optional[torch.Tensor] = None,
         kv: Optional[ForwardPlan] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        discard_padded_queries: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -485,11 +538,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 prediction hooks. A ``block_sparse_inputs`` payload selects the
                 generic block-sparse FMHA.
             timestep: Denoising timestep consumed by the sparse prediction hooks.
-            **kwargs: Backend-specific keyword arguments forwarded by the attention
-                module, such as ``key_padding_mask``; ignored here, as by the other
-                backends. The TRTLLM kernels have no key-padding input, so callers
-                that need padded keys must guard at the model level or select the
-                ``VANILLA`` backend.
             kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
                 ``k``/``v`` are the new tokens only: the fused kernel writes them at
                 ``staging_offset`` and attends over everything cached before them plus
@@ -497,10 +545,28 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 The first ``kv.num_tokens`` rows are real; rows past them are padding,
                 neither cached nor attended, and output zero. ``batch_size`` must be 1.
                 Sparse attention is not supported on this path.
+            key_padding_mask: Boolean valid-prefix mask for dense self-attention.
+            discard_padded_queries: Caller guarantees masked query rows are unused.
+                Required with key_padding_mask; padded output rows are zero-filled.
+            **kwargs: Additional backend-specific arguments.
 
         Returns:
             Output tensor [B, S, H*D]
         """
+        if key_padding_mask is not None:
+            if (
+                kv is not None
+                or not discard_padded_queries
+                or attention_mask != PredefinedAttentionMask.FULL
+                or seq_len_kv not in (None, seq_len)
+                or self.quant_attention_config is not None
+                or sparse_backend_args is not None
+                or self.sparse_params is not None
+            ):
+                raise ValueError(
+                    "TRTLLM padding requires dense self-attention with discarded padded queries."
+                )
+            return self._forward_padded_self_attention(q, k, v, key_padding_mask, timestep)
         if kv is not None:
             if sparse_backend_args is not None:
                 raise NotImplementedError("Sparse attention is not supported over a K/V cache.")

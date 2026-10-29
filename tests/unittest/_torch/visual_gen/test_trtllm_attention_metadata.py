@@ -376,3 +376,35 @@ def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> No
     torch.cuda.synchronize()
 
     torch.testing.assert_close(captured, eager)
+
+
+@_REQUIRES_SM100
+@pytest.mark.parametrize("fused", [False, True])
+def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool) -> None:
+    """Padding never contributes keys, including when ranks need unequal real lengths."""
+    attention = visual_trtllm.TrtllmAttention(
+        num_heads=2,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        attention_metadata_state=create_attention_metadata_state(),
+    )
+    torch.manual_seed(42)
+    q, k, v = [torch.randn(2, 8, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    mask = torch.arange(8, device="cuda")[None] < torch.tensor([5, 7], device="cuda")[:, None]
+    expected = (
+        torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask[:, None, None]
+        )
+        .transpose(1, 2)
+        .flatten(2)
+    )
+    query = torch.cat((q, k, v), dim=2) if fused else q
+    kwargs = dict(batch_size=2, seq_len=8, key_padding_mask=mask, discard_padded_queries=True)
+    actual = attention.forward(query, None if fused else k, None if fused else v, **kwargs)
+    torch.testing.assert_close(actual[mask], expected[mask], atol=2e-2, rtol=2e-2)
+    assert torch.count_nonzero(actual[~mask]) == 0
+    with pytest.raises(ValueError, match="discarded padded queries"):
+        attention.forward(q, k, v, batch_size=2, seq_len=8, key_padding_mask=mask)
+    mask[0, 1] = False
+    with pytest.raises(ValueError, match="trailing padding"):
+        attention.forward(q, k, v, **kwargs)

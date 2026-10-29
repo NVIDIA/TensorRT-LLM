@@ -1649,7 +1649,7 @@ def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -
         MiniMaxH3Pipeline(config)
 
 
-@pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL"])
+@pytest.mark.parametrize("backend", ["CUTEDSL"])
 def test_pipeline_rejects_unvalidated_ulysses_attention(backend: str) -> None:
     config = _ulysses_pipeline_config()
     config.attention.backend = backend
@@ -1780,3 +1780,16 @@ def test_pipeline_accepts_tp(
     config.visual_gen_mapping.ulysses_size = ulysses_size
     MiniMaxH3Pipeline(config)
     assert initialized == [config]
+
+
+@pytest.mark.parametrize("backend", ["TRTLLM", "FLASHINFER"])
+def test_pipeline_accepts_masked_ulysses_backends(
+    monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    config = _ulysses_pipeline_config(2)
+    config.attention.backend = backend
+    MiniMaxH3Pipeline(config)
