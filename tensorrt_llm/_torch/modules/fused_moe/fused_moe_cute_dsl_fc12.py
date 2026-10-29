@@ -35,7 +35,7 @@ import torch
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import AutoTuner
-from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ...utils import ActivationType
 from .fused_moe_cute_dsl import CuteDslFusedMoE, CuteDslFusedMoENvfp4Runner, NvFp4WeightView
 from .impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERejectReason
@@ -107,10 +107,10 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
                 f"CuteDslFc12FusedMoE targets Rubin (SM107), got SM{sm_version}",
             )
 
-        if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             return _reject(
                 MoERejectReason.DEP_MISSING,
-                "CuteDslFc12FusedMoE (SM107 NVFP4) requires CuTE DSL internal",
+                "CuteDslFc12FusedMoE (SM107 NVFP4) requires the CuTe DSL Rubin helpers",
             )
 
         return MoEEligibility.ok()

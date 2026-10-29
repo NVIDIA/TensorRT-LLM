@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -152,6 +152,10 @@ class PeerRegistrar:
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         if not self._attention_policy.check_peer_compatible(peer_ri):
             return False
+
+        AttentionPolicy.validate_peer_compatible(
+            self._self_ext_cache.page_table, peer_ri.page_table
+        )
 
         # Recurrent-state (Mamba/KDA) layout gate. Raises ValueError with a
         # field-level diagnostic instead of returning False, so the precise
@@ -367,8 +371,13 @@ class PeerRegistrar:
             pool_idx=peer_pi,
         )
 
-        mapper = self._attention_policy.build_kv_mapper(
-            peer_ri=peer_ri,
+        policy = self._attention_policy
+        mapper_peer_ri = peer_ri
+        if self_lg.cp_as_tp:
+            policy = AttentionPolicy(self._group_rank_info(self._ri, self_lg))
+            mapper_peer_ri = self._group_rank_info(peer_ri, peer_lg)
+        mapper = policy.build_kv_mapper(
+            peer_ri=mapper_peer_ri,
             mapper_kind=self_pv.mapper_kind,
             self_layer_offsets=self_layer_offsets,
             peer_layer_offsets=peer_layer_offsets,
@@ -532,9 +541,39 @@ class PeerRegistrar:
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
+        if layer_group.cp_as_tp:
+            peer_lg_id, _ = self.get_pool_mapping(peer_rank_info)[(layer_group_id, pool_idx)]
+            peer_lg = peer_rank_info.page_table.layer_groups[peer_lg_id]
+            local = self._group_rank_info(self._ri, layer_group)
+            peer = self._group_rank_info(peer_rank_info, peer_lg)
+            if local.tp_size <= peer.tp_size:
+                if peer.tp_rank // (peer.tp_size // local.tp_size) != local.tp_rank:
+                    return False
+            elif local.tp_rank // (local.tp_size // peer.tp_size) != peer.tp_rank:
+                return False
+            duplicate, _ = AttentionPolicy(local).duplicate_head_factors(peer)
+            return duplicate <= 1 or peer.dp_rank % duplicate == local.tp_rank % duplicate
         if pool_view.mapper_kind == MapperKind.REPLICATED:
             return self._owns_tp_fan_in(peer_rank_info)
         return self.should_send_kv(peer_overlap, peer_rank_info)
+
+    @staticmethod
+    def _group_rank_info(rank_info: RankInfo, layer_group: AttentionLayerGroup) -> RankInfo:
+        tp_size, tp_rank = MambaPolicy._mamba_tp(rank_info)
+        return replace(
+            rank_info,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            cp_size=1,
+            cp_rank=0,
+            dp_size=1,
+            attention=replace(
+                rank_info.attention,
+                kv_heads_per_rank=layer_group.kv_head_num_per_rank,
+                is_mla=False,
+                enable_attention_dp=False,
+            ),
+        )
 
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated

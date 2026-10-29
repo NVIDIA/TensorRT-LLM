@@ -15,8 +15,10 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.h"
+#include "tensorrt_llm/kernels/mxfp8Quant1x128Kf.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -187,12 +189,24 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
         if (m > 0 && n > 0)
         {
 #ifdef ENABLE_BF16
-            const thread_local int multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-            tensorrt_llm::kernels::invokeMxFP8Quantization<__nv_bfloat16, kQuantSfVecSize, kOutputSfVecSize>(1,
-                static_cast<int>(m), static_cast<int>(n), static_cast<int>(n),
-                reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()),
-                reinterpret_cast<int64_t*>(valueE4M3.data_ptr()), reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()),
-                tensorrt_llm::QuantizationSFLayout::SWIZZLED, multiProcessorCount, stream);
+            // TRTLLM_MXFP8_QUANT_KF=1: the Kf kernel (same bytes, closer to the HBM speed of light).
+            static bool const useKfKernel = tensorrt_llm::common::getBoolEnv("TRTLLM_MXFP8_QUANT_KF");
+            if (useKfKernel
+                && tensorrt_llm::kernels::isMxFP8Quant1x128KfSupported(
+                    self.data_ptr(), valueE4M3.data_ptr(), scaleFP8SF.data_ptr(), m, n))
+            {
+                tensorrt_llm::kernels::invokeMxFP8Quant1x128Kf(reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()),
+                    reinterpret_cast<uint8_t*>(valueE4M3.data_ptr()), scaleFP8SF.data_ptr<uint8_t>(), m, n, stream);
+            }
+            else
+            {
+                const thread_local int multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+                tensorrt_llm::kernels::invokeMxFP8Quantization<__nv_bfloat16, kQuantSfVecSize, kOutputSfVecSize>(1,
+                    static_cast<int>(m), static_cast<int>(n), static_cast<int>(n),
+                    reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()),
+                    reinterpret_cast<int64_t*>(valueE4M3.data_ptr()), reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()),
+                    tensorrt_llm::QuantizationSFLayout::SWIZZLED, multiProcessorCount, stream);
+            }
 #else
             C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize a BF16 tensor to MXFP8.");
 #endif
@@ -232,6 +246,10 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
     return {valueE4M3.slice(0, 0, m), packedScale};
 }
 
+// Row count from which TRTLLM_MXFP8_QUANT_KF=1 routes fp8_quantize_1x128_cutedsl_ue8m0 to the Kf kernel (the Kf
+// kernel is faster for every K in {1536, 4096, 7168, 12288} from 1024 rows on, slower at decode batches).
+static constexpr int64_t kKfCutedslMinRows = 1024;
+
 std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_cutedsl_ue8m0(at::Tensor const& self)
 {
     CHECK_TH_CUDA(self);
@@ -256,12 +274,100 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_cutedsl_ue8m0(at::Tensor c
         = at::detail::empty_cuda({paddedM * sfCols}, at::ScalarType::Byte, self.device(), /* stride */ std::nullopt);
 
     auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
+    // TRTLLM_MXFP8_QUANT_KF=1: from kKfCutedslMinRows rows on, the Kf kernel writes this op's output (the
+    // same E4M3 codes and the same R128c4 scale buffer, padded rows zero, for finite inputs). This op, not
+    // fp8_quantize_1x128_packed_ue8m0, quantizes the GEMM inputs of Kimi K3's projections
+    // (_Fp8BlockScaleWeightReadLinear). Below that row count the kernel below is as fast or faster.
+    static bool const useKfKernel = tensorrt_llm::common::getBoolEnv("TRTLLM_MXFP8_QUANT_KF");
+    if (useKfKernel && m >= kKfCutedslMinRows
+        && tensorrt_llm::kernels::isMxFP8Quant1x128KfSupported(
+            self.data_ptr(), valueE4M3.data_ptr(), scaleE8M0.data_ptr(), m, k))
+    {
+        tensorrt_llm::kernels::invokeMxFP8Quant1x128Kf(reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()),
+            reinterpret_cast<uint8_t*>(valueE4M3.data_ptr()), scaleE8M0.data_ptr<uint8_t>(), m, k, stream);
+        return {valueE4M3, scaleE8M0};
+    }
     tensorrt_llm::kernels::fp8_blockscale_gemm::launch_fp8_quantize_1x128_cutedsl_bf16_e4m3(
         reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr()), scaleE8M0.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), static_cast<int>(m), static_cast<int>(k),
         static_cast<int>(paddedM), stream);
 
     return {valueE4M3, scaleE8M0};
+}
+
+// RMSNorm (no residual) fused with fp8_quantize_1x128_cutedsl_ue8m0: returns the
+// same (E4M3 [m, k], uint8 R128c4 scale) pair that op returns for the normalized
+// rows, so the result feeds cute_dsl_mxfp8_gemm_rubin unchanged.
+std::tuple<at::Tensor, at::Tensor> rmsnorm_fp8_quantize_1x128_cutedsl_ue8m0(
+    at::Tensor const& self, at::Tensor const& weight, double const eps)
+{
+    CHECK_TH_CUDA(self);
+    CHECK_TH_CUDA(weight);
+    TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
+    TORCH_CHECK(weight.scalar_type() == at::ScalarType::BFloat16, "RMSNorm weight dtype must be BF16.");
+    TORCH_CHECK(self.dim() == 2, "input must be a matrix");
+    TORCH_CHECK(weight.dim() == 1 && weight.is_contiguous(), "RMSNorm weight must be a contiguous vector");
+    TORCH_CHECK(self.device() == weight.device(), "input and weight must be on the same device");
+    TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
+        "rmsnorm_fp8_quantize_1x128_cutedsl_ue8m0 currently only supports SM100-family GPUs.");
+
+    auto const m = self.sizes()[0];
+    auto const k = self.sizes()[1];
+    TORCH_CHECK(weight.sizes()[0] == k, "RMSNorm weight must have ", k, " elements, got ", weight.sizes()[0]);
+    TORCH_CHECK(m <= std::numeric_limits<int32_t>::max(), "M must be within int32");
+    TORCH_CHECK(k % 128 == 0, "K must be divisible by the production FP8 block size 128, but got ", k);
+    TORCH_CHECK(k <= tensorrt_llm::kernels::fp8_blockscale_gemm::kRmsNormFp8QuantMaxK, "K must be at most ",
+        tensorrt_llm::kernels::fp8_blockscale_gemm::kRmsNormFp8QuantMaxK, ", got ", k);
+    // Rows are read with 16-byte vector loads.
+    TORCH_CHECK(self.stride(1) == 1, "input rows must have unit column stride");
+    TORCH_CHECK(m <= 1 || self.stride(0) % 8 == 0, "input row stride must be a multiple of 8 elements");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(self.data_ptr()) % 16 == 0, "input must be 16-byte aligned");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0, "weight must be 16-byte aligned");
+
+    at::Tensor valueE4M3
+        = at::detail::empty_cuda({m, k}, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
+    auto const paddedM = (m + 127) / 128 * 128;
+    auto const sfCols = (k / 32 + 3) / 4 * 4;
+    at::Tensor scaleE8M0
+        = at::detail::empty_cuda({paddedM * sfCols}, at::ScalarType::Byte, self.device(), /* stride */ std::nullopt);
+
+    auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
+    tensorrt_llm::kernels::fp8_blockscale_gemm::launch_rmsnorm_fp8_quantize_1x128_cutedsl_bf16_e4m3(
+        reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr()), scaleE8M0.data_ptr<uint8_t>(),
+        reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), static_cast<int64_t>(self.stride(0)),
+        reinterpret_cast<__nv_bfloat16 const*>(weight.data_ptr()), static_cast<float>(eps), static_cast<int>(m),
+        static_cast<int>(k), static_cast<int>(paddedM), stream);
+
+    return {valueE4M3, scaleE8M0};
+}
+
+// fp8_quantize_1x128_packed_ue8m0(input, use_r128c4_layout=True) computed by the Kf kernel regardless of
+// TRTLLM_MXFP8_QUANT_KF (same outputs on finite inputs); for tests and A/B runs.
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_r128c4_kf(at::Tensor const& self)
+{
+    CHECK_TH_CUDA(self);
+    CHECK_CONTIGUOUS(self);
+    TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
+    TORCH_CHECK(self.dim() == 2, "input must be a matrix");
+
+    auto const m = self.sizes()[0];
+    auto const n = self.sizes()[1];
+    TORCH_CHECK(n % 128 == 0, "self.sizes()[1] must be a multiple of 128 for R128c4, but got ", n);
+    at::Tensor valueE4M3
+        = at::detail::empty_cuda({m, n}, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
+    auto const sfSize = tensorrt_llm::computeSwizzledLayoutSFSize(static_cast<int>(m), static_cast<int>(n / 32));
+    at::Tensor scaleFP8SF
+        = at::detail::empty_cuda({sfSize}, at::ScalarType::Byte, self.device(), /* stride */ std::nullopt);
+    if (m > 0)
+    {
+        TORCH_CHECK(tensorrt_llm::kernels::isMxFP8Quant1x128KfSupported(
+                        self.data_ptr(), valueE4M3.data_ptr(), scaleFP8SF.data_ptr(), m, n),
+            "fp8_quantize_1x128_r128c4_kf needs an SM10x GPU, m and n within int32 and a 32-byte aligned input");
+        tensorrt_llm::kernels::invokeMxFP8Quant1x128Kf(reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()),
+            reinterpret_cast<uint8_t*>(valueE4M3.data_ptr()), scaleFP8SF.data_ptr<uint8_t>(), m, n,
+            at::cuda::getCurrentCUDAStream(self.get_device()));
+    }
+    return {valueE4M3, scaleFP8SF};
 }
 
 std::tuple<at::Tensor, at::Tensor> silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
@@ -336,7 +442,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("fp8_batched_quantize_1x128_permute102(Tensor input) -> (Tensor, Tensor)");
     m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input, bool use_r128c4_layout=True) -> (Tensor, Tensor)");
+    m.def("fp8_quantize_1x128_r128c4_kf(Tensor input) -> (Tensor, Tensor)");
     m.def("fp8_quantize_1x128_cutedsl_ue8m0(Tensor input) -> (Tensor, Tensor)");
+    m.def("rmsnorm_fp8_quantize_1x128_cutedsl_ue8m0(Tensor input, Tensor weight, float eps) -> (Tensor, Tensor)");
     m.def(
         "silu_and_mul_fp8_quantize_1x128_packed_ue8m0(Tensor input, float? swiglu_limit=None, bool "
         "use_r128c4_layout=True) -> (Tensor, Tensor)");
@@ -347,7 +455,10 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fp8_quantize_1x128", &tensorrt_llm::torch_ext::fp8_quantize_1x128);
     m.impl("fp8_batched_quantize_1x128_permute102", &tensorrt_llm::torch_ext::fp8_batched_quantize_1x128_permute102);
     m.impl("fp8_quantize_1x128_packed_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_packed_ue8m0);
+    m.impl("fp8_quantize_1x128_r128c4_kf", &tensorrt_llm::torch_ext::fp8_quantize_1x128_r128c4_kf);
     m.impl("fp8_quantize_1x128_cutedsl_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_cutedsl_ue8m0);
+    m.impl(
+        "rmsnorm_fp8_quantize_1x128_cutedsl_ue8m0", &tensorrt_llm::torch_ext::rmsnorm_fp8_quantize_1x128_cutedsl_ue8m0);
     m.impl("silu_and_mul_fp8_quantize_1x128_packed_ue8m0",
         &tensorrt_llm::torch_ext::silu_and_mul_fp8_quantize_1x128_packed_ue8m0);
 }

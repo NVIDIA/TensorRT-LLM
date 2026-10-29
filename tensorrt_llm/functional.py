@@ -130,6 +130,9 @@ class AllReduceFusionOp(IntEnum):
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
     RMS_NORM_QUANT_FP8_BLOCKSCALE = 10
+    # Same quantization with the scales in the R128c4 (128x4-swizzled uint8) layout of the Rubin CuTe DSL MXFP8
+    # GEMM, as fp8_quantize_1x128_cutedsl_ue8m0 writes them. MNNVL all-reduce only.
+    RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4 = 11
 
 
 class AllReduceParams:
@@ -160,7 +163,8 @@ class AllReduceParams:
         self.trigger_completion_at_end = trigger_completion_at_end
         assert fusion_op in (
             AllReduceFusionOp.NONE.value, AllReduceFusionOp.RMS_NORM.value,
-            AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE.value) or (
+            AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE.value,
+            AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4.value) or (
                 residual is not None)
 
     def has_affine(self):

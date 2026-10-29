@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 import os
 from dataclasses import dataclass
@@ -21,7 +22,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_env_flag, get_sm_version, is_sm_100f
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -32,8 +34,9 @@ from ...custom_ops.cute_dsl_custom_ops import (
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmRunner,
     Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
-from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ...model_config import ModelConfig, QuantConfig
+from ...ugpu import die_local
 from ...ugpu.autotune import \
     UgpuConcurrentTunableRunner as _UgpuConcurrentTunableRunner
 from ...ugpu.policy import UgpuExecutionPlanner
@@ -43,6 +46,7 @@ from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
+from ..kimi_k3_mk1_gate import mk1_enabled
 from ..linear import _copy_to_new_cuda_allocation
 from .fused_moe_cutlass import CutlassFusedMoE
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
@@ -56,6 +60,91 @@ from .routing import BaseMoeRoutingMethod
 # Kill switch for CuteDslFusedMoE.quantize_input_async (fork the NVFP4 input
 # quantization onto the MoE aux stream so it overlaps top-k + moe_sort).
 ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
+
+# TRTLLM_K3_MOE_SORT_KF=1 (read once at import): run_moe_nvfp4_impl sorts the tokens of a Kimi K3 EP16 rank on SM107 (896
+# experts, top 16, 56 local experts, tile 128, TRTLLM_K3_MOE_SORT_KF_MIN_TOKENS (default 64, not below 16) to 8192 rows, a
+# multiple of 16: the dispatch buffer of attention-DP EP16 has 16 x tokens-per-source-rank rows) with
+# ``kimi_k3_moe_sort_kf`` instead of ``moe_sort``: one cluster kernel found by an automated kernel search
+# (``cpp/tensorrt_llm/kernels/kimiK3MoeSortKf.cu``) that writes the same layout (tile tables, expanded <-> permuted
+# maps, the two scalars), with the rows inside an expert in a deterministic, not ascending, order. On Rubin it is
+# faster than ``moe_sort``. Every other shape, SM and flag setting keeps
+# ``moe_sort``. The kernel has only been run on SM107 (Rubin), so no other SM takes it.
+_K3_MOE_SORT_KF = get_env_flag("TRTLLM_K3_MOE_SORT_KF", False)
+_K3_MOE_SORT_KF_SM = 107
+_K3_MOE_SORT_KF_DEFAULT_MIN_TOKENS = 64
+_K3_MOE_SORT_KF_MAX_TOKENS = 8192
+_K3_MOE_SORT_KF_TOKEN_MULTIPLE = 16
+_K3_MOE_SORT_KF_NUM_EXPERTS = 896
+_K3_MOE_SORT_KF_TOP_K = 16
+_K3_MOE_SORT_KF_LOCAL_EXPERTS = 56
+_K3_MOE_SORT_KF_TILE = 128
+
+
+@functools.lru_cache(maxsize=None)
+def _k3_moe_sort_kf_min_tokens() -> int:
+    """TRTLLM_K3_MOE_SORT_KF_MIN_TOKENS, read on first use (not at import) and never below the token multiple 16: a
+    smaller bound could let a call of no rows reach the kernel. Unset or empty (after ``.strip()``, like the other
+    K3 switches) is the default."""
+    value = os.environ.get("TRTLLM_K3_MOE_SORT_KF_MIN_TOKENS", "").strip()
+    try:
+        minimum = int(value) if value else _K3_MOE_SORT_KF_DEFAULT_MIN_TOKENS
+    except ValueError:
+        raise ValueError(
+            f"TRTLLM_K3_MOE_SORT_KF_MIN_TOKENS must be an integer, got {value!r}"
+        ) from None
+    return max(_K3_MOE_SORT_KF_TOKEN_MULTIPLE, minimum)
+
+
+@functools.lru_cache(maxsize=None)
+def _validate_k3_moe_sort_kf() -> None:
+    """With TRTLLM_K3_MOE_SORT_KF on: the minimum-token setting parses and, on SM107 (the only SM whose sort the op
+    takes), this build has the op. Called when a MoE layer is built (once per process), so that a bad setup fails at
+    the start of the server on every rank and not at the first sort of a step."""
+    if not _K3_MOE_SORT_KF:
+        return
+    _k3_moe_sort_kf_min_tokens()
+    if (get_sm_version() == _K3_MOE_SORT_KF_SM
+            and getattr(torch.ops.trtllm, "kimi_k3_moe_sort_kf", None) is None):
+        raise RuntimeError(
+            "TRTLLM_K3_MOE_SORT_KF=1 needs the trtllm::kimi_k3_moe_sort_kf op, which this "
+            "build of TensorRT-LLM does not have")
+
+
+def _use_k3_moe_sort_kf(token_selected_experts: torch.Tensor, num_experts: int,
+                        top_k: int, local_expert_offset: int,
+                        local_num_experts: int, tile_tokens_dim: int) -> bool:
+    """Whether ``kimi_k3_moe_sort_kf`` sorts this call (TRTLLM_K3_MOE_SORT_KF and K3's EP16 rank shape on SM107)."""
+    if not (_K3_MOE_SORT_KF and num_experts == _K3_MOE_SORT_KF_NUM_EXPERTS
+            and top_k == _K3_MOE_SORT_KF_TOP_K
+            and local_num_experts == _K3_MOE_SORT_KF_LOCAL_EXPERTS
+            and tile_tokens_dim == _K3_MOE_SORT_KF_TILE
+            and 0 <= local_expert_offset <= num_experts - local_num_experts
+            and token_selected_experts.is_cuda and token_selected_experts.dtype
+            == torch.int32 and get_sm_version() == _K3_MOE_SORT_KF_SM):
+        return False
+    num_tokens = token_selected_experts.size(0)
+    return (
+        _k3_moe_sort_kf_min_tokens() <= num_tokens <= _K3_MOE_SORT_KF_MAX_TOKENS
+        and num_tokens % _K3_MOE_SORT_KF_TOKEN_MULTIPLE == 0)
+
+
+def _moe_sort(token_selected_experts: torch.Tensor,
+              token_final_scales: Optional[torch.Tensor], num_experts: int,
+              top_k: int, local_expert_offset: int, local_num_experts: int,
+              tile_tokens_dim: int) -> List[torch.Tensor]:
+    """``trtllm::moe_sort``, or ``trtllm::kimi_k3_moe_sort_kf`` where ``_use_k3_moe_sort_kf`` allows it (same outputs)."""
+    sort_op = (torch.ops.trtllm.kimi_k3_moe_sort_kf if _use_k3_moe_sort_kf(
+        token_selected_experts, num_experts, top_k, local_expert_offset,
+        local_num_experts, tile_tokens_dim) else torch.ops.trtllm.moe_sort)
+    return sort_op(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        tile_tokens_dim=tile_tokens_dim,
+    )
 
 
 def _unwrap_ugpu_runner(runner: TunableRunner) -> TunableRunner:
@@ -292,7 +381,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  output_dtype: torch.dtype = torch.bfloat16,
                  scaling_vector_size: int = 16,
                  workload_identity: Optional[Tuple] = None,
-                 prime_inner_tactics: bool = False):
+                 prime_inner_tactics: bool = False,
+                 tile_sizes: Optional[Tuple[int, ...]] = None):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -312,6 +402,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         # uGPU only: ``forward_impl`` nests its own AutoTuner calls and accepts
         # ``overlap_moe_output_memset``. Single-op backends must leave this off.
         self.prime_inner_tactics = prime_inner_tactics
+        # Routing-tile sizes the inner kernels support (None = all, see _tile_sizes).
+        self.tile_sizes = tile_sizes
 
     def unique_id(self):
         identity = (
@@ -334,6 +426,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
+        if self.tile_sizes is not None:
+            return list(self.tile_sizes)
         return self._tile_sizes()
 
     @staticmethod
@@ -405,7 +499,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
             Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
         ]
-        if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             from ...custom_ops.cute_dsl_custom_ops import (
                 Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner,
                 Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
@@ -568,7 +662,7 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
             comb: List[Tuple[TunableRunner, Any]]) -> bool:
         # BF16 GEMM runners that need CTA_M == tile_size.
         checked_runner_types = []
-        if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             from ...custom_ops.cute_dsl_custom_ops import (
                 Sm107ContiguousGatherGroupedGemmSwigluFusionRunner,
                 Sm107ContiguousGroupedGemmFinalizeFusionRunner)
@@ -690,10 +784,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     MoERejectReason.SM_UNSUPPORTED,
                     f"Unquantized CuteDslFusedMoE requires SM107, got SM{sm_version}"
                 )
-            if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+            if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                 return _reject(
                     MoERejectReason.DEP_MISSING,
-                    "Unquantized CuteDslFusedMoE on SM107 requires CuTE DSL internal"
+                    "Unquantized CuteDslFusedMoE on SM107 requires the CuTe DSL Rubin helpers"
                 )
             return MoEEligibility.ok()
 
@@ -704,10 +798,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     MoERejectReason.SM_UNSUPPORTED,
                     f"NVFP4 requires SM100, SM103, or SM107, got SM{sm_version}"
                 )
-            if sm_version == 107 and not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+            if sm_version == 107 and not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
                 return _reject(
                     MoERejectReason.DEP_MISSING,
-                    "NVFP4 on SM107 (Rubin) requires CuTE DSL internal")
+                    "NVFP4 on SM107 (Rubin) requires the CuTe DSL Rubin helpers"
+                )
             return MoEEligibility.ok()
 
         # FP8_BLOCK_SCALES lands here on purpose. ``run_moe_fp8_block_scales``
@@ -762,6 +857,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             ignore_weights=True,
         )
         self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
+        _validate_k3_moe_sort_kf()
 
         # SiTU (Kimi K3) constants. Unlike CUTLASS -- whose SiTuAdaptor reads
         # per-expert ``swiglu_alpha`` / ``swiglu_beta`` tensors -- the CuTe DSL
@@ -806,6 +902,30 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     "uGPU MoE does not support EPLB because localized weight "
                     "shards cannot follow runtime expert migration.")
             self._ugpu_runtime = UgpuRuntime(self._ugpu_plan.num_partitions)
+        # Die-local routed experts (TRTLLM_K3_DIE_LOCAL_EXPERTS, Kimi K3 MK1 port): the
+        # NVFP4 FC1/FC2 weights become die-homed stacked N-halves and the Rubin kernels
+        # serve each CTA its own die's half first. Built in post_load_weights_impl.
+        self._die_local: Optional[Dict[str, torch.Tensor]] = None
+        self._die_local_requested = False
+        if mk1_enabled("TRTLLM_K3_DIE_LOCAL_EXPERTS"):
+            # Only the two-kernel CUTEDSL path (FC1 act-fusion + FC2 finalize) has
+            # die-local kernels; subclasses (FC12, B12x) run other kernels.
+            if self._ugpu_plan.enabled:
+                reason = "the uGPU MoE plan is active"
+            elif str(model_config.moe_backend).upper() != "CUTEDSL":
+                reason = f"moe_backend {model_config.moe_backend} is not CUTEDSL"
+            else:
+                reason = None
+                self._die_local_requested = True
+            if reason is not None:
+                logger.warning_once(
+                    f"TRTLLM_K3_DIE_LOCAL_EXPERTS is ignored: {reason}.",
+                    key="k3_die_local_experts_not_applicable")
+        if self._die_local_requested and self._using_load_balancer():
+            raise ValueError(
+                "TRTLLM_K3_DIE_LOCAL_EXPERTS does not support EPLB because "
+                "die-local weight halves cannot follow runtime expert migration."
+            )
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -866,15 +986,19 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
     def validate_configurable_moe(self, moe) -> None:
         """Reject runtime weight owners that cannot update localized shards."""
-        if not self._ugpu_plan.enabled:
+        if self._ugpu_plan.enabled:
+            what = "uGPU MoE"
+        elif self._die_local_requested:
+            what = "TRTLLM_K3_DIE_LOCAL_EXPERTS"
+        else:
             return
         if moe.enable_dwdp:
             raise ValueError(
-                "uGPU MoE does not support DWDP because DWDP rebinds the "
+                f"{what} does not support DWDP because DWDP rebinds the "
                 "backend parameters after localized weight shards are created.")
         if moe._using_load_balancer():
             raise ValueError(
-                "uGPU MoE does not support EPLB because localized weight "
+                f"{what} does not support EPLB because localized weight "
                 "shards cannot follow runtime expert migration.")
 
     def _get_quant_method(self):
@@ -884,7 +1008,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 return NVFP4CuteDslFusedMoEMethod()
             return super()._get_quant_method()
         # Unquantized: use BF16 method on SM107 for FC1 weight interleaving
-        if get_sm_version() == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        if get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             return BF16CuteDslFusedMoEMethod()
         return super()._get_quant_method()
 
@@ -942,8 +1066,20 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             x_sf = x_sf.view(x_row, scale_cols)
         return x, x_sf
 
+    def quantize_on_send_global_scale(
+            self, x: Union[torch.Tensor,
+                           Fp4QuantizedTensor]) -> Optional[torch.Tensor]:
+        """The global scale of ``quantize_input(x)`` when that is the plain NVFP4 quantization, which the NVLink
+        one-sided dispatch can do while it sends ``x`` (``can_quantize_on_send``); None otherwise."""
+        if (not self.has_nvfp4 or isinstance(x, Fp4QuantizedTensor)
+                or self.scaling_vector_size != 16):
+            return None
+        return self.fc31_input_scale
+
     def quantize_input_async(
-        self, x: torch.Tensor
+        self,
+        x: torch.Tensor,
+        input_ready_event: Optional[torch.cuda.Event] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
                Optional[torch.cuda.Event]]:
         """Quantize ``x`` on the MoE aux stream so it overlaps top-k and ``moe_sort``.
@@ -956,11 +1092,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         the first kernel that reads ``x``/``x_sf`` (``run_moe_nvfp4_impl``,
         after ``moe_sort``). Falls back to the synchronous ``quantize_input``
         (event ``None``) when disabled, not NVFP4, already quantized, or no aux
-        stream is available.
+        stream is available. The stream running the quantization joins
+        ``input_ready_event``.
         """
         if (not ASYNC_INPUT_QUANT or not self.has_nvfp4
                 or isinstance(x, Fp4QuantizedTensor)
                 or not self._has_moe_output_memset_aux_stream()):
+            if input_ready_event is not None:
+                input_ready_event.wait()
             x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
             return x_q, x_sf, None
         main_stream = torch.cuda.current_stream()
@@ -969,6 +1108,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         x.record_stream(aux_stream)
         with torch.cuda.stream(aux_stream):
             self.event_dict[EventType.Main].wait()
+            if input_ready_event is not None:
+                input_ready_event.wait()
             x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
             self._x_quant_event.record()
         x_q.record_stream(main_stream)
@@ -1032,9 +1173,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         use_ugpu = self._ugpu_runtime is not None
         if use_ugpu:
-            if self.activation_type != ActivationType.Swiglu:
+            # The uGPU FC1 splits the gated [gate | up] weight by N, so each
+            # partition owns matching gate/up rows; _run_moe_nvfp4_ugpu
+            # forwards activation_type and the SiTU betas to the per-partition
+            # act-fusion kernels, as the non-uGPU path does.
+            if self.activation_type not in (ActivationType.Swiglu,
+                                            ActivationType.SiTu):
                 raise NotImplementedError(
-                    "Rubin uGPU NVFP4 MoE currently supports SwiGLU only")
+                    "Rubin uGPU NVFP4 MoE supports SwiGLU and SiTu only")
 
         if moe_output is None:
             moe_output = torch.empty(
@@ -1075,7 +1221,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             ]
         else:
             forward_impl = self.run_moe_nvfp4_impl
-            workload_identity = None
+            # Die-local kernels are 1-CTA only: routing tiles 128 and 256.
+            workload_identity = (
+                "die_local", ) if self._die_local is not None else None
             tuner_key = "CuteDslFusedMoE::run_moe_nvfp4"
             inputs = [
                 x,
@@ -1097,6 +1245,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
             prime_inner_tactics=use_ugpu,
+            tile_sizes=(128, 256) if self._die_local is not None else None,
         )
 
         _, best_tactic = tuner.choose_one(
@@ -1121,21 +1270,37 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         """Non-DWDP NVFP4 MoE implementation using single-tensor ops."""
         output_dtype = torch.bfloat16
         sm_version = get_sm_version()
-        use_rubin = (sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
+        use_rubin = (sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
 
-        tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            num_experts=self.num_slots,
-            top_k=effective_top_k,
-            local_expert_offset=slot_start,
-            local_num_experts=esp,
-            tile_tokens_dim=tile_size,
-        )
+        # A fused router (Kimi K3's routing tail) may attach this rank's moe_sort outputs to the
+        # ids; they are used only when they were built for this rank's experts and tile size.
+        presorted = getattr(token_selected_experts, "_k3_presorted", None)
+        if presorted is not None and presorted[0] != (slot_start, esp,
+                                                      tile_size):
+            logger.warning_once(
+                f"Kimi K3 routing tail: moe_sort outputs built for (slot_start, "
+                f"local experts, tile) {presorted[0]} do not match "
+                f"{(slot_start, esp, tile_size)}; sorting again",
+                key=("k3_presorted_mismatch", presorted[0], (slot_start, esp,
+                                                             tile_size)))
+            presorted = None
+        if presorted is not None:
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = presorted[
+                1]
+        else:
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = _moe_sort(
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                local_expert_offset=slot_start,
+                local_num_experts=esp,
+                tile_tokens_dim=tile_size,
+            )
 
         has_aux_streams = self._has_moe_output_memset_aux_stream()
         if self.use_fused_finalize and has_aux_streams:
@@ -1196,7 +1361,23 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # produced on the aux stream and are first read here, after moe_sort
         # ran on the main stream in parallel with the quantization.
         self._join_pending_x_ready()
-        x, x_sf = gather_act_op(**gather_act_kwargs)
+        if self._die_local is not None:
+            fc1_ws, fc2_ws = self._die_local["ws"].get()
+            die_kwargs = dict(gather_act_kwargs)
+            del die_kwargs["output_tensor"], die_kwargs["output_sf_tensor"]
+            die_kwargs.update(
+                weight=self._die_local["w3_w1_weight"].view(
+                    torch.float4_e2m1fn_x2),
+                weight_scale=self._die_local["fc1_weight_block"].view(
+                    torch.uint8),
+                die_tab=self._die_local["die_tab"],
+                die_ws=fc1_ws,
+                activation_type=int(self.activation_type),
+            )
+            x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_die_local_rubin(
+                **die_kwargs)
+        else:
+            x, x_sf = gather_act_op(**gather_act_kwargs)
 
         if self.use_fused_finalize:
             if has_aux_streams:
@@ -1221,7 +1402,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 if use_rubin else torch.ops.trtllm.
                 cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell)
 
-            finalize_inplace_op(
+            finalize_kwargs = dict(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
@@ -1240,6 +1421,19 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
+            if self._die_local is not None:
+                finalize_kwargs.update(
+                    weight=self._die_local["w2_weight"].view(
+                        torch.float4_e2m1fn_x2),
+                    weight_scale=self._die_local["fc2_weight_block"].view(
+                        torch.uint8),
+                    die_tab=self._die_local["die_tab"],
+                    die_ws=fc2_ws,
+                )
+                torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_die_local_inplace_rubin(
+                    **finalize_kwargs)
+            else:
+                finalize_inplace_op(**finalize_kwargs)
         else:
             if use_rubin:
                 # Rubin does not have a basic grouped GEMM kernel (without
@@ -1900,9 +2094,95 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             # Resolve the borrowed remainder stream now, never during capture.
             self._get_reserved_moe_output_memset_stream()
             self._release_full_weights_after_ugpu_split()
+        elif self._die_local_requested:
+            self._die_local = self._build_die_local_weights()
+            if self._die_local is not None:
+                self._release_full_weights_after_ugpu_split()
+                logger.info_once(
+                    "TRTLLM_K3_DIE_LOCAL_EXPERTS: routed-expert FC1/FC2 weights "
+                    "are die-local stacked N-halves.",
+                    key="k3_die_local_experts_active")
+
+    def _build_die_local_weights(self) -> Optional[Dict[str, torch.Tensor]]:
+        """Stack the NVFP4 FC1/FC2 weights and block scales into die-homed N-halves.
+
+        Returns None (the default path stays in use) unless the layer and device
+        qualify: NVFP4 on SM107 with exactly two memory locality domains.
+        """
+        reason = None
+        if not self.has_nvfp4:
+            reason = "it supports NVFP4 weights only"
+        elif get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            reason = "it needs SM107 with the CuTe DSL Rubin kernels"
+        elif self.activation_type not in (ActivationType.Swiglu,
+                                          ActivationType.SiTu,
+                                          ActivationType.Relu2):
+            reason = f"activation {self.activation_type} is not supported"
+        device = self.w3_w1_weight.device
+        if device.type != "cuda":
+            # post_load_weights may run before the module moves to the GPU.
+            device = torch.device("cuda", torch.cuda.current_device())
+        die_tab = None
+        if reason is None:
+            die_tab = die_local.smid_die_table(device.index)
+            if die_tab is None:
+                reason = "the device does not expose two memory locality domains"
+        if reason is not None:
+            logger.warning_once(
+                f"TRTLLM_K3_DIE_LOCAL_EXPERTS is ignored: {reason}.",
+                key="k3_die_local_experts_ignored")
+            return None
+        self._reclaim_cached_memory_for_die_local(device)
+        return {
+            "w3_w1_weight":
+            die_local.stack_halves(self.w3_w1_weight, device.index),
+            "fc1_weight_block":
+            die_local.stack_halves(self.quant_scales.fc1_weight_block,
+                                   device.index),
+            "w2_weight":
+            die_local.stack_halves(self.w2_weight, device.index),
+            "fc2_weight_block":
+            die_local.stack_halves(self.quant_scales.fc2_weight_block,
+                                   device.index),
+            "die_tab":
+            die_tab,
+            # FC1 and FC2 tile-queue counters (int32[4] each), one set per CUDA stream:
+            # the kernels leave them zeroed, and chunked MoE can run two chunks of this
+            # layer at once on two streams.
+            "ws":
+            die_local.StreamScratch((4, 4), device),
+        }
+
+    def _reclaim_cached_memory_for_die_local(self,
+                                             device: torch.device) -> None:
+        """Make room for this layer's die-local halves when the driver is short of memory.
+
+        The halves come from cuMemCreate, which only sees driver-free memory, while the
+        full weights released by earlier layers stay cached in PyTorch's allocator. Return
+        the cache only when this layer would not fit, instead of after every layer:
+        ModelLoader empties the cache once after all modules, and per-layer empty_cache
+        calls can perturb multi-rank initialization.
+        """
+        if device.type != "cuda":
+            return
+        weights = (self.w3_w1_weight, self.quant_scales.fc1_weight_block,
+                   self.w2_weight, self.quant_scales.fc2_weight_block)
+        needed = sum(w.numel() * w.element_size() for w in weights)
+        # Each tensor rounds up to whole 2 MiB chunks; keep 1 GiB for everything else.
+        needed += len(weights) * (2 << 20) + (1 << 30)
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if free_bytes < needed:
+            torch.cuda.empty_cache()
+
+    def pre_reload_weights(self):
+        if self._die_local is not None:
+            raise NotImplementedError(
+                "TRTLLM_K3_DIE_LOCAL_EXPERTS does not support weight reloading: the "
+                "die-local halves replace the loaded FC1/FC2 weights.")
+        super().pre_reload_weights()
 
     def _release_full_weights_after_ugpu_split(self):
-        """Release full tensors that are replaced by localized uGPU shards."""
+        """Release full tensors replaced by localized uGPU shards or die-local halves."""
         for param_name in (
                 "w3_w1_weight",
                 "w2_weight",

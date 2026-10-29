@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Collection, Dict, List, Optional
 
 import numpy as np
 
@@ -160,7 +160,8 @@ class VmmBounceTransport(BounceTransport):
         """Gather the scattered fragments into the send region and block until done. The whole gather
         runs under the stream lock so a second sender thread can't overwrite the shared staging buffer
         mid-copy and corrupt this region; only the fast gather serializes, the writes stay parallel."""
-        plan = Plan(write_meta.src_ptrs, write_meta.dst_ptrs, write_meta.sizes, total)
+        src_ptrs, dst_ptrs, sizes = bounced_frags(write_meta)
+        plan = Plan(src_ptrs, dst_ptrs, sizes, total)
         with self._send_stream_lock:
             gather_contiguous(
                 src_addr, plan.src_ptrs, plan.sizes, plan.offsets, stream=self._send_stream
@@ -173,23 +174,41 @@ class VmmBounceTransport(BounceTransport):
                 CUASSERT(cudart.cudaEventDestroy(event))
 
     def _make_write(self, src_addr: int, write_meta, total: int):
-        # one coalesced descriptor spanning the whole region
-        sizes = np.array([total], dtype=np.int64)
+        # one coalesced descriptor spanning the gathered fragments, then any in-place fragments
+        num_bounced = num_bounced_frags(write_meta)
+        src_ptrs = np.concatenate(
+            [np.array([src_addr], dtype=np.int64), write_meta.src_ptrs[num_bounced:]]
+        )
+        dst_ptrs = np.concatenate(
+            [
+                np.array([write_meta.bounce_dst_base], dtype=np.int64),
+                write_meta.dst_ptrs[num_bounced:],
+            ]
+        )
+        sizes = np.concatenate([np.array([total], dtype=np.int64), write_meta.sizes[num_bounced:]])
         src = MemoryDescs.from_arrays_uniform_device(
-            MemoryType.VRAM, np.array([src_addr], dtype=np.int64), sizes, self._device_id
+            MemoryType.VRAM, src_ptrs, sizes, self._device_id
         )
         dst = MemoryDescs.from_arrays_uniform_device(
-            MemoryType.VRAM,
-            np.array([write_meta.bounce_dst_base], dtype=np.int64),
-            sizes,
-            write_meta.dst_device_id,
+            MemoryType.VRAM, dst_ptrs, sizes, write_meta.dst_device_id
         )
         return TransferRequest(TransferOp.WRITE, src, dst, write_meta.peer_name, None)
 
     def _reserve_and_gather(self, write_meta, *, timeout):
         """Reserve a send slot and gather into it, or None on send-region backpressure. Eligibility
-        was already decided by the receiver, so the sender only falls back under backpressure."""
-        total = int(write_meta.sizes.sum())
+        was already decided by the receiver, so the sender only falls back under backpressure, or
+        when its bounced fragments would not fit the share the receiver reserved for it."""
+        total = int(bounced_frags(write_meta)[2].sum())
+        if total == 0:
+            return None  # nothing of this writer's payload is bounced
+        budget = getattr(write_meta, "bounce_writer_bytes", None)
+        if budget is not None and total > budget:
+            logger.warning_once(
+                f"[kv-bounce] in-place: {total}B of bounced fragments exceed this writer's "
+                f"{budget}B share of the region; falling back",
+                key="kv-bounce-writer-overflow",
+            )
+            return None
         res = self._send_alloc.reserve(total, timeout=timeout)
         if res is None:
             logger.warning_once(
@@ -235,15 +254,29 @@ class VmmBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        layer_groups: Optional[Collection[int]] = None,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
         ``MambaPolicy.payload_bytes``); the region must cover it or the write would overrun into the
-        neighboring slot."""
+        neighboring slot.
+
+        ``layer_groups`` bounces only those layer groups: the region covers their blocks, the
+        senders send every other fragment in place in the same write, and the request records the
+        groups and each writer's share. It carries no recurrent state, so ``extra_bytes`` must be 0,
+        and it gates on bytes."""
+        if layer_groups is not None:
+            if extra_bytes:
+                raise ValueError(
+                    "a partial bounce carries no recurrent state; extra_bytes must be 0"
+                )
+            layer_groups = sorted(set(layer_groups))
         total = 0
         for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
+            if layer_groups is not None and g not in layer_groups:
+                continue
             if int(block_ids.size) == 0:
                 # Nothing to transfer for this group. Hybrid models (Kimi K3: KDA + MLA) always
                 # carry a trailing empty entry for the mamba layer group — its state is not paged
@@ -279,11 +312,16 @@ class VmmBounceTransport(BounceTransport):
         # TODO(TRTLLM-15194): investigate whether the byte-only gate is
         # safe (or better) for plain-KV payloads too, so this special case can be removed and
         # both payload kinds share one gate.
-        nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
-        if extra_bytes > 0:
+        nblocks = sum(
+            int(a.size)
+            for g, a in enumerate(recv_req.block_ids_per_layer_groups)
+            if layer_groups is None or g in layer_groups
+        )
+        if extra_bytes > 0 or layer_groups is not None:
             if total < self._min_bytes:
                 return self._skip_bounce(
-                    f"{total}B ({nblocks} blocks + recurrent state) < min {self._min_bytes}B "
+                    f"{total}B ({nblocks} blocks + {extra_bytes}B recurrent state) "
+                    f"< min {self._min_bytes}B "
                     f"(too small; tune TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES)",
                     warn_key="kv-bounce-below-min-bytes",
                 )
@@ -306,7 +344,7 @@ class VmmBounceTransport(BounceTransport):
             present_slot_bytes = {
                 self._block_bytes_per_group[g]
                 for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups)
-                if int(block_ids.size) > 0
+                if int(block_ids.size) > 0 and (layer_groups is None or g in layer_groups)
             }
             if len(present_slot_bytes) > 1:
                 return self._skip_bounce(
@@ -328,6 +366,9 @@ class VmmBounceTransport(BounceTransport):
             )
         slot_id, addr = res
         recv_req.bounce_dst_base = addr
+        if layer_groups is not None:
+            recv_req.bounce_layer_groups = layer_groups
+            recv_req.bounce_writer_bytes = total // num_writers
         with self._reserved_map_lock:
             ctx = TransferContext(
                 rid_slice=(recv_req.unique_rid, recv_req.slice_id),
@@ -342,8 +383,9 @@ class VmmBounceTransport(BounceTransport):
         # bounce actually engaged instead of silently falling back to the per-fragment path.
         logger.info_once(
             f"[kv-bounce] coalesced {nblocks} blocks / {total // _MIB}MiB into one region "
-            f"across {num_writers} writer(s)",
-            key="kv-bounce-coalesced",
+            f"across {num_writers} writer(s)"
+            + ("" if layer_groups is None else f", layer groups {layer_groups} only"),
+            key="kv-bounce-coalesced" if layer_groups is None else "kv-bounce-coalesced-partial",
         )
         return True
 
@@ -504,6 +546,7 @@ class NoBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        layer_groups: Optional[Collection[int]] = None,
     ) -> bool:
         return False
 
@@ -569,13 +612,28 @@ def scatter_write_result(
         on_done(True)
 
 
+def num_bounced_frags(write_meta) -> int:
+    """How many leading fragments of the write are gathered into the region; the rest go in place.
+    All of them unless the receiver bounced only some layer groups."""
+    num = getattr(write_meta, "bounce_num_frags", None)
+    return int(write_meta.sizes.size) if num is None else int(num)
+
+
+def bounced_frags(write_meta):
+    """The source pointers, destination pointers and sizes of the gathered fragments."""
+    num = num_bounced_frags(write_meta)
+    return write_meta.src_ptrs[:num], write_meta.dst_ptrs[:num], write_meta.sizes[:num]
+
+
 def encode_result_tail(write_meta) -> list:
-    """The binary tail appended to a bounced result: the destination fragment table and the source
-    this writer wrote to, so the receiver can scatter and order the fan-in writers."""
+    """The binary tail appended to a bounced result: the destination fragment table of the gathered
+    fragments and the source this writer wrote to, so the receiver can scatter and order the fan-in
+    writers."""
     sb = write_meta.bounce_dst_base if write_meta.bounce_dst_base is not None else 0
+    num = num_bounced_frags(write_meta)
     return [
-        write_meta.dst_ptrs.tobytes(),
-        write_meta.sizes.tobytes(),
+        write_meta.dst_ptrs[:num].tobytes(),
+        write_meta.sizes[:num].tobytes(),
         np.array([sb], dtype=np.int64).tobytes(),
     ]
 
@@ -601,13 +659,21 @@ def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
     remains aligned with receive-request layer-group indices.
     """
     from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+    from tensorrt_llm._torch.disaggregation.resource.utils import (
+        get_physical_pool,
+        get_pool_view_num_layers,
+    )
 
     assert page_table is not None
     out: list[int | None] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if not isinstance(lg, AttentionLayerGroup):
             out.append(None)
+            continue
+        if lg.cp_as_tp:
+            out.append(
+                sum(get_pool_view_num_layers(pv) * pv.bytes_per_layer for pv in lg.pool_views)
+            )
             continue
         pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}
         out.append(

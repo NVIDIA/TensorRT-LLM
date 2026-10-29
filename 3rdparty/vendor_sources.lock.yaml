@@ -1,0 +1,14 @@
+schema_version: 1
+vendors:
+  flashinfer-kda-bt16:
+    url: https://github.com/flashinfer-ai/flashinfer.git
+    branch: main
+    commit: b8e81a7dae6c2aa5c9aa19c06e81e9a729271493
+    source: flashinfer/kda_kernels
+    destination: tensorrt_llm/_torch/cute_dsl_kernels/blackwell/kimi_k3_kda
+    include:
+    - kda_chunked_bt16.py
+    - kda_chunked_bt16_small_bh.py
+    patch: 3rdparty/vendor_patches/flashinfer-kda-bt16.patch
+    patch_digest: sha256:8ed15c6d8626f920d93ecbc00ea30ee680e3e1acb19ee8b03d57175c83b601da
+    digest: sha256-tree-v1:e41dd0b752365efc25cb1ad5e538e9750a6e79bec6b24b53d2074f787d8d788c

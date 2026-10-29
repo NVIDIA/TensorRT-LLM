@@ -25,6 +25,7 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -40,6 +41,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     EPGroupHealthLike,
     reject_rank_mask_cuda_graph_capture,
 )
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -55,6 +57,112 @@ _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
 FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
 _CFT_ALIGNMENT_BYTES = 16
+
+# Quantize on send: the fence dispatch kernel quantizes the BF16 hidden state to NVFP4 while it sends it
+# (QUANT_ON_SEND in moeAlltoAllKernels.cu), the bytes of fp4_quantize(x, global_scale, 16, False, False), so the
+# separate quantization kernel and the launch gap in front of the dispatch leave the critical path of a decode MoE
+# layer. Opt-in: unset or "0" keeps the quantization kernel in front of the dispatch, "1" turns it on wherever the
+# kernel can run, "auto" on what TRTLLM_NVFP4_QUANT_KF=1 quantizes in a kernel of its own (Kimi K3: the 3584-wide
+# latent) on the platform and at the batch sizes it was measured at (SM107, up to 512 rows per rank; the K3 DEP16
+# decode batches are 4..384).
+QUANTIZE_ON_SEND_ENV = "TRTLLM_MOE_A2A_QUANTIZE_ON_SEND"
+_FUSED_ROUND_ENV = "TLLM_MOE_A2A_FUSED_ROUND"
+_NVFP4_QUANT_KF_ENV = "TRTLLM_NVFP4_QUANT_KF"
+_DISPATCH_BLOCK_SIZE_ENV = "TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE"
+_QUANTIZE_ON_SEND_TOP_K = 16
+_QUANTIZE_ON_SEND_AUTO_HIDDEN = 3584
+_QUANTIZE_ON_SEND_AUTO_MAX_ROWS = 512
+_QUANTIZE_ON_SEND_AUTO_SM = 107
+# The payload rows of a token that are sent as they are: the int32 expert ids [top_k] and the float32 final scales
+# [top_k] of the Kimi K3 router. The caller passes the actual size.
+_QUANTIZE_ON_SEND_DEFAULT_OTHER_ROW_BYTES = 2 * 4 * _QUANTIZE_ON_SEND_TOP_K
+# The launch limits of the quantize-on-send dispatch, mirrored from moe_a2a_dispatch_launch (moeAlltoAllKernels.cu):
+# the rows [codes | scales | other payloads] of a token are staged in shared memory, one 16-byte vector per thread and
+# preload slot (kDispatchPreloadVecsPerThread), inside the 48 KB of dynamic shared memory the launch does not raise.
+_QUANTIZE_ON_SEND_VECS_PER_THREAD = 4
+_QUANTIZE_ON_SEND_MIN_BLOCK_SIZE = 64
+_QUANTIZE_ON_SEND_MAX_SHARED_BYTES = 48 * 1024
+_STOI_PREFIX = re.compile(r"\s*[+-]?\d+")
+
+
+def _dispatch_block_size() -> int:
+    """The thread count of the dispatch kernel, getEnvMoeA2ADispatchBlockSize() of envUtils.cpp: TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE
+    read as std::stoi does (an unparsable or out-of-range value is the default), clamped to [1, 1024] and rounded up to
+    a multiple of 32; the default is 256."""
+    block = 256
+    match = _STOI_PREFIX.match(os.environ.get(_DISPATCH_BLOCK_SIZE_ENV, ""))
+    if match is not None and -(2**31) <= int(match.group()) < 2**31:
+        block = int(match.group())
+    if block <= 0:
+        block = 256
+    return (min(block, 1024) + 31) // 32 * 32
+
+
+def quantize_on_send_launchable(
+    hidden: int, top_k: int, other_row_bytes: int, block_size: int
+) -> bool:
+    """Whether moe_a2a_dispatch_launch accepts a quantize-on-send dispatch of a BF16 hidden state of width ``hidden``
+    with ``other_row_bytes`` of other payload per token, on ``block_size`` threads. These are the launch checks of
+    moeAlltoAllKernels.cu and moeAlltoAllOp.cpp that depend on the shape; a dispatch they reject raises on every rank,
+    so the selection never lets one through."""
+    # Rows of the codes (hidden / 2 bytes) and the scales (hidden / 16 bytes) that are 16-byte multiples.
+    if hidden <= 0 or hidden % 256 != 0 or other_row_bytes % 16 != 0:
+        return False
+    staged_bytes = hidden // 2 + hidden // 16 + other_row_bytes
+    return (
+        staged_bytes // 16 <= _QUANTIZE_ON_SEND_VECS_PER_THREAD * block_size
+        and other_row_bytes // 16 <= 32 - top_k  # fetched by the lanes of warp 0 that do not route
+        and block_size >= _QUANTIZE_ON_SEND_MIN_BLOCK_SIZE
+        and 2 * top_k * 4 + staged_bytes <= _QUANTIZE_ON_SEND_MAX_SHARED_BYTES
+    )
+
+
+def quantize_on_send_setting() -> str:
+    """The switch of quantize on send: "0" (also when the variable is unset: off), "1" (wherever the kernel can run) or
+    "auto" (the shapes and the platform it was measured on)."""
+    value = os.environ.get(QUANTIZE_ON_SEND_ENV, "").strip()
+    if value not in ("", "0", "1", "auto"):
+        raise ValueError(f"{QUANTIZE_ON_SEND_ENV} must be 0, 1 or auto, got {value!r}")
+    return value or "0"
+
+
+def quantize_on_send_enabled(
+    rows: int,
+    hidden: int,
+    top_k: int,
+    use_cft: bool,
+    other_row_bytes: int = _QUANTIZE_ON_SEND_DEFAULT_OTHER_ROW_BYTES,
+) -> bool:
+    """Whether a dispatch of BF16 rows of width ``hidden`` quantizes them while it sends them. ``rows`` is the largest
+    number of rows of any rank (``runtime_max_tokens_per_rank``), never the rows of this rank: the payloads of a
+    quantizing and of a non-quantizing dispatch differ, so every rank has to reach the same decision.
+
+    The one place that decides. The kernel needs the fence dispatch of the fused-round kernels
+    (TLLM_MOE_A2A_FUSED_ROUND=1, no CFT counted writes), top_k 16, an SM10x GPU and a shape its launch accepts
+    (``quantize_on_send_launchable``, with the TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE of this process); the rest is the
+    switch above: off unless it is set, ``auto`` only on SM107 and what TRTLLM_NVFP4_QUANT_KF=1 quantizes in a kernel
+    of its own.
+    """
+    value = quantize_on_send_setting()
+    if value == "0":
+        return False
+    sm_version = get_sm_version()
+    if not 100 <= sm_version < 110:
+        return False
+    if use_cft or top_k != _QUANTIZE_ON_SEND_TOP_K or os.environ.get(_FUSED_ROUND_ENV) != "1":
+        return False
+    if rows < 1 or not quantize_on_send_launchable(
+        hidden, top_k, other_row_bytes, _dispatch_block_size()
+    ):
+        return False
+    if value == "1":
+        return True
+    return (
+        sm_version == _QUANTIZE_ON_SEND_AUTO_SM
+        and os.environ.get(_NVFP4_QUANT_KF_ENV) == "1"
+        and hidden == _QUANTIZE_ON_SEND_AUTO_HIDDEN
+        and rows <= _QUANTIZE_ON_SEND_AUTO_MAX_ROWS
+    )
 
 
 def get_force_cft() -> bool | None:
@@ -313,6 +421,8 @@ class NVLinkOneSided(Communication):
 
         if self.mapping.world_size != self.ep_size:
             raise RuntimeError("Currently NVLinkOneSided only supports pure EP for MoE.")
+        # A bad TRTLLM_MOE_A2A_QUANTIZE_ON_SEND fails here, on every rank, and never inside a step.
+        quantize_on_send_setting()
 
         # Store needed parameters
         self.num_experts = num_slots
@@ -599,6 +709,54 @@ class NVLinkOneSided(Communication):
             runtime_max_tokens_per_rank,
         )
 
+    def can_quantize_on_send(
+        self,
+        hidden_states: torch.Tensor,
+        global_scale: Optional[torch.Tensor],
+        token_selected_slots: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        all_rank_num_tokens: List[int],
+    ) -> bool:
+        """Whether ``dispatch(..., quantize_on_send_scale=global_scale)`` can take the BF16 ``hidden_states`` and send
+        their NVFP4 quantization (the bytes of ``fp4_quantize(hidden_states, global_scale, 16, False, False)``) along
+        with ``token_selected_slots`` and ``token_final_scales``: the dispatch kernel stages the rows of all payloads,
+        so their sizes enter the decision (``quantize_on_send_enabled``)."""
+        if quantize_on_send_setting() == "0":
+            return False  # the default: nothing below runs, the dispatch is the one of the quantization kernel in front
+        if (
+            self.enable_eplb  # the EPLB-statistics variant of the dispatch kernel has no quantize-on-send test
+            or self._rank_mask_enabled  # nor has the rank-mask variant
+            or global_scale is None
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.dim() != 2
+            or not hidden_states.is_contiguous()
+            or not hidden_states.is_cuda
+            or hidden_states.data_ptr() % 32 != 0
+            or global_scale.dtype != torch.float32
+            or not global_scale.is_cuda
+            or global_scale.numel() < 1
+            or token_selected_slots.dim() != 2
+            or token_selected_slots.dtype != torch.int32
+            or (token_final_scales is not None and token_final_scales.dim() != 2)
+        ):
+            return False
+        other_row_bytes = sum(
+            payload.shape[1] * payload.element_size()
+            for payload in (token_selected_slots, token_final_scales)
+            if payload is not None
+        )
+        # The row count that decides is the one of the dispatch, the same on every rank (a rank may hold fewer rows, or
+        # none), like the CFT choice. What stays rank-local is the form of this rank's tensors above, which is the same
+        # on every rank of a MoE layer.
+        runtime_max_tokens_per_rank = max(all_rank_num_tokens)
+        return quantize_on_send_enabled(
+            runtime_max_tokens_per_rank,
+            hidden_states.shape[1],
+            self.top_k,
+            self.use_cft_for_dispatch(runtime_max_tokens_per_rank),
+            other_row_bytes,
+        )
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -623,7 +781,9 @@ class NVLinkOneSided(Communication):
                 committed membership for dispatch. Without an override, the committed mask and generation are
                 captured together; combine reuses that mask and fails closed if the generation changes first.
                 The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
-                artifact, not valid model output.
+                artifact, not valid model output. ``quantize_on_send_scale`` (a ``can_quantize_on_send`` global
+                scale) makes ``hidden_states`` the BF16 input: the dispatch quantizes it to NVFP4 on the way and
+                returns the received codes and scales as usual, with ``hidden_states_sf=None``.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
@@ -636,6 +796,23 @@ class NVLinkOneSided(Communication):
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
         can_use_cft_for_dispatch = self.use_cft_for_dispatch(runtime_max_tokens_per_rank)
+
+        # Quantize on send (see can_quantize_on_send): hidden_states is the BF16 input and the kernel sends its NVFP4
+        # codes and scales, so hidden_states_sf is None here and the received codes and scales are returned as usual.
+        quantize_on_send_scale = kwargs.get("quantize_on_send_scale")
+        if quantize_on_send_scale is not None:
+            if hidden_states_sf is not None or hidden_states.dtype != torch.bfloat16:
+                raise ValueError(
+                    "quantize_on_send_scale needs the BF16 hidden states and no scaling factors"
+                )
+            if can_use_cft_for_dispatch:
+                raise RuntimeError("quantize on send needs the fence dispatch")
+            tllm_logger.info_once(
+                "NVLinkOneSided AlltoAll: quantize-on-send engaged, the dispatch kernel quantizes the BF16 MoE input "
+                f"(rows={hidden_states.shape[0]}, hidden={hidden_states.shape[1]}) to NVFP4 "
+                f"(set by {QUANTIZE_ON_SEND_ENV}; unset or 0 keeps the quantization kernel in front of the dispatch)",
+                key=f"nvlink_one_sided_quantize_on_send_{hidden_states.shape[0]}_{hidden_states.shape[1]}",
+            )
 
         # Build payloads list - match TRTLLMGen baseline order for optimal performance
         # Order: [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
@@ -651,8 +828,9 @@ class NVLinkOneSided(Communication):
         can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
             can_use_cft_for_dispatch, payloads
         )
+        # The dispatch op sets the expert ids of the received padding rows to invalid_token_expert_id
+        # (in the dispatch kernel, or with the sanitize kernel right after it; see moeAlltoAllOp.cpp).
         expert_id_payload_index = len(payloads) - (2 if token_final_scales is not None else 1)
-        can_fuse_sanitize = can_use_cft_for_dispatch
 
         eplb_local_stats = kwargs.get("eplb_local_stats")
         if eplb_local_stats is not None:
@@ -682,10 +860,11 @@ class NVLinkOneSided(Communication):
                 self.num_experts,
                 eplb_local_stats,
                 can_use_cft_for_dispatch,
-                expert_id_payload_index if can_fuse_sanitize else None,
-                int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
+                expert_id_payload_index,
+                int(self.invalid_token_expert_id),
                 self._rank_mask_enabled,
                 active_rank_mask,
+                quantize_on_send_scale,
             )
         )
         self._watchdog_coordinator.watch_collective(
@@ -701,10 +880,10 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
-        # Payload order matches input:
+        # Payload order matches input (quantize on send: the received scales follow the received codes):
         # [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
         hidden_states_recv = recv_buffers[0]
-        if hidden_states_sf is not None:
+        if hidden_states_sf is not None or quantize_on_send_scale is not None:
             hidden_states_sf_recv = recv_buffers[1]
             token_selected_slots_recv = recv_buffers[2]
             token_final_scales_recv = recv_buffers[3] if token_final_scales is not None else None
@@ -712,15 +891,6 @@ class NVLinkOneSided(Communication):
             hidden_states_sf_recv = None
             token_selected_slots_recv = recv_buffers[1]
             token_final_scales_recv = recv_buffers[2] if token_final_scales is not None else None
-
-        if not can_fuse_sanitize:
-            torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
-                token_selected_slots_recv,
-                self.workspace,
-                self.moe_a2a_metainfo,
-                self.ep_rank,
-                int(self.invalid_token_expert_id),
-            )
 
         # Flatten 3D tensors to 2D for compatibility with MoE backends
         # recv_buffers have shape [ep_size, max_tokens_per_rank, ...], flatten to [ep_size * max_tokens_per_rank, ...]
@@ -844,7 +1014,10 @@ class NVLinkOneSided(Communication):
         Safe to call between forward passes (or from an error handler) to
         recover from a forward that called ``dispatch`` but did not reach
         ``combine`` — e.g. because an OOM aborted the forward. Without this,
-        the next ``dispatch`` would raise ``dispatch called twice``.
+        the next ``dispatch`` would raise ``dispatch called twice``. The rounds after
+        such a dispatch are correct only with TLLM_MOE_A2A_FUSED_ROUND=1: with the
+        legacy kernels (the default) the next dispatch takes an even flag and its
+        combine reads the other counter bank.
         """
         self._dispatch_state = {"phase": "idle"}
 

@@ -26,7 +26,7 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     GroupedGemmInputsHelper,
     _get_sm107_nvfp4_default_mma_config,
 )
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     _runner_tactics_match_tile_size,
@@ -1265,13 +1265,22 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     reason="This test is only supported on SM 107 (Rubin) GPUs",
 )
 @pytest.mark.parametrize("tile_size", [128, 256])
-def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
+@pytest.mark.parametrize("situ_fast", [False, True], ids=["exact", "tanh_approx"])
+def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int, situ_fast: bool, monkeypatch):
     """SiTU epilogue on the Rubin NVFP4 gather+grouped GEMM kernel.
 
     Reduced grid vs the SwiGLU test: enough to compile both tile sizes and
     catch a dropped / swapped beta. The Blackwell test documents why the
     swap check is restricted to (128 tokens, top_k=1, ep=1).
+
+    ``situ_fast`` (TRTLLM_CUTEDSL_FC1_SITU_FAST=1) evaluates the SiTU terms with the
+    hardware tanh (about 2**-11 relative error before the NVFP4 quantization): the
+    NVFP4 bytes must still match the reference within the same tolerance.
     """
+    if situ_fast:
+        monkeypatch.setenv("TRTLLM_CUTEDSL_FC1_SITU_FAST", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_CUTEDSL_FC1_SITU_FAST", raising=False)
     num_tokens = 128
     top_k = 1
     ep_size = 1
@@ -1342,10 +1351,14 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
-        max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
+    # Zero-initialized: the padding rows of every tile enter the reference's output global scale, so uninitialized
+    # memory there makes the reference (and the swap check below) depend on allocator history.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
     )
+    a_sf_gathered = torch.zeros(
+        max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=torch.uint8
+    ).view(a_sf.dtype)
     for i in range(num_valid_permuted_tokens):
         if i >= tile_idx_to_mn_limit_list[i // tile_size]:
             continue
@@ -1456,6 +1469,71 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
             "Swapping situ_beta and situ_linear_beta produced a bit-identical "
             "output; the kernel is ignoring one of the SiTU constants."
         )
+
+        if situ_fast:
+            # Fast vs exact epilogue on the same inputs: the FP4 bytes and the block scales may differ only where the
+            # hardware tanh moves a value across a rounding boundary (about 1e-5 of the bytes on CTX FC1 activations).
+            monkeypatch.delenv("TRTLLM_CUTEDSL_FC1_SITU_FAST")
+            c_exact, c_sf_exact = (
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+                    a,
+                    b_interleaved,
+                    a_sf_unswizzled,
+                    b_sf_interleaved,
+                    alpha,
+                    tile_idx_to_group_idx,
+                    tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles,
+                    torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
+                    **op_kwargs,
+                )
+            )
+            exact_valid = c_exact[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
+            byte_mismatch = (c_valid != exact_valid).float().mean().item()
+            c_sf_exact_unswizzled = unswizzle_sf(
+                c_sf_exact, max_num_permuted_tokens, interm_size, sf_vec_size
+            )
+            valid_rows = [
+                i
+                for i in range(num_valid_permuted_tokens)
+                if i < tile_idx_to_mn_limit_list[i // tile_size]
+            ]
+            sf_exact_valid = torch.cat([c_sf_exact_unswizzled[i] for i in valid_rows])
+            sf_mismatch = (c_sf_valid != sf_exact_valid).float().mean().item()
+            print(
+                f"[situ_fast vs exact] tile {tile_size}: FP4 byte mismatch {byte_mismatch:.2e}, "
+                f"block scale mismatch {sf_mismatch:.2e}"
+            )
+            assert byte_mismatch <= 5e-3, f"{byte_mismatch:.2e} of the FP4 bytes differ"
+            assert sf_mismatch <= 5e-3, f"{sf_mismatch:.2e} of the block scales differ"
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on SM 107 (Rubin) GPUs",
+)
+def test_situ_fast_rejects_unsupported_configurations():
+    """SiTU-fast exists for the SiTU activation with the vectorized epilogue only: any other
+    configuration must fail at construction, not silently run the exact epilogue."""
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import (  # noqa: E501
+        Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel as Kernel,
+    )
+
+    mma_tiler, mma_inst_shape, cluster_shape_mn = _get_sm107_nvfp4_default_mma_config(128)
+    common = dict(
+        sf_vec_size=16,
+        mma_inst_shape=mma_inst_shape,
+        mma_tiler=mma_tiler,
+        cluster_shape_mn=cluster_shape_mn,
+        topk=1,
+    )
+    situ = dict(activation_type=ActivationType.SiTu, situ_beta=1.0, situ_linear_beta=1.0)
+    Kernel(vectorized_f32=True, situ_fast=True, **situ, **common)  # supported
+    with pytest.raises(ValueError, match="vectorized"):
+        Kernel(vectorized_f32=False, situ_fast=True, **situ, **common)
+    with pytest.raises(ValueError, match="requires ActivationType.SiTu"):
+        Kernel(vectorized_f32=True, situ_fast=True, activation_type=ActivationType.Swiglu, **common)
 
 
 @pytest.mark.skipif(
@@ -2587,8 +2665,8 @@ def _make_sm107_nvfp4_finalize_runner(monkeypatch):
 
 
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-    reason="This test requires the internal CuteDSL package",
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="This test requires a CuTe DSL with Rubin (SM107) support",
 )
 def test_sm107_nvfp4_finalize_get_valid_tactics_filters_n_tiling(monkeypatch):
     runner = _make_sm107_nvfp4_finalize_runner(monkeypatch)
@@ -2601,8 +2679,8 @@ def test_sm107_nvfp4_finalize_get_valid_tactics_filters_n_tiling(monkeypatch):
 
 
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-    reason="This test requires the internal CuteDSL package",
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="This test requires a CuTe DSL with Rubin (SM107) support",
 )
 def test_sm107_nvfp4_finalize_forward_rejects_incompatible_n_tiling(monkeypatch):
     runner = _make_sm107_nvfp4_finalize_runner(monkeypatch)
@@ -2613,8 +2691,8 @@ def test_sm107_nvfp4_finalize_forward_rejects_incompatible_n_tiling(monkeypatch)
 
 
 @pytest.mark.skipif(
-    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-    reason="This test requires the internal CuteDSL package",
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="This test requires a CuTe DSL with Rubin (SM107) support",
 )
 def test_sm107_nvfp4_finalize_accepts_two_cta_n_tiling():
     runner_cls = cute_dsl_custom_ops.Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner
@@ -2626,7 +2704,7 @@ def _get_registered_rubin_moe_op(name: str):
     try:
         return getattr(torch.ops.trtllm, name)
     except AttributeError:
-        pytest.skip("internal CuteDSL Rubin MoE ops are not registered")
+        pytest.skip("the CuTe DSL Rubin MoE ops are not registered")
 
 
 def _assert_rubin_moe_op_schema(
@@ -3219,7 +3297,7 @@ def test_rubin_moe_ugpu_composite_owns_concurrent_tuning(
 ):
     composite_op = getattr(cute_dsl_custom_ops, composite_name, None)
     if composite_op is None:
-        pytest.skip("internal CuteDSL Rubin MoE composite op is not registered")
+        pytest.skip("the CuTe DSL Rubin MoE composite op is not registered")
 
     tuning_config = object()
     chosen_tactic = ("chosen", 128)
@@ -3490,14 +3568,21 @@ def test_rubin_moe_ugpu_composite_owns_concurrent_tuning(
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
+@pytest.mark.parametrize(
+    "activation_type", [ActivationType.Swiglu, ActivationType.SiTu], ids=["swiglu", "situ"]
+)
 @pytest.mark.parametrize("tile_size", [128])
 @pytest.mark.parametrize("ep_size", [1, 8])
 @pytest.mark.parametrize("top_k", [1, 2])
 @pytest.mark.parametrize("num_tokens", [128, 515])
 def test_nvfp4_gather_grouped_gemm_swiglu_ugpu_rubin(
-    num_tokens: int, top_k: int, ep_size: int, tile_size: int
+    num_tokens: int, top_k: int, ep_size: int, tile_size: int, activation_type: ActivationType
 ):
+    """uGPU N-split FC1 vs the single-partition kernel: bitwise, SwiGLU and SiTU (Kimi K3)."""
     _skip_if_no_ugpu()
+    act_kwargs = dict(activation_type=activation_type)
+    if activation_type == ActivationType.SiTu:
+        act_kwargs.update(situ_beta=SITU_BETA, situ_linear_beta=SITU_LINEAR_BETA)
 
     sf_vec_size = 16
     hidden_size = 2048
@@ -3545,7 +3630,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_ugpu_rubin(
         output_tensor=None,
         output_sf_tensor=None,
         partition_id=-1,
-        activation_type=ActivationType.Swiglu,
+        **act_kwargs,
     )
 
     half_weight_n = weight.size(1) // 2
@@ -3588,7 +3673,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_ugpu_rubin(
                         output_tensor=c_ugpu,
                         output_sf_tensor=c_sf_ugpu,
                         partition_id=ugpu_id,
-                        activation_type=ActivationType.Swiglu,
+                        **act_kwargs,
                     )
     finally:
         end_for_all_ugpu()
@@ -4023,6 +4108,368 @@ def test_moe_module_ugpu_correctness_rubin(num_tokens: int, top_k: int):
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
+@pytest.mark.parametrize("top_k", [1, 2])
+def test_moe_module_ugpu_situ_matches_single_partition_rubin(top_k: int):
+    """Kimi K3 SiTU through the uGPU NVFP4 MoE (N-split, die-local weights) vs the default module."""
+    _skip_if_no_ugpu()
+
+    from _torch.modules.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
+    from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind
+    from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    num_tokens, hidden_size, intermediate_size, num_experts = 128, 2048, 1536, 256
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+    x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.NVFP4, x, "CUTEDSL"
+    )
+    weights = quantize_util_cls(
+        num_experts=num_experts,
+        dtype=dtype,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+        bias=False,
+        swiglu_gptoss_style=False,
+    ).create_weights(**quant_kwargs)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = hidden_size
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = dtype
+
+    def run(enable_ugpu: bool) -> torch.Tensor:
+        model_config = ModelConfig(
+            pretrained_config=pretrained_config,
+            quant_config=quant_config,
+            mapping=Mapping(),
+            moe_backend="CUTEDSL",
+            ugpu_policy=UgpuPolicy(enabled=enable_ugpu),
+        )
+        backend = create_moe_backend(
+            moe_cls=CuteDslFusedMoE,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=model_config,
+            init_load_balancer=False,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        assert backend.activation_type == ActivationType.SiTu
+        assert (backend._ugpu_runtime is not None) == enable_ugpu
+        selected, scales = routing_method.apply(router_logits)
+        x_q, x_sf = backend.quantize_input(x, post_quant_comm=False)
+        args = dict(
+            x=x_q,
+            token_selected_experts=selected.to(torch.int32),
+            token_final_scales=scales.to(torch.float32),
+            x_sf=x_sf,
+        )
+        if backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM:
+            args["comm_plan"] = MoECommPlan(
+                input_sf_swizzled=True,
+                enable_alltoall=False,
+                moe_output=None,
+                payload_in_workspace=False,
+            )
+        with torch.inference_mode():
+            out = backend.run_moe(MoERunContext(**args))
+        torch.cuda.synchronize()
+        return out
+
+    base = run(False)
+    ugpu = run(True)
+    assert torch.isfinite(base).all() and base.abs().max() > 0
+    # FC1/FC2 are split by N with the full K reduction per partition; only the
+    # top-k finalize accumulation order may differ.
+    torch.testing.assert_close(ugpu, base, rtol=1e-2, atol=0.15)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("situ_fast", [False, True], ids=["exact", "tanh_approx"])
+@pytest.mark.parametrize("num_tokens", [2, 128])
+@pytest.mark.parametrize("top_k", [1, 2])
+def test_moe_module_die_local_situ_matches_default_rubin(
+    top_k: int, num_tokens: int, situ_fast: bool, monkeypatch
+):
+    """Kimi K3 SiTU through die-local experts (TRTLLM_K3_DIE_LOCAL_EXPERTS) vs the default module.
+
+    Die-local experts change only where the FC1/FC2 weights live and which CTA computes
+    which output tile, so FC1 is bitwise and, with at most two finalize contributions per
+    output row (top-1/top-2: a + b == b + a), so is the module output. Two tokens give
+    fewer tiles than CTAs (one tile per CTA, no queue); 128 tokens use the die queues,
+    also from two streams at once. With ``situ_fast`` (TRTLLM_CUTEDSL_FC1_SITU_FAST=1) both
+    arms evaluate SiTU with the hardware tanh, so they still agree bit for bit.
+    """
+    from _torch.modules.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
+    from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind
+    from tensorrt_llm._torch.ugpu import die_local
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("die-local experts need the CuTe DSL Rubin kernels")
+    if die_local.smid_die_table(torch.cuda.current_device()) is None:
+        pytest.skip("die-local experts need a GPU with two memory locality domains")
+    if situ_fast:
+        monkeypatch.setenv("TRTLLM_CUTEDSL_FC1_SITU_FAST", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_CUTEDSL_FC1_SITU_FAST", raising=False)
+
+    hidden_size, intermediate_size, num_experts = 2048, 1536, 256
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+    x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.NVFP4, x, "CUTEDSL"
+    )
+    weights = quantize_util_cls(
+        num_experts=num_experts,
+        dtype=dtype,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+        bias=False,
+        swiglu_gptoss_style=False,
+    ).create_weights(**quant_kwargs)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = hidden_size
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = dtype
+
+    def run(enable_die_local: bool) -> list:
+        if enable_die_local:
+            monkeypatch.setenv("TRTLLM_K3_DIE_LOCAL_EXPERTS", "1")
+        else:
+            monkeypatch.delenv("TRTLLM_K3_DIE_LOCAL_EXPERTS", raising=False)
+        model_config = ModelConfig(
+            pretrained_config=pretrained_config,
+            quant_config=quant_config,
+            mapping=Mapping(),
+            moe_backend="CUTEDSL",
+        )
+        backend = create_moe_backend(
+            moe_cls=CuteDslFusedMoE,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=model_config,
+            init_load_balancer=False,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        backend.load_weights([weights])
+        reclaims = []
+        with monkeypatch.context() as patch:
+            if enable_die_local:
+                # Short of driver memory, the load first returns PyTorch's cached blocks
+                # (cuMemCreate does not see them); with room to spare it leaves the cache alone.
+                patch.setattr(torch.cuda, "mem_get_info", lambda device=None: (0, 1 << 40))
+                patch.setattr(torch.cuda, "empty_cache", lambda: reclaims.append(True))
+            backend.post_load_weights()
+        assert reclaims == ([True] if enable_die_local else [])
+        backend.cuda()
+        assert (backend._die_local is not None) == enable_die_local
+        if enable_die_local:
+            # The stacked die-homed halves replace the full weights.
+            assert backend.w3_w1_weight.numel() == 0 and backend.w2_weight.numel() == 0
+            assert backend._die_local["w3_w1_weight"].size(0) == 2 * num_experts
+            with pytest.raises(NotImplementedError, match="weight reloading"):
+                backend.pre_reload_weights()
+        selected, scales = routing_method.apply(router_logits)
+        x_q, x_sf = backend.quantize_input(x, post_quant_comm=False)
+        args = dict(
+            x=x_q,
+            token_selected_experts=selected.to(torch.int32),
+            token_final_scales=scales.to(torch.float32),
+            x_sf=x_sf,
+        )
+        if backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM:
+            args["comm_plan"] = MoECommPlan(
+                input_sf_swizzled=True,
+                enable_alltoall=False,
+                moe_output=None,
+                payload_in_workspace=False,
+            )
+        outs = []
+        with torch.inference_mode():
+            # Repeated launches: the kernels' tile-queue counters must reset themselves.
+            for _ in range(3):
+                outs.append(backend.run_moe(MoERunContext(**args)).clone())
+            if enable_die_local:
+                # Chunked MoE can run two chunks of one layer at once on two streams:
+                # each stream must get its own tile-queue counters.
+                side = [torch.cuda.Stream() for _ in range(2)]
+                ws_ptrs = set()
+                for stream in side:
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        ws_ptrs.add(backend._die_local["ws"].get()[0].data_ptr())
+                assert len(ws_ptrs) == 2
+                for _ in range(3):
+                    for stream in side:
+                        with torch.cuda.stream(stream):
+                            outs.append(backend.run_moe(MoERunContext(**args)))
+                # A full-chip persistent grid lets the second launch start only as the first
+                # one drains; a 32-CTA grid lets both claim tiles at the same time.
+                torch.cuda.synchronize()
+                sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+                monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", str(sms - 32))
+                for _ in range(4):
+                    for stream in side:
+                        with torch.cuda.stream(stream):
+                            outs.append(backend.run_moe(MoERunContext(**args)))
+                torch.cuda.synchronize()
+                monkeypatch.delenv("TRTLLM_CUTEDSL_SM_RESERVE")
+        torch.cuda.synchronize()
+        if enable_die_local:
+            for ws_set in backend._die_local["ws"].all_sets():
+                assert all(ws.count_nonzero().item() == 0 for ws in ws_set)
+        return outs
+
+    base = run(False)
+    die_local_outs = run(True)
+    assert torch.isfinite(base[0]).all() and base[0].abs().max() > 0
+    for out in die_local_outs:
+        assert torch.equal(out, base[0])
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+def test_moe_chunked_overlap_die_local_matches_default_rubin(monkeypatch):
+    """ConfigurableMoE with moe_max_num_tokens below the token count splits the batch into
+    chunks and runs alternate chunks on an aux stream, so two chunks of one layer can be in
+    flight at once. Die-local experts must still match the default layer bitwise (top-2)."""
+    from _torch.modules.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
+    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
+    from tensorrt_llm._torch.ugpu import die_local
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("die-local experts need the CuTe DSL Rubin kernels")
+    if die_local.smid_die_table(torch.cuda.current_device()) is None:
+        pytest.skip("die-local experts need a GPU with two memory locality domains")
+
+    hidden_size, intermediate_size, num_experts, top_k = 2048, 1536, 256, 2
+    num_tokens, chunk_tokens = 512, 128
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+    x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.NVFP4, x, "CUTEDSL"
+    )
+    weights = quantize_util_cls(
+        num_experts=num_experts,
+        dtype=dtype,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+        bias=False,
+        swiglu_gptoss_style=False,
+    ).create_weights(**quant_kwargs)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = hidden_size
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = dtype
+
+    def run(enable_die_local: bool) -> list:
+        if enable_die_local:
+            monkeypatch.setenv("TRTLLM_K3_DIE_LOCAL_EXPERTS", "1")
+        else:
+            monkeypatch.delenv("TRTLLM_K3_DIE_LOCAL_EXPERTS", raising=False)
+        model_config = ModelConfig(
+            pretrained_config=pretrained_config,
+            quant_config=quant_config,
+            mapping=Mapping(),
+            moe_backend="CUTEDSL",
+            moe_max_num_tokens=chunk_tokens,
+        )
+        moe = create_moe(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=True,
+            model_config=model_config,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        assert isinstance(moe, ConfigurableMoE) and moe.aux_stream is not None
+        moe.load_weights([weights])
+        # As in ModelLoader: ConfigurableMoE is marked _weights_removed, and the loader
+        # runs the backend's own post_load_weights (where the die-local halves are built).
+        moe.backend.post_load_weights()
+        moe.cuda()
+        assert (moe.backend._die_local is not None) == enable_die_local
+        with torch.inference_mode():
+            outs = [moe.forward(x, router_logits).clone() for _ in range(3)]
+        torch.cuda.synchronize()
+        if enable_die_local:
+            for ws_set in moe.backend._die_local["ws"].all_sets():
+                assert all(ws.count_nonzero().item() == 0 for ws in ws_set)
+        return outs
+
+    base = run(False)
+    die_local_outs = run(True)
+    assert torch.isfinite(base[0]).all() and base[0].abs().max() > 0
+    for out in base[1:] + die_local_outs:
+        assert torch.equal(out, base[0])
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
 def test_moe_module_bf16_ugpu_lifecycle_and_forward_chunk_rubin():
     _skip_if_no_ugpu()
 
@@ -4270,3 +4717,196 @@ def test_bf16_grouped_gemm_finalize_rubin(
         f"tile_size={tile_size}: {len(failed)}/{len(tactics)} tactics failed:\n  "
         + "\n  ".join(failed)
     )
+
+
+# L2 evict-first hint on the Rubin routed-expert weight loads (FC1 gather GEMM, FC2 GEMM + finalize).
+EVICT_FIRST_ENV = "TRTLLM_CUTEDSL_MOE_WEIGHT_EVICT_FIRST"
+
+
+@pytest.mark.parametrize(
+    "num_tokens, top_k, num_experts, num_local_experts, tile_size, die_local, expected",
+    [
+        # Default allocation, decode (TP8 GEN: MoE TP4 x EP2 = 448 of 896 local experts): on up to 512 tokens.
+        (6, 16, 896, 448, 128, False, True),
+        (96, 16, 896, 448, 128, False, True),
+        (512, 16, 896, 448, 128, False, True),
+        (513, 16, 896, 448, 128, False, False),
+        (1024, 16, 896, 448, 128, False, False),
+        # Prefill-sized calls (TP8 CTX server: EP8 = 112 local experts): off.
+        (7676, 16, 896, 112, 128, False, False),
+        (16384, 16, 896, 112, 128, False, False),
+        # At most 512 local experts; 896 (DWDP16 prefill: every expert on one GPU) is off at any size.
+        (96, 16, 896, 512, 128, False, True),
+        (96, 16, 896, 513, 128, False, False),
+        (256, 16, 896, 896, 128, False, False),
+        (16384, 16, 896, 896, 128, False, False),
+        # Die-local experts (DEP16 decode: 56 of 896 local experts): on while an expert's rows fit one routing tile.
+        (4096, 16, 896, 56, 128, True, True),
+        (6144, 16, 896, 56, 128, True, True),
+        (7168, 16, 896, 56, 128, True, True),
+        (8192, 16, 896, 56, 128, True, False),
+        (16384, 16, 896, 56, 256, True, False),
+    ],
+)
+def test_moe_weight_evict_first_gate(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    num_local_experts: int,
+    tile_size: int,
+    die_local: bool,
+    expected: bool,
+    monkeypatch,
+):
+    from tensorrt_llm._torch.cute_dsl_kernels import moe_weight_evict_first
+
+    def gate():
+        return moe_weight_evict_first(
+            num_tokens, top_k, num_experts, num_local_experts, tile_size, die_local=die_local
+        )
+
+    monkeypatch.delenv(EVICT_FIRST_ENV, raising=False)
+    assert gate() is expected
+    monkeypatch.setenv(EVICT_FIRST_ENV, "1")
+    assert gate() is expected
+    monkeypatch.setenv(EVICT_FIRST_ENV, "0")
+    assert gate() is False
+
+
+def test_moe_weight_evict_first_rejects_bad_switch(monkeypatch):
+    from tensorrt_llm._torch.cute_dsl_kernels import moe_weight_evict_first
+
+    monkeypatch.setenv(EVICT_FIRST_ENV, "yes")
+    with pytest.raises(ValueError, match=EVICT_FIRST_ENV):
+        moe_weight_evict_first(96, 16, 896, 448, 128)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("die_local_experts", [False, True], ids=["default_layout", "die_local"])
+@pytest.mark.parametrize("num_tokens", [6, 48])
+def test_moe_module_weight_evict_first_is_bitwise_neutral_rubin(
+    num_tokens: int, die_local_experts: bool, monkeypatch
+):
+    """The hint moves no data and changes no arithmetic: the MoE output is bitwise the same with it on and off.
+
+    top_k = 2: every output row sums at most two bf16 contributions, so the FC2 finalize reduction is order independent.
+    Both runs must really take the paths under test: the gate asks for the hint for FC1 and FC2 by default and
+    for neither with the kill switch, on the default and on the die-local (TRTLLM_K3_DIE_LOCAL_EXPERTS) layout.
+    """
+    from _torch.modules.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+    from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
+    from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind
+    from tensorrt_llm._torch.ugpu import die_local
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    if die_local_experts:
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            pytest.skip("die-local experts need the CuTe DSL Rubin kernels")
+        if die_local.smid_die_table(torch.cuda.current_device()) is None:
+            pytest.skip("die-local experts need a GPU with two memory locality domains")
+        monkeypatch.setenv("TRTLLM_K3_DIE_LOCAL_EXPERTS", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_K3_DIE_LOCAL_EXPERTS", raising=False)
+    monkeypatch.delenv(EVICT_FIRST_ENV, raising=False)
+
+    hidden_size, intermediate_size, num_experts, top_k = 2048, 1536, 256, 2
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+    x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.NVFP4, x, "CUTEDSL"
+    )
+    weights = quantize_util_cls(
+        num_experts=num_experts,
+        dtype=dtype,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+        bias=False,
+        swiglu_gptoss_style=False,
+    ).create_weights(**quant_kwargs)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = hidden_size
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = dtype
+    backend = create_moe_backend(
+        moe_cls=CuteDslFusedMoE,
+        routing_method=routing_method,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+        reduce_results=True,
+        model_config=ModelConfig(
+            pretrained_config=pretrained_config,
+            quant_config=quant_config,
+            mapping=Mapping(),
+            moe_backend="CUTEDSL",
+        ),
+        init_load_balancer=False,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    backend.load_weights([weights])
+    with monkeypatch.context() as patch:
+        if die_local_experts:
+            # Short of driver memory, the load first returns PyTorch's cached blocks; keep that out of this test.
+            patch.setattr(torch.cuda, "mem_get_info", lambda device=None: (0, 1 << 40))
+            patch.setattr(torch.cuda, "empty_cache", lambda: None)
+        backend.post_load_weights()
+    backend.cuda()
+    assert (backend._die_local is not None) == die_local_experts
+
+    selected, scales = routing_method.apply(router_logits)
+    x_q, x_sf = backend.quantize_input(x, post_quant_comm=False)
+    args = dict(
+        x=x_q,
+        token_selected_experts=selected.to(torch.int32),
+        token_final_scales=scales.to(torch.float32),
+        x_sf=x_sf,
+    )
+    if backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM:
+        args["comm_plan"] = MoECommPlan(
+            input_sf_swizzled=True,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        )
+
+    decisions = []
+    real_gate = cute_dsl_custom_ops.moe_weight_evict_first
+
+    def spy(*gate_args, **gate_kwargs):
+        decisions.append(real_gate(*gate_args, **gate_kwargs))
+        return decisions[-1]
+
+    monkeypatch.setattr(cute_dsl_custom_ops, "moe_weight_evict_first", spy)
+
+    def run():
+        decisions.clear()
+        with torch.inference_mode():
+            out = backend.run_moe(MoERunContext(**args)).clone()
+        torch.cuda.synchronize()
+        return out, list(decisions)
+
+    out_on, decided_on = run()
+    monkeypatch.setenv(EVICT_FIRST_ENV, "0")
+    out_off, decided_off = run()
+    # One decision per FC1 / FC2 launch of this MoE call.
+    assert len(decided_on) >= 2 and all(decided_on), decided_on
+    assert len(decided_off) >= 2 and not any(decided_off), decided_off
+    assert torch.isfinite(out_on).all() and out_on.abs().max() > 0
+    assert torch.equal(out_on, out_off)

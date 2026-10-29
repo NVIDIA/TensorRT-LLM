@@ -24,11 +24,33 @@
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace
+{
+constexpr size_t kDefaultStagingBufferSizeMb = 64;
+} // namespace
+
+size_t stagingBufferSizeBytes()
+{
+    // Every single task of a two-hop GPU<->Disk copy must fit in the staging buffer, so the
+    // buffer must be at least as large as the largest slot. Models with large per-slot state
+    // (e.g. KDA/Mamba recurrent state spanning many layers) exceed the 64 MB default.
+    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_STAGING_BUFFER_SIZE_MB");
+    if (value == nullptr || *value == '\0')
+    {
+        return kDefaultStagingBufferSizeMb << 20u;
+    }
+    unsigned long long const sizeMb = std::stoull(value);
+    TLLM_CHECK_WITH_INFO(sizeMb > 0, "TLLM_KV_CACHE_MANAGER_V2_STAGING_BUFFER_SIZE_MB must be positive");
+    return static_cast<size_t>(sizeMb) << 20u;
+}
 
 // ---------------------------------------------------------------------------
 // dispatchCopy<DstTier, SrcTier> — template that maps CacheTier pair to
@@ -75,7 +97,9 @@ StagingBuffer::StagingBuffer(StagingBufferManager& manager, size_t minSize, size
 {
     if (minSize > manager.totalSize())
     {
-        throw std::invalid_argument("StagingBuffer: minSize exceeds total staging buffer size");
+        throw std::invalid_argument("StagingBuffer: minSize (" + std::to_string(minSize)
+            + " bytes) exceeds total staging buffer size (" + std::to_string(manager.totalSize())
+            + " bytes); increase TLLM_KV_CACHE_MANAGER_V2_STAGING_BUFFER_SIZE_MB");
     }
 
     std::unique_lock<std::mutex> lock(mManager.mMutex);
@@ -159,7 +183,7 @@ StagingBuffer StagingBufferManager::acquire(size_t minSize, size_t maxSize, CUst
 StagingBufferManager& CopyEngine::getStagingManager()
 {
     if (!mStagingManager)
-        mStagingManager = std::make_unique<StagingBufferManager>(64u << 20u); // 64 MB
+        mStagingManager = std::make_unique<StagingBufferManager>(stagingBufferSizeBytes());
     return *mStagingManager;
 }
 

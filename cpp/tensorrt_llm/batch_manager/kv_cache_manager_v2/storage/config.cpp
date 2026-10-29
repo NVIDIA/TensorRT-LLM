@@ -204,13 +204,14 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Merge SlotDescVariants that share the same slotSizeList.
-    // Key: tuple of sizes (sorted desc).
-    std::map<std::vector<size_t>, std::vector<SlotDescVariant>> poolGroupsBySizes;
+    // Only matching ownership domains and slot layouts may share pools.
+    std::map<std::pair<CacheDomain, std::vector<size_t>>, std::vector<SlotDescVariant>> poolGroupsBySizes;
     for (auto& sg : slotGroups)
     {
-        auto sizes = sg.slotSizeList();
-        poolGroupsBySizes[sizes.raw()].push_back(std::move(sg));
+        auto const sizes = sg.slotSizeList();
+        auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
+        CacheDomain const domain = attn ? attn->cacheDomain : CacheDomain::kTarget;
+        poolGroupsBySizes[{domain, sizes.raw()}].push_back(std::move(sg));
     }
 
     StorageConfig out;

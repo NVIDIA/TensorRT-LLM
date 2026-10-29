@@ -168,6 +168,8 @@ def _make_cache_config_for_test(
     max_num_tokens: int | None = None,
     max_draft_len: int = 0,
     num_extra_kv_tokens: int = 0,
+    cuda_graph_warmup_enabled: bool = True,
+    estimation_graph_max_tokens: int | None = None,
 ) -> KVCacheManagerConfig:
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.kv_cache_type = CacheType.SELFKONLY
@@ -185,6 +187,9 @@ def _make_cache_config_for_test(
     cache_manager.max_batch_size = max_batch_size
     cache_manager.max_num_tokens = max_num_tokens
     cache_manager.max_draft_len = max_draft_len
+    cache_manager.cuda_graph_warmup_enabled = cuda_graph_warmup_enabled
+    cache_manager._estimation_graph_max_tokens = estimation_graph_max_tokens
+    cache_manager.reuse_match_backoff = 0
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
     # Mirrors __init__: without helix the ledger block equals the physical
     # page (the helper re-enacts construction for partial instances).
@@ -350,6 +355,28 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
         ),
         BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
     ]
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_disabled_cuda_graph_preserves_context_warmup_constraint(is_draft: bool) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0, avg_seq_len=327680),
+        is_draft=is_draft,
+        max_batch_size=4,
+        max_seq_len=327680,
+        max_num_tokens=8448,
+        max_draft_len=7,
+        num_extra_kv_tokens=6,
+        cuda_graph_warmup_enabled=False,
+    )
+
+    assert config.constraints == [
+        BatchDesc([KVCacheDesc(capacity=8454, history_length=0)]),
+    ]
+    assert config.typical_step == BatchDesc(
+        [KVCacheDesc(capacity=8454, history_length=0)]
+        + [KVCacheDesc(capacity=327680, history_length=327672)] * 3
+    )
 
 
 def test_avg_seq_len_updates_typical_step() -> None:
@@ -890,3 +917,195 @@ def test_disagg_role_mapper_kinds_default_to_indexed():
         Role.ALL: MapperKind.INDEXED,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+
+
+@pytest.mark.parametrize("graph_enabled", [False, True])
+@pytest.mark.parametrize("pool_groups", [1, 2])
+@pytest.mark.parametrize("beam_width", [1, 2])
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_estimation_token_bound_respects_disabled_graph(
+    graph_enabled: bool,
+    pool_groups: int,
+    beam_width: int,
+    attention_dp: bool,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    creator = _util.KvCacheCreator.__new__(_util.KvCacheCreator)
+    creator._mapping = SimpleNamespace(cp_config={}, enable_attention_dp=attention_dp, tp_size=8)
+    creator._speculative_config = None
+    creator._llm_args = SimpleNamespace(disable_overlap_scheduler=True)
+    creator._tokens_per_block = 64
+    creator._is_kv_cache_manager_v2 = True
+    creator._kv_cache_config = SimpleNamespace(max_attention_window=None)
+    creator._model_engine = SimpleNamespace(
+        cuda_graph_config=object() if graph_enabled else None,
+        batch_size=4,
+        _max_cuda_graph_batch_size=4,
+        max_seq_len=327680,
+        model=SimpleNamespace(model_config=SimpleNamespace(pretrained_config=SimpleNamespace())),
+    )
+    creator._dummy_reqs = [
+        SimpleNamespace(
+            input_token_ids=[0] * 8448, sampling_config=SimpleNamespace(beam_width=beam_width)
+        )
+        for _ in range(8 if attention_dp else 1)
+    ]
+    with patch.object(_util, "_get_num_pool_groups_for_estimation", return_value=pool_groups):
+        actual = creator._get_token_num_for_estimation()
+    expected_blocks = 5124 if graph_enabled else 133
+    assert actual == expected_blocks * 64 * pool_groups * beam_width
+    assert creator._model_engine.max_seq_len == 327680
+
+
+def test_legacy_kv_estimation_keeps_graph_floor_without_graphs(monkeypatch) -> None:
+    # TRTLLM_K3_LEGACY_KV_ESTIMATION=1: the profiling token count keeps the max-sequence
+    # graph-warmup floor on an engine without CUDA graphs, as before.
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    monkeypatch.setenv(kv_cache_manager_v2_module.LEGACY_KV_ESTIMATION_ENV, "1")
+    creator = _util.KvCacheCreator.__new__(_util.KvCacheCreator)
+    creator._mapping = SimpleNamespace(cp_config={}, enable_attention_dp=False, tp_size=8)
+    creator._speculative_config = None
+    creator._llm_args = SimpleNamespace(disable_overlap_scheduler=True)
+    creator._tokens_per_block = 64
+    creator._is_kv_cache_manager_v2 = True
+    creator._kv_cache_config = SimpleNamespace(max_attention_window=None)
+    creator._model_engine = SimpleNamespace(
+        cuda_graph_config=None,
+        batch_size=4,
+        _max_cuda_graph_batch_size=4,
+        max_seq_len=327680,
+        model=SimpleNamespace(model_config=SimpleNamespace(pretrained_config=SimpleNamespace())),
+    )
+    creator._dummy_reqs = [
+        SimpleNamespace(input_token_ids=[0] * 8448, sampling_config=SimpleNamespace(beam_width=1))
+    ]
+    with patch.object(_util, "_get_num_pool_groups_for_estimation", return_value=1):
+        assert creator._get_token_num_for_estimation() == 5124 * 64
+
+
+@pytest.mark.parametrize("estimating", [False, True])
+@pytest.mark.parametrize("graph_enabled", [False, True])
+@pytest.mark.parametrize("draft_reserve, expected_cap", [(7, 832), (64, 448)])
+def test_profiling_graph_cap_uses_gpu_quota_only(
+    estimating, graph_enabled, draft_reserve, expected_cap
+):
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_estimating_kv_cache = estimating
+    manager.cuda_graph_warmup_enabled = graph_enabled
+    manager._get_max_tokens_from_quota = Mock(return_value=1000)
+    manager._ledger_tokens_per_block = 64
+    manager.max_draft_len = 7
+    manager._kv_reserve_draft_tokens = 7
+    manager.num_extra_kv_tokens = 6
+    manager.max_batch_size = 3
+    manager.max_num_tokens = 256
+    manager.max_seq_len = 327680
+    manager._kv_reserve_draft_tokens = draft_reserve
+    cap = manager._get_estimation_graph_token_cap(16384, 0.95)
+    if estimating and graph_enabled:
+        # Reserve whole pages for both short requests, including runtime
+        # draft width plus twice the loop width. The 64-token case crosses pages.
+        assert cap == expected_cap
+        manager._get_max_tokens_from_quota.assert_called_once_with(15564)
+        manager.impl = Mock()
+        manager.impl.clamp_max_seq_len_for_mem.return_value = 327680
+        manager._gpu_max_tokens = cap
+        # A large host tier must not inflate the GPU-only long dummy.
+        assert manager.get_num_available_tokens(
+            token_num_upper_bound=327680, max_num_draft_tokens=2 * draft_reserve + 1
+        ) == expected_cap - 6 - (2 * draft_reserve + 1)
+    else:
+        assert cap is None
+        manager._get_max_tokens_from_quota.assert_not_called()
+    assert manager.max_seq_len == 327680
+
+
+@pytest.mark.parametrize("available, expected", [(0, 262), (float("inf"), None)])
+def test_profiling_graph_cap_preserves_minimal_context(available, expected):
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_estimating_kv_cache = True
+    manager.cuda_graph_warmup_enabled = True
+    manager._get_max_tokens_from_quota = Mock(return_value=available)
+    manager._ledger_tokens_per_block = 64
+    manager.max_draft_len = 7
+    manager._kv_reserve_draft_tokens = 7
+    manager.num_extra_kv_tokens = 6
+    manager.max_batch_size = 3
+    manager.max_num_tokens = 256
+    manager.max_seq_len = 327680
+    assert manager._get_estimation_graph_token_cap(16384, 0.95) == expected
+
+
+@pytest.mark.parametrize("cap, expected", [(512, 512), (None, 1024)])
+def test_profiling_graph_constraint_leaves_context_and_final_unchanged(cap, expected):
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        max_draft_len=2,
+        estimation_graph_max_tokens=cap,
+    )
+    assert config.constraints[0].kv_caches[0].capacity == expected
+    assert config.constraints[0].kv_caches[0].history_length == expected - 1
+    assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])
+    assert config.typical_step.kv_caches[1].capacity == 1024
+
+
+@pytest.mark.cpu_only
+class TestDraftDisaggAdmission:
+    def _make(self):
+        manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        manager.is_draft = True
+        manager._has_cp_helix = False
+        manager.num_extra_kv_tokens = 6
+        manager.tokens_per_block = 32
+        cache = Mock(capacity=0)
+        cache.resize.return_value = True
+        manager._mirror_draft_kv_cache = Mock(return_value=cache)
+        manager._resume_and_restore = Mock(return_value=True)
+        request = SimpleNamespace(
+            py_request_id=7,
+            prompt_len=35000,
+            total_input_len_cp=70000,
+            context_current_position=128,
+            context_chunk_size=34872,
+            py_draft_tokens=[0] * 7,
+        )
+        request.set_prepopulated_prompt_len = Mock()
+        return manager, cache, request
+
+    def test_capacity_only_and_cursor_unchanged(self):
+        manager, cache, request = self._make()
+        assert manager.try_allocate_draft_disagg_gen_init(request)
+        cache.resize.assert_called_once_with(35013)
+        assert request.context_current_position == 128
+        assert request.context_chunk_size == 34872
+        request.set_prepopulated_prompt_len.assert_not_called()
+
+    def test_helix_uses_global_prompt(self):
+        manager, cache, request = self._make()
+        manager._has_cp_helix = True
+        assert manager.try_allocate_draft_disagg_gen_init(request)
+        cache.resize.assert_called_once_with(70013)
+
+    def test_mirror_exhaustion_returns_false(self):
+        manager, cache, request = self._make()
+        manager._mirror_draft_kv_cache.return_value = None
+        assert not manager.try_allocate_draft_disagg_gen_init(request)
+        manager._resume_and_restore.assert_not_called()
+        cache.resize.assert_not_called()
+
+    def test_resume_rejection_returns_false(self):
+        manager, cache, request = self._make()
+        manager._resume_and_restore.return_value = False
+        assert not manager.try_allocate_draft_disagg_gen_init(request)
+        cache.resize.assert_not_called()
+
+    def test_resize_rejection_returns_false(self):
+        manager, cache, request = self._make()
+        cache.resize.return_value = False
+        assert not manager.try_allocate_draft_disagg_gen_init(request)
+        cache.resize.assert_called_once_with(35013)

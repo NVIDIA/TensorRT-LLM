@@ -159,6 +159,28 @@ def _register_fake():
             quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
             scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
             return [norm_out, quant_fp4, scale_fp4, torch.empty_like(residual)]
+        if op in (AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE,
+                  AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4):
+            hidden = input.shape[-1]
+            m = input.numel() // hidden
+            if op == AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE:
+                # Values padded to 4 rows; scales a strided [M, packed sf_k]
+                # int32 view (MN-major), as the C++ op returns them.
+                m_padded = (m + 3) // 4 * 4
+                num_packed_sf_k = (hidden // 128 + 3) // 4
+                quant_out = input.new_empty((m_padded, hidden),
+                                            dtype=torch.float8_e4m3fn)[:m]
+                scale = input.new_empty_strided((m, num_packed_sf_k),
+                                                (1, m_padded),
+                                                dtype=torch.int32)
+                return [quant_out, scale]
+            # R128c4: the shapes of fp8_quantize_1x128_cutedsl_ue8m0.
+            padded_m = (m + 127) // 128 * 128
+            sf_cols = (hidden // 32 + 3) // 4 * 4
+            return [
+                input.new_empty((m, hidden), dtype=torch.float8_e4m3fn),
+                input.new_empty((padded_m * sf_cols, ), dtype=torch.uint8)
+            ]
         return [torch.empty_like(input)]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
@@ -289,6 +311,26 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::dsv3_router_latent_gemm_op")
+    def _(input: torch.Tensor, gate_weight: torch.Tensor,
+          down_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        for tensor in (input, gate_weight, down_weight):
+            torch._check(tensor.is_cuda and tensor.device == input.device)
+            torch._check(tensor.dim() == 2 and tensor.dtype == torch.bfloat16)
+            torch._check(tensor.is_contiguous())
+            torch._check(tensor.stride(0) == 7168)
+            torch._check(tensor.stride(1) == 1)
+            torch._check(tensor.storage_offset() % 8 == 0)
+        torch._check(input.shape[0] >= 1)
+        torch._check(input.shape[0] <= 16)
+        torch._check(input.shape[1] == 7168)
+        torch._check(gate_weight.shape[0] == 896)
+        torch._check(gate_weight.shape[1] == 7168)
+        torch._check(down_weight.shape[0] == 3584)
+        torch._check(down_weight.shape[1] == 7168)
+        return (input.new_empty((input.shape[0], 896), dtype=torch.float32),
+                input.new_empty((input.shape[0], 3584), dtype=torch.bfloat16))
+
     @torch.library.register_fake("trtllm::fp4_gemm")
     def _(
         mat1: torch.Tensor,
@@ -323,6 +365,21 @@ def _register_fake():
                                     dtype=torch.float8_e4m3fn),
             hidden_states.new_empty((num_tokens, 112), dtype=torch.uint8),
         )
+
+    @torch.library.register_fake("trtllm::kimi_k3_noaux_tc_kf_op")
+    def _(scores, bias):
+        num_tokens = scores.shape[0]
+        return (
+            scores.new_empty((num_tokens, 16), dtype=torch.float32),
+            scores.new_empty((num_tokens, 16), dtype=torch.int32),
+        )
+
+    @torch.library.register_fake("trtllm::kimi_k3_kda_mtp_verify_kf")
+    def _(x_q, x_k, x_v, g, beta, onorm_g, w_q, w_k, w_v, A_log, dt_bias,
+          onorm_weight, ssm_state_indices, num_accepted_tokens, cs_q, cs_k,
+          cs_v, recurrent_state, k_cache, g_cache, v_cache, beta_cache, out,
+          out_scale, num_spec, lower_bound, scale, onorm_eps, enable_pdl):
+        pass
 
     @torch.library.register_fake("trtllm::inplace_slice_copy")
     def _(dest, src, dim1_start, dim1_end):
@@ -430,6 +487,13 @@ def _register_fake():
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, swizzled_layout)
 
+        return (input.new_empty(output_shape, dtype=torch.uint8),
+                global_scale.new_empty(scale_shape, dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::fp4_quantize_kf")
+    def _(input: torch.Tensor, global_scale: torch.Tensor):
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, 16, False)
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
@@ -608,11 +672,23 @@ def _register_fake():
         invalid_token_expert_id: Optional[int] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        quantize_global_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         del use_cft_counted_writes, expert_id_payload_index, invalid_token_expert_id, enable_rank_mask, active_rank_mask
         recv_tensors: List[torch.Tensor] = []
-        for payload in input_payloads:
+        for index, payload in enumerate(input_payloads):
             elements_per_token = payload.shape[1]
+            if quantize_global_scale is not None and index == 0:
+                # Quantize on send: the BF16 hidden state arrives as NVFP4 codes and E4M3 scales (uint8 both).
+                recv_tensors.append(
+                    payload.new_empty((ep_size, runtime_max_tokens_per_rank,
+                                       elements_per_token // 2),
+                                      dtype=torch.uint8))
+                recv_tensors.append(
+                    payload.new_empty((ep_size, runtime_max_tokens_per_rank,
+                                       elements_per_token // 16),
+                                      dtype=torch.uint8))
+                continue
             recv_tensors.append(
                 payload.new_empty(
                     (ep_size, runtime_max_tokens_per_rank, elements_per_token)))
@@ -846,6 +922,13 @@ def _register_fake():
                                             dtype=torch.int32)
         return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale
 
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128_r128c4_kf")
+    def _(input: torch.Tensor):
+        m, k = input.shape
+        scale = input.new_empty(((m + 127) // 128 * 128 * (k // 32), ),
+                                dtype=torch.uint8)
+        return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale
+
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_cutedsl_ue8m0")
     def _(input: torch.Tensor):
         m, k = input.shape
@@ -854,6 +937,18 @@ def _register_fake():
         return torch.empty_like(input,
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     (padded_m * sf_cols, ), dtype=torch.uint8)
+
+    @torch.library.register_fake(
+        "trtllm::rmsnorm_fp8_quantize_1x128_cutedsl_ue8m0")
+    def _(input: torch.Tensor, weight: torch.Tensor, eps: float):
+        del weight, eps
+        m, k = input.shape
+        padded_m = fp4_utils.pad_up(m, 128)
+        sf_cols = fp4_utils.pad_up(k // 32, 4)
+        # The op returns a contiguous [m, k] tensor even for a row-strided input.
+        return input.new_empty((m, k),
+                               dtype=torch.float8_e4m3fn), input.new_empty(
+                                   (padded_m * sf_cols, ), dtype=torch.uint8)
 
     @torch.library.register_fake(
         "trtllm::silu_and_mul_fp8_quantize_1x128_packed_ue8m0")
@@ -1038,8 +1133,7 @@ def _register_fake():
                 new_token_final_scales
             ]
 
-        @torch.library.register_fake("trtllm::moe_sort")
-        def _(
+        def _moe_sort_fake(
             token_selected_experts: torch.Tensor,
             token_final_scales: torch.Tensor,
             num_experts: int,
@@ -1082,6 +1176,13 @@ def _register_fake():
                 expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
                 total_num_padded_tokens, num_non_exiting_tiles
             ]
+
+        torch.library.register_fake("trtllm::moe_sort")(_moe_sort_fake)
+        # Same arguments and output shapes as moe_sort (Kimi K3 DEP16 sort kernel); builds
+        # without the op (a Python overlay on an older image) skip it.
+        if hasattr(torch.ops.trtllm, "kimi_k3_moe_sort_kf"):
+            torch.library.register_fake("trtllm::kimi_k3_moe_sort_kf")(
+                _moe_sort_fake)
 
     @torch.library.register_fake("trtllm::moe_permute")
     def _(

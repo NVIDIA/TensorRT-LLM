@@ -1,7 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Utility functions for request processing."""
 
+import math
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .scheduler import WaitingQueue
@@ -74,6 +78,39 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
                     setattr(item.request, attr_name, req_obj_dict[item.id])
 
 
+DISAGG_GEN_ADMISSION_FACTOR_ENV = "TRTLLM_DISAGG_GEN_ADMISSION_FACTOR"
+MAX_DISAGG_GEN_ADMISSION_FACTOR = 2.0
+
+
+def disagg_gen_admission_factor() -> float:
+    """Return the admission factor of a disaggregated generation server.
+
+    Such a server admits up to ``floor(factor * max_num_sequences)`` requests,
+    counting the ones whose KV cache is still being received, while the
+    decoding batch stays at ``max_batch_size``. Set through
+    ``TRTLLM_DISAGG_GEN_ADMISSION_FACTOR``; unset means 1.0, today's
+    behavior. The value is clamped to [1.0, 2.0] because KVCacheManagerV2
+    sizes its index slots at twice ``max_num_sequences`` on disaggregated
+    servers. Only the non-attention-DP path uses it; see
+    ``PyExecutor._get_request_admission_capacity``.
+
+    Raises:
+        ValueError: if the variable is set to a non-finite or non-numeric value.
+    """
+    value = os.environ.get(DISAGG_GEN_ADMISSION_FACTOR_ENV)
+    if not value:
+        return 1.0
+    try:
+        factor = float(value)
+    except ValueError as e:
+        raise ValueError(
+            f"{DISAGG_GEN_ADMISSION_FACTOR_ENV} must be a number, got {value!r}"
+        ) from e
+    if not math.isfinite(factor):
+        raise ValueError(f"{DISAGG_GEN_ADMISSION_FACTOR_ENV} must be finite, got {value!r}")
+    return min(max(factor, 1.0), MAX_DISAGG_GEN_ADMISSION_FACTOR)
+
+
 def derive_attention_dp_per_rank_request_cap(
     base_cap: int,
     max_num_tokens: Optional[int],
@@ -135,6 +172,7 @@ def get_from_waiting_queue(
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[List[int]] = None,
+    home_rank_fn: Optional[Callable] = None,
 ) -> List:
     """Get requests from the waiting queue.
 
@@ -144,6 +182,9 @@ def get_from_waiting_queue(
         enable_attention_dp: Whether to enable attention DP scheduling.
         max_num_active_requests: Maximum number of active requests per rank.
         all_ranks_num_active_requests: Number of active requests for each rank.
+        home_rank_fn: Optional ``req_item -> rank | None`` (attention DP only).
+            A request whose home rank is full stays in the waiting queue instead
+            of being admitted and overflowing to another rank.
 
     Returns:
         List of requests that can be processed.
@@ -174,6 +215,20 @@ def get_from_waiting_queue(
             if enable_attention_dp
             else True
         )
+
+        if can_process and enable_attention_dp and home_rank_fn is not None:
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            explicit_rank = (
+                scheduling_params is not None
+                and scheduling_params.attention_dp_rank is not None
+                and not scheduling_params.attention_dp_relax
+            )
+            home = None if explicit_rank else home_rank_fn(req_item)
+            if home is not None:
+                if scheduling_all_ranks_num_active_requests[home] < max_num_active_requests:
+                    scheduling_all_ranks_num_active_requests[home] += 1
+                else:
+                    can_process = False
 
         if can_process:
             items.append(req_item)

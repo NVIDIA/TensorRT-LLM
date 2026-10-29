@@ -66,6 +66,7 @@ from ..models.modeling_multimodal_mixin import (MultimodalEncoderContractError,
                                                 MultimodalModelMixin,
                                                 _build_request_multimodal_input)
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
+from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                    MoeLoadBalancerIterContext)
@@ -1079,6 +1080,19 @@ class PyTorchModelEngine(ModelEngine):
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
 
+    def get_speculative_model(self) -> Optional[SpecDecOneEngineForCausalLM]:
+        """Return the one-engine speculative model, including inside a VLM."""
+        if not self.is_spec_decode:
+            return None
+        model = self.model
+        if isinstance(model, MultimodalModelMixin):
+            model = model.language_model
+        if not isinstance(model, SpecDecOneEngineForCausalLM):
+            # Kimi's legacy multimodal wrapper exposes its decoder as llm
+            # without inheriting MultimodalModelMixin.
+            model = getattr(model, "llm", None)
+        return model if isinstance(model, SpecDecOneEngineForCausalLM) else None
+
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
         Returns the size (in bytes) occupied by kv cache type.
@@ -1421,9 +1435,13 @@ class PyTorchModelEngine(ModelEngine):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # Helix CP is decode-only and runs into issues with the
-        # autotuner warmup's context requests.
-        if not is_enc_dec and not self.mapping.has_cp_helix():
+        # Helix CP is decode-only, so it tunes on generation requests.
+        if not is_enc_dec and self.mapping.has_cp_helix():
+            self._run_autotuner_warmup(resource_manager, generation_only=True)
+            log_mem_snapshot("warmup/after_autotuner")
+            gc.collect()
+            torch.cuda.empty_cache()
+        elif not is_enc_dec:
             self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
@@ -1785,17 +1803,29 @@ class PyTorchModelEngine(ModelEngine):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
-    def _run_autotuner_warmup(self, resource_manager: ResourceManager):
-        """Runs forward passes to populate the autotuner cache."""
+    def _run_autotuner_warmup(self,
+                              resource_manager: ResourceManager,
+                              generation_only: bool = False):
+        """Runs forward passes to populate the autotuner cache.
+
+        ``generation_only`` tunes on one batch of ``max_batch_size`` generation
+        requests instead of a context batch, for Helix CP GENs.
+        """
         if not self.llm_args.enable_autotuner:
             return
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
-        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num_upper_bound,
-            max_num_draft_tokens=self.original_max_draft_len)
+        if generation_only:
+            tokens_per_gen_request = 1 + self.max_total_draft_tokens
+            num_gen_requests = min(
+                self.batch_size, self.max_num_tokens // tokens_per_gen_request)
+            curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
+        else:
+            token_num_upper_bound = min(
+                self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
+            curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=token_num_upper_bound,
+                max_num_draft_tokens=self.original_max_draft_len)
 
         if self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens:
             logger.info(
@@ -1806,9 +1836,12 @@ class PyTorchModelEngine(ModelEngine):
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info("Running autotuner warmup...")
 
-        warmup_configs = [(curr_max_num_tokens, 0)]
-        if (not self.is_draft_model and self.guided_decoder is None
-                and not self.mapping.has_pp()):
+        if generation_only:
+            warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
+        else:
+            warmup_configs = [(curr_max_num_tokens, 0)]
+        if (not generation_only and not self.is_draft_model
+                and self.guided_decoder is None and not self.mapping.has_pp()):
             # Add generation request to warmup the autotuner cache.
             warmup_configs.append((1 + self.max_total_draft_tokens, 1))
 
@@ -2678,8 +2711,9 @@ class PyTorchModelEngine(ModelEngine):
         """
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        if num_gen_requests and getattr(kv_cache_manager,
-                                        "fp4_mla_context_only_cache", False):
+        if num_gen_requests and (
+                getattr(kv_cache_manager, "fp4_mla_context_only_cache", False)
+                or getattr(kv_cache_manager, "kda_context_only", False)):
             return None
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
@@ -2845,7 +2879,8 @@ class PyTorchModelEngine(ModelEngine):
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        if getattr(kv_cache_manager, "fp4_mla_context_only_cache", False):
+        if (getattr(kv_cache_manager, "fp4_mla_context_only_cache", False)
+                or getattr(kv_cache_manager, "kda_context_only", False)):
             return None
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -3557,8 +3592,12 @@ class PyTorchModelEngine(ModelEngine):
         # The disaggregated attention-DP overlap path opts into larger metadata
         # buffers. Passing None preserves the established max_num_requests
         # fallback for other configurations, including PP.
-        num_seq_slots = (self.max_num_seq_slots
-                         if self._enable_disagg_adp_overlap_headroom else None)
+        # Size slot-indexed spec buffers (e.g. rejection-sampling draft_probs)
+        # by the same pool that sizes the SeqSlotManager
+        # (py_executor_creator passes model_engine.max_num_seq_slots), so every
+        # py_seq_slot has a row. With max_num_requests only, DSpark + rejection
+        # sampling on disaggregated attention-DP gen indexed past the buffer.
+        num_seq_slots = self.max_num_seq_slots
         if no_cache:
             return get_spec_metadata(
                 spec_config,
@@ -7949,6 +7988,13 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata, new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager, can_run_graph, execution_promoted_context_ids)
+            speculative_model = self.get_speculative_model()
+            spec_worker = (speculative_model.spec_worker
+                           if speculative_model is not None else None)
+            if spec_worker is not None:
+                spec_worker.prepare_managed_draft_cache(
+                    speculative_model.draft_model, spec_metadata, attn_metadata,
+                    resource_manager)
             if execution_promoted_context_ids:
                 self.iter_states[
                     'num_ctx_requests'] = scheduled_requests.num_context_requests
@@ -8031,6 +8077,16 @@ class PyTorchModelEngine(ModelEngine):
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
+
+            if (spec_worker is not None and not self.is_warmup
+                    and not self.cuda_graph_runner.is_warmup_only):
+                draft_history_update = spec_worker.snapshot_managed_draft_history(
+                )
+                if draft_history_update is not None:
+                    # Graph output dictionaries persist across replays. Each
+                    # overlapped iteration must retain its own host readback.
+                    outputs = dict(outputs)
+                    outputs['draft_history_update'] = draft_history_update
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

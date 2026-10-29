@@ -1544,6 +1544,60 @@ def test_cutedsl_fc12_survives_autotune_warmup():
     assert not autotuner.stats.failed_profiling_count.get(custom_op, set())
 
 
+@nvfp4_moe_supported
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 107,
+    reason="CUTEDSL_FC12 fused kernel is Rubin (SM107) only",
+)
+def test_cutedsl_fc12_writes_caller_output_buffer():
+    """``forward(moe_output=...)`` on FC12, the GEN backend K3 runs on Rubin.
+
+    The merged MoE all-reduce (``TRTLLM_K3_MERGED_MOE_AR``) hands the routed experts the latent
+    slice of its flat buffer. The finalize must write the same result there as into its own
+    output, and nothing outside the slice (memset + scatter-add stay inside it).
+    """
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+
+    torch.manual_seed(93)
+    num_tokens = 32
+    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    act_scale = float(x.abs().max().float() / (448 * 6))
+    w1 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w3 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w2 = [
+        torch.randn(hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
+
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
+    _stream_nvfp4_bank(moe, bank)
+    moe.backend._weights_transformed = False
+    moe.post_load_weights()
+    router_logits = gate.compute_logits(x)
+
+    guard = 64
+    storage = torch.full(
+        (guard + num_tokens * hidden + guard,), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    buffer = storage[guard : guard + num_tokens * hidden].view(num_tokens, hidden)
+    with torch.inference_mode():
+        expected = moe.forward(x, router_logits, all_rank_num_tokens=None)
+        output = moe.forward(x, router_logits, all_rank_num_tokens=None, moe_output=buffer)
+
+    assert output.data_ptr() == buffer.data_ptr()
+    assert torch.isfinite(expected.float()).all()
+    torch.testing.assert_close(output, expected)
+    assert storage[:guard].isnan().all() and storage[-guard:].isnan().all()
+
+
 def test_fp8_block_scaled_dequantization():
     """FP8_PB_WO attention weights must be dequantized, never reinterpreted.
 

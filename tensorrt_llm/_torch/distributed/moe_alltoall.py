@@ -444,7 +444,8 @@ class MoeAlltoAll:
                  invalid_token_expert_id: Optional[int] = None,
                  expert_id_payload_index: Optional[int] = None,
                  eplb_local_stats: Optional[torch.Tensor] = None,
-                 active_rank_mask: Optional[torch.Tensor] = None):
+                 active_rank_mask: Optional[torch.Tensor] = None,
+                 quantize_global_scale: Optional[torch.Tensor] = None):
         """
         Perform MoE all-to-all dispatch operation.
 
@@ -459,6 +460,10 @@ class MoeAlltoAll:
                 omitted, the committed mask and generation are captured together. Combine reuses that mask and
                 fails closed if the committed generation changes first. The masked kernel rejects inactive routes
                 before remote access; that sentinel is an internal abort artifact, not valid model output.
+            quantize_global_scale: (Optional) quantize on send: input_payloads[0] is the BF16 hidden state and the
+                kernel sends the NVFP4 codes and E4M3 scales of fp4_quantize(hidden, quantize_global_scale, 16,
+                False, False) in its place, so recv_tensors has one more tensor (the scales follow the codes) and
+                expert_id_payload_index still indexes input_payloads. Needs the fence dispatch (see moeAlltoAllOp.cpp).
 
         Returns:
             recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
@@ -470,6 +475,8 @@ class MoeAlltoAll:
             runtime_max_tokens_per_rank)
         can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
             can_use_cft_for_dispatch, input_payloads)
+        if quantize_global_scale is not None and can_use_cft_for_dispatch:
+            raise RuntimeError("quantize on send needs the fence dispatch")
         # Auto-initialize one CFT LE per shared workspace on first dispatch.
         if self.can_use_cft_counted_writes and not self._workspace_entry.get(
                 "cft_initialized", False):
@@ -482,9 +489,11 @@ class MoeAlltoAll:
             assert eplb_local_stats.size(
                 0
             ) == self.eplb_stats_num_experts, "eplb_local_stats size must match eplb_stats_num_experts"
-        can_fuse_sanitize = (can_use_cft_for_dispatch
-                             and invalid_token_expert_id is not None
-                             and expert_id_payload_index is not None)
+        # The dispatch op sets the expert ids of the received padding rows to invalid_token_expert_id
+        # (in the dispatch kernel, or with the sanitize kernel right after it; see moeAlltoAllOp.cpp).
+        sanitize_expert_ids = invalid_token_expert_id is not None
+        if sanitize_expert_ids:
+            assert expert_id_payload_index is not None, "expert_id_payload_index must be provided if invalid_token_expert_id is not None"
 
         requested_active_rank_mask = active_rank_mask
         if (not self._rank_mask_enabled
@@ -506,10 +515,11 @@ class MoeAlltoAll:
             self.num_experts,
             eplb_local_stats,
             can_use_cft_for_dispatch,
-            expert_id_payload_index if can_fuse_sanitize else None,
-            invalid_token_expert_id if can_fuse_sanitize else None,
+            expert_id_payload_index if sanitize_expert_ids else None,
+            invalid_token_expert_id,
             self._rank_mask_enabled,
             active_rank_mask,
+            quantize_global_scale,
         )
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "dispatch",
@@ -523,18 +533,6 @@ class MoeAlltoAll:
         self._state.eplb_gathered_stats = eplb_gathered_stats
         self._state.active_rank_mask_snapshot = active_rank_mask_snapshot
         self._state.phase = "dispatched"
-
-        if invalid_token_expert_id is not None and not can_fuse_sanitize:
-            assert expert_id_payload_index is not None, "expert_id_payload_index must be provided if invalid_token_expert_id is not None"
-            # Sanitize expert IDs for invalid tokens directly on the recv tensor payload
-            recv_token_selected_experts = recv_tensors[expert_id_payload_index]
-            torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
-                recv_token_selected_experts,
-                self.workspace,
-                self.metainfo,
-                self.ep_rank,
-                invalid_token_expert_id,
-            )
 
         return recv_tensors
 
@@ -595,7 +593,10 @@ class MoeAlltoAll:
         Safe to call between forward passes (or from an error handler) to
         recover from a forward that called ``dispatch`` but did not reach
         ``combine`` — e.g. because an OOM aborted the forward. Without this,
-        the next ``dispatch`` would fire the assert at line 239.
+        the next ``dispatch`` would fire the assert at line 239. The rounds after
+        such a dispatch are correct only with TLLM_MOE_A2A_FUSED_ROUND=1: with the
+        legacy kernels (the default) the next dispatch takes an even flag and
+        its combine reads the other counter bank.
         """
         self._state = _A2AState()
 

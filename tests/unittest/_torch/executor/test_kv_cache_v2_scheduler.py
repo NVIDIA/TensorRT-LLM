@@ -2808,9 +2808,8 @@ class TestMultimodalAwareChunkingV2:
 
 
 class TestEqualCostChunking:
-    """Chunks capped by (kv_cost_offset + kv_start) * n.
-
-    The budget is B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens.
+    """Chunks capped by (kv_cost_offset + kv_start) * n against
+    B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens.
     """
 
     ENV = {"TLLM_V2_CTX_COST_KV_OFFSET": "140000", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "64000"}
@@ -2969,3 +2968,54 @@ class TestLongContextDemotion:
         assert sched._ctx_demote_skips == {}  # served: count restarts
         sched.schedule_request([hog], set())
         assert sched._ctx_demote_skips == {}  # finished requests leave no entry
+
+
+class TestDisaggJointAdmission:
+    def _make(self, target_ok=True, draft_ok=True, paired=True):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+        sched = KVCacheV2Scheduler.__new__(KVCacheV2Scheduler)
+        target = Mock()
+        draft = Mock()
+        target.prepare_disagg_gen_init.return_value = target_ok
+        draft.try_allocate_draft_disagg_gen_init.return_value = draft_ok
+        sched.kv_cache_manager = target
+        sched.draft_kv_cache_manager = draft
+        sched._gen_alloc_draft_manager = draft if paired else None
+        return sched, target, draft, make_disagg_request(19)
+
+    def test_target_rejects_before_draft(self):
+        sched, target, draft, req = self._make(target_ok=False)
+        action, tokens = sched._try_schedule_disagg_gen_init(req, None)
+        assert action.value == "skip" and tokens == 0
+        draft.try_allocate_draft_disagg_gen_init.assert_not_called()
+        target.revert_allocate_context.assert_not_called()
+
+    def test_draft_rejection_rolls_back_before_retry(self):
+        sched, target, draft, req = self._make(draft_ok=False)
+        action, _ = sched._try_schedule_disagg_gen_init(req, None)
+        assert action.value == "skip"
+        target.revert_allocate_context.assert_called_once_with(req)
+        draft.free_resources.assert_called_once_with(req)
+        target.suspend_request.assert_called_once_with(req)
+        draft.suspend_request.assert_called_once_with(req)
+        draft.try_allocate_draft_disagg_gen_init.return_value = True
+        action, _ = sched._try_schedule_disagg_gen_init(req, None)
+        assert action.value == "scheduled"
+        assert target.prepare_disagg_gen_init.call_count == 2
+
+    def test_success_reserves_both_without_rollback(self):
+        sched, target, draft, req = self._make()
+        action, _ = sched._try_schedule_disagg_gen_init(req, None)
+        assert action.value == "scheduled"
+        draft.try_allocate_draft_disagg_gen_init.assert_called_once_with(req)
+        target.revert_allocate_context.assert_not_called()
+        draft.free_resources.assert_not_called()
+        draft.prepare_disagg_gen_init.assert_not_called()
+
+    def test_paired_disabled_keeps_target_only_path(self):
+        sched, target, draft, req = self._make(paired=False, draft_ok=False)
+        action, _ = sched._try_schedule_disagg_gen_init(req, None)
+        assert action.value == "scheduled"
+        draft.try_allocate_draft_disagg_gen_init.assert_not_called()
+        target.revert_allocate_context.assert_not_called()

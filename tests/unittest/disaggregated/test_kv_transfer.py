@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
 import os
@@ -19,6 +22,7 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # transfer-engine threading.
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import List, Optional
 
 import numpy as np
@@ -45,6 +49,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -191,12 +196,18 @@ def create_transfer_worker_setup(
     is_mla: bool = False,
     use_v2: bool = False,
     max_attention_window_vec: Optional[List[int]] = None,
+    draft_num_layers: int = 0,
+    draft_total_num_kv_heads: int = 0,
+    bounce=None,
 ):
     """Helper function to set up transfer workers for testing.
 
     Args:
         use_v2: If True, use KVCacheManagerV2. Otherwise use KVCacheManager (C++ bindings).
         max_attention_window_vec: List of window sizes, e.g. [max_seq_len] or [max_seq_len, small_window].
+        draft_num_layers: V2 only: standalone draft (DSpark-style) BF16 layers in the same manager,
+            whose draft_total_num_kv_heads KV heads are split by TP and replicated under attention DP.
+        bounce: The transfer workers' KV bounce config; None keeps the per-fragment path.
     """
     ctx_mappings = []
     for i in range(ctx_pp):
@@ -269,6 +280,19 @@ def create_transfer_worker_setup(
                 mapping=ctx_mappings[i],
                 dtype=dtype,
                 vocab_size=vocab_size,
+                **(
+                    dict(
+                        draft_num_layers=draft_num_layers,
+                        draft_num_kv_heads=draft_total_num_kv_heads
+                        // (1 if ctx_enable_dp else ctx_tp),
+                        draft_head_dim=head_dim,
+                        draft_dtype=DataType.BF16,
+                        draft_total_num_kv_heads=draft_total_num_kv_heads,
+                        draft_attention_backend="TRTLLM",
+                    )
+                    if draft_num_layers
+                    else {}
+                ),
             )
             # V2: Initialize pools using page_table
             random_seed = 0 if is_mla else None
@@ -369,6 +393,7 @@ def create_transfer_worker_setup(
                     instance_name=ctx_instance_name,
                     max_concurrent_sessions=max_batch_size * 2,
                     max_draft_len=4,
+                    bounce=bounce,
                 )
             )
         )
@@ -412,6 +437,19 @@ def create_transfer_worker_setup(
                 mapping=gen_mappings[i],
                 dtype=dtype,
                 vocab_size=vocab_size,
+                **(
+                    dict(
+                        draft_num_layers=draft_num_layers,
+                        draft_num_kv_heads=draft_total_num_kv_heads
+                        // (1 if gen_enable_dp else gen_tp),
+                        draft_head_dim=head_dim,
+                        draft_dtype=DataType.BF16,
+                        draft_total_num_kv_heads=draft_total_num_kv_heads,
+                        draft_attention_backend="TRTLLM",
+                    )
+                    if draft_num_layers
+                    else {}
+                ),
             )
             # Initialize gen pool to zeros to verify transfer correctness
             gen_page_table = KVRegionExtractorV1(gen_kv_cache_manager).page_table
@@ -485,6 +523,7 @@ def create_transfer_worker_setup(
                     instance_name=gen_instance_name,
                     max_concurrent_sessions=max_batch_size * 2,
                     max_draft_len=4,
+                    bounce=bounce,
                 )
             )
         )
@@ -580,7 +619,15 @@ def get_block_ids_per_layer_groups(
     block_ids_per_layer_groups: List[List[int]] = []
 
     for group_id, group_meta in enumerate(page_table.layer_groups):
-        if use_v2:
+        if use_v2 and getattr(group_meta, "cp_as_tp", False):
+            # Standalone draft groups address pages in the shared per-layer index space, as the
+            # transceiver's cache-reuse adapter resolves them.
+            block_ids = list(
+                create_cache_reuse_adapter(kv_cache_manager).get_block_ids(
+                    SimpleNamespace(py_request_id=request_id), group_id, group_meta
+                )
+            )
+        elif use_v2:
             block_ids = list(
                 kv_cache_manager.kv_cache_map[request_id].get_aggregated_page_indices(
                     group_id, valid_only=True
@@ -602,6 +649,30 @@ def get_block_ids_per_layer_groups(
         block_ids_per_layer_groups.append(np.asarray(block_ids, dtype=np.int64))
 
     return block_ids_per_layer_groups
+
+
+def verify_draft_layers(
+    ctx_kv_cache_managers, gen_kv_cache_managers, ctx_request_id, gen_request_id
+):
+    """Check that every standalone draft layer's pages match head for head.
+
+    The context ranks' TP head slices, in rank order, against the generation ranks' (all heads
+    under attention DP). PP 1 only.
+    """
+
+    def pages(mgr, draft_idx, request_id):
+        layer_id = mgr.draft_layer_ids[draft_idx]
+        indices = [i for i in mgr.get_batch_cache_indices([request_id], layer_id)[0] if i >= 0]
+        return mgr.get_draft_buffers(draft_idx, kv_layout="HND")[indices]
+
+    for draft_idx in range(len(ctx_kv_cache_managers[0].draft_layer_ids)):
+        ctx = torch.cat([pages(m, draft_idx, ctx_request_id) for m in ctx_kv_cache_managers], dim=2)
+        gen = torch.cat([pages(m, draft_idx, gen_request_id) for m in gen_kv_cache_managers], dim=2)
+        assert ctx.shape == gen.shape, f"draft layer {draft_idx}: {ctx.shape} vs {gen.shape}"
+        # Bitwise: the pools hold random bits, some of them NaN patterns.
+        ctx_bits, gen_bits = ctx.view(torch.int16), gen.view(torch.int16)
+        assert ctx_bits.equal(gen_bits), f"draft layer {draft_idx} data mismatch"
+        assert (ctx_bits != 0).any(), "context draft pages hold no data to compare"
 
 
 def add_and_verify_request(
@@ -664,6 +735,13 @@ def add_and_verify_request(
     ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
     ctx_request.add_new_token(8 + ctx_request_id, 0)
+    if getattr(valid_ctx_kv_cache_managers[0], "draft_layer_ids", ()):
+        # Standalone draft history rides the aux transfer, as the transceiver sets it.
+        ctx_request.py_draft_transfer_history = {
+            "valid_length": request_len,
+            "position": request_len,
+            "layout": valid_ctx_kv_cache_managers[0].get_draft_transfer_identity(),
+        }
     ctx_request.py_draft_tokens = [
         9 + ctx_request_id,
         10 + ctx_request_id,
@@ -764,6 +842,11 @@ def add_and_verify_request(
         ]
         for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
             sender_session.send(send_kv_slice)
+        send_aux_tasks = []
+        if sender_sessions[0]._need_aux:  # a standalone draft history also needs the aux transfer
+            for sender_session in sender_sessions:
+                sender_session.pack_aux(ctx_request)
+                send_aux_tasks.append(sender_session.send_aux())
 
         for sender_session in sender_sessions:
             assert sender_session.status == SessionStatus.INIT
@@ -831,12 +914,13 @@ def add_and_verify_request(
         sender_session.wait_complete()
     for receiver_session in receiver_sessions:
         receiver_session.wait_complete(blocking=True)
-    if not send_first:
-        for send_aux_task in send_aux_tasks:
-            send_aux_task.wait()
+    for send_aux_task in send_aux_tasks:
+        send_aux_task.wait()
 
     sync_session_status = (
-        SessionStatus.KV_TRANSFERRED if send_first else SessionStatus.FULLY_TRANSFERRED
+        SessionStatus.FULLY_TRANSFERRED
+        if send_aux_tasks or not send_first
+        else SessionStatus.KV_TRANSFERRED
     )
     for sender_session in sender_sessions:
         assert sender_session.status == sync_session_status
@@ -870,7 +954,24 @@ def add_and_verify_request(
                 layers_per_pp.append(len(window_to_layers[window_size]))
         return layers_per_pp
 
+    draft_layer_groups = {
+        group_id
+        for group_id, group in enumerate(
+            valid_ctx_transfer_workers[0]._rank_info.page_table.layer_groups
+        )
+        if getattr(group, "cp_as_tp", False)
+    }
+    if draft_layer_groups:
+        verify_draft_layers(
+            valid_ctx_kv_cache_managers,
+            valid_gen_kv_cache_managers,
+            ctx_request.py_request_id,
+            gen_request.py_request_id,
+        )
+
     for layer_group_id in range(num_layer_groups):
+        if layer_group_id in draft_layer_groups:
+            continue  # verified per head above
         # Get block_ids for this layer_group
         ctx_group_block_ids = [groups[layer_group_id] for groups in ctx_block_ids_per_groups]
         gen_group_block_ids = [groups[layer_group_id] for groups in gen_block_ids_per_groups]
@@ -981,6 +1082,88 @@ def add_and_verify_request(
             kv_cache.close()
         for kv_cache in gen_kv_caches:
             kv_cache.close()
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.skipif(
+    TRANSFER_AGENT_BINDING_IMPORT_ERROR is not None, reason="needs the transfer agent binding"
+)
+@pytest.mark.parametrize("bounce_on", [True, False], ids=["bounce", "in_place"])
+def test_drafter_only_bounce_tp_to_attention_dp(monkeypatch, bounce_on):
+    """TP2 context ranks each hold half the draft heads; attention-DP generation ranks hold all.
+
+    With bounce on, the receiver bounces only the draft layer group: every context rank gathers
+    its draft fragments into its share of the region, while the MLA target pages (one sender)
+    go in place in the same write. Both land exactly, as they do on the per-fragment path.
+    """
+    from tensorrt_llm._torch.disaggregation.native.bounce import config_from_size
+    from tensorrt_llm._torch.disaggregation.native.bounce import impl as bounce_impl
+
+    reserves, builds = [], []
+    real_reserve = bounce_impl.VmmBounceTransport.reserve
+    real_build = bounce_impl.VmmBounceTransport.build_request
+
+    def reserve(self, recv_req, num_writers=1, **kwargs):
+        ok = real_reserve(self, recv_req, num_writers, **kwargs)
+        reserves.append((kwargs.get("layer_groups"), num_writers, ok))
+        return ok
+
+    def build_request(self, write_meta):
+        built = real_build(self, write_meta)
+        builds.append((write_meta.bounce_num_frags, int(write_meta.sizes.size), built is not None))
+        return built
+
+    monkeypatch.setattr(bounce_impl.VmmBounceTransport, "reserve", reserve)
+    monkeypatch.setattr(bounce_impl.VmmBounceTransport, "build_request", build_request)
+
+    setup = create_transfer_worker_setup(
+        2,
+        1,
+        False,
+        2,
+        1,
+        True,
+        is_mla=True,
+        use_v2=True,
+        draft_num_layers=2,
+        draft_total_num_kv_heads=4,
+        bounce=config_from_size(64, min_blocks=1, min_bytes=1) if bounce_on else None,
+    )
+    try:
+        if bounce_on and not setup["ctx_transfer_workers"][0]._sender._bounce.enabled:
+            pytest.skip("fabric bounce buffers unavailable")
+        # Distinct draft data per context rank, so a head routed to the wrong rank shows.
+        for rank, mgr in enumerate(setup["ctx_kv_cache_managers"]):
+            generator = torch.Generator(device="cuda").manual_seed(100 + rank)
+            for draft_idx in range(len(mgr.draft_layer_ids)):
+                bits = mgr.get_draft_buffers(draft_idx).view(torch.int16)
+                bits.copy_(
+                    torch.randint(
+                        -(2**15),
+                        2**15 - 1,
+                        bits.shape,
+                        dtype=torch.int16,
+                        device="cuda",
+                        generator=generator,
+                    )
+                )
+        # One request to each generation DP rank.
+        add_and_verify_request(setup, 0, 1, 64)
+        add_and_verify_request(setup, 2, 2, 128)
+    finally:
+        for worker in setup["ctx_transfer_workers"] + setup["gen_transfer_workers"]:
+            worker.shutdown()
+    if not bounce_on:
+        assert not reserves and not builds
+        return
+
+    # Draft group only, two writers per request, both context ranks coalescing their share.
+    assert len([r for r in reserves if r[2]]) == 2
+    assert all(r[0] and r[1] == 2 for r in reserves if r[2])
+    coalesced = [b for b in builds if b[2]]
+    assert len(coalesced) == 4
+    # One rank also sends the MLA pages in place after its draft fragments.
+    assert any(num < total for num, total, _ in coalesced)
 
 
 # Test configurations as pytest parameters
@@ -1496,6 +1679,94 @@ def test_session_has_transferring_tasks_false():
         gen_transfer_worker.shutdown()
 
 
+def _wait_until(predicate, timeout_s: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("schedule_style", [0, 1], ids=["ctx_first", "gen_first"])
+def test_receive_without_context_session_fails_after_sweep(schedule_style):
+    """A receive that no context TxSession will ever serve must end, not hang.
+
+    A context-first generation request whose context KV cache is gone (its
+    TxSession failed and was closed, or the request names a disagg_request_id
+    the context rank never had, as a re-posted generation request with a new
+    id does) leaves its REQUEST_DATA unclaimed on the sender. Once that entry
+    outlives the sweep TTL the sender reports FAILED, so the RxSession fails
+    instead of holding its KV cache and transfer budget forever. Generation-first
+    entries may legitimately stay unclaimed (ADP broadcast) and are only evicted.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    sender = ctx_tw._sender
+    sc = tensorrt_llm.bindings.SamplingConfig(SamplingParams(temperature=0)._get_sampling_config())
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    gen_request = LlmRequest(
+        request_id=600,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=sc,
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=599,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=setup["ctx_info_endpoint"],
+        disagg_request_id=unique_rid,
+        schedule_style=schedule_style,
+    )
+    page_table = gen_tw._rank_info.page_table
+    empty_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+    )
+
+    try:
+        rx = gen_tw.create_rx_session(gen_request)
+        rx.receive(empty_slice)
+        assert _wait_until(lambda: sender._get_req_info(unique_rid) is not None)
+        assert rx.wait_complete(blocking=False) is None
+        assert rx.has_transferring_tasks()
+
+        # Inside the TTL the sender keeps waiting for a TxSession.
+        ctx_tw.sweep_stale_req_infos()
+        time.sleep(0.2)
+        assert sender._get_req_info(unique_rid) is not None
+        assert rx.wait_complete(blocking=False) is None
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(type(sender), "_STALE_REQ_INFO_TTL_S", 0.0)
+            ctx_tw.sweep_stale_req_infos()
+        assert sender._get_req_info(unique_rid) is None
+        if schedule_style == 0:
+            assert _wait_until(lambda: rx.wait_complete(blocking=False) == WaitResult.FAILED)
+            assert rx.has_failed()
+            assert not rx.has_transferring_tasks()
+        else:
+            time.sleep(0.2)
+            assert rx.wait_complete(blocking=False) is None
+            assert rx.has_transferring_tasks()
+        rx.close()
+
+        # The same workers keep serving ordinary transfers.
+        add_and_verify_request(setup, 0, 1, setup["request_len"], send_first=True)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
 @pytest.mark.timeout(120)
 def test_incompatible_peer_fails_only_affected_requests():
     """An incompatible context peer must fail only the requests targeting it.
@@ -1618,6 +1889,80 @@ def test_helix_windowed_blocks_route_to_last_page_owner(prompt_len):
     assert got[(total_blocks - 1) % cp_size].tolist() == [int(src[-1])]
     for r in range(cp_size):
         assert got[r].tolist() == [int(b) for o, b in zip(ordinals, src) if o % cp_size == r]
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.skipif(
+    TRANSFER_AGENT_BINDING_IMPORT_ERROR is not None, reason="needs the transfer agent binding"
+)
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize(
+    "is_mla,fanin_bounces",
+    [(True, False), (False, True)],
+    ids=["tp2_pp1_to_tp2_pp1_dp_mla", "tp2_pp1_to_tp2_pp1_dp"],
+)
+def test_bounce_fanin_writers_stay_in_their_shares(monkeypatch, use_v2, is_mla, fanin_bounces):
+    """TP2 context ranks fan in to attention-DP generation ranks with the KV bounce on.
+
+    For MLA, should_send_kv elects one context rank to write the whole page to each
+    generation rank, so that fan-in must stay on the per-fragment path: writing every page
+    at the second writer's base would run past the bounce region. With GQA each context rank
+    writes its own heads, an equal share, so the fan-in bounce still engages. Either way, each
+    writer must stay inside its share and the KV must land intact.
+    """
+    from tensorrt_llm._torch.disaggregation.native.bounce import config_from_size
+    from tensorrt_llm._torch.disaggregation.native.bounce import impl as bounce_impl
+
+    fanin_reserves = []  # reserve() result for each multi-writer request
+    writes = []  # (offset in the region, bytes written, per-writer share) for each bounced writer
+    real_reserve = bounce_impl.VmmBounceTransport.reserve
+    real_record_result = bounce_impl.VmmBounceTransport.record_result
+
+    def reserve(self, recv_req, num_writers=1, **kwargs):
+        ok = real_reserve(self, recv_req, num_writers, **kwargs)
+        if num_writers > 1:
+            fanin_reserves.append(ok)
+        return ok
+
+    def record_result(
+        self, rid_slice, peer_rank, dst_ptrs=None, sizes=None, src_base=None, on_done=None
+    ):
+        with self._reserved_map_lock:
+            ctx = self._reserved_map.get(rid_slice)
+        if ctx is not None and dst_ptrs is not None and dst_ptrs.size > 0:
+            writes.append((src_base - ctx.base_addr, int(sizes.sum()), ctx.per_writer_bytes))
+        real_record_result(self, rid_slice, peer_rank, dst_ptrs, sizes, src_base, on_done)
+
+    monkeypatch.setattr(bounce_impl.VmmBounceTransport, "reserve", reserve)
+    monkeypatch.setattr(bounce_impl.VmmBounceTransport, "record_result", record_result)
+    # create_transfer_worker_setup builds its workers without the bounce; turn it on here.
+    bounce = config_from_size(64, min_blocks=1, min_bytes=1)
+    real_worker_config = TransferWorkerConfig
+    monkeypatch.setitem(
+        globals(),
+        "TransferWorkerConfig",
+        lambda **kwargs: real_worker_config(bounce=bounce, **kwargs),
+    )
+
+    setup = create_transfer_worker_setup(2, 1, False, 2, 1, True, is_mla=is_mla, use_v2=use_v2)
+    try:
+        if not setup["gen_transfer_workers"][0]._receiver._bounce.enabled:
+            pytest.skip("fabric bounce buffers unavailable")
+        request_len = setup["request_len"]
+        # Generation request ids 1 and 5 go to attention-DP rank 1, id 2 to rank 0.
+        add_and_verify_request(setup, 0, 1, request_len, send_first=True)
+        add_and_verify_request(setup, 2, 2, request_len, send_first=True)
+        add_and_verify_request(setup, 4, 5, request_len * 2, send_first=True)
+    finally:
+        for worker in setup["ctx_transfer_workers"] + setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+    for offset, nbytes, share in writes:
+        share_end = (offset // share + 1) * share
+        assert offset + nbytes <= share_end, (
+            f"bounce writer at offset {offset} wrote {nbytes}B into a {share}B share"
+        )
+    assert fanin_reserves == ([True] * 3 if fanin_bounces else [])
 
 
 if __name__ == "__main__":

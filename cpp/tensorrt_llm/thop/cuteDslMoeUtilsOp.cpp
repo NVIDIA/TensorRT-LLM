@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
+#include "tensorrt_llm/kernels/kimiK3MoeSortKf.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -132,6 +134,72 @@ std::vector<torch::Tensor> moe_sort(torch::Tensor const& token_selected_experts,
     return moe_topk_sort_impl(std::nullopt, std::nullopt, token_selected_experts, token_final_scales, num_experts,
         top_k, 1, 1, local_expert_offset, local_num_experts, std::nullopt, tile_tokens_dim,
         RoutingMethodType::DeepSeekV3);
+}
+
+// moe_sort of one Kimi K3 DEP16 rank (896 experts, top 16, 56 local experts, tile 128) as one cluster launch of the
+// Kf kernel invokeKimiK3MoeSortKf: the arguments, shapes and layout of moe_sort's outputs, with the rows
+// inside an expert in a deterministic (not ascending) order. The dispatch buffer of an EP16 rank has 16 x tokens-per-
+// source-rank rows, so the row count must be a multiple of 16. token_final_scales is only shape-checked, as in moe_sort
+// the sort does not read it.
+std::vector<torch::Tensor> kimi_k3_moe_sort_kf(torch::Tensor const& token_selected_experts,
+    torch::Tensor const& token_final_scales, int64_t const num_experts, int64_t const top_k,
+    int64_t const local_expert_offset, int64_t const local_num_experts, int64_t const tile_tokens_dim)
+{
+    constexpr int64_t kNumExperts = 896;
+    constexpr int64_t kTopK = 16;
+    constexpr int64_t kNumLocalExperts = 56;
+    constexpr int64_t kTileTokens = 128;
+
+    int const smVersion = tensorrt_llm::common::getSMVersion();
+    TORCH_CHECK(smVersion == 107, "kimi_k3_moe_sort_kf requires an SM107 architecture (got SM", smVersion, ")");
+    TORCH_CHECK(token_selected_experts.is_cuda(), "token_selected_experts must be a CUDA tensor.");
+    TORCH_CHECK(token_selected_experts.scalar_type() == torch::kInt32, "token_selected_experts must be int32.");
+    TORCH_CHECK(token_selected_experts.dim() == 2 && token_selected_experts.size(1) == top_k,
+        "token_selected_experts must have shape [num_tokens, top_k].");
+    TORCH_CHECK(token_final_scales.dim() == 2 && token_final_scales.sizes() == token_selected_experts.sizes(),
+        "token_final_scales must have the shape of token_selected_experts.");
+    TORCH_CHECK(num_experts == kNumExperts && top_k == kTopK && local_num_experts == kNumLocalExperts
+            && tile_tokens_dim == kTileTokens,
+        "kimi_k3_moe_sort_kf supports 896 experts, top_k 16, 56 local experts and tile_tokens_dim 128 only.");
+    TORCH_CHECK(local_expert_offset >= 0 && local_expert_offset + kNumLocalExperts <= kNumExperts,
+        "local_expert_offset must place the 56 local experts inside [0, 896).");
+    int64_t const num_tokens = token_selected_experts.size(0);
+    constexpr int64_t kTokenMultiple = tensorrt_llm::kernels::kKimiK3MoeSortKfTokenMultiple;
+    TORCH_CHECK(num_tokens >= kTokenMultiple && num_tokens <= tensorrt_llm::kernels::kKimiK3MoeSortKfMaxTokens
+            && num_tokens % kTokenMultiple == 0,
+        "kimi_k3_moe_sort_kf supports a multiple of ", kTokenMultiple, " tokens between ", kTokenMultiple, " and ",
+        tensorrt_llm::kernels::kKimiK3MoeSortKfMaxTokens, ", got ", num_tokens, ".");
+
+    // The kernel reads the ids with 16-byte vector loads.
+    bool const idsReady = token_selected_experts.is_contiguous()
+        && reinterpret_cast<uintptr_t>(token_selected_experts.data_ptr()) % 16 == 0;
+    torch::Tensor const ids
+        = idsReady ? token_selected_experts : token_selected_experts.clone(at::MemoryFormat::Contiguous);
+
+    int64_t const max_num_padded_tokens
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
+            num_tokens, top_k, local_num_experts, tile_tokens_dim);
+    int64_t const max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
+        num_tokens, top_k, local_num_experts, tile_tokens_dim);
+    // Like moe_sort, only the valid entries are written: consumers guard the padding with num_non_exiting_tiles and
+    // tile_idx_to_mn_limit, so the outputs need no initialization.
+    auto const intOptions = torch::dtype(torch::kInt32).device(token_selected_experts.device());
+    auto tile_idx_to_expert_idx = torch::empty({max_num_ctas}, intOptions);
+    auto tile_idx_to_mn_limit = torch::empty({max_num_ctas}, intOptions);
+    auto expanded_idx_to_permuted_idx = torch::empty({num_tokens, top_k}, intOptions);
+    auto permuted_idx_to_expanded_idx = torch::empty({max_num_padded_tokens}, intOptions);
+    auto total_num_padded_tokens = torch::empty({1}, intOptions);
+    auto num_non_exiting_tiles = torch::empty({1}, intOptions);
+
+    auto const& stream = at::cuda::getCurrentCUDAStream(token_selected_experts.get_device());
+    tensorrt_llm::kernels::invokeKimiK3MoeSortKf(ids.data_ptr<int32_t>(), static_cast<int32_t>(num_tokens),
+        static_cast<int32_t>(local_expert_offset), tile_idx_to_expert_idx.data_ptr<int32_t>(),
+        tile_idx_to_mn_limit.data_ptr<int32_t>(), expanded_idx_to_permuted_idx.data_ptr<int32_t>(),
+        permuted_idx_to_expanded_idx.data_ptr<int32_t>(), total_num_padded_tokens.data_ptr<int32_t>(),
+        num_non_exiting_tiles.data_ptr<int32_t>(), stream);
+
+    return {tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
+        total_num_padded_tokens, num_non_exiting_tiles};
 }
 
 // Permute
@@ -509,6 +577,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_sort(Tensor token_selected_experts, Tensor token_final_scales, int num_experts, int top_k, "
         "int local_expert_offset, int local_num_experts, int tile_tokens_dim) -> Tensor[]");
     m.def(
+        "kimi_k3_moe_sort_kf(Tensor token_selected_experts, Tensor token_final_scales, int num_experts, int top_k, "
+        "int local_expert_offset, int local_num_experts, int tile_tokens_dim) -> Tensor[]");
+    m.def(
         "moe_permute(Tensor input, Tensor? input_sf, Tensor tile_idx_to_mn_limit, Tensor permuted_idx_to_expanded_idx, "
         "Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
     m.def(
@@ -534,6 +605,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("moe_topk_sort", &tensorrt_llm::torch_ext::moe_topk_sort);
     m.impl("moe_sort", &tensorrt_llm::torch_ext::moe_sort);
+    m.impl("kimi_k3_moe_sort_kf", &tensorrt_llm::torch_ext::kimi_k3_moe_sort_kf);
     m.impl("moe_permute", &tensorrt_llm::torch_ext::moe_permute);
     m.impl("moe_unpermute_inplace", &tensorrt_llm::torch_ext::moe_unpermute_inplace);
     m.impl("moe_unpermute", &tensorrt_llm::torch_ext::moe_unpermute);

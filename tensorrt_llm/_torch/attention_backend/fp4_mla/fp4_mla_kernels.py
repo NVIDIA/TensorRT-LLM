@@ -674,9 +674,33 @@ def _fp4_mla_context_cache_update_kernel(
     STORE_HP_TAIL: tl.constexpr,
     WRITE_V_PACKED: tl.constexpr,
     STORE_V_SCALE: tl.constexpr,
+    LEAD_TILES: tl.constexpr = False,
 ):
-    token_idx = tl.program_id(0)
+    # Each 16-token tile a context touches is quantized by one program. The main
+    # launch (LEAD_TILES=False, one program per token) takes the tiles that start
+    # at a tile boundary. A context that starts inside a tile (a reused prefix or
+    # an earlier chunk that ended mid-tile) leads that tile with the tile's earlier
+    # tokens from the HP ring, where the context that wrote them left their BF16
+    # values (K RoPE applied). The lead launch (LEAD_TILES=True, one program per
+    # context sequence) runs first: in the main launch, the chunk's final tile
+    # may overwrite the same ring slots.
     work_idx = tl.program_id(1)
+    if LEAD_TILES:
+        tl.static_assert(STORE_HP_TAIL, "lead tiles requantize from the HP ring")
+        seq_idx = tl.program_id(0)
+        if seq_idx >= num_contexts:
+            return
+        # Context tokens are laid out sequence by sequence: find the first one.
+        lo = num_tokens * 0
+        hi = num_tokens + 0
+        while lo < hi:
+            mid = (lo + hi) // 2
+            go_right = tl.load(batch_indices_ptr + token_offset + mid) < seq_idx
+            lo = tl.where(go_right, mid + 1, lo)
+            hi = tl.where(go_right, hi, mid)
+        token_idx = lo
+    else:
+        token_idx = tl.program_id(0)
     if (local_layer < 0) | (local_layer >= num_layers):
         return
     if token_idx >= num_tokens:
@@ -690,8 +714,11 @@ def _fp4_mla_context_cache_update_kernel(
     position = tl.load(positions_ptr + metadata_token_idx).to(tl.int64)
     if (batch_idx < 0) | (batch_idx + 1 >= indptr_len) | (position < 0):
         return
+    if LEAD_TILES:
+        if batch_idx != seq_idx:
+            return
 
-    if APPLY_Q_ROPE and work_idx >= NUM_DIM_BLOCKS:
+    if APPLY_Q_ROPE and (not LEAD_TILES) and work_idx >= NUM_DIM_BLOCKS:
         q_head_block = work_idx - NUM_DIM_BLOCKS
         q_heads = q_head_block * BLOCK_Q_HEADS + tl.arange(0, BLOCK_Q_HEADS)
         q_head_mask = q_heads < NUM_Q_HEADS
@@ -731,12 +758,18 @@ def _fp4_mla_context_cache_update_kernel(
         return
 
     dim_block = work_idx
-    if position % HP_BLOCK != 0:
-        return
+    lead = position % HP_BLOCK
+    if LEAD_TILES:
+        if lead == 0:
+            return
+    else:
+        if lead != 0:
+            return
+    tile_position = position - lead
 
     page_size_i64 = tl.cast(page_size, tl.int64)
-    page_idx = position // page_size_i64
-    page_pos = position - page_idx * page_size_i64
+    page_idx = tile_position // page_size_i64
+    page_pos = tile_position - page_idx * page_size_i64
     page_start = tl.load(paged_kv_indptr_ptr + batch_idx).to(tl.int64)
     page_end = tl.load(paged_kv_indptr_ptr + batch_idx + 1).to(tl.int64)
     page_table_offset = page_start + page_idx
@@ -765,8 +798,10 @@ def _fp4_mla_context_cache_update_kernel(
     safe_odd_d = tl.where(mask_odd_d, odd_d, 0)
     safe_all_d = tl.where(mask_all_d, all_d, 0)
 
-    token_candidates = token_idx + token_offsets
-    valid_tokens = token_candidates < num_tokens
+    # Tile slot j holds position tile_position + j: this context's tokens from
+    # slot ``lead`` on, HP-ring tokens before it.
+    token_candidates = token_idx - lead + token_offsets
+    valid_tokens = (token_offsets >= lead) & (token_candidates < num_tokens)
     candidate_metadata = token_offset + token_candidates
     valid_tokens = valid_tokens & (candidate_metadata < metadata_num_tokens)
     safe_candidate_metadata = tl.where(valid_tokens, candidate_metadata, 0)
@@ -778,7 +813,7 @@ def _fp4_mla_context_cache_update_kernel(
         positions_ptr + safe_candidate_metadata, mask=valid_tokens, other=-1
     ).to(tl.int64)
     valid_tokens = valid_tokens & (candidate_batch == batch_idx)
-    valid_tokens = valid_tokens & (candidate_pos == position + token_offsets)
+    valid_tokens = valid_tokens & (candidate_pos == tile_position + token_offsets)
     # int64 so safe_token_candidates * lc_s0 doesn't overflow when num_tokens * head_dim > 2^31.
     safe_token_candidates = tl.where(valid_tokens, token_candidates, 0).to(tl.int64)
 
@@ -839,20 +874,54 @@ def _fp4_mla_context_cache_update_kernel(
 
     if STORE_HP_TAIL:
         tl.static_assert(POOL_HEAD_D >= HEAD_D)
+        # A lead tile reads its earlier tokens' slots while the main launch may
+        # store the chunk's final tile: each needs its own 16 slots.
+        tl.static_assert(HP_POOL_SIZE >= HP_BLOCK)
         hp_batch_valid = (batch_idx >= 0) & (batch_idx < num_contexts)
-        # Context starts are tile-aligned, so only the final incomplete tile
-        # has fewer than HP_BLOCK valid candidates for this sequence.
-        tile_is_partial = tl.sum(valid_tokens.to(tl.int32), axis=0) < HP_BLOCK
+        if LEAD_TILES:
+            hp_index_needed = hp_batch_valid
+        else:
+            # Only a sequence's final tile can stay incomplete; its new tokens
+            # join the ring for the next context or generation step.
+            hp_index_needed = hp_batch_valid & (
+                tl.sum(valid_tokens.to(tl.int32), axis=0) < HP_BLOCK
+            )
         hp_index = tl.load(
             hp_page_ids_ptr + page_table_offset,
-            mask=hp_batch_valid & tile_is_partial,
+            mask=hp_index_needed,
             other=-1,
         ).to(tl.int64)
         hp_batch_valid = hp_batch_valid & (hp_index >= 0) & (hp_index < num_hp_pages)
-        hp_tail_tokens = valid_tokens & hp_batch_valid & tile_is_partial
-        hp_slots = tl.where(hp_tail_tokens, candidate_pos % HP_POOL_SIZE, 0)
         safe_hp_index = tl.where(hp_batch_valid, hp_index, 0)
+        hp_slots = (tile_position + token_offsets) % HP_POOL_SIZE
         hp_base = safe_hp_index * pool_s0 + local_layer * pool_s1 + hp_slots[:, None] * POOL_HEAD_D
+        context_tokens = valid_tokens
+        if LEAD_TILES:
+            # A context resumed inside a tile must find the tile's ring page.
+            # Without it the tile cannot be requantized: the stores below poison
+            # its scales so the request reads NaN instead of mixed scales.
+            tl.device_assert(
+                hp_batch_valid, "FP4 MLA context resumed inside a tile without its HP ring"
+            )
+            ring_missing = ~hp_batch_valid
+            # The tile's tokens before this context, requantized with the new
+            # ones below so the tile holds what a single context over it writes.
+            ring_tokens = (token_offsets < lead) & hp_batch_valid
+            ring_even = tl.load(
+                hp_pool_ptr + hp_base + safe_even_d[None, :],
+                mask=ring_tokens[:, None] & mask_even_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            ring_odd = tl.load(
+                hp_pool_ptr + hp_base + safe_odd_d[None, :],
+                mask=ring_tokens[:, None] & mask_odd_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            even_values = tl.where(ring_tokens[:, None], ring_even, even_values)
+            odd_values = tl.where(ring_tokens[:, None], ring_odd, odd_values)
+            valid_tokens = valid_tokens | ring_tokens
+        tile_is_partial = tl.sum(valid_tokens.to(tl.int32), axis=0) < HP_BLOCK
+        hp_tail_tokens = context_tokens & hp_batch_valid & tile_is_partial
         tl.store(
             hp_pool_ptr + hp_base + safe_even_d[None, :],
             even_values,
@@ -891,6 +960,10 @@ def _fp4_mla_context_cache_update_kernel(
     packed = low | (high << 4)
     v_dim_packed = packed
     v_stored_scale = tl.minimum(tile_scale * kv_global_scale, 448.0)
+    if LEAD_TILES:
+        # After the 448 clamp: minimum() drops a NaN operand.
+        stored_scale = tl.where(ring_missing, float("nan"), stored_scale)
+        v_stored_scale = tl.where(ring_missing, float("nan"), v_stored_scale)
 
     packed_cols = dim_block * (FP4_BLOCK // 2) + byte_offsets
     page_positions = page_pos + token_offsets
@@ -1354,6 +1427,7 @@ def _fp4_mla_generation_q1_kv_tail8_update(
         "num_layers",
         "local_layer",
         "v_page_offset",
+        "generation_len",
     ],
     do_not_specialize_on_alignment=[
         "page_ids_len",
@@ -1364,6 +1438,7 @@ def _fp4_mla_generation_q1_kv_tail8_update(
         "num_layers",
         "local_layer",
         "v_page_offset",
+        "generation_len",
     ],
 )
 def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
@@ -1397,6 +1472,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     num_layers,
     local_layer,
     v_page_offset,
+    generation_len,
     page_size: tl.constexpr,
     kv_s0,
     kv_s2,
@@ -1442,6 +1518,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     Q_SF_COLS: tl.constexpr,
     WRITE_Q: tl.constexpr,
     Q1_KV_BLOCKS_PER_PROGRAM: tl.constexpr,
+    Q_ROWS_PER_SEQ: tl.constexpr = 0,
 ):
     q1_shared_main: tl.constexpr = FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1
     q1_grouped_kv: tl.constexpr = q1_shared_main and Q1_KV_BLOCKS_PER_PROGRAM > 1
@@ -1454,15 +1531,30 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     )
     tl.static_assert(V_HEAD_D % (FP4_BLOCK * Q1_KV_BLOCKS_PER_PROGRAM) == 0)
     tl.static_assert(Q_PREFIX_BLOCKS % Q_PREFIX_BLOCKS_PER_PROGRAM == 0)
+    # The packed attention decode may be a programmatic dependent launch of this
+    # kernel: before griddepcontrol.wait it reads only older metadata and K tiles
+    # that end before the first new token; the Q and KV written here it reads after
+    # it, so it can start once every program has. Write no KV before the new tokens.
+    tl.extra.cuda.gdc_launch_dependents()
     seq_idx = tl.program_id(0)
     if (local_layer < 0) | (local_layer >= num_layers):
         return
     if seq_idx + 1 >= indptr_len:
         return
-    gen_len = tl.load(prompt_lens_ptr + seq_idx)
+    # The launch's generation requests all append generation_len tokens (the host
+    # requires a uniform batch): given, the length costs no load round ahead of kv_len.
+    # 0 loads it per request instead.
+    if generation_len > 0:
+        gen_len = generation_len
+    else:
+        gen_len = tl.load(prompt_lens_ptr + seq_idx)
     if gen_len <= 0:
         return
     kv_len = tl.load(kv_lens_ptr + seq_idx)
+    # The page window in the KV length's load round: the first new tile's page ids
+    # (below, ahead of the Q work) need both.
+    page_start = tl.load(paged_kv_indptr_ptr + seq_idx).to(tl.int64)
+    page_end = tl.load(paged_kv_indptr_ptr + seq_idx + 1).to(tl.int64)
     # Generation tokens are request-major. Deriving their absolute position
     # here avoids materializing per-token metadata in a CUDA graph.
     first_new_pos = kv_len - gen_len
@@ -1501,6 +1593,55 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             )
     elif USE_HELIX:
         hp_pos_offset = rope_first_new_pos - first_new_pos
+    # Every KV path starts at the first new 16-token tile: its page id and HP page id
+    # are loaded here, before the Q work, under the window checks the paths repeat
+    # below (a failed check loads nothing and returns there as before).
+    tl.static_assert(page_size % HP_BLOCK == 0)
+    first_tile_pos = (first_new_pos // HP_BLOCK) * HP_BLOCK
+    tile0_page_idx = first_tile_pos // page_size
+    tile0_page_pos = first_tile_pos - tile0_page_idx * page_size
+    tile0_page_offset = page_start + tile0_page_idx
+    tile0_page_ok = ~(
+        (tile0_page_pos < 0)
+        | (tile0_page_pos >= page_size)
+        | (tile0_page_offset < page_start)
+        | (tile0_page_offset >= page_end)
+        | (tile0_page_offset < 0)
+        | (tile0_page_offset >= page_ids_len)
+    )
+    tile0_physical_page = tl.load(
+        page_ids_ptr + tile0_page_offset, mask=tile0_page_ok, other=-1
+    ).to(tl.int64)
+    tile0_hp_index = tl.load(
+        hp_page_ids_ptr + tile0_page_offset,
+        mask=tile0_page_ok & (tile0_page_offset < hp_page_ids_len),
+        other=-1,
+    ).to(tl.int64)
+    # New tokens that cross a 16-token tile boundary (MTP) also update the next tile:
+    # request its page ids in the same round, not after the first tile's HP ring work.
+    tile1_physical_page = tile0_physical_page
+    tile1_hp_index = tile0_hp_index
+    if MAX_GEN_TILES > 1:
+        tile1_pos = first_tile_pos + HP_BLOCK
+        tile1_page_idx = tile1_pos // page_size
+        tile1_page_pos = tile1_pos - tile1_page_idx * page_size
+        tile1_page_offset = page_start + tile1_page_idx
+        tile1_page_ok = (tile1_pos < kv_len) & ~(
+            (tile1_page_pos < 0)
+            | (tile1_page_pos >= page_size)
+            | (tile1_page_offset < page_start)
+            | (tile1_page_offset >= page_end)
+            | (tile1_page_offset < 0)
+            | (tile1_page_offset >= page_ids_len)
+        )
+        tile1_physical_page = tl.load(
+            page_ids_ptr + tile1_page_offset, mask=tile1_page_ok, other=-1
+        ).to(tl.int64)
+        tile1_hp_index = tl.load(
+            hp_page_ids_ptr + tile1_page_offset,
+            mask=tile1_page_ok & (tile1_page_offset < hp_page_ids_len),
+            other=-1,
+        ).to(tl.int64)
     if FUSE_ROPE_CACHE_STORE:
         work_idx = tl.program_id(1)
         dim_block = work_idx
@@ -1533,7 +1674,15 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 q_token = seq_idx * gen_len + q_token_idx
                 head_lanes = tl.arange(0, BLOCK_Q_HEADS)
                 head_offsets = q_head_block * BLOCK_Q_HEADS + head_lanes
-                q_rows = q_token * NUM_Q_HEADS + head_offsets
+                # The BF16 Q input is token-major; the FP4 output follows the
+                # decode layout: token-major, or packed per request where each
+                # request owns Q_ROWS_PER_SEQ rows (a multiple of 128) holding
+                # its [query token, head] pairs.
+                q_in_rows = q_token * NUM_Q_HEADS + head_offsets
+                if Q_ROWS_PER_SEQ > 0:
+                    q_rows = seq_idx * Q_ROWS_PER_SEQ + q_token_idx * NUM_Q_HEADS + head_offsets
+                else:
+                    q_rows = q_in_rows
                 q_input_row_stride: tl.constexpr = Q_PREFIX_D + ROPE_DIM
                 q_packed_row_stride: tl.constexpr = (Q_PREFIX_D + 2 * ROPE_DIM) // 2
                 # Every lane is valid only when the launch covers the head
@@ -1553,7 +1702,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                         tl.static_assert(Q_PREFIX_BLOCK_D % FP4_BLOCK == 0)
                         q_global_scale = tl.load(q_global_scale_ptr).to(tl.float32)
                         prefix_dims = tl.arange(0, Q_PREFIX_BLOCK_D)
-                        prefix_base = q_rows[:, None].to(tl.int64) * q_input_row_stride
+                        prefix_base = q_in_rows[:, None].to(tl.int64) * q_input_row_stride
                         prefix_groups: tl.constexpr = Q_PREFIX_BLOCK_D // FP4_BLOCK
                         q_prefix_iterations: tl.constexpr = Q_PREFIX_BLOCKS_PER_PROGRAM
                         for q_prefix_iteration in tl.range(
@@ -1765,9 +1914,6 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     if FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1:
         if dim_block * FP4_BLOCK > V_HEAD_D:
             return
-    first_tile_pos = (first_new_pos // HP_BLOCK) * HP_BLOCK
-    page_start = tl.load(paged_kv_indptr_ptr + seq_idx).to(tl.int64)
-    page_end = tl.load(paged_kv_indptr_ptr + seq_idx + 1).to(tl.int64)
     hp_index = tl.full((), 0, tl.int64)
 
     if q1_grouped_kv:
@@ -1798,12 +1944,13 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 | (physical_page_offset >= page_ids_len)
             ):
                 return
-            physical_page = tl.load(page_ids_ptr + physical_page_offset).to(tl.int64)
+            # Tile 0: the page ids loaded with the request metadata (same window).
+            physical_page = tile0_physical_page
             if (physical_page < 0) | (physical_page >= num_pages):
                 return
             if physical_page_offset >= hp_page_ids_len:
                 return
-            hp_index = tl.load(hp_page_ids_ptr + physical_page_offset).to(tl.int64)
+            hp_index = tile0_hp_index
             if (hp_index < 0) | (hp_index >= num_hp_pages):
                 return
 
@@ -1961,12 +2108,14 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 | (physical_page_offset >= page_ids_len)
             ):
                 return
-            physical_page = tl.load(page_ids_ptr + physical_page_offset).to(tl.int64)
+            # The tile-0 page ids: pages hold whole 16-token tiles, so this token's
+            # page is its tile's.
+            physical_page = tile0_physical_page
             if (physical_page < 0) | (physical_page >= num_pages):
                 return
             if physical_page_offset >= hp_page_ids_len:
                 return
-            hp_index = tl.load(hp_page_ids_ptr + physical_page_offset).to(tl.int64)
+            hp_index = tile0_hp_index
             if (hp_index < 0) | (hp_index >= num_hp_pages):
                 return
 
@@ -2090,12 +2239,22 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             | (physical_page_offset >= page_ids_len)
         ):
             return
-        physical_page = tl.load(page_ids_ptr + physical_page_offset).to(tl.int64)
+        if FUSE_ROPE_CACHE_STORE and tile_iter == 0:
+            physical_page = tile0_physical_page
+        elif FUSE_ROPE_CACHE_STORE and tile_iter == 1:
+            physical_page = tile1_physical_page
+        else:
+            physical_page = tl.load(page_ids_ptr + physical_page_offset).to(tl.int64)
         if (physical_page < 0) | (physical_page >= num_pages):
             return
         if physical_page_offset >= hp_page_ids_len:
             return
-        hp_index = tl.load(hp_page_ids_ptr + physical_page_offset).to(tl.int64)
+        if FUSE_ROPE_CACHE_STORE and tile_iter == 0:
+            hp_index = tile0_hp_index
+        elif FUSE_ROPE_CACHE_STORE and tile_iter == 1:
+            hp_index = tile1_hp_index
+        else:
+            hp_index = tl.load(hp_page_ids_ptr + physical_page_offset).to(tl.int64)
         if (hp_index < 0) | (hp_index >= num_hp_pages):
             return
 

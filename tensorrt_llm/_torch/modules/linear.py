@@ -53,7 +53,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
-                              IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
@@ -1286,7 +1286,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             sm_version = get_sm_version()
             uses_cute_dsl_rubin = (activation_scale.dtype == torch.uint8
                                    and sm_version == 107
-                                   and IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+                                   and IS_CUTLASS_DSL_RUBIN_AVAILABLE
                                    and (module.use_cute_dsl_blockscaling_mm
                                         or module.disable_deep_gemm))
             if uses_cute_dsl_rubin:
@@ -1325,7 +1325,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                          or module.disable_deep_gemm) and (
                              sm_version in (100, 103) or
                              (sm_version == 107
-                              and IS_CUTLASS_DSL_INTERNAL_AVAILABLE))
+                              and IS_CUTLASS_DSL_RUBIN_AVAILABLE))
         if uses_cute_dsl:
             if sm_version == 107:
                 act_input_fp8, act_input_sf = \
@@ -1481,7 +1481,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                          or module.disable_deep_gemm) and (
                              sm_version in (100, 103) or
                              (sm_version == 107
-                              and IS_CUTLASS_DSL_INTERNAL_AVAILABLE))
+                              and IS_CUTLASS_DSL_RUBIN_AVAILABLE))
         if uses_cute_dsl and sm_version == 107:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)

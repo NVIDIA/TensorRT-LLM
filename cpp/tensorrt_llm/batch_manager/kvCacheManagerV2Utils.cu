@@ -23,7 +23,10 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
+#include <cstdlib>
 #include <cuda_runtime.h>
+#include <string>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -36,6 +39,51 @@ constexpr uint32_t nbBufs = 4;
 constexpr uint32_t grainBytes = sizeof(Grain);
 
 using MMTask = Task<MemAddress, MemAddress>;
+
+// How each copy task is split across CTAs: pieces of at least minBytesPerCta, and no more pieces than needed for the
+// whole launch to reach targetCtas (0: no target).
+struct CopySplit
+{
+    uint32_t minBytesPerCta;
+    uint32_t targetCtas;
+};
+
+// Device memory: many small CTAs saturate HBM.
+constexpr CopySplit kDeviceCopySplit{grainBytes * ctaSize * 2, 0};
+// Host memory: one CTA cannot saturate the host link. Up to 64 CTAs with pieces of at least 64 KB match cudaMemcpy
+// for both near- and far-socket host memory; smaller pieces get slower again.
+constexpr CopySplit kHostCopySplit{64u << 10, 64};
+// One CTA per task: host copies before they were split (targetCtas 1 caps every task at one piece).
+constexpr CopySplit kHostCopyNoSplit{grainBytes * ctaSize * 2, 1};
+
+// TRTLLM_KVCM_V2_SPLIT_HOST_COPY=0 keeps host<->device copies at one CTA per task (A/B switch). Read once, with the
+// spellings of the Python switches: 0/false/no/off disable the split; unset, blank or 1/true/yes/on keep it.
+CopySplit hostCopySplit() noexcept
+{
+    static CopySplit const split = []() noexcept
+    {
+        char const* const env = std::getenv("TRTLLM_KVCM_V2_SPLIT_HOST_COPY");
+        std::string value = env == nullptr ? "" : env;
+        value.erase(0, value.find_first_not_of(" \t"));
+        value.erase(value.find_last_not_of(" \t") + 1);
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        bool const noSplit = value == "0" || value == "false" || value == "no" || value == "off";
+        if (noSplit)
+        {
+            TLLM_LOG_INFO("KVCacheManagerV2: TRTLLM_KVCM_V2_SPLIT_HOST_COPY=%s, one CTA per host copy task", env);
+        }
+        else if (!(value.empty() || value == "1" || value == "true" || value == "yes" || value == "on"))
+        {
+            TLLM_LOG_WARNING(
+                "KVCacheManagerV2: TRTLLM_KVCM_V2_SPLIT_HOST_COPY=%s is not 0/false/no/off or 1/true/yes/on; keeping "
+                "the split",
+                env);
+        }
+        return noSplit ? kHostCopyNoSplit : kHostCopySplit;
+    }();
+    return split;
+}
 
 __device__ __host__ inline uint32_t divUp(uint32_t a, uint32_t b)
 {
@@ -101,7 +149,7 @@ __global__ void batchedCopy(std::array<MMTask, N> const __grid_constant__ tasks,
 
 template <uint32_t N>
 CUresult launchBatchedCopyImpl(
-    bool lowBandwidth, MMTask const* tasks, uint32_t nbTasks, uint32_t nbBytes, cudaStream_t stream)
+    CopySplit split, MMTask const* tasks, uint32_t nbTasks, uint32_t nbBytes, cudaStream_t stream)
 {
     TLLM_CHECK(nbTasks <= N);
     TLLM_CHECK_WITH_INFO(
@@ -117,7 +165,12 @@ CUresult launchBatchedCopyImpl(
     {
         pTasks = reinterpret_cast<std::array<MMTask, N> const*>(tasks);
     }
-    uint32_t const nbSplits = lowBandwidth ? 1 : divUp(nbBytes, grainBytes * ctaSize * 2);
+    uint32_t nbSplits = divUp(nbBytes, split.minBytesPerCta);
+    if (split.targetCtas != 0)
+    {
+        nbSplits = std::min(nbSplits, divUp(split.targetCtas, nbTasks));
+    }
+    nbSplits = std::max(nbSplits, 1u);
     void* args[] = {(void*) pTasks, (void*) &nbBytes};
     static CUkernel const kernel = []() -> CUkernel
     {
@@ -132,15 +185,13 @@ CUresult launchBatchedCopyImpl(
         stream, args, nullptr);
 }
 
-// When bandwidth is low, e.g. when host memory is involved, we avoid splitting as fewer CTAs should be enough to
-// saturate the bandwidth.
-CUresult launchBatchedCopy(bool lowBandwidth, std::vector<MMTask> const& tasks, uint32_t nbBytes, cudaStream_t stream)
+CUresult launchBatchedCopy(CopySplit split, std::vector<MMTask> const& tasks, uint32_t nbBytes, cudaStream_t stream)
 {
     constexpr uint32_t maxN = 256;
     uint32_t const nbWholeBatches = tasks.size() / maxN;
     for (uint32_t i = 0; i < nbWholeBatches; i++)
     {
-        CUresult const err = launchBatchedCopyImpl<maxN>(lowBandwidth, tasks.data() + maxN * i, maxN, nbBytes, stream);
+        CUresult const err = launchBatchedCopyImpl<maxN>(split, tasks.data() + maxN * i, maxN, nbBytes, stream);
         if (err != CUDA_SUCCESS)
         {
             return err;
@@ -155,33 +206,33 @@ CUresult launchBatchedCopy(bool lowBandwidth, std::vector<MMTask> const& tasks, 
         }
         if (batchSize > maxN / 2)
         {
-            return launchBatchedCopyImpl<maxN>(lowBandwidth, pTasks, batchSize, nbBytes, stream);
+            return launchBatchedCopyImpl<maxN>(split, pTasks, batchSize, nbBytes, stream);
         }
         if (batchSize > maxN / 4)
         {
-            return launchBatchedCopyImpl<maxN / 2>(lowBandwidth, pTasks, batchSize, nbBytes, stream);
+            return launchBatchedCopyImpl<maxN / 2>(split, pTasks, batchSize, nbBytes, stream);
         }
         if (batchSize > maxN / 8)
         {
-            return launchBatchedCopyImpl<maxN / 4>(lowBandwidth, pTasks, batchSize, nbBytes, stream);
+            return launchBatchedCopyImpl<maxN / 4>(split, pTasks, batchSize, nbBytes, stream);
         }
-        return launchBatchedCopyImpl<maxN / 8>(lowBandwidth, pTasks, batchSize, nbBytes, stream);
+        return launchBatchedCopyImpl<maxN / 8>(split, pTasks, batchSize, nbBytes, stream);
     }
 }
 
 CUresult copyHostToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
 {
-    return launchBatchedCopy(true, tasks, numBytes, stream);
+    return launchBatchedCopy(hostCopySplit(), tasks, numBytes, stream);
 }
 
 CUresult copyDeviceToHost(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
 {
-    return launchBatchedCopy(true, tasks, numBytes, stream);
+    return launchBatchedCopy(hostCopySplit(), tasks, numBytes, stream);
 }
 
 CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
 {
-    return launchBatchedCopy(false, tasks, numBytes, stream);
+    return launchBatchedCopy(kDeviceCopySplit, tasks, numBytes, stream);
 }
 
 // dst_tensor[:, :num_seqs, 0] = src_tensor[:, copy_idx]

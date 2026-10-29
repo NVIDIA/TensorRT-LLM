@@ -47,10 +47,10 @@
 // the linker but not the profiler: nsys keys on the demangled short name, so
 // two same-named kernels in one process collapse into one row and an A/B
 // against attnResFwd.cu cannot tell which copy ran. That cost a full
-// misattribution pass on the 20260902-094152 GB300 traces -- baseline and
-// candidate both showed "attn_res_fwd_online_v2_kernel" and the only thing
-// separating them was the launch grid, which is 152 for both whenever
-// RELEASE_TMEM is false. Distinct names, so the trace answers it directly.
+// misattribution pass on the traces -- baseline and candidate both showed
+// "attn_res_fwd_online_v2_kernel" and the only thing separating them was the
+// launch grid, which is the same for both whenever RELEASE_TMEM is false.
+// Distinct names, so the trace answers it directly.
 
 #include "attnResFwdPersistentFused.h"
 
@@ -62,6 +62,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <limits>
 #include <mutex>
@@ -91,8 +92,14 @@ constexpr int CONSUMER_GROUPS = 2;         // two 128-thread consumer groups
 constexpr int CONSUMER_THREADS_PER_GROUP = CONSUMER_THREADS / CONSUMER_GROUPS;
 constexpr int FIRST_USER_NAMED_BARRIER = 8;
 
+// The token term is formed in 64 bits. The candidate term, source *
+// block_stride_r, is formed in CandidateStride: it reaches (N - 2) * T * H
+// elements, so invokeAttnResPersistentFusedFwd passes the stride as int only
+// where that product fits in int, and as long long otherwise (from T = 42800
+// at N = 9).
+template <typename CandidateStride>
 __device__ __forceinline__ bf16_t const* residual_addr(bf16_t const* block_res, bf16_t const* layer_res, int source,
-    int N, int token, int block_stride_m, int block_stride_r, int H)
+    int N, int token, int block_stride_m, CandidateStride block_stride_r, int H)
 {
     if (source < N - 1)
     {
@@ -301,20 +308,103 @@ __device__ __forceinline__ void cp_async_bulk(void* smem_dst, void const* gmem_s
         : "memory");
 }
 
+// FP8 output of the normalized mix (HAS_FP8_OUT, TRTLLM_K3_ATTN_RES_PERSISTENT_FUSE): byte-identical
+// to trtllm::fp8_quantize_1x128_cutedsl_ue8m0 of the BF16 output, i.e. to
+// fp8_quantize_1x128_packed_kernel_impl<., true> (fp8_blockscale_quant_packed.cu), the quantizer the
+// consuming Rubin MXFP8 GEMM would otherwise run: per 1x128 block the amax of |bf16| (clamped to
+// 1e-10), a UE8M0 scale rounded toward +inf from amax * rcp.approx(448), E4M3 codes of
+// x * 2^(127 - e) (satfinite), and the scale replicated over the block's four 1x32 slots at its
+// 128x4-swizzled (R128c4) offset. Rows [T, roundUp(T, 128)) of the scale buffer are written as zero,
+// as the reference does. Same operations in the same order, so the bytes match for every block of
+// finite values (max is exact; the scale is a power of two, so the multiply is exact). This TU is
+// built with --use_fast_math and the reference without it; that only matters for a block holding an
+// Inf (e = 254, where exp2f(-127) flushes to zero here), which a finite RMSNorm output never does.
+constexpr int FP8_OUT_H = 7168;
+constexpr int FP8_SF128_PER_ROW = FP8_OUT_H / 128;       // 56 1x128 blocks per row
+constexpr int FP8_SF_K_TILES = (FP8_OUT_H / 32 + 3) / 4; // 56 uint32 slots per row (4 x 1x32 each)
+
+__device__ __forceinline__ size_t r128c4_offset(int row, int sf128_idx)
+{
+    return static_cast<size_t>(row / 128) * FP8_SF_K_TILES * 512 + static_cast<size_t>(sf128_idx) * 512
+        + static_cast<size_t>(row % 32) * 16 + static_cast<size_t>((row % 128) / 32) * 4;
+}
+
+// |max| of this thread's NV BF16 outputs, as the reference forms it (in BF16, then widened).
+template <int NV>
+__device__ __forceinline__ float fp8_local_amax(bf16_t const* values)
+{
+    __nv_bfloat16 max_elem = __nv_bfloat16(0.0f);
+#pragma unroll
+    for (int i = 0; i < NV; ++i)
+    {
+        max_elem = __hmax(max_elem, __habs(values[i]));
+    }
+    return static_cast<float>(max_elem);
+}
+
+// E4M3 codes of this thread's NV outputs and, from the block leader, the block's R128c4 scale word;
+// `amax` is already the max over the 1x128 block (exact, so the reduction order is immaterial).
+template <int NV>
+__device__ __forceinline__ void fp8_out_store(
+    bf16_t const* values, float amax, uint8_t* code_dst, uint8_t* scale_base, int row, int sf128_idx, bool leader)
+{
+    amax = fmaxf(amax, 1e-10f);
+    float rcp448;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(rcp448) : "f"(448.0f));
+    __nv_fp8_e8m0 ue8m0_scale;
+    ue8m0_scale.__x = __nv_cvt_float_to_e8m0(amax * rcp448, __NV_SATFINITE, cudaRoundPosInf);
+    float const quant_scale
+        = (ue8m0_scale.__x == 0) ? 1.0f : exp2f(static_cast<float>(127u) - static_cast<float>(ue8m0_scale.__x));
+
+    union
+    {
+        uint32_t words[NV / 4];
+        __nv_fp8_e4m3 v[NV];
+    } codes;
+
+#pragma unroll
+    for (int i = 0; i < NV; ++i)
+    {
+        codes.v[i] = __nv_fp8_e4m3(static_cast<float>(values[i]) * quant_scale);
+    }
+    if constexpr (NV == 8)
+    {
+        *reinterpret_cast<uint2*>(code_dst) = make_uint2(codes.words[0], codes.words[1]);
+    }
+    else
+    {
+        static_assert(NV == 4);
+        *reinterpret_cast<uint32_t*>(code_dst) = codes.words[0];
+    }
+    if (leader)
+    {
+        *reinterpret_cast<uint32_t*>(scale_base + r128c4_offset(row, sf128_idx))
+            = static_cast<uint32_t>(ue8m0_scale.__x) * 0x01010101u;
+    }
+}
+
+// HAS_DELTA2 (needs HAS_DELTA): a second addend, so the prefix sum row becomes
+// layer_res + bf16(delta + delta2) -- the MoE residual update residual + bf16(routed + shared) of
+// kimi_k3_moe_residual (delta = routed, delta2 = shared), folded into this mix.
 template <int H, int N, int NC = N_CHUNK_DEFAULT, int B = 1, bool RELEASE_TMEM = false, bool HAS_DELTA = false,
-    bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false>
-__global__ void __launch_bounds__(BLK, 1)
-    attn_res_fwd_persistent_fused_kernel(bf16_t const* __restrict__ block_res, bf16_t const* __restrict__ layer_res,
-        // Diverges from the source copy, which folded the residual add in place on
-        // layer_res. TensorRT-LLM's attn_res_add_rmsnorm_fwd returns the updated
-        // prefix sum as a new tensor, and the read is not affected by the split:
-        // the value consumed here comes from the TMA'd shared-memory copy, not from
-        // a reload of layer_res. Pass layer_res again to recover in-place.
-        bf16_t* __restrict__ updated_layer_res, bf16_t const* __restrict__ delta, bf16_t const* __restrict__ res_w,
-        bf16_t const* __restrict__ rms_w, bf16_t* __restrict__ output, int T, int block_stride_m, int block_stride_r,
-        float rms_eps, bf16_t const* __restrict__ output_norm_weight, float output_norm_eps)
+    bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false, typename CandidateStride = int,
+    bool HAS_DELTA2 = false, bool HAS_FP8_OUT = false>
+__global__ void __launch_bounds__(BLK, 1) attn_res_fwd_persistent_fused_kernel(bf16_t const* __restrict__ block_res,
+    bf16_t const* __restrict__ layer_res,
+    // Diverges from the source copy, which folded the residual add in place on
+    // layer_res. TensorRT-LLM's attn_res_add_rmsnorm_fwd returns the updated
+    // prefix sum as a new tensor, and the read is not affected by the split:
+    // the value consumed here comes from the TMA'd shared-memory copy, not from
+    // a reload of layer_res. Pass layer_res again to recover in-place.
+    bf16_t* __restrict__ updated_layer_res, bf16_t const* __restrict__ delta, bf16_t const* __restrict__ res_w,
+    bf16_t const* __restrict__ rms_w, bf16_t* __restrict__ output, int T, int block_stride_m,
+    CandidateStride block_stride_r, float rms_eps, bf16_t const* __restrict__ output_norm_weight, float output_norm_eps,
+    bf16_t const* __restrict__ delta2, uint8_t* __restrict__ fp8_out, uint8_t* __restrict__ fp8_scale, int sf_rows)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100
+    static_assert(!HAS_DELTA2 || HAS_DELTA, "the second addend needs the first");
+    static_assert(
+        !HAS_FP8_OUT || (HAS_OUTPUT_NORM && H == FP8_OUT_H && B == 1), "the FP8 output is the normalized H = 7168 mix");
     constexpr float LOG2_E = 1.4426950408889634f;
     constexpr int N_CHUNK = NC;
     // The two-source specialization only consumes half of the TMEM columns.
@@ -344,7 +434,8 @@ __global__ void __launch_bounds__(BLK, 1)
     int const k_local = ct_in_group * VEC;
 
     constexpr size_t V_BYTES = (size_t) NUM_BUFS * H * sizeof(bf16_t);
-    constexpr size_t DELTA_BYTES = HAS_DELTA ? (size_t) CHUNK_DEPTH * H * sizeof(bf16_t) : 0;
+    constexpr int NUM_DELTAS = HAS_DELTA ? (HAS_DELTA2 ? 2 : 1) : 0;
+    constexpr size_t DELTA_BYTES = (size_t) NUM_DELTAS * CHUNK_DEPTH * H * sizeof(bf16_t);
     constexpr size_t OUTPUT_NORM_BYTES = OUTPUT_NORM_IN_SMEM ? (size_t) H * sizeof(bf16_t) : 0;
     extern __shared__ __align__(16) char smem_raw[];
     bf16_t* v_bufs = reinterpret_cast<bf16_t*>(smem_raw); // [NUM_BUFS][H]
@@ -356,6 +447,8 @@ __global__ void __launch_bounds__(BLK, 1)
     auto phase_of = [](long long gci) { return (int) ((gci / CHUNK_DEPTH) & 1); };
     auto buf_ptr = [&](int slot) -> bf16_t* { return v_bufs + slot * H; };
     auto delta_buf_ptr = [&](int chunk_slot) -> bf16_t* { return delta_bufs + chunk_slot * H; };
+    // [CHUNK_DEPTH][H] behind the first addend's buffers (HAS_DELTA2 only).
+    auto delta2_buf_ptr = [&](int chunk_slot) -> bf16_t* { return delta_bufs + (CHUNK_DEPTH + chunk_slot) * H; };
 
     if (wid == 0 && elect_one_sync())
     {
@@ -376,12 +469,10 @@ __global__ void __launch_bounds__(BLK, 1)
     //
     // A revision of this file gated it on the launch attribute, on the reasoning
     // that attnResFwd.cu's s1 kernels use `if constexpr (ENABLE_PDL)` and that
-    // the call is documented as a no-op without a programmatic launch. Measured:
-    // removing it collapses MoE routing exactly the way a premature trigger does
-    // -- 92.65% of token-to-expert selections on slots 0..15 with the attribute
-    // OFF, against 1.87% for the same build with it present. So it is doing
-    // something this kernel depends on beyond waiting for a predecessor, and it
-    // stays. The s1 kernels are not a precedent: they are not warp-specialized
+    // the call is documented as a no-op without a programmatic launch. Removing
+    // it breaks MoE routing exactly the way a premature trigger does when the
+    // attribute is off, so it is doing something this kernel depends on beyond
+    // waiting for a predecessor, and it stays. The s1 kernels are not a precedent: they are not warp-specialized
     // and do not allocate TMEM here.
     cudaGridDependencySynchronize();
 
@@ -471,7 +562,7 @@ __global__ void __launch_bounds__(BLK, 1)
                         int prefix_n = N - 1 - ns;
                         if (prefix_n >= 0 && prefix_n < an)
                         {
-                            transaction_bytes += H * (int) sizeof(bf16_t);
+                            transaction_bytes += NUM_DELTAS * H * (int) sizeof(bf16_t);
                         }
                     }
                     mbarrier_expect_tx(plan.bar_ready[chunk_slot], transaction_bytes);
@@ -492,6 +583,11 @@ __global__ void __launch_bounds__(BLK, 1)
                         {
                             cp_async_bulk(delta_buf_ptr(chunk_slot), delta + (long long) tb * H, H * sizeof(bf16_t),
                                 plan.bar_ready[chunk_slot]);
+                            if constexpr (HAS_DELTA2)
+                            {
+                                cp_async_bulk(delta2_buf_ptr(chunk_slot), delta2 + (long long) tb * H,
+                                    H * sizeof(bf16_t), plan.bar_ready[chunk_slot]);
+                            }
                         }
                     }
                 }
@@ -554,9 +650,15 @@ __global__ void __launch_bounds__(BLK, 1)
 #pragma unroll
                                             for (int j = 0; j < 2; j++)
                                             {
-                                                auto delta2
-                                                    = *reinterpret_cast<const __nv_bfloat162*>(delta_ptr + 2 * j);
-                                                v2[j] = __hadd2(v2[j], delta2);
+                                                auto add2 = *reinterpret_cast<const __nv_bfloat162*>(delta_ptr + 2 * j);
+                                                if constexpr (HAS_DELTA2)
+                                                {
+                                                    // bf16(routed + shared) first, as kimi_k3_moe_residual rounds it.
+                                                    add2 = __hadd2(add2,
+                                                        *reinterpret_cast<const __nv_bfloat162*>(
+                                                            delta2_buf_ptr(chunk_slot) + h_base + 2 * j));
+                                                }
+                                                v2[j] = __hadd2(v2[j], add2);
                                             }
                                             *reinterpret_cast<int2*>(updated_layer_res + (long long) tb * H + h_base)
                                                 = vp;
@@ -593,8 +695,14 @@ __global__ void __launch_bounds__(BLK, 1)
 #pragma unroll
                                     for (int j = 0; j < VEC / 2; j++)
                                     {
-                                        auto delta2 = *reinterpret_cast<const __nv_bfloat162*>(delta_ptr + 2 * j);
-                                        v2[j] = __hadd2(v2[j], delta2);
+                                        auto add2 = *reinterpret_cast<const __nv_bfloat162*>(delta_ptr + 2 * j);
+                                        if constexpr (HAS_DELTA2)
+                                        {
+                                            add2 = __hadd2(add2,
+                                                *reinterpret_cast<const __nv_bfloat162*>(
+                                                    delta2_buf_ptr(chunk_slot) + h_base + 2 * j));
+                                        }
+                                        v2[j] = __hadd2(v2[j], add2);
                                     }
                                     *reinterpret_cast<int4*>(updated_layer_res + (long long) tb * H + h_base) = vp;
                                 }
@@ -642,6 +750,11 @@ __global__ void __launch_bounds__(BLK, 1)
                     default: __builtin_unreachable();
                     }
                 }
+                // The producer refills the slots through the async proxy (TMA): a
+                // cross-proxy fence orders this lane's generic-proxy reads before it.
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                // Every lane's reads of the chunk's slots before lane 0 releases them to the producer.
+                __syncwarp();
                 if (lane == 0)
                 {
                     mbarrier_arrive(plan.bar_consumed[chunk_slot]);
@@ -950,6 +1063,8 @@ __global__ void __launch_bounds__(BLK, 1)
                     total_sq = rsqrtf(total_sq / H + output_norm_eps * s_running * s_running);
                 }
                 float output_rsigma = __shfl_sync(0xffffffff, total_sq, 0);
+                // The BF16 outputs, kept for the FP8 pass (HAS_FP8_OUT; H = 7168: 3 full slices + 1 half).
+                [[maybe_unused]] bf16_t fp8_vals[SLICES_PER_GROUP][VEC];
 #pragma unroll
                 for (int si = 0; si < SLICES_PER_GROUP; si++)
                 {
@@ -968,6 +1083,14 @@ __global__ void __launch_bounds__(BLK, 1)
                                 values[j] = __float2bfloat16(acc32[si * VEC + j] * output_rsigma * weight);
                             }
                             *reinterpret_cast<uint2*>(out_ptr + h_base) = packed;
+                            if constexpr (HAS_FP8_OUT)
+                            {
+#pragma unroll
+                                for (int j = 0; j < 4; j++)
+                                {
+                                    fp8_vals[si][j] = values[j];
+                                }
+                            }
                             continue;
                         }
                     }
@@ -985,6 +1108,59 @@ __global__ void __launch_bounds__(BLK, 1)
                         values[j] = __float2bfloat16(acc32[si * VEC + j] * output_rsigma * weight);
                     }
                     *reinterpret_cast<uint4*>(out_ptr + h_base) = packed;
+                    if constexpr (HAS_FP8_OUT)
+                    {
+#pragma unroll
+                        for (int j = 0; j < VEC; j++)
+                        {
+                            fp8_vals[si][j] = values[j];
+                        }
+                    }
+                }
+                if constexpr (HAS_FP8_OUT)
+                {
+                    // 1x128 blocks: 16 lanes x 8 values in the full slices, a warp x 4 values in the half
+                    // slice. All slices' block maxima reduce together so their shuffle chains overlap.
+                    constexpr int LAST = SLICES_PER_GROUP - 1;
+                    float amax[SLICES_PER_GROUP];
+#pragma unroll
+                    for (int si = 0; si < LAST; si++)
+                    {
+                        amax[si] = fp8_local_amax<VEC>(fp8_vals[si]);
+                    }
+                    amax[LAST] = fp8_local_amax<4>(fp8_vals[LAST]);
+                    amax[LAST] = fmaxf(amax[LAST], __shfl_xor_sync(0xffffffffu, amax[LAST], 16));
+#pragma unroll
+                    for (int off = 8; off > 0; off >>= 1)
+                    {
+#pragma unroll
+                        for (int si = 0; si < SLICES_PER_GROUP; si++)
+                        {
+                            amax[si] = fmaxf(amax[si], __shfl_xor_sync(0xffffffffu, amax[si], off));
+                        }
+                    }
+                    uint8_t* const code_row = fp8_out + (long long) tb * H;
+#pragma unroll
+                    for (int si = 0; si < LAST; si++)
+                    {
+                        int const h_base = (si * CONSUMER_GROUPS + group) * K_TILE + k_local;
+                        fp8_out_store<VEC>(
+                            fp8_vals[si], amax[si], code_row + h_base, fp8_scale, tb, h_base / 128, lane % 16 == 0);
+                    }
+                    int const h_last = 6 * K_TILE + group * (K_TILE / 2) + ct_in_group * 4;
+                    fp8_out_store<4>(
+                        fp8_vals[LAST], amax[LAST], code_row + h_last, fp8_scale, tb, h_last / 128, lane == 0);
+                }
+            }
+        }
+        if constexpr (HAS_FP8_OUT)
+        {
+            // The rows the GEMM pads M up to (a multiple of 128) read as zero scales.
+            for (int r = TB + blockIdx.x; r < sf_rows; r += num_ctas)
+            {
+                for (int s = comp_tid; s < FP8_SF128_PER_ROW; s += CONSUMER_THREADS)
+                {
+                    *reinterpret_cast<uint32_t*>(fp8_scale + r128c4_offset(r, s)) = 0u;
                 }
             }
         }
@@ -1001,11 +1177,11 @@ __global__ void __launch_bounds__(BLK, 1)
     // nothing downstream of it is launched with the attribute set, so the trigger
     // has no receiver. TensorRT-LLM enables PDL stack-wide -- getEnvEnablePDL()
     // returns true unless TRTLLM_ENABLE_PDL says otherwise -- so here the next
-    // kernel really does start early. Measured: with PDL on, 98.8% of MoE
-    // token-to-expert selections landed on slots 0..15, which is what a top-16
-    // takes when every expert logit is equal, i.e. when the router read a buffer
-    // that was never written. With PDL off the same build reproduces the
-    // baseline histogram exactly (run record 0903_persistent_pdl_race.md).
+    // kernel really does start early. With PDL on, the MoE token-to-expert
+    // selections collapsed onto slots 0..15, which is what a top-16 takes when
+    // every expert logit is equal, i.e. when the router read a buffer that was
+    // never written. With PDL off the same build reproduces the baseline
+    // selection histogram exactly.
     //
     // attnResFwd.cu's s1 kernels need no barrier here because every thread writes
     // its own slice and then reaches the trigger; only a warp-specialized kernel
@@ -1025,18 +1201,21 @@ __global__ void __launch_bounds__(BLK, 1)
 }
 
 template <int H, int N, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false, bool HAS_DELTA = false,
-    bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false>
+    bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false, typename CandidateStride = int,
+    bool HAS_DELTA2 = false, bool HAS_FP8_OUT = false>
 static void launch_fwd(bf16_t const* block_residual, bf16_t const* layer_residual, bf16_t* updated_layer_residual,
     bf16_t const* delta, bf16_t const* res_weight, bf16_t const* rms_weight, bf16_t* output, int T, float rms_eps,
     int num_sm, cudaStream_t stream, bf16_t const* output_norm_weight = nullptr, float output_norm_eps = 0.f,
-    int block_stride_m = 0, int block_stride_r = 0)
+    int block_stride_m = 0, CandidateStride block_stride_r = 0, bf16_t const* delta2 = nullptr,
+    uint8_t* fp8_out = nullptr, uint8_t* fp8_scale = nullptr, int sf_rows = 0)
 {
+    constexpr int NUM_DELTAS = HAS_DELTA ? (HAS_DELTA2 ? 2 : 1) : 0;
     constexpr size_t smem_size
-        = ((size_t) CHUNK_DEPTH * (NC + (HAS_DELTA ? 1 : 0)) * H * sizeof(bf16_t)
+        = ((size_t) CHUNK_DEPTH * (NC + NUM_DELTAS) * H * sizeof(bf16_t)
               + (OUTPUT_NORM_IN_SMEM ? (size_t) H * sizeof(bf16_t) : 0) + sizeof(FwdSmemPlan<NC>) + 15)
         & ~size_t(15);
     auto kernel = &attn_res_fwd_persistent_fused_kernel<H, N, NC, 1, RELEASE_TMEM, HAS_DELTA, HAS_OUTPUT_NORM,
-        OUTPUT_NORM_IN_SMEM>;
+        OUTPUT_NORM_IN_SMEM, CandidateStride, HAS_DELTA2, HAS_FP8_OUT>;
     // Diverges from the source copy, which used a plain `static bool attrs_set`:
     // that is neither thread-safe nor per-device, so on a multi-GPU process the
     // first caller can leave every other device without the opt-in and the launch
@@ -1058,17 +1237,22 @@ static void launch_fwd(bf16_t const* block_residual, bf16_t const* layer_residua
         }
     }
     int grid = RELEASE_TMEM ? num_sm * 2 : num_sm;
+    // The token index is int in both stride forms: each CTA steps it by the grid
+    // size until it is no longer below T, so its largest value is T - 1 + grid.
+    TLLM_CHECK_WITH_INFO(static_cast<long long>(T) - 1 + grid <= std::numeric_limits<int>::max(),
+        "attn_res persistent fused: T=%d overflows the kernel's int token index "
+        "with a grid of %d CTAs",
+        T, grid);
     cudaLaunchConfig_t config{};
     config.gridDim = grid;
     config.blockDim = BLK;
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
     // Only the attribute is gated; the kernel's two intrinsics stay unconditional
-    // as in the source copy. Gating those as well was tried and measured worse:
+    // as in the source copy. Gating those as well was tried and does not work:
     // with the attribute off, dropping cudaGridDependencySynchronize() collapsed
-    // MoE routing (92.65% of selections on slots 0..15 versus 1.87% with it
-    // kept), so it is load-bearing beyond its documented no-op-without-PDL
-    // behaviour. Leaving it in costs nothing when no programmatic launch is in
+    // MoE routing onto slots 0..15, so it is load-bearing beyond its documented
+    // no-op-without-PDL behaviour. Leaving it in costs nothing when no programmatic launch is in
     // play, and the trigger has no receiver in that case either.
     bool const enable_pdl = tensorrt_llm::common::getEnvEnablePDL();
     cudaLaunchAttribute attrs[1];
@@ -1077,7 +1261,8 @@ static void launch_fwd(bf16_t const* block_residual, bf16_t const* layer_residua
     config.attrs = attrs;
     config.numAttrs = enable_pdl ? 1 : 0;
     cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, updated_layer_residual, delta, res_weight,
-        rms_weight, output, T, block_stride_m, block_stride_r, rms_eps, output_norm_weight, output_norm_eps);
+        rms_weight, output, T, block_stride_m, block_stride_r, rms_eps, output_norm_weight, output_norm_eps, delta2,
+        fp8_out, fp8_scale, sf_rows);
 }
 
 } // namespace fwd_prod_v2
@@ -1119,11 +1304,17 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
     // candidate step is T * H. The source copy carried a token-major bank and
     // therefore takes both strides as arguments; passing ours keeps the kernel
     // body unchanged.
+    //
+    // residual_addr scales the candidate step by sources up to N - 2. Where the
+    // step and that largest offset both fit in int, the kernel takes the step
+    // as int, otherwise as long long. Both forms compute the same addresses;
+    // the long long form is kept out of the int range because it is slightly
+    // slower there. launch_fwd checks the bound on T that applies to both.
     int const T = params.seqLen;
     int const block_stride_m = 7168;
     long long const block_stride_r = static_cast<long long>(T) * 7168;
-    TLLM_CHECK_WITH_INFO(block_stride_r <= std::numeric_limits<int>::max(),
-        "attn_res persistent fused: candidate stride %lld overflows the kernel's int stride", block_stride_r);
+    bool const int_candidate_stride = block_stride_r <= std::numeric_limits<int>::max()
+        && block_stride_r * (params.numCandidates - 2) <= std::numeric_limits<int>::max();
 
     bool const has_delta = params.layerResidualAdd != nullptr;
     auto launch = [&](auto nsrc_tok, auto nc_tok, auto release_tmem_tok)
@@ -1134,10 +1325,22 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
         auto go = [&](auto has_delta_tok)
         {
             constexpr bool HAS_DELTA = decltype(has_delta_tok)::value;
-            launch_fwd<7168, NSRC, NC, RELEASE_TMEM, HAS_DELTA, /*HAS_OUTPUT_NORM=*/true,
-                /*OUTPUT_NORM_IN_SMEM=*/true>(params.blockResidual, params.layerResidual, params.updatedLayerResidual,
-                params.layerResidualAdd, params.resWeight, params.rmsWeight, params.output, T, params.rmsEps, num_sm,
-                stream, params.outputRmsWeight, params.outputRmsEps, block_stride_m, static_cast<int>(block_stride_r));
+            auto launch_with_stride = [&](auto candidate_stride)
+            {
+                launch_fwd<7168, NSRC, NC, RELEASE_TMEM, HAS_DELTA, /*HAS_OUTPUT_NORM=*/true,
+                    /*OUTPUT_NORM_IN_SMEM=*/true, decltype(candidate_stride)>(params.blockResidual,
+                    params.layerResidual, params.updatedLayerResidual, params.layerResidualAdd, params.resWeight,
+                    params.rmsWeight, params.output, T, params.rmsEps, num_sm, stream, params.outputRmsWeight,
+                    params.outputRmsEps, block_stride_m, candidate_stride);
+            };
+            if (int_candidate_stride)
+            {
+                launch_with_stride(static_cast<int>(block_stride_r));
+            }
+            else
+            {
+                launch_with_stride(block_stride_r);
+            }
         };
         if (has_delta)
         {
@@ -1188,6 +1391,107 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
             TLLM_CHECK_WITH_INFO(
                 false, "attn_res persistent fused: unsupported N=%d (must be in [2, 9])", params.numCandidates);
         }
+    }
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+bool attnResPersistentFusedExtSupported(AttnResPersistentExtParams const& params)
+{
+    AttnResFwdParams const& p = params.base;
+    bool const add2_ok = params.layerResidualAdd2 == nullptr || p.layerResidualAdd != nullptr;
+    bool const fp8_ok = (params.fp8Output == nullptr) == (params.fp8Scale == nullptr);
+    // The extended launches take the candidate stride as int only (decode token counts).
+    long long const stride_r = static_cast<long long>(p.seqLen) * 7168;
+    int const far_source = p.numCandidates > 2 ? p.numCandidates - 2 : 1;
+    bool const stride_ok = stride_r * far_source <= std::numeric_limits<int>::max();
+    return attnResPersistentFusedSupported(p) && add2_ok && fp8_ok && stride_ok;
+}
+
+void invokeAttnResPersistentFusedExtFwd(AttnResPersistentExtParams const& params, cudaStream_t stream)
+{
+    AttnResFwdParams const& p = params.base;
+    TLLM_CHECK_WITH_INFO(attnResPersistentFusedExtSupported(params),
+        "attn_res persistent fused (ext): unsupported shape (H=%d, B=%d, N=%d, T=%d), a required tensor is null, "
+        "a second addend without the first, or only one of the two FP8 output pointers",
+        p.hiddenSize, p.batchSize, p.numCandidates, p.seqLen);
+    TLLM_CHECK_WITH_INFO(p.rsigma == nullptr && p.probs == nullptr && p.logits == nullptr,
+        "attn_res persistent fused (ext): rsigma/probs/logits are not produced by this kernel");
+
+    int dev = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&dev));
+    int num_sm = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev));
+    TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res persistent fused (ext): failed to query the SM count of device %d", dev);
+
+    using namespace sm100::fwd_prod_v2;
+
+    int const T = p.seqLen;
+    int const block_stride_r = T * 7168;
+    int const sf_rows = (T + 127) / 128 * 128;
+    bool const has_delta = p.layerResidualAdd != nullptr;
+    bool const has_delta2 = params.layerResidualAdd2 != nullptr;
+    bool const fp8 = params.fp8Output != nullptr;
+    auto* const fp8_out = static_cast<uint8_t*>(params.fp8Output);
+
+    // NC = 3 and RELEASE_TMEM = false, as invokeAttnResPersistentFusedFwd selects for every shape; with
+    // neither extension the launch is that entry point's kernel (same template arguments).
+    auto launch = [&](auto nsrc_tok, auto delta_tok, auto delta2_tok, auto fp8_tok)
+    {
+        constexpr int NSRC = decltype(nsrc_tok)::value;
+        constexpr bool HAS_DELTA = decltype(delta_tok)::value;
+        constexpr bool HAS_DELTA2 = decltype(delta2_tok)::value;
+        constexpr bool HAS_FP8_OUT = decltype(fp8_tok)::value;
+        launch_fwd<7168, NSRC, 3, false, HAS_DELTA, /*HAS_OUTPUT_NORM=*/true, /*OUTPUT_NORM_IN_SMEM=*/true, int,
+            HAS_DELTA2, HAS_FP8_OUT>(p.blockResidual, p.layerResidual, p.updatedLayerResidual, p.layerResidualAdd,
+            p.resWeight, p.rmsWeight, p.output, T, p.rmsEps, num_sm, stream, p.outputRmsWeight, p.outputRmsEps,
+            /*block_stride_m=*/7168, block_stride_r, params.layerResidualAdd2, fp8_out, params.fp8Scale, sf_rows);
+    };
+    auto by_mode = [&](auto nsrc_tok)
+    {
+        if (has_delta2)
+        {
+            if (fp8)
+            {
+                launch(nsrc_tok, std::true_type{}, std::true_type{}, std::true_type{});
+            }
+            else
+            {
+                launch(nsrc_tok, std::true_type{}, std::true_type{}, std::false_type{});
+            }
+        }
+        else if (fp8)
+        {
+            if (has_delta)
+            {
+                launch(nsrc_tok, std::true_type{}, std::false_type{}, std::true_type{});
+            }
+            else
+            {
+                launch(nsrc_tok, std::false_type{}, std::false_type{}, std::true_type{});
+            }
+        }
+        else if (has_delta)
+        {
+            launch(nsrc_tok, std::true_type{}, std::false_type{}, std::false_type{});
+        }
+        else
+        {
+            launch(nsrc_tok, std::false_type{}, std::false_type{}, std::false_type{});
+        }
+    };
+    switch (p.numCandidates)
+    {
+    case 2: by_mode(std::integral_constant<int, 2>{}); break;
+    case 3: by_mode(std::integral_constant<int, 3>{}); break;
+    case 4: by_mode(std::integral_constant<int, 4>{}); break;
+    case 5: by_mode(std::integral_constant<int, 5>{}); break;
+    case 6: by_mode(std::integral_constant<int, 6>{}); break;
+    case 7: by_mode(std::integral_constant<int, 7>{}); break;
+    case 8: by_mode(std::integral_constant<int, 8>{}); break;
+    case 9: by_mode(std::integral_constant<int, 9>{}); break;
+    default:
+        TLLM_CHECK_WITH_INFO(
+            false, "attn_res persistent fused (ext): unsupported N=%d (must be in [2, 9])", p.numCandidates);
     }
     TLLM_CUDA_CHECK(cudaGetLastError());
 }

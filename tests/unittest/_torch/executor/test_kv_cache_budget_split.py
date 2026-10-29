@@ -57,6 +57,7 @@ def _make_creator(
     c._max_batch_size = 1
     c._speculative_config = None
     c._mapping = Mock()
+    c._is_disagg = False
     c._model_engine = Mock()
 
     c._kv_cache_manager_cls = Mock()
@@ -626,3 +627,66 @@ class TestExternalDrafterKvDtype:
 
         assert seen[0][1]["tokens_per_block"] == c._get_draft_tokens_per_block()
         assert c._get_draft_tokens_per_block() != c._tokens_per_block
+
+
+@pytest.mark.parametrize("estimating", [False, True])
+@pytest.mark.parametrize("v2", [False, True])
+def test_build_managers_shares_v2_estimation_gpu_budget(estimating, v2):
+    creator = _make_creator(max_gpu_total_bytes=10 * GB, host_cache_size=2 * GB)
+    original = creator._kv_cache_config.model_dump()
+    creator._skip_est = False
+    creator._is_kv_cache_manager_v2 = v2
+    creator._is_encoder_decoder = Mock(return_value=False)
+    creator._draft_model_engine = None
+    creator._kv_connector_manager = None
+    creator._fp8_ctx_mla_kv_len_cap = None
+    creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
+    creator._joint_reuse_supported = Mock(return_value=True)
+    creator._needs_gpu_kv_cache_budget_split = Mock(return_value=True)
+    creator._get_target_and_draft_cache_costs = Mock(
+        return_value=(CacheCost(slope=80, intercept=2 * GB), CacheCost(slope=20, intercept=GB))
+    )
+    creator._create_kv_cache_manager = Mock(return_value=SimpleNamespace())
+    creator._create_one_model_draft_kv_cache_manager = Mock(return_value=SimpleNamespace())
+    creator.build_managers({}, estimating_kv_cache=estimating)
+    target = creator._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"]
+    draft = creator._create_one_model_draft_kv_cache_manager.call_args.kwargs[
+        "kv_cache_config_override"
+    ]
+    if not estimating or v2:
+        assert target.max_gpu_total_bytes + draft.max_gpu_total_bytes == 10 * GB
+        assert target.max_gpu_total_bytes >= 2 * GB
+        assert draft.max_gpu_total_bytes >= GB
+        assert target is not creator._kv_cache_config
+        assert draft is not creator._kv_cache_config
+    else:
+        assert target.max_gpu_total_bytes == draft.max_gpu_total_bytes == 10 * GB
+    if estimating:
+        assert target.host_cache_size == draft.host_cache_size == 2 * GB
+    else:
+        assert target.host_cache_size + draft.host_cache_size == 2 * GB
+    assert creator._kv_cache_config.model_dump() == original
+
+
+def test_build_managers_legacy_estimation_keeps_whole_v2_profiling_budget(monkeypatch):
+    # TRTLLM_K3_LEGACY_KV_ESTIMATION=1: no target/draft split while profiling (the previous sizing).
+    monkeypatch.setenv("TRTLLM_K3_LEGACY_KV_ESTIMATION", "1")
+    creator = _make_creator(max_gpu_total_bytes=10 * GB, host_cache_size=2 * GB)
+    creator._skip_est = False
+    creator._is_kv_cache_manager_v2 = True
+    creator._is_encoder_decoder = Mock(return_value=False)
+    creator._draft_model_engine = None
+    creator._kv_connector_manager = None
+    creator._fp8_ctx_mla_kv_len_cap = None
+    creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
+    creator._joint_reuse_supported = Mock(return_value=True)
+    creator._needs_gpu_kv_cache_budget_split = Mock(return_value=True)
+    creator._create_kv_cache_manager = Mock(return_value=SimpleNamespace())
+    creator._create_one_model_draft_kv_cache_manager = Mock(return_value=SimpleNamespace())
+    creator.build_managers({}, estimating_kv_cache=True)
+    target = creator._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"]
+    draft = creator._create_one_model_draft_kv_cache_manager.call_args.kwargs[
+        "kv_cache_config_override"
+    ]
+    assert target.max_gpu_total_bytes == draft.max_gpu_total_bytes == 10 * GB
+    assert target.host_cache_size == draft.host_cache_size == 2 * GB

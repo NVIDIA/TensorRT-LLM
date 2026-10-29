@@ -269,7 +269,7 @@ Metrics Endpoint
 
    Some fields, such as CPU memory usage, are not yet available for the PyTorch backend.
 
-   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can slightly impact performance, depending on the serving configuration.
+   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can slightly impact performance, depending on the serving configuration. Setting ``iter_perf_stats_interval: N`` builds the statistics only every N iterations, which reduces this overhead.
 
 The ``/metrics`` endpoint provides runtime iteration statistics such as GPU memory usage and KV cache details.
 

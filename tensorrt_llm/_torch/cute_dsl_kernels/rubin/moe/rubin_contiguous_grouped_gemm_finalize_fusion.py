@@ -1164,6 +1164,11 @@ class Sm107ContiguousGroupedGemmFinalizeFusionKernel:
                                         sC[sC_row, None, 0],
                                         cutlass.Int32(self.copy_size),
                                     )
+
+                # The bulk reductions read sC asynchronously: drain those reads before the next tile
+                # rewrites sC or the CTA exits (the same drain as the NVFP4 finalize kernel).
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()
 
                 # Get next tile (5 elements)

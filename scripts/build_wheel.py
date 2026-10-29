@@ -696,9 +696,11 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
                   staging_dir / tree,
                   exclude=("__pycache__", "*.pyc"))
     top_level_files = [
-        "setup.py", "pyproject.toml", "requirements.txt",
-        "requirements-dev.txt", "constraints.txt", "LICENSE", "README.md"
+        "setup.py", "pyproject.toml", "constraints.txt", "LICENSE", "README.md"
     ]
+    # setup.py parses every top-level requirements file it references (e.g.
+    # requirements-grpc-smg.txt), so stage all of them.
+    top_level_files += [f.name for f in project_dir.glob("requirements*.txt")]
     top_level_files += [
         f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
     ]

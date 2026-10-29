@@ -87,6 +87,7 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
+from ..standalone_draft_cache import DraftHistoryUpdate
 from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import (
@@ -186,6 +187,7 @@ class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTenso
     host: Optional[GenericSampleStateTensorsHost] = None
     sampler_event: Optional[SamplerEvent] = None
     runtime_draft_len: Optional[int] = None
+    draft_history_update: DraftHistoryUpdate | None = None
 
 
 # Generic bounds not supported, https://github.com/python/typing/issues/548

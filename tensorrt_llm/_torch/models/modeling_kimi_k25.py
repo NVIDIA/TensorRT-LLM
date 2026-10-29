@@ -1724,7 +1724,18 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         return self._mm_token_ids
 
     def load_weights(self, weights) -> None:
-        """Load vision + projector + LLM weights from checkpoint."""
+        """Load vision + projector + LLM weights from checkpoint.
+
+        Raises:
+            RuntimeError: Dense DWDP is active on the text model; nothing is loaded.
+        """
+        if getattr(getattr(self, "model", None), "_dense_dwdp_active", False):
+            # The text model's dense weights are views of dense DWDP staging slots that several
+            # layers share; refuse before the vision tower is rebuilt or loaded.
+            raise RuntimeError(
+                f"{type(self).__name__} load_weights is not supported while dense DWDP is "
+                "active: the dense weights live in staging slots shared across layers"
+            )
         # Create vision encoder if it was skipped during meta init.
         # Use the saved VLM config since model_config.pretrained_config
         # has been overwritten with text_config by __init__.

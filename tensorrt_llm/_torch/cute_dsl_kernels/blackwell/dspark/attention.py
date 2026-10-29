@@ -3,10 +3,11 @@
 
 """Blackwell DSpark attention specialization and persistent scheduler."""
 
-from typing import Tuple, Type
+from typing import Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
+from cuda.bindings import driver as cuda
 
 from .attention_kernel import DSparkAttentionKernel
 
@@ -194,7 +195,7 @@ class DSparkPersistentTileScheduler:
 
 
 class DSparkAttention(DSparkAttentionKernel):
-    """Attention over a 128-token rolling window and one 5/6-token draft block."""
+    """Attention over a 128-token paged context window and one 5/6-token draft block."""
 
     window_size = 128
     block_size = 6
@@ -244,7 +245,12 @@ class DSparkAttention(DSparkAttentionKernel):
         mma_qk_tiler_k: int = qk_tiler_k,
         inverse_rope_dim: int = 0,
         output_groups: int | None = None,
+        history_page_size: int = 32,
+        num_heads: int = num_heads,
     ):
+        if num_heads not in (64, 128):
+            raise ValueError(f"DSpark attention must have 64 or 128 heads, got {num_heads}")
+        self.num_heads = num_heads
         expected_config = {
             "acc_dtype": (acc_dtype, cutlass.Float32),
             "mma_qk_tiler_mn": (mma_qk_tiler_mn, self.qk_tiler_mn),
@@ -262,6 +268,8 @@ class DSparkAttention(DSparkAttentionKernel):
             raise ValueError("Unsupported DSpark kernel configuration: " + ", ".join(mismatches))
         if seq_len_q not in (5, 6):
             raise ValueError(f"DSpark block size must be 5 or 6, got {seq_len_q}")
+        if history_page_size not in (16, 32, 64, 128, 256):
+            raise ValueError("DSpark history page size must be 16, 32, 64, 128, or 256")
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
         if output_groups is not None and (
@@ -290,3 +298,110 @@ class DSparkAttention(DSparkAttentionKernel):
         self.fixed_cache_seq_len = self.window_size + seq_len_q
         self.inverse_rope_dim = inverse_rope_dim
         self.output_groups = output_groups
+        self.history_page_size = history_page_size
+        # Subdivide the 64-row loads at physical-page and cyclic-window boundaries.
+        self.history_tile_sizes = tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
+
+    @cute.jit
+    def wrapper(
+        self,
+        batch_size: cutlass.Int32,
+        num_pages: cutlass.Int32,
+        page_stride: cutlass.Int64,
+        table_width: cutlass.Int32,
+        table_stride: cutlass.Int64,
+        q_ptr: cute.Pointer,
+        pages_ptr: cute.Pointer,
+        draft_ptr: cute.Pointer,
+        page_table_ptr: cute.Pointer,
+        cache_seqs_ptr: cute.Pointer,
+        valid_len_ptr: cute.Pointer,
+        capacities_ptr: cute.Pointer,
+        attn_sink_ptr: cute.Pointer,
+        inverse_rope_freqs_ptr: cute.Pointer,
+        o_tensor: cute.Tensor,
+        o_scale_tensor: Optional[cute.Tensor],
+        softmax_scale: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        """Build the runtime tensor layouts from pointers, then launch attention.
+
+        The pointer ABI keeps runtime inputs out of Python-side DLPack and view
+        conversion. ``o_tensor`` remains a tensor so TVM-FFI can select the
+        calling PyTorch stream, matching the CuTe DSL host-wrapper convention.
+        """
+        q_layout = cute.make_layout(
+            (self.num_heads, self.head_dim, self.seq_len_q, batch_size),
+            stride=(
+                self.head_dim,
+                1,
+                self.num_heads * self.head_dim,
+                self.seq_len_q * self.num_heads * self.head_dim,
+            ),
+        )
+        q = cute.make_tensor(q_ptr, layout=q_layout)
+        pages = cute.make_tensor(
+            pages_ptr,
+            layout=cute.make_layout(
+                (self.history_page_size, self.head_dim, num_pages),
+                stride=(self.head_dim, 1, page_stride),
+            ),
+        )
+        draft = cute.make_tensor(
+            draft_ptr,
+            layout=cute.make_layout(
+                (self.page_size_draft, self.head_dim, batch_size),
+                stride=(
+                    self.head_dim,
+                    1,
+                    self.page_size_draft * self.head_dim,
+                ),
+            ),
+        )
+        page_table = cute.make_tensor(
+            page_table_ptr,
+            layout=cute.make_layout((table_width, batch_size), stride=(1, table_stride)),
+        )
+        if cutlass.const_expr(self.output_groups is None):
+            output = cute.make_tensor(o_tensor.iterator, layout=q_layout)
+        else:
+            output = o_tensor
+        cache_seqs = cute.make_tensor(
+            cache_seqs_ptr,
+            layout=cute.make_layout((batch_size,), stride=(1,)),
+        )
+        valid_len = cute.make_tensor(
+            valid_len_ptr,
+            layout=cute.make_layout((batch_size,), stride=(1,)),
+        )
+        capacities = cute.make_tensor(
+            capacities_ptr, layout=cute.make_layout((batch_size,), stride=(1,))
+        )
+        attn_sink = cute.make_tensor(
+            attn_sink_ptr,
+            layout=cute.make_layout((self.num_heads,), stride=(1,)),
+        )
+        inverse_rope_freqs = cute.make_tensor(
+            inverse_rope_freqs_ptr,
+            layout=cute.make_layout(
+                (batch_size * self.seq_len_q * self.inverse_rope_dim,),
+                stride=(1,),
+            ),
+        )
+
+        self(
+            q,
+            pages,
+            draft,
+            page_table,
+            output,
+            o_scale_tensor,
+            cache_seqs,
+            valid_len,
+            capacities,
+            softmax_scale,
+            cutlass.Float32(1.0),
+            attn_sink,
+            inverse_rope_freqs,
+            stream,
+        )

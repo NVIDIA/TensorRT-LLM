@@ -62,15 +62,16 @@ def test_flashinfer_uses_layer_specific_v2_pool_properties() -> None:
         dtype=DataType.NVFP4,
         impl=SimpleNamespace(get_page_index_upper_bound=lambda *_: 99),
         get_kv_cache_num_blocks=lambda layer_idx: 1234 + layer_idx,
-        get_kv_cache_dtype=lambda layer_idx: (DataType.BF16 if layer_idx == 7 else DataType.NVFP4),
+        get_kv_cache_dtype=lambda layer_idx: (DataType.FP8 if layer_idx == 7 else DataType.NVFP4),
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
-    fmha.attn = SimpleNamespace(layer_idx=7)
+    attn = SimpleNamespace(layer_idx=7)
+    fmha._attn_ref = lambda: attn
 
     assert fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=manager)) == 1241
     assert (
         fmha._get_kv_cache_dtype(SimpleNamespace(kv_cache_manager=manager), layer_idx=7)
-        == DataType.BF16
+        == DataType.FP8
     )
 
 

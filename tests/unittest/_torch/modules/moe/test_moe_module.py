@@ -1582,6 +1582,61 @@ def test_configurable_moe_single_gpu(
     )
 
 
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103, 107),
+    reason="CuteDSL NVFP4 MoE runs on SM100/SM103/SM107",
+)
+def test_configurable_moe_writes_caller_output_buffer():
+    """``ConfigurableMoE.forward(moe_output=...)`` without communication: the CuteDSL NVFP4
+    backend writes the result into the caller's buffer, here a slice of a larger allocation."""
+    seq_len, num_experts, top_k, hidden_size, intermediate_size = 7, 8, 2, 512, 512
+    dtype = torch.bfloat16
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    torch.cuda.set_device(mapping.rank)
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, MoeBackendType.CUTEDSL
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        model_cfg = _create_model_config(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            moe_backend=MoeBackendType.CUTEDSL.value,
+            max_num_tokens=256,
+        )
+        with create_moe(
+            routing_method=routing_method, reduce_results=True, model_config=model_cfg
+        ) as fused_moe:
+            fused_moe.load_weights([quantize_util.create_weights(**quant_kwargs)])
+            fused_moe.post_load_weights()
+            fused_moe.cuda(f"cuda:{mapping.rank}")
+            storage = torch.full(
+                (2 * seq_len * hidden_size,), float("nan"), dtype=dtype, device="cuda"
+            )
+            buffer = storage[seq_len * hidden_size :].view(seq_len, hidden_size)
+            with torch.inference_mode():
+                expected = fused_moe.forward(x, router_logits)
+                output = fused_moe.forward(x, router_logits, moe_output=buffer)
+        assert output.data_ptr() == buffer.data_ptr()
+        torch.testing.assert_close(output, expected)
+        assert storage[: seq_len * hidden_size].isnan().all()
+
+
 # ============================================================================
 # FP32 Routing Bias Tests
 # ============================================================================

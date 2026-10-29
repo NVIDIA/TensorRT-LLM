@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -83,6 +83,10 @@ enum class AllReduceFusionOp : int8_t
     RMS_NORM = 9,
     //! AllReduce + RMSNorm + FP8 1x128 block-scale quant (UE8M0, packed MN-major).
     RMS_NORM_QUANT_FP8_BLOCKSCALE = 10,
+    //! AllReduce + RMSNorm + FP8 1x128 block-scale quant whose UE8M0 scales are written in the
+    //! 128x4-swizzled ("R128c4") uint8 layout of the Rubin CuTe DSL MXFP8 GEMM, each 1x128 scale
+    //! replicated over its four 1x32 slots (as fp8_quantize_1x128_cutedsl_ue8m0 writes them).
+    RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4 = 11,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -102,6 +106,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
         break;
     case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
     case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE: os << "RMS_NORM_QUANT_FP8_BLOCKSCALE"; break;
+    case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4: os << "RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4"; break;
     default: os << "UNKNOWN"; break;
     }
     return os;

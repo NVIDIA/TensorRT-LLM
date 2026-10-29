@@ -32,9 +32,15 @@ from typing import (
     Union,
 )
 
+from ._utils import HalfOpenRange as HalfOpenRange
+
 # From _common.py
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
+
+class CacheDomain(enum.Enum):
+    STANDALONE_DRAFT = 0
+    TARGET = 1
 
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
@@ -47,6 +53,31 @@ class PageIndexMode(enum.IntEnum):
 
 LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
+
+class AttnLifeCycle:
+    """The attention life cycle, keyed by window, sink-token shape, and cache domain."""
+
+    def __init__(
+        self,
+        window_size: int | None,
+        num_sink_blocks: int,
+        cache_domain: CacheDomain = CacheDomain.TARGET,
+    ) -> None: ...
+    @staticmethod
+    def make(
+        window_size: int | None,
+        num_sink_tokens: int | None,
+        tokens_per_block: int,
+        cache_domain: CacheDomain = CacheDomain.TARGET,
+    ) -> "AttnLifeCycle": ...
+    @property
+    def window_size(self) -> int | None: ...
+    @property
+    def num_sink_blocks(self) -> int: ...
+    @property
+    def cache_domain(self) -> CacheDomain: ...
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
+
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
@@ -155,6 +186,7 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+    cache_domain: CacheDomain = CacheDomain.TARGET
     @property
     def window_size(self) -> int | None: ...
 

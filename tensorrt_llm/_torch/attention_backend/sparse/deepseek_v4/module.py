@@ -12,7 +12,7 @@ from torch import nn
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType, AttentionMetadata
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mla import _cute_dsl_fp8_bmm_out, _is_cute_dsl_fp8_bmm_available
 from tensorrt_llm._torch.modules.multi_stream_utils import (
@@ -216,7 +216,7 @@ def _uses_rubin_dsv4_o_b_proj_out(self) -> bool:
     return (
         get_sm_version() == 107
         and self.o_b_proj.has_fp8_block_scales
-        and IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+        and IS_CUTLASS_DSL_RUBIN_AVAILABLE
         and (self.o_b_proj.use_cute_dsl_blockscaling_mm or self.o_b_proj.disable_deep_gemm)
     )
 
@@ -578,7 +578,7 @@ def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
         self, num_generations=num_generations, num_contexts=num_contexts
     ):
         return False
-    if get_sm_version() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
         return False
     if self.apply_rotary_emb or position_ids is None:
         return False

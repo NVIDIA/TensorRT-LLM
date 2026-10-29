@@ -51,9 +51,9 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 
-from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
-if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
     from cutlass import testing
 else:
     import cutlass.cute.testing as testing

@@ -28,7 +28,11 @@ CUDA_VER="13.4" # the NGC PyTorch image's CUDA_VERSION, major.minor
 # so its cuDNN is deliberately purged and reinstalled at this version.
 CUDNN_VER="9.25.1.1-1"
 NCCL_VER="2.30.7-1+cuda13.3"
-CUBLAS_VER="13.7.0.27-1"
+# cuBLAS is the NGC PyTorch 26.09 one (same CUDA 13.4 toolkit) rather than this base's
+# 13.7.0.27. Drop the pin with the move to a base that ships cuBLAS 13.8 or later. As with cuDNN,
+# the version guard below then purges the base's cuBLAS packages; that includes cuBLASMp, which
+# leaves the base's cuSOLVERMp unloadable. Nothing here uses either.
+CUBLAS_VER="13.8.0.4-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.4.59-1"

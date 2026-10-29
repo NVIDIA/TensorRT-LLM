@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import atexit
+import os
 import sys
 import threading
 from _thread import LockType
@@ -243,7 +244,10 @@ class StagingBuffer:
     def __enter__(self) -> "StagingBuffer":
         manager = self.manager
         if self.min_size > manager.size:
-            raise ValueError(f"Requested min_size {self.min_size} is too large for the manager")
+            raise ValueError(
+                f"Requested min_size {self.min_size} exceeds the staging buffer size {manager.size}; "
+                "increase TLLM_KV_CACHE_MANAGER_V2_STAGING_BUFFER_SIZE_MB"
+            )
         with manager.mutex:
             # If the tail cannot satisfy min_size, wrap to the front before allocating.
             available = manager._suggest_next_max_size_unsafe()
@@ -316,6 +320,23 @@ class StagingBufferManager:
         return StagingBuffer(self, min_size, max_size, stream)
 
 
+_DEFAULT_STAGING_BUFFER_SIZE_MB = 64
+
+
+def staging_buffer_size_bytes() -> int:
+    """Size of the host staging buffer used for two-hop GPU<->Disk copies.
+
+    Every single copy task must fit, so the buffer must be at least the largest slot. Models with
+    large per-slot state (e.g. KDA/Mamba recurrent state spanning many layers) exceed the 64 MB
+    default; override with TLLM_KV_CACHE_MANAGER_V2_STAGING_BUFFER_SIZE_MB.
+    """
+    value = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_STAGING_BUFFER_SIZE_MB", "")
+    size_mb = int(value) if value else _DEFAULT_STAGING_BUFFER_SIZE_MB
+    if size_mb <= 0:
+        raise ValueError("TLLM_KV_CACHE_MANAGER_V2_STAGING_BUFFER_SIZE_MB must be positive")
+    return size_mb << 20
+
+
 class CopyEngine:
     __slots__ = ("_staging_buffer_manager",)
     _staging_buffer_manager: StagingBufferManager | None
@@ -329,7 +350,7 @@ class CopyEngine:
     @property
     def staging_buffer_manager(self) -> StagingBufferManager:
         if self._staging_buffer_manager is None:
-            self._staging_buffer_manager = StagingBufferManager(64 << 20)
+            self._staging_buffer_manager = StagingBufferManager(staging_buffer_size_bytes())
         return self._staging_buffer_manager
 
     # @TODO: Use a dedicated stream for each different Copier, take set[CachedCudaEvent] instead of

@@ -33,7 +33,9 @@ namespace kernels::kimiK3AttnRes
 //! Contract (checked at the Torch-op bridge): B == 1, N in [1, 12],
 //! T in [1, 16384], H a multiple of 1024 in [4096, 8192]; all residual
 //! tensors bf16 contiguous, rsigma/probs/logits fp32 [N, T, B] when requested.
-//! blockResidual may be nullptr when N == 1.
+//! blockResidual may be nullptr when N == 1. That is the contract of the
+//! per-token entry points declared here; invokeAttnResPersistentFusedFwd
+//! (attnResFwdPersistentFused.h) takes the same struct under its own contract.
 struct AttnResFwdParams
 {
     __nv_bfloat16 const* blockResidual;    // [N-1, T, B, H], nullptr iff N == 1

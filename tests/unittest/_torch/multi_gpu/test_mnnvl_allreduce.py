@@ -129,6 +129,33 @@ def fp4_quantize(input: torch.Tensor, scale: torch.Tensor):
     return torch.ops.trtllm.fp4_quantize(input, scale, 16, False)
 
 
+def fp8_quantize_1x128_ue8m0(input: torch.Tensor):
+    # The function-local import keeps `torch` out of this function's globals:
+    # cloudpickle would otherwise try to pickle the `torch.ops` module instance
+    # by value ("cannot pickle '_Ops' object"), same as in fp4_quantize above.
+    import torch
+    return torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(input)
+
+
+def mnnvl_fusion_fake_signature(input: torch.Tensor, norm_weight: torch.Tensor,
+                                eps: float, fusion_op: int):
+    """(shape, dtype, stride) of each output of the registered fake (meta) kernel of trtllm::mnnvl_fusion_allreduce.
+
+    The meta kernel must describe the real op's outputs exactly; it is what torch.compile and the fake-tensor
+    propagation see. Function-local imports, as in fp8_quantize_1x128_ue8m0 above.
+    """
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode() as mode:
+        outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
+            mode.from_tensor(input), mode.from_tensor(norm_weight), None, eps,
+            torch.empty((3, 1), dtype=input.dtype, device=input.device),
+            torch.empty((12, ), dtype=torch.uint32, device=input.device), True,
+            None, int(fusion_op))
+    return [(tuple(o.shape), o.dtype, o.stride()) for o in outputs]
+
+
 def run_single_rank(
     tensor_parallel_size,
     single_rank_forward_func,
@@ -523,6 +550,113 @@ def test_mnnvl_quant_fusion(seq_len, hidden_size, dtype, fusion_op,
             reference_norm,
             reference_residual,
         ) for i in range(tensor_parallel_size)]),
+    )
+    for r in results:
+        assert r is True
+
+
+def run_r128c4_single_rank(tensor_parallel_size, single_rank_forward_func,
+                           input, norm_weight, eps):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        single_rank_forward_func(input, norm_weight, eps, tensor_parallel_size,
+                                 rank)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@torch.inference_mode()
+def mnnvl_rmsnorm_fp8_blockscale_r128c4_forward(input: torch.Tensor,
+                                                norm_weight: torch.Tensor,
+                                                eps: float,
+                                                tensor_parallel_size: int,
+                                                tensor_parallel_rank: int):
+    """The fused R128c4 quant equals fp8_quantize_1x128_cutedsl_ue8m0 of the fused norm, bit for bit."""
+    input = input.cuda()
+    norm_weight = norm_weight.cuda()
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    MPI.COMM_WORLD.barrier()
+    allreduce = AllReduce(
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        strategy=AllReduceStrategy.MNNVL,
+        dtype=input.dtype,
+    )
+    norm_out = allreduce(input,
+                         all_reduce_params=AllReduceParams(
+                             fusion_op=AllReduceFusionOp.RMS_NORM,
+                             norm_weight=norm_weight,
+                             eps=eps))
+    # The fused op allocates its FP8 and scale outputs uninitialized and must write every byte of them, the zero rows
+    # that pad M to a multiple of 128 included. Run it once, fill both outputs with 0xFF and free them: the caching
+    # allocator hands exactly those blocks (same sizes) to the second run, so a byte the kernel fails to write shows
+    # up as 0xFF in the comparison below instead of passing on a recycled zero block.
+    fused_params = AllReduceParams(
+        fusion_op=AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4,
+        norm_weight=norm_weight,
+        eps=eps)
+    quant_out, scale_out = allreduce(input, all_reduce_params=fused_params)
+    quant_out.view(torch.uint8).fill_(0xFF)
+    scale_out.fill_(0xFF)
+    del quant_out, scale_out
+    quant_out, scale_out = allreduce(input, all_reduce_params=fused_params)
+    ref_quant, ref_scale = fp8_quantize_1x128_ue8m0(norm_out)
+    assert mnnvl_fusion_fake_signature(
+        input, norm_weight, eps,
+        AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE_R128C4) == [
+            (tuple(o.shape), o.dtype, o.stride())
+            for o in (quant_out, scale_out)
+        ]
+    assert quant_out.dtype == torch.float8_e4m3fn
+    assert quant_out.shape == ref_quant.shape
+    assert scale_out.dtype == torch.uint8
+    assert scale_out.shape == ref_scale.shape
+    assert torch.equal(quant_out.view(torch.uint8), ref_quant.view(torch.uint8))
+    assert torch.equal(scale_out, ref_scale)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "seq_len, hidden_size",
+    (
+        # tp=2 at the default 1 MiB threshold: one-shot up to M=73 at 3584,
+        # then two-shot + rmsNormLamport (M=74 is the first; the cluster
+        # width of each case depends on the SM count of the GPU).
+        pytest.param(6, 3584, id="oneshot_m6_n3584"),
+        pytest.param(12, 3584, id="oneshot_m12_n3584"),
+        pytest.param(48, 3584, id="oneshot_m48_n3584"),
+        pytest.param(74, 3584, id="twoshot_first_m74_n3584"),
+        pytest.param(96, 3584, id="twoshot_m96_n3584"),
+        pytest.param(150, 3584, id="twoshot_m150_n3584"),
+        pytest.param(1340, 7168, id="twoshot_m1340_n7168"),
+        # Hidden sizes whose default CTAs split a 16-thread quant group
+        # (a 72-thread CTA at 2304, a 168-thread one at 10752): the grid must
+        # widen the CTAs so a width-16 amax shuffle never straddles two of them.
+        pytest.param(6, 2304, id="oneshot_m6_n2304_group16"),
+        pytest.param(12, 10752, id="oneshot_m12_n10752_group16"),
+    ),
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mnnvl_rmsnorm_fp8_blockscale_r128c4(seq_len, hidden_size,
+                                             mpi_pool_executor):
+    torch.manual_seed(42)
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    x = torch.randn((tensor_parallel_size, seq_len, hidden_size),
+                    dtype=torch.bfloat16)
+    norm_weight = torch.randn((hidden_size, ), dtype=torch.bfloat16)
+    results = mpi_pool_executor.map(
+        run_r128c4_single_rank,
+        *zip(*[(tensor_parallel_size,
+                mnnvl_rmsnorm_fp8_blockscale_r128c4_forward, x[i, :, :],
+                norm_weight, 1e-6) for i in range(tensor_parallel_size)]),
     )
     for r in results:
         assert r is True

@@ -1455,13 +1455,44 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                             mAccLSE=mAccLSE,
                             mLSE=mLSE,
                         )
-                    p_cor_consumer_state, mma_o_consumer_state = self.correction(
-                        compute_common_params,
-                        compute_epilogue_params,
-                        k_tile_count=k_tile_count,
-                        p_cor_consumer_state=p_cor_consumer_state,
-                        mma_o_consumer_state=mma_o_consumer_state,
-                    )
+                    if cutlass.const_expr(self.is_var_split_kv
+                                          and mAccO is not None):
+                        # A request planned onto a single split stores its
+                        # final output (and LSE / Helix stats) directly, as
+                        # the split_kv == 1 build does; the reduction kernel
+                        # skips its rows. Other requests write partials.
+                        direct_common_params = SimpleNamespace(
+                            **{
+                                **vars(compute_common_params), "mAccO": None
+                            })
+                        direct_epilogue_params = SimpleNamespace(
+                            **{
+                                **vars(compute_epilogue_params), "mAccLSE": None
+                            })
+                        if local_split_kv == 1:
+                            p_cor_consumer_state, mma_o_consumer_state = self.correction(
+                                direct_common_params,
+                                direct_epilogue_params,
+                                k_tile_count=k_tile_count,
+                                p_cor_consumer_state=p_cor_consumer_state,
+                                mma_o_consumer_state=mma_o_consumer_state,
+                            )
+                        else:
+                            p_cor_consumer_state, mma_o_consumer_state = self.correction(
+                                compute_common_params,
+                                compute_epilogue_params,
+                                k_tile_count=k_tile_count,
+                                p_cor_consumer_state=p_cor_consumer_state,
+                                mma_o_consumer_state=mma_o_consumer_state,
+                            )
+                    else:
+                        p_cor_consumer_state, mma_o_consumer_state = self.correction(
+                            compute_common_params,
+                            compute_epilogue_params,
+                            k_tile_count=k_tile_count,
+                            p_cor_consumer_state=p_cor_consumer_state,
+                            mma_o_consumer_state=mma_o_consumer_state,
+                        )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -1504,106 +1535,116 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         blk_coord = (bidx, bidy, bidz)
-        local_split_kv = (block_split_kvs[blk_coord[2]]
+        local_split_kv = (max(1, min(block_split_kvs[blk_coord[2]], split_kv))
                           if self.is_var_split_kv else split_kv)
         k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]],
                                      self.mma_qk_tiler[1])
-        k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
+        # A request without KV has no K tiles; keep the divisor nonzero.
+        k_tile_per_cta = max(cute.ceil_div(k_tile_total, local_split_kv), 1)
         local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
+        # A request planned onto a single split stored its output directly in
+        # the split kernel (variable split-KV only); K == 0 rows still take the
+        # canonical empty result from here.
+        reduce_row = cutlass.Boolean(True)
+        if cutlass.const_expr(self.is_var_split_kv):
+            reduce_row = local_split_kv != 1
+        if reduce_row:
 
-        # Alloc shared memory
-        smem = utils.SmemAllocator()
-        storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
-        lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
-        smem_lse_scale = cute.make_tensor(lse_scale_ptr,
-                                          cute.make_layout(MAX_SPLITS))
+            # Alloc shared memory
+            smem = utils.SmemAllocator()
+            storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
+            lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
+            smem_lse_scale = cute.make_tensor(lse_scale_ptr,
+                                              cute.make_layout(MAX_SPLITS))
 
-        gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        if warp_idx == 0:
-            # calculate the global lse and exp ^ (local_lse - global_lse)
-            lse_per_thread = cute.ceil_div(MAX_SPLITS, self.threads_per_warp)
+            gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            if warp_idx == 0:
+                # calculate the global lse and exp ^ (local_lse - global_lse)
+                lse_per_thread = cute.ceil_div(MAX_SPLITS,
+                                               self.threads_per_warp)
 
-            local_lse = cute.make_rmem_tensor(cute.make_layout(lse_per_thread),
-                                              self.lse_dtype)
-            lse_max = -self.lse_dtype.inf
-            # find the max lse
-            for i in cutlass.range_constexpr(lse_per_thread):
-                split_kv_idx = tidx + i * self.threads_per_warp
-                local_lse[i] = (gLSE[split_kv_idx] if cute.elem_less(
-                    split_kv_idx, local_split_kv) else -self.lse_dtype.inf)
-                # reduce the local lse
-                lse_max = cute.arch.fmax(lse_max, local_lse[i])
-            lse_max = cute.arch.warp_reduction_max(lse_max)
-            lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
-            # calculate sum_lse
-            sum_lse = 0.0
-            for i in cutlass.range_constexpr(lse_per_thread):
-                sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-            sum_lse = cute.arch.warp_reduction_sum(sum_lse)
-            # calculate the global_lse
-            global_lse = (lse_max + cute.math.log2(sum_lse, fastmath=True)
-                          if not sum_lse == self.lse_dtype(0.0)
-                          or sum_lse != sum_lse else self.lse_dtype.inf)
-            if tidx == 0:
-                mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
-                if cutlass.const_expr(self.emit_softmax_stats):
-                    # A rank joins the CP merge only for tokens with at least
-                    # one visible local KV entry. With verify groups that is
-                    # per-token: a straddling group leaves this rank zero
-                    # entries for its leading tokens while later ones have some.
-                    if cutlass.const_expr(kv_bounds is not None):
-                        # blk_coord runs over the folded reduction grid
-                        # (H*F, S_q/F, B) while kv_bounds is indexed by the
-                        # true token. A folded chunk packs its rows as
-                        # tok_in_chunk * H + head, so the true token is
-                        # chunk * F + row // H (self.num_heads and
-                        # self.seq_len_q stay pre-fold).
-                        if cutlass.const_expr(self.fold_sq):
-                            q_tok = (blk_coord[1] * self.fold_sq_ratio +
-                                     blk_coord[0] // self.num_heads)
+                local_lse = cute.make_rmem_tensor(
+                    cute.make_layout(lse_per_thread), self.lse_dtype)
+                lse_max = -self.lse_dtype.inf
+                # find the max lse
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    split_kv_idx = tidx + i * self.threads_per_warp
+                    local_lse[i] = (gLSE[split_kv_idx] if cute.elem_less(
+                        split_kv_idx, local_split_kv) else -self.lse_dtype.inf)
+                    # reduce the local lse
+                    lse_max = cute.arch.fmax(lse_max, local_lse[i])
+                lse_max = cute.arch.warp_reduction_max(lse_max)
+                lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
+                # calculate sum_lse
+                sum_lse = 0.0
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    sum_lse += cute.math.exp2(local_lse[i] - lse_max,
+                                              fastmath=True)
+                sum_lse = cute.arch.warp_reduction_sum(sum_lse)
+                # calculate the global_lse
+                global_lse = (lse_max + cute.math.log2(sum_lse, fastmath=True)
+                              if not sum_lse == self.lse_dtype(0.0)
+                              or sum_lse != sum_lse else self.lse_dtype.inf)
+                if tidx == 0:
+                    mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
+                    if cutlass.const_expr(self.emit_softmax_stats):
+                        # A rank joins the CP merge only for tokens with at least
+                        # one visible local KV entry. With verify groups that is
+                        # per-token: a straddling group leaves this rank zero
+                        # entries for its leading tokens while later ones have some.
+                        if cutlass.const_expr(kv_bounds is not None):
+                            # blk_coord runs over the folded reduction grid
+                            # (H*F, S_q/F, B) while kv_bounds is indexed by the
+                            # true token. A folded chunk packs its rows as
+                            # tok_in_chunk * H + head, so the true token is
+                            # chunk * F + row // H (self.num_heads and
+                            # self.seq_len_q stay pre-fold).
+                            if cutlass.const_expr(self.fold_sq):
+                                q_tok = (blk_coord[1] * self.fold_sq_ratio +
+                                         blk_coord[0] // self.num_heads)
+                            else:
+                                q_tok = blk_coord[1]
+                            has_local_kv = kv_bounds[blk_coord[2] *
+                                                     self.seq_len_q + q_tok] > 0
                         else:
-                            q_tok = blk_coord[1]
-                        has_local_kv = kv_bounds[blk_coord[2] * self.seq_len_q +
-                                                 q_tok] > 0
-                    else:
-                        has_local_kv = cache_seqs[blk_coord[2]] > 0
-                    if has_local_kv:
-                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
-                                      0] = global_lse / LOG2_E
-                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
-                                      1] = 1.0
-                    else:
-                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
-                                      0] = -self.lse_dtype.inf
-                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
-                                      1] = 0.0
-            # store the scale to shared memory
-            for i in cutlass.range_constexpr(lse_per_thread):
-                split_kv_idx = tidx + i * self.threads_per_warp
-                if cute.elem_less(split_kv_idx, local_split_kv):
-                    smem_lse_scale[split_kv_idx] = cute.math.exp2(local_lse[i] -
-                                                                  global_lse,
-                                                                  fastmath=True)
+                            has_local_kv = cache_seqs[blk_coord[2]] > 0
+                        if has_local_kv:
+                            mSoftmaxStats[blk_coord[0], blk_coord[1],
+                                          blk_coord[2], 0] = global_lse / LOG2_E
+                            mSoftmaxStats[blk_coord[0], blk_coord[1],
+                                          blk_coord[2], 1] = 1.0
+                        else:
+                            mSoftmaxStats[blk_coord[0], blk_coord[1],
+                                          blk_coord[2], 0] = -self.lse_dtype.inf
+                            mSoftmaxStats[blk_coord[0], blk_coord[1],
+                                          blk_coord[2], 1] = 0.0
+                # store the scale to shared memory
+                for i in cutlass.range_constexpr(lse_per_thread):
+                    split_kv_idx = tidx + i * self.threads_per_warp
+                    if cute.elem_less(split_kv_idx, local_split_kv):
+                        smem_lse_scale[split_kv_idx] = cute.math.exp2(
+                            local_lse[i] - global_lse, fastmath=True)
 
-        pipeline.sync(barrier_id=4)
+            pipeline.sync(barrier_id=4)
 
-        elements_per_thread = cute.ceil_div(
-            self.latent_dim, self.threads_per_warp * self.num_compute_warps)
-        gAccO = mAccO[blk_coord[0], None, None, blk_coord[1], blk_coord[2]]
-        rAccO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread),
-                                      self.acc_dtype)
-        rO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread),
-                                   self.o_dtype)
-        rAccO.fill(0.0)
-        for i in range(local_split_kv):
+            elements_per_thread = cute.ceil_div(
+                self.latent_dim, self.threads_per_warp * self.num_compute_warps)
+            gAccO = mAccO[blk_coord[0], None, None, blk_coord[1], blk_coord[2]]
+            rAccO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread),
+                                          self.acc_dtype)
+            rO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread),
+                                       self.o_dtype)
+            rAccO.fill(0.0)
+            for i in range(local_split_kv):
+                for j in cutlass.range_constexpr(elements_per_thread):
+                    element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+                    rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+            rO.store(rAccO.load().to(self.o_dtype))
             for j in cutlass.range_constexpr(elements_per_thread):
                 element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
-                rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
-        rO.store(rAccO.load().to(self.o_dtype))
-        for j in cutlass.range_constexpr(elements_per_thread):
-            element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
-            mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
+                mO[blk_coord[0], element_idx, blk_coord[1],
+                   blk_coord[2]] = rO[j]
         return
 
     @staticmethod
@@ -1672,7 +1713,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         """
         K = cache_seqs[blk_coord[2]]
         if cutlass.const_expr(self.is_var_split_kv):
-            split_kv = block_split_kvs[blk_coord[2]]
+            # Per-request split planned on the device for the batch's KV
+            # lengths; clamped to the launched grid so the plan can be made
+            # for the largest split any tactic may use.
+            split_kv = max(1, min(block_split_kvs[blk_coord[2]], split_kv))
 
         k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
         k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
@@ -1680,6 +1724,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         k_tile_count = max(
             0,
             min(k_tile_total, k_index + k_tile_per_cta) - k_index)
+        if cutlass.const_expr(self.is_var_split_kv):
+            # The split the request really uses after tile rounding (the
+            # reduction kernel derives the same value): one means this CTA
+            # stores the final output itself and the reduction skips the row.
+            split_kv = cute.ceil_div(k_tile_total, max(k_tile_per_cta, 1))
         return k_index, k_tile_count, split_kv
 
     @cute.jit
@@ -3714,10 +3763,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 (H, split_kv, S, B),
                 stride=(split_kv, 1, H * split_kv, H * split_kv * S),
             )
-            # Byte offset of acc_lse in 64 bits: cosize * width (bits)
-            # overflowed int32 once the fp32 partials reached 2^26 elements
-            # (K3, 384 rows x 512: B * split_kv >= 342) and placed acc_lse
-            # before the workspace (NaN outputs or an illegal address).
+            # Byte offset of acc_lse in 64 bits. cosize is a dynamic Int32:
+            # cosize * width (bits) wrapped past 2**26 elements, and bytes first
+            # (cosize * 4) still wraps past 2**29 (K3, 384 rows x 512:
+            # B * split_kv >= 2731), placing acc_lse before the workspace.
             acc_lse_iter = cute.recast_ptr(
                 workspace.iterator + cutlass.Int64(cute.cosize(acc_o_layout)) *
                 (acc_dtype.width // 8),

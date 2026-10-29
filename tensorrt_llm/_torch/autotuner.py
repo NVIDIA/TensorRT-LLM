@@ -25,7 +25,8 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
+from tensorrt_llm._utils import (confidential_compute_enabled, global_mpi_size,
+                                 nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
 from tensorrt_llm.logger import logger
@@ -1603,6 +1604,15 @@ class AutoTuner:
             )
             return False
 
+        # A spawned worker re-runs MPI_Init (on `import tensorrt_llm`) with the
+        # parent's launcher environment, which blocks inside a multi-rank job.
+        if global_mpi_size() > 1:
+            logger.warning_once(
+                "[Autotuner] Multiprocess tactic profiling is disabled in a multi-rank MPI job.",
+                key=("autotuner", "warning_multiprocess_mpi"),
+            )
+            return False
+
         supported_strategies = {
             DistributedTuningStrategy.INDEPENDENT,
             DistributedTuningStrategy.PARALLEL,
@@ -2306,36 +2316,53 @@ class AutoTuner:
             f"[AutoTuner] Whether using distributed tuning: {self._is_distributed()}"
         )
 
+    def _tuning_group(self) -> Tuple[int, int]:
+        """Return ``(size, index)`` of this rank's tuning group.
+
+        The group is the TP group. Helix CP ranks run the same SPMD forward
+        on the same token batch, so Helix adds the CP ranks too. Otherwise a
+        Helix generation worker with ``tp_size == 1`` would profile every
+        tactic on every CP rank. The index matches the TP-major, CP-minor
+        order of ``Distributed.tp_cp_allgather``, which merges the results.
+        """
+        if self.mapping is None:
+            return 1, 0
+        size = self.mapping.tp_size
+        index = self.mapping.tp_rank
+        if self.mapping.has_cp_helix():
+            size *= self.mapping.cp_size
+            index = index * self.mapping.cp_size + self.mapping.cp_rank
+        return size, index
+
     def _is_distributed(self) -> bool:
         """Check if we're in a distributed environment."""
-        return self.mapping is not None and self.mapping.tp_size > 1 and self._dist is not None
+        return self._dist is not None and self._tuning_group()[0] > 1
 
     def _maybe_parallelize_tactics(
             self, all_valid_tactics: List[Any],
             strategy: DistributedTuningStrategy) -> List[Any]:
-        """Parallelize tactics across all TP ranks if strategy is PARALLEL."""
+        """Split tactics across the tuning group if strategy is PARALLEL."""
         if strategy == DistributedTuningStrategy.PARALLEL and self._is_distributed(
         ):
-            # only distribute across TP ranks
-            # each TP rank will only tune the tactics that are assigned to it
-            tp_size = self.mapping.tp_size
-            tp_rank = self.mapping.tp_rank
-            # Sharding a candidate list shorter than tp_size by idx % tp_size
-            # leaves the ranks with tp_rank >= len(all_valid_tactics) with an
-            # EMPTY shard. Those ranks then find no valid (runner, tactic) pair
-            # and emit a spurious "No valid runner/tactic was found" warning,
-            # while also diverging in tuning wall-time from the ranks that did
-            # get work (a per-rank desync hazard for the following collective).
-            # Parallelizing a sub-tp_size list saves almost nothing, so have
+            # Each rank of the tuning group only tunes its share of tactics;
+            # _merge_cache_data then keeps the fastest across the group.
+            group_size, group_index = self._tuning_group()
+            # Sharding a candidate list shorter than the group size by
+            # idx % group_size leaves the ranks with
+            # group_index >= len(all_valid_tactics) with an EMPTY shard. Those
+            # ranks then find no valid (runner, tactic) pair and emit a
+            # spurious "No valid runner/tactic was found" warning, while also
+            # diverging in tuning wall-time from the ranks that did get work
+            # (a per-rank desync hazard for the following collective).
+            # Parallelizing such a short list saves almost nothing, so have
             # every rank profile the full list instead; the subsequent
             # _merge_cache_data allgather still keeps the min-time winner.
-            if len(all_valid_tactics) < tp_size:
+            if len(all_valid_tactics) < group_size:
                 return all_valid_tactics
-            valid_tactics = []
-            for idx, tactic in enumerate(all_valid_tactics):
-                if idx % tp_size == tp_rank:
-                    valid_tactics.append(tactic)
-            return valid_tactics
+            return [
+                tactic for idx, tactic in enumerate(all_valid_tactics)
+                if idx % group_size == group_index
+            ]
         else:
             return all_valid_tactics
 

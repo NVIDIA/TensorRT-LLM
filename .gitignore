@@ -85,6 +85,7 @@ ad-test-workspace/
 *.safetensors
 */tllm_debug/**
 *.patch
+!3rdparty/vendor_patches/*.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
 examples/disaggregated/slurm/benchmark/logs/
 scripts/attribution/data/checksum_to_paths.yml

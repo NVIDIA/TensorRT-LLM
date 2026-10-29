@@ -193,7 +193,10 @@ def _helix_sanitize_empty_kv(
     return partial_o, softmax_stats
 
 
-@torch.compile(dynamic=False)
+# NCCL requires contiguous chunks. Inductor may pad the transposed buffers
+# behind split views even with pad_outputs=False. Keep fusion, but disable
+# padding for this helper rather than copying every chunk after compilation.
+@torch.compile(dynamic=False, options={"comprehensive_padding": False})
 def _helix_nccl_pre_alltoall(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,

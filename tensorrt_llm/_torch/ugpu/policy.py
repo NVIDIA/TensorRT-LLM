@@ -22,6 +22,7 @@ consolidated here.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
@@ -61,6 +62,34 @@ class UgpuPolicy:
                 f"Runtime resources (streams, mempools, TPC masks) are "
                 f"hardcoded for exactly 2 partitions."
             )
+
+
+# Opt-in weight-only localization: a comma-separated subset of
+# UgpuPolicy.allowed_ops (e.g. "nvfp4_moe") whose weights are localized per
+# die while LlmArgs.enable_ugpu stays off, so the KV cache keeps a single pool
+# (disaggregated KV transfer and attention fork/join are unaffected).
+UGPU_WEIGHT_ONLY_OPS_ENV = "TRTLLM_UGPU_WEIGHT_ONLY_OPS"
+
+
+def build_ugpu_policy(enable_ugpu: bool) -> UgpuPolicy:
+    """UgpuPolicy for model construction.
+
+    ``enable_ugpu`` enables every uGPU op (and, elsewhere, per-die KV pools).
+    Otherwise TRTLLM_UGPU_WEIGHT_ONLY_OPS selects the ops to localize, if any.
+    """
+    if enable_ugpu:
+        return UgpuPolicy(enabled=True)
+    spec = os.environ.get(UGPU_WEIGHT_ONLY_OPS_ENV, "").strip()
+    if not spec:
+        return UgpuPolicy(enabled=False)
+    ops = frozenset(op.strip() for op in spec.split(",") if op.strip())
+    unknown = ops - UgpuPolicy().allowed_ops
+    if unknown:
+        raise ValueError(
+            f"{UGPU_WEIGHT_ONLY_OPS_ENV}={spec!r}: unknown uGPU ops {sorted(unknown)}; "
+            f"choose from {sorted(UgpuPolicy().allowed_ops)}"
+        )
+    return UgpuPolicy(enabled=True, allowed_ops=ops)
 
 
 @dataclass(frozen=True)
@@ -121,7 +150,7 @@ class UgpuExecutionPlanner:
         """
         from tensorrt_llm._torch.cute_dsl_utils import (
             IS_CUTLASS_DSL_AVAILABLE,
-            IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+            IS_CUTLASS_DSL_RUBIN_AVAILABLE,
         )
         from tensorrt_llm._torch.modules.linear import WeightMode
         from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
@@ -174,12 +203,12 @@ class UgpuExecutionPlanner:
                 reason_if_disabled=f"{op_kind} not in allowed_ops",
             )
 
-        # uGPU uses Rubin-only CuteDSL kernels from the internal package.
+        # uGPU uses Rubin-only CuteDSL kernels (they need the CuTe DSL Rubin helpers).
         if not IS_CUTLASS_DSL_AVAILABLE:
             return LinearPartitionPlan(enabled=False, reason_if_disabled="CuteDSL not available")
-        if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             return LinearPartitionPlan(
-                enabled=False, reason_if_disabled="CuteDSL internal Rubin kernels not available"
+                enabled=False, reason_if_disabled="CuteDSL Rubin helpers not available"
             )
 
         supported_weight_modes = (
@@ -256,7 +285,7 @@ class UgpuExecutionPlanner:
         MoE uGPU replicates weights on each partition (not partitioned like Linear).
         Each partition runs the full GroupGemm with inplace output into shared buffers.
         """
-        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
         from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
 
         if not self.policy.enabled:
@@ -307,9 +336,9 @@ class UgpuExecutionPlanner:
                 enabled=False, reason_if_disabled="uGPU MoE requires fused finalize"
             )
 
-        if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             return PartitionPlan(
-                enabled=False, reason_if_disabled="CuteDSL internal Rubin kernels not available"
+                enabled=False, reason_if_disabled="CuteDSL Rubin helpers not available"
             )
 
         return PartitionPlan(
@@ -328,7 +357,7 @@ class UgpuExecutionPlanner:
         """Decide whether Rubin BF16 BMM may use two uGPU partitions."""
         from tensorrt_llm._torch.cute_dsl_utils import (
             IS_CUTLASS_DSL_AVAILABLE,
-            IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+            IS_CUTLASS_DSL_RUBIN_AVAILABLE,
         )
         from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
 
@@ -353,10 +382,10 @@ class UgpuExecutionPlanner:
             )
         if not IS_CUTLASS_DSL_AVAILABLE:
             return PartitionPlan(enabled=False, reason_if_disabled="CuteDSL not available")
-        if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             return PartitionPlan(
                 enabled=False,
-                reason_if_disabled="CuteDSL internal Rubin kernels not available",
+                reason_if_disabled="CuteDSL Rubin helpers not available",
             )
         return PartitionPlan(
             enabled=True,

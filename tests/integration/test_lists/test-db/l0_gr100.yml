@@ -19,6 +19,9 @@ l0_gr100:
   # K3 CTX fusion, shared BF16 MXFP8 GEMM, and dispatch regressions.
   - unittest/_torch/thop/test_k3_ctx_fp8_output.py
   - unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py::test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales
+  - unittest/_torch/attention/test_k3_context_fmha.py::test_k3_context_fmha_cu_kv_dtypes
+  - unittest/_torch/attention/test_fp4_mla.py::test_fp4_mla_context_mxfp8_gather
   - unittest/_torch/attention/test_fp4_mla.py::test_fp4_mla_context_gather_rejects_unsupported_rope_dim
+  - unittest/_torch/attention/test_fp4_mla.py::test_k3_fp8_split_k_context_selection_is_shape_gated
   - unittest/_torch/attention/test_fp4_mla.py::test_mla_strided_context_projection_optional_bias
   - unittest/_torch/attention/test_fp4_mla.py::test_mla_fp4_helix_generation_reaches_fused_cache_update

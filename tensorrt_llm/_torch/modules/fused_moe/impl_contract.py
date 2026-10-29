@@ -421,7 +421,9 @@ class MoECommPlan:
 
     input_sf_swizzled: bool  # what quantize_input actually produced
     enable_alltoall: bool
-    moe_output: Optional[torch.Tensor]  # workspace-backed buffer, or None
+    # Buffer for run_moe to write its output into: workspace-backed (NVLinkOneSided combine
+    # payload) or the caller's (no external communication), or None to allocate one.
+    moe_output: Optional[torch.Tensor]
     # No impl reads this one yet: ``combine()`` still takes the value off the
     # strategy attribute, which the producer assigns from this same field so the
     # two cannot disagree. It is here because the plan is where the decision is

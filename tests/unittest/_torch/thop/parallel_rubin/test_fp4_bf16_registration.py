@@ -21,7 +21,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401
 from tensorrt_llm._torch.compilation.utils import inplace_info
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
-    IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from tensorrt_llm._utils import get_sm_version
 
@@ -35,8 +35,8 @@ requires_cute_dsl = pytest.mark.skipif(
     reason="cutlass-dsl is not available",
 )
 requires_rubin_cute_dsl = pytest.mark.skipif(
-    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
-    reason="Rubin CuTe DSL internal package is not available",
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="the CuTe DSL Rubin helpers are not available",
 )
 
 
@@ -290,7 +290,7 @@ def test_cute_dsl_bf16_legacy_and_ugpu_inplace_schema_and_fake_contract(
     assert _schema_mutated_arguments(ugpu_schema) == {"output"}
     assert len(ugpu_schema.returns) == 0
 
-    if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+    if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
         mutation_map = inplace_info()
         assert mutation_map[legacy_op.default] == {1: "output"}
         assert mutation_map[ugpu_op.default] == {1: "output"}

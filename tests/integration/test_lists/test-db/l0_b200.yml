@@ -105,6 +105,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
   - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_prepad_mixer_ab.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
@@ -179,6 +180,8 @@ l0_b200:
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
+  - unittest/_torch/speculative/test_dspark_layer_major_latent.py
+  - unittest/_torch/modules/test_logits_cast.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
   - unittest/_torch/modeling -k "modeling_llama"

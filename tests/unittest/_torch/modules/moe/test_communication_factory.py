@@ -27,6 +27,9 @@ from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import (
+    quantize_on_send_setting,
+)
 
 
 def _make_model_config(
@@ -434,3 +437,76 @@ def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
         RuntimeError, match="dispatch handle must be initialized before CUDA graph capture"
     ):
         strategy._setup_handle(ctx, object(), 0)
+
+
+QUANTIZE_ON_SEND_ENV = "TRTLLM_MOE_A2A_QUANTIZE_ON_SEND"
+
+
+class _FakeOneSided:
+    """Stands in for NVLinkOneSided, whose constructor validates the quantize-on-send switch like this."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        quantize_on_send_setting()
+
+
+def _create_strategy(model_config):
+    return communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+
+@pytest.mark.parametrize("value", ["yes", "2", "AUTO", "on", "-1", "0 1"])
+def test_auto_selection_does_not_swallow_a_bad_quantize_on_send_value(
+    monkeypatch: pytest.MonkeyPatch, value: str
+):
+    """The auto selection takes any exception of a constructor for "not available": a bad switch has to be rejected
+    before that, on every rank, or the ranks that have it leave the one-sided strategy and the others stay."""
+    model_config = _make_model_config()
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    monkeypatch.setenv(QUANTIZE_ON_SEND_ENV, value)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _FakeOneSided)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+
+    with pytest.raises(ValueError, match=QUANTIZE_ON_SEND_ENV):
+        _create_strategy(model_config)
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "1", "auto", " auto "])
+def test_valid_quantize_on_send_values_select_the_one_sided_strategy_as_before(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+):
+    model_config = _make_model_config()
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    if value is None:
+        monkeypatch.delenv(QUANTIZE_ON_SEND_ENV, raising=False)
+    else:
+        monkeypatch.setenv(QUANTIZE_ON_SEND_ENV, value)
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _FakeOneSided)
+
+    assert isinstance(_create_strategy(model_config), _FakeOneSided)
+
+
+@pytest.mark.parametrize(
+    ("mapping_changes", "expected"),
+    [
+        ({"enable_attention_dp": False}, type(None)),
+        ({"dp_size": 1}, type(None)),
+        ({"moe_tp_size": 2}, AllGatherReduceScatter),
+    ],
+    ids=["no_attention_dp", "single_dp_rank", "moe_tp"],
+)
+def test_a_mapping_that_never_builds_an_all_to_all_does_not_read_the_quantize_on_send_switch(
+    monkeypatch: pytest.MonkeyPatch, mapping_changes: dict, expected: type
+):
+    model_config = _make_model_config()
+    for name, value in mapping_changes.items():
+        setattr(model_config.mapping, name, value)
+    monkeypatch.setenv(QUANTIZE_ON_SEND_ENV, "yes")
+
+    assert isinstance(_create_strategy(model_config), expected)

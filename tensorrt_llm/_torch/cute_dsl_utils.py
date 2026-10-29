@@ -36,9 +36,11 @@ def _skip_legacy_cutlass_mlir_helpers() -> None:
 
 
 IS_CUTLASS_DSL_AVAILABLE = False
-# TODO: Remove IS_CUTLASS_DSL_INTERNAL_AVAILABLE once rubin_helpers is available
-# in the base nvidia-cutlass-dsl package (currently only in nvidia-cutlass-dsl-internal)
-IS_CUTLASS_DSL_INTERNAL_AVAILABLE = False
+# Whether the CuTe DSL package provides the SM107/Rubin helper module
+# (cutlass.utils.rubin_helpers, public since nvidia-cutlass-dsl 4.8.0). Rubin
+# kernels stay disabled when it is absent and callers retain their existing
+# fallback paths.
+IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 
 if platform.system() != "Windows":
     try:
@@ -47,12 +49,12 @@ if platform.system() != "Windows":
         logger.info(f"cutlass dsl is available")
         IS_CUTLASS_DSL_AVAILABLE = True
 
-        # Check for internal cutlass DSL package (has rubin_helpers for SM107)
         try:
             import cutlass.utils.rubin_helpers  # noqa
-            logger.info(f"cutlass dsl internal (rubin) is available")
-            IS_CUTLASS_DSL_INTERNAL_AVAILABLE = True
         except ImportError:
             pass
+        else:
+            logger.info("cutlass dsl Rubin helpers are available")
+            IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
     except ImportError:
         pass

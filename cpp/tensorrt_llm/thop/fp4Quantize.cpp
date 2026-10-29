@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,9 @@
 
 #include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/arcquantFP4.h"
+#include "tensorrt_llm/kernels/nvfp4QuantKf.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -31,6 +33,11 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+// The only width TRTLLM_NVFP4_QUANT_KF=1 routes to the Kf NVFP4 kernel: the input of Kimi K3's routed
+// experts (the latent), fp4_quantize(x, gs, 16, false, false) on BF16 rows. The kernel writes the same bytes as
+// quantize_with_block_size; at this width it is faster at every row count.
+static constexpr int64_t kNvfp4QuantKfCols = 3584;
+
 // self: [M, K], fp16/bf16/fp8_quantized
 // globalScale: [1] float, = (448 * 6) / self.abs().max(). Not used when sfUseUE8M0 is true.
 // nvfp4: sfVecSize = 16, sfUseUE8M0 = false
@@ -134,7 +141,21 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
         else if (self.scalar_type() == at::ScalarType::BFloat16)
         {
 #ifdef ENABLE_BF16
-            LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
+            // TRTLLM_NVFP4_QUANT_KF=1: the Kf kernel (same bytes, closer to the HBM speed of light) for the
+            // linear-layout scales of the Kimi K3 MoE input.
+            static bool const useKfKernel = tensorrt_llm::common::getBoolEnv("TRTLLM_NVFP4_QUANT_KF");
+            if (useKfKernel && !isSfSwizzledLayout && k == kNvfp4QuantKfCols
+                && tensorrt_llm::kernels::isNvfp4QuantKfSupported(self.data_ptr(), valueE2M1.data_ptr(), m, k))
+            {
+                tensorrt_llm::kernels::invokeNvfp4QuantKf(reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()),
+                    globalScalePtr, reinterpret_cast<uint8_t*>(valueE2M1.data_ptr()),
+                    reinterpret_cast<uint8_t*>(scaleFP8SF.data_ptr()), m, k,
+                    at::cuda::getCurrentCUDAStream(self.get_device()));
+            }
+            else
+            {
+                LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
+            }
 #else
             C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
 #endif

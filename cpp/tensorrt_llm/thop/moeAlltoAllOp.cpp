@@ -14,17 +14,22 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllCftManager.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernelsLegacy.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <c10/cuda/CUDAStream.h>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <memory>
+#include <string>
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <unordered_map>
@@ -50,6 +55,32 @@ inline size_t alignOffset(size_t offset, size_t alignment)
 inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
 {
     return maskTensor.has_value() && maskTensor.value().defined();
+}
+
+// TLLM_MOE_A2A_FUSED_ROUND=1 launches the dispatch and combine kernels of moeAlltoAllKernels.cu:
+//   - the fence dispatch prepares its own round and fills the received padding rows' expert ids, so no prepare kernel
+//     runs before it and no sanitize kernel after it (expert-id buffers up to kFusedSanitizeMaxBytes);
+//   - it loads its payloads before routing (TLLM_MOE_A2A_DISPATCH_PRELOAD, on by default);
+//   - the fence combine stages each token's routing in shared memory while it waits for its peers;
+//   - a dispatch after an aborted round (a dispatch whose combine was skipped) still takes an odd flag.
+// Unset or 0 launches the previous kernels (moeAlltoAllKernelsLegacy.cu) exactly as before: a prepare
+// kernel before every dispatch and, after a fence dispatch, the sanitize kernel (which the previous version launched
+// from Python). Both give the same results. Read once per process, logged, and any value other than 0 or 1 is rejected;
+// all ranks of a group must use the same value.
+inline bool useFusedRoundKernels()
+{
+    static bool const enabled = []
+    {
+        char const* env = std::getenv("TLLM_MOE_A2A_FUSED_ROUND");
+        std::string const value = env == nullptr ? "" : env;
+        TLLM_CHECK_WITH_INFO(value.empty() || value == "0" || value == "1",
+            "TLLM_MOE_A2A_FUSED_ROUND must be 0 or 1, got '%s'", value.c_str());
+        bool const fused = value == "1";
+        TLLM_LOG_INFO("MoE A2A: %s kernels (TLLM_MOE_A2A_FUSED_ROUND=%s)", fused ? "fused-round" : "legacy",
+            value.empty() ? "<unset>" : value.c_str());
+        return fused;
+    }();
+    return enabled;
 }
 
 // Resolve a provided rank-mask tensor into a fixed-width uint64 array. On failure
@@ -348,6 +379,22 @@ void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
 //   - numExperts: Total number of routing slots (tokenSelectedExperts values are in [0, numExperts))
 //   - eplbStatsNumExperts: Number of experts used for EPLB stats (may be <= numExperts)
 //   - eplbLocalStats: [eplbStatsNumExperts] tensor containing local statistics for EPLB.
+//   - quantizeGlobalScale: (Optional) quantize on send. inputPayloads[0] is then the BF16 hidden state
+//   [local_num_tokens, hidden] (hidden a multiple of 256, 32-byte aligned) and the dispatch kernel sends its NVFP4
+//   quantization, the bytes of fp4_quantize(hidden, quantizeGlobalScale, 16, false, false): the E2M1 codes [hidden / 2]
+//   as the first received payload and the linear E4M3 scales [hidden / 16] as the second (both uint8); the other
+//   payloads follow, so recvTensors has one more tensor than inputPayloads. quantizeGlobalScale is the one-float FP32
+//   device tensor of that call. It needs the fused-round kernels (TLLM_MOE_A2A_FUSED_ROUND=1), the fence dispatch (no
+//   counted writes), topK 16 and SM10x, and the payload rows [codes | scales | the other payloads] of a token must fit
+//   the kernel's staging in shared memory (at most 4 16-byte vectors per thread of TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE,
+//   at least 64 threads, 48 KB in all); expertIdPayloadIndex still indexes inputPayloads. nvlink_one_sided.py
+//   (quantize_on_send_enabled) mirrors these launch checks.
+//   - expertIdPayloadIndex, invalidTokenExpertId: (Optional, given together) index of the int32 [local_num_tokens,
+//   topK] expert-id payload. The received expert ids of every padding row (rows at or beyond the source rank's token
+//   count) are set to invalidTokenExpertId, as moe_a2a_sanitize_expert_ids does. With TLLM_MOE_A2A_FUSED_ROUND=1 the
+//   dispatch kernel fills them when the expert-id receive buffer has at most kFusedSanitizeMaxBytes, otherwise the
+//   sanitize kernel after it. With the previous kernels (default) the counted-write dispatch kernel fills them and
+//   a fence dispatch is followed by the sanitize kernel.
 //
 // Return values:
 //   - recvTensors: Vector of receive buffers (one tensor per payload), each [ep_size, runtimeMaxTokensPerRank,
@@ -363,7 +410,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
     bool useCftCountedWrites, torch::optional<int64_t> expertIdPayloadIndex,
-    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask)
+    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
+    torch::optional<torch::Tensor> quantizeGlobalScale)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -422,6 +470,65 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         TORCH_CHECK(payload.is_contiguous(), "All payloads must be contiguous");
     }
 
+    for (auto const& payload : inputPayloads)
+    {
+        CHECK_CONTIGUOUS(payload);
+        CHECK_TH_CUDA(payload);
+        TORCH_CHECK(payload.dim() == 2, "payload must be a 2D tensor");
+        TORCH_CHECK(
+            payload.size(0) == localNumTokens, "payload must have the same first dimension as tokenSelectedExperts");
+        // Unlike recv buffer for payloads, payload itself is not allocated by us and we cannot control its alignment.
+        // We only make sure the payload start offset is 16-byte aligned, while the actual vectorized ld/st width is
+        // dynamically determined based on bytes per token of this payload.
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(payload.data_ptr()) % 16 == 0, "payload must be 16-byte aligned");
+    }
+
+    // What is sent: the input payloads, except that quantize on send replaces the BF16 hidden state (payload 0) by its
+    // NVFP4 codes and inserts their scales as payload 1.
+    struct SentPayload
+    {
+        void const* src;
+        int elementSize;
+        int elementsPerToken;
+        torch::TensorOptions options;
+    };
+
+    bool const quantizeOnSend = quantizeGlobalScale.has_value();
+    int quantizeHidden = 0;
+    std::vector<SentPayload> sentPayloads;
+    for (size_t i = 0; i < inputPayloads.size(); i++)
+    {
+        auto const& payload = inputPayloads[i];
+        if (quantizeOnSend && i == 0)
+        {
+            TORCH_CHECK(payload.scalar_type() == torch::kBFloat16, "quantize on send needs a BF16 hidden state");
+            quantizeHidden = static_cast<int>(payload.size(1));
+            TORCH_CHECK(quantizeHidden > 0 && quantizeHidden % 256 == 0,
+                "quantize on send needs a hidden size that is a multiple of 256, got ", quantizeHidden);
+            TORCH_CHECK(reinterpret_cast<uintptr_t>(payload.data_ptr()) % 32 == 0,
+                "quantize on send needs a 32-byte aligned hidden state");
+            auto const wireOptions = payload.options().dtype(torch::kUInt8);
+            sentPayloads.push_back({payload.data_ptr(), 1, quantizeHidden / 2, wireOptions});
+            sentPayloads.push_back({nullptr, 1, quantizeHidden / 16, wireOptions});
+        }
+        else
+        {
+            sentPayloads.push_back({payload.data_ptr(), static_cast<int>(payload.dtype().itemsize()),
+                static_cast<int>(payload.size(1)), payload.options()});
+        }
+    }
+    TORCH_CHECK(sentPayloads.size() <= kMaxPayloads, "Too many payloads sent");
+    if (quantizeOnSend)
+    {
+        torch::Tensor const& scale = quantizeGlobalScale.value();
+        TORCH_CHECK(!useCftCountedWrites, "quantize on send needs the fence dispatch (no CFT counted writes)");
+        TORCH_CHECK(useFusedRoundKernels(), "quantize on send needs TLLM_MOE_A2A_FUSED_ROUND=1");
+        TORCH_CHECK(topK == 16, "quantize on send is implemented for topK 16, got ", topK);
+        TORCH_CHECK(inputPayloads.size() >= 2, "quantize on send needs the hidden state and the expert-id payload");
+        CHECK_INPUT(scale, torch::kFloat32);
+        TORCH_CHECK(scale.numel() >= 1, "quantizeGlobalScale must hold an FP32 value");
+    }
+
     // Record the cacheline aligned start offset for each payload's recv buffer.
     // 1. We assume the base workspace ptr of each rank is aligned (checked in this OP)
     // 2. offsets[PAYLOAD_DATA_OFFSET_INDEX] is aligned (ensured in calculateOffsets)
@@ -434,25 +541,13 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // Start offset for the first payload
     size_t currentOffset = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
-    for (auto const& payload : inputPayloads)
+    for (auto const& sent : sentPayloads)
     {
-        CHECK_CONTIGUOUS(payload);
-        CHECK_TH_CUDA(payload);
-        TORCH_CHECK(payload.dim() == 2, "payload must be a 2D tensor");
-        TORCH_CHECK(
-            payload.size(0) == localNumTokens, "payload must have the same first dimension as tokenSelectedExperts");
-        // Unlike recv buffer for payloads, payload itself is not allocated by us and we cannot control its alignment.
-        // We only make sure the payload start offset is 16-byte aligned, while the actual vectorized ld/st width is
-        // dynamically determined based on bytes per token of this payload.
-        TORCH_CHECK(reinterpret_cast<uintptr_t>(payload.data_ptr()) % 16 == 0, "payload must be 16-byte aligned");
-
-        int elementsPerToken = static_cast<int>(payload.size(1));
-        int elementSize = static_cast<int>(payload.dtype().itemsize());
         // Each payload buffer stores data from ALL ranks
-        int64_t bytesPerPayload = epSize * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
+        int64_t bytesPerPayload = epSize * runtimeMaxTokensPerRank * sent.elementsPerToken * sent.elementSize;
 
-        payloadElementSizes.push_back(elementSize);
-        payloadElementsPerToken.push_back(elementsPerToken);
+        payloadElementSizes.push_back(sent.elementSize);
+        payloadElementsPerToken.push_back(sent.elementsPerToken);
 
         payloadRecvBufferOffsets.push_back(currentOffset);
 
@@ -472,6 +567,12 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         CHECK_TYPE(expertIdPayload, torch::kInt32);
         TORCH_CHECK(expertIdPayload.size(1) == topK, "expert-id payload must have topK columns");
         invalidExpertId = static_cast<int32_t>(*invalidTokenExpertId);
+        if (quantizeOnSend)
+        {
+            // The scales are inserted after the codes: the expert ids of the sent payloads are one further on.
+            TORCH_CHECK(expertIdPayloadIdx >= 1, "the expert-id payload cannot be the hidden state");
+            expertIdPayloadIdx += 1;
+        }
     }
 
     CHECK_TH_CUDA(workspace);
@@ -496,11 +597,11 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         "rankWorkSpacePtr must be %d-byte aligned", CACHELINE_ALIGNMENT);
 
     // Setup payload descriptors for source data
-    int num_payloads = static_cast<int>(inputPayloads.size());
+    int num_payloads = static_cast<int>(sentPayloads.size());
     std::vector<PayloadDescriptor> payloadDescriptors(num_payloads);
     for (int i = 0; i < num_payloads; i++)
     {
-        payloadDescriptors[i].src_data = inputPayloads[i].data_ptr();
+        payloadDescriptors[i].src_data = sentPayloads[i].src;
         payloadDescriptors[i].element_size = payloadElementSizes[i];
         payloadDescriptors[i].elements_per_token = payloadElementsPerToken[i];
     }
@@ -574,9 +675,22 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         }
     }
     params.use_cft_counted_writes = useCftCountedWrites;
-    params.sanitize_expert_ids = useCftCountedWrites && sanitizeExpertIds;
+    bool const fusedRound = useFusedRoundKernels();
+    // Fused round: the dispatch kernel fills the padding rows' expert ids itself when the expert-id receive buffer is
+    // small (decode). A larger one is filled grid-wide by the sanitize kernel after the dispatch (see below).
+    // Legacy: only the counted-write dispatch fills them; a fence dispatch is followed by the sanitize kernel.
+    bool const fuseSanitize = sanitizeExpertIds
+        && (fusedRound ? epSize * runtimeMaxTokensPerRank * topK * static_cast<int64_t>(sizeof(int32_t))
+                    <= tensorrt_llm::kernels::moe_comm::kFusedSanitizeMaxBytes
+                       : useCftCountedWrites);
+    params.sanitize_expert_ids = fuseSanitize;
     params.expert_id_payload_index = expertIdPayloadIdx;
     params.invalid_expert_id = invalidExpertId;
+    if (quantizeOnSend)
+    {
+        params.quantize_global_scale = quantizeGlobalScale.value().data_ptr<float>();
+        params.quantize_hidden = quantizeHidden;
+    }
 
     // CFT handle-based counted writes
     if (useCftCountedWrites)
@@ -621,11 +735,44 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     params.stream = at::cuda::getCurrentCUDAStream();
 
-    // Prepare for dispatch (zero counters/indices and increment flag_val)
-    moe_a2a_prepare_dispatch_launch(params);
+    if (fusedRound)
+    {
+        // The counted-write dispatch needs the prepare kernel (zero counters, increment flag_val, mark the next
+        // recv_counters bank). The fence dispatch kernel prepares its own round.
+        if (useCftCountedWrites)
+        {
+            moe_a2a_prepare_dispatch_launch(params);
+        }
 
-    // Launch the dispatch kernel
-    moe_a2a_dispatch_launch(params);
+        // Launch the dispatch kernel
+        moe_a2a_dispatch_launch(params);
+    }
+    else
+    {
+        // Prepare for dispatch (zero counters/indices and increment flag_val), then dispatch.
+        tensorrt_llm::kernels::moe_comm::legacy::moe_a2a_prepare_dispatch_launch(params);
+        tensorrt_llm::kernels::moe_comm::legacy::moe_a2a_dispatch_launch(params);
+    }
+
+    if (sanitizeExpertIds && !fuseSanitize)
+    {
+        auto* const recvExpertIds
+            = reinterpret_cast<int32_t*>(rankWorkSpacePtr + payloadRecvBufferOffsets[expertIdPayloadIdx]);
+        auto const* const recvCounters
+            = reinterpret_cast<int32_t const*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
+        if (fusedRound)
+        {
+            tensorrt_llm::kernels::moe_comm::moe_a2a_sanitize_expert_ids_launch(recvExpertIds, recvCounters,
+                params.flag_val, invalidExpertId, params.ep_size, params.max_tokens_per_rank, params.top_k,
+                params.stream);
+        }
+        else
+        {
+            tensorrt_llm::kernels::moe_comm::legacy::moe_a2a_sanitize_expert_ids_launch(recvExpertIds, recvCounters,
+                params.flag_val, invalidExpertId, params.ep_size, params.max_tokens_per_rank, params.top_k,
+                params.stream);
+        }
+    }
 
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_dispatch kernel launch failed: ", cudaGetErrorString(result));
@@ -634,7 +781,6 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     std::vector<torch::Tensor> recvTensors;
     for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
     {
-        auto const& payload = inputPayloads[payload_idx];
         void* recvDataPtr;
         if (useCftCountedWrites)
         {
@@ -645,13 +791,27 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         {
             recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
         }
-        auto recvTensor = torch::from_blob(
-            recvDataPtr, {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]}, payload.options());
+        auto recvTensor = torch::from_blob(recvDataPtr,
+            {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]}, sentPayloads[payload_idx].options);
         recvTensors.push_back(recvTensor);
     }
 
-    // Compute aligned offset after dispatch payloads for combine payload region
-    int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(currentOffset, CACHELINE_ALIGNMENT));
+    // Place the combine payload region after the dispatch payload region sized for the STATIC maxNumTokens, not for
+    // runtimeMaxTokensPerRank. The combine kernel has no end-of-combine barrier and dispatch has no start barrier, so
+    // a fast peer may already run the next dispatch while this rank still reads its combine region. If that dispatch
+    // has a larger runtimeMaxTokensPerRank, a runtime-sized dispatch region would extend into this rank's combine
+    // region and overwrite it mid-read. The workspace already reserves both regions for maxNumTokens
+    // (calculate_required_workspace_size).
+    // (A runtimeMaxTokensPerRank above maxNumTokens keeps the old, runtime-sized placement.)
+    int64_t const staticMaxTokens = std::max<int64_t>(offsets[MAX_NUM_TOKENS_INDEX], runtimeMaxTokensPerRank);
+    size_t staticDispatchEnd = static_cast<size_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
+    for (size_t i = 0; i < payloadElementSizes.size(); i++)
+    {
+        staticDispatchEnd += static_cast<size_t>(epSize) * static_cast<size_t>(staticMaxTokens)
+            * static_cast<size_t>(payloadElementsPerToken[i]) * static_cast<size_t>(payloadElementSizes[i]);
+        staticDispatchEnd = alignOffset(staticDispatchEnd, CACHELINE_ALIGNMENT);
+    }
+    int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(staticDispatchEnd, CACHELINE_ALIGNMENT));
     torch::Tensor eplbGatheredStats;
     if (enableEplb)
     {
@@ -862,16 +1022,29 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     params.stream = at::cuda::getCurrentCUDAStream();
 
-    moe_a2a_prepare_combine_launch(params);
-
-    // CFT combine push: processing rank pushes results back to originating rank's LE.
-    if (params.use_cft_for_combine)
+    if (useFusedRoundKernels())
     {
-        moe_a2a_cft_combine_push_launch(params);
-    }
+        moe_a2a_prepare_combine_launch(params);
 
-    // Launch the combine kernel.
-    moe_a2a_combine_launch(params);
+        // CFT combine push: processing rank pushes results back to originating rank's LE.
+        if (params.use_cft_for_combine)
+        {
+            moe_a2a_cft_combine_push_launch(params);
+        }
+
+        // Launch the combine kernel.
+        moe_a2a_combine_launch(params);
+    }
+    else
+    {
+        namespace legacy = tensorrt_llm::kernels::moe_comm::legacy;
+        legacy::moe_a2a_prepare_combine_launch(params);
+        if (params.use_cft_for_combine)
+        {
+            legacy::moe_a2a_cft_combine_push_launch(params);
+        }
+        legacy::moe_a2a_combine_launch(params);
+    }
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_combine kernel launch failed: ", cudaGetErrorString(result));
 
@@ -900,9 +1073,11 @@ void moeA2ASanitizeExpertIdsOp(torch::Tensor& expert_ids, torch::Tensor& workspa
     int* recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
     uint32_t* flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
 
-    tensorrt_llm::kernels::moe_comm::moe_a2a_sanitize_expert_ids_launch(expert_ids.data_ptr<int32_t>(), recv_counters,
-        flag_val, static_cast<int32_t>(invalid_expert_id), ep_size, runtime_max_tokens_per_rank, top_k,
-        at::cuda::getCurrentCUDAStream());
+    auto const launch = useFusedRoundKernels()
+        ? tensorrt_llm::kernels::moe_comm::moe_a2a_sanitize_expert_ids_launch
+        : tensorrt_llm::kernels::moe_comm::legacy::moe_a2a_sanitize_expert_ids_launch;
+    launch(expert_ids.data_ptr<int32_t>(), recv_counters, flag_val, static_cast<int32_t>(invalid_expert_id), ep_size,
+        runtime_max_tokens_per_rank, top_k, at::cuda::getCurrentCUDAStream());
 }
 
 // Return a workspace-backed tensor for combine payload region using from_blob
@@ -965,7 +1140,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int? expert_id_payload_index=None, "
         "int? invalid_token_expert_id=None, "
         "bool enable_rank_mask=False, "
-        "Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor? active_rank_mask=None, "
+        "Tensor? quantize_global_scale=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "

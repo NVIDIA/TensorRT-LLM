@@ -18,7 +18,7 @@ machine. No CUDA or NIXL imports, so it is unit-testable on CPU."""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Collection, Dict, List, Optional, Tuple
 
 
 class TransferState(Enum):
@@ -199,10 +199,12 @@ class BounceTransport(ABC):
         *,
         timeout: Optional[float] = None,
         extra_bytes: int = 0,
+        layer_groups: Optional[Collection[int]] = None,
     ) -> bool:
         """Reserve a region and record its address for the senders. False falls back to per-fragment.
         ``extra_bytes`` sizes the sender's non-paged payload (mamba/KDA recurrent state) that rides
-        the same coalesced write as the KV blocks."""
+        the same coalesced write as the KV blocks. ``layer_groups`` bounces only those groups; the
+        senders write the other fragments in place."""
 
     @abstractmethod
     def writer_base(self, rid_slice, writer_index: int) -> Optional[int]:

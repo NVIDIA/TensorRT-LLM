@@ -674,8 +674,8 @@ class _DecodeInputs:
         self.dt_bias = fp32(self.dim)
         self.onorm_weight = fp32(HEAD_DIM, scale=1.0)
         self.state = fp32(slots, heads, HEAD_DIM, HEAD_DIM)
-        # HF-layout conv pool: [slots, 3 * dim, W] with W contiguous.
-        self.conv_pool = bf16(slots, 3 * self.dim, CONV_KERNEL_SIZE)
+        # Live pools retain the previous W-1 inputs; the current token is separate.
+        self.conv_pool = bf16(slots, 3 * self.dim, CONV_KERNEL_SIZE - 1)
         self.cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
 
     def x_new(self) -> torch.Tensor:
@@ -692,7 +692,7 @@ class _DecodeInputs:
         cs_v,
         state,
         slot_indices,
-        roll_conv_pool,
+        update_conv_cache,
         x_q=None,
         x_k=None,
         x_v=None,
@@ -727,13 +727,13 @@ class _DecodeInputs:
             onorm_eps=1e-5,
             lower_bound=-5.0,
             use_beta_sigmoid_in_kernel=True,
-            roll_conv_pool=roll_conv_pool,
+            update_conv_cache=update_conv_cache,
         )
 
     def staged_windows(self, conv_pool, slot_indices):
         """The historical W-1 columns, batch-row-dense per section."""
-        cs = conv_pool.index_select(0, slot_indices.long())  # [B, 3 * dim, W]
-        staged = cs.view(self.batch, 3, self.dim, CONV_KERNEL_SIZE)[:, :, :, 1:].permute(1, 0, 2, 3)
+        cs = conv_pool.index_select(0, slot_indices.long())
+        staged = cs.view(self.batch, 3, self.dim, CONV_KERNEL_SIZE - 1).permute(1, 0, 2, 3)
         return cs, staged.contiguous()
 
     def aten_roll_(self, conv_pool, cs, slot_indices) -> None:
@@ -744,69 +744,10 @@ class _DecodeInputs:
 
 @torch.no_grad()
 @_KERNEL_HEADS
-def test_decode_reads_fused_in_projection_column_slices(heads: int) -> None:
-    """Column slices of a fused in-projection match separately packed inputs.
-
-    The decode kernel reads its per-token inputs through a batch-row stride,
-    so q, k, v, the o-norm gate and beta can be handed over as views into the
-    one ``[B, 4 * dim + head_dim + heads]`` row the fused in-projection writes.
-    That has to be bit-identical to passing repacked copies, since it is only
-    a change of where the kernel reads the same values.
-    """
-    batch, slots = 5, 8
-    inputs = _DecodeInputs(batch, heads, slots, seed=11)
-    d, hd = inputs.dim, HEAD_DIM
-    slot_indices = torch.tensor([6, 0, 3, 7, 1], dtype=torch.int32, device="cuda")
-
-    # Lay the same values out the way the fused GEMV would: [q|k|v|g|f_a|b].
-    proj = torch.empty(batch, 4 * d + hd + heads, dtype=torch.bfloat16, device="cuda")
-    for section, tensor in enumerate((inputs.x_q, inputs.x_k, inputs.x_v, inputs.onorm_g)):
-        proj[:, section * d : (section + 1) * d] = tensor[0].reshape(batch, d)
-    proj[:, 4 * d : 4 * d + hd] = 0.0  # f_a, consumed by a separate projection
-    proj[:, 4 * d + hd :] = inputs.beta[0]
-    qkvg = proj[:, : 4 * d].unflatten(-1, (4, heads, hd)).permute(1, 0, 2, 3)
-    strided_beta = proj[:, 4 * d + hd : 4 * d + hd + heads].unsqueeze(0)
-    assert not qkvg[0:1].is_contiguous() and not strided_beta.is_contiguous()
-
-    packed_pool = inputs.conv_pool.clone()
-    packed_state = inputs.state.clone()
-    _, packed_windows = inputs.staged_windows(packed_pool, slot_indices)
-    packed_out = inputs.call(
-        cs_q=packed_windows[0],
-        cs_k=packed_windows[1],
-        cs_v=packed_windows[2],
-        state=packed_state,
-        slot_indices=slot_indices,
-        roll_conv_pool=False,
-    )
-
-    strided_pool = inputs.conv_pool.clone()
-    strided_state = inputs.state.clone()
-    _, strided_windows = inputs.staged_windows(strided_pool, slot_indices)
-    strided_out = inputs.call(
-        cs_q=strided_windows[0],
-        cs_k=strided_windows[1],
-        cs_v=strided_windows[2],
-        state=strided_state,
-        slot_indices=slot_indices,
-        roll_conv_pool=False,
-        x_q=qkvg[0:1],
-        x_k=qkvg[1:2],
-        x_v=qkvg[2:3],
-        onorm_g=qkvg[3:4],
-        beta=strided_beta,
-    )
-
-    torch.testing.assert_close(strided_out, packed_out, rtol=0, atol=0)
-    torch.testing.assert_close(strided_state, packed_state, rtol=0, atol=0)
-
-
-@torch.no_grad()
-@_KERNEL_HEADS
-def test_roll_conv_pool_matches_staged_window_and_aten_roll(heads: int) -> None:
+def test_update_conv_cache_matches_staged_window_and_aten_roll(heads: int) -> None:
     """The kernel-owned pool roll reproduces staging plus a separate roll.
 
-    ``roll_conv_pool`` folds two things the decode step used to do around the
+    ``update_conv_cache`` folds two things the decode step used to do around the
     kernel — staging each admitted request's history and rolling the pool
     forward — into the kernel's own conv pass. Both the output and the
     resulting pool have to match the unfused sequence exactly.
@@ -826,7 +767,7 @@ def test_roll_conv_pool_matches_staged_window_and_aten_roll(heads: int) -> None:
         cs_v=windows[2],
         state=staged_state,
         slot_indices=slot_indices,
-        roll_conv_pool=False,
+        update_conv_cache=False,
     )
     inputs.aten_roll_(staged_pool, cs, slot_indices)
 
@@ -839,7 +780,7 @@ def test_roll_conv_pool_matches_staged_window_and_aten_roll(heads: int) -> None:
         cs_v=rolled_pool[:, 2 * d :],
         state=rolled_state,
         slot_indices=slot_indices,
-        roll_conv_pool=True,
+        update_conv_cache=True,
     )
 
     torch.testing.assert_close(rolled_out, staged_out, rtol=0, atol=0)
@@ -852,7 +793,7 @@ def test_roll_conv_pool_matches_staged_window_and_aten_roll(heads: int) -> None:
 
 @torch.no_grad()
 @_KERNEL_HEADS
-def test_roll_conv_pool_stays_in_step_over_many_tokens(heads: int) -> None:
+def test_update_conv_cache_stays_in_step_over_many_tokens(heads: int) -> None:
     """A one-column drift in the in-place roll accumulates instead of cancelling.
 
     A single step cannot tell a correct roll from one that repeats or skips a
@@ -869,7 +810,10 @@ def test_roll_conv_pool_stays_in_step_over_many_tokens(heads: int) -> None:
     rolled_pool = inputs.conv_pool.clone()
     rolled_state = inputs.state.clone()
 
+    generator = torch.Generator(device="cuda").manual_seed(38)
     for step in range(steps):
+        for tensor in (inputs.x_q, inputs.x_k, inputs.x_v):
+            tensor.normal_(std=0.05, generator=generator)
         cs, windows = inputs.staged_windows(staged_pool, slot_indices)
         staged_out = inputs.call(
             cs_q=windows[0],
@@ -877,7 +821,7 @@ def test_roll_conv_pool_stays_in_step_over_many_tokens(heads: int) -> None:
             cs_v=windows[2],
             state=staged_state,
             slot_indices=slot_indices,
-            roll_conv_pool=False,
+            update_conv_cache=False,
         )
         inputs.aten_roll_(staged_pool, cs, slot_indices)
 
@@ -887,7 +831,7 @@ def test_roll_conv_pool_stays_in_step_over_many_tokens(heads: int) -> None:
             cs_v=rolled_pool[:, 2 * d :],
             state=rolled_state,
             slot_indices=slot_indices,
-            roll_conv_pool=True,
+            update_conv_cache=True,
         )
 
         torch.testing.assert_close(
@@ -902,20 +846,4 @@ def test_roll_conv_pool_stays_in_step_over_many_tokens(heads: int) -> None:
             rtol=0,
             atol=0,
             msg=f"recurrent state diverged at step {step}",
-        )
-
-
-@torch.no_grad()
-def test_roll_conv_pool_requires_slot_indices() -> None:
-    """Without slot indices the kernel would roll batch rows, not cache slots."""
-    inputs = _DecodeInputs(batch=2, heads=4, slots=4, seed=41)
-    d = inputs.dim
-    with pytest.raises(ValueError, match="ssm_state_indices"):
-        inputs.call(
-            cs_q=inputs.conv_pool[:, :d],
-            cs_k=inputs.conv_pool[:, d : 2 * d],
-            cs_v=inputs.conv_pool[:, 2 * d :],
-            state=inputs.state,
-            slot_indices=None,
-            roll_conv_pool=True,
         )

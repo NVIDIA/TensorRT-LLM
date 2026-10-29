@@ -52,6 +52,12 @@ Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
 compile-time constant per cache allocation; every shape compiles the same
 kernel structure (the drop's benchmark-only setmaxreg / register-weight
 specializations were retired with the latency restructuring).
+
+Compact layout: with ``TRTLLM_KDA_MTP_COMPACT=1`` the multi-wave
+calls run the two-CTAs-per-SM kernel of ``feat/k3_26.08`` instead. See
+``cute_dsl_kimi_k3_kda_mtp_compact_policy`` for the policy, the precedence against
+``TRTLLM_KDA_MTP_BF16_MATH`` and the bitwise-parity contract. The in-tree kernel
+stays the default.
 """
 
 import os
@@ -79,14 +85,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         TILE_K,
         kda_decode_mtp_kernel,
     )
+
+    # Pure-Python policy; the vendored compact kernel itself is imported on first use.
+    from .cute_dsl_kimi_k3_kda_mtp_compact_policy import select_compact_layout
 else:
     raise ImportError("Kimi K3 KDA MTP decode requires NVIDIA CUTLASS DSL")
 
 # One V pass: the kernel runs 16 warps x 8 rows over the full 128-row state.
 _TILE_V = 128
-
-# Configure before importing the module / starting serving workers.
-_KDA_MTP_COMPACT = os.environ.get("TRTLLM_KDA_MTP_COMPACT", "1") != "0"
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -112,7 +118,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         o: cute.Tensor,
         output_scale: cute.Tensor,
         ht: cute.Tensor,
-        kg_cache: cute.Tensor,
+        k_cache: cute.Tensor,
+        g_cache: cute.Tensor,
         v_cache: cute.Tensor,
         beta_cache: cute.Tensor,
         stage_timing: cute.Tensor,
@@ -130,7 +137,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         KERNEL_WIDTH: cutlass.Constexpr[int],
         lower_bound: cutlass.Constexpr[float],
         onorm_eps: cutlass.Constexpr[float],
-        scale_leading_dim: cutlass.Constexpr[int],
         USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
         USE_SETMAXREG: cutlass.Constexpr[bool],
         USE_REGULAR_METADATA: cutlass.Constexpr[bool],
@@ -143,17 +149,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
         QUANTIZE_OUTPUT: cutlass.Constexpr[bool],
         PROFILE_STAGES: cutlass.Constexpr[bool],
         SPLIT_V: cutlass.Constexpr[int],
+        BF16_MMA: cutlass.Constexpr[bool],
+        USE_PDL: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
-        COMPACT: cutlass.Constexpr[bool] = False,
-        COMPACT_TWO_CTAS: cutlass.Constexpr[bool] = False,
     ):
         if cutlass.const_expr(USE_ZERO_ACCEPTED):
             t_max = 1 + NUM_SPEC
         else:
             t_max = 2 * NUM_SPEC + 1
         smem_qk_layout = cute.make_layout((t_max, K), stride=(K, 1))
-        # GEMM1: M = V rows of the state (TMEM), N = 3 * T_PAD operand rows, tf32.
+        # BF16_MMA: bf16 tensor-core operands ([K~; Q~] only, K = 16 per instruction).
+        OP_DTYPE = cutlass.BFloat16 if BF16_MMA else cutlass.Float32
+        N1 = 2 * T_PAD if BF16_MMA else 3 * T_PAD
+        # GEMM1: M = V rows of the state (TMEM), N = operand rows ([K~; Q~; K~lo] for tf32).
         tiled_mma1 = sm100_utils.make_trivial_tiled_mma(
+            OP_DTYPE,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            (V, N1),
+            tcgen05.OperandSource.TMEM,
+        )
+        smem_layout_b1 = sm100_utils.make_smem_layout_b(tiled_mma1, (V, N1, K), OP_DTYPE, 1)
+        # fp32 A-fragment layout of the (V x K) state in TMEM: the GEMM2 accumulator seed / state
+        # store views use it in every mode.
+        tiled_mma_f32a = sm100_utils.make_trivial_tiled_mma(
             cutlass.Float32,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -161,9 +182,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tcgen05.CtaGroup.ONE,
             (V, 3 * T_PAD),
             tcgen05.OperandSource.TMEM,
-        )
-        smem_layout_b1 = sm100_utils.make_smem_layout_b(
-            tiled_mma1, (V, 3 * T_PAD, K), cutlass.Float32, 1
         )
         # GEMM1b: the S0_lo sweep only needs K~hi (N = T_PAD) -> a third of the N=48 work.
         tiled_mma1k = sm100_utils.make_trivial_tiled_mma(
@@ -240,7 +258,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # GEMM2: (V x T_PAD) x (T_PAD x K), both operands in smem, tf32; issued as two N = K/2
         # column halves so the state store can start on half 0.
         tiled_mma2h = sm100_utils.make_trivial_tiled_mma(
-            cutlass.Float32,
+            OP_DTYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             cutlass.Float32,
@@ -249,14 +267,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tcgen05.OperandSource.SMEM,
         )
         smem_layout_b2h = sm100_utils.make_smem_layout_b(
-            tiled_mma2h, (V, K // 2, T_PAD), cutlass.Float32, 1
+            tiled_mma2h, (V, K // 2, T_PAD), OP_DTYPE, 1
         )
         smem_layout_a2 = sm100_utils.make_smem_layout_a(
-            tiled_mma2h, (V, K // 2, T_PAD), cutlass.Float32, 1
+            tiled_mma2h, (V, K // 2, T_PAD), OP_DTYPE, 1
         )
         # GEMM2 half 0 also carries the output-combination GEMM: N = T_PAD (Bcoef) + K/2 (Kbar rows 0..63).
         tiled_mma2q = sm100_utils.make_trivial_tiled_mma(
-            cutlass.Float32,
+            OP_DTYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             cutlass.Float32,
@@ -265,11 +283,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tcgen05.OperandSource.SMEM,
         )
         smem_layout_b2q = sm100_utils.make_smem_layout_b(
-            tiled_mma2q, (V, T_PAD + K // 2, T_PAD), cutlass.Float32, 1
+            tiled_mma2q, (V, T_PAD + K // 2, T_PAD), OP_DTYPE, 1
         )
         # GEMM3: T x T coupling matrices, A3 = [Kf; Qf] padded to 64 rows, B3 = Kb (16 rows).
         tiled_mma3 = sm100_utils.make_trivial_tiled_mma(
-            cutlass.Float32,
+            OP_DTYPE,
             OperandMajorMode.K,
             OperandMajorMode.K,
             cutlass.Float32,
@@ -278,10 +296,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tcgen05.OperandSource.SMEM,
         )
         smem_layout_a3 = sm100_utils.make_smem_layout_a(
-            tiled_mma3, (4 * T_PAD, T_PAD, K), cutlass.Float32, 1
+            tiled_mma3, (4 * T_PAD, T_PAD, K), OP_DTYPE, 1
         )
         smem_layout_b3 = sm100_utils.make_smem_layout_b(
-            tiled_mma3, (4 * T_PAD, T_PAD, K), cutlass.Float32, 1
+            tiled_mma3, (4 * T_PAD, T_PAD, K), OP_DTYPE, 1
         )
         # Output combination D4[v, t] = sum_s V'[s, v] Bcoef[t, s]: computed as the first 16 columns
         # of GEMM2 half 0; this tiled MMA only provides the accumulator layout of those columns.
@@ -314,7 +332,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             o,
             output_scale,
             ht,
-            kg_cache,
+            k_cache,
+            g_cache,
             v_cache,
             beta_cache,
             smem_qk_layout,
@@ -331,7 +350,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             KERNEL_WIDTH,
             lower_bound,
             onorm_eps,
-            scale_leading_dim,
             USE_FLAT_LAYOUT,
             USE_SETMAXREG,
             USE_REGULAR_METADATA,
@@ -364,22 +382,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tiled_mma2q,
             smem_layout_b2q,
             SPLIT_V,
-            COMPACT,
-            COMPACT_TWO_CTAS,
+            BF16_MMA,
+            tiled_mma_f32a,
+            USE_PDL,
         )
         if cutlass.const_expr(SPLIT_V == 2):
             # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
             launched.launch(
-                grid=(HV, N, 2), block=[NUM_THREADS, 1, 1], cluster=(1, 1, 2), stream=stream
-            )
-        elif cutlass.const_expr(COMPACT_TWO_CTAS):
-            # Two co-resident 512-thread CTAs need <= 64 registers per thread. Without the
-            # launch bound, the sm_107a build allocates 75 and only one CTA fits per SM.
-            launched.launch(
-                grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream, min_blocks_per_mp=2
+                grid=(HV, N, 2),
+                block=[NUM_THREADS, 1, 1],
+                cluster=(1, 1, 2),
+                stream=stream,
+                use_pdl=USE_PDL,
             )
         else:
-            launched.launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
+            launched.launch(
+                grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream, use_pdl=USE_PDL
+            )
 
 
 def _require_stride_layout(
@@ -398,7 +417,8 @@ def _require_stride_layout(
     A_log,
     dt_bias,
     recurrent_state,
-    kg_cache,
+    k_cache,
+    g_cache,
     v_cache,
     beta_cache,
     ssm_state_indices,
@@ -458,7 +478,8 @@ def _require_stride_layout(
         "g": g,
         "beta": beta,
         "recurrent_state": recurrent_state,
-        "kg_cache": kg_cache,
+        "k_cache": k_cache,
+        "g_cache": g_cache,
         "v_cache": v_cache,
         "beta_cache": beta_cache,
     }
@@ -500,14 +521,19 @@ def _require_stride_layout(
         )
     if recurrent_state.dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(f"recurrent_state must be fp32 or bf16, got {recurrent_state.dtype}")
-    if kg_cache.ndim != 4 or kg_cache.shape[1:] != (num_spec, 2, H * K):
-        raise ValueError(f"Expected kg_cache shape [pool, {num_spec}, 2, {H * K}].")
+    if k_cache.ndim != 3 or k_cache.shape[1:] != (num_spec, H * K):
+        raise ValueError(f"Expected k_cache shape [pool, {num_spec}, {H * K}].")
+    if g_cache.ndim != 3 or g_cache.shape[1:] != (num_spec, H * K):
+        raise ValueError(f"Expected g_cache shape [pool, {num_spec}, {H * K}].")
+    if g_cache.dtype != torch.float32:
+        raise ValueError("g_cache (the replayed gates) must be fp32.")
     if v_cache.ndim != 3 or v_cache.shape[1:] != (num_spec, HV * V):
         raise ValueError(f"Expected v_cache shape [pool, {num_spec}, {HV * V}].")
     if beta_cache.ndim != 3 or beta_cache.shape[1:] != (num_spec, HV):
         raise ValueError(f"Expected beta_cache shape [pool, {num_spec}, {HV}].")
     if (
-        kg_cache.shape[0] < pool_size
+        k_cache.shape[0] < pool_size
+        or g_cache.shape[0] < pool_size
         or v_cache.shape[0] < pool_size
         or beta_cache.shape[0] < pool_size
     ):
@@ -598,42 +624,59 @@ def _layout_key(tensor: torch.Tensor, dynamic_layout: bool = False, *, assumed_a
     return (tensor.dtype, shape, stride, _fits_32bit_stride(tensor), assumed_align)
 
 
-# Environment overrides are startup settings; defaults depend on the device.
-_KDA_MTP_COMPACT_QUANTIZED = os.environ.get("TRTLLM_KDA_MTP_COMPACT_QUANTIZED")
-_KDA_MTP_COMPACT_TWO_CTAS = os.environ.get("TRTLLM_KDA_MTP_COMPACT_TWO_CTAS")
-_kda_compact_policy_cache = {}
-
-
-def _kda_compact_policy(device: torch.device):
-    dev = torch.device(device)
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    if idx not in _kda_compact_policy_cache:
-        sm = torch.cuda.get_device_capability(idx)
-        default = sm == (10, 7)
-        quantized = (
-            default if _KDA_MTP_COMPACT_QUANTIZED is None else _KDA_MTP_COMPACT_QUANTIZED != "0"
-        )
-        two_ctas = (
-            default if _KDA_MTP_COMPACT_TWO_CTAS is None else _KDA_MTP_COMPACT_TWO_CTAS != "0"
-        )
-        _kda_compact_policy_cache[idx] = (sm, _KDA_MTP_COMPACT, quantized, two_ctas)
-    return _kda_compact_policy_cache[idx]
-
-
-_num_sms_cache = {}
-
-
-def _num_sms(device: torch.device) -> int:
-    dev = torch.device(device)
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    if idx not in _num_sms_cache:
-        _num_sms_cache[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
-    return _num_sms_cache[idx]
-
-
 # (device_index, enabled) -> persistent int32 [1] control tensor. Keys are
 # plain values (not tensor identities), so entries never go stale.
 _precompute_control_cache = {}
+
+
+def _bf16_math_enabled() -> bool:
+    """Recurrence precision of the verify kernel, from ``TRTLLM_KDA_MTP_BF16_MATH``.
+
+    Unset / 0 (default): 3xTF32 on every product that feeds the state. 1: bf16 tensor-core
+    operands (bf16 TMEM / smem tiles, K = 16 per instruction, fp32 accumulation -- the
+    prefill kernel's precision).
+    """
+    value = os.environ.get("TRTLLM_KDA_MTP_BF16_MATH", "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"TRTLLM_KDA_MTP_BF16_MATH must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+# Kimi K3 MK1 port (SM107 only, see kimi_k3_mk1_gate): TRTLLM_K3_KDA_VERIFY_PDL=1 launches the verify
+# kernels with programmatic dependent launch. A CTA stages everything the projections do not produce
+# (slot and accepted-count tables, the recurrent state, the conv windows, the replay caches, the
+# conv / gate / norm weights) before ``griddepcontrol.wait`` and reads the projections' outputs after
+# it. It releases its dependents once it holds its tensor-memory columns, and the state loads and
+# stores are L2 evict-first. Outputs, state, conv windows and replay caches are bitwise unchanged.
+# Also requires TRTLLM_ENABLE_PDL (on by default). Read at use time; part of the compile key.
+_KDA_VERIFY_PDL_ENV = "TRTLLM_K3_KDA_VERIFY_PDL"
+
+
+def _verify_pdl_enabled() -> bool:
+    """``TRTLLM_K3_KDA_VERIFY_PDL`` on a validated platform, with the stack-wide PDL switch on."""
+    from ..modules.kimi_k3_mk1_gate import mk1_enabled
+
+    return mk1_enabled(_KDA_VERIFY_PDL_ENV) and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+
+
+def _verify_pdl_for_call(packed_token_layout: bool, accepted_converted: bool) -> bool:
+    """Whether this call launches the verify kernel with PDL.
+
+    The variant waits for its producers in the packed token layout only (the legacy layouts have
+    CTAs that skip the load phase), and it reads the accepted-count table before it waits, so the
+    table must not be the output of a kernel launched right before it (the int64 -> int32
+    conversion of the wrapper).
+    """
+    if not _verify_pdl_enabled():
+        return False
+    if accepted_converted or not packed_token_layout:
+        logger.warning_once(
+            "TRTLLM_K3_KDA_VERIFY_PDL is ignored for calls with int64 accepted counts or without "
+            "the packed token layout: the verify kernel is launched without PDL.",
+            key="kda_mtp_verify_pdl_fallback",
+        )
+        return False
+    return True
 
 
 def _precompute_control_tensor(device: torch.device, enabled: bool) -> torch.Tensor:
@@ -689,7 +732,8 @@ def kda_mtp_decode_impl(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     recurrent_state: torch.Tensor,
-    kg_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
     v_cache: torch.Tensor,
     beta_cache: torch.Tensor,
     ssm_state_indices: torch.Tensor,
@@ -724,8 +768,9 @@ def kda_mtp_decode_impl(
         recurrent_state: pool ``[pool, H, V, K]`` fp32 or bf16, **V-first** layout
             (matches the executor ssm pool and the single-token decode
             kernel). Committed in place.
-        kg_cache/v_cache/beta_cache: replay caches ``[pool, M, 2, H*K]`` /
-            ``[pool, M, H*V]`` / ``[pool, M, H]`` fp32. Mutated.
+        k_cache/g_cache/v_cache/beta_cache: replay caches ``[pool, M, H*K]`` (k,
+            fp32 or bf16) / ``[pool, M, H*K]`` (gate, fp32) / ``[pool, M, H*V]`` /
+            ``[pool, M, H]`` (fp32 or bf16). Mutated.
         ssm_state_indices: per-request state-pool slots. On the legacy
             metadata path, ``cu_seqlens`` supplies token offsets ``[N+1]``
             and accepted counts are request-indexed ``[N]``. On the packed
@@ -778,9 +823,9 @@ def kda_mtp_decode_impl(
             dtype=torch.float8_e4m3fn,
             device=x_q.device,
         )
-        scale_leading_dim = (T_total + 127) // 128 * 128
+        scale_rows = (T_total + 127) // 128 * 128
         output_scale = torch.empty(
-            (scale_leading_dim * HV * 4,),
+            (scale_rows * HV * 4,),
             dtype=torch.uint8,
             device=x_q.device,
         )
@@ -793,11 +838,11 @@ def kda_mtp_decode_impl(
         else:
             # Legacy layouts include replay-position holes that remain zero.
             out = torch.zeros(output_shape, dtype=x_q.dtype, device=x_q.device)
-    if num_accepted_tokens.dtype != torch.int32:
+    accepted_converted = num_accepted_tokens.dtype != torch.int32
+    if accepted_converted:
         num_accepted_tokens = num_accepted_tokens.to(torch.int32)
     if not quantize_output:
         output_scale = num_accepted_tokens
-        scale_leading_dim = 1
     _require_stride_layout(
         x_q=x_q,
         x_k=x_k,
@@ -813,7 +858,8 @@ def kda_mtp_decode_impl(
         A_log=A_log,
         dt_bias=dt_bias,
         recurrent_state=recurrent_state,
-        kg_cache=kg_cache,
+        k_cache=k_cache,
+        g_cache=g_cache,
         v_cache=v_cache,
         beta_cache=beta_cache,
         ssm_state_indices=ssm_state_indices,
@@ -881,25 +927,27 @@ def kda_mtp_decode_impl(
     )
     stage_timing_arg = out
     beta_cache_assumed_align = _beta_cache_assumed_align(beta_cache)
+    # The scale buffer's extent follows the batch size (a multiple of 128 rows) and the kernels
+    # read only its pointer: its layout is dynamic, so that the compile key does not change with
+    # the batch size (a static extent compiled once per 128-row class of the batch).
     output_scale_assumed_align = 16 if quantize_output else 4
+
     # Two CTAs per (head, request) while they fit in one wave (see SPLIT_MAX_TILES).
     split_v = 2 if HV * N <= SPLIT_MAX_TILES else 1
-    # Throughput regime (one CTA per tile, more tiles than SMs): the compact smem/TMEM
-    # layout lets two CTAs share an SM. Same arithmetic, so the results are bitwise
-    # identical. A single partial wave keeps the default layout (slightly lower latency).
-    sm, compact_enabled, compact_quantized, two_ctas = _kda_compact_policy(x_q.device)
-    compact = (
-        split_v == 1
-        and HV * N > _num_sms(x_q.device)
-        and recurrent_state.dtype is torch.bfloat16
-        and bool(fuse_output_norm)
-        and num_spec <= 3
-        and (not quantize_output or compact_quantized)
-        and sm in ((10, 0), (10, 3), (10, 7))
-        and compact_enabled
+    bf16_math = _bf16_math_enabled()
+    use_pdl = _verify_pdl_for_call(bool(packed_token_layout), accepted_converted)
+    # The compact two-CTAs-per-SM layout when TRTLLM_KDA_MTP_COMPACT=1 and
+    # its policy holds; bitwise identical to the default (3xTF32) path of the in-tree kernel.
+    compact, compact_two_ctas = select_compact_layout(
+        device=x_q.device,
+        split_v=split_v,
+        num_tiles=HV * N,
+        state_dtype=recurrent_state.dtype,
+        fuse_output_norm=bool(fuse_output_norm),
+        num_spec=num_spec,
+        quantize_output=bool(quantize_output),
+        bf16_math=bf16_math,
     )
-
-    compact_two_ctas = compact and two_ctas
 
     key = (
         x_q.dtype,
@@ -929,8 +977,9 @@ def kda_mtp_decode_impl(
         _layout_key(onorm_g_arg, dynamic_layout=True, assumed_align=16),
         _layout_key(onorm_weight_arg),
         _layout_key(out, dynamic_layout=True, assumed_align=16),
-        _layout_key(output_scale, assumed_align=output_scale_assumed_align),
-        _layout_key(kg_cache),
+        _layout_key(output_scale, dynamic_layout=True, assumed_align=output_scale_assumed_align),
+        _layout_key(k_cache),
+        _layout_key(g_cache),
         _layout_key(v_cache),
         _layout_key(beta_cache, assumed_align=beta_cache_assumed_align),
         _layout_key(ssm_state_indices, dynamic_layout=True, assumed_align=4),
@@ -945,8 +994,10 @@ def kda_mtp_decode_impl(
         bool(fuse_output_norm),
         bool(quantize_output),
         split_v,
+        bf16_math,
         compact,
         compact_two_ctas,
+        use_pdl,
     )
 
     if key not in _compiled_cache:
@@ -955,11 +1006,22 @@ def kda_mtp_decode_impl(
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
             f"fuse_output_norm={fuse_output_norm} "
-            f"quantize_output={quantize_output} split_v={split_v} compact={compact} "
-            f"compact_two_ctas={compact_two_ctas}"
+            f"quantize_output={quantize_output} split_v={split_v} bf16_math={bf16_math} "
+            f"compact={compact} compact_two_ctas={compact_two_ctas} pdl={use_pdl}"
         )
+        if compact:
+            # Loaded only once a call selects it: with TRTLLM_KDA_MTP_COMPACT unset the
+            # vendored kernel is never imported and cannot affect the in-tree path.
+            from .cute_dsl_kimi_k3_kda_mtp_compact_ops import _run_kda_decode_mtp_compact
+
+            launcher = _run_kda_decode_mtp_compact
+            variant_kwargs = {"COMPACT": True, "COMPACT_TWO_CTAS": compact_two_ctas}
+        else:
+            launcher = _run_kda_decode_mtp
+            variant_kwargs = {"BF16_MMA": bf16_math}
+        variant_kwargs.update(USE_PDL=use_pdl)
         _compiled_cache[key] = cute.compile(
-            _run_kda_decode_mtp,
+            launcher,
             _from_dlpack_arg(h0_arg),
             _dlpack_arg(x_q_arg, assumed_align=16),
             _dlpack_arg(x_k_arg, assumed_align=16),
@@ -977,9 +1039,10 @@ def kda_mtp_decode_impl(
             _dlpack_arg(onorm_g_arg, assumed_align=16),
             _from_dlpack_arg(onorm_weight_arg),
             _dlpack_arg(out, assumed_align=16),
-            _from_dlpack_arg(output_scale, assumed_align=output_scale_assumed_align),
+            _dlpack_arg(output_scale, assumed_align=output_scale_assumed_align),
             _from_dlpack_arg(h0_arg),
-            _from_dlpack_arg(kg_cache),
+            _from_dlpack_arg(k_cache),
+            _from_dlpack_arg(g_cache),
             _from_dlpack_arg(v_cache),
             _from_dlpack_arg(beta_cache, assumed_align=beta_cache_assumed_align),
             _dlpack_arg(stage_timing_arg, assumed_align=16),
@@ -997,7 +1060,6 @@ def kda_mtp_decode_impl(
             KERNEL_WIDTH=W,
             lower_bound=lower_bound,
             onorm_eps=float(onorm_eps),
-            scale_leading_dim=scale_leading_dim,
             USE_FLAT_LAYOUT=use_flat_layout,
             USE_SETMAXREG=use_setmaxreg,
             USE_REGULAR_METADATA=use_regular_metadata,
@@ -1011,8 +1073,7 @@ def kda_mtp_decode_impl(
             PROFILE_STAGES=profile_stages,
             SPLIT_V=split_v,
             stream=stream,
-            COMPACT=compact,
-            COMPACT_TWO_CTAS=compact_two_ctas,
+            **variant_kwargs,
         )
 
     # Runtime alignment policy:
@@ -1042,7 +1103,8 @@ def kda_mtp_decode_impl(
         _dlpack_arg(out, assumed_align=16),
         _dlpack_arg(output_scale, assumed_align=output_scale_assumed_align),
         _dlpack_arg(h0_arg, assumed_align=16),
-        _dlpack_arg(kg_cache, assumed_align=16),
+        _dlpack_arg(k_cache, assumed_align=16),
+        _dlpack_arg(g_cache, assumed_align=16),
         _dlpack_arg(v_cache, assumed_align=16),
         _dlpack_arg(beta_cache, assumed_align=beta_cache_assumed_align),
         _dlpack_arg(stage_timing_arg, assumed_align=16),
@@ -1068,7 +1130,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "cs_k",
             "cs_v",
             "recurrent_state",
-            "kg_cache",
+            "k_cache",
+            "g_cache",
             "v_cache",
             "beta_cache",
         ),
@@ -1089,7 +1152,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         recurrent_state: torch.Tensor,
-        kg_cache: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
@@ -1122,7 +1186,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             A_log=A_log,
             dt_bias=dt_bias,
             recurrent_state=recurrent_state,
-            kg_cache=kg_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
             v_cache=v_cache,
             beta_cache=beta_cache,
             ssm_state_indices=ssm_state_indices,
@@ -1156,7 +1221,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         recurrent_state: torch.Tensor,
-        kg_cache: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
@@ -1183,7 +1249,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "cs_k",
             "cs_v",
             "recurrent_state",
-            "kg_cache",
+            "k_cache",
+            "g_cache",
             "v_cache",
             "beta_cache",
         ),
@@ -1204,7 +1271,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         recurrent_state: torch.Tensor,
-        kg_cache: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
@@ -1236,7 +1304,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             A_log=A_log,
             dt_bias=dt_bias,
             recurrent_state=recurrent_state,
-            kg_cache=kg_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
             v_cache=v_cache,
             beta_cache=beta_cache,
             ssm_state_indices=ssm_state_indices,
@@ -1271,7 +1340,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         recurrent_state: torch.Tensor,
-        kg_cache: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
@@ -1300,7 +1370,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             A_log,
             dt_bias,
             recurrent_state,
-            kg_cache,
+            k_cache,
+            g_cache,
             v_cache,
             beta_cache,
             ssm_state_indices,
@@ -1318,10 +1389,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         rows = x_q.shape[1]
         heads = x_v.shape[2]
-        scale_leading_dim = (rows + 127) // 128 * 128
+        scale_rows = (rows + 127) // 128 * 128
         output = x_q.new_empty((rows, heads * x_v.shape[3]), dtype=torch.float8_e4m3fn)
         output_scale = torch.empty(
-            (scale_leading_dim * heads * 4,),
+            (scale_rows * heads * 4,),
             dtype=torch.uint8,
             device=x_q.device,
         )

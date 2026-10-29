@@ -33,7 +33,14 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     dspark_markov_chain_logits,
     dspark_markov_step_bias,
 )
+from tensorrt_llm._torch.speculative import dspark as dspark_module
 from tensorrt_llm._torch.speculative.dflash import dflash_draft_slot_ids
+from tensorrt_llm._torch.speculative.dspark import DSparkWorker
+from tensorrt_llm._torch.speculative.dspark_markov_fused import (
+    FUSED_MARKOV_ENV_VAR,
+    fused_markov_chain_logits,
+    fused_markov_supported,
+)
 
 needs_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="drafter module construction needs CUDA"
@@ -59,6 +66,13 @@ def _has_absorbed_mla_kernel() -> bool:
 needs_absorbed_mla = pytest.mark.skipif(
     not _has_absorbed_mla_kernel(),
     reason="paged absorbed-MLA decode needs an SM100-family GPU",
+)
+
+# The TRTLLM-Gen paged attention the DFlash drafter uses ships for the same
+# SM100 family.
+needs_trtllm_gen = pytest.mark.skipif(
+    not _has_absorbed_mla_kernel(),
+    reason="TRTLLM-Gen paged block decode needs an SM100-family GPU",
 )
 
 # ---------------------------------------------------------------------------
@@ -157,6 +171,200 @@ def test_markov_chain_sharded_matches_full_vocab():
 
     reassembled = torch.cat([torch.stack(rank_outputs[r], dim=1) for r in range(tp)], dim=-1)
     torch.testing.assert_close(reassembled, full)
+
+
+# ---------------------------------------------------------------------------
+# Fused vanilla-Markov chain (TLLM_DSPARK_FUSED_MARKOV): bit-identical to
+# dspark_markov_chain_logits driven by a plain full-vocab argmax.
+# ---------------------------------------------------------------------------
+
+_FUSED_VOCAB = 20000 + 37  # not a multiple of the 2048-wide argmax tiles
+_K3_VOCAB = 163840  # 80 argmax tiles, the reduction width K3 runs
+
+
+def _plain_argmax(step_logits):
+    # What DSparkWorker's argmax_fn reduces to for full-vocab logits.
+    return torch.argmax(step_logits, dim=-1).type(torch.int32).long()
+
+
+def _fused_reference(base, anchor, w1, w2):
+    return dspark_markov_chain_logits(base, anchor, w1, w2, argmax_fn=_plain_argmax)
+
+
+def _fused_weights(rank, vocab=_FUSED_VOCAB, seed=0):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    w1 = torch.randn(vocab, rank, device="cuda", generator=gen).to(torch.bfloat16)
+    w2 = (torch.randn(vocab, rank, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
+    return w1, w2
+
+
+def _assert_bit_identical(actual, expected):
+    assert actual.shape == expected.shape
+    assert torch.equal(actual.view(torch.int32), expected.contiguous().view(torch.int32))
+
+
+def _check_fused_matches_reference(vocab, rank, num_reqs, block_size):
+    w1, w2 = _fused_weights(rank, vocab)
+    gen = torch.Generator(device="cuda").manual_seed(num_reqs * 100 + block_size)
+    base = torch.randn(num_reqs, block_size, vocab, device="cuda", generator=gen) * 3.0
+    anchor = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+    assert fused_markov_supported(base, anchor, w1, w2)
+    _assert_bit_identical(
+        fused_markov_chain_logits(base, anchor, w1, w2), _fused_reference(base, anchor, w1, w2)
+    )
+
+
+@needs_cuda
+@pytest.mark.parametrize("rank", [256, 96])
+@pytest.mark.parametrize("num_reqs,block_size", [(1, 1), (1, 7), (3, 6), (8, 8), (33, 7)])
+def test_fused_markov_matches_reference(num_reqs, block_size, rank):
+    _check_fused_matches_reference(_FUSED_VOCAB, rank, num_reqs, block_size)
+
+
+@needs_cuda
+def test_fused_markov_matches_reference_k3_shape():
+    """K3's vocab reduces 80 argmax tiles per step (BLOCK_P 128), at a large batch."""
+    _check_fused_matches_reference(_K3_VOCAB, 256, 128, 5)
+
+
+@needs_cuda
+@pytest.mark.parametrize("anchor_dtype", [torch.int64, torch.int32])
+def test_fused_markov_out_of_vocab_anchor_gives_zero_bias(anchor_dtype):
+    w1, w2 = _fused_weights(256)
+    vocab = _FUSED_VOCAB
+    base = torch.randn(5, 7, vocab, device="cuda") * 3.0
+    anchor = torch.tensor([-1, vocab, vocab + 5, 0, vocab - 1], device="cuda", dtype=anchor_dtype)
+    out = fused_markov_chain_logits(base, anchor, w1, w2)
+    _assert_bit_identical(out, _fused_reference(base, anchor, w1, w2))
+    _assert_bit_identical(out[:3, 0], base[:3, 0])
+
+
+@needs_cuda
+def test_fused_markov_argmax_ties_nan_and_inf_follow_torch():
+    w1, w2 = _fused_weights(256)
+    base = torch.zeros(6, 7, _FUSED_VOCAB, device="cuda")
+    base[1] = 2.5  # constant row: the bf16 bias alone decides, with many exact ties
+    base[2, :, 100] = float("inf")
+    base[2, :, 30] = float("inf")
+    base[3] = float("-inf")
+    base[4, 2, 12345] = float("nan")
+    base[4, 2, 7] = float("nan")
+    base[5] = (torch.randn(7, _FUSED_VOCAB, device="cuda") * 2).round()
+    anchor = torch.tensor([-1, 5, 6, 7, 8, 9], device="cuda")
+    _assert_bit_identical(
+        fused_markov_chain_logits(base, anchor, w1, w2), _fused_reference(base, anchor, w1, w2)
+    )
+
+
+@needs_cuda
+def test_fused_markov_strided_block_logits():
+    w1, w2 = _fused_weights(256)
+    full = torch.randn(8, 9, _FUSED_VOCAB, device="cuda") * 3.0
+    base = full[::2, 1:8]
+    anchor = torch.randint(0, _FUSED_VOCAB, (4,), device="cuda")
+    _assert_bit_identical(
+        fused_markov_chain_logits(base, anchor, w1, w2), _fused_reference(base, anchor, w1, w2)
+    )
+
+
+@needs_cuda
+def test_fused_markov_supported_requires_contiguous_anchor():
+    """The kernel indexes the anchor by request, so a strided or mis-sized
+    anchor must keep the reference path instead of reading wrong tokens."""
+    w1, w2 = _fused_weights(256)
+    base = torch.randn(4, 7, _FUSED_VOCAB, device="cuda")
+    anchor = torch.randint(0, _FUSED_VOCAB, (8,), device="cuda")
+    assert not fused_markov_supported(base, anchor[::2], w1, w2)
+    assert not fused_markov_supported(base, anchor, w1, w2)
+    assert fused_markov_supported(base, anchor[::2].contiguous(), w1, w2)
+
+
+@needs_cuda
+def test_fused_markov_cuda_graph_replay():
+    w1, w2 = _fused_weights(256)
+    base = torch.randn(4, 7, _FUSED_VOCAB, device="cuda") * 3.0
+    anchor = torch.randint(0, _FUSED_VOCAB, (4,), device="cuda")
+    fused_markov_chain_logits(base, anchor, w1, w2)  # compile outside capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fused_markov_chain_logits(base, anchor, w1, w2)
+    for _ in range(2):
+        base.copy_(torch.randn_like(base) * 3.0)
+        anchor.copy_(torch.randint(0, _FUSED_VOCAB, (4,), device="cuda"))
+        graph.replay()
+        _assert_bit_identical(out, _fused_reference(base, anchor, w1, w2))
+
+
+def _markov_worker(mapping=None, sharded=False):
+    return SimpleNamespace(
+        mapping=mapping,
+        _draft_logits_are_sharded=lambda logits, spec_metadata: sharded,
+        greedy_sample_draft_with_tp_gather=lambda logits, spec_metadata: torch.argmax(
+            logits, dim=-1
+        ).type(torch.int32),
+    )
+
+
+def _spy_fused(monkeypatch):
+    calls = []
+
+    def _spy(*args):
+        calls.append(1)
+        return fused_markov_chain_logits(*args)
+
+    monkeypatch.setattr(dspark_module, "fused_markov_chain_logits", _spy)
+    return calls
+
+
+@needs_cuda
+@pytest.mark.parametrize("case", ["off", "on", "on_strided_anchor"])
+def test_fused_markov_worker_env_gate(monkeypatch, case):
+    w1, w2 = _fused_weights(256)
+    base = torch.randn(3, 7, _FUSED_VOCAB, device="cuda") * 3.0
+    anchor = torch.randint(0, _FUSED_VOCAB, (6,), device="cuda")
+    anchor = anchor[::2] if case == "on_strided_anchor" else anchor[:3].contiguous()
+    fused_calls = _spy_fused(monkeypatch)
+    if case == "off":
+        monkeypatch.delenv(FUSED_MARKOV_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(FUSED_MARKOV_ENV_VAR, "1")
+    draft_model = SimpleNamespace(
+        markov_w1=w1,
+        markov_w2=w2,
+        apply_markov_chain_logits=lambda logits, first, argmax_fn, vocab_slice: (
+            dspark_markov_chain_logits(logits, first, w1, w2, argmax_fn=argmax_fn)
+        ),
+    )
+    out = DSparkWorker._apply_dspark_markov_bias(_markov_worker(), draft_model, base, anchor, None)
+    assert len(fused_calls) == int(case == "on")
+    _assert_bit_identical(out, _fused_reference(base, anchor, w1, w2))
+
+
+@needs_cuda
+def test_fused_markov_worker_vocab_shard_keeps_reference_path(monkeypatch):
+    """TP vocab-sharded draft logits (vocab_slice set) never take the fused
+    full-vocab chain, even with the switch on."""
+    vocab, tp, tp_rank = 8192, 4, 1
+    shard = vocab // tp
+    w1, w2 = _fused_weights(256, vocab)
+    base = torch.randn(3, 7, shard, device="cuda")
+    anchor = torch.randint(0, vocab, (3,), device="cuda")
+    fused_calls = _spy_fused(monkeypatch)
+    monkeypatch.setenv(FUSED_MARKOV_ENV_VAR, "1")
+    seen = {}
+
+    def _apply(logits, first, argmax_fn, vocab_slice):
+        seen["vocab_slice"] = vocab_slice
+        return logits
+
+    draft_model = SimpleNamespace(markov_w1=w1, markov_w2=w2, apply_markov_chain_logits=_apply)
+    mapping = SimpleNamespace(tp_size=tp, tp_rank=tp_rank, enable_attention_dp=False)
+    out = DSparkWorker._apply_dspark_markov_bias(
+        _markov_worker(mapping, sharded=True), draft_model, base, anchor, None
+    )
+    assert fused_calls == []
+    assert seen["vocab_slice"] == slice(tp_rank * shard, (tp_rank + 1) * shard)
+    assert out is base
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +888,88 @@ def test_plain_dflash_block_decode_matches_full_attention_reference():
     assert diff < 0.02, f"plain DFlash parity failed: max abs diff {diff}"
 
 
+def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_size=32):
+    """Block decode through the TRTLLM paged cache, one request per history.
+
+    Pages are shuffled across requests, so only the block tables decide which
+    history each request reads.
+    """
+    dev = "cuda"
+    blk = TINY["block_size"]
+    lengths = [ctx.shape[0] for ctx in captured]
+    history = []
+    for ctx in captured:
+        proj = drafter.project_target_hidden(ctx.to(dev, torch.bfloat16))
+        history.append(drafter.precompute_context_kv(proj, torch.arange(ctx.shape[0], device=dev)))
+    # [N, layers, kv heads, head dim]; the drafter sizes its fused K/V lazily.
+    num_layers, nkv, hd = history[0][0].shape[1:]
+    pages_per_req = max((n + blk + page_size - 1) // page_size for n in lengths)
+    num_pages = len(lengths) * pages_per_req
+    order = torch.randperm(num_pages, generator=torch.Generator().manual_seed(3))
+    page_table = order.view(len(lengths), pages_per_req).to(dev, torch.int32)
+    caches = [
+        torch.zeros(num_pages, 2, nkv, page_size, hd, dtype=torch.bfloat16, device=dev)
+        for _ in range(num_layers)
+    ]
+    for row, (k, v) in enumerate(history):
+        positions = torch.arange(lengths[row], device=dev)
+        pages = page_table[row, positions // page_size].long()
+        offsets = positions % page_size
+        for layer, cache in enumerate(caches):
+            cache[pages, 0, :, offsets] = k[:, layer]
+            cache[pages, 1, :, offsets] = v[:, layer]
+    caches = [cache.to(cache_dtype) for cache in caches]
+    out = drafter.dflash_forward(
+        noise_embedding=torch.stack(noise_embed).to(dev, torch.bfloat16),
+        query_positions=torch.stack([torch.arange(n, n + blk) for n in lengths]).to(dev),
+        num_ctx_per_req=torch.tensor(lengths, device=dev),
+        ctx_k_cache=None,
+        ctx_v_cache=None,
+        ctx_cache_batch_idx=torch.arange(len(lengths), device=dev),
+        ctx_kv_cache=caches,
+        ctx_page_table=page_table,
+    )
+    return out.float().cpu().view(len(lengths), blk, -1)
+
+
+@needs_trtllm_gen
+@pytest.mark.parametrize(
+    "cache_dtype,tolerance",
+    # Relative-error tolerances for BF16 and FP8 caches; the
+    # reference over another request's history is far beyond either.
+    [(torch.bfloat16, 0.02), (torch.float8_e4m3fn, 0.05)],
+    ids=["bf16", "fp8"],
+)
+def test_trtllm_paged_block_decode_matches_full_attention_reference(cache_dtype, tolerance):
+    """The TRTLLM non-causal block attention over a paged BF16 or FP8 cache
+    matches the eager reference for requests with different history lengths.
+
+    Each block query runs as its own one-token decode request over its
+    parent's pages, so a wrong table, length or block write shows up here.
+    An FP8 cache also takes the block's K/V and queries in FP8.
+    """
+    weights = _tiny_weights()
+    drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
+    g = torch.Generator().manual_seed(44)
+    lengths = (CTX_LEN, 70)
+    captured = [
+        torch.randn(n, TINY["hidden_size"] * NUM_CAPTURE, generator=g) * 0.5 for n in lengths
+    ]
+    noise_embed = [
+        torch.randn(TINY["block_size"], TINY["hidden_size"], generator=g) * 0.5 for _ in lengths
+    ]
+
+    out = _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype)
+
+    for row in range(len(lengths)):
+        expected = _reference_block_decode(
+            weights, captured[row].to(torch.bfloat16), noise_embed[row].to(torch.bfloat16), False
+        )
+        expected = expected.float()
+        rel_err = ((out[row] - expected).norm() / expected.norm()).item()
+        assert rel_err < tolerance, f"request {row}: relative error {rel_err}"
+
+
 # ---------------------------------------------------------------------------
 # MLA-backboned DSpark drafter (Inferact/Kimi-K3-DSpark shape).
 #
@@ -1146,6 +1436,111 @@ def test_mla_dspark_block_decode_matches_unabsorbed_reference(monkeypatch, paged
         f"negative control failed: kv_b K/V halves swapped is too close "
         f"({diff_swapped} vs {diff}) -- the absorption may not be exercised"
     )
+
+
+@pytest.mark.parametrize("raw, expected", [(None, 0), ("", 0), ("0", 0), ("1", 1), (" 4 ", 4)])
+def test_mla_dspark_split_cap_env(raw, expected, monkeypatch):
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    if raw is None:
+        monkeypatch.delenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raw)
+    assert md._dspark_mla_max_split_kv() == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "one", "1.5"])
+def test_mla_dspark_split_cap_env_rejects_bad_values(raw, monkeypatch):
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raw)
+    with pytest.raises(ValueError, match="TLLM_DSPARK_MLA_MAX_SPLIT_KV"):
+        md._dspark_mla_max_split_kv()
+
+
+@needs_cuda
+@needs_absorbed_mla
+def test_mla_dspark_cute_dsl_split_cap_matches_reference(monkeypatch):
+    """TLLM_DSPARK_MLA_MAX_SPLIT_KV=1 runs the drafter attention of a batch at
+    the cap's batch floor unsplit. That moves only the FP32 reduction order, so
+    the capped decode meets the same bf16 bound against the un-absorbed
+    reference as the uncapped one, and the two agree to that bound.
+    """
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVMlaDecodeBlackwellRunner as Runner,
+    )
+
+    # Record what the runner does with each split, so the test cannot pass
+    # with a cap that never reached the kernel.
+    seen = []
+    capped_split_kv = Runner._capped_split_kv
+
+    def _recorded(runner, split_kv, batch_size):
+        result = capped_split_kv(runner, split_kv, batch_size)
+        seen.append((runner.max_split_kv, split_kv, result))
+        return result
+
+    monkeypatch.setattr(Runner, "_capped_split_kv", _recorded)
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    g = torch.Generator().manual_seed(43)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in range(20, 20 + 2 * Runner._SPLIT_CAP_MIN_BATCH, 2)
+    ]
+    expected = torch.stack(
+        [
+            _reference_mla_block_decode(weights, c.to(torch.bfloat16), n.to(torch.bfloat16))
+            for c, n in requests
+        ]
+    )
+    outs = {}
+    for cap in (0, 1):
+        monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", str(cap))
+        drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+        assert drafter._mla_max_split_kv == cap
+        outs[cap] = _run_mla_block_decode(drafter, requests, paged=True)
+
+    assert any(c == 1 and s > 1 and r == 1 for c, s, r in seen), seen
+    assert all(r == s for c, s, r in seen if c == 0), seen
+    # One bf16 ULP at this output magnitude (test_mla_dspark_block_decode_matches_
+    # unabsorbed_reference). Over 16 requests the uncapped decode already reaches
+    # 2 ULP somewhere (0.03125), so the bound here is 3 ULP.
+    bound = 3 * 2.0**-6
+    for cap, out in outs.items():
+        diff = (out - expected).abs().max().item()
+        assert diff <= bound, f"split cap {cap}: max abs diff {diff} vs reference"
+    diff = (outs[1] - outs[0]).abs().max().item()
+    assert diff <= bound, f"capped vs uncapped: max abs diff {diff}"
+
+
+@needs_cuda
+@needs_absorbed_mla
+def test_mla_dspark_layer_major_latents_match_per_token_bitwise():
+    """The layer-major prologue runs the fused RMSNorm+RoPE kernel on each
+    layer's row-strided slice of the fused GEMM output in place; it must give
+    precompute_context_kv's latents bit for bit."""
+    torch.manual_seed(0)
+    drafter = _build_mla_drafter(_tiny_mla_weights())
+    n = 37
+    g = torch.Generator().manual_seed(44)
+    captured = torch.randn(n, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5
+    proj = drafter.project_target_hidden(captured.to("cuda", torch.bfloat16))
+    positions = torch.arange(n, device="cuda")
+    layer_major = drafter.precompute_context_kv_layer_major(proj, positions)
+    if layer_major is None:
+        pytest.skip("fused DSpark RMSNorm+RoPE kernel unavailable")
+    per_token, _ = drafter.precompute_context_kv(proj, positions)
+    assert layer_major.shape == (MLA_LAYERS, n, MLA_LATENT)
+    assert torch.equal(layer_major.transpose(0, 1), per_token[:, :, 0])
 
 
 @needs_cuda

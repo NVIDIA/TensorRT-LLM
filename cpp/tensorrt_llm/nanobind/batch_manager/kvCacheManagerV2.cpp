@@ -697,6 +697,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("DROPPABLE", kv::PageStatus::DROPPABLE)
         .export_values();
 
+    nb::enum_<kv::CacheDomain>(m, "CacheDomain")
+        .value("STANDALONE_DRAFT", kv::CacheDomain::kStandaloneDraft)
+        .value("TARGET", kv::CacheDomain::kTarget);
+
     nb::enum_<kv::CacheTier>(m, "CacheTier")
         .value("GPU_MEM", kv::CacheTier::GPU_MEM)
         .value("HOST_MEM", kv::CacheTier::HOST_MEM)
@@ -1149,9 +1153,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int>(), nb::arg("window_size"), nb::arg("num_sink_blocks"))
+        .def(nb::init<std::optional<int>, int, kv::CacheDomain>(), nb::arg("window_size").none(),
+            nb::arg("num_sink_blocks"), nb::arg("cache_domain") = kv::CacheDomain::kTarget)
+        .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
+            nb::arg("tokens_per_block"), nb::arg("cache_domain") = kv::CacheDomain::kTarget)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
+        .def_ro("cache_domain", &kv::AttnLifeCycle::cacheDomain)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1363,13 +1371,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
-        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),
+        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
+                 kv::CacheDomain>(),
             nb::arg("layer_id"), nb::arg("buffers"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt)
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("cache_domain") = kv::CacheDomain::kTarget)
         .def_rw("layer_id", &kv::AttentionLayerConfig::layerId)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)
         .def_rw("num_sink_tokens", &kv::AttentionLayerConfig::numSinkTokens)
+        .def_rw("cache_domain", &kv::AttentionLayerConfig::cacheDomain)
         .def_prop_ro("window_size", &kv::AttentionLayerConfig::windowSize) DEF_COPY(kv::AttentionLayerConfig);
 
     nb::enum_<kv::LayerType>(m, "LayerType")
