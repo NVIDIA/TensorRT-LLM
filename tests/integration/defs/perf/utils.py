@@ -765,7 +765,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
             else:
                 try:
                     self._perf_result = self.get_perf_result(outputs)
-                except (AssertionError, RuntimeError, ValueError):
+                except Exception:
+                    # Add diagnostics without changing the parsing exception.
                     if isinstance(commands, PerfServeScriptTestCmds):
                         commands.print_server_log_tail()
                     raise
