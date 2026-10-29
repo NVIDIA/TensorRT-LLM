@@ -11,12 +11,12 @@ error.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget, tp_reaches_across_nodes
+from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes, tp_reaches_across_nodes
 
 # The GPUs the target is certified on: sm_100 (B200, GB200) and sm_103 (B300,
 # GB300). They run the same kernels.
@@ -74,24 +74,19 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
+@routes("DeepseekV3ForCausalLM")
 def route(
-    pretrained_config: Any,
-    mapping: Any,
-    compute_capability: Tuple[int, int],
-    spec_config: Optional[Any],
-    kv_cache_quant_algo: Optional[Any],
-    model_config: Optional[ModelConfig] = None,
-    llm_args: Optional[TorchLlmArgs] = None,
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
-    ``kv_cache_quant_algo`` is the KV-cache algorithm the engine will run with
-    (see ``_router_index._kv_cache_quant_algo``), not the checkpoint's alone.
-
     Each target is imported where it is returned, so declining costs no import
-    of modeling code. No engine choice in ``model_config`` or ``llm_args`` changes
-    which of these targets runs, so neither is read.
+    of modeling code.
     """
+    pretrained_config = model_config.pretrained_config
+    mapping = model_config.mapping
+    spec_config = model_config.spec_config
+    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
     # The checkpoint is recognized by its config shape; see the gpt_oss routing
     # module for what shape-sniffing does and does not pin. q_lora_rank is in
     # the shape because it changes the attention weight layout: a checkpoint

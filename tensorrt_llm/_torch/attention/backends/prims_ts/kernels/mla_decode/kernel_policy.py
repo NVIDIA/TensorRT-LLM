@@ -161,7 +161,7 @@ def is_throughput_2cta_mla_supported_shape(
         dtype in ("bf16", "e4m3")
         and out_dtype in ("bf16", "e4m3")
         and latent_dim == 512
-        and rope_dim == 64
+        and rope_dim in (0, 64)
         and page_size in SUPPORTED_MLA_PAGE_SIZES
         and 1 <= num_heads <= 128
         and seq_len_q >= 1

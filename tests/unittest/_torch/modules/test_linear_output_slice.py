@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Output slices preserve loaded weights and FP8 scale-block boundaries."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import tensorrt_llm._torch.modules.linear as linear_module
 from tensorrt_llm._torch.modules.linear import (
+    Fp8BlockScaleLowMGemmRange,
+    FP8BlockScalesLinearMethod,
     FP8QDQLinearMethod,
     FP8RowwiseLinearMethod,
     Linear,
@@ -182,6 +187,121 @@ def test_prepare_output_slice_dispatches_to_linear_method():
     actual = linear.forward_slice(inputs, 4, 12)
     torch.testing.assert_close(actual, torch.nn.functional.linear(inputs, linear.weight[4:12]))
     assert prepared_ranges == [(4, 12), (4, 12)]
+
+
+@pytest.mark.cpu_only
+def test_fp8_block_scale_low_m_dispatch_uses_full_weight_only(monkeypatch):
+    """A prepared row slice must not reuse the full projection's low-M range."""
+    monkeypatch.setattr(linear_module, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: 103)
+
+    weight = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.empty((256, 1), dtype=torch.int32)
+    cache = Fp8BlockScaleWeightSliceCache()
+    cache.prepare(weight, scale, 129, 190)
+    module = SimpleNamespace(
+        weight=weight,
+        weight_scale=scale,
+        _output_slice_cache=cache,
+        fp8_low_m_gemm=Fp8BlockScaleLowMGemmRange(max_m=32),
+        use_cute_dsl_blockscaling_mm=False,
+        disable_deep_gemm=False,
+        bias=None,
+    )
+    calls = []
+
+    def low_m_gemm(inputs, selected_weight, selected_scale):
+        calls.append(("low_m", selected_weight is module.weight, selected_weight.shape[0]))
+        assert selected_scale.shape[0] == selected_weight.shape[0]
+        return torch.ones((inputs.shape[0], selected_weight.shape[0]), dtype=torch.bfloat16)
+
+    def regular_gemm(inputs, selected_weight, selected_scale, **kwargs):
+        calls.append(("regular", selected_weight is module.weight, selected_weight.shape[0]))
+        assert selected_scale.shape[0] == selected_weight.shape[0]
+        return torch.zeros((inputs.shape[0], selected_weight.shape[0]), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(torch.ops.trtllm, "fp8_block_scale_low_m_gemm", low_m_gemm, raising=False)
+    monkeypatch.setattr(torch.ops.trtllm, "fp8_swap_ab_gemm", regular_gemm, raising=False)
+    method = FP8BlockScalesLinearMethod()
+    inputs = torch.empty((2, 128), dtype=torch.bfloat16)
+
+    assert torch.all(method.apply(module, inputs, None) == 1)
+    sliced = method.apply_slice(module, inputs, 129, 190)
+    assert sliced.shape == (2, 61)
+    assert torch.all(sliced == 0)
+    assert calls == [("low_m", True, 256), ("regular", False, 128)]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rubin", [False, True])
+def test_kimi_fp8_low_m_dispatch_uses_full_weight_only(monkeypatch, rubin):
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi_module
+
+    monkeypatch.setattr(kimi_module, "_rubin_mxfp8_is_available", lambda: rubin)
+    weight = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
+    scale = (
+        torch.empty((256 * 4,), dtype=torch.uint8)
+        if rubin
+        else torch.empty((256, 1), dtype=torch.int32)
+    )
+    projection = kimi_module._Fp8BlockScaleWeightReadLinear(weight, scale, 256)
+    projection._low_m = Fp8BlockScaleLowMGemmRange(max_m=32)
+    projection._low_m_weight_scale = torch.empty((256, 1), dtype=torch.int32)
+    calls = []
+
+    if rubin:
+
+        def low_m_gemm(inputs, selected_weight, selected_scale):
+            assert selected_weight is projection.weight
+            assert selected_scale is projection._low_m_weight_scale
+            calls.append(("low_m", selected_weight.shape[0]))
+            return torch.ones((inputs.shape[0], 256), dtype=torch.bfloat16)
+
+        def regular_gemm(activation, selected_weight, activation_scale, selected_scale, **kwargs):
+            assert selected_weight.data_ptr() == projection.weight[128:].data_ptr()
+            assert selected_scale.data_ptr() == projection.weight_scale[128 * 4 :].data_ptr()
+            calls.append(("regular", selected_weight.shape[0]))
+            return torch.zeros(
+                (activation.shape[0], selected_weight.shape[0]), dtype=torch.bfloat16
+            )
+
+        monkeypatch.setattr(
+            torch.ops.trtllm, "fp8_block_scale_low_m_gemm", low_m_gemm, raising=False
+        )
+        monkeypatch.setattr(
+            torch.ops.trtllm,
+            "fp8_quantize_1x128_cutedsl_ue8m0",
+            lambda inputs: (inputs, torch.empty(0)),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            torch.ops.trtllm, "cute_dsl_mxfp8_gemm_rubin", regular_gemm, raising=False
+        )
+    else:
+
+        def low_m_gemm(inputs, selected_weight, selected_scale):
+            assert selected_weight is projection.weight
+            calls.append(("low_m", selected_weight.shape[0]))
+            assert selected_scale.shape[0] == selected_weight.shape[0]
+            return torch.ones((inputs.shape[0], selected_weight.shape[0]), dtype=torch.bfloat16)
+
+        def regular_gemm(inputs, selected_weight, selected_scale, **kwargs):
+            assert selected_weight.data_ptr() == projection.weight[128:].data_ptr()
+            calls.append(("regular", selected_weight.shape[0]))
+            assert selected_scale.shape[0] == selected_weight.shape[0]
+            return torch.zeros((inputs.shape[0], selected_weight.shape[0]), dtype=torch.bfloat16)
+
+        monkeypatch.setattr(
+            torch.ops.trtllm, "fp8_block_scale_low_m_gemm", low_m_gemm, raising=False
+        )
+        monkeypatch.setattr(torch.ops.trtllm, "fp8_swap_ab_gemm", regular_gemm, raising=False)
+
+    inputs = torch.empty((2, 128), dtype=torch.bfloat16)
+    assert torch.all(projection(inputs) == 1)
+    sliced = projection.forward_slice(inputs, 129, 190)
+    assert sliced.shape == (2, 61)
+    assert torch.all(sliced == 0)
+    assert calls == [("low_m", 256), ("regular", 128)]
 
 
 @pytest.mark.cpu_only

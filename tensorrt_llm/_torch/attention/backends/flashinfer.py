@@ -1211,20 +1211,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._max_num_blocks_per_seq = self.kv_cache_manager.max_blocks_per_seq
 
             # Layers may share one page-index list only when they are in the
-            # same pool AND have the same page-index scale: VSWA splits pools,
+            # same pool, page-index scale, and KV factor: VSWA splits pools,
             # and per-layer geometry (e.g. Gemma4 sliding/global head_dim)
             # splits scales even when all windows collapse to max_seq_len and
-            # is_vswa is False. Guarded on V2-specific attributes (V1 managers
-            # lack the per-pool infrastructure).
+            # is_vswa is False. Mixed K-only/KV layers can use different view
+            # indices even with the same physical scale. Guarded on V2-specific
+            # attributes (V1 managers lack the per-pool infrastructure).
             mgr = self.kv_cache_manager
             get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
+            get_kv_factor = getattr(mgr, 'get_layer_kv_factor', None)
             layer_space: Dict[int, int] = {}
             if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
                 space_ids = {}
                 for layer_idx in attention_layer_indices:
                     layer_offset = mgr.layer_offsets[layer_idx]
                     key = (mgr.layer_to_pool_mapping_dict[layer_offset],
-                           get_scale(layer_idx))
+                           get_scale(layer_idx),
+                           get_kv_factor(layer_idx) if get_kv_factor else None)
                     if (self._has_mixed_precision_kv()
                             and layer_offset in mgr.high_layers):
                         key = ("mixed_precision_staging", )

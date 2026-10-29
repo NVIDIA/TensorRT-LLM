@@ -30,6 +30,7 @@ from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.serve import serving_extensions
 from tensorrt_llm.serve.render import (
     RENDERED_REQUEST_SCHEMA_VERSION,
+    HarmonyConversionError,
     RenderedRequest,
     RenderResources,
     UnsupportedRenderError,
@@ -37,8 +38,8 @@ from tensorrt_llm.serve.render import (
     fingerprint_mismatch,
     fingerprint_summary,
     fingerprints_match,
-    legacy_render_enabled,
     render_chat,
+    render_chat_for_length,
     render_conversation,
     worker_resolves_thinking,
 )
@@ -197,6 +198,179 @@ class TestRenderChat:
         with pytest.raises(UnsupportedRenderError, match="Multimodal"):
             render_chat(request, resources(tokenizer))
 
+    def test_the_length_of_a_refused_request_renders_the_text_and_template_without_the_media(
+        self, tokenizer
+    ) -> None:
+        request = chat_request(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}},
+                    ],
+                }
+            ]
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            length_render = render_chat_for_length(request, resources(tokenizer))
+            gc.collect()
+
+        text_only = chat_request(messages=[{"role": "user", "content": "what is this"}])
+        assert length_render.text == render_chat(text_only, resources(tokenizer)).text
+        assert length_render.token_ids
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+        # A model with its own input processor is refused; its length uses the text tokenizer.
+        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+
+        class OwnProcessor:
+            tokenizer = None
+
+        own = resources(tokenizer, model_type="mistral_common", input_processor=OwnProcessor())
+        with pytest.raises(UnsupportedRenderError):
+            render_chat(chat_request(), own)
+        assert (
+            render_chat_for_length(chat_request(), own).token_ids
+            == render_chat(chat_request(), resources(tokenizer)).token_ids
+        )
+
+    def test_the_length_counts_the_tool_calls_of_a_request_with_media_and_leaves_the_request_intact(
+        self, tokenizer
+    ) -> None:
+        image = {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}}
+
+        def request():
+            return chat_request(
+                messages=[
+                    {"role": "user", "content": "weather in paris?"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city": "paris"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                    {"role": "user", "content": [{"type": "text", "text": "and here"}, image]},
+                ],
+                tools=[WEATHER_TOOL],
+            )
+
+        same_request = request()
+        first = render_chat_for_length(same_request, resources(tokenizer))
+        second = render_chat_for_length(same_request, resources(tokenizer))
+
+        assert "paris" in first.text and "get_weather" in first.text  # the tool call is rendered
+        assert second.token_ids == first.token_ids  # and the request is not spent by the first
+        # The caller's request keeps its tool calls (the router forwards it) and its other fields.
+        assert all(
+            isinstance(dict(message).get("tool_calls"), list)
+            for message in same_request.messages
+            if dict(message).get("tool_calls") is not None
+        )
+        assert same_request.prompt_token_ids is None
+        assert "image_url" in str(list(same_request.messages))
+
+    def test_the_length_keeps_a_tool_choice_that_changes_which_tools_are_rendered(
+        self, tokenizer, harmony_vocab
+    ) -> None:
+        image = {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}}
+        text = {"type": "text", "text": "what is this"}
+
+        def length(tool_choice):
+            request = chat_request(
+                messages=[{"role": "user", "content": [text, image]}],
+                tools=[WEATHER_TOOL],
+                tool_choice=tool_choice,
+            )
+            return render_chat_for_length(request, resources(tokenizer)).token_ids
+
+        def exact(tool_choice):
+            request = chat_request(
+                messages=[{"role": "user", "content": "what is this"}],
+                tools=[WEATHER_TOOL],
+                tool_choice=tool_choice,
+            )
+            return render_chat(request, resources(tokenizer)).token_ids
+
+        assert length("none") == exact("none")
+        assert length("auto") == exact("auto")
+        # A forcing choice is cleared: the length is that of the auto render.
+        assert length("required") == exact("auto")
+
+        # Harmony removes the tools for "none".
+        def harmony_length(tool_choice):
+            request = chat_request(tools=[WEATHER_TOOL], tool_choice=tool_choice)
+            return render_chat_for_length(request, harmony_resources()).token_ids
+
+        assert harmony_length("none") == render_chat(chat_request(), harmony_resources()).token_ids
+        assert len(harmony_length("auto")) > len(harmony_length("none"))
+
+    def test_the_length_of_a_kimi_k3_request_keeps_the_extensions_tool_serialization(self) -> None:
+        # kimi_k3 dumps tools without null defaults.
+        tokenizer = make_tokenizer(name=KIMI_K3)
+        res = resources(
+            tokenizer,
+            model_type="kimi_k3",
+            extension=serving_extensions.get_serving_extension("kimi_k3"),
+        )
+        image = {"type": "image_url", "image_url": {"url": "http://example.invalid/x.png"}}
+        with_media = chat_request(
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}, image]}],
+            tools=[WEATHER_TOOL],
+        )
+        text_only = chat_request(messages=[{"role": "user", "content": "hi"}], tools=[WEATHER_TOOL])
+
+        assert render_chat_for_length(with_media, res).text == render_chat(text_only, res).text
+
+        # kimi_k3 keeps a tool-call argument that is not JSON.
+        call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "not json"},
+                }
+            ],
+        }
+        lenient = chat_request(messages=[with_media.messages[0], call], tools=[WEATHER_TOOL])
+        lenient_text = chat_request(messages=[text_only.messages[0], call], tools=[WEATHER_TOOL])
+
+        assert render_chat_for_length(lenient, res).text == render_chat(lenient_text, res).text
+
+    def test_only_a_harmony_conversion_error_falls_back_to_the_template_for_a_length(
+        self, tokenizer
+    ) -> None:
+        class FailingHarmony(ServingExtension):
+            def __init__(self, error):
+                self.error = error
+
+            def render_prompt(self, request, res=None):
+                raise self.error
+
+        def resources_failing_with(error):
+            return resources(
+                tokenizer, use_harmony=True, extension=FailingHarmony(error), model_type="gpt_oss"
+            )
+
+        fallback = render_chat_for_length(
+            chat_request(), resources_failing_with(HarmonyConversionError("no description"))
+        )
+        assert fallback.token_ids == render_chat(chat_request(), resources(tokenizer)).token_ids
+        with pytest.raises(RuntimeError, match="boom"):
+            render_chat_for_length(chat_request(), resources_failing_with(RuntimeError("boom")))
+
     def test_a_non_default_input_processor_is_rejected_not_approximated(self, tokenizer) -> None:
         class SpecialProcessor:
             tokenizer = None
@@ -260,7 +434,7 @@ class TestExtensions:
     def test_required_tool_choice_is_rejected_without_extension_support(self, tokenizer) -> None:
         request = chat_request(tools=[WEATHER_TOOL], tool_choice="required")
         # A ValueError for the routes (a 400) and an UnsupportedRenderError for callers
-        # that only need an estimate (the router, count_tokens).
+        # that only need a length (the router, count_tokens).
         with pytest.raises(UnsupportedRenderError, match="tool_choice='required' is not supported"):
             render_chat(request, resources(tokenizer))
         with pytest.raises(ValueError):
@@ -323,6 +497,8 @@ class TestExtensions:
 
         with pytest.raises(UnsupportedRenderError, match="named function is not yet supported"):
             render_chat(request, harmony_resources())
+        # A length (a router routing a request the worker will refuse) gets Harmony's ids.
+        assert render_chat_for_length(request, harmony_resources()).token_ids
 
     def test_the_extension_preprocesses_and_serializes_tools(
         self, tokenizer, extension_model
@@ -477,6 +653,22 @@ class TestRenderConversation:
 
 
 class TestFingerprint:
+    @pytest.mark.parametrize("model_type", [None, ""])
+    def test_unknown_worker_model_type_matches_the_router(self, tokenizer, model_type) -> None:
+        worker = self._worker_resources(
+            tokenizer, model_config=SimpleNamespace(model_type=model_type)
+        )
+        router = RenderResources.from_tokenizer(tokenizer)
+        assert fingerprints_match(worker.fingerprint(), router.fingerprint())
+
+    @pytest.mark.parametrize("local,remote", [(None, "qwen3"), ("", "qwen3"), ("qwen2", "qwen3")])
+    def test_known_model_types_remain_distinct(self, tokenizer, local, remote) -> None:
+        base = resources(tokenizer)
+        assert not fingerprints_match(
+            dataclasses.replace(base, model_type=local).fingerprint(),
+            dataclasses.replace(base, model_type=remote).fingerprint(),
+        )
+
     def test_a_different_server_template_changes_the_digest(self, tokenizer) -> None:
         plain = compute_fingerprint(resources(tokenizer))
         with_template = compute_fingerprint(
@@ -754,6 +946,11 @@ class TestPreparationContext:
         "{% if add_generation_prompt %}<assistant><think>{% endif %}"
     )
     PREFILLED_CLOSED = PREFILLED_OPEN.replace("<think>", "</think>")
+    # MiniMax-M3 in adaptive mode: the generation prompt is the bare assistant header.
+    M3_ADAPTIVE = (
+        "{% for m in messages %}]~b]{{ m.role }}\n{{ m.content }}[e~[\n{% endfor %}"
+        "{% if add_generation_prompt %}]~b]ai\n{% endif %}"
+    )
 
     def _context(self, template, **overrides):
         res = resources(make_tokenizer(chat_template=template), **overrides)
@@ -772,6 +969,10 @@ class TestPreparationContext:
 
     def test_a_prompt_that_prefills_nothing_records_nothing(self, tokenizer) -> None:
         assert render_chat(chat_request(), resources(tokenizer)).context["resolved_thinking"] == {}
+
+    def test_the_minimax_m3_adaptive_header_is_recorded_as_off(self) -> None:
+        # The template prefills nothing after its header, so only that parser resolves the prompt.
+        assert self._context(self.M3_ADAPTIVE)["resolved_thinking"] == {"minimax_m3": False}
 
     def test_no_generation_prompt_records_nothing(self) -> None:
         res = resources(make_tokenizer(chat_template=self.PREFILLED_OPEN))
@@ -837,11 +1038,3 @@ class TestRenderedRequest:
     def test_a_per_response_fingerprint_is_no_longer_part_of_the_schema(self) -> None:
         with pytest.raises(ValidationError):
             RenderedRequest(fingerprint={"digest": "abc"}, token_ids=[1])
-
-
-class TestLegacySwitch:
-    def test_off_by_default_and_enabled_by_the_environment(self, monkeypatch) -> None:
-        monkeypatch.delenv("TRTLLM_RENDER_LEGACY", raising=False)
-        assert legacy_render_enabled() is False
-        monkeypatch.setenv("TRTLLM_RENDER_LEGACY", "1")
-        assert legacy_render_enabled() is True

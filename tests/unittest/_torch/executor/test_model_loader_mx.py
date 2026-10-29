@@ -2562,6 +2562,7 @@ def test_mla_transform_weights_is_idempotent(monkeypatch):
     monkeypatch.setattr(mla_mod, "get_sm_version", lambda: 120)
     quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)
     mla = MLA.__new__(MLA)
+    mla.mapping = mapping_mod.Mapping()
     mla.num_heads_tp = 1
     mla.num_context_heads = 1
     mla._weights_transformed = False

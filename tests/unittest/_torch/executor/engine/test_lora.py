@@ -30,7 +30,7 @@ from tensorrt_llm._torch.pyexecutor.engine.lora import (
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
@@ -597,7 +597,7 @@ def _runner_for_lora(
     lora_model_config: LoraModelConfig,
 ) -> DecoderRunner:
     runner = runner_type.__new__(runner_type)
-    runner.model = model
+    runner._model = model
     runner._model_caller = ModelCaller(model)
     runner._lora = LoraParamBuilder(attn_backend=object(), cuda_graph_manager=None)
     runner.lora_model_config = lora_model_config
@@ -623,7 +623,7 @@ def test_runner_lora_initialization_preserves_outer_multimodal_forward(
     graph_lora_settings[1].owner = owner
     runner.init_cuda_graph_lora_manager(graph_lora_settings[0], lora_model)
 
-    assert runner.model is model
+    assert runner._model is model
     assert runner._lora.cuda_graph_manager is not None
     with model_extra_attrs({}):
         output = runner._model_caller(value=torch.tensor([1]), attn_metadata=model)
@@ -645,7 +645,7 @@ def test_encoder_decoder_runner_inherits_lora_model_fallback(
     assert runner._lora.cuda_graph_manager.layer_info == {
         key: CudaGraphLoraParams.LoraLayerInfo(module_num=1, output_sizes=[96])
     }
-    assert runner.model is model
+    assert runner._model is model
 
 
 @pytest.mark.parametrize(
@@ -851,7 +851,7 @@ def test_engine_reuses_owner_and_shares_lora_config_across_resource_reinitializa
     graph_lora_settings: tuple[LoraConfig, LoraModelConfig], graphs_enabled: bool
 ) -> None:
     model = _MultimodalLoraModel()
-    engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+    engine = ModelEngine.__new__(ModelEngine)
     engine._cleanup_done = True
     engine.model = model
     engine.input_processor = _MultimodalInputProcessor()
@@ -868,7 +868,7 @@ def test_engine_reuses_owner_and_shares_lora_config_across_resource_reinitializa
         builders = []
         for _ in range(2):
             assert engine.initialize_lora_owner() is owner
-            engine._init_cuda_graph_lora_manager(graph_lora_settings[0])
+            engine.init_cuda_graph_lora_manager(graph_lora_settings[0])
             builders.append(engine._runner._lora)
             assert engine.lora_model_config is config
             assert engine._runner.lora_model_config is config
@@ -886,7 +886,7 @@ def test_engine_reuses_owner_and_shares_lora_config_across_resource_reinitializa
     resolve.assert_called_once_with(model, engine.input_processor)
     assert builders[0] is builders[1]
     assert engine._lora_model is model.language_model
-    assert engine.model is engine._runner.model is model
+    assert engine.model is engine._runner._model is model
     assert model.encoder[0].workspace_reservations == []
 
 
@@ -907,7 +907,7 @@ def test_executor_shares_lora_configuration_with_real_cache_constructor(
     )
     model.model_config.pretrained_config = SimpleNamespace(num_hidden_layers=8)
     model.model_config.get_bindings_model_config = lambda **kwargs: binding_config
-    engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+    engine = ModelEngine.__new__(ModelEngine)
     engine._cleanup_done = True
     engine.model = model
     engine.input_processor = _MultimodalInputProcessor()

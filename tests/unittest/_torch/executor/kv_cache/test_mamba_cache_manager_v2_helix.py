@@ -18,6 +18,8 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("cp_size", [2, 4, 8])
 def test_mamba_hybrid_quota_to_tokens_under_helix(cp_size: int) -> None:

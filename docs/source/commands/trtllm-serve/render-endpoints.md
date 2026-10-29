@@ -20,6 +20,9 @@ On a CPU-only host, `trtllm-render` loads only the tokenizer, configuration and 
 trtllm-render --model <checkpoint> --port 8100
 ```
 
+In a container with no GPU driver, `trtllm-render` loads the CUDA toolkit's `libcuda.so` stub from `$CUDA_HOME` or
+`/usr/local/cuda*` so that `tensorrt_llm` can be imported. `python -m tensorrt_llm.serve.render` does not do this.
+
 Give it the same model, tokenizer, chat template and parser options as the workers it fronts. Both processes publish
 a rendering fingerprint on `GET /server_info`. Equal `render_fingerprint.digest` values mean the ids are valid for
 that worker, so compare them once when a worker is added.
