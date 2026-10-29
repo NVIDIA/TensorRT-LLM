@@ -311,6 +311,11 @@
       "path": "dwdp_config.num_prefetch_experts"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_slots"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "enable_attention_dp"

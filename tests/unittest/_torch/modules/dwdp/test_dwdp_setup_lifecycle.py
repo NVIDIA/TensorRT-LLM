@@ -88,6 +88,7 @@ def _run_setup():
         layer_indices=[3],
         num_experts_per_worker=2,
         num_prefetch_experts=2,
+        num_prefetch_slots=2,
     )
 
 
