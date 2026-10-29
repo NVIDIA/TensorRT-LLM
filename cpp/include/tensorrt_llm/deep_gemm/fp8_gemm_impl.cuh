@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -88,6 +88,9 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
 
     // Shared memory
     static constexpr int kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0);
+    // The swizzle needs whole groups of 8 16-byte chunks per row of `smem_d`
+    static constexpr bool kWarpGroupLocalEpilogue
+        = SchedulerType::gemm_type == GemmType::GroupedWithOffset and (BLOCK_N * sizeof(__nv_bfloat16) / 16) % 8 == 0;
     static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(__nv_bfloat16);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
@@ -293,22 +296,28 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                 num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
                 num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
             }
-            uint32_t num_scales_b = SHAPE_K_SCALES * (num_former_iters >= num_full_iters ? 1 : 2);
+            bool const needs_second_scale_b = num_former_iters < num_full_iters;
+            auto const num_previous_lines
+                = scheduler.get_global_scales_b_idx(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
+            auto const local_scales_b
+                = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
 
-            // Load B scales with math warp-groups
-            // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
-            if (threadIdx.x >= 32)
+            // On the warp-group-local epilogue path, B scales are read from global memory right before each K
+            // block's WGMMA and consumed after it, so no barrier separates two tiles
+            if constexpr (not kWarpGroupLocalEpilogue)
             {
-                auto num_previous_lines
-                    = scheduler.get_global_scales_b_idx(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
-                ;
-                auto local_scales_b
-                    = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
+                uint32_t num_scales_b = SHAPE_K_SCALES * (needs_second_scale_b ? 2 : 1);
+
+                // Load B scales with math warp-groups
+                // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+                if (threadIdx.x >= 32)
+                {
 #pragma unroll
-                for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
-                    st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
+                    for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
+                        st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
+                }
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
             }
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 
             // Accumulation for WGMMA or CUDA promotion
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
@@ -339,11 +348,24 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                     for (int s = 0; s < kNumInnerStages; ++s)
                     {
                         // Read B scales
-                        float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1 = 1.0f;
-                        // NOTES: even some blocks do not need to read the second row, but we still load one to align
-                        // with other blocks
-                        if constexpr (not kMustUseUniformedScaleB)
-                            scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+                        float scale_b_0, scale_b_1 = 1.0f;
+                        if constexpr (kWarpGroupLocalEpilogue)
+                        {
+                            scale_b_0 = __ldg(local_scales_b + k_iter * kNumStages + s);
+                            if constexpr (not kMustUseUniformedScaleB)
+                            {
+                                if (needs_second_scale_b)
+                                    scale_b_1 = __ldg(local_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+                            }
+                        }
+                        else
+                        {
+                            scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s);
+                            // NOTES: even some blocks do not need to read the second row, but we still load one to
+                            // align with other blocks
+                            if constexpr (not kMustUseUniformedScaleB)
+                                scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+                        }
 
                         // Wait TMA arrivals
                         full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
@@ -401,78 +423,121 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                     }
                 });
 
-            // Write back to shared memory using STSM
-            DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
+            if constexpr (kWarpGroupLocalEpilogue)
+            {
+                // Each math warp group stages its own rows in its half of `smem_d`, with 16-byte chunks XOR-swizzled
+                // by row so STSM is free of bank conflicts, then writes them out with coalesced 16-byte stores. Only
+                // the threads of one warp group synchronize, so the math warp groups never wait for each other.
+                constexpr uint32_t kChunksPerRow = BLOCK_N * sizeof(__nv_bfloat16) / 16;
+                constexpr uint32_t kChunksPerWarpGroup = WGMMA::M * kChunksPerRow;
+                DG_STATIC_ASSERT(kChunksPerWarpGroup % kNumMathThreadsPerGroup == 0, "Invalid copy-out split");
+                auto const smem_d_chunks = reinterpret_cast<int4 const*>(smem_d);
 #pragma unroll
-            for (auto i = 0; i < WGMMA::kNumAccum / 8; ++i)
-            {
-                SM90_U32x4_STSM_N<nv_bfloat162>::copy(
-                    __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
-                    smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + i * 16 + 8 * (lane_idx / 16));
-            }
-            if constexpr (WGMMA::kNumAccum % 8 != 0)
-            {
-                SM90_U32x2_STSM_N<nv_bfloat162>::copy(__float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0],
-                                                          final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
-                    __float22bfloat162_rn(
-                        {final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
-                    smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16);
-            }
-
-            if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset)
-            {
-                auto m_global_idx = scheduler.get_global_m_idx(m_block_idx);
-                bool cross_boundary = (m_global_idx + BLOCK_M) > scheduler.m_boundary;
-                cute::tma_store_fence();
-                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-                if (!cross_boundary)
+                for (uint32_t i = 0; i < WGMMA::kNumAccum / 8; ++i)
                 {
+                    uint32_t const row = warp_idx * 16 + lane_idx % 16;
+                    uint32_t const chunk = (i * 2 + lane_idx / 16) ^ (row % 8);
+                    SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
+                        smem_d + row * BLOCK_N + chunk * 8);
+                }
+                cutlass::arch::NamedBarrier::sync(kNumMathThreadsPerGroup, 1 + math_wg_idx);
+
+                auto const m_global_idx = scheduler.get_global_m_idx(m_block_idx);
+#pragma unroll
+                for (uint32_t c = threadIdx.x % kNumMathThreadsPerGroup; c < kChunksPerWarpGroup;
+                     c += kNumMathThreadsPerGroup)
+                {
+                    uint32_t const row = math_wg_idx * WGMMA::M + c / kChunksPerRow;
+                    uint32_t const chunk = c % kChunksPerRow;
+                    auto const value = ld_shared(smem_d_chunks + row * kChunksPerRow + (chunk ^ (row % 8)));
+                    if (m_global_idx + row < scheduler.m_boundary
+                        and (SHAPE_N % BLOCK_N == 0 or n_block_idx * BLOCK_N + chunk * 8 < SHAPE_N))
+                        *reinterpret_cast<int4*>(gmem_d + static_cast<uint64_t>(m_global_idx + row) * SHAPE_N
+                            + n_block_idx * BLOCK_N + chunk * 8)
+                            = value;
+                }
+                // The next tile's STSM overwrites these rows
+                cutlass::arch::NamedBarrier::sync(kNumMathThreadsPerGroup, 1 + math_wg_idx);
+            }
+            else
+            {
+                // Write back to shared memory using STSM
+                DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
+#pragma unroll
+                for (auto i = 0; i < WGMMA::kNumAccum / 8; ++i)
+                {
+                    SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
+                        smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + i * 16 + 8 * (lane_idx / 16));
+                }
+                if constexpr (WGMMA::kNumAccum % 8 != 0)
+                {
+                    SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn(
+                            {final_accum[WGMMA::kNumAccum / 8 * 8 + 0], final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
+                        __float22bfloat162_rn(
+                            {final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
+                        smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16);
+                }
+
+                if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset)
+                {
+                    auto m_global_idx = scheduler.get_global_m_idx(m_block_idx);
+                    bool cross_boundary = (m_global_idx + BLOCK_M) > scheduler.m_boundary;
+                    cute::tma_store_fence();
+                    cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+                    if (!cross_boundary)
+                    {
+                        // Use TMA store to write back to global memory
+                        if (threadIdx.x == 0)
+                        {
+                            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N, m_global_idx);
+                            cute::tma_store_arrive();
+                            cute::tma_store_wait<0>();
+                        }
+                    }
+                    else
+                    {
+                        __nv_bfloat16* gmem_d_this_block = gmem_d + m_global_idx * SHAPE_N;
+                        constexpr int NUM_WARPS
+                            = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
+                        write_result_to_gmem<BLOCK_M, BLOCK_N, NUM_WARPS>(gmem_d_this_block, smem_d, m_global_idx,
+                            scheduler.m_boundary, n_block_idx * BLOCK_N, SHAPE_N, SHAPE_N);
+                    }
+                }
+                else if constexpr (SchedulerType::gemm_type == GemmType::StridedBatched)
+                {
+                    cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+                    __nv_bfloat16* gmem_d_this_block;
+                    auto m_global_idx = scheduler.get_global_m_idx(m_block_idx);
+                    gmem_d_this_block = gmem_d + scheduler.curr_group_idx * problem_input.stride_d
+                        + (m_block_idx * BLOCK_M) * problem_input.ld_d;
+                    constexpr int NUM_WARPS
+                        = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
+                    write_result_to_gmem<BLOCK_M, BLOCK_N, NUM_WARPS>(gmem_d_this_block, smem_d, m_global_idx,
+                        scheduler.m_boundary, n_block_idx * BLOCK_N, SHAPE_N, problem_input.ld_d);
+                }
+                else
+                {
+                    cute::tma_store_fence();
+                    cutlass::arch::NamedBarrier(kNumMathThreads).sync();
                     // Use TMA store to write back to global memory
                     if (threadIdx.x == 0)
                     {
-                        cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N, m_global_idx);
+                        cute::SM90_TMA_STORE_2D::copy(
+                            &tensor_map_d, smem_d, n_block_idx * BLOCK_N, scheduler.get_global_m_idx(m_block_idx));
                         cute::tma_store_arrive();
                         cute::tma_store_wait<0>();
                     }
                 }
-                else
-                {
-                    __nv_bfloat16* gmem_d_this_block = gmem_d + m_global_idx * SHAPE_N;
-                    constexpr int NUM_WARPS
-                        = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
-                    write_result_to_gmem<BLOCK_M, BLOCK_N, NUM_WARPS>(gmem_d_this_block, smem_d, m_global_idx,
-                        scheduler.m_boundary, n_block_idx * BLOCK_N, SHAPE_N, SHAPE_N);
-                }
             }
-            else if constexpr (SchedulerType::gemm_type == GemmType::StridedBatched)
-            {
-                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-                __nv_bfloat16* gmem_d_this_block;
-                auto m_global_idx = scheduler.get_global_m_idx(m_block_idx);
-                gmem_d_this_block = gmem_d + scheduler.curr_group_idx * problem_input.stride_d
-                    + (m_block_idx * BLOCK_M) * problem_input.ld_d;
-                constexpr int NUM_WARPS
-                    = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
-                write_result_to_gmem<BLOCK_M, BLOCK_N, NUM_WARPS>(gmem_d_this_block, smem_d, m_global_idx,
-                    scheduler.m_boundary, n_block_idx * BLOCK_N, SHAPE_N, problem_input.ld_d);
-            }
-            else
-            {
-                cute::tma_store_fence();
-                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-                // Use TMA store to write back to global memory
-                if (threadIdx.x == 0)
-                {
-                    cute::SM90_TMA_STORE_2D::copy(
-                        &tensor_map_d, smem_d, n_block_idx * BLOCK_N, scheduler.get_global_m_idx(m_block_idx));
-                    cute::tma_store_arrive();
-                    cute::tma_store_wait<0>();
-                }
-            }
-
             __syncwarp();
         }
     }
