@@ -3,7 +3,7 @@
 
 """Resolved settings for scheduled decoder execution."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -49,5 +49,6 @@ class DecoderRunnerConfig(RunnerConfig):
     enable_autotuner: bool
     cuda_graph_specialize_lora: bool
     # The model takes the one-engine speculative fast paths
-    # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths).
-    spec_decode_fast_paths: bool
+    # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths); False for a config
+    # built without it. Keyword-only, so subclasses may still add required fields.
+    spec_decode_fast_paths: bool = field(default=False, kw_only=True)
