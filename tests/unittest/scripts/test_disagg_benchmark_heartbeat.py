@@ -65,6 +65,16 @@ def test_progress_is_forwarded_after_each_append(tmp_path):
         assert f"Benchmarking: {progress}" in line
 
 
+def test_append_with_unchanged_tail_is_forwarded(tmp_path):
+    (tmp_path / _LOG_NAME).write_text("x" * 200)
+    lines = _run_heartbeat(
+        tmp_path,
+        {2: 'printf x >> "$testOutputDir/trtllm-benchmark.0.log"'},
+    )
+    assert len(lines) == 2
+    assert all(line.endswith("x" * 200) for line in lines)
+
+
 @pytest.mark.parametrize("create_empty_log", [False, True])
 def test_missing_or_empty_log_does_not_emit_heartbeats(tmp_path, create_empty_log):
     if create_empty_log:
@@ -105,11 +115,11 @@ def test_rotated_log_with_same_size_is_forwarded(tmp_path):
         tmp_path,
         {
             2: 'mv "$testOutputDir/trtllm-benchmark.0.log" "$testOutputDir/previous.log"; '
-            'printf "Benchmarking: 2/4\\n" > "$testOutputDir/trtllm-benchmark.0.log"'
+            'printf "Benchmarking: 1/4\\n" > "$testOutputDir/trtllm-benchmark.0.log"'
         },
     )
     assert len(lines) == 2
-    assert "Benchmarking: 2/4" in lines[-1]
+    assert "Benchmarking: 1/4" in lines[-1]
 
 
 def test_carriage_return_progress_uses_latest_line(tmp_path):
