@@ -297,10 +297,10 @@ range.
 ## Kernel Implementation (CuTe DSL on Blackwell)
 
 DENSEGEMM consists of two CuTe DSL kernels, both registered as `torch.library.custom_op`. The Python-side
-entry is `fused_moe_densegemm.py:run_moe_nvfp4`, with kernel bodies under
-`cute_dsl_kernels/blackwell/moe_as_dense_gemm/{fc1,fc2}.py`. Both share
-`Sm100BlockScaledPersistentDenseGemmKernel`, a dense GEMM template using persistent CTA, TMA load, and
-tcgen05 MMA, on top of which expert-aware alpha fusion is implemented separately.
+entry is `cutedsl/dense_gemm.py:run_moe_nvfp4`, with kernel bodies under
+`moe/kernels/blackwell/moe_as_dense_gemm/{fc1,fc2}.py`. Each defines its own
+`Sm100BlockScaledPersistentDenseGemmKernel`, a dense GEMM using persistent CTA, TMA load, and
+tcgen05 MMA, with its expert-aware alpha fusion built in.
 
 | | FC1 | FC2 |
 |---|---|---|
@@ -424,7 +424,7 @@ Future directions include:
 
 ## References
 
-- Source code: [`tensorrt_llm/_torch/moe/fused_moe/fused_moe_densegemm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/fused_moe_densegemm.py)
+- Source code: [`tensorrt_llm/_torch/moe/fused_moe/cutedsl/dense_gemm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/cutedsl/dense_gemm.py)
 - Backend selection: [`tensorrt_llm/_torch/moe/fused_moe/create_moe.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/create_moe.py)
 - FC1 kernel: [`tensorrt_llm/_torch/moe/kernels/blackwell/moe_as_dense_gemm/fc1.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/kernels/blackwell/moe_as_dense_gemm/fc1.py)
 - FC2 kernel: [`tensorrt_llm/_torch/moe/kernels/blackwell/moe_as_dense_gemm/fc2.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/kernels/blackwell/moe_as_dense_gemm/fc2.py)

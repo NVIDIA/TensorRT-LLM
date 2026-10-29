@@ -448,7 +448,10 @@ def test_generate_with_stop_words():
         model=llama_model_path,
         kv_cache_config=global_kvcache_config,
     )
-    stop_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
+    # The model continues "A B C" with space-separated letters, so the token
+    # it generates for N is the space-prefixed " N"; with BPE tokenizers
+    # (e.g. Qwen3) that differs from the token of a bare "N".
+    stop_id = llm.tokenizer.encode(" N", add_special_tokens=False)[-1]
 
     llm_check_output(llm,
                      prompts, ["D E F G H I J K L M"],
@@ -1457,7 +1460,18 @@ def test_startup_metrics_by_server_info() -> None:
     second_response = asyncio.run(server.get_server_info())
     third_response = asyncio.run(server.get_server_info())
 
-    assert json.loads(first_response.body) == {
+    first, second, third = (json.loads(response.body)
+                            for response in (first_response, second_response,
+                                             third_response))
+    # The render fingerprint is covered by its own tests; here it only has to be
+    # present and the same on every call.
+    fingerprints = [
+        body.pop("render_fingerprint") for body in (first, second, third)
+    ]
+    assert fingerprints[0]["digest"]
+    assert fingerprints[0] == fingerprints[1] == fingerprints[2]
+
+    assert first == {
         "disaggregated_params": {},
         "startup_metrics": {},
     }
@@ -1469,8 +1483,8 @@ def test_startup_metrics_by_server_info() -> None:
             }
         },
     }
-    assert json.loads(second_response.body) == expected_success
-    assert json.loads(third_response.body) == expected_success
+    assert second == expected_success
+    assert third == expected_success
     assert executor.calls == 2
 
 

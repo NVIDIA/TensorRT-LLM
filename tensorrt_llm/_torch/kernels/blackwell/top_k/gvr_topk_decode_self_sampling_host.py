@@ -119,7 +119,7 @@ C-semantics notes encoded here:
 
 # ---- dispatch constants (must match the device kernels) ---------------------
 NB = 1024  # register-path histogram bins
-QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths, every register plan)
+QUADC = 96  # crossing-bin O(mc^2) rank gate for streaming paths
 SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
@@ -132,12 +132,9 @@ def route(
     k: int,
     num_sms: int = 148,
     sm_version: int = 100,
+    det: bool = False,
 ) -> dict[str, object]:
-    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
-
-    Deviations from the CUDA reference (self-sampling only): the 4K < n <= 8K
-    register rungs, QC = QUADC for every register plan, NB bins for the
-    not-wide register plans up to n4 <= 2048."""
+    """Select a kernel and launch resources from the shape and device properties."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
@@ -150,22 +147,30 @@ def route(
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    # QC = QUADC for every register plan: the O(mc^2) rank loop is taken only
-    # for mc <= QC, so a wider gate lets one row whose first-k bracket misses
-    # the k-th value stall the whole one-wave launch. Rows with mc <= QUADC
-    # take the same branch under either gate.
-    QC = QUADC
+    QC = 160
     CURE = not (n < 2 * k and b > num_sms)
+    if not wide and k == 2048 and sm_version in (100, 103) and 512 < n4 <= 1024:
+        CURE = True
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
-    # NB bins for the not-wide register plans up to n4 <= 2048 (incl. the
-    # (512, 4, 2) rung below) so IMGOFF == NBH holds at every reg site.
+    long_register = (
+        not wide
+        and sm_version in (100, 103)
+        and n4 > 2048
+        and ((k == 2048 and n4 <= 3072) or (512 < k <= 1024 and n4 <= 5 * 512))
+    )
+    short_wide = wide and k == 2048 and sm_version in (100, 103) and 512 < n4 <= 1024
     NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
+    if long_register or short_wide:
+        NBSEL = NB
     IMGOFF = NBSEL
-    smem_reg = (NBSEL + 2 * CMP) * 4
 
     def _reg(BLK, VPT, MINB, NBH):
+        # Deterministic emitters pack one bit per scalar into a 32-bit mask.
+        if det and VPT > 8:
+            BLK *= 2
+            VPT = (VPT + 1) // 2
         # DEG wins over the CUR flag; DEG forces KPT=1, else KPT ladder 1/2/4.
         if DEGE:
             tpl = (BLK, VPT, MINB, 1, CURE, True, False, NBH)
@@ -180,13 +185,13 @@ def route(
                 "npad": npad,
                 "k": k,  # full ABI
                 "CMP": CMP,
-                "IMGOFF": IMGOFF,
+                "IMGOFF": NBH,
                 "QC": QC,
             },
             "grid": (b, 1),
             "cluster": 1,
             "block": BLK,
-            "smem": smem_reg,
+            "smem": (NBH + 2 * CMP) * 4,
             "ws": False,
         }
 
@@ -200,6 +205,8 @@ def route(
         return _reg(512, 1, 4, NB)
     if n4 <= 1024:
         if wide:
+            if short_wide:
+                return _reg(512, 2, 1, NB)
             if IMGE:
                 # regimg launch: gvr_topk_reg<1024,1,2,1,true,false,true,2048>
                 return {
@@ -219,11 +226,35 @@ def route(
                     "smem": smi,
                     "ws": False,
                 }
-            return _reg(1024, 1, 2, 2 * NB)
+            return _reg(1024, 1, 1, 2 * NB)
+        if sm_version in (100, 103) and k == 2048 and n4 <= 768:
+            return _reg(256, 3, 4, NB)
         return _reg(512, 2, 4, NB)
 
+    if k == 1024 and b in (512, 1024) and 1024 < n4 <= 1536 and sm_version in (100, 103):
+        return _reg(256, (n4 + 255) // 256, 4, NB)
+
+    # Seven/eight resident fragments use rematerialized bins in the varlen launcher.
+    if k == 1024 and b in (512, 1024) and 1536 < n4 <= 2048 and sm_version in (100, 103):
+        return _reg(256, (n4 + 255) // 256, 4, NB)
+
+    if k == 512 and sm_version in (100, 103):
+        if b > 6 * num_sms and 1024 < n4 <= 2560:
+            if n4 <= 2048:
+                return _reg(512, (n4 + 511) // 512, 4, NB)
+            return _reg(256, (n4 + 255) // 256, 4, NB)
+        if num_sms < b <= 2 * num_sms and 2048 < n4 <= 3072:
+            return _reg(512, (n4 + 511) // 512, 2, NB)
+
+    # Wide K=2048 rows that fit one wave of register CTAs (<= 4 streaming splits).
+    k2048_reg_rung = False
+    if wide and k == 2048 and sm_version in (100, 103) and n4 <= 8192:
+        streaming_splits = min(148 // b, (n4 + 1023) // 1024) if b <= 32 else 1
+        k2048_reg_rung = streaming_splits <= 4 or (b <= 16 and n == 32768)
+
     # ---- clustered register-resident path ----
-    if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
+    # K=2048 runs with two hint slots per thread (tuple slot KH); the one-wave rung keeps its rows.
+    if n4 > 4096 and n4 <= 8 * BLKC * 4 and (k <= BLKC or (k == 2 * BLKC and not k2048_reg_rung)):
         av = 148 // (b if b > 0 else 1)  # truncating
         amax = 1
         while (amax << 1) <= av and amax < 8:
@@ -247,7 +278,7 @@ def route(
             smc = (3 * NB + 2 * CMPC) * 4
             return {
                 "kernel": "reg_clus",
-                "tpl": (BLKC, vsel, cs),
+                "tpl": (BLKC, vsel, cs, k),
                 "rt": {"n": n, "npad": npad, "k": k},  # dims only
                 "grid": (cs, b),
                 "cluster": cs,
@@ -256,26 +287,38 @@ def route(
                 "ws": False,
             }
 
-    # 4K < n <= 8K (n4 in (1024, 2048]): one-wave register rungs. Wide rows:
-    # BLK=1024 x VPT=2 covers n4 <= 2048 exactly (the VPT=4 plan below carries
-    # two empty float4 slots per thread). num_sms < b <= 2*num_sms: two
-    # BLK=512 CTAs per SM form one wave; taller batches keep the main slab.
+    # 4K < n <= 8K: select register geometry from the row count and K.
     if n4 <= 2048:
         if wide:
+            if k == 2048 and sm_version in (100, 103) and n4 <= 1536:
+                return _reg(512, 3, 1, 2 * NB)
             return _reg(1024, 2, 1, 2 * NB)
-        # On SM103 with 148 SMs, the existing register plan remains faster
-        # across the measured b=512..1024, k=2048 range. Keep the exception
-        # architecture- and shape-exact: smaller K and nearby lower batches
-        # have different winners, while SM100 retains its original streaming
-        # route byte-for-byte.
         sm103_large_batch_k2048 = (
-            sm_version == 103 and num_sms == 148 and 512 <= b <= 1024 and k == 2048
+            sm_version in (100, 103) and num_sms == 148 and 512 <= b <= 1024 and k == 2048
         )
         if b <= 2 * num_sms or sm103_large_batch_k2048:
+            if n4 <= 1536:
+                if sm_version in (100, 103) and k == 2048 and n4 <= 1280 and b > 2 * num_sms:
+                    sparse_final_slot = n4 <= 4 * 256 + 128
+                    if b <= 4 * num_sms or (b > 6 * num_sms and sparse_final_slot):
+                        return _reg(256, 5, 4, NB)
+                    if b > 5 * num_sms:
+                        return _reg(256, 5, 3, NB)
+                return _reg(512, 3, 2, NB)
             return _reg(512, 4, 2, NB)
 
     if n4 <= 4096 and wide:
-        return _reg(1024, 4, 1, 2 * NB)
+        vpt = 3 if n4 <= 3072 else 4
+        return _reg(1024, vpt, 1, 2 * NB)
+
+    if long_register:
+        return _reg(512, 5 if n4 <= 2560 else 6, 2, NB)
+
+    if k2048_reg_rung:
+        return _reg(1024, (n4 + 1023) // 1024, 1, 2 * NB)
+
+    if n <= 12288:
+        return _reg(512, (n4 + 511) // 512, 2, NBSEL)
 
     # ====================== streaming / collect path ========================
     R = 1
@@ -862,7 +905,7 @@ def _varlen_launcher(
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version)
+    plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
@@ -883,6 +926,15 @@ def _varlen_launcher(
     # size, all safe upper bounds for every per-row n <= envelope; per-row n
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
+        stage_output = num_rows > num_sms and not (
+            k <= 512 and n_kernel <= 2 * k and num_rows <= 2 * num_sms
+        )
+        if k == 2048 and n_kernel > k and num_rows <= num_sms and sm_version in (100, 103):
+            stage_output = True
+        small_k_resident = (
+            k == 512 and num_rows > num_sms and n_kernel > 4096 and sm_version in (100, 103)
+        )
+        static_k = None if k <= 512 and tuple(plan_free["tpl"][:2]) == (1024, 1) else k
         fn = dev.get_compiled__reg(
             tuple(plan_free["tpl"]),
             varlen=True,
@@ -890,12 +942,45 @@ def _varlen_launcher(
             cr_shift=cr_shift,
             hint_free=True,
             det=det,
+            stage_output=stage_output,
+            static_k=static_k,
+            static_npad=npad
+            if (
+                k in (1024, 2048)
+                or small_k_resident
+                or (k == 1024 and plan_free["tpl"][0] == 512 and plan_free["tpl"][1] >= 5)
+                or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
+            )
+            and n_kernel > k
+            and sm_version in (100, 103)
+            else None,
+            dense_bracket=k <= 512,
+            dense_lower_bound=k > 512 and n_kernel < 2 * k,
+            bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8192 else 1,
+            warp_rank=(
+                ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
+                and n_kernel > k
+                and sm_version in (100, 103)
+            ),
+            rematerialize_bins=(small_k_resident and (num_rows > 2 * num_sms or n_kernel <= 8192))
+            or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
+            or (
+                sm_version in (100, 103)
+                and k == 2048
+                and num_rows > 6 * num_sms
+                and tuple(plan_free["tpl"][:3]) == (256, 5, 4)
+            ),
         )
         rt_f = plan_free["rt"]
         lc = (
             "reg",
             fn,
-            (n_kernel, rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+            (
+                n_kernel,
+                rt_f["CMP"],
+                rt_f["QC"],
+                dev.STATIC_BYTES + plan_free["smem"] + (4 * k if stage_output else 0),
+            ),
         )
         _VARLEN_CACHE[key] = lc
         return lc
@@ -927,13 +1012,22 @@ def _varlen_launcher(
         return lc
     plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
+    if k == 512 and num_rows > 2 * num_sms and sm_version in (100, 103):
+        n4 = n_route >> 2
+        if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
+            tpl = (256, 4, 4, tpl[3], 2, False, False)
     rt = plan["rt"]
     r_const = rt["R"]
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = dev.get_compiled(
-        tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True, det=det, fused_k=k
+        tpl[:6] + (False,) + (next_n, cr_shift, r_const),
+        hint_free=True,
+        det=det,
+        fused_k=k,
+        warp_rank=k == 2048 and sm_version in (100, 103),
+        staged_k=k if k == 2048 and r_const == 1 and sm_version in (100, 103) else 0,
     )
     big = num_rows * r_const <= 148
     aim_base = (
@@ -1212,7 +1306,7 @@ def _device_num_sms(dev_index: int) -> int:
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
 def _build_launcher(b, n, npad, k, num_sms, sm_version=100, det=False):
-    rd = route(b, n, npad, k, num_sms, sm_version)
+    rd = route(b, n, npad, k, num_sms, sm_version, det=det)
     fam = rd["kernel"]
     tpl = tuple(rd["tpl"])
     rt = rd["rt"]
@@ -1493,9 +1587,9 @@ def run_varlen(
       not new-token seq_lens); row ``r`` uses
       ``n_r = (kv_lens[r // next_n] - next_n + (r % next_n) + 1) //
       compress_ratio`` valid entries (cr 1 = DSv3.2, 4 = DSv4 Flash/Pro);
-      the bracket is derived from the current row itself (register families:
-      min/max fold of the first k row values; streaming families do not
-      consume a temporal hint on the accept path); ``k`` comes from
+      the bracket is derived from the current row itself (register families
+      use resident scores; streaming families do not consume a temporal
+      hint on the accept path); ``k`` comes from
       ``indices.shape[1]``;
       per-row ``n_r <= k`` takes the short path (identity + ``-1`` tail).
 
@@ -1874,6 +1968,7 @@ def warmup_varlen(
             int(top_k),
             num_sms,
             sm_version,
+            det=bool(deterministic),
         )
         if plan_free["kernel"] == "reg_clus":
             ekey = ("reg_clus", tuple(plan_free["tpl"]))

@@ -76,7 +76,7 @@ def verify_license_files():
         timeout=60)
 
     if result.returncode != 0:
-        print(f"ERROR: License files check failed!")
+        print("ERROR: License files check failed!")
         print(result.stdout)
         print(result.stderr)
         exit(1)
@@ -87,7 +87,7 @@ def verify_license_files():
         import json
         found_files = json.loads(output_lines[-1])
     except (json.JSONDecodeError, IndexError):
-        print(f"ERROR: Could not parse license files from output!")
+        print("ERROR: Could not parse license files from output!")
         print(result.stdout)
         exit(1)
 
@@ -101,7 +101,7 @@ def verify_license_files():
     # Check that at least one valid attribution file is present
     found_attributions = [f for f in found_files if f in valid_attributions]
     if not found_attributions:
-        print(f"ERROR: No valid attribution file found!")
+        print("ERROR: No valid attribution file found!")
         print(f"Expected one of: {valid_attributions}")
         print(f"Found: {found_files}")
         exit(1)
@@ -143,15 +143,17 @@ def verify_openengine_distribution() -> None:
             raise RuntimeError(
                 f"Wheel extra {extra!r} does not declare {expected}")
 
-    expected_grpc = Requirement("grpcio>=1.67.1,<2")
-    grpc_declared = any(
-        canonicalize_name(requirement.name) == canonicalize_name(
-            expected_grpc.name) and requirement.specifier ==
-        expected_grpc.specifier and requirement.marker is None
-        for requirement in requirements)
-    if not grpc_declared:
-        raise RuntimeError(
-            f"TensorRT-LLM does not declare base requirement {expected_grpc}")
+    for expected_grpc in (Requirement("grpcio>=1.73.1,<2"),
+                          Requirement("grpcio-health-checking>=1.73.1,<1.82")):
+        grpc_declared = any(
+            canonicalize_name(requirement.name) == canonicalize_name(
+                expected_grpc.name) and requirement.specifier ==
+            expected_grpc.specifier and requirement.marker is None
+            for requirement in requirements)
+        if not grpc_declared:
+            raise RuntimeError(
+                f"TensorRT-LLM does not declare base requirement {expected_grpc}"
+            )
 
     proto_names = (
         "error",

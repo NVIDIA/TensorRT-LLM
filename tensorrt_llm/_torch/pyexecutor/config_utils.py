@@ -326,34 +326,12 @@ def resolve_ssm_cache_dtype(config):
     return None
 
 
-KIMI_KDA_STATE_DTYPES = (torch.float32, torch.bfloat16)
-
-
 def resolve_auto_ssm_cache_dtype(config, fallback):
-    """Resolve mamba_ssm_cache_dtype="auto" for ``config``.
-
-    Kimi K3 defaults to fp32: the HF reference (fla chunk/fused_recurrent
-    KDA kernels) carries the delta-rule recurrent state in fp32. A bf16
-    state pool is an explicit opt-in through
-    kv_cache_config.mamba_ssm_cache_dtype; prefill, decode and sequential
-    verify then stage the addressed rows through an fp32 copy and round the
-    committed state back to bf16. The fused MTP verify kernel
-    (``trtllm::kda_mtp_decode``) reads and writes a bf16 pool directly and
-    rounds the committed state to nearest.
-    A checkpoint-declared
-    mamba_ssm_cache_dtype is not applied to Kimi K3 (the released
-    checkpoints do not carry the field); it is logged when it would have
-    changed the dtype.
-    """
+    """Resolve the model's automatic recurrent-state dtype."""
     if is_kimi_linear(config):
-        declared = resolve_ssm_cache_dtype(config)
-        if declared is not None and declared != torch.float32:
-            logger.info(
-                "Kimi K3: the checkpoint declares "
-                f"mamba_ssm_cache_dtype={declared}; keeping the fp32 "
-                "recurrent-state pool (kv_cache_config.mamba_ssm_cache_dtype "
-                "opts in to bfloat16).")
-        return torch.float32
+        from ..modules.kimi_kda.cache_manager import \
+            resolve_kimi_ssm_cache_dtype
+        return resolve_kimi_ssm_cache_dtype(config)
     return (resolve_ssm_cache_dtype(config) or resolve_hf_torch_dtype(config)
             or fallback)
 
@@ -361,23 +339,12 @@ def resolve_auto_ssm_cache_dtype(config, fallback):
 def validate_kimi_kda_state_dtype(config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding=False):
-    """Reject state-cache settings the Kimi K3 KDA kernels cannot honor.
-
-    The kernels read fp32 or bf16 state and round the committed state to
-    nearest; stochastic rounding is a Mamba2 fp16-cache feature that would
-    otherwise be accepted and silently ignored here.
-    """
-    if not is_kimi_linear(config):
-        return
-    if mamba_ssm_cache_dtype not in KIMI_KDA_STATE_DTYPES:
-        raise ValueError(
-            "Kimi K3 KDA recurrent-state cache supports float32 (default) or "
-            f"bfloat16; got mamba_ssm_cache_dtype={mamba_ssm_cache_dtype}.")
-    if mamba_ssm_stochastic_rounding and mamba_ssm_cache_dtype != torch.float32:
-        raise ValueError(
-            "Kimi K3 KDA kernels round the committed recurrent state to "
-            "nearest; mamba_ssm_stochastic_rounding is not supported with a "
-            f"{mamba_ssm_cache_dtype} state cache.")
+    """Delegate KDA state-cache validation to the model owner."""
+    if is_kimi_linear(config):
+        from ..modules.kimi_kda.cache_manager import \
+            validate_kimi_state_cache_dtype
+        validate_kimi_state_cache_dtype(mamba_ssm_cache_dtype,
+                                        mamba_ssm_stochastic_rounding)
 
 
 def resolve_vocab_size(config) -> Optional[int]:
@@ -540,74 +507,23 @@ def get_qwen3_hybrid_num_attention_layers(config):
     return sum(layer_mask)
 
 
-def get_qwen4_exp_ple_layer_mask(
-        config: transformers.PretrainedConfig) -> list[bool]:
-    """Return the decoder-layer mask for the one-based PLE layer IDs."""
-    ple_layer_ids = list(getattr(config, "ple_layer_ids", None) or [])
-    invalid_ids = [
-        layer_id for layer_id in ple_layer_ids
-        if not isinstance(layer_id, int) or isinstance(layer_id, bool)
-        or not 1 <= layer_id <= config.num_hidden_layers
-    ]
-    if invalid_ids:
-        raise ValueError(
-            "ple_layer_ids must contain one-based decoder-layer IDs in "
-            f"[1, {config.num_hidden_layers}], got {invalid_ids}")
-    if len(ple_layer_ids) != len(set(ple_layer_ids)):
-        raise ValueError("ple_layer_ids must not contain duplicate layer IDs")
-    if len(ple_layer_ids) > 1:
-        # Qwen4ExpModel._prepare_ple_state currently resolves one shared state
-        # tuple. Supporting multiple PLE layers requires separate per-layer
-        # metadata and pools; removing only this guard would silently reuse state.
-        raise ValueError(
-            "Qwen4-Exp currently supports at most one PLE decoder layer, "
-            f"got ple_layer_ids={ple_layer_ids}")
-    ple_layer_id_set = set(ple_layer_ids)
-    return [(layer_id + 1) in ple_layer_id_set
-            for layer_id in range(config.num_hidden_layers)]
-
-
-@dataclasses.dataclass
-class Qwen4ExpPLECacheParams:
-    """Shapes and dtypes for PLE recurrent-state pools."""
-
-    ple_layer_mask: list[bool]
-    num_ple_layers: int
-    short_conv_channels: int
-    short_conv_state_len: int
-    ngram_context_len: int
-    conv_state_dtype: torch.dtype
-
-
-def extract_qwen4_exp_ple_cache_params(
-        config: transformers.PretrainedConfig) -> Qwen4ExpPLECacheParams:
-    """Derive PLE recurrent-state pool dimensions from the model config."""
-    ple_layer_mask = get_qwen4_exp_ple_layer_mask(config)
-    hc_count = getattr(config, "hc_count", 1) or 1
-    return Qwen4ExpPLECacheParams(
-        ple_layer_mask=ple_layer_mask,
-        num_ple_layers=sum(ple_layer_mask),
-        short_conv_channels=hc_count * config.hidden_size,
-        short_conv_state_len=(config.ple_conv_kernel_size - 1) *
-        config.ngram_size,
-        ngram_context_len=config.ngram_size - 1,
-        conv_state_dtype=resolve_hf_torch_dtype(config) or torch.bfloat16,
-    )
-
-
 def mamba_effective_tp_size(mapping) -> int:
     """TP degree for sizing per-rank mamba/KDA state (budgeting AND allocation).
 
-    Attention-DP replicates the state and takes precedence; helix repurposes
-    CP ranks as plain TP for recurrent-state layers. Must match the runtime
-    pool construction (mamba_cache_manager) or the budget split withholds
-    unsharded-state bytes the allocator never uses (observed: 27.2 GiB/rank
-    mis-withheld on a helix16 gen worker whose real pool is 1/16-sharded).
+    Attention-DP replicates the state; helix repurposes CP ranks as plain TP
+    for recurrent-state layers, and under helix + attention-DP at tp_size 1
+    (Kimi K3 helix_a2a) the CP group still shares every request, so the state
+    stays head-sharded across it. Must match the runtime pool construction
+    (mamba_cache_manager) or the budget split withholds unsharded-state bytes
+    the allocator never uses (observed: 27.2 GiB/rank mis-withheld on a
+    helix16 gen worker whose real pool is 1/16-sharded).
     """
+    if mapping.has_cp_helix():
+        if mapping.enable_attention_dp:
+            return mapping.cp_size if mapping.tp_size == 1 else 1
+        return mapping.tp_size * mapping.cp_size
     if mapping.enable_attention_dp:
         return 1
-    if mapping.has_cp_helix():
-        return mapping.tp_size * mapping.cp_size
     return mapping.tp_size
 
 
@@ -685,74 +601,39 @@ class MambaKVCacheParams:
         return state_bytes_per_layer
 
 
-def extract_mamba_kv_cache_params(
-    config,
-    spec_config=None,
-    quant_config=None,
-) -> MambaKVCacheParams:
-    """Build the mamba-related inputs for kv_cache_manager_cls.
-
-    Supports Nemotron-hybrid, Qwen3-hybrid (Qwen3-Next + Qwen3.5),
-    Qwen4-Exp, and Kimi K3 (kimi_linear).
-
-    Args:
-        config: HuggingFace model config of a hybrid Mamba model.
-        spec_config: Optional speculative-decoding config used to describe
-            appended attention-only MTP/draft layers separately from target
-            layers.
-        quant_config: Optional, used only to surface `mamba_ssm_cache_dtype`.
-
-    Returns:
-        MambaKVCacheParams with normalized field names.
-    """
+def extract_mamba_kv_cache_params(config,
+                                  spec_config=None,
+                                  quant_config=None) -> MambaKVCacheParams:
+    """Dispatch geometry extraction to the model's cache implementation."""
     if is_nemotron_hybrid(config):
-        state_size = config.ssm_state_size
-        conv_kernel = config.conv_kernel
-        num_heads = config.mamba_num_heads
-        n_groups = config.n_groups
-        head_dim = config.mamba_head_dim
-        pattern = config.hybrid_override_pattern
-        target_full_attn_mask = [layer_type == "*" for layer_type in pattern]
-        mamba_mask = [layer_type == "M" for layer_type in pattern]
+        from ..modules.mamba.cache_manager import \
+            get_nemotron_cache_params as extract
     elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
-        state_size = config.linear_key_head_dim
-        conv_kernel = config.linear_conv_kernel_dim
-        num_heads = config.linear_num_value_heads
-        n_groups = config.linear_num_key_heads
-        head_dim = config.linear_value_head_dim
-        target_full_attn_mask, mamba_mask = get_qwen3_hybrid_layer_masks(config)
+        from ..modules.fla.cache_manager import get_gdn_cache_params as extract
     elif is_kimi_linear(config):
-        # Kimi K3 KDA (Kimi Delta Attention) state, mapped onto the Mamba
-        # cache-manager parametrization (see PythonMambaCacheManager):
-        #   conv_dim = head_dim*num_heads + 2*n_groups*state_size
-        #            = 3 * num_heads * head_dim  -> [q | k | v] short-conv
-        #   ssm state shape = [num_heads, head_dim, state_size]
-        #            = [H, V, K] fp32 delta-rule recurrent state.
-        # The pool stores the W - 1 raw inputs needed by the production
-        # causal-convolution kernels, where W is short_conv_kernel_size.
-        lin = unwrap_kimi_text_config(config).linear_attn_config
-        state_size = lin["head_dim"]
-        conv_kernel = lin["short_conv_kernel_size"]
-        num_heads = lin["num_heads"]
-        n_groups = lin["num_heads"]
-        head_dim = lin["head_dim"]
-        target_full_attn_mask, mamba_mask = get_kimi_linear_layer_masks(config)
+        from ..modules.kimi_kda.cache_manager import \
+            get_kimi_cache_params as extract
     elif is_glm5_next(config):
-        # GLM-5.3-Flash KDA state uses the same mamba parametrization as
-        # Kimi K3: [q | k | v] short-conv sections of identical width and an
-        # [H, V, K] fp32 delta-rule recurrent state, with the KDA geometry
-        # coming from the text config's linear_attn_config.
-        lin = unwrap_glm5_next_text_config(config).linear_attn_config
-        state_size = lin["head_dim"]
-        conv_kernel = lin["short_conv_kernel_size"]
-        num_heads = lin["num_heads"]
-        n_groups = lin["num_heads"]
-        head_dim = lin["head_dim"]
-        target_full_attn_mask, mamba_mask = get_glm5_next_layer_masks(config)
+        from ..attention.backends.sparse.glm_kpool.cache_manager import \
+            get_glm5_next_cache_params as extract
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
+    return extract(config, spec_config=spec_config, quant_config=quant_config)
 
+
+def build_mamba_kv_cache_params(config,
+                                *,
+                                state_size,
+                                conv_kernel,
+                                num_heads,
+                                n_groups,
+                                head_dim,
+                                mamba_mask,
+                                target_full_attn_mask,
+                                spec_config=None,
+                                quant_config=None) -> MambaKVCacheParams:
+    """Normalize dtype and draft layout after model-owned geometry extraction."""
     num_draft_layers = 0
     if spec_config is not None:
         # Imported lazily to avoid a circular dependency between
@@ -768,10 +649,6 @@ def extract_mamba_kv_cache_params(
         mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
             config, torch.bfloat16)
     validate_kimi_kda_state_dtype(config, mamba_ssm_cache_dtype)
-    if is_glm5_next(config) and mamba_ssm_cache_dtype != torch.float32:
-        logger.info(f"glm5_next KDA: overriding mamba_ssm_cache_dtype "
-                    f"{mamba_ssm_cache_dtype} -> torch.float32")
-        mamba_ssm_cache_dtype = torch.float32
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -921,6 +798,10 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     cosmos3="Cosmos3Config",
     cosmos3_omni=
     "Cosmos3Config",  # backward-compat alias for pre-rename checkpoints
+    cosmos3_edge="Cosmos3EdgeConfig",
+    cosmos3_edge_text="Cosmos3EdgeTextConfig",
+    cosmos3_edge_vision="Cosmos3EdgeVisionConfig",
+    cosmos3_edge_projector="Cosmos3EdgeProjectorConfig",
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
@@ -970,6 +851,182 @@ def match_nemotron_h_layer_types(model_config, layer_types):
         modern = {v: k for k, v in _NEMOTRON_H_LEGACY_LAYER_TYPES.items()}
         return [modern.get(t, t) for t in layer_types]
     return [_NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types]
+
+
+MINIMAX_DSPARK_DRAFT_ARCH = "DSparkMiniMaxDraftModel"
+
+# Keys of the standalone MiniMax DSpark drafter config.json that describe the
+# target checkpoint it was exported next to, not the drafter itself. The
+# drafter's MXFP8 linears are dequantized to the compute dtype at load, so the
+# quantization block is dropped and the backbone is built unquantized.
+_MINIMAX_DSPARK_DROPPED_KEYS = frozenset({
+    "text_config",
+    "vision_config",
+    "quantization_config",
+    "architectures",
+    "model_type",
+    "_name_or_path",
+})
+
+
+def build_minimax_dspark_draft_config(
+        config_dict: dict) -> transformers.PretrainedConfig:
+    """Flat drafter config for a standalone MiniMax-M3 DSpark checkpoint.
+
+    The drafter ships a MiniMax VL-shaped config.json: ``model_type``
+    ``minimax_m3_vl`` with the backbone geometry nested under ``text_config``,
+    no ``auto_map`` and no modeling code, so ``AutoConfig.from_pretrained``
+    cannot resolve it. The drafter's own fields (``dspark_*``,
+    ``dflash_config``, ``hidden_size``, ``vocab_size``, ...) are duplicated
+    at the top level and inside ``text_config``. The text side wins for other
+    fields; window declarations must agree, and null window fields are unset.
+    The result is a plain ``PretrainedConfig`` with every field as
+    an attribute, which is what ``DFlashForCausalLM`` and the registered
+    ``DSparkMiniMaxDraftModel`` backbone read.
+
+    ``dflash_config`` gets ``use_swa`` / ``swa_window_size`` when the drafter
+    declares ``sliding_attention`` layers with a ``sliding_window`` but not the
+    DFlash spelling: the block decode keys its per-layer window on the former,
+    and the HF reference these drafters are distilled with applies the window
+    on exactly those layers. An explicit ``use_sliding_window: false`` (the
+    DFlash operator switch read by ``get_layer_attention_window``) forces
+    ``use_swa`` off, whether it would come from that translation or from the
+    checkpoint's own ``dflash_config``, and an explicit ``use_swa: false`` in
+    ``dflash_config`` turns ``use_sliding_window`` off when that key is not set
+    explicitly, so the context window and the block windows are disabled
+    together rather than one at a time.
+    """
+    flat = {
+        k: v
+        for k, v in config_dict.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
+    }
+    text = config_dict.get("text_config") or {}
+    # Window declarations may be repeated at the top level, under text_config
+    # and inside either dflash_config copy (HF or DFlash spelling). Every
+    # non-null copy must agree: the context path and the block decode read
+    # them from different places, so conflicting declarations are rejected
+    # before merging, where precedence would otherwise hide them silently.
+    # The error names both sources.
+    window_keys = ("layer_types", "sliding_window", "use_sliding_window")
+    sources = (
+        ("config", config_dict),
+        ("text_config", text),
+        ("dflash_config", config_dict.get("dflash_config") or {}),
+        ("text_config.dflash_config", text.get("dflash_config") or {}),
+    )
+    declared = {}
+    for source_name, source in sources:
+        # use_swa / swa_window_size are DFlash keys: only the dflash_config
+        # copies declare them, nothing reads them at the outer levels.
+        keys = window_keys if source_name in ("config", "text_config") else (
+            *window_keys, "use_swa", "swa_window_size")
+        for key in keys:
+            value = source.get(key)
+            if value is None:
+                continue
+            name = f"{source_name}.{key}"
+            canonical = "sliding_window" if key == "swa_window_size" else key
+            if canonical in declared:
+                other_name, other_value = declared[canonical]
+                if value != other_value:
+                    raise ValueError(
+                        f"Conflicting MiniMax DSpark {canonical}: "
+                        f"{other_name}={other_value!r} vs {name}={value!r}.")
+            else:
+                declared[canonical] = (name, value)
+
+    if "use_swa" in declared and "use_sliding_window" in declared:
+        swa_name, use_swa = declared["use_swa"]
+        sliding_name, use_sliding_window = declared["use_sliding_window"]
+        if use_swa is False and use_sliding_window is True:
+            raise ValueError(f"Conflicting MiniMax DSpark switches: "
+                             f"{swa_name}={use_swa!r} vs "
+                             f"{sliding_name}={use_sliding_window!r}.")
+
+    # A null window field under text_config counts as unset and must not
+    # shadow a value given at the top level.
+    flat.update({
+        k: v
+        for k, v in text.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
+        and not (k in window_keys and v is None)
+    })
+    if "layer_types" in declared and flat.get("num_hidden_layers") is not None:
+        name, types = declared["layer_types"]
+        if len(types) != flat["num_hidden_layers"]:
+            raise ValueError(
+                f"Conflicting MiniMax DSpark layer_types: "
+                f"{name} length={len(types)} vs "
+                f"num_hidden_layers={flat['num_hidden_layers']!r}.")
+
+    dflash = dict(flat.get("dflash_config") or {})
+    # text_config replaces the outer dflash_config as a whole; a window field
+    # declared only in the outer copy must survive that replacement (the scan
+    # above already made sure the two copies agree wherever both speak).
+    outer_dflash = config_dict.get("dflash_config") or {}
+    for key in ("layer_types", "sliding_window", "use_swa", "swa_window_size"):
+        if outer_dflash.get(key) is not None and dflash.get(key) is None:
+            dflash[key] = outer_dflash[key]
+    # The operator switch may also be written inside dflash_config; it is read
+    # from the top level, so a nested declaration is surfaced there.
+    if "use_sliding_window" in declared and flat.get(
+            "use_sliding_window") is None:
+        flat["use_sliding_window"] = declared["use_sliding_window"][1]
+    # A null window field in config.json counts as unset, which is how DFlash
+    # and get_layer_attention_window read it; dropping the key here lets the
+    # lifts and switches below treat null and missing alike.
+    for key in ("layer_types", "sliding_window", "use_sliding_window"):
+        if key in flat and flat[key] is None:
+            del flat[key]
+    for key in ("layer_types", "sliding_window", "use_swa", "swa_window_size"):
+        if key in dflash and dflash[key] is None:
+            del dflash[key]
+    layer_types = dflash.get("layer_types") or flat.get("layer_types") or []
+    sliding_window = dflash.get("sliding_window") or flat.get("sliding_window")
+    # DFlash and get_layer_attention_window read the per-layer types and the
+    # window size from the top level; values the checkpoint keeps only in
+    # dflash_config would otherwise window every draft layer, or window the
+    # block decode and not the context.
+    if layer_types:
+        flat.setdefault("layer_types", list(layer_types))
+    if sliding_window:
+        flat.setdefault("sliding_window", int(sliding_window))
+    # Two switches gate the windows: the top-level use_sliding_window (context
+    # window) and the DFlash use_swa (block windows). A checkpoint use_swa:
+    # false also turns the context window off unless use_sliding_window is set
+    # explicitly, and use_sliding_window: false always turns use_swa off, so
+    # neither path stays windowed on its own by accident.
+    if dflash.get("use_swa") is False:
+        flat.setdefault("use_sliding_window", False)
+    if flat.get("use_sliding_window") is False:
+        dflash["use_swa"] = False
+        dflash.pop("swa_window_size", None)
+    elif ("use_swa" not in dflash and sliding_window
+          and "sliding_attention" in layer_types):
+        dflash["use_swa"] = True
+        dflash["swa_window_size"] = int(sliding_window)
+        dflash.setdefault("layer_types", list(layer_types))
+    elif (dflash.get("use_swa") is True and sliding_window
+          and dflash.get("swa_window_size") is None):
+        # An explicit use_swa without the DFlash window size takes the HF one;
+        # DFlash rejects use_swa with no size.
+        dflash["swa_window_size"] = int(sliding_window)
+    flat["dflash_config"] = dflash
+    flat["architectures"] = [MINIMAX_DSPARK_DRAFT_ARCH]
+    # Not ``minimax_m3_vl``: that model_type selects the VL target's
+    # text_config unwrapping and input-processor registration, neither of
+    # which applies to the flattened drafter.
+    flat["model_type"] = "minimax_dspark_draft"
+    dtype = flat.pop("dtype", None) or flat.pop("torch_dtype",
+                                                None) or "bfloat16"
+    flat.pop("torch_dtype", None)
+    if isinstance(dtype, str):
+        dtype = str_dtype_to_torch(dtype)
+    config = transformers.PretrainedConfig()
+    for key, value in flat.items():
+        setattr(config, key, value)
+    config.dtype = dtype
+    config.torch_dtype = dtype
+    return config
 
 
 def load_pretrained_config(model_name_or_path: str,
@@ -1113,6 +1170,16 @@ def load_pretrained_config(model_name_or_path: str,
         vision_config = getattr(model_config, "vision_config", None)
         if getattr(vision_config, "num_hidden_layers", 0) > 0:
             model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
+    elif architectures and architectures[0] == MINIMAX_DSPARK_DRAFT_ARCH:
+        # Standalone MiniMax-M3 DSpark drafter: VL-shaped config.json with
+        # no auto_map, flattened here (see build_minimax_dspark_draft_config).
+        model_config = build_minimax_dspark_draft_config(config_dict)
+    elif model_type == "muse_spark":
+        # The runtime reads a flat config; the translation from the composite
+        # one rejects any value the runtime does not implement.
+        from tensorrt_llm._torch.configs import MuseSparkOpenConfig
+        model_config = MuseSparkOpenConfig.from_open_format(config_dict)
+        model_config.architectures = ["MuseSparkForConditionalGeneration"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

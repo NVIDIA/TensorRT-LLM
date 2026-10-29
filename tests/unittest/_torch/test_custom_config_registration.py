@@ -18,11 +18,16 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 from transformers import AutoConfig
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
 from tensorrt_llm._torch.configs import (
     Cosmos3Config,
+    Cosmos3EdgeConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
     DeepseekV3Config,
     DeepseekV41Config,
     DeepseekV41TextConfig,
@@ -30,6 +35,56 @@ from tensorrt_llm._torch.configs import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+_COSMOS3_EDGE_MIN_CONFIG = {
+    "architectures": ["Cosmos3EdgeForConditionalGeneration"],
+    "model_type": "cosmos3_edge",
+    "image_token_id": 19,
+    "video_token_id": 18,
+    "vision_start_token_id": 20,
+    "vision_end_token_id": 21,
+    "tie_word_embeddings": False,
+    "projector_config": {
+        "model_type": "cosmos3_edge_projector",
+        "input_hidden_size": 1152,
+        "merger_intermediate_size": 11520,
+        "out_hidden_size": 2048,
+        "spatial_merge_size": 2,
+        "use_postshuffle_norm": False,
+    },
+    "text_config": {
+        "model_type": "cosmos3_edge_text",
+        "hidden_size": 2048,
+        "intermediate_size": 9216,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "hidden_act": "relu2",
+        "max_position_embeddings": 131072,
+        "vocab_size": 131072,
+        "rms_norm_eps": 1e-5,
+        "dtype": "bfloat16",
+        "rope_parameters": {
+            "mrope_section": [24, 20, 20],
+            "rope_theta": 100000000,
+            "rope_type": "default",
+        },
+    },
+    "vision_config": {
+        "model_type": "cosmos3_edge_vision",
+        "hidden_size": 1152,
+        "intermediate_size": 4304,
+        "num_hidden_layers": 27,
+        "num_attention_heads": 16,
+        "num_channels": 3,
+        "num_patches": 256,
+        "patch_size": 16,
+        "hidden_act": "gelu_pytorch_tanh",
+        "layer_norm_eps": 1e-6,
+    },
+}
 
 
 _COSMOS3_MIN_CONFIG = {
@@ -91,6 +146,15 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
         assert cfg.text_config.max_position_embeddings == 8192
         assert cfg.vision_config.hidden_size == 256
         assert cfg.vision_config.out_hidden_size == 1024
+    elif model_type == "cosmos3_edge":
+        assert cfg.text_config.hidden_act == "relu2"
+        assert cfg.text_config.rope_scaling["mrope_interleaved"] is True
+        assert cfg.text_config.rope_scaling["type"] == "mrope"
+        assert cfg.text_config.rope_scaling["mrope_section"] == [24, 20, 20]
+        assert cfg.projector_config.merger_intermediate_size == 11520
+        assert cfg.vision_config.out_hidden_size == 2048
+        assert cfg.vision_config.temporal_patch_size == 1
+        assert cfg.vision_config.num_heads == 16
     elif model_type == "deepseek_v41":
         assert not isinstance(cfg.text_config, dict)
         assert not isinstance(cfg.vision_config, dict)
@@ -108,6 +172,10 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
     [
         ("cosmos3", Cosmos3Config),
         ("cosmos3_omni", Cosmos3Config),  # backward-compat alias
+        ("cosmos3_edge", Cosmos3EdgeConfig),
+        ("cosmos3_edge_text", Cosmos3EdgeTextConfig),
+        ("cosmos3_edge_vision", Cosmos3EdgeVisionConfig),
+        ("cosmos3_edge_projector", Cosmos3EdgeProjectorConfig),
         ("deepseek_v32", DeepseekV3Config),
         ("kimi_k2", DeepseekV3Config),
         # The composite is covered by from_pretrained below; check subtypes directly.
@@ -126,6 +194,7 @@ def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
     ("model_type", "config_cls", "config_dict"),
     [
         ("cosmos3", Cosmos3Config, _COSMOS3_MIN_CONFIG),
+        ("cosmos3_edge", Cosmos3EdgeConfig, _COSMOS3_EDGE_MIN_CONFIG),
         ("deepseek_v32", DeepseekV3Config, _deepseek_min_config("deepseek_v32")),
         ("kimi_k2", DeepseekV3Config, _deepseek_min_config("kimi_k2")),
         ("deepseek_v41", DeepseekV41Config, _DEEPSEEK_V41_MIN_CONFIG),
@@ -145,8 +214,61 @@ def test_autoconfig_from_pretrained_resolves_to_local_config(
 
     cfg = AutoConfig.from_pretrained(str(model_dir))
     _verify_autoconfig_from_pretrained(cfg, model_type, config_cls)
-    if model_type == "cosmos3":
+    if model_type in ("cosmos3", "cosmos3_edge"):
         assert cfg._name_or_path == str(model_dir)
+
+
+def test_edge_text_config_keeps_legacy_torch_dtype():
+    cfg = Cosmos3EdgeTextConfig(torch_dtype="float16")
+    assert cfg.dtype == torch.float16
+
+
+def test_edge_rope_parameters_keep_checkpoint_keys():
+    cfg = Cosmos3EdgeTextConfig(
+        rope_parameters={
+            "rope_type": "yarn",
+            "rope_theta": 1e8,
+            "factor": 2.0,
+            "original_max_position_embeddings": 32768,
+        }
+    )
+    assert cfg.rope_parameters["rope_type"] == "yarn"
+    assert cfg.rope_parameters["factor"] == 2.0
+    assert cfg.rope_parameters["original_max_position_embeddings"] == 32768
+    assert cfg.rope_parameters["type"] == "mrope"
+    assert cfg.rope_parameters["mrope_interleaved"] is True
+
+
+def test_edge_rope_parameters_reject_unknown_type():
+    with pytest.raises(ValueError, match="not supported"):
+        Cosmos3EdgeTextConfig(rope_parameters={"rope_type": "custom_rope"})
+
+
+def test_edge_vision_merge_must_match_projector():
+    with pytest.raises(ValueError, match="spatial_merge_size"):
+        Cosmos3EdgeConfig(
+            vision_config={"spatial_merge_size": 4},
+            projector_config={"spatial_merge_size": 2},
+        )
+
+
+def test_edge_from_dict_returns_unused_kwargs():
+    config, unused = Cosmos3EdgeConfig.from_dict(
+        {"model_type": "cosmos3_edge", "text_config": {"torch_dtype": "float16"}},
+        return_unused_kwargs=True,
+        _name_or_path="/tmp/cosmos3-edge",
+        not_a_config_field="kept",
+    )
+    assert config.text_config.dtype == torch.float16
+    assert config._name_or_path == "/tmp/cosmos3-edge"
+    assert unused["not_a_config_field"] == "kept"
+
+
+def test_edge_attn_implementation_reaches_sub_configs():
+    cfg = Cosmos3EdgeConfig(attn_implementation="sdpa")
+    assert cfg.text_config._attn_implementation == "sdpa"
+    assert cfg.vision_config._attn_implementation == "sdpa"
+    assert cfg.projector_config._attn_implementation == "sdpa"
 
 
 def test_legacy_cosmos3_omni_model_type_still_resolves(tmp_path):

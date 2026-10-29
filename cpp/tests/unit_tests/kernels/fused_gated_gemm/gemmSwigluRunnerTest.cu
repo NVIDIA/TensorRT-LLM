@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -339,7 +339,7 @@ TEST(GemmSwigluRunner, Sm90FP8)
     EXPECT_TRUE(hopperFp8.passed);
 #else  // COMPILE_HOPPER_TMA_GEMMS
     std::cout << "[TensorRT LLM Error][GemmSwigluRunnerTest] Please recompile with support for hopper by passing "
-                 "90-real as an arch to build_wheel.py."
+                 "90 as an arch to build_wheel.py."
               << std::endl;
 #endif // COMPILE_HOPPER_TMA_GEMMS
 }

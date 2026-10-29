@@ -27,7 +27,6 @@ from tensorrt_llm.serve.router_utils import KV_CACHE_HASH_ALGO_DEFAULT
 
 from .render_helpers import (
     KIMI_K3,
-    LLAMA,
     SERVER_TEMPLATE,
     WEATHER_TOOL,
     chat_request,
@@ -44,11 +43,6 @@ MODEL_TYPE = "render-test-model"
 @pytest.fixture(scope="module")
 def tokenizer():
     return make_tokenizer()
-
-
-@pytest.fixture(autouse=True)
-def _no_legacy(monkeypatch):
-    monkeypatch.delenv("TRTLLM_RENDER_LEGACY", raising=False)
 
 
 class TestResourceGovernor:
@@ -85,20 +79,6 @@ class TestResourceGovernor:
         expected = render_chat(request, resources(tokenizer, default_chat_template=SERVER_TEMPLATE))
         assert expected.text.startswith("SERVER:")
         assert ids == expected.token_ids
-
-    @pytest.mark.asyncio
-    async def test_the_legacy_switch_restores_the_request_only_template(
-        self, tokenizer, monkeypatch
-    ) -> None:
-        governor = self._governor(tokenizer, chat_template=SERVER_TEMPLATE)
-        modern = await self._convert(governor)
-        monkeypatch.setenv("TRTLLM_RENDER_LEGACY", "1")
-
-        legacy = await self._convert(governor)
-
-        assert legacy != modern
-        request = chat_request(messages=[{"role": "user", "content": "hello world"}])
-        assert legacy == render_chat(request, resources(tokenizer)).token_ids
 
 
 class _Router:
@@ -252,6 +232,40 @@ class TestRouterWriteBack:
             router._tokenize(chat_request())
             assert len(reports()) == 3  # forwarding resumed, then broke again
 
+    def test_concurrent_decisions_never_forward_to_a_mismatching_worker(
+        self, router, tokenizer
+    ) -> None:
+        # _tokenize runs on several threads; the decision must not live on the instance.
+        import sys
+        import threading
+
+        fingerprint = _Router.worker_fingerprint(tokenizer)
+        router._server_info = {
+            "server1": {"render_fingerprint": fingerprint},
+            "server2": {"render_fingerprint": {**fingerprint, "digest": "a-different-digest"}},
+        }
+        assert router._may_write_back_token_ids("m") is False
+        assert not {"_write_back_blockers", "_thinking_blockers"} & set(vars(router))
+        wrong = []
+
+        def decide():
+            for _ in range(4000):
+                if router._may_write_back_token_ids("m"):
+                    wrong.append(1)
+
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)  # switch threads as often as possible
+        try:
+            threads = [threading.Thread(target=decide) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=120)
+        finally:
+            sys.setswitchinterval(interval)
+        assert not any(thread.is_alive() for thread in threads)
+        assert wrong == []
+
     def test_ids_are_not_forwarded_when_no_worker_has_reported_yet(self, router) -> None:
         router._server_info = {}
         request = chat_request()
@@ -353,8 +367,8 @@ class TestRouterWriteBack:
 
             ids = built._tokenize(request)[0]
 
-            assert ids
-            assert request.prompt_token_ids is None
+            assert ids  # routed on the request's text
+            assert request.prompt_token_ids is None  # and left to the worker, which answers it
         finally:
             built._test_patcher.stop()
 
@@ -485,23 +499,63 @@ class TestRouterWriteBack:
 
         assert rendered.token_ids == tokenize_harmony_chat_request(chat_request())
 
+    def test_a_harmony_conversion_error_is_routed_on_no_ids(self, harmony_vocab) -> None:
+        # A tool without a description cannot be converted to Harmony.
+        from tensorrt_llm.serve.router import KvCacheAwareRouter
+
+        router = KvCacheAwareRouter(
+            server_role=None,
+            servers=["server1"],
+            use_tokens=False,
+            max_batch_size=32,
+            tokens_per_block=32,
+            use_harmony=True,
+        )
+        no_description = {
+            "type": "function",
+            "function": {"name": "f", "parameters": {"type": "object", "properties": {}}},
+        }
+        named = {"type": "function", "function": {"name": "f"}}
+        for tool_choice in (None, named):
+            request = chat_request(tools=[no_description], tool_choice=tool_choice)
+
+            assert router._tokenize(request) == [[]]
+            assert request.prompt_token_ids is None
+
+    def test_object_valued_tool_arguments_are_routed_on_no_ids_not_on_a_partial_render(
+        self, router, tokenizer
+    ) -> None:
+        # The exact render spends the message iterators; a second render would drop the tool call.
+        self._trust(router, tokenizer)
+        request = chat_request(
+            messages=[
+                {"role": "user", "content": "weather in paris?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": {"city": "paris"}},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                {"role": "user", "content": "thanks"},
+            ],
+            tools=[WEATHER_TOOL],
+        )
+
+        assert router._tokenize(request) == [[]]
+        assert request.prompt_token_ids is None
+
     def test_a_request_that_is_already_pre_tokenized_is_left_alone(self, router, tokenizer) -> None:
         self._trust(router, tokenizer)
         request = chat_request(prompt_token_ids=[4, 5, 6])
 
         assert router._tokenize(request) == [[4, 5, 6]]
         assert request.prompt_token_ids == [4, 5, 6]
-
-    def test_the_legacy_switch_forwards_ids_without_asking_the_workers(
-        self, router, monkeypatch
-    ) -> None:
-        monkeypatch.setenv("TRTLLM_RENDER_LEGACY", "1")
-        router._server_info = {}
-        request = chat_request()
-
-        ids = router._tokenize(request)[0]
-
-        assert request.prompt_token_ids == ids
 
 
 class TestCoordinatorFrontendWriteBack:
@@ -599,7 +653,14 @@ class TestServerInfoFingerprint:
 
 
 class TestCountTokens:
-    def _client(self, tokenizer, chat_template=None, use_harmony=False):
+    def _client(
+        self,
+        tokenizer,
+        chat_template=None,
+        use_harmony=False,
+        model_type=None,
+        input_processor=None,
+    ):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -613,6 +674,10 @@ class TestCountTokens:
         if use_harmony:
             server.use_harmony = True
             server.model_config = SimpleNamespace(model_type="gpt_oss")
+        elif model_type is not None:
+            server.model_config = SimpleNamespace(model_type=model_type)
+        if input_processor is not None:
+            server.generator = SimpleNamespace(input_processor=input_processor)
         app.add_api_route(
             "/v1/messages/count_tokens", server.anthropic_count_tokens, methods=["POST"]
         )
@@ -647,7 +712,7 @@ class TestCountTokens:
         self, tokenizer, harmony_vocab
     ) -> None:
         # A tool without a description is rejected by Harmony; the count falls back to the
-        # template estimate instead of failing the call.
+        # template count.
         body = {
             **self.BODY,
             "tools": [{"name": "f", "input_schema": {"type": "object", "properties": {}}}],
@@ -660,6 +725,70 @@ class TestCountTokens:
         assert response.status_code == 200, response.text
         assert response.json()["input_tokens"] > 0
 
+    def test_a_request_with_media_is_counted_with_its_system_blocks_tools_and_tool_calls(
+        self, tokenizer
+    ) -> None:
+        # Media is refused by the exact render; the count still covers the rest of the prompt.
+        tool = {
+            "name": "get_weather",
+            "description": "Get the weather.",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+        }
+        image = {"type": "image", "source": {"type": "url", "url": "http://example.invalid/x.png"}}
+        text = {"type": "text", "text": "look at this"}
+
+        def count(first_turn, tool_input) -> int:
+            body = {
+                "model": "m",
+                "system": "be terse",
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "tools": [tool],
+                "messages": [
+                    {"role": "user", "content": first_turn},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "get_weather",
+                                "input": tool_input,
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "t1", "content": "sunny"}
+                        ],
+                    },
+                ],
+            }
+            response = self._client(tokenizer).post("/v1/messages/count_tokens", json=body)
+            assert response.status_code == 200, response.text
+            return response.json()["input_tokens"]
+
+        paris = {"city": "paris", "units": "metric"}
+        assert count([text, image], paris) == count([text], paris)  # the media adds nothing
+        assert count([text, image], paris) > count([text, image], {})  # the tool call is counted
+
+    def test_a_passthrough_model_with_its_own_input_processor_is_counted(self, tokenizer) -> None:
+        # A passthrough model carries its own input processor; the count uses the text tokenizer.
+        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+
+        class OwnProcessor:
+            tokenizer = None
+
+        client = self._client(
+            tokenizer, model_type="mistral_common", input_processor=OwnProcessor()
+        )
+
+        response = client.post("/v1/messages/count_tokens", json=self.BODY)
+
+        assert response.status_code == 200, response.text
+        plain = self._client(tokenizer).post("/v1/messages/count_tokens", json=self.BODY).json()
+        assert response.json() == plain
+
     def test_the_server_template_is_part_of_the_count(self, tokenizer) -> None:
         plain = self._client(tokenizer).post("/v1/messages/count_tokens", json=self.BODY).json()
         templated = (
@@ -668,17 +797,6 @@ class TestCountTokens:
             .json()
         )
         assert templated != plain
-
-    def test_the_legacy_switch_restores_the_old_count(self, monkeypatch) -> None:
-        llama = make_tokenizer(name=LLAMA)  # a tokenizer that adds BOS by default
-        modern = self._client(llama).post("/v1/messages/count_tokens", json=self.BODY).json()
-        monkeypatch.setenv("TRTLLM_RENDER_LEGACY", "1")
-
-        legacy = self._client(llama).post("/v1/messages/count_tokens", json=self.BODY).json()
-
-        # The old count encoded with the tokenizer's default special tokens (BOS),
-        # which the chat route does not add; the shared pipeline matches the route.
-        assert legacy["input_tokens"] == modern["input_tokens"] + 1
 
 
 class TestResponsesInputTokens:

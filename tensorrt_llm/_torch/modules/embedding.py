@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from tensorrt_llm.functional import AllReduceParams
+from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
@@ -62,6 +62,7 @@ class LMHead(Linear):
         use_custom_cublas_mm: bool = False,
         quant_config=None,
         output_dtype: Optional[torch.dtype] = None,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
@@ -105,6 +106,7 @@ class LMHead(Linear):
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
             quant_config=quant_config,
+            allreduce_strategy=allreduce_strategy,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -327,6 +329,7 @@ class Embedding(LMHead):
         reduce_output: bool = True,
         enable_torch_compile_for_embedding: Optional[bool] = False,
         use_custom_cublas_mm: bool = False,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
@@ -337,6 +340,7 @@ class Embedding(LMHead):
             gather_output=gather_output,
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            allreduce_strategy=allreduce_strategy,
         )
 
         self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding

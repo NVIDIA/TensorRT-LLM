@@ -5,7 +5,7 @@
 `route` compares the facts that fix which code runs against the one deployment the
 target was written for, and raises `NoTarget` stating them otherwise (`auto` falls
 back to the built-in implementation; `require` raises). The checkpoint's published
-architecture name is kept by `load_pretrained_config`, so `_router_index` keys on it.
+architecture name is kept by `load_pretrained_config`, so `route` registers under it.
 All criteria are read off `text_config` / `vision_config`; the composite parent's
 mirrored fields are unreliable.
 """
@@ -19,7 +19,7 @@ import torch
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget
+from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -77,7 +77,7 @@ def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineC
 
 
 def _check_engine(
-    spec_config: Optional[Any], kv_cache_quant_algo: Optional[Any], engine: Optional[EngineChoices]
+    spec_config: Optional[Any], kv_cache_quant_algo: Optional[Any], engine: EngineChoices
 ) -> None:
     """Decline what the target's constructor or first forward would refuse.
 
@@ -98,8 +98,6 @@ def _check_engine(
             f"a {kv_cache_quant_algo} KV cache; the target stores K/V as the checkpoint's bf16, "
             "as FP8 or as NVFP4"
         )
-    if engine is None:
-        return
     if engine.torch_dtype != torch.bfloat16:
         raise NoTarget(f"the engine runs the model in {engine.torch_dtype}; the target is bf16")
     if str(engine.moe_backend).upper() not in _MOE_BACKENDS:
@@ -134,24 +132,22 @@ def _check_engine(
         )
 
 
+# Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
+# config loader's composite branch writes the same name back.
+@routes("Qwen4ExpForConditionalGeneration")
 def route(
-    pretrained_config: Any,
-    mapping: Any,
-    compute_capability: Tuple[int, int],
-    spec_config: Optional[Any],
-    kv_cache_quant_algo: Optional[Any],
-    model_config: Optional[ModelConfig] = None,
-    llm_args: Optional[TorchLlmArgs] = None,
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
-    ``kv_cache_quant_algo`` is the KV-cache algorithm the engine will run with
-    (see ``_router_index._kv_cache_quant_algo``), not the checkpoint's alone.
-
     The target is imported where it is returned, so declining costs no import
-    of modeling code. With ``model_config`` and ``llm_args`` it also declines the
-    engine choices (`EngineChoices`) the target's constructor would refuse.
+    of modeling code. It also declines the engine choices (`EngineChoices`) the
+    target's constructor would refuse.
     """
+    pretrained_config = model_config.pretrained_config
+    mapping = model_config.mapping
+    spec_config = model_config.spec_config
+    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
     text = getattr(pretrained_config, "text_config", None)
     vision = getattr(pretrained_config, "vision_config", None)
     # Absent means this is not the normalized Qwen4-Exp composite at all, and
@@ -213,12 +209,7 @@ def route(
         # isort: on
         # fmt: on
 
-        engine = (
-            engine_choices(model_config, llm_args)
-            if model_config is not None and llm_args is not None
-            else None
-        )
-        _check_engine(spec_config, kv_cache_quant_algo, engine)
+        _check_engine(spec_config, kv_cache_quant_algo, engine_choices(model_config, llm_args))
         return ModelingV2Qwen38FlashNextNvfp4Sm103Tp1
 
     raise NoTarget(
