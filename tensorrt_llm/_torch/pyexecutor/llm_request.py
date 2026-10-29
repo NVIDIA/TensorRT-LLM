@@ -1571,7 +1571,8 @@ def executor_request_to_llm_request(
         position_ids: Optional[List] = None) -> LlmRequest:
     sampling_config = executor_request.sampling_config
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    input_tokens = (input_token_ids if input_token_ids is not None else
+                    executor_request.get_input_token_ids_array())
     if position_ids is None:
         position_ids = executor_request.position_ids
 

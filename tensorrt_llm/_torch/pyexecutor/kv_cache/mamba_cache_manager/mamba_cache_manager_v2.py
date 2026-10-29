@@ -62,7 +62,6 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    DEFAULT_BEAM_INDEX,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -1127,7 +1126,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and commit_end > kv_cache.num_committed_tokens
         ):
             tokens = self._augment_tokens_for_block_reuse(
-                request.get_tokens(DEFAULT_BEAM_INDEX),
+                self._reuse_token_source(request),
                 request,
                 start=kv_cache.num_committed_tokens,
                 end=commit_end,
