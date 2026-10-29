@@ -721,9 +721,10 @@ class PageLayout:
         device_region_index: (pool group, pool index) -> device region index in Lender.regions.
         staging_region_index: Pool group -> staging region index in Lender.regions; empty when the
             lender stages nothing.
-        rebuilds_untransferred: Whether the buffers peers do not transfer derive from the others,
-            which the manager rebuilds after the native transfer imports a request's pages; a
-            reader that invokes no rebuild, such as the lender, moves them too.
+        rebuilds_untransferred: Whether some buffers peers do not transfer derive from the others,
+            which the manager rebuilds after the native transfer imports a request's pages
+            (``KVCacheManagerV2._page_derived_roles``); a reader that invokes no rebuild, such as
+            the lender, moves every untransferred buffer then.
 
     Raises:
         ValueError: If tokens_per_page, a slot width or a KV head count is not a positive integer; a

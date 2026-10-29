@@ -376,7 +376,8 @@ class Manager:
     get_page_table = KVCacheManagerV2.get_page_table
     _page_head_split = KVCacheManagerV2._page_head_split
     _page_state_split = KVCacheManagerV2._page_state_split
-    _page_rebuilds_untransferred = KVCacheManagerV2._page_rebuilds_untransferred
+    _page_derived_roles = KVCacheManagerV2._page_derived_roles
+    rebuild_disagg_imported_cache = KVCacheManagerV2.rebuild_disagg_imported_cache
     _page_layer_configs = KVCacheManagerV2._page_layer_configs
     _page_layer_ids = KVCacheManagerV2._page_layer_ids
     _page_kv_heads = KVCacheManagerV2._page_kv_heads
@@ -668,6 +669,41 @@ def test_local_only_buffers_do_not_decide_the_identity():
     layout = derive_layout(manager).page_layout
     assert layout.layer_groups[0].shard == ShardDesc()
     assert {b.role: b.transferred for b in layout.buffers} == {"index_key": True, "scratch": False}
+
+
+@pytest.mark.cpu_only
+def test_derived_buffers_need_a_rebuild_and_the_lender_moves_them():
+    """A buffer the receiver rebuilds from the transferred ones stays out of a native transfer and
+    sets ``rebuilds_untransferred``, so the lender, which rebuilds nothing, moves it; naming one
+    without overriding the rebuild is refused. A buffer holding nothing a peer needs moves nowhere
+    and needs no rebuild."""
+    groups = [kv_group(lids=(0,), extra=[("v_scale", 32, None)])]
+    mappers = {"v_scale": "replicated"}
+
+    class Derives(Manager):
+        def _page_derived_roles(self):
+            return frozenset({"v_scale"})
+
+    with pytest.raises(ValueError, match=r"derives its \['v_scale'\] buffers .* does not override"):
+        Derives(groups, mappers=mappers).get_page_table()
+
+    class Rebuilds(Derives):
+        def rebuild_disagg_imported_cache(self, requests):
+            pass
+
+    layout = Rebuilds(groups, mappers=mappers).get_page_table().page_layout
+    assert layout.rebuilds_untransferred
+    assert {b.role: b.transferred for b in layout.buffers} == {
+        "key": True,
+        "value": True,
+        "v_scale": False,
+    }
+    assert all(
+        b.transferred for b in derive_layout(Rebuilds(groups, mappers=mappers)).page_layout.buffers
+    )
+    local = derive_layout(Manager(groups, mappers=mappers, ignored=("v_scale",))).page_layout
+    assert not local.rebuilds_untransferred
+    assert {b.role: b.transferred for b in local.buffers}["v_scale"] is False
 
 
 @pytest.mark.cpu_only
@@ -1627,8 +1663,7 @@ def test_fp4_mla_installs_its_model_layers_beside_its_layer_ids():
     assert manager._page_layer_ids() == {0: (8, 4), 1: (14, 7), 2: (9, 4), 3: (15, 7)}
     # Native's transfer skips the V sidecars, which the receiver rebuilds; the page table says so,
     # and a lender, which invokes no rebuild, lends them too.
-    assert manager._page_untransferred_roles()
-    assert manager._page_rebuilds_untransferred()
+    assert manager._page_derived_roles()
 
 
 M3_TPB = 128

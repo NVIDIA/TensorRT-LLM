@@ -3805,7 +3805,7 @@ def test_v2_kda_draft_records_replace_the_replay_caches(kda_replay_num_spec):
             "kda_state_tok",
         }
         # A KVCM state buffer of the SSM layers, kept out of disaggregated transfers like the other replay buffers.
-        assert DataRole("kda_state_tok") in mgr._page_untransferred_roles()
+        assert DataRole("kda_state_tok") in mgr._page_derived_roles()
         assert len(mgr.kda_state_tok) == 2
         for layer_idx in range(2):
             layer_cache = mgr.mamba_layer_cache(layer_idx)
@@ -4579,7 +4579,7 @@ def test_v2_kda_replay_buffers_are_kvcm_state_buffers():
         assert mgr._mamba_state_bytes_per_slot() == (
             2 * (mgr.ssm_bytes + mgr.conv_bytes) + 2 * layer_bytes + 16
         )
-        ignored = {str(role) for role in mgr._page_untransferred_roles()}
+        ignored = {str(role) for role in mgr._page_derived_roles()}
         assert replay_roles | {"prev_num_accepted_tokens"} <= ignored
     finally:
         mgr.shutdown()
@@ -4729,9 +4729,7 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg):
         if ctx_only:
             assert mgr.get_intermediate_ssm_states(0) is None
             assert mgr.get_intermediate_conv_states(0) is None
-            assert not mgr._page_untransferred_roles() & {
-                DataRole(name) for name in _KDA_REPLAY_FIELDS
-            }
+            assert not mgr._page_derived_roles() & {DataRole(name) for name in _KDA_REPLAY_FIELDS}
             mgr.update_mamba_states(
                 SimpleNamespace(num_seqs=1, num_contexts=1),
                 torch.ones(1, device="cuda", dtype=torch.int32),

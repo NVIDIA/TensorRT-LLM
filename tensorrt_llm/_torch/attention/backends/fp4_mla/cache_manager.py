@@ -212,16 +212,19 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_mla_v_packed_pool_base",
             "get_mla_v_packed_page_offset",
             "get_fp4_mla_hp_pool",
-            "_page_buffer_tensors",
-            "_page_untransferred_roles",
-            "_page_rebuilds_untransferred",
             "rebuild_disagg_imported_cache",
             "_model_layers_and_tails",
-            "_page_layer_ids",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
         )
-        for method_name in method_names:
+        # Every page-table hook the policy declares, so that one it adds is never left to the
+        # manager's default.
+        page_hooks = tuple(
+            name
+            for name in vars(Fp4MlaV2CacheLayoutPolicy)
+            if name.startswith(("_page_", "disagg_"))
+        )
+        for method_name in method_names + page_hooks:
             method = getattr(Fp4MlaV2CacheLayoutPolicy, method_name)
             setattr(manager, method_name, MethodType(method, manager))
 
@@ -941,14 +944,10 @@ class Fp4MlaV2CacheLayoutPolicy:
             return replicated(size)
         return self._page_head_split(layer_id, size, tokens, state, token_major_=True)
 
-    def _page_untransferred_roles(self) -> frozenset[str]:
+    def _page_derived_roles(self) -> frozenset[str]:
         """V scales and packed V derive from K and K scales; the generation worker rebuilds them
         locally in rebuild_disagg_imported_cache."""
         return frozenset((str(Role.MLA_V_SCALE), str(Role.MLA_V_PACKED)))
-
-    def _page_rebuilds_untransferred(self) -> bool:
-        """The untransferred V sidecars are rebuilt after a native import."""
-        return True
 
     def rebuild_disagg_imported_cache(self, requests: Iterable["LlmRequest"]) -> None:
         """Rebuild the derived V sidecars of requests whose prompt KV was imported."""

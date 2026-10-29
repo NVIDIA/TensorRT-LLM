@@ -974,7 +974,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         On a disaggregated generation server the ctx->gen transfer populates
         only the base ``conv`` / ``temporal`` pools (the KDA replay buffers
-        are untransferred, see ``_page_untransferred_roles``); the per-slot ``kda_conv_*``
+        are derived and untransferred, see ``_page_derived_roles``); the per-slot ``kda_conv_*``
         replay caches consumed by ``trtllm::kda_mtp_decode`` are normally
         seeded by a *local* prefill/decode via
         ``_sync_kda_replay_conv_window`` and would otherwise hold zeros (or a
@@ -3616,13 +3616,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return replicated(size)
         return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 
-    def _page_untransferred_roles(self) -> frozenset[str]:
+    def _page_derived_roles(self) -> frozenset[str]:
         """Keep the KDA replay buffers out of disaggregated transfers.
 
         They are generation-local: a context server allocates none, and a
-        generation server seeds them from the transferred conv state.
+        generation server seeds them from the transferred conv state
+        (``rebuild_disagg_imported_cache``).
         """
-        return super()._page_untransferred_roles() | self._kda_replay_roles()
+        return super()._page_derived_roles() | self._kda_replay_roles()
 
     def disagg_state_slot(self, request) -> Optional[int]:
         """The request's recurrent-state slot, while this rank holds recurrent layers."""

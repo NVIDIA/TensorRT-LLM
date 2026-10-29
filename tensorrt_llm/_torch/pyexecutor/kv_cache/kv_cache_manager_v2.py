@@ -3493,8 +3493,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Built from the runtime config and storage and the hooks below: how each buffer's bytes
         spread over ranks (``_page_buffer_tensors``), how layers are named (``_page_layer_ids``),
-        the KV heads (``_page_kv_heads``), which roles never travel
-        (``_page_untransferred_roles``) and the quantization (``_page_quant_mode``); a subclass
+        the KV heads (``_page_kv_heads``), which roles never travel because they hold nothing a
+        peer needs (``_page_untransferred_roles``) or the receiver rebuilds them
+        (``_page_derived_roles``) and the quantization (``_page_quant_mode``); a subclass
         overrides the hook whose answer differs. ``ValueError`` if its layer groups, layer configs
         and declarations do not agree."""
         tokens_per_block = int(self.tokens_per_block)
@@ -3518,7 +3519,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if is_recurrent_layer(layer_cfg[group[0]]):
                 state_groups.add(lg)
 
-        untransferred = self._page_untransferred_roles()
+        derived = self._page_derived_roles()
+        untransferred = self._page_untransferred_roles() | derived
         expansions = {
             lid: buffer_expansions(cfg, tokens_per_block) for lid, cfg in layer_cfg.items()
         }
@@ -3578,6 +3580,15 @@ class KVCacheManagerV2(BaseResourceManager):
                         buffers.append(desc)
                         group_buffers[lg].append(desc)
 
+        rebuilt = sorted({b.role for b in buffers if b.role in derived})
+        rebuild = getattr(getattr(self, "rebuild_disagg_imported_cache", None), "__func__", None)
+        if rebuilt and rebuild is KVCacheManagerV2.rebuild_disagg_imported_cache:
+            raise ValueError(
+                f"{type(self).__name__} derives its {rebuilt} buffers from the transferred ones but "
+                "does not override rebuild_disagg_imported_cache, so an import would leave them "
+                "stale"
+            )
+
         layer_groups: list[LayerGroupDesc] = []
         total_kv_heads: dict[int, int] = {}
         for lg, group in enumerate(grouping):
@@ -3632,7 +3643,7 @@ class KVCacheManagerV2(BaseResourceManager):
             total_kv_heads_by_layer=total_kv_heads,
             dtype=self._page_dtype(),
             quant_mode=self._page_quant_mode(),
-            rebuilds_untransferred=self._page_rebuilds_untransferred(),
+            rebuilds_untransferred=bool(rebuilt),
         )
         return ManagerLayout(
             page_layout=page_layout,
@@ -3705,10 +3716,10 @@ class KVCacheManagerV2(BaseResourceManager):
         head-major (HND) by the layer's KV heads, as the TRTLLM attention kernels write them, and
         ``Role.INDEX_KEY`` alike on every rank, since every index-key side cache so far (DSA
         indexer-K, MiniMax M3) projects replicated across TP ranks. A buffer that never moves
-        (``_page_untransferred_roles``) is this rank's own. A manager registering any other role,
-        or laying these out otherwise, overrides this method, building tensors with
-        ``page_layout``'s ``head_major``, ``token_major``, ``sectioned`` and ``replicated`` or
-        declaring its own.
+        (``_page_untransferred_roles``, ``_page_derived_roles``) is this rank's own. A manager
+        registering any other role, or laying these out otherwise, overrides this method, building
+        tensors with ``page_layout``'s ``head_major``, ``token_major``, ``sectioned`` and
+        ``replicated`` or declaring its own.
 
         Raises:
             ValueError: For a role that moves and that the manager does not declare: guessing how
@@ -3719,13 +3730,13 @@ class KVCacheManagerV2(BaseResourceManager):
             return replicated(size)
         if role in _HEAD_SPLIT_ROLES:
             return self._page_head_split(layer_id, size, tokens, state)
-        if role in self._page_untransferred_roles():
+        if role in self._page_untransferred_roles() | self._page_derived_roles():
             split = self._page_state_split() if state else ("tp",)
             return owned(size, grid_place(rank_topology(self.mapping), split)[0], split)
         raise ValueError(
             f"{type(self).__name__} registers role {role!r} but does not declare how its bytes "
             "spread over ranks; override _page_buffer_tensors (or list the role in "
-            "_page_untransferred_roles if it never moves)"
+            "_page_untransferred_roles or _page_derived_roles if it never moves)"
         )
 
     def _page_head_split(
@@ -3764,15 +3775,17 @@ class KVCacheManagerV2(BaseResourceManager):
             return ("tp", "cp")
         return ("tp",)
 
-    def _page_rebuilds_untransferred(self) -> bool:
-        """Whether the untransferred buffers derive from the others and are rebuilt after the
-        native transfer imports a request's pages. False by default."""
-        return False
-
     def _page_untransferred_roles(self) -> frozenset[str]:
         """Roles whose buffers hold no state a peer needs, such as storage-only buffers that
         satisfy a pool's layout: they stay in local copies of whole pages but are never moved.
-        None by default."""
+        None by default. Buffers the receiver rebuilds instead are ``_page_derived_roles``."""
+        return frozenset()
+
+    def _page_derived_roles(self) -> frozenset[str]:
+        """Roles whose buffers derive from the transferred ones: a transfer leaves them for
+        ``rebuild_disagg_imported_cache`` to rebuild after the import, and a reader that rebuilds
+        nothing, such as the lender, moves them instead. None by default; a manager naming any
+        overrides that rebuild, or its page table is refused."""
         return frozenset()
 
     def _page_dtype(self) -> str | None:
@@ -3804,7 +3817,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def disagg_untransferred_buffers(self, request: LlmRequest) -> frozenset[tuple[int, str]]:
         """The buffers, as (global layer id, role), a transfer of this request leaves for the
         receiver to rebuild: none. Buffers that never move for any request are
-        ``_page_untransferred_roles``."""
+        ``_page_untransferred_roles`` and ``_page_derived_roles``."""
         return frozenset()
 
     def disagg_sends_first_tokens(self, request: LlmRequest) -> bool:
@@ -3823,8 +3836,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def rebuild_disagg_imported_cache(self, requests: Iterable[LlmRequest]) -> None:
         """Derive, before their first generation step, the caches of requests whose transfer just
-        completed that the transfer did not carry: nothing. A manager with such caches overrides
-        this and calls it through ``super()``."""
+        completed that the transfer did not carry: nothing. A manager with such caches, the
+        buffers of its ``_page_derived_roles`` among them, overrides this and calls it through
+        ``super()``."""
 
     @property
     def draft_prompt_lookahead(self) -> int:

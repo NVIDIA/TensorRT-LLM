@@ -84,7 +84,7 @@ INTERNALS = {
     "_page_head_split",
     "_page_state_split",
     "_page_untransferred_roles",
-    "_page_rebuilds_untransferred",
+    "_page_derived_roles",
     "_page_layer_ids",
     "_page_kv_heads",
     "get_life_cycle_pool_group_indices",
