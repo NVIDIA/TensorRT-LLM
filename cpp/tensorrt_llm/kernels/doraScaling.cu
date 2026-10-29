@@ -38,36 +38,28 @@ __global__ void tokenPerChannelScaleKernel(size_t const numModules, size_t const
      * pointers for the same module are next to each other. For example:
      * scales = [token0_module0_ptr, token1_module0_ptr, ..., token0_module1_ptr, token1_module1_ptr, ...]
      */
-    auto const threadId = blockIdx.x * blockDim.x + threadIdx.x;
-    // number of columns in the input
-    auto const numChannels = cumModuleSizes[numModules - 1];
-    // current thread's column
-    auto const channelId = threadId % numChannels;
-    // current thread's token
-    auto const tokenId = threadId / numChannels;
-    // offset the input column to fit in the scaling vector's column in case of multiple modules
+    int64_t const numChannels = cumModuleSizes[numModules - 1];
+    int64_t const tokenId = blockIdx.x;
+    int64_t const channelId = (blockIdx.y * blockDim.x) + threadIdx.x;
+
+    if (channelId >= numChannels)
+    {
+        return;
+    }
+
     int64_t scaleChannelOffset = 0;
-
     T const* scale = nullptr;
-
-    // this loop searches for the module the current column is a part of, in case of multiple modules
-    for (auto moduleId = 0; moduleId < numModules; moduleId++)
+    for (size_t moduleId = 0; moduleId < numModules; moduleId++)
     {
         if (channelId < cumModuleSizes[moduleId])
         {
-            // pick the proper scale for the token and module
-            scale = scales[numTokens * moduleId + tokenId];
+            scale = scales[(numTokens * moduleId) + tokenId];
             break;
         }
-        // adjust scale offset
         scaleChannelOffset = cumModuleSizes[moduleId];
     }
-
-    if (threadId < numChannels * numTokens)
-    {
-        // apply scaling if scale is not null (it is null in case of a non-DoRA adapter)
-        result[threadId] = scale == nullptr ? a[threadId] : a[threadId] * scale[channelId - scaleChannelOffset];
-    }
+    int64_t const index = (tokenId * numChannels) + channelId;
+    result[index] = scale == nullptr ? a[index] : a[index] * scale[channelId - scaleChannelOffset];
 }
 
 template <typename T>
@@ -75,8 +67,10 @@ void tokenPerChannelScale(int64_t const numel, size_t const numModules, size_t c
     int64_t const* __restrict__ cumModuleSizes, T const* __restrict__ a, T const* const* __restrict__ scale_ptrs,
     T* __restrict__ result, cudaStream_t stream)
 {
-    dim3 block(256);
-    dim3 grid((numel + 255) / 256);
+    size_t const numChannels = numel / numTokens;
+    constexpr size_t blockSize = 128;
+    dim3 block(blockSize);
+    dim3 grid(numTokens, (numChannels + blockSize - 1) / blockSize);
 
     tokenPerChannelScaleKernel<T>
         <<<grid, block, 0, stream>>>(numModules, numTokens, cumModuleSizes, a, scale_ptrs, result);

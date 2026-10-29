@@ -39,6 +39,7 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
                             USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
+add_gtest(doraScalingTest doraScalingTest.cu)
 add_gtest(ropeTest ropeTest.cu)
 add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
