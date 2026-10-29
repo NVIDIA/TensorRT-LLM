@@ -66,24 +66,8 @@ engine = _load("mv2flow_engine_driver", _HERE / "engine_driver.py")
 wio = _load("mv2flow_workload_io", _HERE / "workload_io.py")
 
 
-def logprob_rows(entries: Any) -> list[list[list[Any]]]:
-    """The engine's log-probs, one ``{token id: Logprob}`` per position, as ``[id, log-prob, rank]`` lists.
-
-    Best first. A position the engine returned as a bare float (the simple
-    format) becomes one entry with no id, which the gate reads as missing.
-    """
-    rows: list[list[list[Any]]] = []
-    for entry in entries or ():
-        if isinstance(entry, Mapping):
-            row = [
-                [int(token), float(getattr(lp, "logprob", lp)), getattr(lp, "rank", None)]
-                for token, lp in entry.items()
-            ]
-            row.sort(key=lambda item: -item[1])
-        else:
-            row = [[None, float(entry), None]]
-        rows.append(row)
-    return rows
+#: One implementation of the engine's log-prob rows, shared with the engine driver.
+logprob_rows = engine.logprob_rows
 
 
 def sampling_for(base: Any, max_tokens: int, top_k: int) -> Any:

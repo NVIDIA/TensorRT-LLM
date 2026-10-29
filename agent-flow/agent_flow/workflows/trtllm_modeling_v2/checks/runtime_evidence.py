@@ -511,15 +511,20 @@ def attest_engine(
 
 
 def reuse_shortfall(attestation: EngineAttestation, *, asks: bool) -> str | None:
-    """Judge only an explicit repeat experiment, never inferred eval prefix matches."""
+    """Judge only an explicit repeat experiment, never inferred eval prefix matches.
+
+    A probe that could not run, or whose responses reported no ``cached_tokens``,
+    observed nothing: it is no negative result, and the engine record says why
+    (:func:`engine_records`). A configuration variant about block reuse still
+    owes an observation of it (``feature_evidence.BLOCK_REUSE``).
+    """
     probe = attestation.reuse.get("probe")
     if not asks or not isinstance(probe, Mapping):
         return None
     leg = f" of the {attestation.leg} leg" if attestation.leg else ""
     reused = _count(probe.get("reused"))
     if reused is None:
-        why = probe.get("skipped") or probe.get("error") or "cached_tokens was not reported"
-        return f"KV-cache reuse UNKNOWN{leg}: the controlled repeat probe could not validate reuse ({why})"
+        return None
     if reused == 0:
         return (
             f"the engine{leg} reused nothing: the reuse probe sent one {probe.get('tokens')}-token prompt "

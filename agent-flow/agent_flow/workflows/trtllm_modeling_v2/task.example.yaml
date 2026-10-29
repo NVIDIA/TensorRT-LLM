@@ -1,5 +1,7 @@
 # trtllm-modeling-v2 task specification: every key the spec accepts, with its default. Fill it in
-# and check it with `trtllm-modeling-v2 --task task.yaml --workspace W --dry-run`. Or derive one:
+# by following spec/INTAKE.md, lint it with `trtllm-modeling-v2 intake lint --task task.yaml`, and check it
+# with `trtllm-modeling-v2 --task task.yaml --workspace W --dry-run`. `trtllm-modeling-v2 intake
+# derive --checkpoint <dir> --repo <checkout> --goal "..." --out D` writes a starting spec. Or derive one:
 # `trtllm-modeling-v2 --checkpoint <dir> --site site.yaml --goal "..." --workspace W` writes
 # W/task.derived.yaml (beside W/derive.report.md) and runs it; spec/derive.py lists goal words.
 #
@@ -40,7 +42,9 @@ features: []
 #   kv_fp8:
 #     unit: core                    # default core
 #     members: [tep4]               # default: the unit's, and the benchmark runs at one of them
-#     gates: [boot, accuracy]       # the default; `acceptance` needs a speculator unit
+#     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at every
+#                                   # member of its unit; accuracy alone checks the setting took
+#                                   # effect (spec/INTAKE.md). `acceptance` needs a speculator unit
 #     runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # over the unit's; flags appended
 #     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
 #     env: {}                       # added to the gate command's environment
@@ -48,7 +52,9 @@ features: []
 #     # samples, acceptance.
 #     accuracy: {discriminators: {kv_cache_quant_algo: FP8}}
 #     note: KV cache stored as FP8
-#   # A variant of disagg owes the equivalence witness at each of its members instead.
+#   # A variant of disagg owes the equivalence witness at each of its members instead. A variant
+#   # on a feature unit that changes a KV dtype or chunking is a combination; core's own variant
+#   # proves the axis, so add it only when the request names it.
 
 # A requested feature@member cell no check covers (`coverage.yaml`) stops the run at preflight
 # unless accepted here: `<feature>@<member>`, `<feature>@*` for a row, `<unit>+<unit>` for a pair.
@@ -85,13 +91,15 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 # CUDA-graph capture batches) are the serving envelope the target claims.
 #
 # runtime:
-#   cuda_graph: false          # default false
+#   cuda_graph: false          # default false; set true to onboard for serving: eager gates
+#                              # make every accuracy run 10-50x slower
 #   chunked_prefill: false     # default false
 #   overlap_scheduler: true    # default true  (--disable_overlap_scheduler)
 #   kv_cache_reuse: true       # default true  (--disable_kv_cache_reuse)
 #   # Anything else the gate command needs, verbatim. Without --max_seq_len the engine sizes its
 #   # cache for `max_position_embeddings` (`Impossible to fit in any sequence in kvCache`).
-#   extra_flags: [--max_seq_len=8192, --max_batch_size=8, --kv_cache_fraction=0.6]
+#   # max_seq_len = isl + osl; max_batch_size >= the per-rank concurrency the perf block claims.
+#   extra_flags: [--max_seq_len=9216, --max_batch_size=64, --kv_cache_fraction=0.7]
 #
 # Per unit, layered over `default`: {default: {extra_flags: [...]}, multimodal: {...}}. A setting
 # both launchers take (the KV fraction, KV and SSM cache dtypes, tokens per block, max_num_tokens,
@@ -106,6 +114,7 @@ environment:
   kind: local
 
   # REQUIRED: the interpreter every Python command runs under, the editable install to measure.
+  # It must exist at launch (`intake lint` checks a path visible from this host).
   python: /path/to/TensorRT-LLM/.venv-3.12/bin/python
 
   # Exported to every command. Preflight requires TMPDIR and CLAUDE_CODE_TMPDIR outside /tmp, and
@@ -281,8 +290,10 @@ accuracy:
   #         keywords_any: [carrot]
 
   # Optional BOOT BOUNDARIES, off unless `enabled: true` or `profile: certified`.
-  # Every ordinary boot adds sequential probes then loaded requests in the SAME engine.
-  # Both probe outputs must contain and match at least `agree_tokens` tokens (EOS ignored).
+  # One member's boot of each unit (`members`, else attention DP first, then the widest; never a
+  # configuration variant's) adds sequential probes then loaded requests in the SAME engine.
+  # Both probe outputs must contain and match at least `agree_tokens` tokens (EOS ignored), but for
+  # a near-tie: legs that part on two tokens within `tie_margin` nats in a leg's own top-5 log-probs.
   # Long inputs are exactly max_seq_len - max_tokens - 1 tokens, capped at max_num_tokens - 1
   # without chunked prefill. Needs explicit max_seq_len; long_prompts: 0 disables long inputs.
   # Submitted concurrency is at most max_batch_size, not proof of actual scheduler batches or
@@ -292,7 +303,11 @@ accuracy:
   #   max_tokens: 16               # default
   #   agree_tokens: 4              # default
   #   long_prompts: 2              # default
-  #   probes: ["The capital of France is", "Two plus two equals"]
+  #   tie_margin: 0.15             # default, nats
+  #   members: [dep4]              # default: one per unit, as above
+  #   # One right continuation each: open-ended prompts have near-tied tokens that flip with batch
+  #   # shape (MoE routing, low-precision GEMM tactics) far more often than these.
+  #   probes: ["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]
   #   timeout: 3600                # default, seconds for the complete boot; CLI --timeout overrides
 
   # The SERVE gate: `trtllm-serve` starts each unit's target with the accuracy gate's options at its

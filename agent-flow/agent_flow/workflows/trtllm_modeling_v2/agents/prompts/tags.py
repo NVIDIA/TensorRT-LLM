@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from ...operators.coverage import TIER_DESCRIPTION
+from ...operators.coverage import MAX_ROW_CELLS, TIER_DESCRIPTION
 from .survey import CAPTURE_LISTS_HEADING
 
 #: What the planner chooses a task's kind and tags by: one line per tag.
@@ -46,7 +46,13 @@ disk would tell you.
 
 Read the checkpoint as data: its quantization method decides which entries
 apply and which anchor row is right, and an entry's `CELLS`, `ARCHS` and
-`note` decide what it covers. The config's traps: a multimodal checkpoint
+`note` decide what it covers. Read the HuggingFace modeling code for the
+math; TensorRT-LLM's support for this architecture: what the runtime
+allocates, and which attention backend serves this geometry (the classes on
+`AttentionBackend`, sparse ones included; `tree_map.md` says where they are);
+and every entry in the catalog and in each target's `ops/`. `surface.md`
+lists them all; your dispatch shows each list's most relevant names first.
+The config's traps: a multimodal checkpoint
 nests the language model's geometry under `text_config`; a per-layer pattern
 (`layer_types`, a hybrid layer pattern) is not a sliding window; a
 speculative drafter may sit under `mtp.*` while its `dspark_*` keys say it is
@@ -74,6 +80,14 @@ public API as installed and the engine's pybind bindings serve steps no
 trtllm op does. A vision tower's attention was once called a ceiling while
 `thop_attention` served it all along. Prefer a wrong verify, which costs one
 dispatch, to a wrong ceiling, which costs a feature.
+
+**Before writing new code (tier 4 or 5), look at the prior art.** Your
+dispatch's prior-art section lists what this tree already implements that
+shares the checkpoint's words, and the limits the engine's kernels set for
+this geometry. A GAP row that writes new code names in `tried` each lead that
+shares its words and why it does not serve; `plan.md` states the design for
+each engine limit. A survey review holds the draft to both and sends it back
+once with what it left unconsidered.
 
 **The envelope.** `task.yaml`'s runtime block declares what the target serves
 at every member: `max_num_tokens`, `max_batch_size`, `max_seq_len` and the
@@ -135,10 +149,13 @@ The validator reports every structural error at once. What it cannot check:
   `note` for it. Untagged rows block `core`; when unsure, leave it untagged.
 - `depends_on` is for real ordering only: a spurious one serializes work.
 - A `verify` row states its `cells`: one mapping per cell, the entry's spec
-  keys with values from the runtime facts, spanning the envelope: every dtype
-  each variant runs, each captured batch times each call site's rows per
-  request, each member's per-rank pool sizes, the prefill chunk up to
-  `max_num_tokens`.
+  keys with values from the runtime facts. The kernel writer certifies each
+  cell, so cover each axis of the envelope, not their product: every dtype
+  each variant runs, each call site's rows per request at the smallest and
+  the largest captured batch (and where the entry's code switches path),
+  each member's per-rank pool sizes, one prefill chunk at `max_num_tokens`.
+  Vary one axis at a time from a base cell; a row holds at most
+  {MAX_ROW_CELLS} cells.
 - One row per shared entry: every call site's shapes go in its `cells`, the
   sites in its `note`. `site` (lowercase words joined by `_`) names its local
   variant, else it is `r<n>`; a target name never contains `__`.

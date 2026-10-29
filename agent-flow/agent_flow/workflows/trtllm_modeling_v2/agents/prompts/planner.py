@@ -37,7 +37,7 @@ read the run's state and write the next version of the task graph.
   which tasks finished, failed or reported something new, with their evidence;
 - `runtime_facts.yaml`, whose key numbers the request carries, and each
   finished task's receipt, `tasks/<id>.receipt.yaml`;
-- `surface.md`, `host_facts.md` and `vocabulary.yaml` when they exist.
+- `surface.md`, `prior_art.md`, `host_facts.md` and `vocabulary.yaml` when they exist.
 
 ## What you write
 

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
+from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import engine_driver, workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract
@@ -39,7 +40,7 @@ _TASK = {
 }
 
 
-def _run_boot(tmp_path, monkeypatch, *, mutate=None, task=None):
+def _run_boot(tmp_path, monkeypatch, *, mutate=None, task=None, unit=None, member=None):
     events = []
     specs = []
     active = 0
@@ -114,7 +115,7 @@ def _run_boot(tmp_path, monkeypatch, *, mutate=None, task=None):
         return CommandResult(returncode=0, stdout=output)
 
     result = boot_checks.run_boot_gate(
-        _env(), task_data=task or _TASK, runner=run, workdir=tmp_path
+        _env(), task_data=task or _TASK, runner=run, workdir=tmp_path, unit=unit, member=member
     )
     return result, specs, events
 
@@ -192,3 +193,96 @@ def test_boundaries_are_opt_in_and_unchunked_length_is_reported_honestly(tmp_pat
     assert len(specs[0]["phases"][1]["requests"][0]["token_ids"]) == 31
     assert "exactly 31 input tokens" in result.detail
     assert "capped by unchunked" in result.detail
+
+
+def test_unchunked_variant_owes_no_split_prompt(tmp_path, monkeypatch):
+    """A variant that turns chunked prefill off is about chunking, but its engine never splits."""
+    task = copy.deepcopy(_TASK)
+    task["accuracy"].pop("envelope")
+    task["variants"] = {
+        "unchunked": {
+            "unit": "core",
+            "runtime": {
+                "chunked_prefill": False,
+                "extra_flags": ["--max_seq_len=64", "--max_batch_size=8", "--max_num_tokens=64"],
+            },
+        }
+    }
+    task = check_config.variant_spec(task, "unchunked", world_size=1)
+    result, specs, _ = _run_boot(tmp_path, monkeypatch, task=task, unit="unchunked")
+    # The engine ran (this fake prints no engine record, which the attestation then names);
+    # before, the gate refused it for want of a prompt an unchunked engine would split.
+    assert specs, result.detail
+    assert "leave no room" not in result.detail
+    assert not any(r.get("id") == "chunk" for r in specs[0]["requests"])
+
+
+def _parted(gap):
+    """Probe0's loaded leg takes another token at step 2, ``gap`` nats behind in both legs."""
+
+    def mutate(record):
+        if record.get("id") != "probe0":
+            return
+        own = 2 if record.get("phase") == "baseline" else 9
+        other = 9 if own == 2 else 2
+        if record.get("phase") == "loaded":
+            record["token_ids"] = [0, 1, 9, 3]
+        rows = [[[t, 0.0, 1]] for t in record["token_ids"]]
+        rows[2] = [[own, -0.1, 1], [other, -0.1 - gap, 2]]
+        record["top_logprobs"] = rows
+
+    return mutate
+
+
+def test_a_probe_that_parts_at_a_near_tie_passes_and_says_so(tmp_path, monkeypatch):
+    result, specs, events = _run_boot(tmp_path, monkeypatch, mutate=_parted(0.05))
+    assert result.passed, result.detail
+    assert "near-tie(s) (probe0 step 2: baseline 2, loaded 9, 0.050 apart)" in result.detail
+    # The probes ask the engine for their top log-probs; the fillers do not.
+    probes = [r for p in specs[0]["phases"] for r in p["requests"] if r["id"].startswith("probe")]
+    assert probes and all(r["logprobs"] == boot_checks.BOUNDARY_TOP_K for r in probes)
+    asked = [e[2] for e in events if e[0] == "submit" and getattr(e[2], "logprobs", 0)]
+    assert len(asked) == len(probes)
+
+
+def test_a_probe_that_parts_past_the_margin_fails(tmp_path, monkeypatch):
+    result, _, _ = _run_boot(tmp_path, monkeypatch, mutate=_parted(2.0))
+    assert not result.passed
+    assert "must agree on 4 tokens" in result.detail
+    assert "past the near-tie margin 0.150" in result.detail
+
+
+def test_boundaries_run_once_per_unit_at_the_member_that_batches_most():
+    assert boot_checks.boundary_member(["tp4", "tep4", "dep4"]) == "dep4"
+    assert boot_checks.boundary_member(["tp4", "tep8"]) == "tep8"
+    task = copy.deepcopy(_TASK)
+    task.update(parallel="unified", members={"default": ["tp4", "tep4", "dep4"]})
+    task["variants"] = {"kv_fp8": {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}}}
+    spec = boot_checks.BootBoundarySpec.from_task(task)
+    assert [m for m in ("tp4", "tep4", "dep4") if spec.runs_at(task, "core", m, 4)] == ["dep4"]
+    assert not spec.runs_at(task, "kv_fp8", "dep4", 4)
+    task["accuracy"]["envelope"]["members"] = ["tp4"]
+    spec = boot_checks.BootBoundarySpec.from_task(task)
+    assert [m for m in ("tp4", "tep4", "dep4") if spec.runs_at(task, "core", m, 4)] == ["tp4"]
+
+
+def test_a_boot_at_another_member_runs_no_boundaries(tmp_path, monkeypatch):
+    task = copy.deepcopy(_TASK)
+    task["accuracy"]["envelope"]["members"] = ["tp2"]
+    result, specs, _ = _run_boot(tmp_path, monkeypatch, task=task, member="tp1")
+    assert result.passed, result.detail
+    assert not specs[0].get("phases")
+    assert "boot boundaries" not in result.detail
+
+
+def test_the_spec_names_a_near_tie_margin_and_boundary_members():
+    from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
+
+    def errors(block):
+        found = []
+        task_schema._validate_envelope(block, found)
+        return found
+
+    assert errors({"enabled": True, "tie_margin": 0.2, "members": ["dep4"]}) == []
+    assert any("tie_margin" in e for e in errors({"tie_margin": -1}))
+    assert any("members" in e for e in errors({"members": ["four"]}))

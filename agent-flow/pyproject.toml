@@ -45,6 +45,7 @@ include = ["agent_flow*"]
     "task.example.yaml",
     "agents/skills/**/*.md",
     "README.md",
+    "spec/INTAKE.md",
     # The compute sessions' shell wrappers, run by path inside and outside
     # the container.
     "infra/compute/scripts/*.sh",

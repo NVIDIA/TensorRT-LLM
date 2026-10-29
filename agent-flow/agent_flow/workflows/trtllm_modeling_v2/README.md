@@ -16,6 +16,18 @@ execution permissions appropriate for your environment, then describe the task. 
 checkout and workspace paths, compute configuration, feature/parallelism scope and accuracy reference.
 The agent prepares the spec and launches the workflow; missing inputs must be resolved, not guessed.
 
+**The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
+derive` writes a starting spec (no `site.yaml` needed), and `trtllm-modeling-v2 intake lint` checks
+it for slow or stalling choices (eager gates, a batch below the claimed concurrency, disaggregation
+wider than one node, variant cross products, variants that boot at every member, a feature proven
+at several members or again under another axis, unusable accuracy anchors, open-ended boot probes) and blocks an accuracy check that runs without CUDA graphs and
+what would stop preflight (uncovered requested cells, a KV-cache dtype the engine does not load),
+and prints the contract's checks per unit and variant, the
+engine's constraints for this geometry and the prior art the tree already holds. The spec should be
+the smallest contract that covers the request. Launch only once the lint is clean or its findings
+are accepted in `notes`. Preflight's substrate gate boots a GPU beside the run's first turns; its
+failure stops the run, which the same command resumes once the host is fixed.
+
 **Example prompt** — replace placeholders and omit requirements you do not need.
 
 ```text

@@ -50,13 +50,39 @@ def build_llm(spec: Mapping[str, Any]) -> tuple[Any, Any]:
     return LLM(**options), sampling
 
 
-def sampling_for(base: Any, max_tokens: int, ignore_eos: bool) -> Any:
-    """A copy of the declared sampling parameters with this request's budget."""
+def sampling_for(base: Any, max_tokens: int, ignore_eos: bool, logprobs: int = 0) -> Any:
+    """A copy of the declared sampling parameters with this request's budget.
+
+    ``logprobs`` asks for each generated token's top-k log-probs, as a request
+    whose tokens a gate compares up to a near-tie does.
+    """
     params = copy.deepcopy(base)
     params.max_tokens = int(max_tokens)
     if ignore_eos:
         params.ignore_eos = True
+    if logprobs:
+        params.logprobs = int(logprobs)
     return params
+
+
+def logprob_rows(entries: Any) -> list[list[list[Any]]]:
+    """The engine's log-probs, one ``{token id: Logprob}`` per position, as ``[id, log-prob, rank]`` lists.
+
+    Best first. A position the engine returned as a bare float (the simple
+    format) becomes one entry with no id, which a gate reads as missing.
+    """
+    rows: list[list[list[Any]]] = []
+    for entry in entries or ():
+        if isinstance(entry, Mapping):
+            row = [
+                [int(token), float(getattr(lp, "logprob", lp)), getattr(lp, "rank", None)]
+                for token, lp in entry.items()
+            ]
+            row.sort(key=lambda item: -item[1])
+        else:
+            row = [[None, float(entry), None]]
+        rows.append(row)
+    return rows
 
 
 def make_input(llm: Any, request: Mapping[str, Any], *, model: str = "") -> Any:
@@ -114,7 +140,7 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
         raise RuntimeError("the engine returned no sequences")
     first = sequences[0]
     prompt_ids = getattr(output, "prompt_token_ids", None)
-    return {
+    record = {
         "index": index,
         "id": request.get("id", str(index)),
         "prompt_sha": wio.prompt_digest(str(request.get("prompt", request.get("token_ids", "")))),
@@ -126,6 +152,9 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
         "images": len(request.get("images") or ()),
         "sequences": sequences,
     }
+    if request.get("logprobs"):
+        record["top_logprobs"] = logprob_rows(getattr(output.outputs[0], "logprobs", None))
+    return record
 
 
 def _run_requests(
@@ -156,7 +185,12 @@ def _run_requests(
         streams = [
             llm.generate_async(
                 inputs[start + i],
-                sampling_for(base, r["max_tokens"], bool(spec.get("ignore_eos"))),
+                sampling_for(
+                    base,
+                    r["max_tokens"],
+                    bool(spec.get("ignore_eos")),
+                    int(r.get("logprobs") or 0),
+                ),
                 streaming=True,
             )
             for i, r in enumerate(window)

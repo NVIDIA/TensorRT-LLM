@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import yaml
@@ -22,13 +23,16 @@ import yaml
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as vocab
+from agent_flow.workflows.trtllm_modeling_v2.operators import prior_art
 from agent_flow.workflows.trtllm_modeling_v2.run import graph as graph_mod
+from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator as orchestrator_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
 from agent_flow.workflows.trtllm_modeling_v2.run.records.state import (
     STAGE_EXECUTION,
     STAGE_PREFLIGHT,
     load_state,
 )
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 
@@ -316,6 +320,107 @@ def test_dry_run_stops_before_the_first_agent_turn(tmp_path, task_file, monkeypa
         workflow.run(task_file)
     assert calls == []
     assert _state(tmp_path).stage == STAGE_PREFLIGHT
+
+
+def _substrate_boot(command: str) -> bool:
+    return "TRTLLM_MODELING_V2=off" in command and "engine_driver" in command
+
+
+def test_the_substrate_gate_runs_beside_the_first_turns_and_its_failure_leaves_the_run_open(
+    tmp_path, task_file, monkeypatch
+):
+    planner_called, booted = threading.Event(), []
+
+    def failing(command, env=None, timeout=0):
+        if _substrate_boot(command):
+            booted.append(command)
+            # The gate answers only once the first turn is under way: it does not hold it back.
+            planner_called.wait(10)
+            return CommandResult(returncode=1, stdout="MPI_ERR_SPAWN: could not spawn processes")
+        return passing_shell()(command, env, timeout)
+
+    workspace = (tmp_path / "ws").resolve()
+
+    def planner(turn, prompt):
+        planner_called.set()
+        deadline = time.monotonic() + 10
+        while not orchestrator_mod._STOPS[workspace].done():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        return plan_every_unit(turn, prompt)
+
+    workflow = _workflow(tmp_path, shell_runner=failing, skip_substrate_gate=False)
+    calls = _install(monkeypatch, workflow, Script(None, planner=planner))
+    with workflow:
+        workflow.run(task_file)
+    assert booted, "the substrate gate never ran"
+    # The graph the turn wrote is never adopted: nothing starts after the stop.
+    assert [name for name, _ in calls] == ["planner"]
+    state = _state(tmp_path)
+    assert not state.done and state.verdict == "" and state.stage == STAGE_EXECUTION
+    journal = (tmp_path / "ws" / "journal.md").read_text()
+    assert "substrate gate failed" in journal and "stopped: the substrate gate failed" in journal
+    assert "run closed" not in journal
+
+    # Fixed outside the run, the same command proves the host again and goes on.
+    second = _workflow(tmp_path, skip_substrate_gate=False)
+    _install(monkeypatch, second, Script(None))
+    with second:
+        second.run(task_file)
+    assert _state(tmp_path).verdict == "delivered"
+
+
+def test_a_survey_that_writes_what_the_tree_has_is_sent_back_once(tmp_path, task_file, monkeypatch):
+    """The review holds the draft to the dispatch's prior art; the re-draft is taken as it is."""
+    monkeypatch.setattr(TrtllmModelingV2Workflow, "survey_first", True)
+    lead = prior_art.Candidate(
+        path="tensorrt_llm/_torch/attention/backends/sparse/qsa/kernels.py",
+        kind="attention backend",
+        matched=("gqa", "sparse", "topk"),
+        score=9.0,
+        names=("triton_qsa_paged_sparse_gqa",),
+    )
+
+    def take(workflow, config):
+        workflow._prior_art = prior_art.PriorArt(words=lead.matched, candidates=[lead])
+        workflow._engine_limits = []
+        workflow._prior_art_block = prior_art.survey_block(workflow._prior_art, [])
+
+    monkeypatch.setattr(bootstrap, "_take_prior_art", take)
+    workspace = tmp_path / "ws"
+    prompts = []
+
+    def surveyor(turn, prompt):
+        prompts.append(prompt)
+        tried = (
+            "no trtllm op or _torch/modules callable"
+            if turn == 1
+            else ("qsa/kernels.py takes power-of-two heads only")
+        )
+        _write_vocabulary(workspace, [{"n": 1, "mode": "onboard", "target": "ops/norm/rms"}])
+        doc = yaml.safe_load((workspace / "vocabulary.yaml").read_text())
+        doc["steps"].append(
+            {
+                "step": "sparse GQA attention over the selected regions",
+                "values": {"topk": 512},
+                "state": "GAP",
+                "tier": 5,
+                "tried": tried,
+            }
+        )
+        (workspace / "vocabulary.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
+        return {"decision": "DRAFT_READY", "summary": f"draft {turn}"}
+
+    workflow = _workflow(tmp_path)
+    calls = _install(monkeypatch, workflow, Script(None, surveyor=surveyor))
+    with workflow:
+        workflow.run(task_file)
+    assert [name for name, _ in calls].count("surveyor") == 2
+    assert "Prior art and engine limits" in prompts[0] and "Survey review" not in prompts[0]
+    assert "## Survey review: re-draft" in prompts[1] and "qsa/kernels.py" in prompts[1]
+    assert (workspace / "survey_review.md").is_file()
+    assert "survey review: sent back with 1 finding(s)" in (workspace / "journal.md").read_text()
+    assert _state(tmp_path).verdict == "delivered"
 
 
 def test_a_new_run_starts_with_the_survey_beside_the_planners_first_turn(

@@ -39,6 +39,7 @@ from ...checks import gate_cli
 from ...infra.compute.scheduler import WATCHER_STALE_S, watcher_records
 from ...infra.git import CommitPolicy
 from ...operators import promotion as promotion_mod
+from ...operators import survey_review
 from ...operators.coverage import QueueItem, VocabularyError, load_vocabulary, queue_item_from_ref
 from ...spec import variants as variants_mod
 from ...spec.task_schema import assembly_units
@@ -237,6 +238,15 @@ class ExecutionStage:
             f"execution stage: {verdict}",
             contract_mod.standing(evaluation, self.workflow.workspace, marker),
         )
+        if verdict.startswith("stopped"):
+            # Preflight's substrate gate, running beside the first turns, found the run
+            # cannot go on here: nothing is closed, and the same command resumes once fixed.
+            print_message(
+                f"[bold yellow]⚠ execution stage {escape_markup(verdict)}; the run stays open: "
+                f"re-run the same command once the cause is fixed[/bold yellow]",
+                log,
+            )
+            return False
         if verdict not in ("delivered", "delivery-blocked"):
             self.workflow._close_run(state, log, verdict=verdict)
             return False
@@ -780,21 +790,61 @@ class ExecutionStage:
         )
         context = self._task_context(receipts, unit, task)
         parts = (header, context, tag_section(tags), prompt)
-        result = self._dispatch_task(
-            role, unit, task.id, "\n\n".join(p.strip() for p in parts if p)
-        )
+        dispatch = "\n\n".join(p.strip() for p in parts if p)
+        result = self._dispatch_task(role, unit, task.id, dispatch)
         if role == "assembler" and result.decision == "BLOCKED":
             result.annotate(self._blocked_report(result.data))
         if role == "assembler" and result.decision == "UNIT_READY":
             result.annotate(uncertified_report(result.data.get("uncertified")))
-        if task.kind == "survey" and result.decision == "DRAFT_READY":
-            try:
-                load_vocabulary(
-                    self.workflow.vocabulary_path, units=assembly_units(self.workflow.task_data)
-                )
-            except VocabularyError as exc:
-                result.decision = f"vocabulary.yaml does not validate: {exc}"
+        if task.kind == "survey":
+            result = self._checked_survey(result, role, unit, task.id, dispatch)
         return result
+
+    def _checked_survey(
+        self, result: TaskResult, role: str, unit: str, task_id: str, dispatch: str
+    ) -> TaskResult:
+        """A drafted survey, validated, then reviewed; sent back once with what the review found.
+
+        The review (``operators/survey_review.py``) holds the vocabulary to the
+        prior art and engine limits the dispatch carried. Its findings go back
+        to the surveyor once per run (``survey_review.md`` records it); after
+        that they stand in the journal and the draft is taken as it is.
+        """
+        if result.decision != "DRAFT_READY":
+            return result
+        try:
+            load_vocabulary(
+                self.workflow.vocabulary_path, units=assembly_units(self.workflow.task_data)
+            )
+        except VocabularyError as exc:
+            result.decision = f"vocabulary.yaml does not validate: {exc}"
+            return result
+        try:
+            plan = self.workflow.plan_path.read_text(encoding="utf-8")
+        except OSError:
+            plan = ""
+        findings = survey_review.review_survey(
+            yaml.safe_load(self.workflow.vocabulary_path.read_text(encoding="utf-8")) or {},
+            plan,
+            getattr(self.workflow, "_prior_art", None),
+            getattr(self.workflow, "_engine_limits", None) or (),
+        )
+        record = self.workflow.workspace / survey_review.REVIEW_FILENAME
+        if not findings:
+            return result
+        if record.exists():
+            self.workflow.journal.section(
+                f"survey review: {len(findings)} finding(s) stand after the re-draft",
+                "\n".join(f"- {f}" for f in findings),
+            )
+            return result
+        review = survey_review.render_review(findings)
+        record.write_text(review + "\n", encoding="utf-8")
+        self.workflow.journal.section(
+            f"survey review: sent back with {len(findings)} finding(s)", review
+        )
+        again = self._dispatch_task(role, unit, task_id, f"{dispatch}\n\n{review}", fresh=True)
+        return self._checked_survey(again, role, unit, task_id, dispatch)
 
     def _engine_defect_said(self, result: TaskResult) -> str:
         """What the planner hears of the engine defect a failed receipt reports; ``""`` without one.
@@ -1066,6 +1116,7 @@ def _surveyor_prompt(self) -> str:
         f"Read `{self.task_path}` for the run's spec: the checkpoint, the "
         f"architecture, the parallel segment, the features and the accuracy anchor.\n\n"
         f"{self._surface_block}\n"
+        f"{getattr(self, '_prior_art_block', '')}\n"
         f"{capture_lists_block(self.task_data)}\n"
         f"Write `{self.plan_path}` and `{self.vocabulary_path}` as the `survey` "
         f"section specifies. The orchestrator parses `vocabulary.yaml` and refuses "

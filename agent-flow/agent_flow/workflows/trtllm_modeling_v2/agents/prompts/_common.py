@@ -58,7 +58,10 @@ EVIDENCE_DISCIPLINE = """\
 
 Your decision file is what the orchestrator acts on; your report is a claim
 the next agent builds on without re-checking. Same-protocol accuracy reruns
-move 0.1-0.3 points; a smaller change is not a result.
+move 0.1-0.3 points; a smaller change is not a result. A benchmark you start
+yourself runs as the gates do, CUDA graphs on: eager takes 10-50x longer and
+scores a path the target does not serve. Eager is for a few prompts while
+debugging.
 """
 
 CITATION_DISCIPLINE = """\

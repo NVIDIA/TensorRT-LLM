@@ -201,7 +201,12 @@ def test_requested_inputs_and_partial_ranks_do_not_attest_actual_configuration()
     unknown = runtime_evidence.EngineAttestation(
         leg="", reported=True, reuse={"probe": {"status": "UNKNOWN", "skipped": "no capacity"}}
     )
-    assert "UNKNOWN" in runtime_evidence.reuse_shortfall(unknown, asks=True)
+    # A probe that could not run observed nothing: no negative result, no failure.
+    assert runtime_evidence.reuse_shortfall(unknown, asks=True) is None
+    reused_nothing = runtime_evidence.EngineAttestation(
+        leg="", reported=True, reuse={"probe": {"tokens": 96, "reused": 0}}
+    )
+    assert "reused nothing" in runtime_evidence.reuse_shortfall(reused_nothing, asks=True)
 
 
 def test_repeat_probe_completes_before_resubmission_and_pins_attention_rank(monkeypatch):
@@ -221,7 +226,7 @@ def test_repeat_probe_completes_before_resubmission_and_pins_attention_rank(monk
         def generate_async(self, prompt, params, **kwargs):
             events.append(("submit", kwargs))
             return SimpleNamespace(
-                result=lambda: (events.append(("complete", {})) or SimpleNamespace(cached_tokens=4))
+                result=lambda: events.append(("complete", {})) or SimpleNamespace(cached_tokens=4)
             )
 
     result = reuse_probe.probe(LLM(), SimpleNamespace(), {"enable_attention_dp": True})

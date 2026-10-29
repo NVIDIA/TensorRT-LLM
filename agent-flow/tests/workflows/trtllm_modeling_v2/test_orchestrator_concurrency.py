@@ -239,3 +239,40 @@ def test_an_operator_message_reaches_the_planner_while_a_long_task_runs(tmp_path
     finally:
         writer.join(_WAIT)
     assert seen["read before the task ended"]
+
+
+def test_a_stop_ends_the_run_at_once_without_waiting_for_the_turns_in_flight(tmp_path):
+    release, started, turns = threading.Event(), threading.Event(), []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            return PlannerAnswer(
+                "GRAPH_UPDATED", "plan", g.Graph(tasks=[_task("a", satisfies=_KEYS)])
+            )
+        return PlannerAnswer("DONE", "all green")
+
+    def work(task):
+        started.set()
+        release.wait(_WAIT)
+        return "UNIT_READY"
+
+    with orchestrator_mod.stoppable(tmp_path) as stop:
+        orchestrator = _orchestrator(tmp_path, plan, work)
+        threading.Thread(target=lambda: started.wait(_WAIT) and stop("the host failed")).start()
+        begun = time.monotonic()
+        assert orchestrator.run() == "stopped: the host failed"
+        assert time.monotonic() - begun < _WAIT / 2
+    release.set()
+    assert len(turns) == 1
+
+
+def test_a_stop_before_the_loop_starts_nothing(tmp_path):
+    def plan(turn):
+        raise AssertionError("no planner turn starts after a stop")
+
+    with orchestrator_mod.stoppable(tmp_path) as stop:
+        stop("the host failed")
+        orchestrator = _orchestrator(tmp_path, plan, lambda task: "UNIT_READY")
+        assert orchestrator.run() == "stopped: the host failed"
+    assert not orchestrator_mod._STOPS

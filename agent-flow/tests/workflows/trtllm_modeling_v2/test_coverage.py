@@ -100,6 +100,26 @@ def test_load_from_disk(tmp_path):
     assert parsed[0].target == "flashinfer_rmsnorm"
 
 
+def test_a_row_covers_each_axis_not_their_product():
+    def doc(count):
+        row = {
+            "n": 1,
+            "mode": vocab.MODE_VERIFY,
+            "target": "gemm/cublas_mm",
+            "surface": "k=7168",
+            "cells": [{"m": m, "k": 7168, "n": 1536} for m in range(1, count + 1)],
+        }
+        return _doc(
+            verdict=vocab.VERDICT_AFTER_ADDITIONS,
+            steps=[_ok_step(state=vocab.STATE_CERT)],
+            queue=[row],
+        )
+
+    vocab.parse_vocabulary(doc(vocab.MAX_ROW_CELLS))
+    with pytest.raises(vocab.VocabularyError, match=f"{vocab.MAX_ROW_CELLS + 1} cells"):
+        vocab.parse_vocabulary(doc(vocab.MAX_ROW_CELLS + 1))
+
+
 # ------------------------------------------------------------------ unit
 
 

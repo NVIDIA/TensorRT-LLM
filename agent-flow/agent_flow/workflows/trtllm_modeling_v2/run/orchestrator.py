@@ -29,7 +29,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from ..agents import decisions as decision_table
 from ..agents.slots import AgentGate, Priority, run_at, turn_priority
@@ -68,6 +68,9 @@ RECHECKS_WHILE_BUSY = 4
 #: How long a task thread waiting on its soft dependencies sleeps between looks,
 #: past the wake-up each recorded outcome gives it.
 SOFT_POLL_S = 5.0
+#: Per workspace, the stop a run this process drives there answers (:func:`stoppable`).
+_STOPS: dict[Path, Future] = {}
+_STOPS_LOCK = threading.Lock()
 
 
 @dataclass
@@ -411,6 +414,9 @@ class GraphOrchestrator:
         #: the task threads waiting on soft dependencies; ``_closing`` once the loop ends.
         self._ended = threading.Condition()
         self._closing = False
+        #: Done once the run is asked to stop (:func:`stoppable`); its result says why.
+        with _STOPS_LOCK:
+            self._stop: Future = _STOPS.get(self.workspace.resolve()) or Future()
 
     def _persist(self, what: str, write: Callable[[], None]) -> None:
         """``write`` now, or, when the filesystem is full, again until it lands."""
@@ -1673,9 +1679,10 @@ class GraphOrchestrator:
     def run(self) -> str:
         """Drive the run to a verdict: delivered, escalated, ceiling, planner-stalled or planner-refused.
 
-        The loop's own failure, or Ctrl-C, records what finished and raises at
-        once: the turns and checks in flight are left to end on their own, and
-        a resumed run starts them again.
+        Or ``stopped: <reason>``, when :func:`stoppable` asked it to stop: it
+        then returns at once, and the turns and checks in flight are left to
+        end on their own. The loop's own failure, or Ctrl-C, records what
+        finished and raises at once, the same way; a resumed run starts them again.
         """
         checks = ThreadPoolExecutor(
             max_workers=self.max_parallel_checks, thread_name_prefix="mv2-check"
@@ -1700,11 +1707,13 @@ class GraphOrchestrator:
                 with self._ended:
                     self._closing = True
                     self._ended.notify_all()
+                stopped = crashed or self._stop.done()
                 for pool in (planner, tasks):
-                    pool.shutdown(wait=not crashed, cancel_futures=crashed)
+                    pool.shutdown(wait=not stopped, cancel_futures=stopped)
         finally:
             # After the tasks: a task still running submits its checks here.
-            checks.shutdown(wait=not crashed, cancel_futures=crashed)
+            stopped = crashed or self._stop.done()
+            checks.shutdown(wait=not stopped, cancel_futures=stopped)
             self._check_pool = None
 
     def _record_finished(self) -> None:
@@ -1728,9 +1737,12 @@ class GraphOrchestrator:
         # A resumed run whose contract held before it stopped keeps a milestone for it.
         self._correctness(*self._evaluated())
         completion = None
-        if not self.graph.tasks:
+        if not self.graph.tasks and not self._stop.done():
             self._wake_planner(planner)
         while True:
+            if self._stop.done():
+                self.s.log(f"[stop] {self._stop.result()}: nothing more starts")
+                return f"stopped: {self._stop.result()}"
             for tid, future in list(running.items()):
                 if future.done():
                     del running[tid]
@@ -1914,12 +1926,14 @@ class GraphOrchestrator:
             self._wait(running, self._timeout())
 
     def _wait(self, running: dict[str, Future], timeout: float | None) -> None:
-        """Until something in flight ends, or ``timeout`` passes; with nothing in flight, the timeout."""
+        """Until something in flight ends, the run is stopped, or ``timeout`` passes.
+
+        With nothing in flight, the timeout (the poll interval when there is none).
+        """
         in_flight = self._in_flight(running)
-        if in_flight:
-            wait(in_flight, timeout=timeout, return_when=FIRST_COMPLETED)
-        else:
-            time.sleep(self.poll_s if timeout is None else timeout)
+        if not in_flight and timeout is None:
+            timeout = self.poll_s
+        wait([*in_flight, self._stop], timeout=timeout, return_when=FIRST_COMPLETED)
 
     def _in_flight(self, running: dict[str, Future]) -> list[Future]:
         """The tasks, re-checks and planner turn in flight, as futures to wait on.
@@ -2021,6 +2035,35 @@ def _answered(
     return outcome.status == "done" and written[outcome.task] == ("done", outcome.attempt)
 
 
+@contextlib.contextmanager
+def stoppable(workspace: Path | str) -> Iterator[Callable[[str], None]]:
+    """While open, the callable it yields stops the run this process drives on ``workspace``.
+
+    Called with the reason, from any thread, it makes the loop start nothing
+    more and return ``stopped: <reason>`` at once; the turns and checks in
+    flight are left to end on their own and their outcomes are never read. A
+    loop that starts after it was called stops as it starts. For what runs
+    beside the run's first turns and can find the run cannot go on, such as
+    preflight's substrate gate.
+    """
+    key = Path(workspace).resolve()
+    stopped: Future = Future()
+
+    def stop(reason: str) -> None:
+        with _STOPS_LOCK:
+            if not stopped.done():
+                stopped.set_result(reason)
+
+    with _STOPS_LOCK:
+        _STOPS[key] = stopped
+    try:
+        yield stop
+    finally:
+        with _STOPS_LOCK:
+            if _STOPS.get(key) is stopped:
+                del _STOPS[key]
+
+
 __all__ = [
     "CEILING",
     "CHECKED",
@@ -2034,4 +2077,5 @@ __all__ = [
     "PlannerTurn",
     "Services",
     "seed",
+    "stoppable",
 ]

@@ -70,7 +70,7 @@ REF_DISPATCH_BASE, REF_DISPATCH_SPAN = 10_000, 90_000
 
 # Where a GAP's implementation is allowed to come from, cheapest first.
 TIER_TRTLLM_OP = 1  # torch.ops.trtllm.* -- an op the engine already exports
-TIER_INTREE_CALLABLE = 2  # tensorrt_llm/_torch/modules/** -- the kernel plane
+TIER_INTREE_CALLABLE = 2  # a callable already in this tree -- the kernel plane, reused
 TIER_KERNEL_LIBRARY = 3  # flashinfer.* -- a pinned kernel library, called directly
 TIER_NATIVE_TORCH = 4  # composed from torch ops, written by this run
 TIER_TRITON = 5  # a Triton kernel, written by this run
@@ -90,8 +90,11 @@ KERNEL_LIBRARIES: tuple[str, ...] = ("flashinfer",)
 TIER_DESCRIPTION: dict[int, str] = {
     TIER_TRTLLM_OP: "an op the engine already exports as torch.ops.trtllm.*",
     TIER_INTREE_CALLABLE: (
-        "a callable already in this repository under tensorrt_llm/_torch/modules/**; "
-        "the kernel plane is reused, not rewritten"
+        "a callable already in this repository: the engine's modules, its attention "
+        "backends (sparse ones included), custom ops and kernels (`tree_map.md` in the "
+        "workspace says where each is in this checkout), or another modeling_v2 "
+        "target's `ops/` (reused by promotion into the catalog); the kernel plane is "
+        "reused, not rewritten"
     ),
     TIER_KERNEL_LIBRARY: (
         "a kernel from a library the engine already pins (FlashInfer), called through "
@@ -119,6 +122,11 @@ _VALID_VERDICTS = (VERDICT_ASSEMBLABLE, VERDICT_AFTER_ADDITIONS, VERDICT_CEILING
 
 #: The unit a queue row belongs to when it names none.
 UNIT_CORE = "core"
+
+#: Cells one queue row may list. The kernel writer certifies every cell its row lists, so a
+#: row covers each axis of the envelope (dtype, rows per captured batch, per-rank sizes, the
+#: prefill chunk), not their product.
+MAX_ROW_CELLS = 64
 
 
 class VocabularyError(ValueError):
@@ -409,6 +417,14 @@ def _parse_queue(
                 f"queue[{index}] is a verify dispatch with no `surface`. The value and "
                 f"the contract line that excludes it are what the kernel writer is dispatched "
                 f"with, so vagueness here costs a whole run"
+            )
+        cells = row.get("cells")
+        if isinstance(cells, list) and len(cells) > MAX_ROW_CELLS:
+            errors.append(
+                f"queue[{index}] lists {len(cells)} cells, more than {MAX_ROW_CELLS}. The kernel "
+                f"writer certifies each one: cover each axis (every dtype, each call site's rows "
+                f"at the smallest and largest captured batch, each member's per-rank sizes, one "
+                f"chunk at max_num_tokens), varying one at a time from a base cell, not their product"
             )
 
         site = _parse_site(row, index, target, errors)

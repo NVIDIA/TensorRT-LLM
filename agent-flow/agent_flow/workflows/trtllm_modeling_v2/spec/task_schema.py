@@ -405,6 +405,10 @@ ENVELOPE_KEYS: tuple[str, ...] = (
     "long_prompts",
     "probes",
     "timeout",
+    # Nats within which two tokens a probe's legs part on are a near-tie, which passes.
+    "tie_margin",
+    # The members whose boot runs the phases; default one per unit (checks/boot.py).
+    "members",
 )
 
 # Serve defaults are derived from the declared sequence bound in derive_gate_defaults.
@@ -1409,6 +1413,18 @@ def _validate_envelope(block: Any, errors: list[str]) -> None:
             "probes": (
                 lambda v: bool(v) and _nonempty_strings(v),
                 "must be a non-empty list of prompts",
+            ),
+            "tie_margin": (
+                lambda v: _number(v) and v >= 0,
+                "must be a number of nats >= 0",
+            ),
+            "members": (
+                lambda v: (
+                    bool(v)
+                    and _nonempty_strings(v)
+                    and all(PARALLEL_PATTERN.match(str(m)) for m in v)
+                ),
+                "must be a non-empty list of members (tp<N>, tep<N>, dep<N>)",
             ),
         },
         errors,

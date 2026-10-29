@@ -17,7 +17,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ..infra.compute.environment import RunEnvironment
 
@@ -375,8 +375,15 @@ def run_inventory_probe(
 # --------------------------------------------------------------------------
 
 
-def format_surface(inventory: Inventory, *, limit: int = 40) -> str:
-    """What the build supplies, as the surveyor reads it; ``limit`` caps each list."""
+def format_surface(
+    inventory: Inventory, *, limit: int = 40, rank: Callable[[str], float] | None = None
+) -> str:
+    """What the build supplies, as the surveyor reads it; ``limit`` caps each list.
+
+    With ``rank`` (``prior_art.ranker``) each list is ordered by how much each name shares
+    the checkpoint's vocabulary before it is cut, so what this checkpoint is likely to
+    reuse is read first, however its name sorts.
+    """
     lines = ["## Surface survey", ""]
     if not inventory.ok:
         lines += [
@@ -391,10 +398,17 @@ def format_surface(inventory: Inventory, *, limit: int = 40) -> str:
         "checkpoint demands is yours to read (`config.json`, the HuggingFace code); joining "
         "the two is your job."
     )
+    if rank is not None:
+        lines.append(
+            "Each list is ordered by how much a name shares this checkpoint's `config.json` "
+            "vocabulary, most first; a cut list continues, in the same order, in `surface.md`."
+        )
 
     def listed(title: str, items: list[str]) -> None:
         if not items:
             return
+        if rank is not None:
+            items = sorted(items, key=lambda item: (-rank(item), item))
         lines.extend(["", f"**{title}** ({len(items)}):", ""])
         lines.extend(f"- `{item}`" for item in items[:limit])
         if len(items) > limit:
@@ -423,10 +437,21 @@ def format_surface(inventory: Inventory, *, limit: int = 40) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_surface_file(path: str | Path, inventory: Inventory) -> Path:
+def surface_names(inventory: Inventory) -> list[str]:
+    """Every name the surface lists, as it lists them: what a ranking is weighed over."""
+    return [
+        *(f"{e.category}/{e.name}" for e in inventory.catalog if not e.scope),
+        *(f"{e.scope}/ops/{e.category}/{e.name}" for e in inventory.promotable),
+        *inventory.unwrapped_ops,
+    ]
+
+
+def write_surface_file(
+    path: str | Path, inventory: Inventory, *, rank: Callable[[str], float] | None = None
+) -> Path:
     """Write the survey unabridged, with the versions the probe read, for audit and for agents."""
     out = Path(path)
-    body = [format_surface(inventory, limit=1_000_000), "## Versions", ""]
+    body = [format_surface(inventory, limit=1_000_000, rank=rank), "## Versions", ""]
     body.extend(f"- {k}: {v}" for k, v in sorted(inventory.versions.items()))
     out.write_text("\n".join(body) + "\n", encoding="utf-8")
     return out
@@ -443,5 +468,6 @@ __all__ = [
     "parse_inventory",
     "probe_command",
     "run_inventory_probe",
+    "surface_names",
     "write_surface_file",
 ]

@@ -3,17 +3,19 @@
 
 """Preflight: the checks, the environment, the agent probe, host facts and the surface survey.
 
-The substrate gate, the one check that boots a GPU, runs before the run's
-first turn, unless a recent pass in this environment stands for it.
+The substrate gate, the one check that boots a GPU, runs beside the run's
+first turns, unless a recent pass in this environment stands for it: its
+failure stops the run, which stays open for the same command to resume.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import os
+import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import yaml
 from rich.markup import escape as escape_markup
@@ -33,7 +35,13 @@ from ...infra.compute.environment import (
 from ...infra.compute.executor import select_command_executor, shell_runner_for
 from ...infra.files import read_json, write_json_atomic
 from ...infra.git import CommitPolicy
-from ...operators.inventory import format_surface, run_inventory_probe, write_surface_file
+from ...operators import prior_art, tree_anchors
+from ...operators.inventory import (
+    format_surface,
+    run_inventory_probe,
+    surface_names,
+    write_surface_file,
+)
 from ...spec.task_schema import assembly_units
 from ..records.state import WorkflowState
 from ..validation import contract as contract_mod
@@ -136,8 +144,15 @@ def substrate_reuse(
     return True, f"passed {age / 3600:.1f} h ago in this environment"
 
 
-def _run_preflight(workflow, state: WorkflowState, log) -> bool:
-    """Resolve and prove what the run needs before its first turn; False stops the run."""
+def _run_preflight(
+    workflow, state: WorkflowState, log, *, stop: Callable[[str], None] | None = None
+) -> bool:
+    """Resolve and prove what the run needs before its first turn; False stops the run.
+
+    With ``stop`` the substrate gate runs beside what follows
+    (:func:`_prove_substrate_beside`) and its failure calls it; without, it
+    runs here and its failure returns False.
+    """
     print_rule("[bold magenta]preflight[/bold magenta]", log)
     kwargs: dict[str, Any] = {}
     if workflow._command_runner is not None:
@@ -204,7 +219,9 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
 
     # Skipped on a dry run, which only asks whether the spec resolves.
     if not workflow.dry_run and not workflow.skip_substrate_gate:
-        if not _prove_substrate(workflow, result, log):
+        if stop is not None:
+            _prove_substrate_beside(workflow, result, log, stop)
+        elif not _prove_substrate(workflow, result, log):
             return False
 
     _take_survey(workflow, result, log)
@@ -290,6 +307,35 @@ def _prove_substrate(workflow, result, log) -> bool:
     )
     workflow.journal.event("substrate gate passed", f"run because {why}; `{record_path}`")
     return True
+
+
+def _prove_substrate_beside(workflow, result, log, stop: Callable[[str], None]) -> None:
+    """Run the substrate gate on a thread of its own, while the run's first turns start.
+
+    A pass rewrites the host facts with what it measured; a failure, or an
+    error that kept it from a verdict, calls ``stop`` with why.
+    """
+
+    def prove() -> None:
+        try:
+            passed = _prove_substrate(workflow, result, log)
+        except Exception as exc:  # the run waits on this thread's answer, whatever it hit
+            workflow.journal.section("substrate gate failed", f"{type(exc).__name__}: {exc}")
+            passed = False
+        if passed:
+            _write_host_facts(workflow, result)
+            return
+        stop("the substrate gate failed; the journal has its output")
+
+    workflow._substrate_thread = threading.Thread(target=prove, name="mv2-substrate", daemon=True)
+    workflow._substrate_thread.start()
+
+
+def _await_substrate(workflow) -> None:
+    """Wait for a substrate gate that runs beside the run, if one does."""
+    thread = getattr(workflow, "_substrate_thread", None)
+    if thread is not None:
+        thread.join()
 
 
 def _prove_agents(workflow, log) -> bool:
@@ -392,6 +438,23 @@ def _write_contract(workflow) -> None:
     workflow.journal.section(
         "coverage: what the contract proves of the request", workflow._coverage.render()
     )
+    _write_intake_lint(workflow)
+
+
+def _write_intake_lint(workflow) -> None:
+    """Journal the intake lint of the spec the run starts from; a finding never stops the run."""
+    from ...spec import lint as lint_mod
+
+    try:
+        report = lint_mod.lint_task(
+            workflow.task_data,
+            contract=workflow._contract,
+            world_size=workflow._gate_env().world_size,
+        )
+    except Exception as exc:  # the lint is advice: it must not cost the run its start
+        workflow.journal.section("intake lint: not run", f"{type(exc).__name__}: {exc}")
+        return
+    workflow.journal.section(f"intake lint: {report.summary()}", report.render(prior_art_limit=8))
 
 
 def _write_host_facts(workflow, result) -> None:
@@ -475,6 +538,77 @@ def _write_host_facts(workflow, result) -> None:
     workflow.host_facts_path.write_text(head + appended, encoding="utf-8")
 
 
+#: What the tree already implements for this checkpoint and what the engine refuses, per run.
+PRIOR_ART_FILENAME = "prior_art.md"
+#: Where the checkout under test keeps what the workflow reads and the roles are sent to.
+TREE_MAP_FILENAME = "tree_map.md"
+
+
+def _checkpoint_config(task_data: Mapping[str, Any]) -> dict[str, Any]:
+    """The checkpoint's ``config.json``, or ``{}`` when it cannot be read here."""
+    import json
+
+    try:
+        path = Path(str(task_data.get("checkpoint_path") or "")) / "config.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _take_prior_art(workflow, config: Mapping[str, Any]) -> None:
+    """Read the tree's prior art and the engine's limits for this checkpoint, for the survey.
+
+    Into ``prior_art.md`` in the workspace, for every role, and the section the
+    survey dispatch carries; the leads and the limits the survey review holds
+    the vocabulary to. **Never fatal**: an unreadable config or tree leaves none.
+    """
+    repo = workflow.task_data.get("trtllm_repo_path")
+    workflow._prior_art, workflow._engine_limits = None, []
+    if config and repo:
+        try:
+            workflow._prior_art = prior_art.find_prior_art(repo, config)
+            workflow._engine_limits = prior_art.engine_limits(config, repo)
+        except OSError:
+            pass
+    workflow._prior_art_block = prior_art.survey_block(workflow._prior_art, workflow._engine_limits)
+    path = workflow.workspace / PRIOR_ART_FILENAME
+    if not workflow._prior_art_block:
+        path.unlink(missing_ok=True)
+        return
+    path.write_text(
+        prior_art.survey_block(workflow._prior_art, workflow._engine_limits, limit=12),
+        encoding="utf-8",
+    )
+
+
+def _take_tree_map(workflow) -> str:
+    """Write ``tree_map.md``: every anchor's place in the checkout under test (:mod:`.tree_anchors`).
+
+    Returns a line for the journal when an anchor moved or is missing, else
+    ``""``. **Never fatal**: a checkout it cannot read leaves no map.
+    """
+    repo = workflow.task_data.get("trtllm_repo_path")
+    path = workflow.workspace / TREE_MAP_FILENAME
+    if not repo:
+        path.unlink(missing_ok=True)
+        return ""
+    try:
+        found = [tree_anchors.resolve(repo, key) for key in tree_anchors.ANCHORS]
+        path.write_text(tree_anchors.render_map(repo, found), encoding="utf-8")
+    except OSError:
+        path.unlink(missing_ok=True)
+        return ""
+    parts = []
+    moved = [r.anchor.concept for r in found if r.via == "search"]
+    if moved:
+        parts.append(f"moved: {', '.join(moved)}")
+    gone = [r.anchor.concept for r in found if not r.found]
+    if gone:
+        parts.append(f"missing: {', '.join(gone)}")
+    return f"tree map ({'; '.join(parts)}): `{TREE_MAP_FILENAME}`" if parts else ""
+
+
 def _take_survey(workflow, result, log) -> None:
     """Measure what the build supplies, for the surveyor and in ``surface.md``.
 
@@ -487,8 +621,13 @@ def _take_survey(workflow, result, log) -> None:
         result.environment,
         shell_runner=workflow._shell_runner,
     )
-    workflow._surface_block = format_surface(inventory)
-    write_surface_file(workflow.workspace / "surface.md", inventory)
+    config = _checkpoint_config(workflow.task_data)
+    # Every list is ordered by what this checkpoint is likely to reuse before it is cut.
+    rank = prior_art.ranker(config, surface_names(inventory)) if config else None
+    workflow._surface_block = format_surface(inventory, rank=rank)
+    write_surface_file(workflow.workspace / "surface.md", inventory, rank=rank)
+    _take_prior_art(workflow, config)
+    tree_note = _take_tree_map(workflow)
 
     headline = (
         f"{len(inventory.spendable)}/{len(inventory.catalog)} entries certified on "
@@ -496,7 +635,10 @@ def _take_survey(workflow, result, log) -> None:
         if inventory.ok
         else f"inventory probe failed: {inventory.error.splitlines()[0]}"
     )
-    workflow.journal.section("surface survey", headline + "\n\nFull survey: `surface.md`")
+    workflow.journal.section(
+        "surface survey",
+        headline + "\n\nFull survey: `surface.md`" + (f"\n\n{tree_note}" if tree_note else ""),
+    )
     # A probe that never ran must not read as an empty catalog.
     mark, colour = ("✔", "green") if inventory.ok else ("⚠", "yellow")
     print_message(f"[bold {colour}]{mark} survey[/bold {colour}] {headline}", log)

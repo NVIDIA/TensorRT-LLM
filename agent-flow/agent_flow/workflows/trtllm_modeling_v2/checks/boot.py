@@ -13,7 +13,13 @@ from typing import Any, Mapping, Sequence
 from ..checks.logit_reference import Reference, load_reference
 from ..checks.logit_reference import ReferenceError as LogitReferenceError
 from ..infra.compute.environment import RunEnvironment
-from ..spec.task_schema import BOOT_KEYS, load_prompts_file
+from ..spec.task_schema import (
+    BOOT_KEYS,
+    TaskSchemaError,
+    load_prompts_file,
+    members_for,
+    parse_parallel_segment,
+)
 from ..spec.variants import is_variant
 from . import check_config, feature_evidence
 from .check_config import (
@@ -419,6 +425,42 @@ def _declares_workload(block: Mapping[str, Any]) -> bool:
     return False
 
 
+#: The top log-probs each boundary probe's tokens carry, to tell a near-tie from a defect.
+BOUNDARY_TOP_K = 5
+#: Kinds of member in the order the boundary phases prefer one: the member that batches most.
+_BOUNDARY_KINDS = {"dep": 0, "tep": 1, "tp": 2}
+
+
+def boundary_member(members: Sequence[str]) -> str | None:
+    """The member a unit's boundary phases run at: attention DP first, then the widest."""
+
+    def key(member: str) -> tuple[int, int, str]:
+        try:
+            kind, size = parse_parallel_segment(member)
+        except TaskSchemaError:
+            return (len(_BOUNDARY_KINDS) + 1, 0, member)
+        return (_BOUNDARY_KINDS.get(kind, len(_BOUNDARY_KINDS)), -(size or 0), member)
+
+    return min(members, key=key) if members else None
+
+
+def _tie_gap(alone: Mapping[str, Any], loaded: Mapping[str, Any], step: int) -> float | None:
+    """How far apart the two legs' tokens at ``step`` are in either leg's own log-probs.
+
+    ``None`` when neither leg's top-k holds both tokens.
+    """
+    tokens = (alone["token_ids"][step], loaded["token_ids"][step])
+    gaps = []
+    for record, (own, other) in ((alone, tokens), (loaded, tokens[::-1])):
+        rows = record.get("top_logprobs") or ()
+        if step >= len(rows):
+            continue
+        row = {entry[0]: entry[1] for entry in rows[step] if entry and entry[0] is not None}
+        if own in row and other in row:
+            gaps.append(abs(float(row[own]) - float(row[other])))
+    return min(gaps) if gaps else None
+
+
 @dataclass(frozen=True)
 class BootBoundarySpec:
     """Optional runtime-boundary phases of boot, configured by ``accuracy.envelope``.
@@ -426,6 +468,12 @@ class BootBoundarySpec:
     Sequential probes and loaded requests share the boot's engine, sampling and
     tuning choices. Cache reuse remains as declared; this is not a cold-cache
     comparison or evidence of scheduler batch sizes or CUDA graph execution.
+
+    They run once per unit, in its boot at one member (``members``, else
+    :func:`boundary_member`), never in a configuration variant's. A probe whose
+    legs part where the two tokens are within ``tie_margin`` of each other in a
+    leg's own log-probs is a near-tie: batch shape moves low-precision
+    arithmetic, and a near-tie flips with it without any defect.
     """
 
     enabled: bool = False
@@ -439,6 +487,10 @@ class BootBoundarySpec:
         "Two plus two equals",
     )
     timeout: int = 2 * BOOT_TIMEOUT_S
+    #: Nats; the greedy comparison's floor (``DEFAULT_THRESHOLD_FACTOR * MIN_MAX_DELTA``).
+    tie_margin: float = DEFAULT_THRESHOLD_FACTOR * MIN_MAX_DELTA
+    #: The members whose boot runs the phases; empty: one per unit.
+    members: tuple[str, ...] = ()
 
     @classmethod
     def from_task(cls, task_data: Mapping[str, Any]) -> "BootBoundarySpec":
@@ -447,9 +499,22 @@ class BootBoundarySpec:
             for key, value in ((task_data.get("accuracy") or {}).get("envelope") or {}).items()
             if value is not None
         }
-        if "probes" in block:
-            block["probes"] = tuple(block["probes"])
+        for key in ("probes", "members"):
+            if key in block:
+                block[key] = tuple(block[key])
         return cls(**block)
+
+    def runs_at(
+        self, task_data: Mapping[str, Any], unit: str | None, member: str | None, world_size: int
+    ) -> bool:
+        """Whether ``unit``'s boot at ``member`` runs the phases: one member of each unit."""
+        if member is None:
+            return True
+        if unit is not None and is_variant(task_data, unit):
+            return False
+        if self.members:
+            return member in self.members
+        return member == boundary_member(members_for(task_data, unit or "core", world_size))
 
     def prompt_tokens(self, limits: EngineLimits) -> int:
         """Sequence-bound prompt length, capped by the unchunked token budget."""
@@ -473,7 +538,12 @@ class BootBoundarySpec:
                 "boot boundaries leave no room for a long prompt and its output budget"
             )
         probes = [
-            {"id": f"probe{n}", "prompt": prompt, "max_tokens": self.max_tokens}
+            {
+                "id": f"probe{n}",
+                "prompt": prompt,
+                "max_tokens": self.max_tokens,
+                "logprobs": BOUNDARY_TOP_K,
+            }
             for n, prompt in enumerate(self.probes)
         ]
         loaded = [
@@ -501,21 +571,31 @@ class BootBoundarySpec:
     def failure(
         self, phases: Sequence[Mapping[str, Any]], records: Sequence[Mapping[str, Any]]
     ) -> str:
-        """Require complete nonempty outputs, exact long lengths and full probe prefixes."""
+        """Why the phases fail (:meth:`judge`); ``""`` when they pass."""
+        return self.judge(phases, records)[0]
+
+    def judge(
+        self, phases: Sequence[Mapping[str, Any]], records: Sequence[Mapping[str, Any]]
+    ) -> tuple[str, list[str]]:
+        """Require complete nonempty outputs, exact long lengths and agreeing probe prefixes.
+
+        Returns why the phases fail (``""`` when they pass) and the probes whose
+        legs parted at a near-tie, which pass.
+        """
         outputs: dict[tuple[str, str], Mapping[str, Any]] = {}
         for record in records:
             key = (str(record.get("phase", "")), str(record.get("id", "")))
             if key in outputs:
-                return f"boot boundaries returned duplicate record {key}"
+                return f"boot boundaries returned duplicate record {key}", []
             outputs[key] = record
         for phase in phases:
             for request in phase["requests"]:
                 key = (phase["id"], request["id"])
                 record = outputs.get(key)
                 if record is None:
-                    return f"boot boundaries returned no record for {key}"
+                    return f"boot boundaries returned no record for {key}", []
                 if not record.get("token_ids"):
-                    return f"boot boundaries generated nothing for {key}"
+                    return f"boot boundaries generated nothing for {key}", []
                 if "token_ids" in request:
                     expected = len(request["token_ids"])
                     observed = record.get("prompt_tokens")
@@ -523,18 +603,33 @@ class BootBoundarySpec:
                         return (
                             f"{key} reached {observed} prompt tokens, not the {expected} "
                             "required by boot boundaries"
-                        )
+                        ), []
+        ties: list[str] = []
         for n in range(len(self.probes)):
             key = f"probe{n}"
-            alone = outputs[("baseline", key)]["token_ids"]
-            loaded = outputs[("loaded", key)]["token_ids"]
+            alone_record, loaded_record = outputs[("baseline", key)], outputs[("loaded", key)]
+            alone, loaded = alone_record["token_ids"], loaded_record["token_ids"]
             need = self.agree_tokens
-            if len(alone) < need or len(loaded) < need or alone[:need] != loaded[:need]:
-                return (
-                    f"{key} must agree on {need} tokens: baseline {alone[:need]} "
-                    f"vs loaded {loaded[:need]}"
+            said = f"{key} must agree on {need} tokens: baseline {alone[:need]} vs loaded {loaded[:need]}"
+            if len(alone) < need or len(loaded) < need:
+                return said, ties
+            step = next((s for s in range(need) if alone[s] != loaded[s]), None)
+            if step is None:
+                continue
+            gap = _tie_gap(alone_record, loaded_record, step)
+            if gap is not None and gap <= self.tie_margin:
+                ties.append(
+                    f"{key} step {step}: baseline {alone[step]}, loaded {loaded[step]}, "
+                    f"{gap:.3f} apart"
                 )
-        return ""
+                continue
+            why = (
+                f"{gap:.3f} apart at step {step}, past the near-tie margin {self.tie_margin:.3f}"
+                if gap is not None
+                else f"at step {step} no leg's top-{BOUNDARY_TOP_K} log-probs hold both tokens"
+            )
+            return f"{said} ({why})", ties
+        return "", ties
 
     def describe(self, config: Mapping[str, Any]) -> str:
         limits = EngineLimits.from_config(config)
@@ -573,7 +668,8 @@ def run_boot_gate(
     (:func:`engine_failure`). ``mode`` other than ``require`` is a control run
     on the stock implementation, recorded as ``boot[<mode>]``. When enabled,
     ``accuracy.envelope`` appends sequential baseline and loaded boundary phases
-    to this same engine, without adding a separate contract check.
+    to this same engine, without adding a separate contract check, in one
+    member's boot of each unit (:meth:`BootBoundarySpec.runs_at`).
     """
     spec = spec or BootSpec()
     env = with_mode(environment, mode)
@@ -597,7 +693,9 @@ def run_boot_gate(
         config["sampling"].update(temperature=0.0, top_k=1, top_p=1.0)
         requests += greedy.requests()
     subjects = check_config.subject_fields(task_data, unit)
-    chunks = feature_evidence.about(subjects, feature_evidence.CHUNKED)
+    # A prompt the engine must split proves chunking only where the engine chunks: a variant
+    # that turns chunked prefill off is about chunking too, and owes no split prompt.
+    chunks = feature_evidence.about(subjects, feature_evidence.CHUNKED) and limits.chunked_prefill
     if chunks and not any(
         len(p.input_ids) > limits.max_num_tokens for p in (greedy.prompts if greedy else ())
     ):
@@ -614,7 +712,11 @@ def run_boot_gate(
         requests.append({"id": "chunk", "probe_tokens": length, "max_tokens": 1})
     boundary = BootBoundarySpec.from_task(task_data)
     phases = []
-    if boundary.enabled and mode == MODE_REQUIRE:
+    if (
+        boundary.enabled
+        and mode == MODE_REQUIRE
+        and boundary.runs_at(task_data, unit, member, environment.world_size)
+    ):
         try:
             phases = boundary.phases(config)
         except ValueError as exc:
@@ -675,8 +777,9 @@ def run_boot_gate(
         return _verdict(passed=False, detail=feature_evidence.unobserved_detail(unobserved), **ran)
 
     all_records = parse_driver_records(combined)
+    boundary_ties: list[str] = []
     if phases:
-        failure = boundary.failure(phases, all_records)
+        failure, boundary_ties = boundary.judge(phases, all_records)
         if failure:
             return _verdict(passed=False, detail=failure, **ran)
     records = {
@@ -749,7 +852,13 @@ def run_boot_gate(
         passed=True,
         detail=f"engine cold-started and produced {checked} for {len(texts)} prompt(s)"
         f"{sent}; workload: {spec.source}{agreed}{chunked}"
-        + (boundary.describe(config) if phases else ""),
+        + (boundary.describe(config) if phases else "")
+        + (
+            f"; boundary probes agreed up to {len(boundary_ties)} near-tie(s) "
+            f"({'; '.join(boundary_ties)})"
+            if boundary_ties
+            else ""
+        ),
         **ran,
     )
 

@@ -36,7 +36,7 @@ _READING: dict[str, str] = {
     "planner": f"""\
 1. `{_PACKAGE}/README.md`, whole.
 2. The run's spec, `task.yaml`, and its contract, `contract.yaml`, in the workspace.
-3. `surface.md` in the workspace, when it exists.
+3. `surface.md` and `prior_art.md` in the workspace, when they exist.
 4. The existing targets under `{_PACKAGE}/models/`: how each is laid out, by
    listing, not reading every file.
 """,
