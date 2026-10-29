@@ -997,25 +997,22 @@ TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityRejectsBeamSearch)
     manager->shutdown();
 }
 
-TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityMustFitTheGpuQuota)
+TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityRaisesASmallGpuQuota)
 {
     // 8 MiB holds the elastic layout and a 9-slot fixed group, but not ceil(2048 / 0.97) = 2112 slots of
-    // 4 KiB, which take 5 allocation units of 2 MiB before the other groups' minimum slots.
-    auto elastic = std::make_shared<KvCacheManager>(makeReservedSsmConfig(8 << 20, std::nullopt));
-    elastic->shutdown();
+    // 4 KiB, which take 5 allocation units of 2 MiB before the other groups' minimum slots. The fixed group
+    // then raises the quota, as the elastic floors do, and keeps its full size.
     auto small = std::make_shared<KvCacheManager>(makeReservedSsmConfig(8 << 20, 8));
     EXPECT_EQ(hotSlotCounts(*small).at(3), 9);
     small->shutdown();
-    try
+    auto const manager = std::make_shared<KvCacheManager>(makeReservedSsmConfig(8 << 20, 2048));
+    auto const counts = hotSlotCounts(*manager);
+    EXPECT_EQ(counts.at(3), 2112);
+    for (auto const count : counts)
     {
-        auto const manager = std::make_shared<KvCacheManager>(makeReservedSsmConfig(8 << 20, 2048));
-        manager->shutdown();
-        ADD_FAILURE() << "an undersized GPU quota was accepted";
+        EXPECT_GT(count, 0);
     }
-    catch (std::invalid_argument const& error)
-    {
-        EXPECT_NE(std::string(error.what()).find("max_live_kv_caches"), std::string::npos) << error.what();
-    }
+    manager->shutdown();
 }
 
 TEST_F(ReplayCacheTest, ClosingScratchCacheReleasesEverySlotExactlyOnce)

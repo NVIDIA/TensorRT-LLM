@@ -332,33 +332,15 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mHotMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
-    // A fixed-capacity group's floor is its fixed size, so every quota check reserves it. Unlike an
-    // elastic minimum, which raises a too-small quota, it must fit in the configured quota.
+    // A fixed-capacity group's floor is its fixed size, so every quota check reserves it. Like the
+    // elastic floors, it raises a GPU quota that is too small to hold all floors.
     mFixedSlots = config.fixedSlotCounts;
     TLLM_CHECK_WITH_INFO(mFixedSlots.size() == numPoolGroups(), "Fixed slot counts must cover every pool group");
-    if (hasFixedPoolGroups())
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
     {
-        size_t fixedBytes = 0;
-        auto const paid = CacheLevelStorage::poolsPaidByQuota(
-            slotSizeLists, _secondaryBudget(sparsePools, hostMemSizeGranularity(), std::nullopt));
-        for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
+        if (auto const fixed = mFixedSlots[pgIdx])
         {
-            if (auto const fixed = mFixedSlots[pgIdx])
-            {
-                mHotMinSlots[pgIdx] = *fixed;
-                fixedBytes += CacheLevelStorage::grainsForSlots(*fixed, slotSizeLists[pgIdx], paid[pgIdx], gpuGranularity)
-                    * gpuGranularity;
-            }
-        }
-        size_t const minQuota = minQuotaForLevel(slotSizeLists, gpuGranularity, mHotMinSlots,
-            _secondaryBudget(sparsePools, hostMemSizeGranularity(), std::nullopt));
-        if (roundUp(gpuQuota, gpuGranularity) < minQuota)
-        {
-            throw std::invalid_argument("GPU quota of " + std::to_string(gpuQuota)
-                + " bytes cannot hold the fixed-capacity private SSM pool group sized by max_live_kv_caches ("
-                + std::to_string(fixedBytes) + " bytes) plus the minimum slots of the other pool groups ("
-                + std::to_string(minQuota - fixedBytes) + " bytes); at least " + std::to_string(minQuota)
-                + " bytes are needed");
+            mHotMinSlots[pgIdx] = *fixed;
         }
     }
 
