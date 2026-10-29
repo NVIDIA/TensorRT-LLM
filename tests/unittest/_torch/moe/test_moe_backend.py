@@ -517,6 +517,21 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
     assert legacy_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 512
 
 
+@pytest.mark.parametrize("decode_tuning", [False, True])
+def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
+    """Only a model that declares decode tuning runs rank 0's tactic on every rank; otherwise every rank
+    tunes on its own."""
+    from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    config = FP4BlockScaleMoERunner.get_tuning_config(4, decode_tuning=decode_tuning)
+    assert config.distributed_tuning_strategy == (
+        DistributedTuningStrategy.BROADCAST
+        if decode_tuning
+        else DistributedTuningStrategy.INDEPENDENT
+    )
+
+
 @pytest.mark.parametrize(
     "disable_value,expected_disabled",
     [

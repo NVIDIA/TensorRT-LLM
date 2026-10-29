@@ -90,6 +90,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             to_trtllm_gen_act_type(self.activation_type),
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
+            decode_tuning=self.decode_tuning,
         )
         packed_hidden = self.w3_w1_weight.shape[-1]
 
@@ -245,6 +246,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
             prerouted=prerouted,
+            decode_tuning=self.decode_tuning,
         )
 
         if not k.do_finalize:

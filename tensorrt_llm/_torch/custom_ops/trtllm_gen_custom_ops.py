@@ -463,7 +463,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  do_finalize: bool,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
-                 use_dp: bool = False):
+                 use_dp: bool = False,
+                 decode_tuning: bool = False):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -480,7 +481,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
-            use_dp=use_dp)
+            use_dp=use_dp,
+            decode_tuning=decode_tuning)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
@@ -665,20 +667,22 @@ class FP4BlockScaleMoERunner(TunableRunner):
     def get_tuning_config(cls,
                           ep_size: int,
                           tune_max_num_tokens: int = 8192,
-                          use_dp: bool = False) -> TuningConfig:
+                          use_dp: bool = False,
+                          decode_tuning: bool = False) -> TuningConfig:
+        """``decode_tuning`` (declared by the model): every rank runs rank 0's
+        tactic, as ranks that time a decode shape differently would run
+        different tactics and the slowest rank sets every layer's pace."""
 
         dynamic_tensor_specs = cls.get_dynamic_tensor_specs(
             ep_size, tune_max_num_tokens, use_dp)
         constraint_specs = cls.get_constraint_specs()
 
-        # Every rank runs rank 0's tactic: ranks that time a shape differently
-        # would run different tactics, and the slowest rank sets every layer's
-        # pace.
         tuning_config = TuningConfig(
             dynamic_tensor_specs=dynamic_tensor_specs,
             constraint_specs=constraint_specs,
             tune_max_num_tokens=max(8192, tune_max_num_tokens),
-            distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST)
+            distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST
+            if decode_tuning else DistributedTuningStrategy.INDEPENDENT)
 
         return tuning_config
 
@@ -737,8 +741,11 @@ def fp4_block_scale_moe_runner(
         prerouted_tables: Optional[torch.Tensor] = None,
         prerouted_ids: Optional[torch.Tensor] = None,
         prerouted_weights: Optional[torch.Tensor] = None,
-        prerouted_tactic: Optional[List[int]] = None) -> List[torch.Tensor]:
-    """``prerouted_tables`` (flat int32 routing tables), ``prerouted_ids`` /
+        prerouted_tactic: Optional[List[int]] = None,
+        decode_tuning: bool = False) -> List[torch.Tensor]:
+    """``decode_tuning``: see ``FP4BlockScaleMoERunner.get_tuning_config``.
+
+    ``prerouted_tables`` (flat int32 routing tables), ``prerouted_ids`` /
     ``prerouted_weights`` (top-k ids, BF16 top-k weights), built for
     ``prerouted_tactic``'s tile (``lookup_tactic``): the op
     runs that tactic and skips its routing kernel; with ``do_finalize=False``
@@ -760,6 +767,7 @@ def fp4_block_scale_moe_runner(
         act_type,
         tune_max_num_tokens=tune_max_num_tokens,
         use_dp=use_dp,
+        decode_tuning=decode_tuning,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -904,7 +912,8 @@ def _(routing_logits,
       prerouted_tables: Optional[torch.Tensor] = None,
       prerouted_ids: Optional[torch.Tensor] = None,
       prerouted_weights: Optional[torch.Tensor] = None,
-      prerouted_tactic: Optional[List[int]] = None) -> List[torch.Tensor]:
+      prerouted_tactic: Optional[List[int]] = None,
+      decode_tuning: bool = False) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2
