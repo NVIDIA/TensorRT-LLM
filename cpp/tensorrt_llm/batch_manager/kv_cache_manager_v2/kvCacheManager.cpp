@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -512,9 +513,336 @@ void KvCacheManager::clearReusableBlocks()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
-    _checkNoLivingKvCaches("clear_reusable_blocks()");
+    // Private graph-padding caches have no tree references and cannot publish new prefixes.
+    auto const unsafe = std::count_if(mLivingKvCaches.begin(), mLivingKvCaches.end(),
+        [&](KvCache const* cache)
+        {
+            return !cache->id || mStatsExcludedKvCacheIds.find(*cache->id) == mStatsExcludedKvCacheIds.end()
+                || cache->numCommittedTokens() != 0 || cache->commitState() != KvCache::CommitState::USER_STOP;
+        });
+    TLLM_CHECK_WITH_INFO(unsafe == 0,
+        "clear_reusable_blocks() with %zu KV cache(s) still open; close them (or drain the engine) first",
+        static_cast<size_t>(unsafe));
     TLLM_CHECK_DEBUG(mRadixTree);
     mRadixTree->clear();
+    ++mReuseStateVersion;
+}
+
+uint64_t KvCacheManager::getReuseStateVersion() const
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockShared();
+    return mReuseStateVersion;
+}
+
+bool KvCacheManager::isMemoryReady() const
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockShared();
+    return mMemoryState == MemoryState::kActive;
+}
+
+void KvCacheManager::validateMemoryRelease(bool discard, std::vector<std::shared_ptr<KvCache>> const& retiring) const
+{
+    KVCM2_API_GUARD();
+    // Page status checks temporarily acquire non-atomic holder references.
+    auto const apiLock = lockExclusive();
+    TLLM_CHECK_WITH_INFO(mMemoryState == MemoryState::kActive, "Cache memory release or restoration is pending");
+    std::set<KvCache const*> retiringCaches;
+    for (auto const& cache : retiring)
+    {
+        TLLM_CHECK_WITH_INFO(mLivingKvCaches.count(cache.get()) && cache->id
+                && mStatsExcludedKvCacheIds.count(*cache->id) && cache->numCommittedTokens() == 0
+                && cache->commitState() == KvCache::CommitState::USER_STOP,
+            "Only living, noncommitting internal caches of this manager may retire before sleep");
+        retiringCaches.insert(cache.get());
+    }
+    _validateMemoryRelease(discard, retiringCaches);
+}
+
+void KvCacheManager::_validateMemoryRelease(bool discard, std::set<KvCache const*> const& retiring) const
+{
+    TLLM_CHECK_WITH_INFO(numLocalityDomains() == 1, "KV cache sleep with multiple locality domains is not supported");
+    std::set<Page const*> requiredPages;
+
+    struct References
+    {
+        int holders = 0;
+        int locks = 0;
+    };
+
+    std::map<Page const*, References> retiringRefs;
+    auto collect = [&](BeamBlockPages const& beams, bool retires)
+    {
+        for (auto const& beam : beams)
+        {
+            for (auto const& blockPage : beam)
+            {
+                if (auto const& page = blockPageGetPage(blockPage))
+                {
+                    requiredPages.insert(page.get());
+                    // Graph padding and the guard neither match nor commit prefixes.
+                    if (retires && !page->isCommitted())
+                    {
+                        auto& refs = retiringRefs[page.get()];
+                        if (std::holds_alternative<SharedPageLock>(blockPage))
+                        {
+                            ++refs.locks;
+                        }
+                        else
+                        {
+                            ++refs.holders;
+                        }
+                    }
+                }
+            }
+        }
+    };
+    for (KvCache const* cache : mLivingKvCaches)
+    {
+        TLLM_CHECK_WITH_INFO(cache->status() == KvCache::Status::SUSPENDED || cache->isActive(),
+            "Invalid cache state for memory release");
+        TLLM_CHECK_WITH_INFO(!discard
+                || (cache->id && mStatsExcludedKvCacheIds.find(*cache->id) != mStatsExcludedKvCacheIds.end()
+                    && cache->numCommittedTokens() == 0),
+            "Discarding KV cache memory requires all user requests to be drained");
+        if (!discard)
+        {
+            bool const retires = retiring.count(cache) != 0;
+            for (auto const& block : cache->mBlocks)
+            {
+                collect(block.pages, retires);
+            }
+            collect(cache->mSsmBlocks, retires);
+            for (auto const& candidates : cache->mOptionalCandidates)
+            {
+                for (auto const& [ordinal, holder] : candidates)
+                {
+                    requiredPages.insert(holder->page.get());
+                }
+            }
+        }
+    }
+    if (!discard)
+    {
+        std::set<Page const*> retiringPages;
+        for (auto const& [page, refs] : retiringRefs)
+        {
+            // A shared lock owns the unique lock, which in turn owns one holder. Do not
+            // credit a page still needed by another cache or by a holder outside the caches.
+            auto const holder = page->holder.lock();
+            auto const lock = holder->uniqLock.lock();
+            if (holder.useCount() == refs.holders + 1 + (lock ? 1 : 0) && (!lock || lock.useCount() == refs.locks + 1)
+                && holder->page.useCount() == 1 + page->scheduledForEviction())
+            {
+                retiringPages.insert(page);
+            }
+        }
+        mStorage->validateReleaseMemory(requiredPages, retiringPages);
+    }
+}
+
+void KvCacheManager::releaseGpuMemory(bool discard)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (mMemoryState == MemoryState::kReleased)
+    {
+        TLLM_CHECK_WITH_INFO(mSleepDiscard == discard, "Cannot change discard mode while cache memory is released");
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(mMemoryState == MemoryState::kActive, "Cache memory release or restoration is pending");
+    _validateMemoryRelease(discard);
+    mSleepDiscard = discard;
+    mMemoryState = MemoryState::kReleasing;
+    for (KvCache* cache : mLivingKvCaches)
+    {
+        cache->mResumeAfterSleep = cache->isActive();
+    }
+    bool recoverable = true;
+    bool preparingBackups = true;
+    auto recover = [&]()
+    {
+        if (recoverable)
+        {
+            _recoverMemoryRelease();
+        }
+        else
+        {
+            mMemoryState = MemoryState::kFailed;
+        }
+    };
+    try
+    {
+        // Reserve and copy sparse backups before any native pool loses backing.
+        for (auto* batch : mLivingBatches)
+        {
+            batch->_prepareMemoryRelease(discard);
+        }
+        preparingBackups = false;
+        for (auto* batch : mLivingBatches)
+        {
+            recoverable = false;
+            batch->_suspendForSleep();
+            recoverable = true;
+        }
+        for (KvCache* cache : mLivingKvCaches)
+        {
+            if (cache->isActive())
+            {
+                recoverable = false;
+                cache->suspend();
+                recoverable = true;
+            }
+            else if (cache->hasScratchSlots())
+            {
+                auto scope = cache->recordEventScope();
+                cache->_freeReservedGpuSlots();
+            }
+        }
+        if (discard)
+        {
+            recoverable = false;
+            for (KvCache* cache : mLivingKvCaches)
+            {
+                cache->releaseMemory();
+            }
+            // Released caches retain only their private page layout, with no references into the tree.
+            mRadixTree->clear();
+            ++mReuseStateVersion;
+            recoverable = true;
+        }
+        if (!discard)
+        {
+            // Eviction may change reuse before an offload fails. Rollback restores execution,
+            // not identical prefix contents on every rank; conservatively invalidate its epoch.
+            ++mReuseStateVersion;
+        }
+        mStorage->releaseMemory(discard);
+        for (auto* batch : mLivingBatches)
+        {
+            batch->_releaseMemory(discard);
+        }
+        mMemoryState = MemoryState::kReleased;
+    }
+    catch (OutOfPagesError const&)
+    {
+        recover();
+        throw;
+    }
+    catch (OutOfMemoryError const&)
+    {
+        recover();
+        throw;
+    }
+    catch (ResourceBusyError const&)
+    {
+        recover();
+        throw;
+    }
+    catch (std::bad_alloc const&)
+    {
+        // Allocation failure during metadata mutation need not leave a retryable state.
+        recoverable = recoverable && preparingBackups;
+        recover();
+        throw;
+    }
+    catch (...)
+    {
+        mMemoryState = MemoryState::kFailed;
+        throw;
+    }
+}
+
+void KvCacheManager::_recoverMemoryRelease()
+{
+    mMemoryState = MemoryState::kRestoring;
+    try
+    {
+        // A partially released pool can acquire fresh backing during recovery.
+        // Initialize it before restoring retained pages and graph-visible state.
+        _restoreGpuMemory(/*zero=*/true);
+    }
+    catch (...)
+    {
+        mMemoryState = MemoryState::kFailed;
+        throw;
+    }
+}
+
+void KvCacheManager::materializeGpuMemory(bool zero)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (mMemoryState == MemoryState::kActive)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(mMemoryState == MemoryState::kReleased || mMemoryState == MemoryState::kRestoring,
+        "Cache memory recovery failed; the manager must be shut down");
+    TLLM_CHECK_WITH_INFO(!mMaterializingGpuMemory.has_value() || *mMaterializingGpuMemory == zero,
+        "Cannot change zero mode while retrying GPU memory restoration");
+    mMemoryState = MemoryState::kRestoring;
+    try
+    {
+        _restoreGpuMemory(zero);
+    }
+    catch (OutOfPagesError const&)
+    {
+        throw;
+    }
+    catch (OutOfMemoryError const&)
+    {
+        throw;
+    }
+    catch (...)
+    {
+        mMemoryState = MemoryState::kFailed;
+        throw;
+    }
+}
+
+void KvCacheManager::_restoreGpuMemory(bool zero)
+{
+    if (!mMaterializingGpuMemory.has_value())
+    {
+        mMaterializingGpuMemory = zero;
+    }
+    // An eviction failure can precede unmapping. Those pools need no rematerialization.
+    if (mStorage->hasSavedPoolCapacities())
+    {
+        mStorage->materializeMemory(zero);
+    }
+    std::vector<KvCache*> releasedCaches;
+    for (KvCache* cache : mLivingKvCaches)
+    {
+        if (cache->status() == KvCache::Status::UNMATERIALIZED)
+        {
+            releasedCaches.push_back(cache);
+        }
+    }
+    KvCache::materializeMemory(releasedCaches);
+    // Every arena must be backed before any Batch republishes graph-visible state.
+    for (auto* batch : mLivingBatches)
+    {
+        batch->_materializeMemory(zero);
+    }
+    for (auto* batch : mLivingBatches)
+    {
+        batch->_resumeAfterSleep();
+        batch->_cancelMemoryRelease();
+    }
+    for (KvCache* cache : mLivingKvCaches)
+    {
+        if (cache->mResumeAfterSleep)
+        {
+            TLLM_CHECK_WITH_INFO(cache->isActive() || cache->resume(cache->cudaStream()),
+                "Could not restore an unbatched cache after memory release");
+            cache->mResumeAfterSleep = false;
+        }
+    }
+    mMaterializingGpuMemory.reset();
+    mMemoryState = MemoryState::kActive;
 }
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
@@ -525,6 +853,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    TLLM_CHECK_WITH_INFO(mMemoryState == MemoryState::kActive, "Cache memory is not ready for allocation");
     if (numLocalityDomains() > 1)
     {
         TLLM_CHECK_WITH_INFO(localityDomainId.has_value(),
@@ -640,6 +969,7 @@ bool KvCacheManager::prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens,
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    TLLM_CHECK_WITH_INFO(mMemoryState == MemoryState::kActive, "Cache memory is not ready for prefetch");
     if (target < kHotLevel || target >= mStorage->numCacheLevels())
         throw std::out_of_range("Prefetch target is outside the configured cache tiers");
     _unlinkPagesOfFailedRemoteLevels();
@@ -1060,6 +1390,7 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    TLLM_CHECK_WITH_INFO(mMemoryState == MemoryState::kActive, "Cache memory is not ready for pool resize");
     // Same precondition as adjust(): _adjustLevel may defragment, invalidating any page index an
     // ACTIVE cache holds.
     for (KvCache* kvc : mLivingKvCaches)
@@ -1604,6 +1935,10 @@ void KvCacheManager::unregisterKvCache(KvCache* kvc)
 
 void KvCacheManager::tryUpdateTargetRatios()
 {
+    if (mMemoryState != MemoryState::kActive)
+    {
+        return;
+    }
     if (mNumSampledKvCaches - mLastUpdateNumSampledKvCaches < mConfig.poolRebalance.targetRatioUpdateInterval)
         return;
     mLastUpdateNumSampledKvCaches = mNumSampledKvCaches;
@@ -1702,6 +2037,7 @@ void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    TLLM_CHECK_WITH_INFO(mMemoryState == MemoryState::kActive, "Cache memory is not ready for pool adjustment");
     for (KvCache* kvc : mLivingKvCaches)
         TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
             "level adjustment requires every KvCache to be SUSPENDED: _adjustLevel may "

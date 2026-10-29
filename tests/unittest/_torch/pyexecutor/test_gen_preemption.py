@@ -109,15 +109,19 @@ def test_pool_headroom(settings, extra):
     assert mamba._max_resident_sequences() == 128 + extra
 
 
-def test_headroom_follows_each_executor_configuration(monkeypatch):
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
+@pytest.mark.parametrize("sleep", [False, True], ids=["awake", "sleep-enabled"])
+def test_headroom_follows_each_executor_configuration(
+    monkeypatch: pytest.MonkeyPatch, sleep: bool
+) -> None:
+    """Sleep support does not remove the V2 scheduler's reserved headroom."""
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig, SleepConfig
 
     monkeypatch.setenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", "90")
     enabled = SimpleNamespace(
         scheduler_config=SchedulerConfig(gen_preemption=ON),
         kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
         max_beam_width=1,
-        sleep_config=None,
+        sleep_config=SleepConfig() if sleep else None,
     )
     disabled = SimpleNamespace(scheduler_config=SchedulerConfig())
     for args, expected in ((enabled, 48), (disabled, 0), (enabled, 48)):

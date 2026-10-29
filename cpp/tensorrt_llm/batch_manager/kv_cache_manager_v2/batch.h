@@ -553,10 +553,8 @@ public:
     //! fetches around it rather than tearing one.
     void resetHitMissCounter();
 
-    //! Device bytes every life cycle's sparse arena holds, zero without sparse offload.
-    //!
-    //! The arenas sit outside the cache tiers' quota, so a caller budgeting device memory
-    //! must account for them separately.
+    //! Device backing required outside the cache tiers' quota, rounded per sparse arena.
+    //! Zero without sparse offload; unchanged during sleep, not a current residency measurement.
     [[nodiscard]] size_t sparseArenaBytes() const;
 
     //! Whether the occupied rows are exactly [0, numKvCaches()).
@@ -688,6 +686,18 @@ private:
     [[nodiscard]] int32_t const* flushToUnits(LifeCycleId lifeCycle) const;
 
     friend class KvCache;
+    friend class KvCacheManager;
+
+    //! Manager-only sleep transitions. Rows and leases stay owned by this Batch while
+    //! suspended; public per-cache lifecycle calls remain forbidden for members.
+    void _suspendForSleep();
+    void _prepareMemoryRelease(bool discard);
+    void _cancelMemoryRelease() noexcept;
+    void _releaseMemory(bool discard);
+    void _materializeMemory(bool zero);
+    void _resumeAfterSleep();
+
+    bool mSleeping = false;
 
     //! Called by a member being destroyed. Unreachable while seated -- the Batch holds a
     //! reference, so the destructor cannot run -- and kept as the assertion of that.

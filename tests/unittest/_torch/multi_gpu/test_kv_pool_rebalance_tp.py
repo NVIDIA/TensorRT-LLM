@@ -99,6 +99,7 @@ def _make_executor(
     exe.dist = dist
     exe.enable_attention_dp = enable_attention_dp
     exe.enable_kv_pool_rebalance = True
+    exe._sleeping_memory_tags = set()
     exe.kv_cache_transceiver = None
     exe.kv_connector_manager = None
     exe.is_warmup = False

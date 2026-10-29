@@ -4,7 +4,7 @@
 import contextlib
 import functools
 from contextlib import contextmanager
-from typing import Generator
+from typing import Generator, Protocol
 
 import torch
 
@@ -15,9 +15,31 @@ from tensorrt_llm.bindings.internal.runtime import (
     push_virtual_memory_allocator)
 
 __all__ = [
-    "RestoreMode", "maybe_scope", "scope", "release_with_tag",
+    "RestoreMode", "TaggedMemoryResource", "MemoryReleaseAbortedError",
+    "maybe_scope", "scope", "preserve_contents", "release_with_tag",
     "materialize_with_tag", "release_host_backups_with_tag"
 ]
+
+
+class MemoryReleaseAbortedError(RuntimeError):
+    """Release failed, but resources and bindings are ready for execution again.
+
+    Tagged allocations must still be intact when this exception is raised.
+    Distributed callers must also establish that no peer committed a release.
+    """
+
+    def __init__(self,
+                 message: str,
+                 *,
+                 reuse_state_changed: bool = False) -> None:
+        """Record whether local recovery invalidated shared prefix state.
+
+        Args:
+            message: Release failure description.
+            reuse_state_changed: Whether peers must invalidate reuse or stop.
+        """
+        super().__init__(message)
+        self.reuse_state_changed = reuse_state_changed
 
 
 @functools.cache
@@ -40,8 +62,10 @@ class _MultiPoolProxy:
     the proxy.
     """
 
-    def __init__(self):
+    def __init__(self, tag: str, mode: RestoreMode) -> None:
         self._pools: list[torch.cuda.MemPool] = []
+        self.tag = tag
+        self.mode = mode
 
     def _add(self, pool: torch.cuda.MemPool):
         self._pools.append(pool)
@@ -79,7 +103,7 @@ def _scope(
         push_virtual_memory_allocator(tag, mode, stream.cuda_stream)
         pushed_allocator = True
 
-        proxy = _MultiPoolProxy()
+        proxy = _MultiPoolProxy(tag, mode)
         pool = torch.cuda.MemPool(
             _get_torch_pluggable_virtual_memory_allocator())
         pool_ctx = torch.cuda.use_mem_pool(pool)
@@ -109,6 +133,25 @@ scope = contextmanager(_scope)
 
 
 @contextmanager
+def preserve_contents() -> Generator[None, None, None]:
+    """Preserve all allocations inside a scope that discards data on sleep.
+
+    The metadata keeps the parent's tag, so it is released with its owning
+    component, but restores its contents at the same addresses on wakeup.
+    """
+    if not _pool_stack or _pool_stack[-1][1].mode not in (RestoreMode.NONE,
+                                                          RestoreMode.MEMSET):
+        yield
+        return
+    parent = _pool_stack[-1][1]
+    with scope(parent.tag, RestoreMode.CPU) as proxy:
+        try:
+            yield
+        finally:
+            parent._pools.extend(proxy._pools)
+
+
+@contextmanager
 def maybe_scope(
     enable: bool,
     tag: str,
@@ -120,25 +163,61 @@ def maybe_scope(
         yield
 
 
-def release_with_tag(*tags: str) -> int:
+class TaggedMemoryResource(Protocol):
+    """An owner of memory that is not allocated by the runtime allocator."""
+
+    def release_memory(self, tags: tuple[str, ...]) -> None:
+        """Release native backing before tagged allocator storage is released.
+
+        Args:
+            tags: Normalized tags owned by the caller's drained runtime.
+
+        The caller must prevent new work and external access. Failures propagate;
+        only MemoryReleaseAbortedError establishes recovered local execution,
+        and its reuse_state_changed flag must still be checked across ranks.
+        """
+        ...
+
+    def materialize_memory(self, tags: tuple[str, ...]) -> None:
+        """Restore native backing after tagged storage and CUDA synchronization.
+
+        Args:
+            tags: Normalized tags whose native resources must be rebuilt.
+
+        Rebuild graph-visible bindings before returning. Failures propagate and
+        must keep admission closed; success alone is not distributed readiness.
+        """
+        ...
+
+
+def release_with_tag(*tags: str,
+                     resource: TaggedMemoryResource | None = None) -> int:
     """Release virtual memory allocated with given tags
 
     :param tags: The tag of the scope when the virtual memory is allocated
+    :param resource: Native resource owner released before tagged allocations.
     :return: Number of memory blobs released
     """
+    if resource is not None:
+        resource.release_memory(tags)
     manager = get_virtual_memory_manager()
     released_blobs = sum(manager.release_with_tag(tag) for tag in tags)
     return released_blobs
 
 
-def materialize_with_tag(*tags: str) -> int:
+def materialize_with_tag(*tags: str,
+                         resource: TaggedMemoryResource | None = None) -> int:
     """Materialize virtual memory allocated with given tags
 
     :param tags: The tag of the scope when the virtual memory is allocated
+    :param resource: Native owner restored after tagged allocations and CUDA synchronization.
     :return: Number of memory blobs materialized
     """
     manager = get_virtual_memory_manager()
     materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
+    if resource is not None:
+        torch.cuda.synchronize()
+        resource.materialize_memory(tags)
     return materialized_blobs
 
 

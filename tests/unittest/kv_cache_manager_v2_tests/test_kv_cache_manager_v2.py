@@ -783,11 +783,16 @@ class TestSparseBufferConfig(unittest.TestCase):
                             regions[1][0] - first_base, aligned(first_payload + first_tail)
                         )
                         metadata_bytes = aligned(num_layers * units_per_buffer * 4)
-                        self.assertEqual(
-                            batch.sparse_arena_bytes,
+                        layout_bytes = (
                             sum(aligned(payload + tail) for _, payload, tail in regions)
                             + 3 * 256
-                            + max_leases * metadata_bytes,
+                            + max_leases * metadata_bytes
+                        )
+                        chunk = _introspection.tier_allocation_granularity(
+                            CacheTier.GPU_MEM, layout_bytes
+                        )
+                        self.assertEqual(
+                            batch.sparse_arena_bytes, -(-layout_bytes // chunk) * chunk
                         )
                         self.assertEqual(manager.get_sparse_cache_max_units(0), units_per_buffer)
                         for base, payload, tail in regions:
@@ -4192,7 +4197,8 @@ class TestSparseDataPath(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def test_a_flushed_cell_lands_in_its_hot_page(self):
+    @parameterized.expand([(0,), (2,)])
+    def test_a_flushed_cell_lands_in_its_hot_page(self, sleep_cycles):
         ctypes, cudart, torch = self._deps()
         manager = self._manager()
         cache = None
@@ -4235,6 +4241,24 @@ class TestSparseDataPath(unittest.TestCase):
                     cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
                 )
                 self.assertEqual(int(err), 0)
+
+                # The arena holds the only current copy. Preserving sleep must keep its
+                # bytes and lease metadata even though no write-back has happened yet.
+                backing_bytes = batch.sparse_arena_bytes
+                for _ in range(sleep_cycles):
+                    manager.release_gpu_memory(discard=False)
+                    self.assertEqual(batch.sparse_arena_bytes, backing_bytes)
+                    self.assertEqual(batch.row_of(cache), 0)
+                    with self.assertRaisesRegex(RuntimeError, "Batch memory is released"):
+                        batch.publish()
+                    manager.materialize_gpu_memory()
+                    self.assertEqual(
+                        int(batch.get_sparse_cache_base_address(LayerId(0), "key")), arena
+                    )
+                    self.assertEqual(
+                        _introspection.sparse_cache_resident_ordinals(cache, lg), resident
+                    )
+                    self.assertTrue(cache.is_active)
 
                 batch.wait_published()
                 # The watermark crosses unit 0, so its cell is written back. The flush runs
@@ -5442,6 +5466,33 @@ class TestBatch(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_batch_destruction_releases_python_callback_with_gil(self):
+        """The final cache reference can own a Python callback through native code."""
+        import weakref
+
+        class Priority:
+            def __call__(self, ordinal, lifecycle):
+                return 0
+
+        manager = self._manager()
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=1, max_blocks_per_seq=4
+                )
+                callback = Priority()
+                reference = weakref.ref(callback)
+                cache = manager.create_kv_cache(custom_priority_callback=callback)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                del cache, callback
+                self.assertIsNotNone(reference())
+                del batch
+                self.assertIsNone(reference())
+        finally:
+            manager.shutdown()
+
     def test_membership_is_exclusive(self):
         manager = self._manager()
         try:
@@ -6358,6 +6409,66 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    def test_rejected_discard_preserves_reuse_version(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 1, 0, 0, tokens_per_block=4, kv_buf_size=4096)
+        cache = self.manager.create_kv_cache(id=1)
+        version = self.manager.get_reuse_state_version()
+        try:
+            for operation in (
+                self.manager.validate_memory_release,
+                self.manager.release_gpu_memory,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "user requests to be drained"):
+                    operation(discard=True)
+                self.assertEqual(self.manager.get_reuse_state_version(), version)
+                self.assertTrue(self.manager.is_memory_ready())
+            self.manager.mark_stats_excluded(1)
+            self.manager.validate_memory_release(discard=True)
+            self.assertEqual(self.manager.get_reuse_state_version(), version)
+        finally:
+            cache.close()
+        self.manager.clear_reusable_blocks()
+        self.assertEqual(self.manager.get_reuse_state_version(), version + 1)
+
+    def test_sleep_capacity_rejection_keeps_batch_usable(self) -> None:
+        import torch
+
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(4 << 20)],
+                layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096)])],
+            )
+        )
+        stream = torch.cuda.Stream()
+        cache = self.manager.create_kv_cache()
+        batch = Batch(
+            self.manager,
+            stream.cuda_stream,
+            index_tables=[IndexTableSpec([BufferId(0, "key")])],
+            max_batch_size=1,
+            max_blocks_per_seq=4,
+        )
+        try:
+            self.assertTrue(cache.resume(stream.cuda_stream))
+            self.assertTrue(cache.resize(4, 0))
+            batch.add_kv_cache(cache)
+            batch.publish()
+            batch.wait_published()
+            for _ in range(2):
+                with self.assertRaises(OutOfPagesError):
+                    self.manager.release_gpu_memory(discard=False)
+                self.assertTrue(self.manager.is_memory_ready())
+                self.assertTrue(cache.is_active)
+                self.assertEqual(batch.row_of(cache), 0)
+                batch.publish()
+                batch.wait_published()
+            self.assertTrue(cache.resize(8, 0))
+        finally:
+            batch.remove_kv_cache(cache)
+            cache.close()
+            stream.synchronize()
+
     def test_side_stream_waits_for_a_busy_recycled_slot(self) -> None:
         """A full pool hands out a slot its previous owner's stream still writes.
 
@@ -6401,6 +6512,209 @@ class TestNoBatching(TestKVCacheManagerV2):
         finally:
             loader.close()
         execution_stream.synchronize()
+
+    @parameterized.expand(
+        [
+            (f"{name}_{'sparse' if sparse_fetch else 'swa'}", zero, discard, sparse_fetch)
+            for name, zero, discard in [
+                ("none", False, True),
+                ("memset", True, True),
+                ("preserve", False, False),
+            ]
+            for sparse_fetch in (False, True)
+        ]
+    )
+    def test_sleep_preserves_native_batch_state(
+        self, _name: str, zero: bool, discard: bool, sparse_fetch: bool
+    ) -> None:
+        import ctypes
+
+        import torch
+        from cuda.bindings import runtime as cudart
+
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(8 << 20), HostCacheTierConfig(32 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig("key", 4096, is_sparse=True),
+                            BufferConfig("index", 256),
+                        ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=2, max_cached_units=4, unit_tokens=4
+                        )
+                        if sparse_fetch
+                        else None,
+                    ),
+                    AttentionLayerConfig(1, [BufferConfig("key", 4096)], sliding_window_size=4),
+                    SsmLayerConfig(2, [BufferConfig("ssm_state", 4096)]),
+                ],
+                swa_scratch_reuse=SwaScratchReuseConfig(),
+                commit_min_snapshot=True,
+            )
+        )
+        cache = self.manager.create_kv_cache(id=1)
+        never_resumed = self.manager.create_kv_cache(id=2)
+        hole = self.manager.create_kv_cache(id=3)
+        self.manager.mark_stats_excluded(1)
+        self.manager.mark_stats_excluded(2)
+        sparse = self.manager.get_layer_group_id(0)
+        swa = self.manager.get_layer_group_id(1)
+        ssm = self.manager.get_layer_group_id(2)
+        stream = torch.cuda.Stream()
+        batch = Batch(
+            self.manager,
+            stream.cuda_stream,
+            index_tables=[IndexTableSpec([BufferId(0, "key")])],
+            max_batch_size=3,
+            max_blocks_per_seq=4,
+        )
+        table = graph = None
+        with torch.cuda.stream(stream):
+            try:
+                self.assertTrue(hole.resume(stream.cuda_stream))
+                self.assertTrue(hole.resize(1 if sparse_fetch else 4, 0))
+                self.assertTrue(cache.resume(stream.cuda_stream))
+                cache.stop_committing()
+                if sparse_fetch:
+                    # Sparse fetch currently admits one token per step. A separate
+                    # chunked path exercises SWA scratch without enabling sparse fetch.
+                    for capacity in range(1, 17):
+                        self.assertTrue(cache.resize(capacity, capacity - 1))
+                else:
+                    self.assertTrue(cache.resize(8, 0))
+                    self.assertTrue(cache.resize(16, 8))
+                logical_state = (cache.capacity, cache.history_length)
+                self.assertEqual(cache.has_scratch_slots, not sparse_fetch)
+                hole.close()
+                batch.add_kv_cache(cache, 2)
+                batch.move(1, 2)
+                batch.publish()
+                table = torch.from_dlpack(batch.converted_index_table(0))
+                table_address = table.data_ptr()
+                arena_address = (
+                    batch.get_sparse_cache_base_address(LayerId(0), "key") if sparse_fetch else None
+                )
+                lease = _introspection.sparse_cache_base_cell(cache, sparse)
+                scratch_count = len(cache.get_scratch_slots(swa))
+                swa_valid = [i != BAD_PAGE_INDEX for i in cache.get_base_page_indices(swa)]
+                addresses = [
+                    pool.base_address
+                    for group in self.manager.pool_group_descs
+                    for pool in group.pools
+                ]
+                capacities = [
+                    [stat.total for stat in self.manager.get_storage_statistics(CacheLevel(level))]
+                    for level in range(2)
+                ]
+                observed = torch.empty_like(table)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    observed.copy_(table)
+
+                for _ in range(2):
+                    stream.synchronize()
+                    version = self.manager.get_reuse_state_version()
+                    self.manager.validate_memory_release(discard=discard)
+                    self.manager.release_gpu_memory(discard=discard)
+                    self.assertEqual(self.manager.get_reuse_state_version(), version + 1)
+                    for operation in (
+                        self.manager.adjust,
+                        lambda: self.manager.resize(CacheLevel(0), 8 << 20),
+                        self.manager.create_kv_cache,
+                        lambda: self.manager.prefetch_reuse(
+                            ReuseScope(), [1, 2, 3, 4], CacheLevel(0)
+                        ),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "Cache memory is not ready"):
+                            operation()
+                    self.assertEqual(
+                        cache.status,
+                        _KVCache.Status.UNMATERIALIZED if discard else _KVCache.Status.SUSPENDED,
+                    )
+                    self.assertEqual((cache.capacity, cache.history_length), logical_state)
+                    self.assertEqual(batch.row_of(cache), 1)
+                    self.assertEqual(
+                        list(cache.get_base_page_indices(sparse)), [BAD_PAGE_INDEX] * 4
+                    )
+                    self.assertTrue(
+                        all(
+                            stat.total == 0
+                            for level in range(2 if discard else 1)
+                            for stat in self.manager.get_storage_statistics(CacheLevel(level))
+                        )
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "Batch memory is released"):
+                        batch.publish()
+
+                    self.manager.materialize_gpu_memory(zero=zero)
+                    self.assertEqual(
+                        [
+                            [
+                                stat.total
+                                for stat in self.manager.get_storage_statistics(CacheLevel(level))
+                            ]
+                            for level in range(2)
+                        ],
+                        capacities,
+                    )
+                    self.assertEqual(never_resumed.status, _KVCache.Status.SUSPENDED)
+                    self.assertTrue(cache.is_active)
+                    self.assertEqual(batch.row_of(cache), 1)
+                    self.assertEqual(_introspection.sparse_cache_base_cell(cache, sparse), lease)
+                    self.assertEqual(len(cache.get_scratch_slots(swa)), scratch_count)
+                    self.assertEqual(
+                        [
+                            pool.base_address
+                            for group in self.manager.pool_group_descs
+                            for pool in group.pools
+                        ],
+                        addresses,
+                    )
+                    if sparse_fetch:
+                        self.assertEqual(
+                            batch.get_sparse_cache_base_address(LayerId(0), "key"), arena_address
+                        )
+                        # The kernel's over-read tail must be zero even for zero=False.
+                        units = self.manager.get_sparse_cache_max_units(LayerId(0))
+                        unit_bytes = 4096 // self.manager.get_sparse_cache_units_per_page(
+                            LayerId(0)
+                        )
+                        tail = bytearray(unit_bytes)
+                        sink = (ctypes.c_ubyte * unit_bytes).from_buffer(tail)
+                        (error,) = cudart.cudaMemcpy(
+                            ctypes.addressof(sink),
+                            int(arena_address) + 3 * units * unit_bytes,
+                            unit_bytes,
+                            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                        )
+                        self.assertEqual(int(error), 0)
+                        self.assertEqual(tail, bytearray(unit_bytes))
+                    self.assertEqual(
+                        [i != BAD_PAGE_INDEX for i in cache.get_base_page_indices(swa)], swa_valid
+                    )
+                    self.assertNotEqual(cache.get_ssm_block_base_index(ssm), BAD_PAGE_INDEX)
+                    self.assertEqual(table.data_ptr(), table_address)
+                    graph.replay()
+                    stream.synchronize()
+                    self.assertTrue(torch.equal(observed, table))
+                    converted = self.manager.get_page_index_converter(LayerId(0), "key")(
+                        list(cache.get_base_page_indices(sparse))
+                    )
+                    self.assertEqual(table[1, 0].cpu().tolist(), list(converted))
+                    self.assertTrue(bool((table[0] == BAD_PAGE_INDEX).all()))
+                    self.assertTrue(bool((table[2] == BAD_PAGE_INDEX).all()))
+            finally:
+                stream.synchronize()
+                if cache.is_active and batch.row_of(cache) is not None:
+                    batch.remove_kv_cache(cache)
+                del table, graph, batch
+                cache.close()
+                never_resumed.close()
+                hole.close()
 
     class Request(NamedTuple):
         id: int
@@ -7402,6 +7716,29 @@ class TestLivingKvCacheGuard(TestKVCacheManagerV2):
 
         self.manager.shutdown()
         del self.manager
+
+    def test_clear_reusable_blocks_keeps_private_padding(self) -> None:
+        """Clear stale weight-dependent prefixes without closing graph padding."""
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 4, 128, 1)
+        prompt = self._seed_reusable_prompt()
+        padding = self.manager.create_kv_cache(id=123)
+        self.manager.mark_stats_excluded(123)
+        stream_holder = CachedCudaStream()
+        try:
+            # Stats exclusion alone must not permit a cache that can still commit.
+            with self.assertRaises(self.GuardError):
+                self.manager.clear_reusable_blocks()
+            padding.stop_committing()
+            self.assertTrue(padding.resume(cast(CudaStream, stream_holder.handle)))
+            padding.capacity = 32
+            self.manager.clear_reusable_blocks()
+            self.assertTrue(padding.is_active)
+            self.assertEqual(padding.capacity, 32)
+            self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 0)
+            with self.assertRaises(self.GuardError):
+                self.manager.shutdown()
+        finally:
+            padding.close()
 
     def test_guard_counts_only_open_caches(self) -> None:
         """The guard counts sequences still open, not objects still referenced."""
@@ -12111,6 +12448,12 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self.manager.clear_reusable_blocks()
 
     def test_held_pages_take_kept_copy_slots_on_a_full_disk(self) -> None:
+        self._held_pages_on_full_disk(sleep=False)
+
+    def test_sleep_reclaims_kept_copy_slots_for_held_pages(self) -> None:
+        self._held_pages_on_full_disk(sleep=True)
+
+    def _held_pages_on_full_disk(self, *, sleep: bool) -> None:
         # Held pages of a suspended request and droppable pages whose disk copies are kept fall into a disk tier
         # filled with exactly those copies. A kept copy only saves a write, so the held pages must get its slot.
         self.disk_tier_options = {"num_io_threads": 4, "keep_copy_after_restore": True}
@@ -12147,19 +12490,40 @@ class TestNoBatchingDiskOptions(TestNoBatching):
                 _introspection.disk_copy_counters(self.manager)["retained"], disk_pages
             )
             # A suspended request holds as many GPU pages as the disk has.
-            held = self.manager.create_kv_cache(None, tokens(disk_pages))
+            held_tokens = tokens(disk_pages)
+            held = self.manager.create_kv_cache(None, held_tokens)
             self.assertTrue(held.resume(stream))
             self.assertTrue(held.resize(32 * disk_pages))
-            held.suspend()
-            # Taking the whole GPU pushes A and the held pages to disk together.
-            last = self.manager.create_kv_cache(None, tokens(gpu_pages))
             try:
-                self.assertTrue(last.resume(stream))
-                self.assertTrue(last.resize(32 * gpu_pages))
+                if sleep:
+                    # A retained copy contributes exactly one slot, even when its
+                    # primary is also an evictable GPU page.
+                    self.assertTrue(held.resize(32 * (disk_pages + 1)))
+                    with self.assertRaises(OutOfPagesError):
+                        self.manager.validate_memory_release()
+                    self.assertTrue(held.resize(32 * disk_pages))
+                    self.engine.execute([Step(held, held_tokens, [])], stream)
+                held.suspend()
+                if sleep:
+                    before = _introspection.disk_copy_counters(self.manager)
+                    self.assertEqual(before["retained"], disk_pages)
+                    self.manager.validate_memory_release()
+                    self.assertEqual(_introspection.disk_copy_counters(self.manager), before)
+                    self.manager.release_gpu_memory()
+                    self.manager.materialize_gpu_memory()
+                else:
+                    # Taking the whole GPU pushes A and the held pages to disk together.
+                    last = self.manager.create_kv_cache(None, tokens(gpu_pages))
+                    try:
+                        self.assertTrue(last.resume(stream))
+                        self.assertTrue(last.resize(32 * gpu_pages))
+                    finally:
+                        last.close()
+                self.assertTrue(held.resume(stream))
+                if sleep:
+                    self.engine.execute([Step(held, [], held_tokens)], stream)
             finally:
-                last.close()
-            self.assertTrue(held.resume(stream))
-            held.close()
+                held.close()
         s.take_finish_event()
         self.manager.clear_reusable_blocks()
 

@@ -233,7 +233,7 @@ def test_lease_matches_native_layout(cells: int, lease_bytes: int) -> None:
 
     assert shape.lease_bytes == lease_bytes
     # Shared tables and region alignment are paid once, not per lease.
-    assert shape.arena_bytes(513) - shape.arena_bytes(512) == pytest.approx(lease_bytes, abs=512)
+    assert shape.layout_bytes(513) - shape.layout_bytes(512) == pytest.approx(lease_bytes, abs=512)
 
 
 @pytest.mark.cpu_only
@@ -255,11 +255,11 @@ def test_arena_reserves_one_tile_per_pool(
         return (size + 255) // 256 * 256
 
     # Each pool holds two layers of three cells per lease, followed by 128 rows
-    # total. Zero leases measures the fixed overhead used by the capacity solver.
+    # total. Zero leases isolates the fixed layout overhead.
     usable_rows = max_leases * 2 * 3 * units_per_cell
     pool_bytes = sum(aligned((usable_rows + 128) * size) for size in row_bytes)
     metadata_bytes = aligned(2 * 3 * units_per_cell * 4)
-    assert shape.arena_bytes(max_leases) == pool_bytes + 3 * 256 + max_leases * metadata_bytes
+    assert shape.layout_bytes(max_leases) == pool_bytes + 3 * 256 + max_leases * metadata_bytes
     assert shape.entries == 2 * 3 * units_per_cell
     assert shape.lease_bytes == 2 * 3 * units_per_cell * sum(row_bytes) + metadata_bytes
 
@@ -280,7 +280,9 @@ def test_arena_follows_the_batch_rows() -> None:
 
     assert shape == V4_FLASH_ARENA
     assert shape.lease_bytes == 7_273_856
-    assert sparse_arena_bytes(config, 513) == shape.arena_bytes(513)
+    # This layout selects 4 MiB chunks; the final chunk is only partially occupied.
+    assert shape.layout_bytes(513) == 3_731_530_496
+    assert sparse_arena_bytes(config, 513) == shape.arena_bytes(513) == 890 * (4 << 20)
 
 
 @pytest.mark.cpu_only
@@ -327,9 +329,13 @@ def test_layers_with_different_windows_get_separate_arenas() -> None:
     windowed = _sparse_layer(1)
     windowed.sliding_window_size = 4096
 
-    shapes = sparse_arena_shapes([_sparse_layer(0), windowed], tokens_per_block=TOKENS_PER_BLOCK)
+    config = _config([_sparse_layer(0), windowed], [])
+    shapes = sparse_arena_shapes(config.layers, tokens_per_block=TOKENS_PER_BLOCK)
 
     assert [shape.num_layers for shape in shapes] == [1, 1]
+    # The two layouts together fit one chunk, but each arena needs its own mapping.
+    assert sum(shape.layout_bytes(1) for shape in shapes) < 2 << 20
+    assert sparse_arena_bytes(config, 1) == 2 * (2 << 20)
 
 
 @pytest.mark.cpu_only
@@ -849,28 +855,27 @@ def test_capacity_recommendation_charges_a_batch_slot_one_lease(padding_leases: 
     # A cache holds a lease only while it is seated in the Batch, so each slot
     # holds one, even on a disaggregated or overlap worker where the index mapper
     # admits two requests per slot.
-    lease_bytes = V4_FLASH_ARENA.lease_bytes
     gpu_bytes_per_request = 81_657_856 + 1024 * 52_176
-    # Ten batch slots of one lease each, plus any padding leases.
+    # Leave exactly enough for ten rows including their whole arena chunks.
     budget = (
-        10 * (gpu_bytes_per_request + lease_bytes)
-        + V4_FLASH_ARENA.arena_bytes(padding_leases)
-        - V4_FLASH_ARENA.arena_bytes(10 + padding_leases)
+        10 * gpu_bytes_per_request
+        + V4_FLASH_ARENA.arena_bytes(10 + padding_leases)
+        - V4_FLASH_ARENA.arena_bytes(16 + padding_leases)
     )
     capacity = _v4_flash_capacity(
-        max_batch_size=10,
+        max_batch_size=16,
         gpu_pool_bytes=budget,
         host_budget_bytes=1 << 50,
-        num_leases=10 + padding_leases,
+        num_leases=16 + padding_leases,
         batch_buffer_bytes=0,
     )
     assert capacity.recommended_max_batch_size == 10
 
     short = _v4_flash_capacity(
-        max_batch_size=10,
+        max_batch_size=16,
         gpu_pool_bytes=budget - 1,
         host_budget_bytes=1 << 50,
-        num_leases=10 + padding_leases,
+        num_leases=16 + padding_leases,
         batch_buffer_bytes=0,
     )
     assert short.recommended_max_batch_size == 9
@@ -880,10 +885,9 @@ def test_capacity_recommendation_charges_a_batch_slot_one_lease(padding_leases: 
 def test_capacity_recommendation_charges_every_batch_slot_its_rows_of_offload_buffers() -> None:
     gpu_bytes_per_request = 81_657_856 + 1024 * 52_176
     # 1 MiB of offload buffers per row, sized for 16 rows.
-    slot_bytes = gpu_bytes_per_request + V4_FLASH_ARENA.lease_bytes + (1 << 20)
-    # Device memory for ten batch slots, the arena's shared tables and the
-    # offload buffers, of which the pools get what the rest leaves.
-    budget = 10 * slot_bytes + V4_FLASH_ARENA.arena_bytes(0)
+    slot_bytes = gpu_bytes_per_request + (1 << 20)
+    # Ten requests, their rows of offload buffers, and their mapped arena.
+    budget = 10 * slot_bytes + V4_FLASH_ARENA.arena_bytes(10)
     gpu_pool_bytes = budget - V4_FLASH_ARENA.arena_bytes(16) - (16 << 20)
     capacity = _v4_flash_capacity(
         max_batch_size=16,

@@ -1121,6 +1121,12 @@ class Qwen35HybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2)
         return region.request_indices(request_ids)
 
     @override
+    def _restore_memory_bindings(self) -> None:
+        super()._restore_memory_bindings()
+        if self._replay_region is not None and self.local_num_mamba_layers:
+            self._replay_region.restore_indices(self.kv_cache_map)
+
+    @override
     def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
         super()._setup_state_indices(requests, num_contexts)
         if self._replay_region is not None and self.local_num_mamba_layers:

@@ -676,7 +676,9 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
-    def _with_dying_donor(self, prefix: str, body, attention_only: bool = False) -> None:
+    def _with_dying_donor(
+        self, prefix: str, body, attention_only: bool = False, *, with_host: bool = True
+    ) -> None:
         """Run body(stream, donor) against a remote level whose donor the body stops; the manager must stay usable.
 
         attention_only: two attention layers, 8 MiB GPU and host tiers (8 blocks each), so that every page is tracked.
@@ -686,11 +688,14 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
         directory = tempfile.mkdtemp(prefix=prefix)
         donor = _Donor(directory, 1 << 30, self.transport)
         try:
-            self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
+            self.cfg = self._config(
+                with_host=with_host, directory=directory, transfer_timeout_ms=10_000
+            )
             if attention_only:
                 tiers = list(self.cfg.cache_tiers)
                 tiers[0] = GpuCacheTierConfig(quota=8 << 20)
-                tiers[1] = HostCacheTierConfig(quota=8 << 20)
+                if with_host:
+                    tiers[1] = HostCacheTierConfig(quota=8 << 20)
                 self.cfg = replace(self.cfg, cache_tiers=tiers, layers=self.cfg.layers[:2])
             self.manager = KVCacheManager(self.cfg)
             self.engine = FakeEngine(self.cfg)
@@ -729,6 +734,38 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             self._reuse_and_check(fresh, stream)
 
         self._with_dying_donor("kvcm2_write_", body)
+
+    def test_sleep_does_not_count_capacity_on_a_failed_remote_level(self) -> None:
+        """A failed donor cannot back held pages, even when it has free slots."""
+
+        def body(stream, donor) -> None:
+            prompt = self._prompt(4 * self.tokens_per_block)
+            self._prefill(prompt, stream)
+            self._push_to_last_level(prompt, stream)
+            donor.stop()
+            for _ in range(8):
+                self._prefill(self._prompt(256), stream)
+            self.assertTrue(self.manager.any_remote_level_failed)
+
+            cache = self.manager.create_kv_cache()
+            try:
+                self.assertTrue(cache.resume(stream))
+                self.assertTrue(cache.resize(4 * self.tokens_per_block, 0))
+                version = self.manager.get_reuse_state_version()
+                for operation in (
+                    self.manager.validate_memory_release,
+                    self.manager.release_gpu_memory,
+                ):
+                    with self.assertRaisesRegex(base.OutOfPagesError, "offload capacity"):
+                        operation(discard=False)
+                    self.assertTrue(self.manager.is_memory_ready())
+                    self.assertTrue(cache.is_active)
+                    self.assertEqual(self.manager.get_reuse_state_version(), version)
+                self.assertTrue(cache.resize(5 * self.tokens_per_block, 0))
+            finally:
+                cache.close()
+
+        self._with_dying_donor("kvcm2_sleep_", body, attention_only=True, with_host=False)
 
     def test_pages_a_request_holds_on_a_failed_level_leave_the_reuse_tree(self) -> None:
         """Pages a suspended request holds on a failed remote level are matched by no new request.
