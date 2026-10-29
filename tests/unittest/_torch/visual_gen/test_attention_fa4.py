@@ -207,10 +207,14 @@ def test_use_2cta_request_toggles_fa4_flag_for_the_call_only():
 
     before = fa4_utils._fa_disable_2cta_enabled
     with _fa4_2cta_request(True):
-        assert fa4_utils._fa_disable_2cta_enabled is (before if not fa4_2cta_requestable() else False)
+        assert fa4_utils._fa_disable_2cta_enabled is (
+            before if not fa4_2cta_requestable() else False
+        )
     assert fa4_utils._fa_disable_2cta_enabled is before
     with _fa4_2cta_request(False):
-        assert fa4_utils._fa_disable_2cta_enabled is (before if not fa4_2cta_requestable() else True)
+        assert fa4_utils._fa_disable_2cta_enabled is (
+            before if not fa4_2cta_requestable() else True
+        )
     assert fa4_utils._fa_disable_2cta_enabled is before
     with _fa4_2cta_request(None):
         assert fa4_utils._fa_disable_2cta_enabled is before
@@ -219,9 +223,7 @@ def test_use_2cta_request_toggles_fa4_flag_for_the_call_only():
 @pytest.mark.parametrize("use_2cta", [True, False])
 def test_use_2cta_forward_matches_default_kernel(use_2cta):
     """Both FA4 kernel choices give the same attention output on a 2-CTA-eligible shape."""
-    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
-        fa4_2cta_requestable,
-    )
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import fa4_2cta_requestable
 
     if not fa4_2cta_requestable():
         pytest.skip("FA_DISABLE_2CTA set explicitly in the environment")
