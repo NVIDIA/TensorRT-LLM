@@ -10,6 +10,7 @@ from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import etcd3
 
+METADATA_KEY_PREFIX = "trtllm/"
 RECORD_SIGNATURE_FIELD = "signature"
 _SIGNATURE_PREFIX = "sha256="
 
@@ -65,7 +66,8 @@ class EtcdDictionary(RemoteDictionary):
         # This implementation assumes that key is in the
         # format of "trtllm/executor_name/key"
         unique_keys = set()
-        for _, metadata in self._client.get_all():
+        for _, metadata in self._client.get_prefix(METADATA_KEY_PREFIX,
+                                                   keys_only=True):
             key = metadata.key.decode('utf-8')
             sub_keys = key.split('/')
             if len(sub_keys) >= 2:

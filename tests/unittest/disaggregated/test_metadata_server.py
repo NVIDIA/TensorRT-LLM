@@ -5,6 +5,7 @@
 import json
 import secrets
 import socket
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -216,6 +217,20 @@ def test_config_validation():
     )
     assert cfg.port == 2379
     assert MetadataServerConfig(server_type="etcd", ca_cert="/ca.pem").user is None
+
+
+def test_etcd_dictionary_lists_only_the_trtllm_prefix():
+    client = mock.MagicMock()
+    client.get_prefix.return_value = [
+        (b"", SimpleNamespace(key=b"trtllm/a")),
+        (b"", SimpleNamespace(key=b"trtllm/a/extra")),
+        (b"", SimpleNamespace(key=b"trtllm/b")),
+    ]
+    with mock.patch.object(metadata_server_module.etcd3, "client", return_value=client):
+        store = metadata_server_module.EtcdDictionary("etcd-host", 2379)
+    assert sorted(store.keys()) == ["trtllm/a", "trtllm/b"]
+    client.get_prefix.assert_called_once_with("trtllm/", keys_only=True)
+    client.get_all.assert_not_called()
 
 
 def test_create_metadata_server_passes_credentials():
