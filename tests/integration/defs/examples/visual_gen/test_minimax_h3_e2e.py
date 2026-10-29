@@ -585,3 +585,65 @@ def test_minimax_h3_diffusers_lpips_and_audio_reference(
 
     assert lpips_distance < MINIMAX_H3_LPIPS_THRESHOLD
     assert audio_distance < MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD
+
+
+# CUDA-graph replay of the compiled transformer against the compiled eager run. The graph path
+# also pads the packed sequence to a 256-row bucket, so the clips are not bit-identical; the
+# difference must stay inside the Diffusers-reference tolerance of this file.
+MINIMAX_H3_CUDA_GRAPH_LPIPS_THRESHOLD = MINIMAX_H3_LPIPS_THRESHOLD
+MINIMAX_H3_CUDA_GRAPH_PROMPT = "A red fox walking through snow at dusk, soft wind, distant birds"
+
+
+def _generate_minimax_h3_t2va(checkpoint_path: str, *, enable_cuda_graph: bool):
+    """One compiled T2VA clip at the quality canvas; returns (video uint8, audio float)."""
+    _disable_inductor_compile_worker_quiesce()
+    pipeline = PipelineLoader(
+        VisualGenArgs(
+            model=checkpoint_path,
+            torch_compile_config=TorchCompileConfig(enable=True),
+            cuda_graph_config={"enable": enable_cuda_graph},
+        )
+    ).load(skip_warmup=True)
+    output = None
+    try:
+        output = pipeline.forward(
+            prompt=MINIMAX_H3_CUDA_GRAPH_PROMPT,
+            seed=MINIMAX_H3_SEED,
+            height=MINIMAX_H3_QUALITY_HEIGHT,
+            width=MINIMAX_H3_QUALITY_WIDTH,
+            num_frames=MINIMAX_H3_QUALITY_NUM_FRAMES,
+            frame_rate=24.0,
+            num_inference_steps=MINIMAX_H3_NUM_INFERENCE_STEPS,
+        )
+        if enable_cuda_graph:
+            runners = pipeline._cuda_graph_runners
+            assert "transformer" in runners, "CUDA graph runner was not installed"
+            assert runners["transformer"].graphs, "no CUDA graph was captured"
+            keys = list(runners["transformer"].graphs)
+            # One graph per timestep-table length only: the padded bucket keeps the layout key stable.
+            assert len(keys) <= 3, f"unexpected number of graphs captured: {len(keys)}"
+        return output.video.detach().cpu(), output.audio.detach().cpu()
+    finally:
+        del output
+        del pipeline
+        _cleanup_cuda()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_minimax_h3_cuda_graph_matches_eager(_full_cuda_memory_budget) -> None:
+    """CUDA-graph replay reproduces the compiled eager clip within the LPIPS and audio tolerances."""
+    checkpoint_path = _minimax_h3_checkpoint_path()
+    eager_video, eager_audio = _generate_minimax_h3_t2va(checkpoint_path, enable_cuda_graph=False)
+    graph_video, graph_audio = _generate_minimax_h3_t2va(checkpoint_path, enable_cuda_graph=True)
+
+    assert graph_video.shape == eager_video.shape
+    expected = eager_video.permute(0, 1, 4, 2, 3).float().div(255.0)
+    lpips_distance = _mean_lpips_distance(graph_video, expected)
+    audio_distance = _multi_resolution_log_stft_distance(graph_audio, eager_audio)
+    print(f"MiniMax-H3 CUDA graph vs eager: LPIPS {lpips_distance:.4f}, audio log-STFT {audio_distance:.4f}")
+    assert lpips_distance < MINIMAX_H3_CUDA_GRAPH_LPIPS_THRESHOLD, (
+        f"CUDA-graph clip drifted from eager: LPIPS {lpips_distance:.4f} >= {MINIMAX_H3_CUDA_GRAPH_LPIPS_THRESHOLD}"
+    )
+    assert audio_distance < MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD, (
+        f"CUDA-graph audio drifted from eager: {audio_distance:.4f} >= {MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD}"
+    )
