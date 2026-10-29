@@ -85,6 +85,7 @@ def _make_model_config(
     quant_config: QuantConfig | None = None,
     dynamic_weight_quant: bool = False,
     force_dynamic_quantization: bool = False,
+    attention_backend: str = "VANILLA",
     **overrides: object,
 ) -> DiffusionModelConfig:
     pretrained_config_dict = _TINY_CONFIG | overrides
@@ -97,7 +98,7 @@ def _make_model_config(
         dynamic_weight_quant=dynamic_weight_quant,
         force_dynamic_quantization=force_dynamic_quantization,
         mapping=Mapping(),
-        attention=AttentionConfig(backend="VANILLA"),
+        attention=AttentionConfig(backend=attention_backend),
     )
 
 
@@ -1973,3 +1974,59 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
     assert loudest[0] < amplitude_bound, f"Linear output amplitude {loudest[0]:.3e} at {loudest[1]}"
     assert torch.isfinite(video).all() and torch.isfinite(audio).all()
     assert video.abs().max() < amplitude_bound and audio.abs().max() < amplitude_bound
+@pytest.mark.parametrize(
+    "backend,capability,expected",
+    [
+        ("FA4", (10, 0), None),
+        ("FA4", (10, 3), True),
+        ("FA4", (10, 7), True),
+        ("FA4", (9, 0), None),
+        ("VANILLA", (10, 3), None),
+        ("CUTEDSL", (10, 7), None),
+    ],
+)
+def test_fa4_2cta_default_follows_device_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    capability: tuple[int, int],
+    expected: bool | None,
+) -> None:
+    """H3 asks for FA4's 2-CTA kernel on SM 103 and SM 107 only; elsewhere FA4's default stands."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    assert h3.fa4_use_2cta_default(backend) is expected
+
+
+def test_fa4_2cta_default_without_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert h3.fa4_use_2cta_default("FA4") is None
+
+
+def test_fa4_2cta_request_reaches_transformer_block_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request lands on every transformer block's FA4 backend, not on the token refiner's."""
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
+        FlashAttn4Attention,
+        fa4_2cta_requestable,
+    )
+
+    monkeypatch.setattr(h3, "fa4_use_2cta_default", lambda attn_backend: True)
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(attention_backend="FA4"))
+
+    assert model.fa4_use_2cta is True
+    expected = True if fa4_2cta_requestable() else None
+    for block in model.transformer_blocks:
+        backend = block.attn.attn
+        assert isinstance(backend, FlashAttn4Attention)
+        assert backend.use_2cta is expected
+    refiner_backend = model.token_refiner.refiner_blocks[0].attn.attn
+    assert isinstance(refiner_backend, FlashAttn4Attention)
+    assert refiner_backend.use_2cta is None
+
+
+def test_fa4_2cta_request_is_not_sent_to_other_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A VANILLA backend never sees FA4's keyword, even when the default would request it."""
+    monkeypatch.setattr(h3, "fa4_use_2cta_default", lambda attn_backend: True)
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(attention_backend="VANILLA"))
+    assert not hasattr(model.transformer_blocks[0].attn.attn, "use_2cta")
