@@ -415,6 +415,29 @@ TEST(KvCacheManagerV2ArenaPoolLayoutTest, SameRatioSameWindowsAndMinSlots)
     EXPECT_THROW(arenaPoolWindows(64 * kMiB, kDsv4Sizes, {0.5f, 0.25f, 0.25f}, {1, 2, 2}), std::invalid_argument);
 }
 
+// An arena of minArenaBytes lays out for any ratio with every group at its minimum; StorageManager raises
+// a smaller quota (e.g. the estimation pass's, from free memory) to it, as the VMM path does.
+TEST(KvCacheManagerV2ArenaPoolLayoutTest, MinArenaBytesFitsMinSlots)
+{
+    std::vector<std::vector<float>> const ratios{{0.98f, 0.01f, 0.01f}, {0.01f, 0.98f, 0.01f},
+        {0.01f, 0.01f, 0.98f}, {0.34f, 0.33f, 0.33f}};
+    for (auto const& sizes : {kDsv4Sizes, PoolSizes{{2 * kMiB}, {10 * kMiB}, {768 * kKiB}}})
+    {
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> typed;
+        for (auto const& group : sizes)
+            typed.push_back(TypedVec<PoolIndex, size_t>{group});
+        std::vector<SlotCount> const minSlots{40, 45, 45};
+        size_t const arena = ArenaGpuCacheLevelStorage::minArenaBytes(typed, TypedVec<PoolGroupIndex, SlotCount>{minSlots});
+        for (auto const& ratio : ratios)
+        {
+            auto const w = arenaPoolWindows(arena, sizes, ratio, minSlots);
+            checkPoolLayout(arena, sizes, w);
+            for (size_t g = 0; g < sizes.size(); ++g)
+                EXPECT_GE(w[PoolGroupIndex{static_cast<int>(g)}][PoolIndex{0}].size(), minSlots[g]) << "group " << g;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bound pools: a group's slot ids map to each bound pool's own ids.
 // ---------------------------------------------------------------------------
