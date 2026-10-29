@@ -111,6 +111,7 @@ class Coordinator:
         request_shutdown: Callable[[], bool] | None = None,
     ) -> None:
         self._request_shutdown = request_shutdown
+        self._shutdown_task: asyncio.Task | None = None
         self.instance_id = instance_id
         self.ready = False
         self.stopping = False
@@ -126,6 +127,8 @@ class Coordinator:
 
     async def close(self) -> None:
         self.ready = False
+        if self._shutdown_task is not None:
+            await asyncio.gather(self._shutdown_task, return_exceptions=True)
         await self._server.stop(0)
         await asyncio.gather(*(peer.close() for peer in self._peers))
 
@@ -167,6 +170,12 @@ class Coordinator:
             failed += reply["failed"]
         return {"aborted": aborted, "failed": failed}
 
+    async def _shutdown_group(self) -> None:
+        try:
+            await asyncio.gather(*(peer.request({"operation": "shutdown"}) for peer in self._peers))
+        finally:
+            self._request_shutdown()
+
     async def _dispatch(self, message: dict, context: grpc.aio.ServicerContext) -> dict:
         operation = message["operation"]
         if operation == "shutdown":
@@ -175,9 +184,16 @@ class Coordinator:
             )
             result = {"matched": matched, "supported": self._request_shutdown is not None}
             if matched and self._request_shutdown is not None:
-                # The launcher callback withdraws the group and sets its stop
-                # event synchronously. Cancellation cannot undo acceptance.
-                result["already_stopping"] = self._request_shutdown()
+                already_stopping = self.stopping
+                if self._shutdown_task is None:
+                    self.ready = False
+                    self.stopping = True
+                    self._shutdown_task = asyncio.create_task(self._shutdown_group())
+                try:
+                    await asyncio.shield(self._shutdown_task)
+                except grpc.aio.AioRpcError:
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, "Frontend shutdown failed")
+                result["already_stopping"] = already_stopping
             return result
         if operation == "heartbeat":
             # Check expiry before refreshing: a late heartbeat cannot resurrect
@@ -321,9 +337,10 @@ class FrontendClient:
         self.frontend_id = frontend_id
         self.reservations: dict[str, Reservation] = {}
         self._fail = fail
+        self.begin_shutdown: Callable | None = None
         self._cleanup: set[asyncio.Task] = set()
         self._connection = _Connection(_address(directory, "coordinator"))
-        self._server = _server(_address(directory, f"frontend-{frontend_id}"), self._abort)
+        self._server = _server(_address(directory, f"frontend-{frontend_id}"), self._dispatch)
 
     async def start(self) -> None:
         await self._server.start()
@@ -366,7 +383,11 @@ class FrontendClient:
         if not task.cancelled() and (error := task.exception()) is not None:
             self._fail(f"OpenEngine ownership cleanup failed: {error}")
 
-    async def _abort(self, message: dict, context: grpc.aio.ServicerContext) -> dict:
+    async def _dispatch(self, message: dict, context: grpc.aio.ServicerContext) -> dict:
+        if message.get("operation") == "shutdown":
+            if self.begin_shutdown is not None:
+                await asyncio.shield(self.begin_shutdown())
+            return {}
         aborted = failed = 0
         for request_id, token in message["requests"]:
             reservation = self.reservations.get(token)

@@ -120,6 +120,8 @@ class OpenEngineServer:
         self._llm = llm
         self._frontend = frontend
         self._shutdown_owner = request_shutdown
+        if frontend is not None:
+            frontend.begin_shutdown = self.begin_shutdown
         self._stopping = False
         self._health_task: asyncio.Task | None = None
         self._shutdown_health_task: asyncio.Task[None] | None = None

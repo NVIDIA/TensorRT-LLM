@@ -43,12 +43,14 @@ class Handle:
 
 
 @asynccontextmanager
-async def group(coordinator_type=Coordinator, client_type=FrontendClient):
+async def group(coordinator_type=Coordinator, client_type=FrontendClient, count=2):
     # Short paths avoid the AF_UNIX pathname limit under pytest's tmp_path.
     with TemporaryDirectory(prefix="oe-test-") as directory:
         failures = []
-        coordinator = coordinator_type(directory, 2, "shared-engine", lambda: True, failures.append)
-        clients = [client_type(directory, i, failures.append) for i in range(2)]
+        coordinator = coordinator_type(
+            directory, count, "shared-engine", lambda: True, failures.append
+        )
+        clients = [client_type(directory, i, failures.append) for i in range(count)]
         await coordinator.start()
         for client in clients:
             await client.start()
@@ -104,7 +106,7 @@ async def test_forwarded_shutdown_rejections_do_not_fail_group():
         transitions = []
 
         def stop():
-            already = coordinator.stopping
+            already = bool(transitions)
             if not already:
                 transitions.append("stop")
             coordinator.ready = False
@@ -200,6 +202,39 @@ async def test_cancelled_shutdown_keeps_launcher_commit():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_shutdown_finishes_group_publication():
+    """A cancelled reply cannot strand a committed shutdown during fanout."""
+    async with group() as (coordinator, (first, _), failures):
+        entered, release, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original = coordinator._peers[0].request
+
+        async def delayed(message):
+            entered.set()
+            await release.wait()
+            return await original(message)
+
+        coordinator._peers[0].request = delayed
+
+        def stop():
+            stopped.set()
+            return False
+
+        coordinator._request_shutdown = stop
+        task = asyncio.create_task(first.request("shutdown", expected_instance_id="shared-engine"))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            await asyncio.wait_for(stopped.wait(), 2)
+            assert coordinator.stopping
+            assert not failures
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_wins_over_pending_group_probe_admission():
     """A probe rejected by stopping group admission must report NOT_READY."""
     from conftest import FakeServicerContext
@@ -290,6 +325,52 @@ async def test_forwarded_shutdown_withdraws_health_before_owner_cleanup():
                 assert not failures
         finally:
             await server.stop(grace=0)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_publishes_readiness_on_every_frontend_before_reply():
+    """An attached peer must not stay ready after another frontend acknowledges."""
+    async with group(count=3) as (coordinator, clients, failures):
+
+        def stop():
+            already = coordinator.stopping
+            coordinator.ready = False
+            coordinator.stopping = True
+            return already
+
+        coordinator._request_shutdown = stop
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            llm_id="shared-engine",
+            tokenizer=None,
+            _check_health=lambda: True,
+        )
+        servers = [OpenEngineServer("127.0.0.1", 0, llm, "test", frontend=c) for c in clients]
+        channels = []
+        try:
+            for server in servers:
+                await server.start()
+                channels.append(grpc.aio.insecure_channel(f"127.0.0.1:{server.port}"))
+            for channel in channels:
+                status = await health_pb2_grpc.HealthStub(channel).Check(
+                    health_pb2.HealthCheckRequest(service="readiness"), timeout=3
+                )
+                assert status.status == health_pb2.HealthCheckResponse.SERVING
+            reply = await openengine_pb2_grpc.ControlStub(channels[1]).Shutdown(
+                lifecycle_pb2.ShutdownRequest(expected_instance_id="shared-engine"), timeout=3
+            )
+            assert reply.status == lifecycle_pb2.SHUTDOWN_STATUS_ACCEPTED
+            for channel in channels:
+                status = await health_pb2_grpc.HealthStub(channel).Check(
+                    health_pb2.HealthCheckRequest(service="readiness"), timeout=3
+                )
+                assert status.status == health_pb2.HealthCheckResponse.NOT_SERVING
+            assert not failures
+        finally:
+            for channel in channels:
+                await channel.close()
+            for server in servers:
+                await server.stop(grace=0)
 
 
 @pytest.mark.asyncio
@@ -655,9 +736,9 @@ async def test_peer_abort_rpc_deadline_preserves_group(monkeypatch):
     """A slow peer's gRPC deadline is an incomplete abort, not a group failure."""
 
     class SlowFrontend(FrontendClient):
-        async def _abort(self, message, context):
+        async def _dispatch(self, message, context):
             await asyncio.sleep(0.2)
-            return await super()._abort(message, context)
+            return await super()._dispatch(message, context)
 
     async with group(client_type=SlowFrontend) as (_, (first, second), failures):
         reservation = await first.reserve("slow")
