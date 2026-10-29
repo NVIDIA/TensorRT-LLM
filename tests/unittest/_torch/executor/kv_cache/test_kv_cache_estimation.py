@@ -26,6 +26,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModel
 from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
     KvCacheCreator,
+    _adjust_torch_mem_fraction,
     _create_kv_cache_manager,
     _derive_v2_layer_type_attention_windows,
     _get_num_pool_groups_for_estimation,
@@ -37,6 +38,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+    _compute_auto_host_tier_quota,
+    _get_available_memory_for_auto_host_tier,
     _get_static_cache_size_layer_components,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
@@ -2059,3 +2062,250 @@ def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) 
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window == ([1024] if guard == "explicit_window" else None)
+
+
+# ---------------------------------------------------------------------------
+# Integrated-GPU (unified memory) free-memory accounting for the V2 manager
+# ---------------------------------------------------------------------------
+
+_UTIL = "tensorrt_llm._torch.pyexecutor._util"
+_MEMORY = "tensorrt_llm._torch.pyexecutor.kv_cache.memory_utils"
+_MANAGER = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+_GiB = 1 << 30
+
+
+@pytest.mark.parametrize(
+    "is_v2,integrated,expected_free",
+    [
+        (True, True, 60 * _GiB),  # the only case that changes
+        (True, False, 4 * _GiB),  # discrete GPU: CUDA value
+        (False, True, 4 * _GiB),  # V1 manager: CUDA value
+        (False, False, 4 * _GiB),
+    ],
+)
+def test_device_free_memory_is_gated_on_v2_and_integrated(
+    is_v2: bool, integrated: bool, expected_free: int
+) -> None:
+    """Only V2 integrated GPUs use reclaimable memory for KV capacity."""
+    creator = object.__new__(KvCacheCreator)
+    creator._is_kv_cache_manager_v2 = is_v2
+    with (
+        patch("torch.cuda.mem_get_info", return_value=(4 * _GiB, 120 * _GiB)),
+        patch(f"{_UTIL}.is_device_integrated", return_value=integrated),
+        patch(f"{_MEMORY}._read_meminfo_available_bytes", return_value=60 * _GiB),
+        patch(f"{_MEMORY}._read_cgroup_memory_headroom_bytes", return_value=None),
+    ):
+        assert creator._get_device_free_memory() == (expected_free, 120 * _GiB)
+
+
+def _make_v2_estimation_creator(
+    max_gpu_total_bytes: int | None = None,
+) -> tuple[KvCacheCreator, KvCacheConfig]:
+    """Construct a minimal V2 creator for memory budgeting tests."""
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.9,
+        max_gpu_total_bytes=max_gpu_total_bytes,
+        enable_block_reuse=False,
+    )
+    model_engine = Mock()
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    model_engine.model.model_config.is_encoder_decoder = False
+    model_engine.mm_encoder_output_budget_bytes = None
+    model_engine.mm_encoder_cache = None
+    llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=True)
+    with patch.object(
+        KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            mapping=Mock(cp_config={}),
+            net_max_seq_len=3000,
+            kv_connector_manager=None,
+            max_num_tokens=8192,
+            max_beam_width=1,
+            tokens_per_block=32,
+            max_seq_len=3000,
+            max_batch_size=512,
+            kv_cache_config=kv_cache_config,
+            llm_args=llm_args,
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
+    return creator, kv_cache_config
+
+
+@pytest.mark.parametrize(
+    "integrated,user_cap,expected",
+    [
+        # Integrated: 0.9 x MemAvailable (60 GiB) instead of 0.9 x MemFree (4 GiB).
+        (True, None, int(0.9 * 60 * _GiB)),
+        # An explicit max_gpu_total_bytes still caps the provisional quota.
+        (True, 10 * _GiB, 10 * _GiB),
+        # Discrete GPU: unchanged.
+        (False, None, int(0.9 * 4 * _GiB)),
+        (False, 1 * _GiB, 1 * _GiB),
+    ],
+)
+def test_v2_provisional_quota_counts_reclaimable_memory_on_integrated_gpus(
+    integrated: bool, user_cap: int | None, expected: int
+) -> None:
+    """Reclaimable memory increases capacity without bypassing user caps."""
+    creator, kv_cache_config = _make_v2_estimation_creator(max_gpu_total_bytes=user_cap)
+    with (
+        patch.object(creator, "_get_token_num_for_estimation", return_value=16384),
+        patch("torch.cuda.mem_get_info", return_value=(4 * _GiB, 120 * _GiB)),
+        patch(f"{_UTIL}.is_device_integrated", return_value=integrated),
+        patch(f"{_MEMORY}._read_meminfo_available_bytes", return_value=60 * _GiB),
+        patch(f"{_MEMORY}._read_cgroup_memory_headroom_bytes", return_value=None),
+    ):
+        assert creator.try_prepare_estimation()
+    assert kv_cache_config.max_gpu_total_bytes == expected
+
+
+@pytest.mark.parametrize("integrated", [False, True])
+def test_v2_final_budget_excludes_reclaimable_memory_from_peak(integrated: bool) -> None:
+    """The final V2 budget subtracts only memory the process actually holds.
+
+    The profiling measurements use the same free value, so on an integrated GPU
+    reclaimable page cache no longer shows up as non-torch peak usage. The
+    budget formula itself is unchanged.
+    """
+    creator, kv_cache_config = _make_v2_estimation_creator()
+    py_executor = Mock()
+    py_executor.warmup_scope.return_value = nullcontext()
+    py_executor.dist.mapping.rank = 0
+    py_executor.dist.broadcast.side_effect = lambda value, root: value
+    py_executor.enqueue_requests.return_value = [1]
+    py_executor.await_responses.return_value = []
+    kv_manager = Mock()
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=10 * _GiB)
+    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+    captured = {}
+
+    def _capture(
+        peak_memory: int, total_gpu_memory: int, fraction: float, allocated_bytes: int
+    ) -> int:
+        """Capture the final budgeting inputs without allocating a cache."""
+        captured.update(peak=peak_memory, total=total_gpu_memory, allocated=allocated_bytes)
+        return 1 * _GiB
+
+    torch_bytes = {"allocated_bytes.all.current": 60 * _GiB, "allocated_bytes.all.peak": 61 * _GiB}
+    with (
+        patch.object(creator, "_get_token_num_for_estimation", return_value=16384),
+        # CUDA: 4 GiB free (MemFree); kernel: 60 GiB available incl. page cache.
+        patch("torch.cuda.mem_get_info", return_value=(4 * _GiB, 120 * _GiB)),
+        patch(f"{_UTIL}.is_device_integrated", return_value=integrated),
+        patch(f"{_MEMORY}._read_meminfo_available_bytes", return_value=60 * _GiB),
+        patch(f"{_MEMORY}._read_cgroup_memory_headroom_bytes", return_value=None),
+        patch("torch.cuda.memory_stats", return_value=torch_bytes),
+        patch("torch.cuda.empty_cache"),
+        patch("torch.cuda.reset_peak_memory_stats"),
+        patch.object(creator, "_encode_dummy_inputs", return_value=None),
+        patch.object(creator, "_cal_max_memory", side_effect=_capture),
+        patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=1)),
+        patch(f"{_UTIL}.get_attention_workspace_bytes_per_token", return_value=0),
+        patch(f"{_UTIL}.get_attention_workspace_fixed_bytes", return_value=0),
+    ):
+        assert creator.try_prepare_estimation()
+        creator.configure_kv_cache_capacity(py_executor)
+
+    used_outside_torch = (120 - (60 if integrated else 4)) * _GiB - 60 * _GiB
+    assert captured["total"] == 120 * _GiB
+    assert captured["allocated"] == 10 * _GiB
+    assert captured["peak"] == 61 * _GiB + max(used_outside_torch, 0)
+    assert kv_cache_config.max_gpu_total_bytes == 1 * _GiB
+
+
+@pytest.mark.parametrize(
+    "is_v2,integrated", [(True, True), (True, False), (False, True), (False, False)]
+)
+@pytest.mark.parametrize("available,cgroup", [(20, None), (20, 5), (20, 0), (None, 1), (200, None)])
+def test_torch_mem_fraction_leaves_headroom_for_lazy_allocations(
+    is_v2: bool, integrated: bool, available: int | None, cgroup: int | None
+) -> None:
+    """The allocator can consume reclaimable memory after the KV pool is built."""
+    reserved, raw_free, total = 64 * _GiB, 2 * _GiB, 128 * _GiB
+    with (
+        patch("torch.cuda.set_per_process_memory_fraction") as set_fraction,
+        patch("torch.cuda.get_allocator_backend", return_value="cudaMallocAsync"),
+        patch("torch.cuda.memory_reserved", return_value=reserved),
+        patch("torch.cuda.mem_get_info", return_value=(raw_free, total)),
+        patch(f"{_UTIL}.is_device_integrated", return_value=integrated),
+        patch(
+            f"{_MEMORY}._read_meminfo_available_bytes",
+            return_value=None if available is None else available * _GiB,
+        ),
+        patch(
+            f"{_MEMORY}._read_cgroup_memory_headroom_bytes",
+            return_value=None if cgroup is None else cgroup * _GiB,
+        ),
+    ):
+        _adjust_torch_mem_fraction(use_reclaimable_memory=is_v2)
+    free = raw_free
+    if is_v2 and integrated:
+        free = raw_free if available is None else min(total, max(raw_free, available * _GiB))
+        if cgroup is not None:
+            free = min(free, cgroup * _GiB)
+    expected = min(total, max(0, reserved + free - 32 * 1024**2)) / total
+    assert set_fraction.call_args_list[0].args == (1.0,)
+    assert set_fraction.call_args_list[1].args == (expected,)
+    assert 0 <= expected <= 1
+    if is_v2 and integrated and available == 20 and cgroup is None:
+        # A lazy 4 GiB workspace would exceed the old raw-free cap but fits now.
+        assert reserved + 4 * _GiB > reserved + raw_free - 32 * 1024**2
+        assert reserved + 4 * _GiB < expected * total
+
+
+@pytest.mark.parametrize(
+    "integrated,available,cgroup,quota,local_ranks,memlock,expected_gib",
+    [
+        (True, 90, None, 81, 1, float("inf"), 4.5),
+        (True, 90, 85, 81, 1, float("inf"), 2),
+        (True, 90, 10, 81, 1, float("inf"), 0),
+        (True, None, None, 27, 1, float("inf"), 1.5),
+        (True, 90, None, 81, 1, 5 * _GiB, 4),
+        (False, 90, None, 81, 1, float("inf"), 15),
+        (True, 90, None, 40, 2, float("inf"), 2.5),
+        (True, 90, None, 45, 2, float("inf"), 0),
+        (True, 90, None, 20, 4, float("inf"), 1.25),
+        (True, 90, None, 40, 2, 1.25 * _GiB, 1),
+        (False, 90, None, 40, 2, float("inf"), 7.5),
+    ],
+)
+def test_auto_host_tier_uses_shared_memory_budget(
+    integrated: bool,
+    available: int | None,
+    cgroup: int | None,
+    quota: int,
+    local_ranks: int,
+    memlock: float,
+    expected_gib: float,
+) -> None:
+    """Host sizing accounts for every local device pool in the shared budget."""
+    with (
+        patch("torch.cuda.mem_get_info", return_value=(30 * _GiB, 120 * _GiB)),
+        patch(f"{_MANAGER}.os.sysconf", side_effect=[4096, 30 * _GiB // 4096]),
+        patch(
+            f"{_MEMORY}._read_meminfo_available_bytes",
+            return_value=None if available is None else available * _GiB,
+        ),
+        patch(
+            f"{_MEMORY}._read_cgroup_memory_headroom_bytes",
+            return_value=None if cgroup is None else cgroup * _GiB,
+        ),
+        patch(f"{_MANAGER}.logger.warning") as warn,
+    ):
+        available_bytes = _get_available_memory_for_auto_host_tier(integrated)
+        host_quota = _compute_auto_host_tier_quota(
+            quota * _GiB, local_ranks, available_bytes, memlock, shares_device_memory=integrated
+        )
+    assert host_quota == expected_gib * _GiB
+    assert warn.called == (expected_gib == 0)
+    if integrated:
+        device_bytes = quota * _GiB * local_ranks
+        if device_bytes <= available_bytes:
+            assert device_bytes + host_quota * local_ranks <= available_bytes
+        else:
+            assert host_quota == 0

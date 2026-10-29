@@ -39,6 +39,7 @@ from strenum import StrEnum
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
+from tensorrt_llm._torch.pyexecutor.kv_cache.memory_utils import get_integrated_gpu_free_memory
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -498,6 +499,21 @@ def _estimate_full_attn_size_per_token(
     )
 
 
+def _get_available_memory_for_auto_host_tier(shares_device_memory: bool) -> float:
+    """Read available memory before allocating either cache tier.
+
+    Args:
+        shares_device_memory: Whether host and device allocations share RAM.
+    """
+    if shares_device_memory:
+        cuda_free, cuda_total = torch.cuda.mem_get_info()
+        return get_integrated_gpu_free_memory(cuda_free, cuda_total)
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (ValueError, OSError):
+        return float("inf")
+
+
 def _compute_auto_host_tier_quota(
     quota: int,
     local_ranks: int,
@@ -513,10 +529,10 @@ def _compute_auto_host_tier_quota(
     pinnable-memory (RLIMIT_MEMLOCK) limit.
 
     On an integrated GPU the device pool and the host tier are the same
-    physical memory, so ``mem_available`` counts bytes the device quota is
-    about to consume. Charging the device quota against the budget keeps the
-    two tiers from double-counting; when nothing is left the tier is dropped
-    rather than falling back to the device quota.
+    physical memory, so ``mem_available`` counts bytes the local device pools
+    are about to consume. Charge a device quota for every local rank before
+    sharing the remaining budget between host tiers; when nothing is left the
+    tier is dropped rather than falling back to the device quota.
 
     Args:
         quota: Device (GPU) KV cache quota in bytes; must be positive.
@@ -526,15 +542,15 @@ def _compute_auto_host_tier_quota(
         memlock_limit: RLIMIT_MEMLOCK soft limit in bytes, or
             ``float("inf")`` if unlimited or unknown.
         shares_device_memory: Whether host and device memory are one physical
-            pool (integrated GPU). Charges ``quota`` against ``mem_available``
-            and allows a zero result.
+            pool (integrated GPU). Charges ``quota * local_ranks`` against
+            ``mem_available`` and allows a zero result.
 
     Returns:
         Host cache tier quota in bytes. Positive, except on integrated GPUs
         with no headroom left, where 0 means "provision no host tier".
     """
     if shares_device_memory and mem_available != float("inf"):
-        mem_available = max(0.0, mem_available - quota)
+        mem_available = max(0.0, mem_available - quota * local_ranks)
     candidates = [quota]
     if mem_available != float("inf"):
         candidates.append(int(mem_available / local_ranks * 0.5))
@@ -548,8 +564,9 @@ def _compute_auto_host_tier_quota(
             # OOM-killed.
             logger.warning(
                 "KV cache manager v2 auto host tier sizing has no headroom "
-                "left on this integrated GPU after reserving the "
-                f"{quota / (1 << 30):.2f}GiB device quota; provisioning no "
+                "left on this integrated GPU after reserving "
+                f"{local_ranks} local device quota(s) of "
+                f"{quota / (1 << 30):.2f}GiB each; provisioning no "
                 "host tier. Lower kv_cache_config.max_tokens or "
                 "free_gpu_memory_fraction, or set an explicit "
                 "kv_cache_config.host_cache_size."
@@ -2273,10 +2290,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # ~170GiB device quota each on a 975GiB node).
             local_ranks = max(1, Distributed.get(mapping).local_world_size)
 
-            try:
-                mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
-            except (ValueError, OSError):
-                mem_available = float("inf")
+            shares_device_memory = is_device_integrated()
+            mem_available = _get_available_memory_for_auto_host_tier(shares_device_memory)
             try:
                 _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
                 memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float("inf")
@@ -2287,7 +2302,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 local_ranks,
                 mem_available,
                 memlock_limit,
-                shares_device_memory=is_device_integrated(),
+                shares_device_memory=shares_device_memory,
             )
             logger.info(
                 f"KV cache manager v2 auto host tier sizing: "
