@@ -804,6 +804,7 @@ class ConfigurableMoE(MoE):
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        dispatch_start_event: Optional[torch.cuda.Event] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -824,6 +825,11 @@ class ConfigurableMoE(MoE):
         ``prerouted``: the tokens' routing, computed by the caller for a backend
         that declares ``supports_prerouted_routing`` (one chunk, no
         communication).
+
+        ``dispatch_start_event``: recorded on the current stream right before
+        the external ``Communication.dispatch`` is issued (at entry on paths
+        without one), so a caller can hold independent side-stream work until
+        the dispatch window.
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -856,6 +862,7 @@ class ConfigurableMoE(MoE):
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
             prerouted=prerouted,
+            dispatch_start_event=dispatch_start_event,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
