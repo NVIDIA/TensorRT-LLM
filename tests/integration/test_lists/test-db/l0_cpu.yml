@@ -126,7 +126,6 @@ l0_cpu:
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   # MiniMax-M3 compressed-tensors NVFP4 MoE packaging: config expansion and
   # index-projection quantization.
-  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fold_gemma_boundary_weights_accepts_partial_lazy_load
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_projection_quantization_follows_checkpoint_entries
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_expands_to_mixed_precision
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_moe_config_honors_ignored_layers

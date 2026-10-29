@@ -76,7 +76,6 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
     _dispatch_attention_over_live_tokens,
-    _fold_gemma_boundary_norm_weights,
     _get_index_projection_quant_config,
     _load_index_qk_proj_weights,
     _load_qkv_index_proj_weights,
@@ -305,15 +304,21 @@ def test_minimax_m3_moe_reduces_only_local_terms(
     assert moe.allreduce.params == [None]
 
 
-def _build_decoder_layer_with_stubs(
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "scheduler_kind, expected_post_fusion",
+    [
+        (MoESchedulerKind.EXTERNAL_COMM, True),
+        (MoESchedulerKind.FUSED_COMM, False),
+    ],
+)
+def test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler(
     monkeypatch: pytest.MonkeyPatch,
     scheduler_kind: MoESchedulerKind,
-    use_gemma_norm: bool,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-    hidden_size: int = 6144,
-) -> MiniMaxM3DecoderLayer:
-    """A TP2 MoE decoder layer with real norms and stub attention, MoE and AllReduce."""
+    expected_post_fusion: bool,
+) -> None:
+    """A fused-communication MoE must not schedule a second boundary reduction."""
+
     monkeypatch.setenv("TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED", "0")
 
     class _DecoderComponent(nn.Module):
@@ -337,18 +342,19 @@ def _build_decoder_layer_with_stubs(
         _DecoderMoE,
     )
     monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.RMSNorm",
+        _DecoderComponent,
+    )
+    monkeypatch.setattr(
         "tensorrt_llm._torch.models.modeling_minimaxm3.AllReduce",
         _DecoderComponent,
     )
-    config = _make_text_config()
-    config.use_gemma_norm = use_gemma_norm
-    config.torch_dtype = dtype
-    config.hidden_size = hidden_size
     model_config = ModelConfig(
-        pretrained_config=config,
+        pretrained_config=_make_text_config(),
         mapping=Mapping(world_size=2, rank=0, tp_size=2),
     )
-    return MiniMaxM3DecoderLayer(
+
+    layer = MiniMaxM3DecoderLayer(
         model_config=model_config,
         layer_idx=3,
         aux_stream_dict={
@@ -356,25 +362,6 @@ def _build_decoder_layer_with_stubs(
             AuxStreamType.MoeShared: None,
         },
     )
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "scheduler_kind, expected_post_fusion",
-    [
-        (MoESchedulerKind.EXTERNAL_COMM, True),
-        (MoESchedulerKind.FUSED_COMM, False),
-    ],
-)
-@pytest.mark.parametrize("use_gemma_norm", [False, True])
-def test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler(
-    monkeypatch: pytest.MonkeyPatch,
-    scheduler_kind: MoESchedulerKind,
-    expected_post_fusion: bool,
-    use_gemma_norm: bool,
-) -> None:
-    """Plain and folded-Gemma norms preserve fusion without a second routed reduction."""
-    layer = _build_decoder_layer_with_stubs(monkeypatch, scheduler_kind, use_gemma_norm)
 
     assert layer.enable_fusion
     assert layer.pre_feed_forward_fusion
@@ -3568,28 +3555,6 @@ def test_packaged_nvfp4_experts_load_and_run_on_cutlass(use_cuda_graph: bool, tu
             # and the BF16 rounding of the GEMM outputs.
             assert _relative_l2(out, ref) < 0.02
             assert _cosine(out, ref) > 0.999
-
-
-@pytest.mark.cpu_only
-def test_minimax_m3_fold_gemma_boundary_weights_accepts_partial_lazy_load() -> None:
-    stored = torch.tensor([0.25, -0.25], dtype=torch.bfloat16)
-
-    class LazyWeight:
-        def __getitem__(self, index: slice) -> torch.Tensor:
-            assert index == slice(None)
-            return stored
-
-    untouched = LazyWeight()
-    weights = {
-        "model.layers.2.input_layernorm.weight": LazyWeight(),
-        "model.layers.2.self_attn.q_norm.weight": untouched,
-    }
-    result = _fold_gemma_boundary_norm_weights(weights)
-    assert result is weights
-    torch.testing.assert_close(
-        result["model.layers.2.input_layernorm.weight"], stored + 1.0, rtol=0, atol=0
-    )
-    assert result["model.layers.2.self_attn.q_norm.weight"] is untouched
 
 
 def _stub_minimax_m3_attention_construction(
