@@ -149,6 +149,13 @@ def _support_result(
     beam_width: int = 1,
     use_spec_decoding: bool = False,
     is_spec_dec_tree: bool = False,
+    query_width: int = 1,
+    query_lens: list[int] | None = None,
+    helix: bool = False,
+    helix_bounds_valid: bool = False,
+    kv_lens_override: list[int] | None = None,
+    metadata_overrides: dict | None = None,
+    forward_overrides: dict | None = None,
     has_attention_sinks: bool = False,
     has_relative_attention_bias: bool = False,
     has_sparse_attention: bool = False,
@@ -156,6 +163,7 @@ def _support_result(
     position_embedding_type: int = 0,
     kv_lora_rank: int | None = None,
     qk_rope_head_dim: int | None = None,
+    mla_kv_cache_residual_dim: int = 0,
     has_output: bool = True,
     attention_window_size: int = 128,
     attention_chunk_size: int = 0,
@@ -190,11 +198,12 @@ def _support_result(
     q_width = attn.num_heads * head_dim
     if is_fused_qkv and not is_mla:
         q_width += 2 * attn.num_kv_heads * head_dim
-    q = _TensorSpec((4, q_width), dtype)
+    num_tokens = 4 * query_width
+    q = _TensorSpec((num_tokens, q_width), dtype)
     mla_context = is_mla and attention_input_type == AttentionInputType.context_only
     output_width = attn.num_heads * (128 if mla_context else 512 if is_mla else head_dim)
     forward_args = AttentionForwardArgs(
-        output=_TensorSpec((4, output_width), output_dtype) if has_output else None,
+        output=_TensorSpec((num_tokens, output_width), output_dtype) if has_output else None,
         attention_input_type=attention_input_type,
         attention_mask=PredefinedAttentionMask.CAUSAL,
         attention_window_size=attention_window_size,
@@ -211,6 +220,12 @@ def _support_result(
         forward_args.mla_bmm2_scale = _TensorSpec((1,), torch.float32)
     if mla_fp8_inputs is not None:
         forward_args = replace(forward_args, **mla_fp8_inputs)
+    if helix:
+        forward_args.softmax_stats_tensor = _TensorSpec(
+            (num_tokens, attn.num_heads, 2), torch.float32
+        )
+    if forward_overrides is not None:
+        forward_args = replace(forward_args, **forward_overrides)
     if has_sparse_runtime_metadata:
         forward_args.sparse_runtime_params = SparseRuntimeParams(sparse_kv_indices=torch.empty(1))
     if attention_input_type == AttentionInputType.context_only:
@@ -242,8 +257,11 @@ def _support_result(
                 dtype=torch.int32,
             ),
         )
+    kv_cache_manager.mla_kv_cache_residual_dim = mla_kv_cache_residual_dim
     metadata = SimpleNamespace(
-        helix_position_offsets=None,
+        helix_position_offsets=_TensorSpec((num_tokens,), torch.int32) if helix else None,
+        helix_kv_bounds=_TensorSpec((num_tokens,), torch.int32) if helix else None,
+        _helix_spec_tokens_valid=helix_bounds_valid,
         num_sparse_topk=0,
         use_spec_decoding=use_spec_decoding,
         is_spec_dec_tree=is_spec_dec_tree,
@@ -264,9 +282,20 @@ def _support_result(
         num_contexts=num_contexts,
         num_generations=num_generations,
         num_ctx_tokens=num_ctx_tokens,
-        kv_lens_runtime=torch.tensor(kv_lens, dtype=torch.int32),
+        kv_lens_runtime=torch.tensor(
+            kv_lens_override if kv_lens_override is not None else kv_lens, dtype=torch.int32
+        ),
+        seq_lens=torch.tensor(
+            query_lens
+            if query_lens is not None
+            else [query_width] * (num_contexts + num_generations),
+            dtype=torch.int32,
+        ),
         max_seq_len=max_seq_len,
     )
+    if metadata_overrides is not None:
+        for name, value in metadata_overrides.items():
+            setattr(metadata, name, value)
     fmha = PrimsTSFmha(attn)
     k = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
     v = (
@@ -304,6 +333,95 @@ def test_supports_mla_context(num_heads: int, fp8: bool) -> None:
         quant_mode=QuantMode.from_description(use_fp8_kv_cache=fp8),
     )
     assert supported, reason
+
+
+@pytest.mark.parametrize("query_width", [1, 6, 8])
+@pytest.mark.parametrize("helix", [False, True])
+@pytest.mark.parametrize("page_size", [32, 128])
+def test_supports_uniform_linear_fp8_mla(query_width: int, helix: bool, page_size: int) -> None:
+    supported, reason = _support_result(
+        attention_input_type=AttentionInputType.generation_only,
+        head_dim=576,
+        is_mla=True,
+        quant_mode=QuantMode.FP8_KV_CACHE,
+        kv_dtype=DataType.FP8,
+        use_spec_decoding=True,
+        query_width=query_width,
+        tokens_per_block=page_size,
+        helix=helix,
+        helix_bounds_valid=query_width > 1,
+        kv_lens_override=[0, 0, 32, 64] if helix else None,
+    )
+    assert supported, reason
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_reason",
+    [
+        ({"query_lens": [1, 11, 6, 6]}, "uniform per-request"),
+        ({"is_spec_dec_tree": True}, "tree speculative"),
+        ({"metadata_overrides": {"is_spec_dec_dynamic_tree": True}}, "tree speculative"),
+        ({"forward_overrides": {"attention_mask_data": torch.empty(1)}}, "custom attention"),
+        ({"helix_bounds_valid": False}, "valid per-token KV bounds"),
+        ({"forward_overrides": {"softmax_stats_tensor": None}}, "requires softmax statistics"),
+        (
+            {
+                "forward_overrides": {
+                    "softmax_stats_tensor": _TensorSpec((24, 8, 2), torch.bfloat16)
+                }
+            },
+            "contiguous FP32",
+        ),
+        (
+            {"metadata_overrides": {"helix_kv_bounds": _TensorSpec((24,), torch.int64)}},
+            "int32 per-token",
+        ),
+        (
+            {"metadata_overrides": {"helix_kv_bounds": _TensorSpec((23,), torch.int32)}},
+            "int32 per-token",
+        ),
+        (
+            {
+                "metadata_overrides": {
+                    "helix_kv_bounds": _TensorSpec((24,), torch.int32, device="cpu")
+                }
+            },
+            "int32 per-token",
+        ),
+        (
+            {
+                "metadata_overrides": {
+                    "helix_kv_bounds": _TensorSpec((24,), torch.int32, contiguous=False)
+                }
+            },
+            "int32 per-token",
+        ),
+        (
+            {"forward_overrides": {"attention_mask": PredefinedAttentionMask.FULL}},
+            "requires a causal mask",
+        ),
+        ({"helix": False, "kv_lens_override": [0, 32, 64, 96]}, "at least one KV"),
+        ({"mla_kv_cache_residual_dim": 64}, "full FP8 KV cache"),
+    ],
+)
+def test_rejects_unsupported_mla_verification_layouts(
+    overrides: dict, expected_reason: str
+) -> None:
+    args = dict(
+        attention_input_type=AttentionInputType.generation_only,
+        head_dim=576,
+        is_mla=True,
+        quant_mode=QuantMode.FP8_KV_CACHE,
+        kv_dtype=DataType.FP8,
+        use_spec_decoding=True,
+        query_width=6,
+        helix=True,
+        helix_bounds_valid=True,
+    )
+    args.update(overrides)
+    supported, reason = _support_result(**args)
+    assert not supported
+    assert expected_reason in reason
 
 
 @pytest.mark.parametrize(
@@ -407,7 +525,7 @@ def test_fp8_mla_supported(
         ({"is_fused_qkv": True}, "MLA decode requires query-only input"),
         ({"attention_input_type": AttentionInputType.context_only}, "MLA context requires QK=192"),
         ({"attention_input_type": AttentionInputType.mixed}, "dispatched separately"),
-        ({"use_spec_decoding": True}, "speculative decoding"),
+        ({"is_spec_dec_tree": True}, "tree speculative decoding"),
         ({"has_sparse_attention": True}, "sparse attention"),
     ],
 )
@@ -1613,7 +1731,7 @@ def test_workspace_allocation_change_invalidates_only_workspace_bound_wrappers()
     fmha._update_workspace_allocation(first_workspace)
     fmha._context_wrappers[1] = Mock()
     fmha._decode_wrappers[1] = Mock()
-    fmha._mla_decode_wrappers[1] = Mock()
+    fmha._mla_decode_wrappers[(1, 1)] = Mock()
 
     second_workspace = torch.empty(64, dtype=torch.uint8)
     fmha._update_workspace_allocation(second_workspace)
@@ -1630,6 +1748,9 @@ def _get_test_mla_wrapper(
     workspace_buffer: torch.Tensor,
     *,
     mask_type: str = "causal",
+    query_width: int = 1,
+    store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ) -> object:
     return fmha._get_or_plan_mla_decode_wrapper(
         workspace_buffer,
@@ -1638,26 +1759,44 @@ def _get_test_mla_wrapper(
         kv_lora_rank=512,
         qk_rope_head_dim=64,
         page_size=32,
-        max_q_len=1,
-        max_kv_len=96,
+        max_q_len=query_width,
+        max_kv_len=block_tables.shape[-1] * 32,
         q_dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
         output_dtype=torch.bfloat16,
         mask_type=mask_type,
+        store_softmax_stats=store_softmax_stats,
+        use_kv_bounds=use_kv_bounds,
     )
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("page_size", [32, 128])
+@pytest.mark.parametrize(
+    "query_width,helix_mode",
+    [
+        (1, "none"),
+        (6, "none"),
+        (8, "none"),
+        (1, "single"),
+        (1, "token"),
+        (6, "token"),
+        (8, "token"),
+    ],
+)
 def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     monkeypatch: pytest.MonkeyPatch,
     fp8: bool,
+    page_size: int,
+    query_width: int,
+    helix_mode: str,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
     attn.quant_mode = QuantMode.FP8_KV_CACHE if fp8 else QuantMode(0)
     fmha = PrimsTSFmha(attn)
     kernel_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
-    kv_cache = torch.empty((20, 1, 32, 576), dtype=kernel_dtype)
+    kv_cache = torch.empty((20, 1, page_size, 576), dtype=kernel_dtype)
     block_tables = torch.tensor(
         [
             [[0, 1, 2], [10, 11, 12]],
@@ -1684,41 +1823,56 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         wrapper_factory,
     )
 
+    num_tokens = 2 * query_width
+    helix = helix_mode != "none"
+    # Include unused capacity to catch accidental context/padded-row offsets.
+    kv_bounds = torch.tensor(
+        [0] * query_width + [page_size - 1] + [page_size] * (query_width - 1) + [999] * 4,
+        dtype=torch.int32,
+    )
+    stats = torch.empty((num_tokens, attn.num_heads, 2), dtype=torch.float32) if helix else None
     metadata = SimpleNamespace(
         is_cuda_graph=False,
+        helix_position_offsets=torch.empty(num_tokens, dtype=torch.int32) if helix else None,
+        _helix_spec_tokens_valid=helix_mode == "token",
+        helix_kv_bounds=kv_bounds,
         beam_width=1,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
     )
-    output = torch.empty((2, attn.num_heads, 512), dtype=torch.bfloat16)
+    output = torch.empty((num_tokens, attn.num_heads, 512), dtype=torch.bfloat16)
     forward_args = AttentionForwardArgs(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=64,
-        quant_q_buffer=torch.zeros(2 * attn.num_heads * 576 + 16, dtype=torch.uint8)
+        quant_q_buffer=torch.zeros(num_tokens * attn.num_heads * 576 + 16, dtype=torch.uint8)
         if fp8
         else None,
         mla_bmm1_scale=torch.tensor([0.125, 0.125 * math.log2(math.e)]) if fp8 else None,
         mla_bmm2_scale=torch.tensor([2.0]) if fp8 else None,
+        softmax_stats_tensor=stats,
     )
-    sequence_lengths = torch.tensor([33, 64], dtype=torch.int32)
-    assert sequence_lengths.data_ptr() % 16 == 0
+    all_sequence_lengths = torch.tensor(
+        [999, 999, 0, page_size] if helix else [999, 999, page_size + 1, page_size * 2],
+        dtype=torch.int32,
+    )
+    sequence_lengths = all_sequence_lengths[2:]
     params = FmhaParams(
         attn=attn,
         meta=metadata,
         fwd=forward_args,
         workspace=torch.empty(64, dtype=torch.uint8),
-        query_input=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
+        query_input=torch.empty((num_tokens, attn.num_heads * 576), dtype=torch.bfloat16),
         output=output,
         sequence_lengths=sequence_lengths,
-        input_seq_length=1,
+        input_seq_length=query_width,
         max_past_kv_length=64,
         max_attention_window_size=64,
         cyclic_attention_window_size=64,
-        num_tokens=2,
+        num_tokens=num_tokens,
         seq_offset=2,
-        tokens_per_block=32,
+        tokens_per_block=page_size,
         kv_factor=1,
         total_num_blocks=20,
         batch_size=2,
@@ -1737,24 +1891,26 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         attn.num_heads,
         512,
         64,
-        32,
-        96,
+        page_size,
+        3 * page_size,
     )
     workspace_buffer = plan_kwargs["workspace_buffer"]
     assert workspace_buffer.data_ptr() == params.workspace.data_ptr()
     assert workspace_buffer.numel() == 64
     assert {key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"} == {
-        "max_q_len": 1,
+        "max_q_len": query_width,
         "packed_query": False,
         "q_dtype": kernel_dtype,
         "kv_dtype": kernel_dtype,
         "out_dtype": torch.bfloat16,
         "mask_type": "causal",
+        "store_softmax_stats": helix,
+        "use_kv_bounds": helix,
     }
     wrapper.run.assert_called_once()
     run_args = wrapper.run.call_args.args
     run_kwargs = wrapper.run.call_args.kwargs
-    assert run_args[0].shape == (2, 1, attn.num_heads, 576)
+    assert run_args[0].shape == (2, query_width, attn.num_heads, 576)
     query_buffer = forward_args.quant_q_buffer if fp8 else params.query_input
     assert run_args[0].data_ptr() == query_buffer.data_ptr()
     assert run_args[0].dtype == kernel_dtype
@@ -1768,16 +1924,31 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     )
     assert run_kwargs["seq_lens_kv"].data_ptr() == sequence_lengths.data_ptr()
     torch.testing.assert_close(run_kwargs["seq_lens_kv"], sequence_lengths)
-    assert run_kwargs["out"].shape == (2, 1, attn.num_heads, 512)
+    assert run_kwargs["out"].shape == (2, query_width, attn.num_heads, 512)
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["softmax_scale"] == pytest.approx(0.125 if fp8 else 1.0 / math.sqrt(128 + 64))
     assert run_kwargs["output_scale"] == (2.0 if fp8 else 1.0)
     assert run_kwargs["validate"] is False
+    if helix:
+        expected_bounds = kv_bounds[:num_tokens] if helix_mode == "token" else sequence_lengths
+        assert run_kwargs["kv_bounds"].data_ptr() == expected_bounds.data_ptr()
+        assert run_kwargs["kv_bounds"].shape == (num_tokens,)
+        torch.testing.assert_close(run_kwargs["kv_bounds"], expected_bounds)
+        assert run_kwargs["softmax_stats"].shape == (2, query_width, attn.num_heads, 2)
+        assert run_kwargs["softmax_stats"].data_ptr() == stats.data_ptr()
+    else:
+        assert run_kwargs["kv_bounds"] is None
+        assert run_kwargs["softmax_stats"] is None
 
     block_tables[:, 0].add_(20)
     block_tables[:, 1].add_(200)
     sequence_lengths.add_(1)
-    fmha.run_mla_generation(params)
+    kv_bounds[:num_tokens].add_(1)
+    with monkeypatch.context() as capture_patch:
+        capture_patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        capture_patch.setattr(torch.Tensor, "item", Mock(side_effect=AssertionError("device read")))
+        capture_patch.setattr(torch.Tensor, "cpu", Mock(side_effect=AssertionError("device read")))
+        fmha.run_mla_generation(params)
 
     wrapper_factory.assert_called_once_with()
     wrapper.plan.assert_called_once()
@@ -1788,8 +1959,10 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         run_kwargs["block_tables"],
         torch.tensor([[20, 21, 22], [23, 24, 25]], dtype=torch.int32),
     )
-    torch.testing.assert_close(run_kwargs["seq_lens_kv"], torch.tensor([34, 65], dtype=torch.int32))
-    assert fmha._mla_decode_wrappers[2] is wrapper
+    torch.testing.assert_close(run_kwargs["seq_lens_kv"], sequence_lengths)
+    if helix:
+        torch.testing.assert_close(wrapper.run.call_args.kwargs["kv_bounds"], expected_bounds)
+    assert fmha._mla_decode_wrappers[(2, query_width)] is wrapper
 
 
 @pytest.mark.parametrize("buffer_dtype", [torch.uint8, torch.float8_e4m3fn])
@@ -1916,8 +2089,8 @@ def test_mla_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     for wrapper in wrappers:
         wrapper.plan.assert_called_once()
         assert wrapper.plan.call_args.kwargs["workspace_buffer"] is workspace
-    assert fmha._mla_decode_wrappers[2] is wrappers[0]
-    assert fmha._mla_decode_wrappers[1] is wrappers[1]
+    assert fmha._mla_decode_wrappers[(2, 1)] is wrappers[0]
+    assert fmha._mla_decode_wrappers[(1, 1)] is wrappers[1]
 
 
 def test_mla_wrapper_capture_uses_cached_plan_and_rejects_plan_miss(
@@ -1958,6 +2131,51 @@ def test_mla_wrapper_capture_uses_cached_plan_and_rejects_plan_miss(
     wrapper.plan.assert_called_once()
 
 
+@pytest.mark.parametrize("helix", [False, True])
+def test_mla_wrapper_cache_separates_query_widths(
+    monkeypatch: pytest.MonkeyPatch,
+    helix: bool,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    wrapper_factory = Mock(side_effect=lambda: Mock())
+    monkeypatch.setattr(prims_mla_module, "BatchMLADecodePagedTSWrapper", wrapper_factory)
+    fmha = PrimsTSFmha(_Attention(head_dim=576, is_mla=True, num_heads=4))
+    block_tables = torch.zeros((2, 3), dtype=torch.int32)
+    seq_lens = torch.tensor([33, 64], dtype=torch.int32)
+    workspace = torch.empty(64, dtype=torch.uint8)
+    widths = (1, 6, 8)
+    planned = []
+    for query_width in widths:
+        planned.append(
+            _get_test_mla_wrapper(
+                fmha,
+                block_tables,
+                seq_lens,
+                workspace,
+                query_width=query_width,
+                store_softmax_stats=helix,
+                use_kv_bounds=helix,
+            )
+        )
+    assert wrapper_factory.call_count == len(widths)
+    assert len({id(wrapper) for wrapper in planned}) == len(widths)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    for query_width, wrapper in zip(reversed(widths), reversed(planned)):
+        assert (
+            _get_test_mla_wrapper(
+                fmha,
+                block_tables,
+                seq_lens,
+                workspace,
+                query_width=query_width,
+                store_softmax_stats=helix,
+                use_kv_bounds=helix,
+            )
+            is wrapper
+        )
+        wrapper.plan.assert_called_once()
+
+
 @pytest.mark.parametrize("is_cuda_graph", [False, True], ids=["eager", "cuda-graph"])
 def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     monkeypatch: pytest.MonkeyPatch,
@@ -1996,6 +2214,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     get_page_index_upper_bound = Mock(return_value=20)
     metadata = SimpleNamespace(
         is_cuda_graph=is_cuda_graph,
+        helix_position_offsets=None,
         beam_width=1,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
@@ -2082,10 +2301,13 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
 
 @pytest.mark.parametrize("is_cuda_graph", [False, True], ids=["eager", "cuda-graph"])
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("query_width,with_stats", [(1, False), (6, True), (8, True)])
 def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     monkeypatch: pytest.MonkeyPatch,
     is_cuda_graph: bool,
     fp8: bool,
+    query_width: int,
+    with_stats: bool,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     workspace_size = Mock(return_value=48)
@@ -2098,7 +2320,7 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     attn.quant_mode = QuantMode.FP8_KV_CACHE if fp8 else QuantMode(0)
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 1
-    q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
+    q = torch.empty((2 * query_width, attn.num_heads * 576), dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         is_cuda_graph=is_cuda_graph,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
@@ -2109,11 +2331,14 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
         tokens_per_block=32,
         kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
     )
-    output = torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16)
+    output = torch.empty((2 * query_width, attn.num_heads * 512), dtype=torch.bfloat16)
     forward_args = AttentionForwardArgs(
         output=output,
         attention_input_type=AttentionInputType.generation_only,
         attention_window_size=96,
+        softmax_stats_tensor=torch.empty((2 * query_width, attn.num_heads, 2), dtype=torch.float32)
+        if with_stats
+        else None,
     )
 
     workspace = torch.empty(0, dtype=torch.uint8)
@@ -2131,6 +2356,8 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     assert workspace_size.call_args.kwargs["q_dtype"] == kernel_dtype
     assert workspace_size.call_args.kwargs["kv_dtype"] == kernel_dtype
     assert workspace_size.call_args.kwargs["out_dtype"] == torch.bfloat16
+    assert workspace_size.call_args.kwargs["max_seq_len_q"] == query_width
+    assert workspace_size.call_args.kwargs["store_softmax_stats"] == with_stats
     assert workspace.numel() == 48
 
 
@@ -2152,7 +2379,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
     workspace = torch.empty(48, dtype=torch.uint8)
     fmha._update_workspace_allocation(workspace)
     wrapper = Mock()
-    fmha._mla_decode_wrappers[2] = wrapper
+    fmha._mla_decode_wrappers[(2, 1)] = wrapper
     q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         is_cuda_graph=True,
@@ -2173,7 +2400,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
 
     stream.synchronize.assert_not_called()
-    assert fmha._mla_decode_wrappers[2] is wrapper
+    assert fmha._mla_decode_wrappers[(2, 1)] is wrapper
     assert workspace.numel() == 48
     workspace_size.assert_called_once()
 
