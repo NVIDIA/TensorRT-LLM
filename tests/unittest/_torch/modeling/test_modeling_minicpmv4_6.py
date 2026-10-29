@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for MiniCPM-V 4.6 config loading on the PyTorch backend.
+"""Unit tests for MiniCPM-V 4.6 configuration and multimodal forward.
 
-These tests are intentionally CPU-only and do not require model weights or a
-native ``minicpmv4_6`` transformers release, so they run (and protect the fix)
-on the repo's currently-pinned ``transformers==5.5.4`` CI as well as on
-``>=5.7.0``:
+The configuration tests do not require a GPU, model weights or a native
+``minicpmv4_6`` transformers release. The forward test uses a small CUDA model
+with locally initialized weights. Both work with the repo's currently-pinned
+``transformers==5.5.4`` as well as ``>=5.7.0``:
 
 * ``_resolve_composite_torch_dtype`` dtype resolution.
 * ``_build_minicpmv4_6_config`` / ``load_pretrained_config`` composite-config
@@ -264,3 +264,127 @@ def test_native_minicpmv4_6_config_available():
     from transformers import MiniCPMV4_6Config as HFMiniCPMV4_6Config
 
     assert HFMiniCPMV4_6Config.model_type == "minicpmv4_6"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Model forward requires CUDA")
+def test_minicpmv46_multimodal_forward():
+    from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6Model
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+
+    raw = _minicpmv4_6_config_dict()
+    raw.update(
+        torch_dtype="bfloat16",
+        image_size=8,
+        insert_layer_id=0,
+        image_token_id=62,
+        video_token_id=63,
+    )
+    raw["vision_config"].update(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        image_size=8,
+        patch_size=2,
+    )
+    raw["text_config"].update(
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        max_position_embeddings=32,
+        full_attention_interval=1,
+        layer_types=["full_attention"],
+        bos_token_id=None,
+        eos_token_id=None,
+        pad_token_id=None,
+    )
+    config = _build_minicpmv4_6_config(raw)
+    model_cls = get_registered_model_class("MiniCPMV4_6ForConditionalGeneration")
+    assert model_cls is MiniCPMV4_6Model
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(0)
+        model = (
+            model_cls(
+                ModelConfig(pretrained_config=config, attn_backend="VANILLA", max_num_tokens=16)
+            )
+            .cuda()
+            .eval()
+        )
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if parameter.ndim > 1:
+                    parameter.normal_(mean=0.0, std=0.05)
+                elif name.startswith("mm_encoder.") and name.endswith("weight"):
+                    parameter.fill_(1.0)
+                else:
+                    # Qwen3.5 uses Gemma RMSNorm: zero weights mean unit scale.
+                    parameter.zero_()
+        model.llm.setup_aliases()
+        assert isinstance(model, MiniCPMV4_6Model)
+        assert len(model.mm_encoder.encoder.layers) == 1
+        assert len(model.llm.model.layers) == 1
+
+        metadata = VanillaAttentionMetadata(
+            max_num_requests=1,
+            max_num_tokens=4,
+            kv_cache_manager=None,
+            seq_lens=torch.tensor([4], dtype=torch.int32),
+            num_contexts=1,
+            request_ids=[1],
+            kv_cache_params=KVCacheParams(use_cache=False, num_cached_tokens_per_seq=[0]),
+            mamba_metadata=Mamba2Metadata(1, chunk_size=128, max_num_tokens=4),
+        )
+        metadata.prepare()
+        input_ids = torch.tensor([65, 3, 7, 11], dtype=torch.int32, device="cuda")
+        position_ids = torch.arange(4, dtype=torch.int32, device="cuda")
+        pixels = torch.randn(1, 3, 2, 32, dtype=torch.bfloat16, device="cuda")
+        target_sizes = torch.tensor([[4, 4]], dtype=torch.int32)
+        image = MultimodalParams(
+            multimodal_data={"image": {"pixel_values": pixels, "target_sizes": target_sizes}}
+        )
+        changed_image = MultimodalParams(
+            multimodal_data={"image": {"pixel_values": -pixels, "target_sizes": target_sizes}}
+        )
+        forward_kwargs = dict(
+            attn_metadata=metadata,
+            position_ids=position_ids,
+            return_context_logits=True,
+        )
+        with torch.inference_mode():
+            logits = model(input_ids=input_ids, multimodal_params=[image], **forward_kwargs)
+            embeddings = model.mm_encoder([image])[0]
+            attached = MultimodalParams(
+                multimodal_data={
+                    "image": changed_image.multimodal_data["image"],
+                    "multimodal_embedding": embeddings,
+                }
+            )
+            other_ids = input_ids.clone()
+            other_ids[0] = 66
+            attached_logits = model(
+                input_ids=other_ids, multimodal_params=[attached], **forward_kwargs
+            )
+            changed_logits = model(
+                input_ids=input_ids, multimodal_params=[changed_image], **forward_kwargs
+            )
+            text_embedding = model.llm.model.embed_tokens(input_ids[-1:])
+            bypassed_logits = model.llm.lm_head(model.llm.model.norm(text_embedding)).float()
+
+        assert logits.shape == (4, 64)
+        assert logits.dtype == torch.float32
+        assert torch.isfinite(logits).all()
+        assert torch.isfinite(attached_logits).all()
+        assert torch.isfinite(changed_logits).all()
+        torch.testing.assert_close(logits, attached_logits, rtol=0.02, atol=0.02)
+        assert not torch.allclose(logits[-1:], changed_logits[-1:], rtol=1e-3, atol=1e-3)
+        assert not torch.allclose(logits[-1:], bypassed_logits, rtol=0.02, atol=0.02)
