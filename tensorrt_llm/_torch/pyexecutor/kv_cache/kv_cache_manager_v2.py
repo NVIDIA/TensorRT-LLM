@@ -3351,8 +3351,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.dtype not in (DataType.HALF, DataType.BF16, DataType.FP8):
             raise ValueError("Mixed precision requires FP16/BF16/FP8 high KV")
         layers = list(config.layers)
-        # Disaggregated transfer derives collision-free layer ids for the
-        # retained-token twins from this (model layer, kind) mapping.
+        # Disaggregated transfer and the lender name layers from this (model
+        # layer, kind) mapping (_virtual_layers). Every pipeline stage keeps it,
+        # twins or not, so a model layer has one name under any split.
         layer_attn_to_layer_id = {
             (model, _MixedPrecisionLayerKind.PRIMARY): LayerId(local)
             for local, model in enumerate(self.pp_layers)
@@ -3390,9 +3391,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
+        self._layer_attn_to_layer_id = layer_attn_to_layer_id
         if not self.high_layers:
             return config
-        self._layer_attn_to_layer_id = layer_attn_to_layer_id
         # A configured pool_ratio must now cover the appended retained-token
         # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)

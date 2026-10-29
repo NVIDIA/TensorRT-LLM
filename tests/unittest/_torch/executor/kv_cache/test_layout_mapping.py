@@ -446,6 +446,17 @@ def test_layouts_whose_bytes_line_up_but_mean_other_things_are_refused():
         check_compatible(expanded, base)
 
 
+def test_layers_of_one_name_but_other_model_layers_are_refused():
+    """Peers pair buffers by global layer id. A side naming its layers otherwise, as a stage of a
+    mixed-precision model naming model layer ``m`` as ``m`` where the other stages name it
+    ``2 m``, would move one model layer's KV into another's pages; such peers are refused."""
+    topology = Instance().ranks(0)[0]
+    base = layout(topology, (2,), [("key", kv(4), "attention")])
+    check_compatible(base, _with_group(base, model_layers=(2,)))
+    with pytest.raises(ValueError, match="'key'\\): of model layer 1 against 2"):
+        check_compatible(_with_group(base, model_layers=(1,)), base)
+
+
 def test_layer_groups_keeping_other_windows_correspond():
     """Retention differs legitimately between the sides: a context worker with block reuse keeps a
     reuse-backoff token more (GPT-OSS with Eagle3 keeps 129 tokens of a 128-token window), a

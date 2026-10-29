@@ -367,11 +367,12 @@ def _transferred(layout: PageLayout) -> dict[tuple[int, str], BufferDesc]:
 def check_compatible(a: PageLayout, b: PageLayout) -> None:
     """Check that two ranks' pages correspond, whichever sends.
 
-    On the layers both hold, every buffer either rank transfers the other transfers too, as the
-    same tensors: the same names, axes and extents over all ranks, however each splits them, and
-    elements of the same type where the tensors state one, in pages of as many sub-pages, in layer
-    groups of the same kind. The KV data is of one element type and quantization. Pages pair one to
-    one, so where both transfer attention buffers their pages hold as many tokens.
+    On the layers both hold, which name the same model layers, every buffer either rank transfers
+    the other transfers too, as the same tensors: the same names, axes and extents over all ranks,
+    however each splits them, and elements of the same type where the tensors state one, in pages
+    of as many sub-pages, in layer groups of the same kind. The KV data is of one element type and
+    quantization. Pages pair one to one, so where both transfer attention buffers their pages hold
+    as many tokens.
 
     How many tokens each side keeps of a windowed group is not compared: retention margins (reuse
     backoff, draft tokens) legitimately differ between the sides, and a transfer moves the blocks
@@ -420,6 +421,12 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
         paged |= ga.kind == "attention" and gb.kind == "attention"
         if ga.kind != gb.kind:
             problems.append(f"buffer {key}: a layer group of {ga.kind} against one of {gb.kind}")
+        model_a = ga.model_layers[ga.layers.index(x.layer)]
+        model_b = gb.model_layers[gb.layers.index(y.layer)]
+        if model_a != model_b:
+            # A layer named alike on both sides but of different model layers, as when one side
+            # names its layers by pipeline stage, would move one layer's bytes into another's.
+            problems.append(f"buffer {key}: of model layer {model_a} against {model_b}")
     if paged and a.tokens_per_page != b.tokens_per_page:
         problems.append(f"pages of {a.tokens_per_page} tokens against {b.tokens_per_page}")
     if problems:

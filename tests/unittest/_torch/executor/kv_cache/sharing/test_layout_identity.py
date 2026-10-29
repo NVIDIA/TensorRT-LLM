@@ -1220,6 +1220,97 @@ def test_retained_precision_twins_past_the_local_layers_are_named_by_their_model
         manager.get_page_table()
 
 
+# Windows of a four-layer model: layer 0 full attention, the others sliding.
+MIXED_PRECISION_WINDOWS = (None, 8, 8, 8)
+
+
+def mixed_precision_stage(pp_layers, *, mixed=True):
+    """A pipeline stage holding model layers ``pp_layers`` of a model whose full-attention layers
+    keep a low-precision history and a retained-token twin (``mixed=False``: the same model with
+    one precision), named as ``KVCacheManagerV2._add_mixed_precision_layers`` names them."""
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+
+    windows = [MIXED_PRECISION_WINDOWS[m] for m in pp_layers]
+    stage = SimpleNamespace(
+        low_precision_dtype=DataType.NVFP4 if mixed else None,
+        kv_cache_type=CacheType.SELF,
+        mapping=SimpleNamespace(cp_size=1),
+        dtype=DataType.BF16,
+        pp_layers=list(pp_layers),
+        high_layers={},
+        num_kv_heads_per_layer=[1] * len(pp_layers),
+        head_dim_per_layer=[8] * len(pp_layers),
+        max_attention_window_vec=windows,
+        _shared_kv_layers=set(),
+        tokens_per_block=TPB,
+        first_n=1,
+        last_n=4,
+    )
+    stage._is_mixed_precision_layer = types.MethodType(
+        KVCacheManagerV2._is_mixed_precision_layer, stage
+    )
+    kv = [BufferConfig(role="key", size=HEAD_BYTES), BufferConfig(role="value", size=HEAD_BYTES)]
+    config = dataclasses.make_dataclass("Config", ["layers"])(
+        [
+            AttentionLayerConfig(layer_id=lid, buffers=kv, sliding_window_size=window)
+            for lid, window in enumerate(windows)
+        ]
+    )
+    KVCacheManagerV2._add_mixed_precision_layers(stage, config)
+    local = range(len(pp_layers))
+    groups = [
+        (lids, window, sinks)
+        for lids, window, sinks in (
+            ([lid for lid in local if windows[lid] is not None], 8, None),
+            ([lid for lid in local if windows[lid] is None], None, None),
+            (sorted(stage.high_layers.values()), stage.last_n + 1, stage.first_n),
+        )
+        if lids
+    ]
+    manager = Manager(
+        [kv_group(lids=lids) for lids, _, _ in groups],
+        pp_layers=pp_layers,
+        windows=[window for _, window, _ in groups],
+        sinks=[sinks for _, _, sinks in groups],
+    )
+    if hasattr(stage, "_layer_attn_to_layer_id"):
+        manager._layer_attn_to_layer_id = stage._layer_attn_to_layer_id
+    return manager
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_names_a_model_layer_alike_on_every_pipeline_stage():
+    """Every stage of a mixed-precision model names model layer ``m`` ``2 m`` and its twin
+    ``2 m + 1``, a stage holding no twin too, so instances split into other pipeline stages pair
+    each model layer with itself. Peers naming a model layer otherwise, as a stage naming its
+    layers by its own twins once did or the model served with one precision, are refused."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible
+
+    whole = mixed_precision_stage([0, 1, 2, 3])
+    first, last = mixed_precision_stage([0, 1]), mixed_precision_stage([2, 3])
+    assert whole._page_layer_ids() == {0: (0, 0), 1: (2, 1), 2: (4, 2), 3: (6, 3), 4: (1, 0)}
+    assert first._page_layer_ids() == {0: (0, 0), 1: (2, 1), 2: (1, 0)}
+    assert last._page_layer_ids() == {0: (4, 2), 1: (6, 3)}
+    pages = {
+        name: m.get_page_table().page_layout
+        for name, m in (("whole", whole), ("first", first), ("last", last))
+    }
+    for stage in ("first", "last"):
+        check_compatible(pages["whole"], pages[stage])
+        check_compatible(pages[stage], pages["whole"])
+    assert_layouts_reshard([pages["whole"]], [pages["first"], pages["last"]])
+    assert_layouts_reshard([pages["first"], pages["last"]], [pages["whole"]])
+
+    del last._layer_attn_to_layer_id
+    by_stage = last.get_page_table().page_layout
+    with pytest.raises(ValueError, match="of model layer 1 against 2"):
+        check_compatible(pages["whole"], by_stage)
+    plain = mixed_precision_stage([0, 1, 2, 3], mixed=False).get_page_table().page_layout
+    with pytest.raises(ValueError, match="of model layer 0 against 1"):
+        check_compatible(pages["whole"], plain)
+
+
 @pytest.mark.cpu_only
 def test_an_internal_layer_several_attention_types_share_takes_the_first_s_global_id():
     """An internal layer several model layers share is named by its first entry, as native does."""
