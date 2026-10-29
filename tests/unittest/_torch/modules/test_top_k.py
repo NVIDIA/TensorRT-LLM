@@ -330,7 +330,7 @@ def test_gvr_v2_decode_is_hint_free(monkeypatch) -> None:
     assert not top_k.needs_gvr_prior
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("padded_rows", [False, True])
 def test_gvr_v2_decode_preserves_native_input(monkeypatch, dtype, padded_rows) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
@@ -392,7 +392,8 @@ def test_gvr_v2_decode_forwards_deterministic_kwargs(monkeypatch) -> None:
     }
 
 
-def test_gvr_v2_decode_deterministic_bf16_widens_to_fp32(monkeypatch) -> None:
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gvr_v2_decode_deterministic_low_precision_widens_to_fp32(monkeypatch, dtype) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
@@ -402,8 +403,8 @@ def test_gvr_v2_decode_deterministic_bf16_widens_to_fp32(monkeypatch) -> None:
         gvr_deterministic=True,
         gvr_sorting="ascending",
     )
-    # an aligned bf16 arena view with an odd logical width (multirow stride 16)
-    scores = torch.randn(2, 16, dtype=torch.bfloat16)[:, :13]
+    # an aligned 16-bit arena view with an odd logical width (multirow stride 16)
+    scores = torch.randn(2, 16, dtype=dtype)[:, :13]
     lengths = torch.full((2,), 13, dtype=torch.int32)
     output = torch.empty(2, 2, dtype=torch.int32)
 
@@ -445,7 +446,7 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
         decode_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
     )
-    scores = torch.randn(1, 8, dtype=torch.float16)
+    scores = torch.randn(1, 8, dtype=torch.float64)  # dtype gate miss
     lengths = torch.tensor([32], dtype=torch.int32)
     output = torch.empty(1, 2, dtype=torch.int32)
 
@@ -471,20 +472,21 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("layout", ["row_stride", "inner_stride", "base", "single_row_width"])
-def test_gvr_v2_bf16_unaligned_layout_falls_back(monkeypatch, layout) -> None:
+def test_gvr_v2_16bit_unaligned_layout_falls_back(monkeypatch, layout, dtype) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
     top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
     if layout == "row_stride":
-        scores = torch.randn(2, 12, dtype=torch.bfloat16)
+        scores = torch.randn(2, 12, dtype=dtype)
     elif layout == "inner_stride":
-        scores = torch.randn(2, 16, dtype=torch.bfloat16)[:, ::2]
+        scores = torch.randn(2, 16, dtype=dtype)[:, ::2]
     elif layout == "base":
-        scores = torch.randn(2, 16, dtype=torch.bfloat16)[:, 1:9]
+        scores = torch.randn(2, 16, dtype=dtype)[:, 1:9]
     else:
-        scores = torch.randn(1, 16, dtype=torch.bfloat16)[:, :12]
+        scores = torch.randn(1, 16, dtype=dtype)[:, :12]
     lengths = torch.full((scores.shape[0],), scores.shape[1], dtype=torch.int32)
     output = torch.empty(scores.shape[0], 2, dtype=torch.int32)
 

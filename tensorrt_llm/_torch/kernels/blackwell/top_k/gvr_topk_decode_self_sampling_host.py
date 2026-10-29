@@ -804,6 +804,9 @@ def _bf16_halve_u(plan: dict) -> dict:
     return plan
 
 
+_halve_u16 = _bf16_halve_u  # dtype-neutral name: the fp16 arm shares the bf16 route twins
+
+
 def _gvr_main_gate(blk: int, kpt: int, split: bool = True) -> tuple[int, int]:
     """(SCPB, CMPB) constexpr mirror of GvrMainKernel.__init__.
     Kept here so a route rung can check what it does to the
@@ -1157,9 +1160,16 @@ def _route_bf16_table(
 
 
 def _route_bf16(
-    b: int, n: int, npad: int, k: int, num_sms: int = 148, sm_version: int = 100
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, object]:
-    """bf16 dispatch table. ``_route_bf16_table`` (the fp32 table before #20106) is
+    """16-bit dispatch table (``dtype``: bfloat16, or float16 sharing the bf16 routes and tuning
+    until it is tuned on its own timing). ``_route_bf16_table`` (the fp32 table before #20106) is
     the starting point; bf16-specific re-tunes (16B-vector U
     halving, register-family capacity fitting, bin-count halving) are applied
     to the returned copy only."""
@@ -1178,9 +1188,10 @@ def _route_bf16(
     pk16 = npad <= 65536 and n <= 65536 and (b > 15)
     if plan["kernel"] == "main" and (not plan["tpl"][5]) and (b > 148):
         n4q = n >> 2
-        if 1152 < n4q <= 3072 and (b <= 256 or (k == 512 and b >= 1024)):
+        if 1152 < n4q <= 3072 and (b <= 256 or (k == 512 and b >= 1024) or k == 2048):
             # floor-0.97 step 1: the N <= 12K register rung of #20106 (`_reg(512, ceil(n4/512), 2, NBSEL)`)
-            # for the big-batch rows the BF16 table kept on the main kernel
+            # for the big-batch rows the BF16 table kept on the main kernel; K=2048 takes it at every
+            # large batch (the main kernel's block64 sampling pays off only on the K <= 1024 rows there)
             CMP = n if n < 2560 else 2560
             QC = 160  # floor-0.97 step 3: #20106's register-plan rank gate
             CURE = not (n < 2 * k and b > 148)
@@ -1374,9 +1385,14 @@ def _route_bf16(
 
 
 def _route_streaming_bf16(
-    b: int, n: int, npad: int, k: int, force_main: bool = False
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    force_main: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, object]:
-    """bf16 twin of route_streaming (see _route_bf16).
+    """16-bit twin of route_streaming (see _route_bf16; ``dtype`` as there).
 
     Split-aware vector-width pick: the fp32 table derives the split count R so
     each CTA's chunk (~n/R) fills one fp32 tile of BLK*U*4 elements. When
@@ -1482,11 +1498,39 @@ def _route_streaming_bf16(
     return plan
 
 
+def _route_fp16(
+    b: int, n: int, npad: int, k: int, num_sms: int = 148, sm_version: int = 100
+) -> dict[str, object]:
+    """fp16 dispatch = the bf16 table with the dtype threaded (no fp16-specific re-tune yet)."""
+    return _route_bf16(b, n, npad, k, num_sms, sm_version, dtype=torch.float16)
+
+
+# Native 16-bit logits dtypes and the device-module dtype tags.
+_LOW_DTYPES = (torch.bfloat16, torch.float16)
+_DTYPE_TAG = {torch.float32: "f32", torch.bfloat16: "bf16", torch.float16: "f16"}
+
+# 16-bit register plans (reg / regimg, N <= 16K) take the code-radix kernel: the exact K-th 16-bit code
+# from two 8-bit-digit histogram passes over the packed halfwords and a counted-cut emit, no bracket,
+# window or refinement.  One switch for the A/B against the bracket kernel (`kern`); FP32 never reads it.
+_REG_CODE_RADIX_16BIT = True
+
+
 # Dtype-isolated launch caches preserve the original FP32 key and hot lookup.
-# BF16 additionally keys by device because its cold compilation uses that device.
+# The 16-bit caches additionally key by device because their cold compilation uses that device.
 _VARLEN_CACHE = {}
 _VARLEN_CACHE_BF16: dict[tuple[int, ...], tuple] = {}
+_VARLEN_CACHE_FP16: dict[tuple[int, ...], tuple] = {}
 _BF16_COMPILE_LOCK = threading.RLock()
+
+
+def _varlen_cache_for(dtype: torch.dtype) -> dict:
+    """Launcher cache of one logits dtype; read from the module globals at call time (tests patch them)."""
+    if dtype is torch.bfloat16:
+        return _VARLEN_CACHE_BF16
+    if dtype is torch.float16:
+        return _VARLEN_CACHE_FP16
+    return _VARLEN_CACHE
+
 
 # ---- prefill launcher cache ------------------------------------------------
 # Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
@@ -1523,32 +1567,34 @@ def _prefill_bucket(n_env: int) -> int:
     return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
 
 
-def _prefill_cache_key(tier: int, k: int, n_bucket: int, bf16: bool = False, det: bool = False):
+def _prefill_cache_key(tier: int, k: int, n_bucket: int, dtype_tag: str = "f32", det: bool = False):
     # tiers 1/2 fix U, so the bucket does not change their engine — collapse it
     # to one key so warmup covers them with a single launch.
-    return (tier, k, n_bucket if tier == 0 else 0, "bf16" if bf16 else "f32") + (
-        (True,) if det else ()
-    )
+    return (tier, k, n_bucket if tier == 0 else 0, dtype_tag) + ((True,) if det else ())
 
 
 def _prefill_launcher(
-    tier: int, k: int, n_bucket: int, bf16: bool = False, det: bool = False
+    tier: int, k: int, n_bucket: int, dtype: torch.dtype = torch.float32, det: bool = False
 ) -> tuple:
     """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
     r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
-    upper bounds; npad is filled per call in ``run_prefill``. BF16 takes the
-    bf16 streaming plan (halved per-thread vector batch, 16-byte bf16x8 loads)
-    and the r_const == 1 bf16 tuning scalars of ``_varlen_launcher``."""
-    if bf16 and det:
+    upper bounds; npad is filled per call in ``run_prefill``. The 16-bit dtypes
+    (bfloat16, float16) take the bf16 streaming plan (halved per-thread vector
+    batch, 16-byte x8 loads) and the r_const == 1 bf16 tuning scalars of
+    ``_varlen_launcher``."""
+    low = dtype in _LOW_DTYPES
+    if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
-    key = _prefill_cache_key(tier, k, n_bucket, bf16, det)
+    key = _prefill_cache_key(tier, k, n_bucket, _DTYPE_TAG[dtype], det)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
     b_route = _PREFILL_TIER_ROWS[tier]
     n_route = max(n_bucket, k + 1)
-    route_fn = _route_streaming_bf16 if bf16 else route_streaming
-    plan = route_fn(b_route, n_route, n_route, k, force_main=True)
+    if low:
+        plan = _route_streaming_bf16(b_route, n_route, n_route, k, force_main=True, dtype=dtype)
+    else:
+        plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
     if plan["kernel"] != "main":
         raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
     rt = plan["rt"]
@@ -1562,11 +1608,11 @@ def _prefill_launcher(
         prefill=True,
         det=det,
         fused_k=k,
-        **({"dtype": "bf16"} if bf16 else {}),
+        **({"dtype": _DTYPE_TAG[dtype]} if low else {}),
     )
     big = tier == 0
-    if bf16:
-        # r_const==1 branch of the bf16 _varlen_launcher tuning scalars (the
+    if low:
+        # r_const==1 branch of the 16-bit _varlen_launcher tuning scalars (the
         # prefill envelope is <= 32768, so the n_env >= 131072 aim rung never applies)
         unsplit_aim = 3 * k // 2 if k == 1024 else 2 * k
         aim_base = unsplit_aim if big else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
@@ -1587,6 +1633,21 @@ def _prefill_launcher(
     return lc
 
 
+def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict) -> bool:
+    """Whether a 16-bit register plan takes the code-radix kernel (`_REG_CODE_RADIX_16BIT` A/B switch).
+
+    Geometry-only (capture-stable) rule from the g43_b6_r3 panel (258 register cases, cold L2, 24 reps):
+    the code-radix kernel beats the bracket kernel on the near-K Flash rows (K=512, N <= 1280, every batch
+    size: +7%), on the K=512 N <= 2051 rows at >= 512 rows (+1..+6%) and on the V3.2 rows that the bracket
+    kernel runs with the bin proof (K=2048, <= 148 rows, N <= 8207: parity to +5%); everywhere else the
+    bracket kernel is 8-18% faster (its whole path does ~12 SASS per element, the three radix sweeps ~26)."""
+    if not _REG_CODE_RADIX_16BIT or plan["kernel"] not in ("reg", "regimg"):
+        return False
+    if k == 512:
+        return n_kernel <= 1280 or (n_kernel <= 2051 and num_rows >= 512)
+    return k == 2048 and num_rows <= 148 and n_kernel <= 8207
+
+
 def _varlen_launcher(
     num_rows: int,
     npad: int,
@@ -1603,25 +1664,25 @@ def _varlen_launcher(
 ) -> tuple:
     """Build a capture-stable launcher from the shared dtype kernel templates.
 
-    FP32 keeps its original routes, tuning scalars and cache key. BF16 uses
-    the same family selection and ABI assembly with its packed-load routes,
-    refinement parameters and near-K complement specialization. All choices
-    depend only on the capture-stable geometry and dtype.
+    FP32 keeps its original routes, tuning scalars and cache key. The 16-bit
+    dtypes use the same family selection and ABI assembly with their packed-load
+    routes, refinement parameters and near-K complement specialization; FP16
+    shares the BF16 routes and tuning. All choices depend only on the
+    capture-stable geometry and dtype.
     """
-    if dtype not in (torch.float32, torch.bfloat16):
-        raise RuntimeError(f"decode launcher requires float32 or bfloat16, got {dtype}")
-    bf16 = dtype is torch.bfloat16
-    if bf16 and det:
+    if dtype not in _DTYPE_TAG:
+        raise RuntimeError(f"decode launcher requires float32, bfloat16 or float16, got {dtype}")
+    low = dtype in _LOW_DTYPES
+    if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
     profile = _pack_device_profile(num_sms, sm_version)
-    if bf16:
+    if low:
         if device_index is None:
-            raise RuntimeError("BF16 launcher requires a device index")
+            raise RuntimeError("16-bit launcher requires a device index")
         key = (num_rows, npad, k, n_env, next_n, cr, device_index, profile)
-        cache = _VARLEN_CACHE_BF16
     else:
         key = (num_rows, npad, k, n_env, next_n, cr, profile) + ((True,) if det else ())
-        cache = _VARLEN_CACHE
+    cache = _varlen_cache_for(dtype)
     hit = cache.get(key)
     if hit is not None:
         return hit
@@ -1631,19 +1692,19 @@ def _varlen_launcher(
     n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
     dev = _device()
-    dtype_options = {"dtype": "bf16"} if bf16 else {}
-    if bf16 and k in (512, 1024, 2048) and 0 < n_kernel - k <= 3:
+    dtype_options = {"dtype": _DTYPE_TAG[dtype]} if low else {}
+    if low and k in (512, 1024, 2048) and 0 < n_kernel - k <= 3:
         fn = dev.get_compiled_complement(k, n_kernel, next_n, cr_shift, **dtype_options)
         lc = ("complement", fn, n_kernel)
         cache[key] = lc
         return lc
-    if bf16:
-        plan_free = _route_bf16(num_rows, n_route, npad, k, num_sms, sm_version)
+    if low:
+        plan_free = _route_bf16(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
         plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det)
     if plan_free["kernel"] == "reg_clus":
         cluster_options = dict(dtype_options)
-        if bf16:
+        if low:
             cluster_options["nbh"] = (
                 512 if k > 1024 or (k in (512, 1024) and n_env >= 65536) else 1024
             )
@@ -1655,7 +1716,8 @@ def _varlen_launcher(
                 96 if k > 1024 and num_rows > 1 and plan_free["tpl"][2] >= 8 else 384
             )
             if (
-                num_rows == 1
+                dtype is not torch.float16
+                and num_rows == 1
                 and next_n == 1
                 and cr == 1
                 and k == 2048
@@ -1664,8 +1726,10 @@ def _varlen_launcher(
             ):
                 cluster_options["hybrid"] = True
                 cluster_options["oneq_enabled"] = True
-        if bf16 and not cluster_options.get("hybrid", False) and k == 2048:
-            cluster_options["alignbins"] = True  # bits-domain window (single-valued crossing bin)
+        if low and not cluster_options.get("hybrid", False) and k == 2048:
+            # bits-domain window (single-valued crossing bin): bf16 = the negative-side code window at the
+            # sample minimum, fp16 = the fkey16 window at the sampled K-th anchor (stage B5)
+            cluster_options["alignbins"] = True
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
             varlen=True,
@@ -1678,7 +1742,7 @@ def _varlen_launcher(
         lc = ("reg_clus", fn, n_kernel)
     elif plan_free["kernel"] in ("reg", "regimg"):
         reg_options = dict(dtype_options)
-        if bf16:
+        if low:
             reg_options["pk16"] = bool(plan_free.get("pk16", False))
             if k == 2048 and num_rows <= 148 and n_kernel > 2048:
                 reg_options["binproof"] = True
@@ -1693,11 +1757,14 @@ def _varlen_launcher(
                 reg_options["packed_prefetch"] = False
             # bits-domain bracket on DEG rows only; where the bin proof already applies (K=2048,
             # <= 148 rows) the proof with 1024 bins beats the window by ~5% cold
-            reg_options["alignbins"] = bool(plan_free["tpl"][5]) and not reg_options.get(
-                "binproof", False
+            reg_options["alignbins"] = (
+                dtype is not torch.float16
+                and bool(plan_free["tpl"][5])
+                and not reg_options.get("binproof", False)
             )
+            reg_options["code_radix"] = _reg_code_radix(k, n_kernel, num_rows, plan_free)
         stage_output = False
-        if bf16:
+        if low:
             # the dtype-neutral #20106 register-path options, FP32 rules (floor-0.97 step 1)
             bf16_small_k_resident = (
                 k == 512 and num_rows > num_sms and n_kernel > 4096 and sm_version in (100, 103)
@@ -1813,13 +1880,15 @@ def _varlen_launcher(
         )
         lc = ("clus", fn, (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0))
     else:
-        streaming_fn = _route_streaming_bf16 if bf16 else route_streaming
-        plan = streaming_fn(num_rows, n_route, npad, k, force_main=True)
+        if low:
+            plan = _route_streaming_bf16(num_rows, n_route, npad, k, force_main=True, dtype=dtype)
+        else:
+            plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
         tpl = tuple(plan["tpl"])
         rt = plan["rt"]
         r_const = rt["R"]
         main_options = dict(dtype_options)
-        if bf16:
+        if low:
             if plan.get("vec4"):
                 main_options["vector_elems"] = 4
             else:
@@ -1843,7 +1912,7 @@ def _varlen_launcher(
             **main_options,
         )
         big = num_rows * r_const <= 148
-        if bf16:
+        if low:
             if r_const > 2 and k > 1024:
                 split_aim = 13 * k // 8 if num_rows > 8 else 7 * k // 4
                 split_sfac = 48
@@ -2421,9 +2490,9 @@ def run_varlen(
     host reads.  Without ``max_seq_len`` the envelope comes from ONE
     ``kv_lens.max()`` host read (documented sync, refused under capture).
 
-    Both dtypes use the shared kernel templates with dtype-specific tuning. BF16 logits
-    require a row stride divisible by eight and a 16-byte aligned base; optional
-    values remain FP32. Input conversion, if needed, belongs to the caller.
+    The 16-bit dtypes (bfloat16, float16) use the shared kernel templates with 16-bit
+    tuning; they require a row stride divisible by eight and a 16-byte aligned base;
+    optional values remain FP32. Input conversion, if needed, belongs to the caller.
 
     KNOWN LIMITATION: on rows containing NaN logits the selected index SET
     can differ from ``heuristicTopKDecode.cu`` (both kernels order NaNs
@@ -2436,10 +2505,10 @@ def run_varlen(
     function of the capture-stable launcher key.
     """
     if logits.dtype is not torch.float32:
-        if logits.dtype is torch.bfloat16:
+        if logits.dtype in _LOW_DTYPES:
             if deterministic or sorting is not None:
                 raise RuntimeError("deterministic mode requires float32 logits")
-            return _run_varlen_bf16(
+            return _run_varlen_16(
                 logits,
                 kv_lens,
                 indices,
@@ -2449,7 +2518,7 @@ def run_varlen(
                 max_seq_len=max_seq_len,
                 workspace=workspace,
             )
-        raise RuntimeError(f"logits must be float32 or bfloat16 (got {logits.dtype})")
+        raise RuntimeError(f"logits must be float32, bfloat16 or float16 (got {logits.dtype})")
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
     if kv_lens.dtype is not _I32:
@@ -2591,7 +2660,7 @@ def run_varlen(
     return
 
 
-def _run_varlen_bf16(
+def _run_varlen_16(
     logits: torch.Tensor,
     kv_lens: torch.Tensor,
     indices: torch.Tensor,
@@ -2601,16 +2670,18 @@ def _run_varlen_bf16(
     max_seq_len: int | None = None,
     workspace: torch.Tensor | None = None,
 ) -> None:
-    """BF16 entry specialization preserving the FP32 hot path in ``run_varlen``.
+    """16-bit (bfloat16 / float16) entry specialization preserving the FP32 hot path in ``run_varlen``.
 
     Same per-row varlen contract;
-    bfloat16 logits read directly by the device code and widened only in
+    16-bit logits read directly by the device code and widened only in
     registers. Optional values are CUDA float32, with the same flattened
     output view and -FLT_MAX padding as FP32 decode. Supplying
     max_seq_len avoids device-to-host reads; use the exact uncompressed
     envelope, not the padded storage width, to preserve dispatch."""
-    if logits.dtype is not torch.bfloat16:
-        raise RuntimeError(f"logits must be bfloat16 (got {logits.dtype}); fp32 -> run_varlen")
+    if logits.dtype not in _LOW_DTYPES:
+        raise RuntimeError(
+            f"logits must be bfloat16 or float16 (got {logits.dtype}); fp32 -> run_varlen"
+        )
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
     if kv_lens.dtype is not _I32:
@@ -2666,7 +2737,7 @@ def _run_varlen_bf16(
     lg = logits
     if not logits.is_contiguous():
         need = logits.storage_offset() + num_rows * npad
-        if logits.untyped_storage().size() // 2 < need:
+        if logits.untyped_storage().size() // logits.element_size() < need:
             raise RuntimeError("logits view storage too small to widen to its row stride")
         lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
     if npad & 7:
@@ -2691,7 +2762,7 @@ def _run_varlen_bf16(
     else:
         if _is_capturing():
             raise RuntimeError(
-                "run_varlen_bf16 without max_seq_len reads kv_lens.max() on host; "
+                "run_varlen (16-bit logits) without max_seq_len reads kv_lens.max() on host; "
                 "pass max_seq_len (a capture-stable engine constant)"
             )
         n_env = int(kv_lens.max().item()) >> cshift
@@ -2699,13 +2770,13 @@ def _run_varlen_bf16(
     n_env = min(max(n_env, 1), npad)
     profile = _device_profile_key(d)
     key = (num_rows, npad, k, n_env, nn, cr, d, profile)
-    lc = _VARLEN_CACHE_BF16.get(key)
+    lc = _varlen_cache_for(logits.dtype).get(key)
     if lc is None:
         if _is_capturing():
             raise RuntimeError(
                 "varlen launcher not compiled for this shape — warm up before CUDA graph capture"
             )
-        # Serialize cold compilation across BF16 families. Shared-memory layouts
+        # Serialize cold compilation across 16-bit families. Shared-memory layouts
         # are instance constants; warmed launches never take the lock.
         with _BF16_COMPILE_LOCK, torch.cuda.device(d):
             num_sms, sm_version = _unpack_device_profile(profile)
@@ -2718,7 +2789,7 @@ def _run_varlen_bf16(
                 cr,
                 num_sms,
                 sm_version,
-                dtype=torch.bfloat16,
+                dtype=logits.dtype,
                 device_index=d,
             )
     idx = indices
@@ -2744,6 +2815,9 @@ def _run_varlen_bf16(
     return
 
 
+_run_varlen_bf16 = _run_varlen_16  # name kept for existing callers
+
+
 def run_prefill(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -2757,17 +2831,17 @@ def run_prefill(
     """Hint-free self-sampling Top-K for prefill: row ``r`` selects the Top-K of
     ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
     with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
-    Logits are float32 (row stride a multiple of 4) or bfloat16 (row stride a
-    multiple of 8), 16-byte aligned base, unit inner stride. No device reads,
+    Logits are float32 (row stride a multiple of 4) or 16-bit (bfloat16 / float16,
+    row stride a multiple of 8), 16-byte aligned base, unit inner stride. No device reads,
     never compiles under capture; trusts 0 <= ks <= ke <= shape[1].
     ``deterministic`` / ``sorting`` as in ``run_varlen`` (float32 only)."""
     det = _check_det_args(deterministic, sorting)
-    if logits.dtype not in (_F32, torch.bfloat16):
-        raise RuntimeError(f"logits must be float32 or bfloat16 (got {logits.dtype})")
-    bf16 = logits.dtype is torch.bfloat16
-    if bf16 and det:
+    if logits.dtype not in _DTYPE_TAG:
+        raise RuntimeError(f"logits must be float32, bfloat16 or float16 (got {logits.dtype})")
+    dtype_tag = _DTYPE_TAG[logits.dtype]
+    if logits.dtype in _LOW_DTYPES and det:
         raise RuntimeError("deterministic mode requires float32 logits")
-    elems16 = 8 if bf16 else 4  # elements per 16-byte vector
+    elems16 = 16 // logits.element_size()  # elements per 16-byte vector
     for _nm, _t in (("row_starts", row_starts), ("row_ends", row_ends)):
         if not (isinstance(_t, _TENSOR) and _t.is_cuda):
             raise RuntimeError(f"{_nm} must be a CUDA tensor")
@@ -2833,14 +2907,14 @@ def run_prefill(
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
         tier = _prefill_tier(r1 - r0, n_env, k)
-        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, bf16, det))
+        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, dtype_tag, det))
         if lc is None:
             if _is_capturing():
                 raise RuntimeError(
                     "prefill launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _prefill_launcher(tier, k, n_bucket, bf16, det)
+            lc = _prefill_launcher(tier, k, n_bucket, logits.dtype, det)
         _, fn, (scap, cmp_), tail = lc
         # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
         # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
@@ -2867,13 +2941,16 @@ def prefill_ready(
         return True
     k = indices.shape[1]
     npad = logits.stride(0)
-    bf16 = logits.dtype is torch.bfloat16
+    dtype_tag = _DTYPE_TAG.get(logits.dtype)
+    if dtype_tag is None:
+        return False
     n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
     n_env = min(max(n_env, 1), max(npad, 1))
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
-        if _prefill_cache_key(tier, k, n_bucket, bf16, bool(deterministic)) not in _PREFILL_CACHE:
+        key = _prefill_cache_key(tier, k, n_bucket, dtype_tag, bool(deterministic))
+        if key not in _PREFILL_CACHE:
             return False
     return True
 
@@ -2907,7 +2984,13 @@ __all__ = [
 # this covers the eager/first-touch path (num_rows defaults to (1,)).
 _VARLEN_WARMUP_DONE: set = set()
 _VARLEN_WARMUP_DONE_BF16: set = set()
+_VARLEN_WARMUP_DONE_FP16: set = set()
 _VARLEN_WARMUP_LOCK = threading.Lock()
+
+
+def _varlen_warmup_done_for(dtype: torch.dtype) -> set:
+    """Warmup done-set of one 16-bit logits dtype; module globals read at call time (tests patch them)."""
+    return _VARLEN_WARMUP_DONE_FP16 if dtype is torch.float16 else _VARLEN_WARMUP_DONE_BF16
 
 
 def warmup_varlen(
@@ -2937,15 +3020,15 @@ def warmup_varlen(
     the same way.
 
     """
-    if dtype not in (torch.float32, torch.bfloat16):
-        raise RuntimeError(f"decode warmup requires float32 or bfloat16, got {dtype}")
-    bf16 = dtype is torch.bfloat16
-    if bf16 and deterministic:
+    if dtype not in _DTYPE_TAG:
+        raise RuntimeError(f"decode warmup requires float32, bfloat16 or float16, got {dtype}")
+    low = dtype in _LOW_DTYPES
+    if low and deterministic:
         raise RuntimeError("deterministic mode requires float32 logits")
     dev = torch.cuda.current_device()
     profile = _device_profile_key(dev)
     num_sms, sm_version = _unpack_device_profile(profile)
-    if bf16:
+    if low:
         k = operator.index(top_k)
         nn = operator.index(next_n)
         cr = operator.index(compress_ratio)
@@ -2966,7 +3049,11 @@ def warmup_varlen(
         with _VARLEN_WARMUP_LOCK:
             for rows in req_rows:
                 key = (rows, npad, k, n_env, nn, cr, dev, profile)
-                if key in _VARLEN_WARMUP_DONE_BF16 and key in _VARLEN_CACHE_BF16 and dev in _ws_hot:
+                if (
+                    key in _varlen_warmup_done_for(dtype)
+                    and key in _varlen_cache_for(dtype)
+                    and dev in _ws_hot
+                ):
                     continue
                 rows_list.append(rows)
                 warmup_keys.append(key)
@@ -3064,9 +3151,9 @@ def warmup_varlen(
             )
         del logits, kv_lens, out
         torch.cuda.synchronize()
-    if bf16:
+    if low:
         with _VARLEN_WARMUP_LOCK:
-            _VARLEN_WARMUP_DONE_BF16.update(warmup_keys)
+            _varlen_warmup_done_for(dtype).update(warmup_keys)
         return
     # Band launches compile every FP32 engine. Populate exact requested rows
     # without additional launches so subsequent capture finds each cache key.
@@ -3104,11 +3191,11 @@ def warmup_prefill(
     the tier-0 arm per pow2 envelope bucket where a <= 148-row launch keeps it
     (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
     one launch each. ``max_cols`` is the compressed max column count;
-    ``dtype`` selects the fp32 or bf16 engines; idempotent per done-key."""
-    if dtype not in (torch.float32, torch.bfloat16):
-        raise RuntimeError(f"warmup_prefill supports float32 or bfloat16, got {dtype}")
-    elems16 = 8 if dtype is torch.bfloat16 else 4
-    if dtype is torch.bfloat16 and deterministic:
+    ``dtype`` selects the fp32, bf16 or fp16 engines; idempotent per done-key."""
+    if dtype not in _DTYPE_TAG:
+        raise RuntimeError(f"warmup_prefill supports float32, bfloat16 or float16, got {dtype}")
+    elems16 = 16 // dtype.itemsize
+    if dtype in _LOW_DTYPES and deterministic:
         raise RuntimeError("deterministic mode requires float32 logits")
     dev = torch.cuda.current_device()
     k = int(top_k)
@@ -3128,7 +3215,7 @@ def warmup_prefill(
             for n_env in (bk // 2 + 1, bk):  # the tier can change inside a bucket
                 tier = _prefill_tier(int(rows), n_env, k)
                 keys.setdefault(
-                    _prefill_cache_key(tier, k, bk, dtype is torch.bfloat16, deterministic),
+                    _prefill_cache_key(tier, k, bk, _DTYPE_TAG[dtype], deterministic),
                     (tier, bk, n_env),
                 )
     done_key = (
