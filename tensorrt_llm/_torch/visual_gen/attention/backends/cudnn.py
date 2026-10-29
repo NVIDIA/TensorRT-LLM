@@ -29,12 +29,18 @@ Quant dtype    ``quant_attention_config``                 cuDNN node
 Layout: NHD ``[B, S, H, D]``.  cuDNN takes explicit per-tensor strides, so the
 NHD buffers are described to the graph as ``[B, H, S, D]`` with BSHD strides and
 never transposed into a real HND copy.
+
+Padding: the SDPA nodes have no key-padding input. A trailing-padding
+``key_padding_mask`` (valid tokens form a prefix, as Ulysses and the CUDA-graph
+buckets lay it out) is honoured by running each batch item on its valid prefix and
+zero-filling the padded output rows; callers declare with ``discard_padded_queries``
+that they never read those rows.
 """
 
 import math
 import threading
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import cudnn
 import torch
@@ -242,6 +248,10 @@ class CuDNNAttention(AttentionBackend):
     _cudnn_handles: ClassVar[Dict[int, Any]] = {}
     _graph_cache: ClassVar[Dict[Tuple, _CuDNNGraphBundle]] = {}
     _scales_cache: ClassVar[Dict[Tuple[int, str | None], Any]] = {}
+    # Valid-prefix lengths of the last key_padding_mask seen: (mask, mask._version, lengths).
+    # Every layer of a request receives the same mask object, so the device-to-host
+    # synchronization that reads the lengths happens once per request, not once per layer.
+    _padding_prefix_cache: ClassVar[Optional[Tuple[torch.Tensor, Optional[int], List[int]]]] = None
     _cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
@@ -341,6 +351,7 @@ class CuDNNAttention(AttentionBackend):
         with cls._cache_lock:
             cls._graph_cache.clear()
             cls._scales_cache.clear()
+            cls._padding_prefix_cache = None
 
     @staticmethod
     def _build_graph(
@@ -795,7 +806,7 @@ class CuDNNAttention(AttentionBackend):
         b, s_q, h_q, d_qk = q.shape
         _, s_kv, h_kv, d_v = v.shape
         device = q.device
-        out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        out_dtype = self._out_dtype()
         q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
 
         # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
@@ -891,6 +902,72 @@ class CuDNNAttention(AttentionBackend):
         lse = None if stats is None else stats.squeeze(-1)
         return output, lse
 
+    @classmethod
+    def _padding_prefix_lengths(cls, key_padding_mask: torch.Tensor) -> List[int]:
+        """Per-item valid-prefix lengths of a trailing-padding mask, read from the host once.
+
+        The cache is keyed by mask identity and mutation counter; a mask created under
+        ``torch.inference_mode`` has no counter and is re-read on every call.
+        """
+        version = None if torch.is_inference(key_padding_mask) else key_padding_mask._version
+        with cls._cache_lock:
+            cached = cls._padding_prefix_cache
+            if (
+                version is not None
+                and cached is not None
+                and cached[0] is key_padding_mask
+                and cached[1] == version
+            ):
+                return cached[2]
+        mask = key_padding_mask.cpu()
+        lengths = mask.sum(dim=1).tolist()
+        expected = torch.arange(mask.shape[1]).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+        if not torch.equal(mask, expected):
+            raise ValueError("cuDNN padded self-attention requires trailing padding.")
+        with cls._cache_lock:
+            cls._padding_prefix_cache = (key_padding_mask, version, lengths)
+        return lengths
+
+    @torch.compiler.disable
+    def _forward_padded_self_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend each batch item over its valid prefix; padded output rows are zero.
+
+        The output keeps the padded ``[B, S, H, D_v]`` shape because Ulysses needs it
+        for the return all-to-all. The quantized recipes run unchanged on the prefix:
+        the per-tensor FP8 amax and the MXFP8 block scales then exclude the padding.
+        """
+        if key_padding_mask.dtype != torch.bool or key_padding_mask.shape != q.shape[:2]:
+            raise ValueError("cuDNN padding mask must be boolean with shape [batch, sequence].")
+        lengths = self._padding_prefix_lengths(key_padding_mask)
+        seq_len = q.shape[1]
+        outputs = []
+        for batch_idx, length in enumerate(lengths):
+            if length == 0:
+                output = q.new_zeros(
+                    (1, seq_len, self.num_heads, v.shape[3]), dtype=self._out_dtype()
+                )
+            else:
+                item = slice(batch_idx, batch_idx + 1)
+                output, _ = self._run(
+                    q[item, :length],
+                    k[item, :length],
+                    v[item, :length],
+                    is_causal=False,
+                    with_lse=False,
+                )
+                output = torch.nn.functional.pad(output, (0, 0, 0, 0, 0, seq_len - length))
+            outputs.append(output)
+        return torch.cat(outputs, dim=0)
+
+    def _out_dtype(self) -> torch.dtype:
+        return self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+
     def forward(
         self,
         q: torch.Tensor,
@@ -900,6 +977,7 @@ class CuDNNAttention(AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         kv: Optional[ForwardPlan] = None,
+        discard_padded_queries: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -909,7 +987,10 @@ class CuDNNAttention(AttentionBackend):
             k: Key tensor ``[B, S_kv, H_kv, D]``.
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
-            key_padding_mask: Not supported by this backend.
+            key_padding_mask: Boolean ``[B, S]`` valid-prefix mask for dense
+                self-attention (True = valid). Padding must be trailing.
+            discard_padded_queries: Caller guarantees masked query rows are unused.
+                Required with ``key_padding_mask``; padded output rows are zero-filled.
             kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
                 ``k``/``v`` are the new tokens only: they are written at
                 ``staging_offset`` and attention runs over everything cached before them
@@ -923,8 +1004,18 @@ class CuDNNAttention(AttentionBackend):
         """
         if kv is not None:
             return self._run_paged(q, k, v, kv, attention_mask, key_padding_mask)
+        if key_padding_mask is not None:
+            if (
+                not discard_padded_queries
+                or attention_mask != PredefinedAttentionMask.FULL
+                or k.shape[1] != q.shape[1]
+            ):
+                raise ValueError(
+                    "cuDNN padding requires dense self-attention with discarded padded queries."
+                )
+            return self._forward_padded_self_attention(q, k, v, key_padding_mask)
         output, _ = self._run(
-            q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
+            q, k, v, is_causal=attention_mask == PredefinedAttentionMask.CAUSAL, with_lse=False
         )
         return output
 
@@ -945,21 +1036,16 @@ class CuDNNAttention(AttentionBackend):
         """
         if kwargs.get("kv") is not None:
             raise NotImplementedError("forward_with_lse does not support a K/V cache.")
+        if key_padding_mask is not None:
+            raise NotImplementedError(
+                "cuDNN forward_with_lse does not support key_padding_mask; the padded rows "
+                "have no log-sum-exp for the Ring / Attention2D merge."
+            )
         output, lse = self._run(
-            q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
+            q, k, v, is_causal=attention_mask == PredefinedAttentionMask.CAUSAL, with_lse=True
         )
         assert lse is not None, "cuDNN graph was built with stats but returned none."
         return output, lse
-
-    @staticmethod
-    def _resolve_mask(
-        attention_mask: PredefinedAttentionMask, key_padding_mask: Optional[torch.Tensor]
-    ) -> bool:
-        if key_padding_mask is not None:
-            raise NotImplementedError(
-                "cuDNN backend does not support key_padding_mask; use the VANILLA backend."
-            )
-        return attention_mask == PredefinedAttentionMask.CAUSAL
 
     @classmethod
     def support_lse(cls) -> bool:

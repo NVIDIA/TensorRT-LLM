@@ -283,3 +283,109 @@ def test_cudnn_fp8_attention_with_fused_qkv(num_kv_heads):
     ):
         cosine = F.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
         assert cosine > MIN_COSINE["fp8"], f"{what}: cosine similarity {cosine} too low"
+
+
+def _masked_sdpa_reference(q, k, v, mask):
+    """SDPA over the valid keys only, in [B, S, H, D]."""
+    num_heads, num_kv_heads = q.shape[2], k.shape[2]
+    q_t, k_t, v_t = (t.transpose(1, 2).float() for t in (q, k, v))
+    if num_heads != num_kv_heads:
+        k_t = k_t.repeat_interleave(num_heads // num_kv_heads, dim=1)
+        v_t = v_t.repeat_interleave(num_heads // num_kv_heads, dim=1)
+    out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=mask[:, None, None, :])
+    return out.transpose(1, 2)
+
+
+@pytest.mark.parametrize("quant_dtype", list(QUANT_CONFIGS), ids=["unquantized", "fp8", "mxfp8"])
+@pytest.mark.parametrize("num_kv_heads", [4, 2], ids=["mha", "gqa"])
+def test_cudnn_padded_self_attention_matches_masked_sdpa(quant_dtype, num_kv_heads):
+    """Trailing padding never contributes keys; padded output rows are zero.
+
+    Lengths differ per item and are not multiples of the kernel tiles, and the FP8 /
+    MXFP8 recipes run on the valid prefix (their scales exclude the padding).
+    """
+    _require_cudnn(quant_dtype)
+    device = torch.device("cuda")
+    batch, num_heads, seq_len, head_dim = 2, 4, 300, 128
+    q, k, v = _make_qkv(batch, num_heads, num_kv_heads, seq_len, seq_len, head_dim, device)
+    lengths = torch.tensor([257, 300], device=device)
+    mask = torch.arange(seq_len, device=device)[None] < lengths[:, None]
+    attention = CuDNNAttention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+        dtype=torch.bfloat16,
+        quant_attention_config=QUANT_CONFIGS[quant_dtype],
+    )
+
+    expected = _masked_sdpa_reference(q, k, v, mask)
+    actual = attention.forward(q, k, v, key_padding_mask=mask, discard_padded_queries=True)
+    assert actual.shape == (batch, seq_len, num_heads, head_dim)
+    assert torch.count_nonzero(actual[~mask]) == 0
+    valid_actual, valid_expected = actual[mask].float(), expected[mask]
+    cosine = F.cosine_similarity(valid_actual.flatten(), valid_expected.flatten(), dim=0).item()
+    assert cosine > MIN_COSINE[quant_dtype], f"cosine {cosine} below {MIN_COSINE[quant_dtype]}"
+    if quant_dtype is None:
+        torch.testing.assert_close(valid_actual, valid_expected, atol=2e-2, rtol=2e-2)
+
+    # The unpadded item equals the plain forward on that item.
+    full = attention.forward(q[1:], k[1:], v[1:])
+    torch.testing.assert_close(actual[1:], full, atol=0.0, rtol=0.0)
+
+
+def test_cudnn_padded_self_attention_contract():
+    """The padded path is dense self-attention with discarded queries and trailing padding."""
+    _require_cudnn(None)
+    device = torch.device("cuda")
+    q, k, v = _make_qkv(2, 4, 4, 64, 64, 64, device)
+    attention = CuDNNAttention(num_heads=4, head_dim=64, dtype=torch.bfloat16)
+    mask = torch.arange(64, device=device)[None] < torch.tensor([40, 64], device=device)[:, None]
+    kwargs = dict(key_padding_mask=mask, discard_padded_queries=True)
+
+    with pytest.raises(ValueError, match="discarded padded queries"):
+        attention.forward(q, k, v, key_padding_mask=mask)
+    with pytest.raises(ValueError, match="discarded padded queries"):
+        attention.forward(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL, **kwargs)
+    with pytest.raises(ValueError, match="discarded padded queries"):
+        attention.forward(q, k[:, :32], v[:, :32], **kwargs)
+    with pytest.raises(NotImplementedError, match="forward_with_lse"):
+        attention.forward_with_lse(q, k, v, **kwargs)
+    interior = mask.clone()
+    interior[0, 1] = False
+    with pytest.raises(ValueError, match="trailing padding"):
+        attention.forward(q, k, v, key_padding_mask=interior, discard_padded_queries=True)
+    # An item with no valid token yields a zero row block, not an empty cuDNN problem.
+    empty = torch.arange(64, device=device)[None] < torch.tensor([0, 64], device=device)[:, None]
+    out = attention.forward(q, k, v, key_padding_mask=empty, discard_padded_queries=True)
+    assert torch.count_nonzero(out[0]) == 0
+    torch.testing.assert_close(out[1:], attention.forward(q[1:], k[1:], v[1:]), atol=0.0, rtol=0.0)
+
+
+def test_cudnn_padding_prefix_plan_is_read_once_per_mask():
+    """Layers sharing one mask object sync the prefix lengths to the host once."""
+    _require_cudnn(None)
+    device = torch.device("cuda")
+    q, k, v = _make_qkv(1, 4, 4, 64, 64, 64, device)
+    attention = CuDNNAttention(num_heads=4, head_dim=64, dtype=torch.bfloat16)
+    CuDNNAttention.clear_graph_cache()
+    with torch.inference_mode(False):
+        mask = torch.arange(64, device=device)[None] < torch.tensor([48], device=device)[:, None]
+    reads = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor, *args, **kwargs):
+        nonlocal reads
+        if tensor is mask:
+            reads += 1
+        return original_cpu(tensor, *args, **kwargs)
+
+    torch.Tensor.cpu = counting_cpu
+    try:
+        for _ in range(3):
+            attention.forward(q, k, v, key_padding_mask=mask, discard_padded_queries=True)
+        assert reads == 1
+        mask[0, 47] = False  # a mutation invalidates the cached plan
+        attention.forward(q, k, v, key_padding_mask=mask, discard_padded_queries=True)
+        assert reads == 2
+    finally:
+        torch.Tensor.cpu = original_cpu
