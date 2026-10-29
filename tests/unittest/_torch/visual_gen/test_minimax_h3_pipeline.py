@@ -401,12 +401,13 @@ def test_pipeline_keeps_torch_compile_enabled(
         accepted.cuda_graph = SimpleNamespace(enable=True)
         accepted.attention = SimpleNamespace(backend=backend)
         MiniMaxH3Pipeline(accepted)
-    # CUTEDSL has no padding mask and, unlike TRTLLM, no SM gate ahead of this check.
-    rejected = _config(TorchCompileConfig(enable=True))
-    rejected.cuda_graph = SimpleNamespace(enable=True)
-    rejected.attention = SimpleNamespace(backend="CUTEDSL")
-    with pytest.raises(NotImplementedError, match="key_padding_mask"):
-        MiniMaxH3Pipeline(rejected)
+    # CUTEDSL and CUDNN have no padding mask and, unlike TRTLLM, no SM gate ahead of this check.
+    for backend in ("CUTEDSL", "CUDNN"):
+        rejected = _config(TorchCompileConfig(enable=True))
+        rejected.cuda_graph = SimpleNamespace(enable=True)
+        rejected.attention = SimpleNamespace(backend=backend)
+        with pytest.raises(NotImplementedError, match="key_padding_mask"):
+            MiniMaxH3Pipeline(rejected)
 
 
 def test_modular_manifest_discovers_h3_pipeline_and_transformer_config(tmp_path: Path) -> None:
