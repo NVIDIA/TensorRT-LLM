@@ -21,8 +21,13 @@ multi-rank job -- calling into MPI under Ray silently produces a size-1 communic
 to make the MNNVL workspace allocation fail and fall back to NCCL.
 """
 
-import pytest
+import importlib
+from unittest.mock import Mock
 
+import pytest
+import torch
+
+import tensorrt_llm._utils as utils
 from tensorrt_llm._torch.distributed import ops
 
 
@@ -279,3 +284,70 @@ def test_explicit_request_still_respects_hardware(mnnvl_capable_hardware, monkey
     mapping = _FakeMapping()
     mapping.multi_node = True
     assert not ops.MNNVLAllReduce.is_mnnvl(mapping, torch.int8, explicitly_requested=True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [4, 8])
+@pytest.mark.parametrize("kind", ["mc_allreduce", "shard_accept", "sampled_accept"])
+@pytest.mark.parametrize("setup_succeeds", [True, False])
+def test_minimax_workspace_constructors_use_tp_process_group(
+    ray_mode, monkeypatch, tp_size: int, kind: str, setup_succeeds: bool
+) -> None:
+    """Run the production constructors without MPI; only GPU allocation is substituted."""
+    module = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
+        f"minimax_m3_nvfp4__sm_103__tp{tp_size}.ops.m3_{kind}"
+    )
+    pg = _FakeProcessGroup()
+    pg.GROUP_SIZE = tp_size
+    pg.backend.group_size = tp_size if setup_succeeds else 0
+    mapping = _FakeMapping(pg)
+    mapping.tp_size = tp_size
+    no_mpi = Mock(side_effect=AssertionError("MPI must not be used by Ray workers"))
+    monkeypatch.setattr(ops, "mpi_comm", no_mpi)
+    monkeypatch.setattr(utils, "mpi_comm", no_mpi)
+    monkeypatch.setattr(utils, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    synchronize = Mock()
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+
+    # CPU buffers exercise tensor initialization and constructor outputs without CUDA.
+    uc = torch.empty(4096, dtype=torch.int32 if kind == "mc_allreduce" else torch.int64)
+    mc = torch.empty_like(uc)
+    handle = Mock(spec_set=["get_uc_buffer", "get_mc_buffer"])
+    handle.get_uc_buffer.return_value = uc
+    handle.get_mc_buffer.return_value = mc
+    allocate = Mock(return_value=handle)
+    monkeypatch.setattr(ops, "_make_mnnvl_mcast_buffer", allocate)
+    if kind == "sampled_accept":
+        # This host-only C++ op supplies a size; communicator selection stays real.
+        monkeypatch.setattr(module, "_ws_words_op", lambda world: 4096)
+
+    def create() -> object:
+        if kind == "mc_allreduce":
+            return module.McAllReduceWorkspace.create(mapping, hidden=6144)
+        if kind == "shard_accept":
+            return module.create_workspace(mapping, torch.device("cpu"), slot_rows=4)
+        return module.SampledAcceptWorkspace.create(mapping, torch.device("cpu"))
+
+    if not setup_succeeds:
+        # A borrowed ProcessGroup has no MPI Free(); rejection must preserve the intended error.
+        with pytest.raises(RuntimeError, match="outside CUDA-graph capture|creation failed"):
+            create()
+        allocate.assert_not_called()
+        synchronize.assert_not_called()
+    else:
+        workspace = create()
+        assert workspace.comm is pg
+        assert workspace.rank == mapping.tp_rank
+        if kind == "sampled_accept":
+            assert workspace.world == tp_size
+        else:
+            assert workspace.world_size == tp_size
+        assert workspace.handle is handle
+        allocate.assert_called_once()
+        assert allocate.call_args.args[0] is pg
+        assert pg.backend.allreduces == 2
+        synchronize.assert_called_once()
+    no_mpi.assert_not_called()
+    assert pg.requested_devices == [torch.device("cpu")] * pg.backend.allreduces

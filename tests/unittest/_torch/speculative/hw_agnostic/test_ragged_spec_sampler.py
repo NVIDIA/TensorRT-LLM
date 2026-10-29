@@ -604,7 +604,7 @@ def cpu_sampler(monkeypatch):
         transfers.append(("copy", tuple(tensor.shape)))
         return tensor.clone()
 
-    def record_event():
+    def record_event(side_stream_event=None):
         transfers.append(("record", None))
         return types.SimpleNamespace(synchronize=lambda: transfers.append(("sync", None)))
 

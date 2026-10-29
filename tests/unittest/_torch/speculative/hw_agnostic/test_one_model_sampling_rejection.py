@@ -26,6 +26,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.speculative.spec_sampler_base import (
     UNSUPPORTED_BAD_WORDS_MSG,
     UNSUPPORTED_EMBEDDING_BIAS_MSG,
+    UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG,
     UNSUPPORTED_MIN_LENGTH_MSG,
     UNSUPPORTED_MIN_P_MSG,
     UNSUPPORTED_NO_REPEAT_NGRAM_MSG,
@@ -45,6 +46,11 @@ UNSUPPORTED_CASES = [
     ("bad", dict(bad="nope"), UNSUPPORTED_BAD_WORDS_MSG),
     ("no_repeat_ngram_size", dict(no_repeat_ngram_size=3), UNSUPPORTED_NO_REPEAT_NGRAM_MSG),
     ("top_p_decay", dict(top_p_decay=0.5), UNSUPPORTED_TOP_P_DECAY_MSG),
+    (
+        "logits_processor",
+        dict(logits_processor=lambda req_id, logits, ids, stream, client_id: None),
+        UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG,
+    ),
 ]
 
 # Values a frontend forwards explicitly at their neutral setting. These must not
@@ -162,6 +168,11 @@ EXECUTOR_SIDE_CASES = [
     ("min_length", dict(py_min_length=16), UNSUPPORTED_MIN_LENGTH_MSG),
     ("bad_words", dict(py_bad_words=[[7]]), UNSUPPORTED_BAD_WORDS_MSG),
     ("no_repeat_ngram_size", dict(py_no_repeat_ngram_size=3), UNSUPPORTED_NO_REPEAT_NGRAM_MSG),
+    (
+        "logits_post_processor",
+        dict(py_logits_post_processors=[lambda req_id, logits, ids, stream, client_id: None]),
+        UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG,
+    ),
 ]
 
 
@@ -272,3 +283,21 @@ def test_executor_side_check_still_rejects_top_p_decay():
 def test_executor_side_check_admits_a_neutral_request():
     """The stub covers every field the path reads; a neutral request passes."""
     _validate_on_executor(_executor_request())
+
+
+@pytest.mark.cpu_only
+def test_executor_side_check_admits_an_empty_post_processor_list():
+    """An empty list is what a request without callbacks may carry: not rejected."""
+    request = _executor_request()
+    request.py_logits_post_processors = []
+    _validate_on_executor(request)
+
+
+@pytest.mark.cpu_only
+def test_executor_side_check_rejects_a_post_processor_on_the_full_path():
+    """Through the whole validate_request, as the executor admits a request."""
+    request = _executor_request()
+    request.py_logits_post_processors = [lambda req_id, logits, ids, stream, client_id: None]
+    with pytest.raises(ValueError) as excinfo:
+        _validate_on_executor(request)
+    assert str(excinfo.value) == UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG

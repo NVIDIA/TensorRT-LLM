@@ -28,7 +28,8 @@ Provides:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+import os
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -64,6 +65,37 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
+
+class _UnchangedCopy:
+    """Remembers the inputs of the last decode-only block-table copy into one destination.
+
+    In steady decode the block tables change only when a request grows into a
+    new page, so a copy whose destination, batch order, decode-only shape and
+    host block-offset table equal the previous copy's can be skipped.
+    """
+
+    def __init__(self) -> None:
+        self._key: Optional[tuple] = None
+        self._host: Optional[torch.Tensor] = None
+
+    def skip(self, dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks, host) -> bool:
+        if num_contexts != 0:
+            self._key = None
+            return False
+        key = (dst.data_ptr(), tuple(request_ids), beam_width, num_seqs, max_blocks)
+        return key == self._key and self._host is not None and torch.equal(host, self._host)
+
+    def record(
+        self, dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks, host
+    ) -> None:
+        if num_contexts != 0:
+            return
+        self._key = (dst.data_ptr(), tuple(request_ids), beam_width, num_seqs, max_blocks)
+        if self._host is None or self._host.shape != host.shape:
+            self._host = host.clone()
+        else:
+            self._host.copy_(host)
 
 
 class MiniMaxM3SparseIndexCache:
@@ -153,6 +185,11 @@ class MiniMaxM3SparseIndexCache:
                 f"[N, 1, {self.sparse_index_dim}], got {tuple(idx_v.shape)}"
             )
         buf.index_copy_(0, out_cache_loc.to(torch.long), idx_v.to(buf.dtype))
+
+
+# SM107: price M3's real per-token footprint in the pre-allocation estimate (index-K on every sparse layer, FP8 dense
+# and shared Eagle layers) instead of the generic all-NVFP4 K/V sum. Kill switch: False keeps the generic estimate.
+_SM107_EXACT_KV_SIZE_ESTIMATE = True
 
 
 def shared_draft_layer_count(spec_config, layer_mask) -> int:
@@ -269,6 +306,11 @@ def extend_attention_op_pools_for_shared_draft_layers(
     )
 
 
+# Zero every KV pool view (NVFP4 + FP8 K/V, NVFP4 block scales, paged index keys) once at allocation, so no reader
+# ever sees uninitialized bytes. Kill switch (diagnostics only): TRTLLM_M3_KV_POOL_ZERO_INIT=0.
+_KV_POOL_ZERO_INIT = os.environ.get("TRTLLM_M3_KV_POOL_ZERO_INIT", "1") == "1"
+
+
 def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:
     """Fail at setup, not at the first prefill, when the P128 opt-in has no FMHA (SM107).
 
@@ -323,6 +365,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     ``DeepseekV4CacheManager`` does for SWA layers; see
     :meth:`_prepare_page_table_tensor`.
     """
+
+    # Decode-step shortcuts a model opts into (RuntimeHooks.msa); see configure_decode_shortcuts.
+    skip_unchanged_block_offsets = False
+    reuse_pool_views = False
+    block_ids_from_views = False
 
     _main_kv_mapper_kind = MapperKind.HND
     _main_kv_view_layout = "NHD"
@@ -404,6 +451,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
         super().__init__(*args, **kwargs)
+        self._unchanged_copies: Dict[int, _UnchangedCopy] = {}
+        self._pool_views: Dict[tuple, torch.Tensor] = {}
 
         if self.dtype == DataType.NVFP4:
             dense_target_layers = [
@@ -465,18 +514,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
                     layer_idx, kv_layout
                 )
-        # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
-        # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
-        # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
-        # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
-        # byte a kernel writes is unchanged.
-        for view in (
-            *self._kv_buffers.values(),
-            *self._block_scale_buffers.values(),
-            *self._index_k_buffers.values(),
-        ):
-            if view is not None:
-                view.zero_()
+        if _KV_POOL_ZERO_INIT:
+            # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
+            # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
+            # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
+            # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
+            # byte a kernel writes is unchanged.
+            for view in (
+                *self._kv_buffers.values(),
+                *self._block_scale_buffers.values(),
+                *self._index_k_buffers.values(),
+            ):
+                if view is not None:
+                    view.zero_()
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
         # Dynamic-tree relocation moves packed K/V bytes without their NVFP4
@@ -534,6 +584,72 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             * self.num_kv_heads_per_layer[int(local_layer_idx)]
             * self.head_dim_per_layer[int(local_layer_idx)]
         )
+
+    @classmethod
+    def get_cache_size_per_token(cls, model_config, mapping, num_layers=None, **kwargs):
+        """Pre-allocation bytes per token, including what the generic estimate leaves out.
+
+        The base classmethod sums K/V for the target layers only, all at the cache dtype. This manager also holds
+        one index-K head per sparse layer (replicated on every TP rank), keeps the dense target layers and the
+        appended one-model Eagle layers in FP8 when the cache is NVFP4 (see :meth:`_build_cache_config`), and
+        allocates those shared draft layers itself. On SM107 the difference is added to the per-token term.
+        """
+        base = super().get_cache_size_per_token(model_config, mapping, num_layers, **kwargs)
+        if (
+            not _SM107_EXACT_KV_SIZE_ESTIMATE
+            or get_sm_version() != 107
+            or kwargs.get("is_draft", False)
+        ):
+            return base
+        extra = cls._extra_bytes_per_token(model_config, mapping, num_layers, kwargs)
+        if isinstance(base, tuple):
+            return (base[0] + extra,) + tuple(base[1:])
+        return base + extra
+
+    @classmethod
+    def _extra_bytes_per_token(cls, model_config, mapping, num_layers, kwargs) -> int:
+        config = model_config.pretrained_config
+        config = getattr(config, "text_config", None) or config
+        num_target_layers = int(num_layers if num_layers is not None else config.num_hidden_layers)
+        local_layers = (
+            list(mapping.pp_layers(num_target_layers))
+            if mapping.pp_size > 1
+            else list(range(num_target_layers))
+        )
+        sparse_layers = [layer for layer in local_layers if layer >= 3]
+        dense_layers = [layer for layer in local_layers if layer < 3]
+        tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+        kv_heads = max(1, int(config.num_key_value_heads) // tp)
+        head_dim = int(
+            getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        )
+
+        sparse_config = getattr(model_config, "sparse_attention_config", None)
+        index_dim = int(getattr(sparse_config, "sparse_index_dim", None) or 128)
+        index_elem = 1 if str(getattr(sparse_config, "indexer_kv_dtype", "bf16")) == "fp8" else 2
+        extra = len(sparse_layers) * index_dim * index_elem
+
+        kv_elems = 2 * kv_heads * head_dim  # K and V
+        quant_config = model_config.quant_config
+        nvfp4 = quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache()
+        if nvfp4:
+            # The base prices every layer as NVFP4 data + block scales; dense layers are FP8.
+            extra += len(dense_layers) * (kv_elems - (kv_elems // 2 + kv_elems // 16))
+            draft_layer_bytes = kv_elems
+        else:
+            draft_layer_bytes = None
+        spec_config = kwargs.get("spec_config")
+        if spec_config is not None and not kwargs.get("use_separate_draft_kv_cache", False):
+            num_draft = shared_draft_layer_count(spec_config, None)
+            if draft_layer_bytes is None:
+                elem = (
+                    1
+                    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache()
+                    else 2
+                )
+                draft_layer_bytes = kv_elems * elem
+            extra += num_draft * draft_layer_bytes
+        return extra
 
     def is_nvfp4_layer(self, layer_idx: int) -> bool:
         """Whether ``layer_idx`` stores packed NVFP4 data and block scales."""
@@ -698,6 +814,20 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     ) -> None:
         if self.num_attention_op_pools == 0:
             return
+        if self.skip_unchanged_block_offsets:
+            guard = self._unchanged_copies.setdefault(dst_tensor.data_ptr(), _UnchangedCopy())
+            args = (
+                dst_tensor,
+                request_ids,
+                beam_width,
+                num_contexts,
+                num_seqs,
+                max_blocks,
+                self.host_kv_cache_block_offsets,
+            )
+            if guard.skip(*args):
+                return
+            guard.record(*args)
         # The base materializer owns only the storage-pool output rows; virtual
         # draft pools are filled below with their own conversion metadata.
         base_dst = dst_tensor[: self.num_pools] if self._draft_op_pools else dst_tensor
@@ -907,12 +1037,79 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, self._main_kv_layout_name()
         )
-        full_slot_shape = [num_slots, scale, *page_shape]
-        full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
-        kv = full_view[:, :2]
         # Sparse reference kernels use token-major indexing; preserve the
         # native head-major backing and expose a zero-copy strided view.
-        return kv if kv_layout == self._main_kv_layout_name() else kv.transpose(2, 3)
+        return self._pool_view(
+            "kv",
+            addr_key,
+            torch_dtype,
+            num_slots,
+            scale,
+            page_shape,
+            transpose=kv_layout != self._main_kv_layout_name(),
+        )
+
+    def configure_decode_shortcuts(
+        self,
+        skip_unchanged_block_offsets: bool,
+        reuse_pool_views: bool,
+        block_ids_from_views: bool = False,
+    ) -> None:
+        """Turn on the decode-step shortcuts a model opted into.
+
+        ``skip_unchanged_block_offsets``: skip a decode-only block-table copy
+        whose inputs equal the previous copy's into the same destination.
+        ``reuse_pool_views``: hand out one pool view per geometry instead of
+        re-wrapping the pool memory on every attention call.
+        ``block_ids_from_views``: fill :meth:`get_block_ids_per_seq` rows from the
+        page-index views directly (see there).
+        """
+        self.skip_unchanged_block_offsets = skip_unchanged_block_offsets
+        self.reuse_pool_views = reuse_pool_views
+        self.block_ids_from_views = block_ids_from_views
+        if block_ids_from_views:
+            logger.info("[M3 host] block-id tables filled from page-index views")
+
+    def _pool_view(
+        self,
+        kind: str,
+        addr_key: int,
+        torch_dtype: torch.dtype,
+        num_slots: int,
+        scale: int,
+        page_shape: List[int],
+        transpose: bool = False,
+    ) -> torch.Tensor:
+        """The ``[num_slots, 2, ...]`` K+V view of a pool rooted at ``addr_key``; ``transpose`` swaps the
+        page's head and token axes (the token-major view of head-major storage).
+
+        The view is a pure function of the pool geometry, which is static once the
+        pool is laid out, so with ``reuse_pool_views`` it is built once per geometry
+        (a re-laid-out pool has another key). Inference-mode views are inference
+        tensors, so each mode keeps its own.
+        """
+        key = (
+            kind,
+            addr_key,
+            torch_dtype,
+            num_slots,
+            scale,
+            tuple(page_shape),
+            transpose,
+            torch.is_inference_mode_enabled(),
+        )
+        view = self._pool_views.get(key) if self.reuse_pool_views else None
+        if view is None:
+            full_slot_shape = [num_slots, scale, *page_shape]
+            full_view = convert_to_torch_tensor(
+                TensorWrapper(addr_key, torch_dtype, full_slot_shape)
+            )
+            view = full_view[:, :2]
+            if transpose:
+                view = view.transpose(2, 3)
+            if self.reuse_pool_views:
+                self._pool_views[key] = view
+        return view
 
     def _kv_scale_slot_geometry(
         self, layer_idx: int, kv_layout: Optional[str]
@@ -983,9 +1180,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
             layer_idx, kv_layout
         )
-        full_slot_shape = [num_slots, scale, *page_shape]
-        full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
-        return full_view[:, :2]
+        return self._pool_view("scale", addr_key, torch_dtype, num_slots, scale, page_shape)
 
     def get_kv_subpage_pool(
         self, layer_idx: int, kv_layout: str = "HND"
@@ -1100,7 +1295,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         The rows are written through a numpy view of a single zero-filled,
         pinned result, so the attention metadata builders ship it to the device
         in one asynchronous copy.
+
+        With ``block_ids_from_views`` each row is slice-copied from the request's
+        page-index view (an int32 array) rather than built as a Python list of the
+        whole padded row first; the table is the same.
         """
+        if self.block_ids_from_views:
+            views = [self.kv_cache_map[req_id].get_base_page_indices(0) for req_id in request_ids]
+            max_blocks = max((len(view) for view in views), default=0)
+            padded_tensor = torch.zeros(
+                (len(views), max_blocks), dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+            rows = padded_tensor.numpy()
+            for row, view in zip(rows, views):
+                row[: len(view)] = view
+            rows[rows == BAD_PAGE_INDEX] = 0
+            return padded_tensor
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         batch = len(block_ids_per_seq)
         max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
@@ -1147,6 +1357,7 @@ class MiniMaxM3DraftKVCacheView:
         if manager.tokens_per_block in self.trtllm_gen_extra_tokens_per_block:
             _require_trtllm_gen_extra_page_route(manager.tokens_per_block)
         self._manager = manager
+        self._unchanged_copy = _UnchangedCopy()
         layer_id = draft_layer_ids[0]
         local = int(manager.layer_offsets[layer_id])
         self._local_layer_idx = local
@@ -1217,6 +1428,19 @@ class MiniMaxM3DraftKVCacheView:
         """
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
         manager = self._manager
+        if manager.skip_unchanged_block_offsets:
+            args = (
+                dst_tensor,
+                request_ids,
+                beam_width,
+                num_contexts,
+                num_seqs,
+                max_blocks,
+                self.host_kv_cache_block_offsets,
+            )
+            if self._unchanged_copy.skip(*args):
+                return
+            self._unchanged_copy.record(*args)
         copy_idx = manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
         if self._page_table_materializer.uses_device_expansion:

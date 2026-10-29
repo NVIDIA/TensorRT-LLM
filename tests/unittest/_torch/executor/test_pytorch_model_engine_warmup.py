@@ -45,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.speculative.utils import resolve_draft_len, update_draft_len
@@ -376,6 +377,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=flashinfer_tune))
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
+        runtime_hooks=DEFAULT_RUNTIME_HOOKS,
         _warmup_timer=_WarmupTimer(rank=0),
         _config=SimpleNamespace(
             enable_autotuner=True,
@@ -497,6 +499,7 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
 ) -> None:
     """A repeated warmup with an already tuned token shape must not re-run tuning."""
     engine = SimpleNamespace(
+        runtime_hooks=DEFAULT_RUNTIME_HOOKS,
         _config=SimpleNamespace(
             enable_autotuner=True,
             torch_compile_enabled=False,
@@ -1443,6 +1446,7 @@ class TestWarmupCleanup(unittest.TestCase):
             self.assertEqual(method.backend, "trtllm")
 
             engine = SimpleNamespace(
+                runtime_hooks=DEFAULT_RUNTIME_HOOKS,
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(enable_autotuner=False, torch_compile_enabled=False),
                 _graphs=SimpleNamespace(enabled=True),
@@ -1506,6 +1510,7 @@ class TestWarmupCleanup(unittest.TestCase):
             self.assertFalse(method.needs_native_autotune)
 
             engine = SimpleNamespace(
+                runtime_hooks=DEFAULT_RUNTIME_HOOKS,
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(
                     enable_autotuner=True,
@@ -1636,6 +1641,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                runtime_hooks=DEFAULT_RUNTIME_HOOKS,
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(
                     enable_autotuner=True,
@@ -1751,6 +1757,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                runtime_hooks=DEFAULT_RUNTIME_HOOKS,
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(
                     enable_autotuner=True,
@@ -1835,6 +1842,7 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             method = MXFP8LinearMethod()
             engine = SimpleNamespace(
+                runtime_hooks=DEFAULT_RUNTIME_HOOKS,
                 _warmup_timer=_WarmupTimer(rank=0),
                 _config=SimpleNamespace(enable_autotuner=False, torch_compile_enabled=False),
                 _graphs=SimpleNamespace(enabled=False),

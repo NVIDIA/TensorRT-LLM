@@ -18,6 +18,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    MsaRuntimePolicy,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -46,6 +52,9 @@ def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
 class DecoderMetadata:
     """Attention and speculative metadata reused across decoder iterations."""
 
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+
     def __init__(
         self,
         *,
@@ -58,6 +67,7 @@ class DecoderMetadata:
         self._config = config
         self.mapping = mapping
         self.model = model
+        self.runtime_hooks = runtime_hooks_of(model)
         self._buffers = buffers
         self._attention_runtime_features = attention_runtime_features
         # This field is initialized lazily on the first forward pass.
@@ -104,8 +114,36 @@ class DecoderMetadata:
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )
         self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        self._arm_msa_policy(kv_cache_manager)
 
         return self.attn_metadata
+
+    def _arm_msa_policy(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None) -> None:
+        """Hand the model's MiniMax-M3 MSA preparation choices to the metadata and the KV cache."""
+        msa = self.runtime_hooks.msa
+        if msa == MsaRuntimePolicy():
+            return
+        # Imported here: only a model that armed an MSA policy needs the sparse backend.
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+            MiniMaxM3KVCacheManagerV2,
+        )
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
+            MiniMaxM3MsaSparseAttentionMetadata,
+        )
+
+        if not isinstance(
+            self.attn_metadata, MiniMaxM3MsaSparseAttentionMetadata
+        ) or not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
+            raise ValueError(
+                "RuntimeHooks.msa requires the MiniMax-M3 MSA sparse attention backend and KV cache, "
+                f"got {type(self.attn_metadata).__name__} and {type(kv_cache_manager).__name__}"
+            )
+        self.attn_metadata.msa_policy = msa
+        kv_cache_manager.configure_decode_shortcuts(
+            skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
+            reuse_pool_views=msa.reuse_pool_views,
+            block_ids_from_views=msa.block_ids_from_views,
+        )
 
     def setup_speculative(
         self, spec_resource_manager: BaseResourceManager | None
@@ -115,6 +153,14 @@ class DecoderMetadata:
         self.spec_metadata = create_spec_metadata(
             self._config, self.model.config, spec_resource_manager
         )
+        self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
+        self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        if self.runtime_hooks.pack_spec_rng_uploads:
+            logger.info("[M3 host] sampled-step Philox uploads staged into the step-input pack")
+        if self.runtime_hooks.spec_small_h2d:
+            logger.info(
+                "[M3 host] spec step small uploads off the boundary (accepted counts packed, static slot ids)"
+            )
         return self.spec_metadata
 
     @property

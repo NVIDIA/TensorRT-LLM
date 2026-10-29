@@ -521,6 +521,7 @@ def _preemption_executor() -> PyExecutor:
     # Wide enough that a mid-stream request emits nothing of its own, so any
     # response seen below came from the finish path rather than from streaming.
     executor.stream_interval = 100
+    executor.first_content_emit_iters = 1
     return executor
 
 

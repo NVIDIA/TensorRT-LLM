@@ -3480,6 +3480,16 @@ _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_decode_graph_capture_active", default=False)
 
 
+def flashinfer_mxfp8_autotune_active() -> bool:
+    """Whether the current forward runs inside ``flashinfer_mxfp8_autotune``."""
+    return _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
+
+
+def flashinfer_mxfp8_decode_graph_capture_active() -> bool:
+    """Whether the current forward is a decode CUDA-graph warmup or capture."""
+    return _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
+
+
 @contextmanager
 def flashinfer_mxfp8_autotune() -> Iterator[None]:
     """Tune FlashInfer MXFP8 tactics while enabling auto-dispatched calls."""

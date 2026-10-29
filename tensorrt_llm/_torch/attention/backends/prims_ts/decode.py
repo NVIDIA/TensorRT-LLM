@@ -15,6 +15,7 @@
 
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
+from ._worktile_scope import with_scalar_work_tile_info
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 import functools
@@ -1507,6 +1508,7 @@ def _make_decode_compile_spec(
 
 
 @functools.cache
+@with_scalar_work_tile_info
 def _get_compiled_decode(
     compile_spec: _DecodeCompileSpec,
 ):

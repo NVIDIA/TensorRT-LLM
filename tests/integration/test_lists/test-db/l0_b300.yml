@@ -141,7 +141,7 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   # TIMEOUT measured: 3122 cases in 13m54s on one GB300 (the cpu_only files run on the CPU
   # stage instead), so 30 is 2.2x headroom.
-  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)
+  - unittest/_torch/modeling_v2 --import-mode=importlib --ignore=unittest/_torch/modeling_v2/comm --ignore-glob=unittest/_torch/modeling_v2/**/comm/* TIMEOUT (30)
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
   # qwen4_exp target, pre-merge: gsm8k; one MTP engine for gsm8k with the acceptance-length
   # floor (the only gate that sees a miscomputed draft layer), mmmu (the vision tower) and

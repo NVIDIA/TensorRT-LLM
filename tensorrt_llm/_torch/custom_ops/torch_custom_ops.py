@@ -41,6 +41,7 @@ from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from . import mxfp8_cute_pinned_tactics as _mxfp8_cute_pinned
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
@@ -808,6 +809,13 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
             backend = "cutlass"
             context = nullcontext()
         else:
+            # Above 32 rows on SM107, for a model that opts in: the pinned tuned tactic (bitwise the
+            # heuristic's output, faster); see mxfp8_cute_pinned_tactics. Otherwise, or with no entry:
+            # FlashInfer's heuristic config.
+            pinned = _mxfp8_cute_pinned.run(act, act_scale, weight,
+                                            weight_scale, self.output_dtype)
+            if pinned is not None:
+                return pinned
             # Skip FlashInfer's CuTeDSL config sweep; use its heuristic config.
             backend = "cute-dsl"
             context = _flashinfer_autotune(tune_mode=False,
@@ -833,6 +841,19 @@ def _choose_mxfp8_tactic(custom_op: str, runner: TunableRunner,
     return tactic
 
 
+def mxfp8_quantize_autotuned(
+        input: torch.Tensor,
+        tune: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The quantize half of ``mxfp8_quantize_gemm_autotuned``: MXFP8 activation and scales,
+    on this token bucket's tuned quantize backend."""
+    quantize_runner = MXFP8QuantizeRunner(input.dtype)
+    quantize_inputs = [input]
+    return quantize_runner(quantize_inputs,
+                           tactic=_choose_mxfp8_tactic(
+                               _MXFP8_QUANTIZE_AUTOTUNED_OP, quantize_runner,
+                               quantize_inputs, tune))
+
+
 def mxfp8_quantize_gemm_autotuned(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -847,12 +868,67 @@ def mxfp8_quantize_gemm_autotuned(
         quantize_inputs,
         tactic=_choose_mxfp8_tactic(_MXFP8_QUANTIZE_AUTOTUNED_OP,
                                     quantize_runner, quantize_inputs, tune))
+    return mxfp8_gemm_autotuned(act, act_scale, weight, weight_scale,
+                                output_dtype, tune)
+
+
+def mxfp8_gemm_autotuned(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    tune: bool = False,
+) -> torch.Tensor:
+    """The GEMM half of mxfp8_quantize_gemm_autotuned for an activation already in MXFP8.
+
+    Same runner, op key and tuning-cache entries as the decode-graph MXFP8 GEMM:
+    the tactic per token bucket comes from the AutoTuner (merged across ranks
+    when the runtime asks for it), never from a per-rank backend sweep.
+    """
     gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
     gemm_inputs = [act, act_scale, weight, weight_scale]
     return gemm_runner(gemm_inputs,
                        tactic=_choose_mxfp8_tactic(
                            _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,
                            gemm_inputs, tune))
+
+
+def flashinfer_mxfp8_gemm_cute_dsl(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    sweep_configs: bool,
+) -> torch.Tensor:
+    """FlashInfer's CuTeDSL MXFP8 GEMM for an activation its producer already quantized.
+
+    Unlike ``mxfp8_quantize_gemm_autotuned``, the backend is fixed rather than
+    chosen per token bucket: the AutoTuner profiles with the weight L2-resident,
+    where CUTLASS can edge out CuTeDSL, while a decode step streams it cold.
+
+    ``sweep_configs`` runs FlashInfer's own CuTeDSL config sweep: it profiles
+    the configs for this shape while ``flashinfer_mxfp8_autotune`` is active
+    (the warmup tuning pass) and replays the cached best one afterwards;
+    without it the heuristic config runs.
+    """
+    if sweep_configs:
+        from ..modules.linear import flashinfer_mxfp8_autotune_active
+        context = _flashinfer_autotune(
+            tune_mode=flashinfer_mxfp8_autotune_active())
+    else:
+        context = _flashinfer_autotune(tune_mode=False, skip_ops="mxfp8_gemm")
+    with context:
+        return _flashinfer_mm_mxfp8(
+            act,
+            weight.t(),
+            act_scale,
+            weight_scale,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend="cute-dsl",
+        )
 
 
 class FP4GemmRunner(TunableRunner):
@@ -2624,6 +2700,16 @@ def _(
     return gate.new_empty(gate.shape, dtype=o_dtype)
 
 
+# The AllReduce tuner profiles NCCL_SYMMETRIC by pre-allocating two NCCL window buffers of [2 x max_num_tokens, hidden]
+# (plus registration) inside the memory-profiling warm-up, so they shrink the KV pool even where NCCL_SYMMETRIC never
+# wins (agg TP2: only NCCL / ONESHOT are picked; ~1.24 GiB per rank of KV, GEMM-AR 803388).
+# TRTLLM_AR_TUNE_NCCL_SYMMETRIC=0 leaves it out of the candidates (no windows) and makes plain NCCL the cache-miss
+# fallback; the default keeps stock behavior.
+_AR_TUNE_NCCL_SYMMETRIC = os.environ.get("TRTLLM_AR_TUNE_NCCL_SYMMETRIC",
+                                         "1") == "1"
+_AR_TUNE_NCCL_SYMMETRIC_LOGGED = False
+
+
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_done: ClassVar[set] = set()
@@ -2729,10 +2815,16 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
-            AllReduceStrategy.NCCL.value,
-        ]
+        global _AR_TUNE_NCCL_SYMMETRIC_LOGGED
+        valid_strategies = [AllReduceStrategy.NCCL.value]
+        if _AR_TUNE_NCCL_SYMMETRIC:
+            valid_strategies.insert(0, AllReduceStrategy.NCCL_SYMMETRIC.value)
+        elif not _AR_TUNE_NCCL_SYMMETRIC_LOGGED:
+            _AR_TUNE_NCCL_SYMMETRIC_LOGGED = True
+            logger.info(
+                "[tunable_allreduce] AR tuner: NCCL_SYMMETRIC left out (no NCCL window buffers "
+                "pre-allocated); cache-miss fallback is NCCL (TRTLLM_AR_TUNE_NCCL_SYMMETRIC=0)"
+            )
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -2823,7 +2915,8 @@ class AllReduceRunner(TunableRunner):
             # Fall back to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
             # by a cross-rank barrier in NCCLWindowAllocator which falls back
             # to plain NCCL.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            tactic = (AllReduceStrategy.NCCL_SYMMETRIC.value if
+                      _AR_TUNE_NCCL_SYMMETRIC else AllReduceStrategy.NCCL.value)
 
         return torch.ops.trtllm.allreduce(
             input,

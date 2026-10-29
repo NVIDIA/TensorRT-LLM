@@ -87,6 +87,13 @@ list(FILTER SRC_CU EXCLUDE REGEX "fusedSampling/.*")
 # Marlin is built as its own architecture-scoped OBJECT library below.
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
+# The MiniMax-M3 decode attention kernels are built as their own
+# architecture-scoped OBJECT library below.
+list(FILTER SRC_CU EXCLUDE REGEX
+     "minimaxM3/(fusedDecodeAttn|attnMega|attnC1)\\.cu$")
+# The MiniMax-M3 sm_107 decode kernels are built as their own sm_107-only OBJECT
+# library below.
+list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107Tp[248]/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
@@ -121,10 +128,49 @@ if(MARLIN_SRC)
   set_cuda_architectures(marlin_src 89 90 120f)
 endif()
 
+# MiniMax-M3 decode attention: block-scaled tcgen05 MMAs (.scale_vec::1X) exist
+# on the arch-specific sm_100a / sm_103a targets only, not on the sm_100f family
+# target the rest of this library builds. Other targets compile kernels that
+# trap.
+add_library(
+  minimax_m3_attn_src OBJECT minimaxM3/fusedDecodeAttn.cu minimaxM3/attnMega.cu
+                             minimaxM3/attnC1.cu)
+set_property(TARGET minimax_m3_attn_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET minimax_m3_attn_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_cuda_architectures(minimax_m3_attn_src 100 103)
+
+# MiniMax-M3 sm_107 decode kernels (minimaxM3Sm107Tp{2,4,8}/): written for
+# sm_107 only (PDL griddepcontrol, sm_10x-only PTX), so they are compiled for
+# the sm_10x entries of this build's architectures only (the same targets, e.g.
+# the sm_100f family, that kernels_src compiles its sm_10x code for), not for
+# the older ones. A build without an sm_10x architecture compiles them for
+# sm_107a: their torch ops link against the host launchers, and only the sm_107
+# targets launch them.
+file(GLOB MINIMAX_M3_SM107_SRC minimaxM3Sm107Tp2/*.cu minimaxM3Sm107Tp4/*.cu
+     minimaxM3Sm107Tp8/*.cu)
+add_library(minimax_m3_sm107_src OBJECT ${MINIMAX_M3_SM107_SRC})
+set_property(TARGET minimax_m3_sm107_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                  ON)
+target_include_directories(
+  minimax_m3_sm107_src
+  PRIVATE
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+)
+target_link_libraries(minimax_m3_sm107_src PRIVATE trtllm_gen_fmha_interface)
+set(MINIMAX_M3_SM107_ARCHS ${CMAKE_CUDA_ARCHITECTURES})
+list(FILTER MINIMAX_M3_SM107_ARCHS INCLUDE REGEX "^10[0-9]")
+if(NOT MINIMAX_M3_SM107_ARCHS)
+  set(MINIMAX_M3_SM107_ARCHS 107a-real)
+endif()
+set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_ARCHITECTURES
+                                                  ${MINIMAX_M3_SM107_ARCHS})
+
 add_library(
   kernels_src STATIC
   ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
-  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
+  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>
+  $<TARGET_OBJECTS:minimax_m3_attn_src> $<TARGET_OBJECTS:minimax_m3_sm107_src>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(

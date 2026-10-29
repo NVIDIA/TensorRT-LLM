@@ -62,6 +62,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
+from .msa_decode import dense_decode_max_seq_len
 from .phased import FmhaParams, PhasedFmha
 from .utils import (
     get_attention_chunk_size,
@@ -1207,6 +1208,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
         )
         gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
+        # A layer may cap the KV split's max_seq_len per request count (a no-op unless it sets the cap).
+        max_kv_len = dense_decode_max_seq_len(attn, max_kv_len, batch_beam)
 
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,

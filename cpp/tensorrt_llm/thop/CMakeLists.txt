@@ -67,14 +67,16 @@ add_th_common_family(
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   sparseKvCacheCompactOp.cpp
-  minimaxM3Fp8IndexerOp.cpp
-  minimaxM3SelectBlocksOp.cpp
   mlaRopeInplaceOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp)
+
+# MiniMax-M3 torch ops live in minimaxM3/; that directory adds them to
+# th_common_attention with target_sources() so the list stays next to the files.
+add_subdirectory(minimaxM3)
 
 target_sources(
   th_common_attention

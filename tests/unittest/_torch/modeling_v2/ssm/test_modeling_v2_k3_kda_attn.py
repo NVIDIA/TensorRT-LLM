@@ -23,7 +23,6 @@ another launch on the same pools.
 import importlib
 import zlib
 
-import _kda_cells as kc
 import pytest
 import torch
 
@@ -32,7 +31,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_
     K3KdaBuffers,
 )
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["..", "."]
+import _kda_cells as kc
 from _validating import validating
 
 _attn = importlib.import_module(

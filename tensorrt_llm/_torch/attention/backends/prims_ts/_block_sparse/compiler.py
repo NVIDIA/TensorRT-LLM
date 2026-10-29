@@ -14,6 +14,7 @@
 
 """Compilation and caching for PrimTS block-sparse attention adapters."""
 
+from .._worktile_scope import with_scalar_work_tile_info
 from collections.abc import Callable
 import functools
 
@@ -31,6 +32,7 @@ from .config import _BlockSparseCompileKey, _make_block_sparse_config
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 
 
+@with_scalar_work_tile_info
 def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     """Compile one contiguous or paged attention adapter for ``key``.
 
