@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 from typing import List
 
 import torch
@@ -57,7 +58,8 @@ class MappingBase:
             enable_attention_dp=False,
             enable_lm_head_tp_in_adp=False,
             dwdp_size=0,
-            dwdp_rank=0):
+            dwdp_rank=0,
+            helix_repurposed_cp_size=1):
         # Validate and store DWDP configuration
         if dwdp_size < 0 or dwdp_size == 1:
             raise ValueError(
@@ -67,6 +69,8 @@ class MappingBase:
                 f"dwdp_rank must be in [0, {dwdp_size}), got {dwdp_rank}")
         self._dwdp_size = dwdp_size
         self._dwdp_rank = dwdp_rank
+        # CP size folded into tp by repurpose_helix_cp_to_tp(); 1 otherwise.
+        self._helix_repurposed_cp_size = helix_repurposed_cp_size
 
         # set default values for non-moe cases
         # or where only one MOE parallelism size is specified
@@ -304,6 +308,34 @@ class MappingBase:
     def dp_size(self):
         return self.tp_size if self.enable_attention_dp else 1
 
+    @property
+    def helix_repurposed_cp_size(self) -> int:
+        return self._helix_repurposed_cp_size
+
+    @property
+    def tp_group_shares_requests(self) -> bool:
+        """Whether every rank of the TP group serves the same requests.
+
+        True without attention DP, and with it when the TP group is one helix
+        CP group repurposed by repurpose_helix_cp_to_tp() (original tp_size 1).
+        """
+        return (not self.enable_attention_dp
+                or 1 < self._helix_repurposed_cp_size == self.tp_size)
+
+    def mapping_for_full_rows(self) -> "MappingBase":
+        """Mapping for a module that runs on every row of its rank's batch.
+
+        Under attention DP such a module is replicated, unless the TP group
+        shares requests (helix + attention DP at tp_size 1): then it keeps
+        TP sharding, and only token-sliced modules (FFN/MoE) use attention DP.
+        """
+        if not (self.enable_attention_dp and self.tp_group_shares_requests):
+            return self
+        mapping = copy.copy(self)
+        mapping.enable_attention_dp = False
+        mapping.enable_lm_head_tp_in_adp = False
+        return mapping
+
     def has_cp_ulysses(self):
         return self.cp_size > 1 and self.cp_config.get(
             "cp_type") == CpType.ULYSSES
@@ -456,6 +488,7 @@ class MappingBase:
             'enable_lm_head_tp_in_adp': self.enable_lm_head_tp_in_adp,
             'dwdp_size': self._dwdp_size,
             'dwdp_rank': self._dwdp_rank,
+            'helix_repurposed_cp_size': self._helix_repurposed_cp_size,
         }
 
 
@@ -581,7 +614,8 @@ class Mapping(MappingBase):
             enable_attention_dp=False,
             enable_lm_head_tp_in_adp=False,
             dwdp_size=0,
-            dwdp_rank=0):
+            dwdp_rank=0,
+            helix_repurposed_cp_size=1):
         super().__init__(world_size=world_size,
                          rank=rank,
                          gpus_per_node=gpus_per_node,
@@ -598,7 +632,8 @@ class Mapping(MappingBase):
                          enable_attention_dp=enable_attention_dp,
                          enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp,
                          dwdp_size=dwdp_size,
-                         dwdp_rank=dwdp_rank)
+                         dwdp_rank=dwdp_rank,
+                         helix_repurposed_cp_size=helix_repurposed_cp_size)
 
     def repurpose_helix_cp_to_tp(self):
         # In helix parallelism, CP is relevant only for the attention layer. These ranks are repurposed to TP
@@ -620,11 +655,15 @@ class Mapping(MappingBase):
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
             dwdp_size=self._dwdp_size,
-            dwdp_rank=self._dwdp_rank)
+            dwdp_rank=self._dwdp_rank,
+            helix_repurposed_cp_size=self.cp_size)
 
     # DeviceMesh specific methods
     @property
     def tp_group_pg(self) -> ProcessGroup:
+        tp_group_pg = getattr(self, "_tp_group_pg", None)
+        if tp_group_pg is not None:
+            return tp_group_pg
         raise NotImplementedError("tp_group_pg is not implemented.")
 
     @property

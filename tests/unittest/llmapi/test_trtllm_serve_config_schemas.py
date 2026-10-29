@@ -166,12 +166,28 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 1}}, True),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 2}}, True),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"attention_config": {"backend": "not-a-backend"}}, False),
     ],
 )
 def test_config_validation(
     schemas: dict[str, dict], filename: str, config: dict, valid: bool
 ) -> None:
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("field", ["transfer_timeout_sec", "control_grace_sec"])
+@pytest.mark.parametrize(("value", "valid"), [(0.5, True), (0.0, False), (-1.0, False)])
+def test_connector_timeout_constraints(
+    schemas: dict[str, dict], filename: str, field: str, value: float, valid: bool
+) -> None:
+    config = {"kv_connector_config": {"connector": "lmcache", field: value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 

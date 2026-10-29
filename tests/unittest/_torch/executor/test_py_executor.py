@@ -47,7 +47,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     PyResult,
     SamplingConfig,
 )
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     EncoderStepResult,
@@ -70,9 +70,13 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 pytestmark = pytest.mark.cpu_only
 
 
-def _forward_step_executor(engine, *, enable_spec_decode=False, runtime_draft_len=0):
+def _forward_step_executor(
+    engine: Mock, *, enable_spec_decode: bool = False, runtime_draft_len: int = 0
+) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         model_engine=engine,
+        enable_attention_dp=False,
+        kv_connector_manager=None,
         resource_manager=object(),
         iter_counter=0,
         enable_spec_decode=enable_spec_decode,
@@ -106,10 +110,12 @@ def _run_forward_step(executor, batch, new_tensors=None):
         ("shutdown_for_kv_cache_estimation", False),
     ],
 )
-def test_shutdown_graph_lifecycle(shutdown_method, releases_model_owned_graphs):
+def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_graphs: bool) -> None:
     engine = Mock()
     executor = object.__new__(PyExecutor)
     executor.executor_request_queue = Mock()
+    executor.enable_attention_dp = False
+    executor._kv_connector_failed = False
     executor.shutdown_event = Mock()
     executor.hang_detector = Mock()
     executor.hang_detector.detected.return_value = False
@@ -157,7 +163,7 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
     runner.forward.side_effect = lambda inputs, **kwargs: {
         "logits": logits if inputs.gather_context_logits else logits[2::3]
     }
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._runner = runner
     engine._warmup_depth = 0
     engine.route_capture = None
@@ -839,6 +845,7 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
         draft_model_engine=types.SimpleNamespace(model=draft),
         resource_manager=Mock(),
         _prefetched_request_ids={41},
+        enable_attention_dp=False,
         disagg=Mock(),
     )
     request = types.SimpleNamespace(py_request_id=41, py_seq_slot=3)
@@ -985,7 +992,7 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
         ),
         encoder_max_batch_size=encoder_max_batch_size,
     )
-    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = _encoder_decoder_runner(batch_sizes, pad_to_limit=True)
     executor.batch_wait_timeout_iters = 48
@@ -1008,7 +1015,7 @@ def _make_feature_encoder_batch_wait_executor(
         encoder_cuda_graph_config=EncodeCudaGraphConfig(enable_padding=True),
         encoder_max_batch_size=encoder_max_batch_size,
     )
-    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = _encoder_decoder_runner(
         runner_batch_sizes if runner_enabled else (), pad_to_limit=False
@@ -1025,7 +1032,7 @@ def _make_encoder_fallback_batch_wait_executor():
         encoder_cuda_graph_config=None,
         encoder_max_batch_size=None,
     )
-    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = None
     executor.batch_wait_timeout_iters = 48
@@ -1431,13 +1438,14 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_waiting_queue_size() == 1
 
 
-def _make_executor_with_kv_cache_manager(kv_cache_manager):
+def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
     executor.resource_manager = Mock()
     executor.resource_manager.resource_managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
     executor.enable_attention_dp = False
+    executor._kv_connector_deadlines = {}
     executor.adp_router = Mock(exclude_retiring_requests=False)
     executor._kv_cache_capacity = executor._read_kv_cache_capacity()
     executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
@@ -2137,7 +2145,7 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
 
     executor = object.__new__(PyExecutor)
     executor._is_kv_manager_v2 = False
-    executor.dist = Mock(pp_rank=1, rank=1)
+    executor.dist = Mock(pp_rank=1, rank=1, is_first_pp_rank=False)
     executor.device_id = 0
     profiler = MagicMock()
     profiler.__enter__.return_value = Mock()
@@ -2182,6 +2190,74 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     ]
 
 
+@pytest.mark.parametrize(
+    ("rank", "is_first_pp_rank", "enable_attention_dp", "schedules_batch"),
+    [
+        (0, True, False, True),
+        # A TP rank receives the batch rank 0 scheduled.
+        (1, True, False, False),
+        # Each first-stage rank of an attention-DP group schedules its own batch.
+        (1, True, True, True),
+        # A later stage receives the batch of the stage before it.
+        (3, False, True, False),
+    ],
+    ids=["rank0", "tp-first-stage", "adp-first-stage", "adp-later-stage"],
+)
+def test_each_pp_rank_schedules_once_per_iteration(
+    monkeypatch, rank, is_first_pp_rank, enable_attention_dp, schedules_batch
+):
+    """Scheduler state that advances per pass, such as a prefix wait's budget,
+    must advance in step on every PP rank. A rank that scheduled the batch
+    itself must not run its scheduler again; every other rank runs it once."""
+
+    class StopAfterSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor._pp_rebalance_drain_iters = None
+    executor._can_pause_for_rebalance = Mock(return_value=False)
+    executor.enable_attention_dp = enable_attention_dp
+    executor.dist = Mock(rank=rank, pp_rank=rank // 2, tp_size=2, is_first_pp_rank=is_first_pp_rank)
+    executor.device_id = 0
+    profiler = MagicMock()
+    profiler.__enter__.return_value = Mock()
+    executor._profiler = Mock(return_value=profiler)
+    executor.hang_detector = MagicMock()
+    executor.enable_iter_perf_stats = False
+    executor._fetch_and_activate_new_requests = Mock(return_value=[])
+    executor.is_shutdown = False
+    executor._handle_control_request = Mock()
+    executor.kv_cache_transceiver = None
+    executor._pad_attention_dp_dummy_request = Mock()
+    executor._pp_retry_until_can_schedule = Mock()
+    executor._mm_encoder_item_scheduling_enabled = False
+    executor._terminate_recompute_paused_requests = Mock(side_effect=StopAfterSchedule)
+    executor.active_requests = [Mock()]
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+
+    def schedule_and_propagate(microbatch_id):
+        if executor._pp_rank_schedules():
+            # PyExecutor._schedule runs the scheduler.
+            executor.scheduler.schedule_request(executor.active_requests, executor.inflight_req_ids)
+        return ScheduledRequests(), [], 0, False
+
+    executor._pp_schedule_and_propagate = schedule_and_propagate
+
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT", Mock())
+
+    with pytest.raises(StopAfterSchedule):
+        PyExecutor._executor_loop_pp(executor)
+
+    assert executor._pp_rank_schedules() is schedules_batch
+    executor.scheduler.schedule_request.assert_called_once()
+    assert executor._pp_retry_until_can_schedule.called is not schedules_batch
+
+
 def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2189,7 +2265,7 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
         pass
 
     executor = object.__new__(PyExecutor)
-    executor.dist = Mock(pp_rank=1, rank=1)
+    executor.dist = Mock(pp_rank=1, rank=1, is_first_pp_rank=False)
     executor.device_id = 0
     profiler = MagicMock()
     profiler.__enter__.return_value = Mock()
@@ -2626,6 +2702,7 @@ class _StubADPExecutor:
         enable_non_overlap_adp_forward_intent=None,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
         exclude_retiring_requests=True,
+        tp_size=2,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -2655,7 +2732,9 @@ class _StubADPExecutor:
         self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
 
         self.dist = Mock()
-        self.dist.tp_size = 1
+        # Peers are modeled through peer_forward_intent; tp_size only tells the
+        # executor whether attention DP has any peer at all.
+        self.dist.tp_size = tp_size
         self.dist.cp_size = 1
         self.dist.tp_rank = 0
         self.dist.tp_allgather.side_effect = lambda value: [value]
@@ -2719,6 +2798,30 @@ def _run_update_role(stub, candidates):
 def _make_adp_queue_item(request_type: RequestType, request_id: int = 1) -> RequestQueueItem:
     request = Mock(spec=ExecutorRequest, request_type=request_type)
     return RequestQueueItem(id=request_id, request=request)
+
+
+def test_pad_dummy_skipped_for_single_rank_attention_dp():
+    # tp1 attention DP (e.g. DWDP context workers) has no peer to keep in step.
+    stub = _StubADPExecutor(tp_size=1)
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert stub.active_requests == []
+
+
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_pad_dummy_single_rank_attention_dp_with_kv_connector(capacity_only: bool) -> None:
+    # A connector that moves KV needs a forward pass to flush its finished
+    # loads, so a tp1 rank still pads; a capacity-only connector does not.
+    stub = _StubADPExecutor(tp_size=1)
+    stub.expected_num_active_requests = 1
+    stub.kv_connector_manager = Mock(capacity_only=capacity_only)
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == (0 if capacity_only else 1)
 
 
 def test_adp_dummy_role_set_to_ctx_on_context_only_request():
@@ -3024,7 +3127,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
         seen["active"] = total_num_active_requests
         seen["all_ranks"] = all_ranks_num_active_requests
-        return []
+        return [], {}
 
     stub._pop_from_waiting_queue = _pop
     with patch(
@@ -3571,8 +3674,12 @@ def _unfittable_rank(**kwargs):
     return stub, ScheduledRequests()
 
 
-def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
+@pytest.mark.parametrize("has_local_request", [False, True])
+def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_request: bool) -> None:
     stub, scheduled_batch = _unfittable_rank()
+    if not has_local_request:
+        # Local cancellation can empty this owner while peers still need forward.
+        stub.active_requests = []
 
     _run_pad_empty(stub, scheduled_batch)
 
@@ -3581,8 +3688,8 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     dummy = scheduled_batch.generation_requests[0]
     assert dummy.is_attention_dp_dummy is True
     assert dummy in stub.active_requests
-    # A generation dummy, not the context dummy the pre-schedule path would
-    # pick: this rank is empty precisely because it is short of KV cache.
+    # Post-schedule padding uses a generation dummy for both a starved owner
+    # and an owner left empty by cancellation.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
@@ -3635,6 +3742,32 @@ def test_pad_empty_batch_no_op_when_batch_is_not_empty():
     assert scheduled_batch.generation_requests == []
 
 
+def test_pad_empty_batch_no_op_for_single_rank_attention_dp():
+    # tp1 attention DP (e.g. DWDP context workers) has no peer whose collectives
+    # an empty batch would stall, so a padding forward is pure waste.
+    stub, scheduled_batch = _unfittable_rank(tp_size=1)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.batch_size == 0
+    assert stub._pending_adp_dummy_request is None
+
+
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_pad_empty_batch_single_rank_attention_dp_with_kv_connector(
+    capacity_only: bool,
+) -> None:
+    # A canceled connector load frees its slot only after a forward pass flushes
+    # its response, so a tp1 rank with a KV-moving connector still pads.
+    stub, scheduled_batch = _unfittable_rank(tp_size=1)
+    stub.kv_connector_manager = Mock(capacity_only=capacity_only)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == (0 if capacity_only else 1)
+
+
 def test_pad_empty_batch_no_op_when_attention_dp_disabled():
     stub, scheduled_batch = _unfittable_rank(enable_attention_dp=False)
 
@@ -3644,14 +3777,16 @@ def test_pad_empty_batch_no_op_when_attention_dp_disabled():
     assert scheduled_batch.batch_size == 0
 
 
-def test_pad_empty_batch_no_op_when_rank_has_no_active_requests():
-    # The pre-schedule path already covers this case.
+def test_pad_empty_batch_no_op_when_no_rank_has_active_requests() -> None:
     stub, scheduled_batch = _unfittable_rank()
     stub.active_requests = []
+    stub.expected_num_active_requests = 0
 
     _run_pad_empty(stub, scheduled_batch)
 
     assert stub.add_dummy_calls == []
+    assert stub.active_requests == []
+    assert scheduled_batch.batch_size == 0
 
 
 def test_pad_empty_batch_respects_max_num_active_requests():
@@ -3868,8 +4003,9 @@ class TestPendingTransferResponseFlush:
         executor._terminate_request.assert_called_once_with(request)
 
     @staticmethod
-    def _make_executor_loop_stub():
+    def _make_executor_loop_stub() -> PyExecutor:
         executor = object.__new__(PyExecutor)
+        executor.enable_attention_dp = False
         executor.device_id = 0
         profiler = MagicMock()
         profiler.__enter__.return_value = Mock()

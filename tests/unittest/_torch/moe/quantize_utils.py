@@ -35,7 +35,7 @@ from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
 from tensorrt_llm._torch.moe.fused_moe import BaseMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_120f
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -147,7 +147,7 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
             if backend_name == "DEEPGEMM":
                 # Use DEEPGEMM-specific util with E8M0 scales and manual grouped_gemm reference
                 quantize_util_cls = DeepGemmFP8BlockScalesQuantizeUtil
-            elif backend_name == "CUTLASS" and get_sm_version() == 120:
+            elif backend_name == "CUTLASS" and is_sm_120f():
                 # SM120 CUTLASS uses E8M0 scale format (same as DEEPGEMM)
                 quantize_util_cls = DeepGemmFP8BlockScalesQuantizeUtil
             elif backend_name == "TRTLLM":
@@ -662,19 +662,13 @@ class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
         self.swiglu_gptoss_style = swiglu_gptoss_style
 
     def check_accuracy(self, output, ref_output):
-        # The CuteDSL fused kernel introduces three precision error sources
-        # vs the reference implementation:
-        #   1. Fused SwiGLU uses fastmath sigmoid (rcp_approx + exp2 fastmath)
-        #      — per-element error in the intermediate activation tensor.
-        #   2. Inter-GEMM FP4 requantization uses rcp_approx vs exact division
-        #      — per-block scaling error in the intermediate FP4 tensor.
-        #   3. Fused finalize accumulates top-k expert outputs via bf16
-        #      atomic-add (vectorized_atomic_add_bf16x8 / blk_reduce_bf16)
-        #      vs fp32 accumulation in the reference.
-        #
-        # Errors (1) and (2) compound through GEMM2's K dimension
-        # (= intermediate_size), while error (3) scales with top_k.
-        # Total error variance ∝ intermediate_size × top_k.
+        # The reference GatedMLP rounds the FC1 GEMM output and the SwiGLU
+        # result to bf16 before quantizing the FC2 input to NVFP4. Backends
+        # that quantize from the fp32 accumulator instead (CuteDSL,
+        # TRTLLM-Gen) put a fraction of those values on a neighbouring FP4
+        # code, and FC2 sums every such difference over K = intermediate_size.
+        # Backends that finalize with bf16 atomic adds also round each top-k
+        # contribution, so the mismatch grows with intermediate_size × top_k.
         #
         # With intermediate_size=2048 and top_k=8 (e.g. e256/e384 configs
         # for Kimi-K2 / DeepSeek-V3 class models), mismatch reaches ~3-5%
