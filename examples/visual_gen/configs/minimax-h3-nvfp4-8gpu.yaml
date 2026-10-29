@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# 8-GPU MiniMax-H3 VisualGen configuration for a pre-quantized ModelOpt NVFP4
+# checkpoint (--model) with pure Ulysses sequence parallelism and parallel VAE
+# tile decode. The quantization recipe comes from the checkpoint's
+# quantization_config; see minimax-h3-nvfp4-1gpu.yaml. FA4 is one of the two
+# attention backends that honour the packed-row padding mask Ulysses needs.
+cuda_graph_config:
+  enable: false
+
+attention_config:
+  backend: FA4
+
+parallel_config:
+  ulysses_size: 8
+  # Decode independent spatial tiles using the loaded VAE geometry.
+  parallel_vae_size: 8
+
+compilation_config:
+  skip_warmup: false
+  resolutions:
+    - [544, 960]
+  num_frames:
+    - 124

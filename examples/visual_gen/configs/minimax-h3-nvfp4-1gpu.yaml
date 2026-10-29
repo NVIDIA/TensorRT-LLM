@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# 1-GPU MiniMax-H3 VisualGen configuration for a pre-quantized ModelOpt NVFP4
+# checkpoint, supplied through --model. The quantization recipe (NVFP4 weights,
+# block scales, calibrated activation scales and the exclusion list) comes from
+# the checkpoint's quantization_config, so no quant_config is set here; adding
+# `quant_config: {quant_algo: NVFP4}` would switch to dynamic activation
+# quantization instead. Attention stays BF16 through FA4.
+cuda_graph_config:
+  enable: false
+
+attention_config:
+  backend: FA4
+
+compilation_config:
+  skip_warmup: false
+  resolutions:
+    - [544, 960]
+  num_frames:
+    - 124
