@@ -249,6 +249,9 @@ l0_b200:
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # DWDP expert prefetch on real streams and copies; the peer-GPU gather
+  # cases skip below 2 GPUs.
+  - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/fused_moe/test_cutedsl_fc2_tuning.py
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py

@@ -3438,7 +3438,7 @@
     },
     "DwdpConfig": {
       "additionalProperties": false,
-      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\ndouble-buffered P2P remote regions), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
+      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
       "properties": {
         "contention_opt": {
           "default": false,
@@ -3468,6 +3468,13 @@
           "default": 0,
           "description": "The number of prefetch experts per worker.",
           "title": "Num Prefetch Experts",
+          "type": "integer"
+        },
+        "num_prefetch_slots": {
+          "default": 2,
+          "description": "The number of expert prefetch buffer slots. Each slot holds the remote experts of one MoE layer; more slots let the prefetch run further ahead of the MoE compute, at the cost of device memory that is then not available to the KV cache.",
+          "minimum": 2,
+          "title": "Num Prefetch Slots",
           "type": "integer"
         }
       },

@@ -29,6 +29,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -1443,6 +1444,10 @@ class MTPForCausalLM(nn.Module):
             for layer_idx in range(mtp_num_layers)
         ])
         self.folds_kv_lens_increment = folds_kv_lens_increment
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None and mtp_repeat_count > 1:
+            for layer_idx in range(mtp_num_layers):
+                dwdp_manager.add_repeated_layer(layer_idx + start_layer_idx)
         self.owns_lm_head = lm_head_quant_config is not None
         if self.owns_lm_head:
             if getattr(model_config.pretrained_config, "tie_word_embeddings",

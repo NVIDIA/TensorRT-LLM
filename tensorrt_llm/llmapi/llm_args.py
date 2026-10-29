@@ -5761,7 +5761,7 @@ class DwdpConfig(StrictBaseModel):
     Each worker holds a subset of experts locally and asynchronously prefetches
     the remaining experts from peer workers via CUDA VMM + MNNVL fabric
     handles (composite virtual-address layout with zero-copy local mapping and
-    double-buffered P2P remote regions), enabling fully asynchronous execution
+    P2P remote prefetch slots), enabling fully asynchronous execution
     across ranks without synchronization barriers.
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
@@ -5783,6 +5783,14 @@ class DwdpConfig(StrictBaseModel):
         "Enable limited-contention prefetch optimization. Uses batched "
         "memcpy with round-robin slice ordering across peers and a 2 MiB "
         "slice granularity to reduce NVLink contention.")
+    num_prefetch_slots: int = Field(
+        default=2,
+        ge=2,
+        description=
+        "The number of expert prefetch buffer slots. Each slot holds the "
+        "remote experts of one MoE layer; more slots let the prefetch run "
+        "further ahead of the MoE compute, at the cost of device memory that "
+        "is then not available to the KV cache.")
 
 
 class BaseLlmArgs(StrictBaseModel):
