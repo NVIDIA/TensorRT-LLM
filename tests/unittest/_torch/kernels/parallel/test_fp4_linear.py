@@ -508,9 +508,19 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
 
     AutoTuner.get().print_profiling_cache()
 
+    # CuTe DSL split-K tactics round each K slice's partial sum to BF16 before
+    # reducing it into the output, so their error is a few BF16 ulps of the
+    # partial sums, which scale with the output RMS rather than per element.
+    sm_version = get_sm_version()
+    if sm_version == 107 or (sm_version in (100, 103) and HIDDEN_SIZE >= 4096
+                             and OUTPUT_SIZE <= 512):
+        atol = 0.05 * output_ref.float().pow(2).mean().sqrt().item()
+    else:
+        atol = 0.15
+
     # Verify auto mode result matches reference
     torch.cuda.synchronize()
-    torch.testing.assert_close(output_auto, output_ref, rtol=1e-2, atol=0.15)
+    torch.testing.assert_close(output_auto, output_ref, rtol=1e-2, atol=atol)
 
     # Test all combinations of outer layer (backend selection) and inner layer (backend tactics)
     # Outer layer: nvfp4_gemm selects backend
@@ -611,7 +621,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
                 torch.testing.assert_close(output,
                                            output_ref,
                                            rtol=1e-2,
-                                           atol=0.15)
+                                           atol=atol)
 
             total_tactics_tested += 1
             tactics_by_backend[runner_name].append(total_tactics_tested)

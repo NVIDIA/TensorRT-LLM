@@ -479,6 +479,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 "The swapped indexer-Q epilogue requires a column-major BF16 "
                 "GEMM boundary plus packed output, scale, position, and RoPE tensors"
             )
+        if cutlass.const_expr(
+                self.split_k > 1 and self.c_dtype
+                not in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16)):
+            raise ValueError("split_k > 1 needs an FP32, FP16 or BF16 output")
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
