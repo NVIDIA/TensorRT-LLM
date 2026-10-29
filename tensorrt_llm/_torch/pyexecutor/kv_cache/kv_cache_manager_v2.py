@@ -8288,4 +8288,6 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._sharing is not None:
             self._sharing._on_reset()
         # A reset can run while inference is paused or idle, with no next iteration.
+        # Buffered attention-DP events gather here: every rank must reset in the
+        # same order, including ranks with an empty cache.
         self.flush_iteration_events()

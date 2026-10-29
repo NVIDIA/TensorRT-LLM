@@ -10326,9 +10326,11 @@ class PyExecutor:
         Must run at a control-action boundary: ``_handle_control_request``
         retires the overlap loop's in-flight batch on every rank before the
         action fires (see ``_retire_inflight_batch_for_control``), so
-        everything here is rank-local and issues no TP collectives. Consuming
-        an in-flight batch here instead would gather on some attention-DP
-        ranks only and deadlock the engine.
+        request teardown here is rank-local. The final prefix-cache reset
+        flushes events; with buffered attention-DP events, that flush gathers
+        across ranks, so every rank must call this method in the same order.
+        Consuming an in-flight batch here instead would gather on some
+        attention-DP ranks only and deadlock the engine.
 
         Not supported with pipeline parallelism (``pp_size > 1``): the PP
         microbatch ring keeps batches in flight across the control action, and

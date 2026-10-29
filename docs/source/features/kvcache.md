@@ -402,7 +402,12 @@ exposed through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
 
 #### Streaming path (prototype)
 
-Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event publishing overhead under attention data parallelism: each emitting rank publishes its own events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the LLM API. Each emitting rank drains its local native event source, converts the events to wire structs and enqueues a batch at iteration boundaries and when a prefix-cache reset completes. A background thread performs msgpack encoding and socket I/O.
+Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event
+publishing overhead under attention data parallelism: each emitting rank publishes its own
+events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the
+LLM API. Each emitting rank drains its local native event source, converts the events to wire
+structs and enqueues a batch at iteration boundaries and when a prefix-cache reset completes.
+A background thread performs msgpack encoding and socket I/O.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
@@ -421,9 +426,19 @@ kv_cache_config = KvCacheConfig(
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
 events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
 
-A successful prefix-cache reset emits ordered `AllBlocksCleared` after preceding stored or removed events. Reset flushes events without waiting for another inference iteration, including while inference is idle or paused. The marker is retained in bounded replay history and does not change the engine lifetime ID.
+A successful prefix-cache reset emits ordered `AllBlocksCleared` after preceding stored or
+removed events. A populated reset also emits `BlockRemoved` for previously published resident
+blocks before `AllBlocksCleared`; consumers should accept both even though the reset marker
+already invalidates the whole index. Reset flushes events without waiting for another
+inference iteration, including while inference is idle or paused. The marker is retained in
+bounded replay history and does not change the engine lifetime ID. Orderly engine shutdown
+also clears the reuse tree and queues a final `AllBlocksCleared` before publisher teardown.
+The best-effort delivery guarantees below apply to reset and shutdown events too.
 
-Streaming exposes only the full-block residency information external routers need, using the attention lifecycle with the largest window. Conversion to `BlockStored`, `BlockRemoved`, and `AllBlocksCleared` is centralized at iteration and reset publication boundaries, keeping internal lifecycle details contained and avoiding Python callbacks from native cache operations.
+Streaming exposes only the full-block residency information external routers need, using the
+attention lifecycle with the largest window. Conversion to `BlockStored`, `BlockRemoved`, and
+`AllBlocksCleared` is centralized at iteration and reset publication boundaries, keeping
+internal lifecycle details contained and avoiding Python callbacks from native cache operations.
 
 **Multimodal payloads.** `token_ids` can contain integers and hexadecimal digest strings;
 integer-only consumers are incompatible. Each `mm_keys[i]` describes the multimodal segments
@@ -445,7 +460,14 @@ port must be at least *ranks-per-host* away from ```endpoint```'s rather than `N
 Overlapping ranges are rejected at startup. For `ipc://` and `inproc://` endpoints, which
 have no port, each rank appends a `_dp<rank>` suffix instead.
 
-**Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```, an 8-byte big-endian sequence number, and a msgpack payload `[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key: `BlockStored`, `BlockRemoved`, or `AllBlocksCleared`. Stored and removed events carry int64 block hashes derived from the V2 radix block keys. `AllBlocksCleared` has no additional fields. This is the format documented for custom router backends; it differs from vLLM's positional-array encoding of the individual events, though the batch envelope is positional in both.
+**Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
+an 8-byte big-endian sequence number, and a msgpack payload
+`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key:
+`BlockStored`, `BlockRemoved`, or `AllBlocksCleared`. Stored and removed events carry int64
+block hashes derived from the V2 radix block keys. `AllBlocksCleared` has no additional
+fields. This is the format documented for custom router backends; it differs from vLLM's
+positional-array encoding of the individual events, though the batch envelope is positional
+in both.
 
 **Delivery guarantees.** Delivery is best effort, and batch loss is observable. Every accepted
 batch reserves a sequence number up front, so a batch dropped by a full publisher queue

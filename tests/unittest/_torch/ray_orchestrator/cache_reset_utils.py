@@ -60,7 +60,7 @@ def _buffered_events(llm):
     return [json.loads(event) if isinstance(event, str) else event for event in events]
 
 
-def _check_cache_reset_events_through_control_rpc(streaming, tmp_path):
+def check_cache_reset_events_through_control_rpc(streaming, tmp_path):
     """Observe reset events through public transports while the control RPC is parked."""
     ranks = 1 if streaming else 2
     endpoint = f"ipc://{tmp_path}/events"
@@ -98,11 +98,10 @@ def _check_cache_reset_events_through_control_rpc(streaming, tmp_path):
             model=llm_models_root() / "Qwen3/Qwen3-0.6B",
             orchestrator_type="ray",
             ray_worker_extension_cls=(
-                "_torch.ray_orchestrator.test_kv_cache_reset_events.ResetEventsWorkerExtension"
+                "_torch.ray_orchestrator.cache_reset_utils.ResetEventsWorkerExtension"
             ),
             tensor_parallel_size=ranks,
             enable_attention_dp=not streaming,
-            enable_lm_head_tp_in_adp=not streaming,
             kv_cache_config=config,
             load_format="dummy",
             model_kwargs={"num_hidden_layers": 1},
@@ -172,18 +171,3 @@ def _check_cache_reset_events_through_control_rpc(streaming, tmp_path):
                 for identity in parked:
                     observer.send_multipart([identity, b"observed"])
                 assert sorted(ray.get(refs, timeout=40)) == list(range(ranks))
-
-
-@pytest.mark.ray
-@pytest.mark.timeout(240)
-def test_streaming_reset_is_published_before_control_rpc_resumes(tmp_path):
-    _check_cache_reset_events_through_control_rpc(True, tmp_path)
-
-
-@pytest.mark.ray
-@pytest.mark.gpu2
-@pytest.mark.timeout(240)
-def test_buffered_attention_dp_reset_with_an_empty_rank(tmp_path, monkeypatch):
-    """Exercise the event gather through Gloo's CPU object transport."""
-    monkeypatch.setenv("TLLM_CUDA_OBJECT_COLLECTIVES", "0")
-    _check_cache_reset_events_through_control_rpc(False, tmp_path)

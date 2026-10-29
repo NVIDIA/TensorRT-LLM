@@ -273,7 +273,7 @@ l0_h100:
     - unittest/executor/test_shim_ray.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_postproc_workers.py
-    - unittest/_torch/ray_orchestrator/test_kv_cache_reset_events.py::test_streaming_reset_is_published_before_control_rpc_resumes
+    - unittest/_torch/ray_orchestrator/single_gpu/test_kv_cache_reset_events.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part0"
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part1"
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part2"
