@@ -169,6 +169,10 @@ public:
     static void setLastAdjustmentTime(KvCacheManager& manager, double value);
     static void setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
 
+    //! Current GPU slot window [begin, end) of each pool group. Arena-relative under copy-based
+    //! rebalancing; [0, numSlots) otherwise.
+    static std::vector<std::pair<SlotCount, SlotCount>> gpuSlotWindows(KvCacheManager& manager);
+
     //! Allocates `size` bytes of host-tier memory the way the host tier would
     //! and reports where its pages landed.
     //!

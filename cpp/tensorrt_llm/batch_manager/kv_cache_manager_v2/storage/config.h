@@ -243,6 +243,10 @@ struct StorageConfig
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;
 
+    // Copy-based rebalancing: the GPU level is one arena of windows (PoolRebalanceConfig).
+    bool gpuArena = false;
+    bool dropUnreferencedOnRebalance = false;
+
     // Map each LifeCycleId → its PoolGroupIndex.
     TypedVec<LifeCycleId, PoolGroupIndex> lifeCycleGrouping() const;
 

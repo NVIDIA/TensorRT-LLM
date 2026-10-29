@@ -658,7 +658,9 @@ size_t KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) co
     auto const& attr = mStorage->getBufferAttr(layerId, role);
     LifeCycleId lc = attr.lifeCycleId;
     PoolGroupIndex pg = mStorage->getPoolGroupIndex(lc);
-    SlotCount const numSlots = mStorage->numSlots(pg, kHotLevel);
+    // An id bound, not a count: with copy-based rebalancing a pool's ids are arena-relative and
+    // the bound is the arena end, so views over the pool cover every id it may ever be given.
+    SlotCount const numSlots = mStorage->slotIdUpperBound(pg);
     auto slotSizes = mStorage->slotSize(pg);
     size_t slotSize = slotSizes.at(attr.poolIndex);
     return (exactDiv(slotSize, attr.size) * slotCountToSizeT(numSlots) - exactDiv(attr.offset, attr.size))

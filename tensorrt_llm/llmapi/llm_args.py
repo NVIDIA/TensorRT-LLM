@@ -5118,6 +5118,30 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "Number of PyExecutor iterations between checks of whether a pool rebalance "
         "should be attempted.")
 
+    copy_based_rebalancing: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Copy-based rebalancing (CoReba). The GPU KV cache becomes one arena mapped once at "
+        "startup; every pool group addresses it from the same base pointer with block indices "
+        "relative to the arena. A rebalance moves the pool boundaries in proportion to the new "
+        "ratios and copies blocks out of the parts that change owner, instead of remapping memory. "
+        "Requires one pool per pool group; the GPU quota is fixed afterwards.")
+
+    drop_unreferenced_on_rebalance: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "With copy_based_rebalancing: drop, rather than copy, blocks that must move during a "
+        "rebalance and that no request references (cached reusable blocks).")
+
+    @model_validator(mode='after')
+    def _validate_drop_requires_copy_based(self) -> 'KvPoolRebalanceConfig':
+        if self.drop_unreferenced_on_rebalance and not self.copy_based_rebalancing:
+            raise ValueError(
+                "drop_unreferenced_on_rebalance requires copy_based_rebalancing")
+        return self
+
 
 # Mixed-precision KV dtype: "mixed_<low dtype>_<high dtype>". The
 # first/last tokens and the attention inputs use the second dtype;

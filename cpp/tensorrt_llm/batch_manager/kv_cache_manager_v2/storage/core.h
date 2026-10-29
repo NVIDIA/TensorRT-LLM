@@ -26,6 +26,7 @@
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <algorithm>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -35,6 +36,65 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+// ---------------------------------------------------------------------------
+// SlotWindow — half-open range [begin, end) of slot ids a pool group owns.
+//
+// Ordinary pools always own [0, numSlots). With copy-based rebalancing every GPU
+// pool group addresses the same arena from the same base, so its ids are
+// arena-relative and the window starts wherever the group's part of the arena
+// does. A rebalance moves the window; ids of slots that stay inside it are kept.
+// ---------------------------------------------------------------------------
+struct SlotWindow
+{
+    SlotId begin{0};
+    SlotId end{0};
+
+    [[nodiscard]] SlotCount size() const noexcept
+    {
+        return end - begin;
+    }
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return !(begin < end);
+    }
+
+    [[nodiscard]] bool contains(SlotId id) const noexcept
+    {
+        return id >= begin && id < end;
+    }
+
+    [[nodiscard]] bool contains(SlotWindow const& other) const noexcept
+    {
+        return other.begin >= begin && other.end <= end;
+    }
+
+    //! Overlap of two windows. When they are disjoint the result is empty and anchored at the larger
+    //! begin, which need not lie inside either window.
+    [[nodiscard]] SlotWindow intersect(SlotWindow const& other) const noexcept
+    {
+        SlotId const b = std::max(begin, other.begin);
+        SlotId const e = std::min(end, other.end);
+        return b < e ? SlotWindow{b, e} : SlotWindow{b, b};
+    }
+
+    //! Smallest window covering both.
+    [[nodiscard]] SlotWindow hull(SlotWindow const& other) const noexcept
+    {
+        return SlotWindow{std::min(begin, other.begin), std::max(end, other.end)};
+    }
+
+    bool operator==(SlotWindow const& other) const noexcept
+    {
+        return begin == other.begin && end == other.end;
+    }
+
+    bool operator!=(SlotWindow const& other) const noexcept
+    {
+        return !(*this == other);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Slot — represents ownership of one allocated slot in a pool group.
@@ -131,44 +191,90 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// SlotAllocator — manages a fixed-capacity array of slot ids.
-// Mirrors _storage/_core.py::SlotAllocator.
+// SlotAllocator — manages the slot ids of one window [begin, end).
+// Mirrors _storage/_core.py::SlotAllocator, generalized to windows that need not
+// start at 0 and may move at either end (copy-based rebalancing).
+//
+// Ids are issued lazily: the ids handed out at least once form one contiguous
+// run inside the target window ("issued"), and new ids extend that run at the end
+// the growth direction prefers. Released ids are recycled before new ones are
+// issued. A shrink sets a smaller target window first; ids outside it are
+// overflow until every one of them has been released, then finishShrink() adopts
+// the target.
 // ---------------------------------------------------------------------------
 class SlotAllocator
 {
 public:
+    //! Which end of the window fresh ids are taken from.
+    //!
+    //! Under copy-based rebalancing a window's edges move, and any block sitting
+    //! next to a moving edge may have to be copied. Issuing ids away from the edge
+    //! that moves keeps that region cold for as long as possible.
+    enum class Growth
+    {
+        kAscending,  //!< from begin upward: the end edge is the one that moves
+        kDescending, //!< from end downward: the begin edge is the one that moves
+    };
+
     explicit SlotAllocator(SlotCount capacity);
+    SlotAllocator(SlotWindow window, Growth growth);
     ~SlotAllocator();
 
     [[nodiscard]] SlotCount numFreeSlots() const noexcept;
     [[nodiscard]] SlotCount numOccupiedSlots() const noexcept;
 
+    //! Number of slots in the window (not an id bound unless the window starts at 0).
     [[nodiscard]] SlotCount numSlots() const noexcept
     {
-        return mCapacity;
+        return mWindow.size();
+    }
+
+    [[nodiscard]] SlotWindow window() const noexcept
+    {
+        return mWindow;
+    }
+
+    [[nodiscard]] SlotWindow targetWindow() const noexcept
+    {
+        return mTarget;
+    }
+
+    [[nodiscard]] Growth growth() const noexcept
+    {
+        return mGrowth;
     }
 
     // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
     // here so no caller has to remember the lower one.
     [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
     {
-        return slot >= SlotId{0} && slot < numSlots();
+        return mWindow.contains(slot);
     }
 
     Slot allocate();
     std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
 
+    //! Grow the window to newNumSlots, keeping its begin.
     void expand(SlotCount newNumSlots);
+    //! Grow the window to `window`, which must contain the current one.
+    void expandWindow(SlotWindow window);
+    //! Start shrinking the window to newNumSlots, keeping its begin.
     void prepareForShrink(SlotCount newNumSlots);
+    //! Start shrinking the window to `target`, which must lie inside the current one.
+    void prepareForShrinkWindow(SlotWindow target);
     bool finishShrink();
 
     [[nodiscard]] bool shrinkInProgress() const noexcept
     {
-        return mTargetCapacity < mCapacity;
+        return mTarget != mWindow;
     }
 
     [[nodiscard]] std::vector<SlotId> getSlotsBlockingShrink() const;
+
+    //! How many ids issued so far lie outside `target`; these must all be vacated before the
+    //! window can shrink to it.
+    [[nodiscard]] SlotCount numIssuedOutside(SlotWindow target) const noexcept;
 
     // Read-only accessors for debug assertions (mirrors Python's direct attribute access).
     [[nodiscard]] SlotCount numOverflowSlots() const noexcept
@@ -176,14 +282,21 @@ public:
         return slotCountValueFromSize(mOverflowSlots.size());
     }
 
+    //! Number of ids issued at least once and still inside the window.
     [[nodiscard]] SlotCount numActiveSlots() const noexcept
     {
-        return mNumActiveSlots;
+        return mIssued.size() + mNumIssuedOutsideTarget;
+    }
+
+    //! Issued ids outside the target window during a shrink; zero otherwise.
+    [[nodiscard]] SlotCount numIssuedOutsideTarget() const noexcept
+    {
+        return mNumIssuedOutsideTarget;
     }
 
     [[nodiscard]] SlotCount targetCapacity() const noexcept
     {
-        return mTargetCapacity;
+        return mTarget.size();
     }
 
     void synchronize();
@@ -191,13 +304,19 @@ public:
 private:
     void scrubEvents();
     [[nodiscard]] bool check() const noexcept;
+    [[nodiscard]] SlotId issueFreshId();
 
-    SlotCount mCapacity;
-    SlotCount mTargetCapacity;
-    SlotCount mNumActiveSlots;
+    SlotWindow mWindow;
+    SlotWindow mTarget;
+    //! Ids issued at least once that lie inside the target window: always one contiguous run.
+    SlotWindow mIssued;
+    //! Ids issued at least once that lie outside the target window (shrink in progress).
+    SlotCount mNumIssuedOutsideTarget = 0;
+    Growth mGrowth = Growth::kAscending;
     SlotCount mNumReadyRecycledSlots;
     std::deque<Slot> mRecycledSlots;
     std::vector<Slot> mOverflowSlots;
+    //! Indexed by slot id, so sized to the window's end rather than its size.
     DynamicBitset mOccupiedMask;
 };
 
@@ -249,11 +368,24 @@ public:
 
     virtual SlotCount numSlots() const noexcept = 0;
 
+    //! First slot id of the pool: its ids are [slotBegin(), slotBegin() + numSlots()).
+    [[nodiscard]] virtual SlotId slotBegin() const noexcept
+    {
+        return SlotId{0};
+    }
+
+    //! Exclusive bound on every slot id this pool can ever hold, at any size. Kernels index
+    //! the pool from baseAddress(), so views over it must extend this far.
+    [[nodiscard]] virtual SlotCount slotIdUpperBound() const noexcept
+    {
+        return numSlots();
+    }
+
     // SlotId is signed, so a bare `slot < numSlots()` admits negatives, which then convert to a
     // huge size_t offset. Both ends are checked here so no caller has to remember the lower one.
     [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
     {
-        return slot >= SlotId{0} && slot < numSlots();
+        return slot >= slotBegin() && slot < slotBegin() + numSlots();
     }
 
     size_t numBytes() const noexcept
@@ -279,6 +411,20 @@ public:
     virtual void destroy() = 0;
     virtual void resize(SlotCount newNumSlots) = 0;
     virtual Address slotAddress(SlotId slot) const = 0;
+
+    //! Address of slot id 0, from which every slot address is base + id * slotSize. For an
+    //! arena pool that is the arena start, which may lie outside the pool's own window.
+    [[nodiscard]] virtual Address baseAddress() const
+    {
+        return slotAddress(SlotId{0});
+    }
+
+    //! Move the pool to `window`. Pools that are not arena-backed always start at 0.
+    virtual void setWindow(SlotWindow window)
+    {
+        TLLM_CHECK_WITH_INFO(window.begin == SlotId{0}, "Only arena pools have windows that do not start at 0");
+        resize(window.size());
+    }
 
 protected:
     size_t mSlotSize;
@@ -313,6 +459,63 @@ public:
 
 private:
     VirtMem mVirtMem;
+};
+
+// ---------------------------------------------------------------------------
+// ArenaGpuSlotPool — a window into a GPU arena shared by every pool group.
+//
+// The pool owns no memory. Its slot ids are arena-relative, slot `id` lives at
+// arenaBase + id * slotSize, and the pool may use only ids inside its window.
+// Moving the window maps or unmaps nothing.
+// ---------------------------------------------------------------------------
+class ArenaGpuSlotPool : public SlotPoolBase
+{
+public:
+    //! `granularity` is the arena's physical chunk size, the grain its bytes are counted in.
+    ArenaGpuSlotPool(
+        size_t slotSize, MemAddress arenaBase, size_t arenaBytes, SlotWindow window, size_t granularity);
+
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return mGranularity;
+    }
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
+    }
+
+    SlotCount numSlots() const noexcept override
+    {
+        return mWindow.size();
+    }
+
+    SlotId slotBegin() const noexcept override
+    {
+        return mWindow.begin;
+    }
+
+    SlotCount slotIdUpperBound() const noexcept override
+    {
+        return slotCountValueFromSize(mArenaBytes / mSlotSize);
+    }
+
+    void destroy() override;
+    void resize(SlotCount newNumSlots) override;
+    Address slotAddress(SlotId slot) const override;
+    Address baseAddress() const override;
+    void setWindow(SlotWindow window) override;
+
+    [[nodiscard]] SlotWindow window() const noexcept
+    {
+        return mWindow;
+    }
+
+private:
+    MemAddress mArenaBase;
+    size_t mArenaBytes;
+    SlotWindow mWindow;
+    size_t mGranularity;
 };
 
 // ---------------------------------------------------------------------------
@@ -405,6 +608,7 @@ class PoolGroupBase
 {
 public:
     explicit PoolGroupBase(SlotCount numSlots);
+    PoolGroupBase(SlotWindow window, SlotAllocator::Growth growth);
     virtual ~PoolGroupBase();
 
     //! The tier this pool group belongs to, which is what names it to the levels above:
@@ -456,6 +660,17 @@ public:
     void release(Slot slot);
     void destroy();
     void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt);
+    //! Move every pool to `window`. The slot allocator is moved separately, as with resizePools.
+    void setPoolWindows(SlotWindow window);
+
+    //! Address of slot id 0 of pool `poolIdx` (see SlotPoolBase::baseAddress).
+    Address baseAddress(PoolIndex poolIdx) const
+    {
+        return mPools.at(poolIdx)->baseAddress();
+    }
+
+    //! Exclusive bound on the slot ids this group can ever use.
+    SlotCount slotIdUpperBound() const noexcept;
 
     // Addresses for all pools at a given slot id.
     TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
@@ -568,6 +783,12 @@ public:
         PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {},
         HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
+
+    //! Arena-backed group (copy-based rebalancing): a window into the arena at
+    //! [arenaBase, arenaBase + arenaBytes). Device pools only; sparse (host-backed) pools are
+    //! rejected by ArenaGpuCacheLevelStorage.
+    GpuPoolGroup(SlotWindow window, SlotAllocator::Growth growth, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        MemAddress arenaBase, size_t arenaBytes, size_t arenaGranularity);
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
         return CacheTier::GPU_MEM;
@@ -691,9 +912,17 @@ public:
         return *mPoolGroups.at(pgIdx);
     }
 
+    PoolGroupBase const& poolGroup(PoolGroupIndex pgIdx) const
+    {
+        return *mPoolGroups.at(pgIdx);
+    }
+
+    //! Address of slot `slotId` of one pool, computed from the pool's base (slot id 0) so that it
+    //! is defined even for ids outside the pool's window, as an arena pool's base is.
     MemAddress getBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotId slotId) const
     {
-        return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
+        auto const& pg = *mPoolGroups.at(pgIdx);
+        return std::get<MemAddress>(pg.baseAddress(poolIdx)) + pg.slotSize().at(poolIdx) * toSizeT(slotId);
     }
 
     //! Bytes this level holds in pools whose pages are `medium`, each rounded to that
@@ -704,7 +933,7 @@ public:
     //! At cacheTier() this is what the level's quota pays for. Host-backed pools of a
     //! device level fall outside it, which is the point: a rebalance given an inflated
     //! figure would hand the level more slots than the device can hold.
-    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const
+    [[nodiscard]] virtual size_t roundedNumBytes(CacheTier medium) const
     {
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
@@ -917,6 +1146,77 @@ public:
 
 private:
     PooledPhysMemAllocator& mPhysMemAllocator;
+};
+
+// ---------------------------------------------------------------------------
+// ArenaGpuCacheLevelStorage — GPU level for copy-based rebalancing (CoReba).
+//
+// One VA range, mapped in full at construction and never remapped, holds every
+// pool group. Groups are laid out in PoolGroupIndex order, each owning a window
+// of arena-relative slot ids; every group's base pointer is the arena start, so
+// slot `id` of a group with slot size S is at arenaBase + id * S. A rebalance
+// recomputes the windows (computeArenaWindows) and moves blocks out of the parts
+// that change owner; base pointers never change.
+// ---------------------------------------------------------------------------
+class ArenaGpuCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    //! arenaBytes must be a multiple of the allocator's physical chunk size.
+    ArenaGpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, size_t arenaBytes,
+        TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        PooledPhysMemAllocator& physMemAllocator);
+    //! Destroys the pool groups before the arena they point into.
+    ~ArenaGpuCacheLevelStorage() override;
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
+    }
+
+    //! The arena is the quota and cannot change size: every byte of it is paid for by the GPU
+    //! tier, whatever share the windows give each group. It holds no pool of any other medium.
+    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const override
+    {
+        return medium == CacheTier::GPU_MEM ? mArenaBytes : 0;
+    }
+
+    [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
+    {
+        return mArenaBytes;
+    }
+
+    void destroy() override;
+
+    [[nodiscard]] MemAddress arenaBase() const noexcept
+    {
+        return mArena.address();
+    }
+
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> windows() const;
+
+    //! The windows this arena's pool groups would get for `ratioList`.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> computeWindows(
+        TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+
+    //! Split an arena of arenaBytes between pool groups laid out in index order, in proportion
+    //! to ratioList (byte shares), giving every group at least minSlots slots.
+    //!
+    //! Each boundary is snapped to a whole block of the larger of its two neighbours' slot sizes;
+    //! the other neighbour's window then stops at its last whole block before (or starts at its
+    //! first whole block after) it, so a boundary wastes less than one block of the smaller size.
+    //! Because the grid is fixed, a boundary that does not move leaves every block where it was.
+    static TypedVec<PoolGroupIndex, SlotWindow> computeArenaWindows(size_t arenaBytes,
+        TypedVec<PoolGroupIndex, size_t> const& slotSizes, TypedVec<PoolGroupIndex, float> const& ratioList,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+
+    //! Growth direction for the group at pgIdx: away from the boundary that moves.
+    static SlotAllocator::Growth growthFor(PoolGroupIndex pgIdx, PoolGroupIndex numPoolGroups) noexcept;
+
+private:
+    [[nodiscard]] TypedVec<PoolGroupIndex, size_t> slotSizes() const;
+
+    size_t mArenaBytes;
+    VirtMem mArena;
 };
 
 class HostCacheLevelStorage : public CacheLevelStorage

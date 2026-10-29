@@ -633,6 +633,16 @@ void KvCacheIntrospection::setTargetRatioListGpu(KvCacheManager& manager, TypedV
     ++manager.mTargetRatioGeneration;
 }
 
+std::vector<std::pair<SlotCount, SlotCount>> KvCacheIntrospection::gpuSlotWindows(KvCacheManager& manager)
+{
+    std::vector<std::pair<SlotCount, SlotCount>> result;
+    for (auto const& window : manager.mStorage->hotWindows())
+    {
+        result.emplace_back(window.begin.value(), window.end.value());
+    }
+    return result;
+}
+
 namespace
 {
 
