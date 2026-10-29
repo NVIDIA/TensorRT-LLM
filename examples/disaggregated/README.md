@@ -52,9 +52,7 @@ If an unsupported NIXL backend is specified, TRT-LLM selects the NIXL UCX backen
 
 ### LIBFABRIC Backend Setup
 
-**Note:** Containers built from NGC PyTorch base images with AWS EFA development files at `/opt/amazon/efa` build the NIXL-LIBFABRIC plugin against that installation by default (see `docker/common/install_nixl.sh`). Set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` to select this backend. Other base images fall back to system libfabric detection and may not include the plugin. Use the installation options below if the plugin is missing or you need a custom libfabric installation.
-
-**KV cache V2 limitation with the NIXL LIBFABRIC backend:** Two-node B300 testing with NGC PyTorch 26.09, NIXL 1.4.0 and AWS libfabric 2.4.0amzn5.0 exposed [NIXL allocation-context handling](https://github.com/ai-dynamo/nixl/pull/2425) and [libfabric CUDA VMM synchronization](https://github.com/ofiwg/libfabric/issues/12853) failures on the EFA RDM path. A diagnostic backport of the libfabric fixes alone still failed NIXL's context check. With that backport and unmodified NIXL, `NIXL_DISABLE_CUDA_ADDR_WA=1` allowed KV cache V2 inference to complete; this workaround does not fix the bundled libfabric. The container patches neither dependency and does not set this environment variable by default. Plugin availability does not establish KV cache V2 compatibility over EFA. KV cache V1 passed the Qwen3-0.6B TP1/PP1 control only. The NIXL UCX backend remains the default.
+**Note:** The NIXL-LIBFABRIC plugin is always built against libfabric 1.21.0, the same version used by NIXL upstream, to keep backward compatibility (see `docker/common/install_nixl.sh`). At runtime, containers built from NGC PyTorch base images use the AWS EFA installation at `/opt/amazon/efa`. Set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` to select this backend. Other base images fall back to system libfabric detection if available. Use the installation options below if the plugin is missing or you need a custom libfabric installation.
 
 #### Prerequisites
 
@@ -63,7 +61,7 @@ If an unsupported NIXL backend is specified, TRT-LLM selects the NIXL UCX backen
 **Required Dependencies:**
 
 **Libfabric**
-- Reuse the AWS EFA installation bundled in NGC PyTorch base images at `/opt/amazon/efa`, subject to the KV cache V2 limitation above.
+- Reuse the AWS EFA installation bundled in NGC PyTorch base images at `/opt/amazon/efa`.
 - For a custom libfabric installation, see [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
 - **Minimum required version:** v1.21.0
 - For EFA-enabled AWS instances using a non-bundled version, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
@@ -94,7 +92,7 @@ Skip these steps if your container already includes the NIXL LIBFABRIC plugin fo
 
 3. **Reinstall NIXL after installing libfabric:**
    - After installing libfabric and hwloc, you must rebuild NIXL to generate the LIBFABRIC plugin against your custom path
-   - You can base your installation on the TensorRT LLM NIXL installation script located at `docker/common/install_nixl.sh`, which selects the bundled AWS EFA path when its header and link library are present, or leaves `-Dlibfabric_path` empty for system detection
+   - You can base your installation on the TensorRT LLM NIXL installation script located at `docker/common/install_nixl.sh`, which uses libfabric v1.21.0 or leaves `-Dlibfabric_path` empty for system detection
    - For a custom installation, set `LIBFABRIC_INSTALL_PATH=/path/to/libfabric` immediately before the script's `meson setup` command, keeping the other Meson options unchanged
    - For more details, see the [NIXL LIBFABRIC Plugin documentation](https://github.com/ai-dynamo/nixl/tree/6ee64753605b3110f8ef96c7cfc2f1315675c9c7/src/plugins/libfabric#nixl-libfabric-plugin)
 
@@ -409,12 +407,12 @@ Skip this step if the container already includes AWS EFA at `/opt/amazon/efa`. O
 # Install AWS EFA library (required for LIBFABRIC with EFA)
 curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz
 tar -xf aws-efa-installer-latest.tar.gz
-cd aws-efa-installer && ./efa_installer.sh --yes --skip-kmod
+cd aws-efa-installer && ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify
 ```
 
 ##### 3. Rebuild NIXL with EFA Support if Needed
 
-Skip this step if the NIXL LIBFABRIC plugin was already built against the container's EFA installation. If you installed or replaced EFA, follow the rebuild instructions in [LIBFABRIC Backend Setup](#libfabric-backend-setup), using `/opt/amazon/efa` as the libfabric path.
+Skip this step if the NIXL LIBFABRIC plugin was already built against the container's libfabric version.
 
 ##### 4. Configure and Launch Services
 
