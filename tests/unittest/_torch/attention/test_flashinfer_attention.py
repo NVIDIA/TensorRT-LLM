@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import List, Optional, Union
 from unittest import mock
 
+import pytest
 import torch
 from parameterized import parameterized
 
@@ -1387,6 +1388,7 @@ def _refresh_wrappers(page_tuple):
     return FlashInferWrappers(is_planned=True, fa2_plan_num_blocks=page_tuple)
 
 
+@pytest.mark.cpu_only
 def test_page_table_change_replans_every_recorded_wrapper():
     """The multi-wrapper (variable sliding window) case the fix was written for.
 
@@ -1410,6 +1412,7 @@ def test_page_table_change_replans_every_recorded_wrapper():
     assert all(w.is_planned for w in cache.values())
 
 
+@pytest.mark.cpu_only
 def test_an_unchanged_page_table_does_not_replan():
     """The plan and its stream sync run only on a page-count change."""
     params = _FakePlanParams()
@@ -1422,6 +1425,7 @@ def test_an_unchanged_page_table_does_not_replan():
     assert cache[params].is_planned is True
 
 
+@pytest.mark.cpu_only
 def test_no_generations_clears_the_recorded_page_tuple():
     """A context-only step has no decode plan to keep current."""
     params = _FakePlanParams()
