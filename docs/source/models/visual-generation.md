@@ -183,6 +183,10 @@ are not supported. See the
   role `reference`. Audio requires an image or video reference. See the
   [Ref2VA example](../../../examples/visual_gen/README.md#minimax-h3-reference-to-video-and-audio)
   for input limits, ordering, and media dependencies.
+- With the FA4 backend, MiniMax-H3 requests FA4's 2-CTA forward kernel for its transformer
+  blocks on SM103 and SM107, where it is the faster BF16 attention at the clip lengths H3
+  runs; SM100 keeps FA4's default. An explicit `FA_DISABLE_2CTA` in the environment overrides
+  the request either way.
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
   model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
