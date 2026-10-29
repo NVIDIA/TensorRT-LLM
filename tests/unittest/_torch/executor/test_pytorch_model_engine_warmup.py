@@ -1051,7 +1051,10 @@ class TestWarmupCleanup(unittest.TestCase):
         warmup._warmup_timer = _WarmupTimer(rank=0)
         warmup.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
         warmup._config = SimpleNamespace(
-            dtype=torch.float16, cuda_graph_batch_sizes=[1, 4], enable_in_graph_sampling=False
+            dtype=torch.float16,
+            cuda_graph_batch_sizes=[1, 4],
+            enable_in_graph_sampling=False,
+            max_beam_width=1,
         )
         model_engine = object.__new__(ModelEngine)
         model_engine._metrics = warmup._metrics = {}
