@@ -4016,7 +4016,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                               num_groups=num_local_experts)
 
         if is_w4a16_nvfp4:
-            # W4A16 path: BF16/FP16 activations multiplied by FP4 weights.
+            # W4A16 path: BF16 activations multiplied by FP4 weights.
             # FlashInfer's W4A16 packer expects the ModelOpt scale contract:
             # normalized FP8 block scales plus per-expert ``weight_global_scale``.
             w1_alpha_b12x = w1_w_scale_2.to(torch.float32).contiguous()
@@ -4068,8 +4068,10 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         )
 
         # Replace the wrapper's per-instance output buffer with a shared one.
-        # Layers run sequentially on a single stream, so a single buffer of the
-        # right shape is correct and saves
+        # Layers run sequentially on a single stream, and a multi-chunk forward
+        # copies every chunk but the last out of it, the trailing ``torch.cat``
+        # the last (the backend declares ``run_moe_reuses_buffers``), so a
+        # single buffer of the right shape is correct and saves
         # ``(num_moe_layers - 1) * max_num_tokens * hidden_size * 2`` bytes —
         # ~2.5 GB on Nemotron-Super-120B with ``max_num_tokens=2048``,
         # ``hidden=8192``, bf16, 80 MoE layers.

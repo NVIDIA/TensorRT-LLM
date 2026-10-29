@@ -46,6 +46,7 @@ def route(
         pretrained_config.n_routed_experts,
         pretrained_config.q_lora_rank,
     )
+    index_n_heads = getattr(pretrained_config, "index_n_heads", None)
     # tp16: attention heads and the expert intermediate dimension sharded over
     # 16 ranks, no attention DP, no expert parallelism. A weight-layout
     # question, which is why it selects a target rather than a runtime branch.
@@ -84,15 +85,67 @@ def route(
         # isort: on
         # fmt: on
         return ModelingV2Glm52Nvfp4Sm107Tp16
+
+    # tep4: the attention heads and the dense MLPs sharded four ways, the experts
+    # sharded four ways. Attention DP would replicate attention, which is a
+    # different weight layout and so a different target.
+    tep4 = (
+        mapping.world_size == 4
+        and mapping.tp_size == 4
+        and mapping.pp_size == 1
+        and mapping.moe_ep_size == 4
+        and mapping.moe_tp_size == 1
+        and not mapping.enable_attention_dp
+    )
+    # The sm103 target drives the checkpoint's MTP module (layer 78) through the
+    # one-model MTP-Eagle loop with one draft token, or runs without speculation.
+    # A generation step then carries at most 2 query rows per sequence: the decode
+    # attention's grid, the base-row index kind and the specialised MLA rope kernel
+    # are built for that width. The engine resolves an unset draft length to 1
+    # before this runs.
+    draft_len = getattr(spec_config, "max_draft_len", None) or 1
+    draft_tokens = getattr(spec_config, "max_total_draft_tokens", None) or draft_len
+    mtp1_or_none = spec_config is None or (
+        isinstance(spec_config, MTPDecodingConfig)
+        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        and draft_len == 1
+        and draft_tokens == 1
+    )
+    # GLM-5.2-NVFP4 on 4 B300s (sm103), tep4, MTP-Eagle with one draft token or
+    # no speculation. index_n_heads is checked because a DeepSeek-V3.2-shaped DSA
+    # checkpoint would otherwise match the shape.
+    if (
+        compute_capability == (10, 3)
+        and shape == _SHAPE
+        and index_n_heads == 32
+        and tep4
+        and mtp1_or_none
+        and kv_cache_quant_algo == QuantAlgo.FP8
+    ):
+        # fmt: off
+        # isort: off
+        from .glm_5_2_nvfp4__sm_103__tep4.modeling import ModelingV2Glm52Nvfp4Sm103Tep4
+        # isort: on
+        # fmt: on
+        return ModelingV2Glm52Nvfp4Sm103Tep4
+
+    spec = (
+        "off"
+        if spec_config is None
+        else f"{spec_config.spec_dec_mode.name} (max_draft_len={draft_len}, "
+        f"max_total_draft_tokens={draft_tokens})"
+    )
     raise NoTarget(
         f"compute capability {compute_capability}, config shape {shape}, "
+        f"index_n_heads={index_n_heads}, "
         f"world_size={mapping.world_size} tp={mapping.tp_size} moe_ep={mapping.moe_ep_size} "
         f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp} "
-        f"pp={mapping.pp_size} cp={mapping.cp_size}, speculative decoding "
-        f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}; "
+        f"pp={mapping.pp_size} cp={mapping.cp_size}, speculative decoding {spec}; "
         f"KV cache {kv_cache_quant_algo or 'bf16'}; "
-        "the one glm_moe_dsa target is GLM-5.2-NVFP4 on sm107, tp16 (16 ranks, "
+        "the glm_moe_dsa targets are GLM-5.2-NVFP4 on sm107, tp16 (16 ranks, "
         "tensor-parallel attention and experts, no attention DP), with one-model "
-        "MTP-Eagle as a linear chain or no speculative decoding, and an fp8 latent "
-        "KV cache (not the packed fp8_ds_mla layout)"
+        "MTP-Eagle as a linear chain or no speculative decoding; and GLM-5.2-NVFP4 "
+        "on sm103, tep4 (4 ranks, tensor-parallel attention, expert-parallel MoE), "
+        "with one-model MTP-Eagle at max_draft_len=1 or no speculative decoding. "
+        "Both need an fp8 latent KV cache (not the packed fp8_ds_mla layout)"
     )
