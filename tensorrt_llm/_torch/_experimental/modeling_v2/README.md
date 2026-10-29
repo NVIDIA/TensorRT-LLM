@@ -309,7 +309,7 @@ with no code of its own declares no `SOURCES`.
 
 ### Default and specialized targets
 
-The parallel segment of a target's name is either one topology (for
+The final segment of a target's name is usually one topology (for
 example `dep4`) or `default`. A `default` target computes its weight shapes
 from the engine's `Mapping` and covers every layout its routing module
 admits. A named topology is a specialization, written only where one layout
@@ -318,6 +318,10 @@ the number of targets proportional to the specializations someone chose to
 write, not to the number of layouts a model is deployed at. Neither model
 has one today: the default forward computes the same thing at every layout
 a specialization once served.
+
+A workload specialization can span several topologies. For example,
+`glm_5_2_nvfp4__sm_107__low_latency` names the Rubin low-latency implementation;
+its routing module admits TP4, TP8 and TP16.
 
 The architecture segment `sm_10x` covers sm_100 (B200, GB200) and sm_103
 (B300, GB300): both run the same kernels, and every entry the two targets

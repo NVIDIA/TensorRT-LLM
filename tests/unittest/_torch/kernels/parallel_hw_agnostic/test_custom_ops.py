@@ -18,7 +18,7 @@ import torch
 import torch._library.utils as library_utils
 
 import tensorrt_llm  # noqa: F401
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__tp16.ops import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa_rubin.glm_5_2_nvfp4__sm_107__low_latency.ops import (  # noqa: E501
     _cpp_fakes,  # noqa: F401
 )
 

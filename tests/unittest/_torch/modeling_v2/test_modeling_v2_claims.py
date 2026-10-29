@@ -37,9 +37,12 @@ _ROOT = Path(_modeling_v2.__file__).resolve().parent
 _ARCHS = sorted(registered_routes())
 
 
-def _routing_path(arch: str) -> Path:
-    """The routing.py whose ``route`` is registered for ``arch``."""
-    return Path(sys.modules[registered_routes()[arch].__module__].__file__).resolve()
+def _routing_paths(arch: str) -> tuple[Path, ...]:
+    """Every deployment family's routing.py registered for ``arch``."""
+    return tuple(
+        Path(sys.modules[route.__module__].__file__).resolve()
+        for route in registered_routes()[arch]
+    )
 
 
 # ``route`` hands back the class itself, imported from the target directory
@@ -52,18 +55,17 @@ _TARGET_IMPORT = re.compile(
 
 def _routed_targets(arch: str):
     """(target directory, class name) for every target ``route`` can return."""
-    source = _routing_path(arch).read_text()
-    family_dir = _routing_path(arch).parent
     return [
-        (family_dir / target, plain or wrapped)
-        for target, plain, wrapped in _TARGET_IMPORT.findall(source)
+        (routing_path.parent / target, plain or wrapped)
+        for routing_path in _routing_paths(arch)
+        for target, plain, wrapped in _TARGET_IMPORT.findall(routing_path.read_text())
     ]
 
 
 def test_no_routing_module_is_orphaned():
     """A routing.py that models/__init__.py does not import, or whose ``route``
     carries no ``@routes``, would never be consulted."""
-    registered = {_routing_path(arch) for arch in _ARCHS}
+    registered = {path for arch in _ARCHS for path in _routing_paths(arch)}
     on_disk = set((_ROOT / "models").glob("*/routing.py"))
     assert on_disk == registered, (
         f"routing modules on disk with no registered route: "
@@ -75,8 +77,11 @@ def test_no_routing_module_is_orphaned():
 def test_no_target_directory_is_orphaned(arch):
     """A target directory ``route`` never imports from is dead code: nothing
     else can reach it."""
-    family_dir = _routing_path(arch).parent
-    on_disk = {p.parent for p in family_dir.glob("*/modeling.py")}
+    on_disk = {
+        p.parent
+        for routing_path in _routing_paths(arch)
+        for p in routing_path.parent.glob("*/modeling.py")
+    }
     routed = {target_dir for target_dir, _ in _routed_targets(arch)}
     assert on_disk == routed, (
         f"{arch}: target directories route() never imports: "
@@ -87,12 +92,12 @@ def test_no_target_directory_is_orphaned(arch):
 
 @pytest.mark.parametrize("arch", _ARCHS)
 def test_target_identity_matches_its_path(arch):
-    """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>,
+    """Identity is the directory name: <checkpoint>__<gpu arch>__<specialization>,
     and the class name encodes the same triple."""
     for target_dir, name in _routed_targets(arch):
         segments = target_dir.name.split("__")
         assert len(segments) == 3, (
-            f"{arch}: {target_dir.name!r} is not a <checkpoint>__<sm>__<parallel> directory name"
+            f"{arch}: {target_dir.name!r} is not a <checkpoint>__<sm>__<specialization> directory name"
         )
 
         def camel(segment: str) -> str:
@@ -407,9 +412,9 @@ def test_every_target_has_the_accuracy_gate_of_its_name():
     never run.
     """
     routed = {
-        (_routing_path(arch).parent.name, f"Test{name}")
+        (target_dir.parent.name, f"Test{name}")
         for arch in _ARCHS
-        for _, name in _routed_targets(arch)
+        for target_dir, name in _routed_targets(arch)
     }
     gates = set()
     for path in (_TESTS_ROOT / "integration/defs/accuracy/modeling_v2").glob("test_*.py"):
@@ -427,7 +432,7 @@ def test_every_target_has_the_accuracy_gate_of_its_name():
 # `unittest/`, with what they wait for. They are the only tests no list may
 # reach, and none of them may be listed.
 _NO_CI_STAGE = {
-    "unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/comm": (
+    "unittest/_torch/modeling_v2/models/glm_moe_dsa_rubin/glm_5_2_nvfp4__sm_107__low_latency/comm": (
         "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
 }

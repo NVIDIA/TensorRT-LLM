@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Architecture name -> ``route``, and the resolver that consults it.
+"""Architecture name -> candidate routes, and the resolver that selects one.
 
 The checkpoint's own ``architectures[0]`` (``GptOssForCausalLM``,
-``DeepseekV3ForCausalLM``) selects a family's ``route``, never a target: one
+``DeepseekV3ForCausalLM``) selects candidate family routes, never a target: one
 architecture has many deployments and a target serves exactly one of them.
 ``modeling_v2_resolve`` returns the target *class*, the model loader records it
 on ``ModelConfig.modeling_v2_target``, and ``AutoModelForCausalLM._resolve_class``
@@ -13,19 +13,17 @@ Two levels, on purpose:
 
 * Each family's ``routing.py`` declares the ``architectures[0]`` values its
   ``route`` serves with ``@routes(...)``, and ``models/__init__.py`` imports
-  every family's ``routing.py``, which is what registers them. The names are
-  things that already exist in every checkpoint's config.json, so adding a
-  new checkpoint, GPU arch or parallel topology never touches either -- only
-  a new architecture family does.
-* That ``route`` owns the rest of the decision as one
+  every family's ``routing.py``, which is what registers them. Independent
+  families may serve the same architecture; exactly one must match a deployment.
+* Each ``route`` owns its deployment decision as one
   forward-reading tree over the facts that fix which code runs. It receives
   the ``ModelConfig``, the LLM arguments and the GPU's compute capability, and
   reads from the first two the checkpoint's config, the parallel mapping, the
   speculative-decoding config, the KV-cache algorithm the engine will run with
   (:func:`engine_kv_cache_quant_algo`) and any other engine choice its targets
   depend on. It returns the target class, or raises :class:`NoTarget` with the
-  reason in words. Reading that one file tells you where any configuration
-  lands.
+  reason in words. The resolver consults every candidate and rejects ambiguous
+  matches, so registration order never determines which target runs.
 
 Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
 are deliberately not routing inputs. They do not change which code runs, so a
@@ -42,7 +40,7 @@ from __future__ import annotations
 
 import enum
 import os
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -50,26 +48,27 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-# architectures[0] -> the ``route`` that decides where it lands, filled by ``@routes``.
-_ROUTES: Dict[str, Callable[..., type]] = {}
+# architectures[0] -> candidate routes, filled by ``@routes``.
+_ROUTES: dict[str, tuple[Callable[..., type], ...]] = {}
 
 
 def routes(*architectures: str):
-    """Declare that the decorated ``route`` decides where these ``architectures[0]`` values land."""
+    """Register a deployment-family route for these ``architectures[0]`` values."""
 
     def register(route):
         for arch in architectures:
-            assert arch not in _ROUTES, (
-                f"{arch} routed by both {_ROUTES[arch].__module__} and {route.__module__}"
+            candidates = _ROUTES.get(arch, ())
+            assert route not in candidates, (
+                f"{arch} already registers {route.__module__}.{route.__name__}"
             )
-            _ROUTES[arch] = route
+            _ROUTES[arch] = (*candidates, route)
         return route
 
     return register
 
 
-def registered_routes() -> Dict[str, Callable[..., type]]:
-    """architectures[0] -> ``route``, for every family ``models/__init__.py`` imports."""
+def registered_routes() -> dict[str, tuple[Callable[..., type], ...]]:
+    """architectures[0] -> candidate routes from every imported family."""
     from . import models  # noqa: F401
 
     return _ROUTES
@@ -180,8 +179,9 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
 
     Returns the target class, or None for the built-in implementation:
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
-    for the architecture, or when that ``route`` raises ``NoTarget``.
+    for the architecture, or when every candidate raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+    Multiple matching routes are an error in both ``auto`` and ``require``.
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -193,11 +193,29 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     arch = pretrained_config.architectures[0]
 
     try:
-        route = registered_routes().get(arch)
-        if route is None:
+        candidates = registered_routes().get(arch, ())
+        if not candidates:
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
-        return route(config, llm_args, _device_compute_capability())
+        capability = _device_compute_capability()
+        matches = []
+        declines = []
+        for route in candidates:
+            try:
+                target = route(config, llm_args, capability)
+            except NoTarget as why:
+                declines.append(f"{route.__module__}: {why}")
+            else:
+                matches.append((route, target))
+        if len(matches) > 1:
+            detail = "; ".join(
+                f"{route.__module__}.{route.__name__} -> {_qualified(target)}"
+                for route, target in matches
+            )
+            raise ValueError(f"modeling_v2: ambiguous routes for {arch!r}: {detail}")
+        if not matches:
+            raise NoTarget("; ".join(declines))
+        return matches[0][1]
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None

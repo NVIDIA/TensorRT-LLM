@@ -402,8 +402,11 @@
 # co-own them with each parent path's owners.
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
-/cpp/tensorrt_llm/kernels/glmMoeDsa @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
-/cpp/tensorrt_llm/thop/glmMoeDsa/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa_rubin/ @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
+/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa_rubin/ @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
+/tests/integration/defs/accuracy/modeling_v2/test_glm_moe_dsa_rubin.py @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
+/cpp/tensorrt_llm/kernels/glmMoeDsaRubin/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
+/cpp/tensorrt_llm/thop/glmMoeDsaRubin/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
 # A family's native code lives in its csrc/ directories: the kernels owners
 # co-own it. Last, so it applies under the family rules above; a family with its
 # own owners adds them here.

@@ -31,6 +31,7 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     NoTarget,
     modeling_v2_resolve,
@@ -166,6 +167,93 @@ def _model_config(
 
 # A speculative mode no target implements.
 _NGRAM = NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2)
+
+
+@pytest.fixture
+def _isolated_router_registry(monkeypatch) -> ModelConfig:
+    # Load real family registrations before replacing the registry for this test.
+    _router_index.registered_routes()
+    monkeypatch.setattr(_router_index, "_ROUTES", {})
+    return _model_config(PretrainedConfig(architectures=["SharedTestArchitecture"]))
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_multiple_routes_select_the_unique_match(_isolated_router_registry, mode, reverse):
+    called = []
+
+    def decline(*args) -> type:
+        called.append("decline")
+        raise NoTarget("different deployment")
+
+    def match(*args) -> type:
+        called.append("match")
+        return ModelConfig
+
+    candidates = (match, decline) if reverse else (decline, match)
+    for candidate in candidates:
+        _router_index.routes("SharedTestArchitecture")(candidate)
+    assert modeling_v2_resolve(_isolated_router_registry, _llm_args(mode)) is ModelConfig
+    assert sorted(called) == ["decline", "match"]
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_multiple_routes_preserve_all_decline_reasons(_isolated_router_registry, mode):
+    @_router_index.routes("SharedTestArchitecture")
+    def first(*args) -> type:
+        raise NoTarget("first deployment mismatch")
+
+    @_router_index.routes("SharedTestArchitecture")
+    def second(*args) -> type:
+        raise NoTarget("second deployment mismatch")
+
+    if mode == "auto":
+        assert modeling_v2_resolve(_isolated_router_registry, _llm_args(mode)) is None
+    else:
+        with pytest.raises(
+            ValueError, match="first deployment mismatch.*second deployment mismatch"
+        ):
+            modeling_v2_resolve(_isolated_router_registry, _llm_args(mode))
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_multiple_matching_routes_are_an_error(_isolated_router_registry, mode):
+    @_router_index.routes("SharedTestArchitecture")
+    def first(*args) -> type:
+        return ModelConfig
+
+    @_router_index.routes("SharedTestArchitecture")
+    def second(*args) -> type:
+        return ModelConfig
+
+    # Even returning the same class must not hide two overlapping deployment claims.
+    with pytest.raises(ValueError, match="ambiguous routes.*first.*second"):
+        modeling_v2_resolve(_isolated_router_registry, _llm_args(mode))
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_router_errors_are_not_hidden_by_another_match(_isolated_router_registry, mode, reverse):
+    def match(*args) -> type:
+        return ModelConfig
+
+    def broken(*args) -> type:
+        raise RuntimeError("target setup failed")
+
+    candidates = (broken, match) if reverse else (match, broken)
+    for candidate in candidates:
+        _router_index.routes("SharedTestArchitecture")(candidate)
+    with pytest.raises(RuntimeError, match="target setup failed"):
+        modeling_v2_resolve(_isolated_router_registry, _llm_args(mode))
+
+
+def test_registering_the_same_route_twice_is_rejected(_isolated_router_registry):
+    @_router_index.routes("SharedTestArchitecture")
+    def route(*args) -> type:
+        return ModelConfig
+
+    with pytest.raises(AssertionError, match="already registers"):
+        _router_index.routes("SharedTestArchitecture")(route)
 
 
 def _qwen4_exp_config(**vision_overrides):
