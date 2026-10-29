@@ -13,6 +13,7 @@ from tensorrt_llm._torch.pyexecutor.engine.metadata import (
     _get_max_num_heads_per_kv,
     build_attention_metadata,
 )
+from tensorrt_llm.mapping import CpType, Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -99,6 +100,44 @@ def test_build_attention_metadata_forwards_shared_and_cache_inputs() -> None:
     assert metadata.draft_kv_cache_manager is draft_kv_cache_manager
     assert metadata.enable_context_mla_with_cached_kv
     assert metadata.max_num_heads_per_kv == 4
+
+
+@pytest.mark.parametrize(
+    ("mla", "cp_size", "override", "expected"),
+    [
+        pytest.param(True, 2, None, True, id="fresh-helix-mla"),
+        pytest.param(True, 1, None, False, id="ordinary-mla"),
+        pytest.param(False, 2, None, False, id="helix-non-mla"),
+        pytest.param(True, 2, False, False, id="explicit-disable"),
+        pytest.param(True, 1, True, True, id="explicit-enable"),
+    ],
+)
+def test_build_attention_metadata_fresh_helix_mla_default(
+    mla: bool, cp_size: int, override: bool | None, expected: bool
+) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            kv_lora_rank=512 if mla else None,
+            qk_rope_head_dim=64 if mla else None,
+        ),
+        sparse_attention_config=None,
+        enable_flash_mla=False,
+    )
+    metadata = build_attention_metadata(
+        model_config,
+        max_batch_size=4,
+        max_num_tokens=16,
+        max_beam_width=1,
+        attention_backend=_AttentionBackend,
+        attention_runtime_features=AttentionRuntimeFeatures(
+            cache_reuse=False, chunked_prefill=False
+        ),
+        mapping=Mapping(world_size=cp_size, cp_size=cp_size, cp_config={"cp_type": CpType.HELIX}),
+        cache_indirection=None,
+        enable_context_mla_with_cached_kv=override,
+    )
+
+    assert metadata.enable_context_mla_with_cached_kv is expected
 
 
 @pytest.mark.parametrize(

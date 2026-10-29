@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Check Helix's phase-dependent head split with complete Kimi K3 MLA outputs.
+"""Check Kimi K3 MLA head layouts, KV ownership and prefill/decode handoff.
 
-These tests deliberately replicate the KV history to isolate projection and
-head-layout correctness. Owner-only persistence and distributed cached-context
-loading need separate tests; this fixture does not validate their handoff.
+Head-only cases replicate KV history to isolate projection/layout correctness.
+Storage cases use Helix pages, check exact ownership and unchanged storage,
+and decode directly from prefill. Historical attention gathering is separate.
 """
 
 import pickle
@@ -33,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+from tensorrt_llm._torch.pyexecutor.engine.metadata import build_attention_metadata
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import CpType, Mapping
@@ -50,6 +51,9 @@ class _Scenario:
     num_heads: int = 32
     fp8: bool = False
     gate: bool = True
+    check_kv_ownership: bool = False
+    fp8_cache: bool = False
+    compact_cache: bool = False
 
 
 @torch.no_grad()
@@ -84,7 +88,7 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         rms_norm_eps=1e-6,
         mla_use_nope=True,
         mla_use_output_gate=scenario.gate,
-        max_position_embeddings=512,
+        max_position_embeddings=2048 if scenario.check_kv_ownership else 512,
     )
     config._attn_implementation = "eager"
     reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
@@ -92,7 +96,7 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
     model_config = ModelConfig(
         pretrained_config=config,
         mapping=mapping,
-        quant_config=QuantConfig(),
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8 if scenario.fp8_cache else None),
         quant_config_dict={
             f"model.layers.0.self_attn.{name}": QuantConfig(
                 quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
@@ -128,6 +132,8 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
     assert mixer.mqa.num_heads == config.num_attention_heads // scenario.tp_size
 
     reference.cuda()
+    if scenario.check_kv_ownership:
+        return _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scenario)
     batch, context_length = 2, 128
     generator = torch.Generator(device="cuda").manual_seed(1234)
     hidden = torch.randn(
@@ -246,6 +252,348 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
     finally:
         handle.remove()
         manager.shutdown()
+
+
+def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scenario):
+    config = model_config.pretrained_config
+    # Default cases overallocate so the old writer can fail safely. Compact
+    # cases reserve only the ledger pages needed by the global maximum.
+    lengths = [31, 64, 65, 127, 128, 129, 191, 193]
+    if scenario.compact_cache:
+        # Amortize the VMM slab even for one-byte FP8 cache elements.
+        lengths *= 4
+    batch, max_length = len(lengths), max(lengths) + 4
+    generator = torch.Generator(device="cuda").manual_seed(5678)
+    hidden = torch.randn(
+        batch,
+        max_length,
+        config.hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    mask = torch.full((max_length, max_length), float("-inf"), device="cuda").triu(1)[None, None]
+    expected = reference(hidden, attention_mask=mask)
+    cache_context = max_length
+    if scenario.compact_cache:
+        # The helper reserves (context_per_rank + 1) * CP global tokens.
+        # Reserve only the physical pages needed by the global maximum.
+        cache_context = (max_length + mapping.cp_size) // mapping.cp_size - 1
+    manager, _ = setup_kv_and_metadata(
+        SimpleNamespace(
+            ctx_len=cache_context * mapping.world_size,
+            batch=batch,
+            kv_cache_tokens_per_block=64,
+            num_layers=1,
+            kv_cache_dtype=torch.float8_e4m3fn if scenario.fp8_cache else torch.bfloat16,
+        ),
+        mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+    )
+    cache = manager.get_buffers(0)
+    if scenario.compact_cache:
+        page = manager.tokens_per_block
+        # VMM rounds the backing pool to a 2 MiB slab. Compare against
+        # page-rounded unsharded storage and check assigned pages separately.
+        unsharded_pages = batch * ((max_length + page) // page)
+        assert cache.shape[0] < unsharded_pages
+        assert all(manager.kv_cache_map[req].num_blocks == 1 for req in range(batch))
+        print(
+            f"CP={mapping.cp_size} compact KV bytes per rank: "
+            f"{cache.numel() * cache.element_size()}",
+            flush=True,
+        )
+    cache.fill_(-2)
+    captured = []
+    generated = []
+    original_context = mixer.forward_context
+    original_generation = mixer.mqa.mla_rope_generation
+    prefill_lengths = list(lengths)
+
+    def remember_context(*args, **kwargs):
+        latent_cache = kwargs["latent_cache"] if "latent_cache" in kwargs else args[6]
+        captured.append(latent_cache.clone())
+        return original_context(*args, **kwargs)
+
+    mixer.forward_context = remember_context
+
+    def remember_generation(*args, **kwargs):
+        generated.append(args[2].clone())
+        return original_generation(*args, **kwargs)
+
+    mixer.mqa.mla_rope_generation = remember_generation
+    attrs = {"mla_layers": {mixer.layer_idx_str: weakref.ref(mixer)}}
+    page = manager.tokens_per_block
+
+    def metadata_for(
+        query_lengths,
+        cached,
+        num_contexts,
+        global_positions=None,
+        *,
+        enable_context_mla_with_cached_kv=None,
+    ):
+        metadata = build_attention_metadata(
+            model_config,
+            max_batch_size=batch,
+            max_num_tokens=sum(query_lengths),
+            max_beam_width=1,
+            attention_backend=get_attention_backend("TRTLLM"),
+            attention_runtime_features=AttentionRuntimeFeatures(
+                cache_reuse=False, chunked_prefill=False
+            ),
+            kv_cache_manager=manager,
+            mapping=mapping,
+            cache_indirection=None,
+            enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
+        )
+        metadata.seq_lens = torch.tensor(query_lengths, dtype=torch.int)
+        metadata.request_ids = list(range(batch))
+        metadata.num_contexts = num_contexts
+        metadata.prompt_lens = [
+            query_lengths[i] if i < num_contexts else lengths[i] for i in range(batch)
+        ]
+        metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached)
+        if global_positions is not None:
+            metadata.update_helix_param(
+                global_positions,
+                [(g // page) % mapping.cp_size != mapping.cp_rank for g in global_positions],
+            )
+        else:
+            # Initialize the legacy context-position view as well so the
+            # unchanged writer is safe to run as a negative control.
+            metadata.update_helix_param(
+                [g for length in query_lengths for g in range(length)], [False] * batch
+            )
+        metadata.prepare()
+        attrs["attention_metadata"] = weakref.ref(metadata)
+        return metadata
+
+    def owned_positions(length):
+        return [g for g in range(length) if (g // page) % mapping.cp_size == mapping.cp_rank]
+
+    def check_cache(metadata, history):
+        occupied = torch.zeros(cache.shape[0], page, dtype=torch.bool, device="cuda")
+        for req, values in enumerate(history):
+            positions = owned_positions(values.shape[0])
+            if not positions:
+                continue
+            local = torch.arange(len(positions), device="cuda")
+            blocks = metadata.kv_cache_block_offsets[0, req, 0][local // page].long()
+            actual = cache[blocks, 0, local % page, 0]
+            target = values[positions].to(cache.dtype)
+            torch.testing.assert_close(actual.float(), target.float(), atol=0, rtol=0)
+            occupied[blocks, local % page] = True
+        unused = cache[:, 0, :, 0][~occupied]
+        assert torch.equal(
+            unused.view(torch.uint8), torch.full_like(unused, -2).view(torch.uint8)
+        ), f"CP rank {mapping.cp_rank} wrote a non-owned KV slot"
+
+    try:
+        metadata = metadata_for(lengths, [0] * batch, batch)
+        context = torch.cat([hidden[i, :length] for i, length in enumerate(lengths)])
+        with model_extra_attrs(attrs):
+            actual = runtime(context, metadata)
+        target = torch.cat([expected[i, :length] for i, length in enumerate(lengths)])
+        _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
+        history = list(captured[0].split(lengths))
+        check_cache(metadata, history)
+        # No cache injection or repair: these are the pages written by prefill.
+        metadata = metadata_for(
+            [lengths[0]] + [1] * (batch - 1),
+            [0] + [len(owned_positions(g)) for g in lengths[1:]],
+            1,
+            lengths[1:],
+        )
+        mixed = torch.cat(
+            (
+                hidden[0, : lengths[0]],
+                torch.stack([hidden[i, g] for i, g in enumerate(lengths) if i > 0]),
+            )
+        )
+        with model_extra_attrs(attrs):
+            actual = runtime(mixed, metadata)
+        target = torch.cat(
+            (
+                expected[0, : lengths[0]],
+                torch.stack([expected[i, g] for i, g in enumerate(lengths) if i > 0]),
+            )
+        )
+        _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
+        history[0] = captured[-1]
+        for req in range(1, batch):
+            history[req] = torch.cat((history[req], generated[-1][req - 1 : req]))
+        check_cache(metadata, history)
+        lengths = [lengths[0]] + [g + 1 for g in lengths[1:]]
+        for _ in range(3):
+            metadata = metadata_for(
+                [1] * batch, [len(owned_positions(g)) for g in lengths], 0, lengths
+            )
+            inputs = torch.stack([hidden[i, g] for i, g in enumerate(lengths)])
+            with model_extra_attrs(attrs):
+                actual = runtime(inputs, metadata)
+            target = torch.stack([expected[i, g] for i, g in enumerate(lengths)])
+            _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
+            history = [
+                torch.cat((values, generated[-1][req : req + 1]))
+                for req, values in enumerate(history)
+            ]
+            check_cache(metadata, history)
+            lengths = [g + 1 for g in lengths]
+
+        # Exercise the context writer with nonzero global prefixes and real
+        # RoPE, independently of historical-attention gathering.
+        # This happens after the direct prefill/decode handoff checks above.
+        # The unsharded control also needs cached-context indptrs for this probe.
+        chunk = 7
+        metadata = metadata_for(
+            [chunk] * batch,
+            [g - chunk for g in prefill_lengths],
+            batch,
+            enable_context_mla_with_cached_kv=True,
+        )
+        latent = torch.cat(
+            [values[g - chunk : g] for values, g in zip(history, prefill_lengths)]
+        ).clone()
+        q = torch.randn(
+            batch * chunk,
+            mixer.num_context_heads * mixer.qk_head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        if mapping.cp_size > 1:
+            saved_cache = cache.clone()
+            with pytest.raises(NotImplementedError, match="distributed KV gathering"):
+                original_context(
+                    q=q,
+                    compressed_kv=latent[:, : mixer.kv_lora_rank],
+                    k_pe=latent[:, mixer.kv_lora_rank :],
+                    position_ids=None,
+                    attn_metadata=metadata,
+                    output=torch.empty_like(q),
+                    latent_cache=latent,
+                )
+            torch.testing.assert_close(cache.float(), saved_cache.float(), atol=0, rtol=0)
+        expected_q = q.clone().view(-1, mixer.num_context_heads, mixer.qk_head_dim)
+
+        def quarter_turn(values):
+            pairs = values.unflatten(-1, (-1, 2))
+            return torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(-2)
+
+        expected_q[..., mixer.qk_nope_head_dim :] = quarter_turn(
+            expected_q[..., mixer.qk_nope_head_dim :]
+        )
+        expected_latent = latent.clone()
+        expected_latent[:, mixer.kv_lora_rank :] = quarter_turn(latent[:, mixer.kv_lora_rank :])
+        expected_cache = cache.clone()
+        for req, length in enumerate(prefill_lengths):
+            own = owned_positions(length)
+            for g in range(length - chunk, length):
+                if g not in own:
+                    continue
+                local = own.index(g)
+                block = metadata.kv_cache_block_offsets[0, req, 0, local // page].item()
+                expected_cache[block, 0, local % page, 0] = expected_latent[
+                    req * chunk + g - (length - chunk)
+                ].to(cache.dtype)
+        table = mixer.mha.rotary_cos_sin
+        saved_table = table.clone()
+        try:
+            table.view(-1, 2)[:, 0] = 0
+            table.view(-1, 2)[:, 1] = 1
+            mixer.mha.mla_rope_append_paged_kv_assign_q(q, latent, metadata)
+            torch.testing.assert_close(q.view_as(expected_q), expected_q, atol=0, rtol=0)
+            torch.testing.assert_close(latent, expected_latent, atol=0, rtol=0)
+            torch.testing.assert_close(cache.float(), expected_cache.float(), atol=0, rtol=0)
+        finally:
+            table.copy_(saved_table)
+        return 0.0
+    finally:
+        mixer.forward_context = original_context
+        mixer.mqa.mla_rope_generation = original_generation
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@skip_pre_blackwell
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16-weights", "fp8-weights"])
+@pytest.mark.parametrize("num_heads,gate", [(32, True), (6, False), (6, True)])
+def test_k3_mla_fp8_cache_reference(fp8, num_heads, gate):
+    # Keep an unsharded numerical/control baseline for the FP8 KV cache.
+    run_helix_test(
+        _check_context_heads,
+        _Scenario(
+            cp_size=1,
+            num_heads=num_heads,
+            gate=gate,
+            fp8=fp8,
+            fp8_cache=True,
+            check_kv_ownership=True,
+        ),
+        "nccl",
+        world_size=1,
+        max_mismatch_ratio=0.0,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs")
+@skip_pre_blackwell
+@pytest.mark.parametrize("fp8_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
+def test_k3_mla_helix_compact_cache(fp8_cache):
+    run_helix_test(
+        _check_context_heads,
+        _Scenario(
+            cp_size=4, fp8=True, fp8_cache=fp8_cache, check_kv_ownership=True, compact_cache=True
+        ),
+        "nccl",
+        world_size=4,
+        max_mismatch_ratio=0.0,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+@skip_pre_blackwell
+@pytest.mark.parametrize("fp8_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16-weights", "fp8-weights"])
+@pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
+@pytest.mark.parametrize(
+    "tp_size,cp_size,num_heads",
+    [
+        (1, 2, 32),
+        pytest.param(
+            2,
+            2,
+            32,
+            marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs"),
+        ),
+        pytest.param(
+            1,
+            4,
+            32,
+            marks=pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs"),
+        ),
+        (1, 2, 6),
+    ],
+    ids=["tp1-cp2", "tp2-cp2", "tp1-cp4", "tp1-cp2-unaligned"],
+)
+def test_k3_mla_helix_owned_prefill(fp8, fp8_cache, gate, tp_size, cp_size, num_heads):
+    run_helix_test(
+        _check_context_heads,
+        _Scenario(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            num_heads=num_heads,
+            fp8=fp8,
+            gate=gate,
+            check_kv_ownership=True,
+            fp8_cache=fp8_cache,
+        ),
+        "nccl",
+        world_size=tp_size * cp_size,
+        max_mismatch_ratio=0.0,
+    )
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")

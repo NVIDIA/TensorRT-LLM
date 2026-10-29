@@ -64,8 +64,11 @@ def build_attention_metadata(
     """Construct attention metadata and resolve model-derived inputs."""
     pretrained_config = model_config.pretrained_config
     if enable_context_mla_with_cached_kv is None:
+        # Owner-only Helix prefill uses the append indptrs even without cached tokens.
         enable_context_mla_with_cached_kv = is_mla(pretrained_config) and (
-            attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
+            attention_runtime_features.cache_reuse
+            or attention_runtime_features.chunked_prefill
+            or mapping.has_cp_helix()
         )
     if max_num_heads_per_kv is None:
         max_num_heads_per_kv = _get_max_num_heads_per_kv(model_config)
