@@ -92,8 +92,11 @@ from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, per
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo, validate_protocol_version
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    build_page_table_from_manager,
+)
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -2286,6 +2289,9 @@ class TxSession(TxSessionBase):
                 self._retirement.close()
             raise
         self.receiver_ready: bool = False
+        # When the context side opened the send, so that the rebalance drain
+        # can tell how long a send has been waiting for receiver_ready.
+        self.created_monotonic = time.monotonic()
         self.kv_tasks = []
         self.aux_task = None
         self._reported_aux_peer_ranks: set[int] = set()
@@ -3344,6 +3350,16 @@ class Receiver(ReceiverBase):
     def _should_register_peer(self, params: DisaggregatedParams) -> bool:
         endpoint = self._extract_info_endpoint(params)
         return endpoint not in self._sender_ep_instance_map
+
+    @property
+    def has_registered_with_peers(self) -> bool:
+        """Whether any context peer holds this rank's page table and agent desc.
+
+        ``REGISTER_RANK_INFO`` is the only way a peer learns them, and it is
+        sent from ``_get_sender_info`` alone, which records the peer here.
+        Entries are never removed, so once True this stays True.
+        """
+        return bool(self._sender_ep_instance_map)
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
@@ -4477,6 +4493,32 @@ class RankInfoServer:
         self.shutdown()
 
 
+# Incremental KV pool registration (see TransferWorker._register_kv_tails): the
+# registration unit, and a switch back to registering every pool as a whole.
+_KV_REG_SEGMENT_BYTES = 64 << 20
+
+
+def _incremental_kv_registration_enabled() -> bool:
+    return os.environ.get("TLLM_KV_INCREMENTAL_REGISTRATION", "1") != "0"
+
+
+def _paged_kv_pools(page_table: KVCachePageTable) -> Optional[Dict[int, tuple]]:
+    """Every KV pool as base -> (slot stride, pool group, num slots).
+
+    None when a layer group is not paged attention (recurrent state shares
+    allocations between roles), where incremental registration does not apply.
+    """
+    if any(lg.kind == CacheKind.STATE for lg in page_table.layer_groups):
+        return None
+    pools = {}
+    for pg_idx, pg in enumerate(page_table.pool_groups):
+        for pool in pg.pools:
+            pools.setdefault(
+                int(pool.base_address), (int(pool.slot_stride_bytes), pg_idx, int(pool.num_slots))
+            )
+    return pools
+
+
 def _create_nixl_agent(
     name: str,
     rank: int,
@@ -4660,6 +4702,11 @@ class TransferWorker:
                 "per-descriptor NIXL transfers are in use."
             )
         self._registered_mem: list = []
+        # The KV pools' entry in _registered_mem; swapped on a pool resize.
+        self._kv_registered_mem: Optional[RegMemoryDescs] = None
+        # Incremental registration: per pool base, (start, end, descs) segments
+        # in address order covering [0, end of the last one). None: legacy.
+        self._kv_segments: Optional[Dict[int, list]] = None
         try:
             self._register_kv_cache()
             if self._aux_buffer is not None:
@@ -4690,6 +4737,15 @@ class TransferWorker:
 
     def _register_kv_cache(self):
         assert self._rank_info.page_table is not None
+        if self._kv_segments is not None:
+            self._register_kv_tails()
+            return
+        if _incremental_kv_registration_enabled():
+            pools = _paged_kv_pools(self._rank_info.page_table)
+            if pools is not None:
+                self._kv_segments = {base: [] for base in pools}
+                self._register_kv_tails()
+                return
         memory_descs = get_unique_pool_memory_descs(
             self._rank_info.page_table, self._rank_info.device_id
         )
@@ -4698,6 +4754,139 @@ class TransferWorker:
             self._agent.register_memory(reg_memory_desc)
             logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
             self._registered_mem.append(reg_memory_desc)
+            self._kv_registered_mem = reg_memory_desc
+
+    # -- Incremental KV pool registration ---------------------------------------
+    #
+    # NIXL registration costs ~280 us per physical chunk of a pool, and the
+    # ranks of a node serialize on it, so re-registering every pool made a
+    # rebalance cost 250-600 ms. Instead each pool is registered as segments of
+    # _KV_REG_SEGMENT_BYTES; a resize drops only the segments that reach past
+    # the pool's planned length (before adjust() unmaps them) and then registers
+    # [end of the last kept segment, new length). Pools never move, so kept
+    # segments stay valid; NIXL keys regions by base address and splits
+    # transfers at region boundaries.
+
+    def _register_kv_tails(self) -> None:
+        """Register every pool from the end of its last segment to its length."""
+        for base, (stride, _, num_slots) in _paged_kv_pools(self._rank_info.page_table).items():
+            segs = self._kv_segments.setdefault(base, [])
+            length = num_slots * stride
+            covered = segs[-1][1] if segs else 0
+            if length < covered:
+                # adjust() shrank the pool below the planned length, so the
+                # tail past `length` was unmapped while still registered.
+                # planCacheLevel and adjustCacheLevel share one computation,
+                # so this should not happen.
+                logger.error(
+                    f"KV pool {base:#x}: {length} bytes after resize, below the "
+                    f"{covered} bytes still registered; deregistering the excess."
+                )
+                while segs and segs[-1][1] > length:
+                    self._deregister_kv_segment(segs.pop()[2])
+                covered = segs[-1][1] if segs else 0
+            if covered < length and covered % _KV_REG_SEGMENT_BYTES:
+                # The last segment ends mid-chunk (the old pool length). A
+                # multi-chunk VMM descriptor must start at a chunk boundary
+                # (VmmDescSplitter::splitVmmDescs), so redo that segment from
+                # its aligned start instead of appending at `covered`.
+                covered = segs[-1][0]
+                self._deregister_kv_segment(segs.pop()[2])
+            for start in range(covered, length, _KV_REG_SEGMENT_BYTES):
+                end = min(start + _KV_REG_SEGMENT_BYTES, length)
+                descs = RegMemoryDescs(
+                    "VRAM",
+                    [
+                        (
+                            base + start,
+                            end - start,
+                            self._rank_info.device_id,
+                            f"kv_pool_{base:x}_{start:x}",
+                        )
+                    ],
+                )
+                self._agent.register_memory(descs)
+                self._registered_mem.append(descs)
+                segs.append((start, end, descs))
+
+    def _deregister_kv_segment(self, descs: RegMemoryDescs) -> None:
+        self._registered_mem.remove(descs)
+        self._agent.deregister_memory(descs)
+
+    def _planned_kv_lengths(self) -> Optional[Dict[int, int]]:
+        """Each pool's length in bytes after the next adjust(), or None if unknown."""
+        impl = getattr(self._config.kv_cache_manager, "impl", None)
+        planned = getattr(impl, "planned_slot_counts", None)
+        if planned is None:
+            return None
+        page_table = self._rank_info.page_table
+        current = [int(d.num_slots) for d in impl.pool_group_descs]
+        pools = _paged_kv_pools(page_table)
+        if pools is None or len(planned) != len(current):
+            return None
+        if any(current[pg] != num_slots for _, pg, num_slots in pools.values()):
+            # The page table's pool groups are not the manager's, in order.
+            return None
+        return {base: planned[pg] * stride for base, (stride, pg, _) in pools.items()}
+
+    def begin_kv_pool_resize(self) -> None:
+        """Deregister the KV pools ahead of ``KvCacheManager::adjust()``.
+
+        It has to come before ``adjust()``: a shrinking pool has the tail of
+        its registered region unmapped (``cuMemUnmap``) by the resize. Which
+        pools change is only known afterwards, so every KV pool is dropped.
+        The NIXL wrapper's ``registerMemory`` merges region info without
+        overwriting, so a pool cannot be re-registered at a new size without
+        this either.
+
+        The caller guarantees that no send or receive is in flight and that
+        no peer holds this rank's page table (see
+        ``Receiver.has_registered_with_peers``).
+
+        With incremental registration only the segments reaching past a pool's
+        planned length are dropped; without a plan, every segment is.
+        """
+        if self._kv_segments is not None:
+            planned = self._planned_kv_lengths()
+            for base, segs in self._kv_segments.items():
+                new_len = planned.get(base, 0) if planned is not None else 0
+                while segs and segs[-1][1] > new_len:
+                    self._deregister_kv_segment(segs.pop()[2])
+            return
+        reg = getattr(self, "_kv_registered_mem", None)
+        if reg is None:
+            return
+        self._kv_registered_mem = None
+        self._registered_mem.remove(reg)
+        self._agent.deregister_memory(reg)
+
+    def end_kv_pool_resize(self) -> None:
+        """Rebuild the local page table and re-register the KV pools.
+
+        Must run after every ``begin_kv_pool_resize``, whether or not
+        ``adjust()`` succeeded. Base addresses survive a resize and only
+        ``num_slots`` changes, so the slot layouts, the bounce sizing and the
+        per-peer caches stay valid; what is refreshed is every copy of the page
+        table, the registration, and the agent desc that ``REGISTER_RANK_INFO``
+        hands to peers.
+        """
+        page_table = build_page_table_from_manager(self._config.kv_cache_manager)
+        # Single attribute assignments: RankInfoServer serializes _rank_info
+        # from its listener thread, and generation peers read only geometry
+        # from it, never num_slots or the agent desc.
+        self._rank_info.page_table = page_table
+        self._kv_extractor = KVRegionExtractorV1(page_table)
+        self._peer_registrar.replace_self_extractor(self._kv_extractor)
+        self._register_kv_cache()
+        self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
+
+    @property
+    def has_registered_with_peers(self) -> bool:
+        return self._receiver.has_registered_with_peers
+
+    @property
+    def has_cross_node_peer(self) -> bool:
+        return self._peer_registrar.has_cross_node_peer
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None

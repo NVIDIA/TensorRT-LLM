@@ -194,6 +194,11 @@ public:
         DropRecorder const& dropRecorder = {});
 
     // Dynamic cache level resizing.
+    // The slot counts adjustCacheLevel(level, newQuota, ratioList, ...) would set. adjustCacheLevel
+    // uses this too, so a caller can act on the plan (e.g. deregister a shrinking tail) before the
+    // resize and rely on it matching.
+    TypedVec<PoolGroupIndex, SlotCount> planCacheLevel(
+        CacheLevel level, std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList) const;
     //! lockedPages (in-place relocation only): hot-level pages locked by ACTIVE caches, per pool
     //! group. They are never evicted; any outside a group's new window is relocated in place.
     //! scratchSlots (in-place relocation only): the SWA scratch slots ACTIVE caches hold, per pool

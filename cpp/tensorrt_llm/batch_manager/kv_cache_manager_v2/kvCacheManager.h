@@ -417,6 +417,9 @@ public:
     // executor right after it clamps max_seq_len to the initial split, so that rebalancing keeps one request
     // of that length (and its prefill chunks) schedulable. Returns the hot-level floors.
     TypedVec<PoolGroupIndex, SlotCount> raiseHotMinSlots(BatchDesc const& batch);
+    // Hot-level slot count per pool group after the next adjust(): the current counts when it
+    // would leave the hot level alone. Valid until the tuner's state changes (a new sample).
+    TypedVec<PoolGroupIndex, SlotCount> plannedSlotCounts() const;
 
     // ---- Internals used by KvCache ----------------------------------------
 

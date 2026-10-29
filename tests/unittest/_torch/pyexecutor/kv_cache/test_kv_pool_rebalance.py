@@ -127,6 +127,15 @@ def _make_executor(
     # the PP drain delegate to.
     exe._rebalance_kv_pools_now = lambda: PyExecutor._rebalance_kv_pools_now(exe)
     exe._pp_ring_is_quiescent = lambda: PyExecutor._pp_ring_is_quiescent(exe)
+    # Disaggregated-serving drain and back-off (no-ops without a transceiver).
+    exe._disagg_rebalance_disabled = False
+    exe._disagg_rebalance_skips = 0
+    exe._disagg_rebalance_retry_at = 0.0
+    exe._kv_pool_rebalance_allow_cross_node = False
+    exe._in_disagg_rebalance_backoff = lambda: PyExecutor._in_disagg_rebalance_backoff(exe)
+    exe._drain_disagg_transfers_for_rebalance = (
+        lambda: PyExecutor._drain_disagg_transfers_for_rebalance(exe)
+    )
 
     # KV cache manager (resource-manager wrapper).
     exe.kv_cache_manager = MagicMock()
@@ -243,8 +252,19 @@ class TestCanPauseForRebalance:
         exe = _make_executor(pp_size=2)
         assert PyExecutor._can_pause_for_rebalance(exe) is True
 
-    def test_transceiver_present_returns_false(self):
-        exe = _make_executor(kv_cache_transceiver=MagicMock())
+    def test_unsupported_transceiver_returns_false(self):
+        transceiver = MagicMock()
+        transceiver.kv_pool_rebalance_unsupported_reason.return_value = "unsupported"
+        exe = _make_executor(kv_cache_transceiver=transceiver)
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_supported_transceiver_returns_true(self):
+        """Context-side disaggregated rebalance: the per-rank checks run later, in the drain."""
+        transceiver = MagicMock()
+        transceiver.kv_pool_rebalance_unsupported_reason.return_value = None
+        exe = _make_executor(kv_cache_transceiver=transceiver)
+        assert PyExecutor._can_pause_for_rebalance(exe) is True
+        exe._disagg_rebalance_disabled = True
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
     def test_connector_present_returns_false(self):
@@ -1202,6 +1222,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # The suspend/adjust/resume core is covered by its own tests; here we only
     # care that the loop reaches it, and on which iteration.
     exe._rebalance_kv_pools_now = MagicMock()
+    exe._drain_disagg_transfers_for_rebalance = MagicMock(return_value=True)
 
     # Per-iteration no-ops.
     exe._handle_control_request = MagicMock()

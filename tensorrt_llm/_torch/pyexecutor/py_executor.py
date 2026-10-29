@@ -425,6 +425,26 @@ _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 # minute, while cutting the collective rate by an order of magnitude.
 KV_POOL_REBALANCE_CHECK_INTERVAL = 10
 
+# Wall-clock budget for draining disagg KV sends ahead of a rebalance.  The
+# executor loop is stalled for the drain (no forward runs, so no new send can
+# start), so this bounds the stall; a drain that does not finish in time skips
+# the rebalance, and the auto-tuner asks again on a later check.
+KV_POOL_REBALANCE_DISAGG_DRAIN_S = 0.5
+
+# A send whose generation peer has not asked for it after this long is waiting
+# on the peer's admission queue, which under load takes seconds; the drain
+# gives up at once instead of stalling out the full budget.  Measured on a
+# context-first deployment, this skips almost every drain that would have
+# expired and almost none that would have succeeded.
+KV_POOL_REBALANCE_DISAGG_PEER_WAIT_S = 0.2
+
+# Back-off after a skipped drain.  The manager's cooldown starts only in
+# adjust(), so without this a skipped rebalance is retried at every check, and
+# under sustained load each retry stalls the loop.  Doubles per consecutive
+# skip, resets on a drain that succeeds.
+KV_POOL_REBALANCE_DISAGG_BACKOFF_S = 1.0
+KV_POOL_REBALANCE_DISAGG_BACKOFF_MAX_S = 60.0
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -723,6 +743,7 @@ class PyExecutor:
         dense_dwdp_manager: Optional[DenseDwdpManager] = None,
         enable_kv_pool_rebalance: bool = False,
         kv_pool_rebalance_check_interval: int = KV_POOL_REBALANCE_CHECK_INTERVAL,
+        kv_pool_rebalance_allow_cross_node: bool = False,
         enable_adp_dummy_fixes: bool = False,
         enable_scheduler_aware_adp_dummy: bool = False,
         enable_non_overlap_adp_forward_intent: bool = False,
@@ -736,6 +757,9 @@ class PyExecutor:
         # Iteration throttle for the KV pool rebalance check.  See
         # _can_pause_for_rebalance / _agreed_need_adjustment.
         self._rebalance_check_interval = kv_pool_rebalance_check_interval
+        # kv_pool_rebalance_config.allow_cross_node_disagg; see
+        # _drain_disagg_transfers_for_rebalance.
+        self._kv_pool_rebalance_allow_cross_node = kv_pool_rebalance_allow_cross_node
         self._metrics: dict[str, float | dict[str, float]] = {}
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -937,6 +961,18 @@ class PyExecutor:
                                           None)
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
+        # Set, identically on every rank, once a peer is found to hold this
+        # instance's pool layout; see _drain_disagg_transfers_for_rebalance.
+        self._disagg_rebalance_disabled = False
+        # Back-off after skipped drains; see _note_disagg_drain_outcome.
+        self._disagg_rebalance_skips = 0
+        self._disagg_rebalance_retry_at = 0.0
+        if enable_kv_pool_rebalance and kv_cache_transceiver is not None:
+            reason = kv_cache_transceiver.kv_pool_rebalance_unsupported_reason()
+            if reason is not None:
+                logger.warning(
+                    "kv_cache_config.enable_kv_pool_rebalance is set but has no "
+                    f"effect on this disaggregated instance: {reason}.")
         # Countdown of drain iterations remaining before a pipeline-parallel
         # rebalance can run; None when no rebalance is pending.  Only
         # _executor_loop_pp uses it -- see _start_pp_rebalance_drain.
@@ -6715,9 +6751,14 @@ class PyExecutor:
     def _can_pause_for_rebalance(self) -> bool:
         """Gate KV pool rebalance to the cases the hook supports.
 
-        Scope: no in-flight disagg transfer, no KV connector, no drafter, not
-        during warmup or shutdown. Honors the ``enable_kv_pool_rebalance``
-        opt-in flag (default off).
+        Scope: no KV connector, no drafter, not during warmup or shutdown.
+        Honors the ``enable_kv_pool_rebalance`` opt-in flag (default off).
+
+        Disaggregated serving is supported on the context side only, and the
+        gate here is the configuration half of that: the per-rank half (no
+        transfer in flight, no peer holding this instance's layout) differs
+        between ranks, so it is checked collectively after the decision, in
+        ``_drain_disagg_transfers_for_rebalance``.
 
         Beam search *is* supported.  It needs no special handling on this side:
         ``KvCache::suspend`` / ``resume`` walk every beam already
@@ -6751,7 +6792,11 @@ class PyExecutor:
         if not self.enable_kv_pool_rebalance:
             return False
         if self.kv_cache_transceiver is not None:
-            return False
+            if self._disagg_rebalance_disabled:
+                return False
+            if (self.kv_cache_transceiver.kv_pool_rebalance_unsupported_reason(
+            ) is not None):
+                return False
         if self.kv_connector_manager is not None:
             # Rebalance suspends every active request and runs a defragmenting
             # migration, which reassigns slot_id -- the same field a tier
@@ -6915,7 +6960,10 @@ class PyExecutor:
         Chaining CP, then TP, then PP leaves every rank holding global rank 0's
         value (or, under ADP, its own replica's first-stage value).
         """
-        need = self.kv_cache_manager.impl.need_adjustment
+        # The disagg back-off goes into this rank's own reading, before the
+        # agreement below, so it cannot split the ranks either.
+        need = (not self._in_disagg_rebalance_backoff()
+                and self.kv_cache_manager.impl.need_adjustment)
         if self.dist.cp_size > 1:
             need = self.dist.cp_broadcast(need, root=0)
         if self.dist.tp_size > 1:
@@ -6977,7 +7025,106 @@ class PyExecutor:
 
         torch.cuda.current_stream().synchronize()
         self._consume_previous_batch_for_rebalance()
+        if not self._drain_disagg_transfers_for_rebalance():
+            return
         self._rebalance_kv_pools_now()
+
+    def _drain_disagg_transfers_for_rebalance(self) -> bool:
+        """Wait out in-flight disagg sends; True when a rebalance may run.
+
+        No-op (True) without a transceiver.  Otherwise this runs after the
+        ranks have agreed to rebalance and after the previous batch has been
+        consumed, so no forward is in flight and no new send can start: sends
+        are only started from a finished forward (``_send_kv_async``).  The
+        set of in-flight sends can therefore only shrink, and this polls it
+        down, releasing the requests whose sends settle.
+
+        Every input that differs between ranks is exchanged in one allgather
+        per pass, and every exit is a pure function of the gathered values, so
+        all ranks make the same number of passes -- the ``reap_context_sends``
+        and ``_flush_pending_transfer_responses`` calls below contain
+        collectives of their own and must stay matched.
+
+        Three outcomes skip the rebalance:
+
+        * A rank with a veto (``kv_pool_rebalance_veto_reason``): its layout
+          is held by a peer (it has registered with a context peer, i.e. it
+          receives KV), so a peer would keep writing from the old extent and
+          registration keys; or a peer is on another node, where rebalance is
+          not validated.  A veto never reverts, so rebalance is switched off
+          for good, on every rank alike, rather than paying this drain on
+          every later check.
+        * A send on any rank that has waited more than
+          ``KV_POOL_REBALANCE_DISAGG_PEER_WAIT_S`` for its peer to ask for it.
+          That peer is queueing, and the send would most likely outlast the
+          deadline, so the drain stops now rather than stalling until then.
+        * The drain outlasting ``KV_POOL_REBALANCE_DISAGG_DRAIN_S`` on any
+          rank.
+
+        After either of the last two the auto-tuner still wants the
+        adjustment, and the next attempt waits out a back-off
+        (``_note_disagg_drain_outcome``).
+        """
+        transceiver = self.kv_cache_transceiver
+        if transceiver is None:
+            return True
+        deadline = time.monotonic() + KV_POOL_REBALANCE_DISAGG_DRAIN_S
+        while True:
+            veto = transceiver.kv_pool_rebalance_veto_reason(
+                allow_cross_node=self._kv_pool_rebalance_allow_cross_node)
+            busy = (self.async_transfer_manager.has_any_inflight_requests()
+                    or transceiver.has_inflight_transfers())
+            expired = time.monotonic() >= deadline
+            peer_wait = (transceiver.oldest_send_waiting_for_peer_s()
+                         > KV_POOL_REBALANCE_DISAGG_PEER_WAIT_S)
+            states = self.dist.allgather((veto, busy, expired, peer_wait))
+            vetoes = [s[0] for s in states if s[0] is not None]
+            if vetoes:
+                self._disagg_rebalance_disabled = True
+                logger.warning(f"KV pool rebalance disabled: {vetoes[0]}.")
+                return False
+            if not any(s[1] for s in states):
+                self._note_disagg_drain_outcome(skipped=False)
+                return True
+            if any(s[3] for s in states):
+                backoff = self._note_disagg_drain_outcome(skipped=True)
+                logger.warning(
+                    "KV pool rebalance skipped: a disagg KV send has waited "
+                    f"over {KV_POOL_REBALANCE_DISAGG_PEER_WAIT_S}s for its "
+                    f"peer to ask for it. Retrying in {backoff:g}s.")
+                return False
+            if any(s[2] for s in states):
+                backoff = self._note_disagg_drain_outcome(skipped=True)
+                logger.warning(
+                    "KV pool rebalance skipped: disagg KV sends still in "
+                    f"flight after {KV_POOL_REBALANCE_DISAGG_DRAIN_S}s. "
+                    f"Retrying in {backoff:g}s.")
+                return False
+            self.disagg.reap_context_sends(1)
+            self._flush_pending_transfer_responses()
+
+    def _note_disagg_drain_outcome(self, skipped: bool) -> float:
+        """Track consecutive skipped drains; return the back-off now in force.
+
+        Skips are decided on gathered values, so the count is the same on
+        every rank.  The retry time is a local clock reading, which is fine:
+        it only gates this rank's own ``need_adjustment`` reading before the
+        agreement in ``_agreed_need_adjustment``.
+        """
+        if not skipped:
+            self._disagg_rebalance_skips = 0
+            self._disagg_rebalance_retry_at = 0.0
+            return 0.0
+        backoff = min(
+            KV_POOL_REBALANCE_DISAGG_BACKOFF_S *
+            2**min(self._disagg_rebalance_skips, 32),
+            KV_POOL_REBALANCE_DISAGG_BACKOFF_MAX_S)
+        self._disagg_rebalance_skips += 1
+        self._disagg_rebalance_retry_at = time.monotonic() + backoff
+        return backoff
+
+    def _in_disagg_rebalance_backoff(self) -> bool:
+        return time.monotonic() < self._disagg_rebalance_retry_at
 
     def _rebalance_kv_pools_now(self) -> None:
         """Suspend every active request, ``adjust()``, resume.
@@ -7006,10 +7153,16 @@ class PyExecutor:
                 paused.append(req)
         paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
 
+        transceiver = self.kv_cache_transceiver
+        if transceiver is not None:
+            transceiver.begin_kv_pool_resize()
         try:
             mgr.impl.adjust()
         except OutOfPagesError as e:
             logger.warning(f"KV pool adjust() failed: {e!r}")
+        finally:
+            if transceiver is not None:
+                transceiver.end_kv_pool_resize()
 
         remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         if remote_tail_adp:
@@ -7106,7 +7259,8 @@ class PyExecutor:
             # Sampling for the last microbatch runs on its own stream; its
             # writes must land before pages move underneath them.
             self.sample_stream.synchronize()
-        self._rebalance_kv_pools_now()
+        if self._drain_disagg_transfers_for_rebalance():
+            self._rebalance_kv_pools_now()
         self._pp_rebalance_drain_iters = None
 
     def _suspend_padding_dummies_for_rebalance(

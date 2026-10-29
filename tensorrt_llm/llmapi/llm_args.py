@@ -5146,6 +5146,15 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "blocks are copied on the GPU between iterations and their block indices rewritten in "
         "place, SWA scratch slots included.")
 
+    allow_cross_node_disagg: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Disaggregated context servers: keep rebalancing after a KV transfer peer is "
+        "found on another node. Rebalancing there is validated for intra-node "
+        "transfers only, so by default it is switched off on every rank once a peer "
+        "on another host registers.")
+
     @model_validator(mode='after')
     def _validate_drop_requires_copy_based(self) -> 'KvPoolRebalanceConfig':
         if self.drop_unreferenced_on_rebalance and not self.copy_based_rebalancing:

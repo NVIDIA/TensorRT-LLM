@@ -57,6 +57,13 @@ class PeerOverlap:
         )
 
 
+def _endpoint_host(endpoint: Optional[str]) -> Optional[str]:
+    """Host part of a ``tcp://host:port`` messenger endpoint, or None if unset."""
+    if not endpoint:
+        return None
+    return endpoint.split("://", 1)[-1].rsplit(":", 1)[0] or None
+
+
 class PeerRegistrar:
     # Registry: CacheKind -> PolicyClass. Add new layer types here. The
     # policy owns every mapper kind of its life cycle and picks the mapper
@@ -75,6 +82,7 @@ class PeerRegistrar:
         ] = {}  # key: (peer_key, self_lg_pool_key, peer_lg_pool_key)
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
+        self._has_cross_node_peer = False
         self._overlap_cache: dict[tuple[str, int, int], PeerOverlap] = {}
         self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
         self._lg_pool_mapping_cache: Dict[
@@ -90,6 +98,7 @@ class PeerRegistrar:
         key = self._unique_key(peer_name, peer_rank)
         self._peer_ri_cache[key] = peer_ri
         self._aux_transfer_layout_cache.pop(key, None)
+        self._note_peer_host(peer_ri)
         peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
         extractor = KVRegionExtractorV1(peer_ri.page_table)
         self._peer_ext_cache[key] = extractor
@@ -132,6 +141,15 @@ class PeerRegistrar:
         assert self._self_ext_cache is not None
         return self._self_ext_cache
 
+    def replace_self_extractor(self, extractor: KVRegionExtractorV1) -> None:
+        """Swap in the local extractor rebuilt after a KV pool resize.
+
+        Only ``num_slots`` changes on a resize, and nothing cached per peer
+        here (mappers, overlaps, pool mappings) reads it, so the peer caches
+        stay valid.
+        """
+        self._self_ext_cache = extractor
+
     def unregister(self, peer_name: str, peer_rank: int):
         key = self._unique_key(peer_name, peer_rank)
         if key in self._peer_ri_cache:
@@ -162,6 +180,21 @@ class PeerRegistrar:
     @property
     def self_rank_info(self) -> RankInfo:
         return self._ri
+
+    @property
+    def has_cross_node_peer(self) -> bool:
+        """Whether a registered peer's messenger endpoint is on another host.
+
+        Compares endpoint hosts, so a same-node peer reached through a
+        different address also counts as remote. Never reverts to False.
+        """
+        return self._has_cross_node_peer
+
+    def _note_peer_host(self, peer_ri: RankInfo) -> None:
+        self_host = _endpoint_host(self._ri.self_endpoint)
+        peer_host = _endpoint_host(peer_ri.self_endpoint)
+        if self_host is not None and peer_host is not None and self_host != peer_host:
+            self._has_cross_node_peer = True
 
     def _unique_key(self, name: str, rank: int) -> str:
         return name + str(rank)

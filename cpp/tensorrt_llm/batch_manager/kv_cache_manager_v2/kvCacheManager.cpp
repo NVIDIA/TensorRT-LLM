@@ -1693,6 +1693,21 @@ TypedVec<PoolGroupIndex, SlotCount> KvCacheManager::raiseHotMinSlots(BatchDesc c
     return mStorage->raiseHotMinSlots(batch, tokensPerBlock());
 }
 
+TypedVec<PoolGroupIndex, SlotCount> KvCacheManager::plannedSlotCounts() const
+{
+    auto const apiLock = lockShared();
+    // An arena (copy-based rebalancing) is never remapped: its pools keep their extent, so there is nothing to plan
+    // for; report the current counts, as when no adjustment is pending.
+    if (mStorage->isGpuArena() || !_needAdjustment(kHotLevel))
+    {
+        TypedVec<PoolGroupIndex, SlotCount> current(mStorage->numPoolGroups(kHotLevel));
+        for (PoolGroupIndex pgIdx{0}; pgIdx < current.size(); ++pgIdx)
+            current[pgIdx] = mStorage->numSlots(pgIdx, kHotLevel);
+        return current;
+    }
+    return mStorage->planCacheLevel(kHotLevel, getQuota(kHotLevel), _getTargetRatioList(kHotLevel));
+}
+
 void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();
