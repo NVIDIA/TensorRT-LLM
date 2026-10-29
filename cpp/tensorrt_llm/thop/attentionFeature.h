@@ -51,11 +51,10 @@ concept AttentionFeature
 template <typename T, typename KVCacheBuffer>
 struct FusedQKVMaskedAttentionDispatchParams;
 
-/// trtllm-gen kernels serve SM100-family devices except the consumer Blackwell parts.
+/// trtllm-gen kernels serve SM100-family devices.
 [[nodiscard]] inline bool isTllmGenDevice()
 {
-    int const sm = tensorrt_llm::common::getSMVersion();
-    return sm >= 100 && sm != 120 && sm != 121;
+    return tensorrt_llm::common::isSM100Family();
 }
 
 // ---- Features. Each is constructed from the key, prepared on every forward phase, and maps

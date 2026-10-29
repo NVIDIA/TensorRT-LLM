@@ -46,7 +46,7 @@ public:
         , Features(key)...
     {
         mSM = tensorrt_llm::common::getSMVersion();
-        mUseTllmGen = (mSM >= 100) && (mSM != 120) && (mSM != 121);
+        mUseTllmGen = tensorrt_llm::common::isSM100Family(mSM);
         mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
         mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
         mNumKVHeads = static_cast<int>(num_kv_heads);

@@ -532,7 +532,7 @@ bool MHA::convertMMHAParamsToXQAParams(
         xqaParams.data_type = DATA_TYPE_E4M3;
     }
     if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && (mSM < kSM_90 || mSM > kSM_120)))
+        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
     {
         xqaParams.multi_block_mode = false;
     }
@@ -728,19 +728,7 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
         params.block_counter = input_params.block_counter;
     }
 
-<<<<<<< ours
     params.multi_processor_count = input_params.multi_processor_count;
-=======
-        op->mUseNvfp4MlaKvCache = op->mKVCacheQuantMode.hasFp4KvCache() && op->mUseTllmGenSparseAttention
-            && !sparse_attn_kv_lens.has_value() && aux_kv_cache_pool_ptr.has_value();
-        op->mFP8ContextMLA = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::isSM100Family()
-                                 || tensorrt_llm::common::isSM120Family())
-            && (op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache);
-        op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
-        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache;
-        // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
-        op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64 && head_size == 576;
->>>>>>> theirs
 
     // cross attn
     params.memory_length_per_sample = input_params.memory_length_per_sample;
@@ -913,7 +901,6 @@ tensorrt_llm::common::op::AttentionContextWorkspaceLayout MHA::contextWorkspaceL
 
 size_t MHA::getWorkspaceSizeForContext(FmhaParams const& p) const
 {
-<<<<<<< ours
     return p.num_tokens == 0 ? 0 : contextWorkspaceLayout(p).totalSize;
 }
 
@@ -927,10 +914,6 @@ size_t MHA::getWorkspaceSizeForGeneration(FmhaParams const& p) const noexcept
     auto const max_num_tokens = static_cast<int32_t>(p.num_gen_tokens);
     auto const max_blocks_per_sequence = static_cast<int32_t>(p.getMaxBlocksPerSequence());
     if (max_num_tokens == 0)
-=======
-    // Only SM100 family supports NVFP4 output.
-    if (!tensorrt_llm::common::isSM100Family())
->>>>>>> theirs
     {
         return 0;
     }
@@ -2161,15 +2144,16 @@ MHA::MHA(AttentionBase const& key)
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(
-            mSM == 89 || mSM == 90 || tensorrt_llm::common::isSM100Family(mSM) || mSM == 120 || mSM == 121,
-            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100f, sm_120 or sm_121.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || tensorrt_llm::common::isSM100Family(mSM)
+                || tensorrt_llm::common::isSM120Family(mSM),
+            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100f or sm_120f.");
     }
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!is_fp4_out || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!is_fp4_out || tensorrt_llm::common::isSM100Family(mSM) || mSM == 120 || mSM == 121,
-        "fuse_fp4_quant only supports SM100f or SM120 or SM121 devices.");
+    TLLM_CHECK_WITH_INFO(
+        !is_fp4_out || tensorrt_llm::common::isSM100Family(mSM) || tensorrt_llm::common::isSM120Family(mSM),
+        "fuse_fp4_quant only supports SM100f or SM120f devices.");
 
     // Check requirements for FP4 KV cache.
     TLLM_CHECK_WITH_INFO(!quant_mode.hasFp4KvCache() || mFP8ContextFMHA, "FP4 KV cache requires FP8 context FMHA");
@@ -2542,7 +2526,7 @@ MLA::MLA(AttentionBase const& key)
     mSkipCorrectionThreshold = applySkipCorrection ? static_cast<float>(skip_correction_threshold) : 0.0F;
 
     mUseNvfp4MlaKvCache = use_nvfp4_mla_kv_cache;
-    mFP8ContextMLA = (mSM == 90 || tensorrt_llm::common::isSM100Family(mSM) || mSM == 107 || mSM == 120)
+    mFP8ContextMLA = (mSM == 90 || tensorrt_llm::common::isSM100Family(mSM) || tensorrt_llm::common::isSM120Family(mSM))
         && (quant_mode.hasFp8KvCache() || mUseNvfp4MlaKvCache);
     mFP8GenerationMLA = quant_mode.hasFp8KvCache() || mUseNvfp4MlaKvCache;
     if (uses_spcompress)
@@ -2552,8 +2536,8 @@ MLA::MLA(AttentionBase const& key)
     }
     if (mFP8GenerationMLA)
     {
-        TLLM_CHECK_WITH_INFO(
-            mSM == 89 || mSM == 90 || tensorrt_llm::common::isSM100Family(mSM) || mSM == 120 || mSM == 121,
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || tensorrt_llm::common::isSM100Family(mSM)
+                || tensorrt_llm::common::isSM120Family(mSM),
             "FP8 Generation MLA is supported on Ada, Hopper or Blackwell architecture.");
     }
     TLLM_CHECK_WITH_INFO(!quant_mode.hasFp4KvCache() || mUseNvfp4MlaKvCache,
@@ -2616,7 +2600,7 @@ void MLA::initContext()
 void MLA::initGeneration()
 {
     // Deepseek-V2 Generation needs a differ fmha with different argumments
-    mEnableXQA = (mSM == kSM_120) && mIsGenerationMLA;
+    mEnableXQA = tensorrt_llm::common::isSM120Family(mSM) && mIsGenerationMLA;
     if (mUseTllmGen)
     {
         Data_type qDataType = DATA_TYPE_FP32;
@@ -3186,7 +3170,7 @@ bool MLA::fillXqaParams(XQAParams& xqaParams, FmhaParams const& p, bool forConfi
             xqaParams.data_type = DATA_TYPE_E4M3;
         }
         if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-            || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && (mSM < kSM_90 || mSM > kSM_120)))
+            || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
         {
             xqaParams.multi_block_mode = false;
         }
@@ -4085,9 +4069,8 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     std::optional<int64_t> const tokens_per_block, int64_t const mask_type, int64_t const quant_mode,
     bool const use_paged_context_fmha, bool is_mla_enable)
 {
-    // Only Blackwell supports NVFP4 output.
-    // SM 120 does not support NVFP4 output.
-    if (tensorrt_llm::common::getSMVersion() < 100 || tensorrt_llm::common::getSMVersion() == 120)
+    // Only SM100 family supports NVFP4 output.
+    if (!tensorrt_llm::common::isSM100Family())
     {
         return false;
     }
