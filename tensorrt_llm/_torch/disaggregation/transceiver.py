@@ -1280,6 +1280,63 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether req's send session was torn down before its last slice."""
         return req.py_kv_send_session_retired and get_unique_rid(req) not in self._send_sessions
 
+    # -- KV pool rebalance ---------------------------------------------------
+    #
+    # Context-only for now. The context side is the RDMA initiator, so a
+    # resize of its pools needs only a local re-registration. Generation peers
+    # read nothing from its RankInfo that a resize changes. A rank that has
+    # sent REGISTER_RANK_INFO to a context peer is a different matter: the
+    # peer writes into its pools from a cached extent and cached keys.
+
+    def kv_pool_rebalance_unsupported_reason(self) -> Optional[str]:
+        if self._enable_pipelined_transfer:
+            # Intermediate chunks are sent while the request is still active,
+            # so they are not covered by the drain over finished requests.
+            return "pipelined prefill transfer is enabled"
+        if self._fp4_mla_bridge_enabled:
+            return "the FP4 MLA ownership bridge is enabled"
+        return None
+
+    def kv_pool_layout_shared_with_peers(self) -> bool:
+        return self._transfer_worker.has_registered_with_peers
+
+    def kv_pool_rebalance_veto_reason(self, allow_cross_node: bool = False) -> Optional[str]:
+        reason = super().kv_pool_rebalance_veto_reason(allow_cross_node)
+        if reason is not None:
+            return reason
+        if self._transfer_worker.has_cross_node_peer and not allow_cross_node:
+            # A resize unmaps and remaps the pools' tails; whether RDMA
+            # registrations stay coherent across that has only been checked for
+            # intra-node transfers.
+            return (
+                "a KV transfer peer is on another node, and rebalance is "
+                "validated for intra-node transfers only (set "
+                "kv_cache_config.kv_pool_rebalance_config.allow_cross_node_disagg "
+                "to allow it)"
+            )
+        return None
+
+    def has_inflight_transfers(self) -> bool:
+        return bool(self._send_sessions or self._recv_sessions)
+
+    def oldest_send_waiting_for_peer_s(self) -> float:
+        now = time.monotonic()
+        return max(
+            (
+                now - s.created_monotonic
+                for s in self._send_sessions.values()
+                if s.status is SessionStatus.INIT
+            ),
+            default=0.0,
+        )
+
+    def begin_kv_pool_resize(self) -> None:
+        self._transfer_worker.begin_kv_pool_resize()
+
+    def end_kv_pool_resize(self) -> None:
+        self._transfer_worker.end_kv_pool_resize()
+        self._page_table = self._transfer_worker.page_table
+
     def _build_prefill_extent(
         self,
         req: LlmRequest,
