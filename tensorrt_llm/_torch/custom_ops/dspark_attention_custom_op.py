@@ -1019,7 +1019,9 @@ def is_fused_dsv4_dspark_attention_supported(
 ) -> bool:
     """Return whether tensors can use the fused DSV4 DSpark attention kernel."""
     if _get_dspark_arch_str() is None:
-        return _log_unsupported(f"SM {get_sm_version()} is not SM100 or SM103", "sm_version")
+        return _log_unsupported(
+            f"SM {get_sm_version()} is not SM100, SM103, or SM107", "sm_version"
+        )
     if not all(t.is_cuda for t in (q, kv_cache, valid_len, attn_sink, inverse_rope_freqs)):
         return _log_unsupported("all inputs must be CUDA tensors", "device")
     if q.dtype != torch.bfloat16:

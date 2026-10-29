@@ -27,10 +27,9 @@ _DSV4_DSPARK_BLOCK_SIZES = (5, 6)
 _DSV4_DSPARK_ARCH_BY_SM = {
     100: "sm_100",
     103: "sm_103",
+    107: "sm_107",
 }
-# The RMSNorm/RoPE kernels are plain SIMT CuTe kernels with no architecture-specific
-# instructions, so they run on more GPUs than the DSV4 DSpark attention kernel gated
-# by _DSV4_DSPARK_ARCH_BY_SM.
+# RMSNorm/RoPE support is checked independently of attention allocator selection.
 _DSPARK_RMSNORM_ROPE_SM_VERSIONS = frozenset((100, 103, 107))
 
 

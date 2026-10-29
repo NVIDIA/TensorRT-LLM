@@ -2745,10 +2745,15 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         _install_default_v2_state(mgr)
         mgr._num_reserved_dummy_slots = 1
         mgr.dtype = DataType.HALF
+        mgr.dtype_per_layer = [mgr.dtype] * mgr.num_local_layers
+        mgr.cp_as_tp_layer_ids = set()
+        mgr._helix_cp_size = 1
+        mgr._standalone_draft_layer_ids = ()
+        mgr._draft_layer_sizes = []
         mgr.enable_swa_scratch_reuse = False
         mgr.enable_stats = False
         mgr.num_extra_kv_tokens = 0
-        mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+        mgr.get_layer_bytes_per_token = lambda local_layer_idx, data_role: 8
 
         kv_cache_config = KvCacheConfig(
             pool_ratio=pool_ratio,

@@ -6961,6 +6961,9 @@ class KVCacheManagerV2(BaseResourceManager):
         on this manager and the supplied draft manager when it is no longer
         needed, including when subsequent warmup or graph capture fails.
         """
+        # A unified manager creates target and draft pools in one cache.
+        if draft_kv_cache_manager is self:
+            draft_kv_cache_manager = None
         _kv_draft = (
             kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         )
