@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -14,7 +13,12 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    convert_to_torch_tensor,
+    get_env_flag,
+    get_size_in_bytes,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -433,9 +437,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
             else getattr(model_config, "pretrained_config", None)
         )
         rope_head_dim = int(getattr(residual_config, "qk_rope_head_dim", 0))
-        residual_quantization_enabled = (
-            os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1"
-        )
+        residual_quantization_enabled = get_env_flag("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", True)
         self.mla_kv_cache_residual_dim = (
             rope_head_dim if dtype == DataType.NVFP4 and residual_quantization_enabled else 0
         )
@@ -695,9 +697,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
             model_config, mapping, num_layers=num_layers, **kwargs
         )
         quant_config = model_config.quant_config
-        residual_quantization_enabled = (
-            os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1"
-        )
+        residual_quantization_enabled = get_env_flag("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", True)
         if (
             quant_config is not None
             and quant_config.quant_mode.has_fp4_kv_cache()

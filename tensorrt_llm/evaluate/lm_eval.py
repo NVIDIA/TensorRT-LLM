@@ -29,6 +29,7 @@ import numpy as np
 from tqdm import tqdm
 
 import tensorrt_llm.profiler as profiler
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.inputs import prompt_inputs
 
 try:
@@ -243,7 +244,7 @@ class LmEvalWrapper(TemplateLM):
             self.max_in_flight = 0
         # Env-gated speculative-decoding stats (AL) aggregation over the
         # eval corpus. See SPEC_STATS_ENV_VAR.
-        self.spec_stats = os.environ.get(SPEC_STATS_ENV_VAR) == "1"
+        self.spec_stats = get_env_flag(SPEC_STATS_ENV_VAR, False)
 
     @property
     def eot_token_id(self) -> int:

@@ -18,6 +18,7 @@ import os
 from collections import Counter
 from typing import Callable, Optional
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
@@ -265,8 +266,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # just-arrived generation-only requests (first token not yet emitted)
         # ahead of older in-flight decodes to reduce TTFT under budget
         # pressure. See _schedule_loop.
-        self._prioritize_first_token_gen = (
-            os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
+        self._prioritize_first_token_gen = get_env_flag(
+            "TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", False
         )
 
         # Long-prefill demotion (opt-in). Context scheduling is FCFS, so a

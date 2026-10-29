@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA packed-V views, repacking, and cache validity tracking."""
 
-import os
 from typing import Any, Optional, Sequence
 
 import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_env_flag, prefer_pinned
 from tensorrt_llm.bindings import DataType
 
 from .config import (
@@ -29,12 +28,7 @@ from .layout import _ensure_workspace_tensor, get_fp4_mla_v_scale_pool_size
 
 
 def _shared_v_pack_storage_enabled() -> bool:
-    return os.getenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1").lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
+    return get_env_flag("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", True)
 
 
 def _select_triton_block_v(num_queries: int, *, prefer_prepacked_v: bool = False) -> int:

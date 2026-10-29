@@ -35,8 +35,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
     is_qwen4_exp, load_pretrained_config)
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
-                                 torch_dtype_to_binding)
+from tensorrt_llm._utils import (get_env_flag, get_sm_version, is_sm_100f,
+                                 is_sm_120f, torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
@@ -389,8 +389,8 @@ class ModelConfig(Generic[TConfig]):
 
     def __post_init__(self):
         # Fused expert reduction can change accumulation order between runs.
-        if (os.getenv("FORCE_DETERMINISTIC", "0") == "1"
-                or os.getenv("FORCE_MOE_KERNEL_DETERMINISTIC", "0") == "1"):
+        if (get_env_flag("FORCE_DETERMINISTIC", False)
+                or get_env_flag("FORCE_MOE_KERNEL_DETERMINISTIC", False)):
             self.moe_disable_finalize_fusion = True
 
         if (self.sparse_attention_config is None

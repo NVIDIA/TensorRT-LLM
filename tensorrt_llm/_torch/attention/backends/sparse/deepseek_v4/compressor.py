@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -13,6 +12,7 @@ from tensorrt_llm._torch.attention.backends.interface import MLAParams, Position
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._utils import get_env_flag
 
 from .params import DeepseekV4AttentionType
 
@@ -62,7 +62,7 @@ NVFP4_COMPRESS_RESIDUAL_DIM = 64
 
 def get_nvfp4_compress_residual_dim() -> int:
     """Resolve the NVFP4 COMPRESS layout from the MLA residual startup switch."""
-    if os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1":
+    if get_env_flag("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", True):
         return NVFP4_COMPRESS_RESIDUAL_DIM
     return 0
 

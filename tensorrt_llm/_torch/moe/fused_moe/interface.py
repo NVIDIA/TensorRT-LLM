@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import weakref
 from abc import abstractmethod
 from enum import Enum
@@ -21,6 +20,8 @@ from typing import Dict, List, Optional, Tuple, Union, final
 
 import torch
 from torch import nn
+
+from tensorrt_llm._utils import get_env_flag
 
 from ...distributed.ops import reducescatter
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
@@ -38,8 +39,8 @@ from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
 # Lives here rather than next to either reader because both need it: the
 # scheduler decides whether to precompute top-k at all, and
 # TrtllmGenFusedMoEBase decides whether its kernel may route again.
-FORCE_SEPARATED_ROUTING = os.environ.get(
-    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
+FORCE_SEPARATED_ROUTING = get_env_flag("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING",
+                                       False)
 
 
 def _reject(reason: MoERejectReason, detail: str) -> MoEEligibility:
@@ -342,8 +343,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
 
         self.all_reduce = None
         # Debug function for eliminating imbalance during performance analysis.
-        self.enable_dummy_allreduce = os.environ.get(
-            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+        self.enable_dummy_allreduce = get_env_flag(
+            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", False)
         if not self.use_dp and self.mapping.tp_size > 1:
             self.all_reduce = AllReduce(
                 mapping=self.mapping,
@@ -463,8 +464,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         return self.dtype if self.dtype is not None else torch.float32
 
     def _init_perfect_router(self):
-        self._enable_perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER",
-                                                     "0") == "1"
+        self._enable_perfect_router = get_env_flag("ENABLE_PERFECT_ROUTER",
+                                                   False)
         if not self._enable_perfect_router:
             return
 

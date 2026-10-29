@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -24,6 +23,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._utils import get_env_flag
 
 
 def make_noise_generator(seed: int, device: torch.device | str) -> torch.Generator:
@@ -45,7 +45,7 @@ def make_noise_generator(seed: int, device: torch.device | str) -> torch.Generat
     If a per-request device choice is ever needed, promote this to a
     ``generator_device`` request/config field (as vLLM-omni / SGLang-Diffusion do).
     """
-    gen_device = "cpu" if os.environ.get("TLLM_VISUALGEN_CPU_RNG") == "1" else device
+    gen_device = "cpu" if get_env_flag("TLLM_VISUALGEN_CPU_RNG", False) else device
     return torch.Generator(device=gen_device).manual_seed(seed)
 
 

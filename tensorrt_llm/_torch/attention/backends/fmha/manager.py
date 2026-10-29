@@ -20,7 +20,6 @@ from __future__ import annotations
 import bisect
 import functools
 import inspect
-import os
 from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple
@@ -32,6 +31,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     CustomAttentionMask,
 )
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
@@ -172,7 +172,7 @@ def _is_fmha_cache_enabled() -> bool:
 
 
 def _is_fmha_cache_sanity_check_enabled() -> bool:
-    return os.environ.get(_FMHA_CACHE_SANITY_CHECK_ENV, "0") == "1"
+    return get_env_flag(_FMHA_CACHE_SANITY_CHECK_ENV, False)
 
 
 def _snapshot_fmha_cache_value(

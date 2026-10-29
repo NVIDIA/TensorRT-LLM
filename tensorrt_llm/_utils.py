@@ -510,7 +510,7 @@ def torch_comm():
 
 def mpi_disabled() -> bool:
     """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
-    return os.environ.get("TLLM_DISABLE_MPI") == "1"
+    return get_env_flag("TLLM_DISABLE_MPI", False)
 
 
 def mpi_rank():
@@ -970,8 +970,8 @@ def nvtx_range_debug(msg: str,
                         that is both a context manager and an identity
                         decorator; it is safe for concurrent and nested use.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or \
+            get_env_flag("TLLM_NVTX_DEBUG", False):
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
         return _NULL_RANGE
@@ -984,8 +984,8 @@ def nvtx_mark_debug(msg: str,
     """
     Creates an NVTX marker for debugging purposes.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or \
+            get_env_flag("TLLM_NVTX_DEBUG", False):
         nvtx_mark(msg, color=color, domain=domain, category=category)
 
 
@@ -1337,8 +1337,7 @@ def get_env_flag(name: str, default: Optional[bool] = None) -> Optional[bool]:
 
     Unset or blank returns ``default``. ``1``/``true``/``yes``/``on`` return
     True and ``0``/``false``/``no``/``off`` return False (case-insensitive,
-    surrounding whitespace ignored). Any other value raises ``ValueError``, so
-    a typo cannot silently select the other arm of an A/B.
+    surrounding whitespace ignored). Any other value raises ``ValueError``.
     """
     raw = os.environ.get(name)
     if raw is None or not raw.strip():

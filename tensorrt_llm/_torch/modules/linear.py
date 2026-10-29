@@ -22,7 +22,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     BufferKind, mxfp8_quantize_gemm_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
-from tensorrt_llm._utils import is_device_integrated, mpi_disabled
+from tensorrt_llm._utils import get_env_flag, is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -128,7 +128,7 @@ def quant_config_has_nvfp4_activation_quantization(
 def _fp8_per_tensor_uses_cute_dsl_sm107() -> bool:
     # Opt-in until an LLM API option exists; SM107 only.
     return (get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
-            and os.environ.get("USE_CUTE_DSL_FP8_PER_TENSOR_MM", "0") == "1")
+            and get_env_flag("USE_CUTE_DSL_FP8_PER_TENSOR_MM", False))
 
 
 def _fp8_block_scales_uses_cute_dsl_sm107(module) -> bool:
@@ -282,8 +282,8 @@ def copy_weight(dst: Parameter, src: torch.Tensor):
 def _load_kv_cache_scales(module: Linear, k_scales: List[torch.Tensor],
                           v_scales: List[torch.Tensor]) -> None:
     """Merge calibration scales without replacing graph-visible storage."""
-    if not hasattr(module, "kv_scales") or os.environ.get(
-            "TRTLLM_LOAD_KV_SCALES", "1") != "1":
+    if not hasattr(module, "kv_scales") or not get_env_flag(
+            "TRTLLM_LOAD_KV_SCALES", True):
         return
     if not k_scales and not v_scales:
         return
@@ -783,8 +783,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     copy_weight_shard(module.weight, weight, shard_offset,
                                       shard_size)
 
-        if hasattr(module, "kv_scales") and os.environ.get(
-                "TRTLLM_LOAD_KV_SCALES", "1") == "1":
+        if hasattr(module, "kv_scales") and get_env_flag(
+                "TRTLLM_LOAD_KV_SCALES", True):
             k_scales = [
                 w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w
             ]
@@ -1092,7 +1092,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         self.rescale_fused_weights(module)
 
         # Handle kv_scales for NVFP4 KV cache
-        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
+        if get_env_flag("TRTLLM_LOAD_KV_SCALES", True):
             k_scales = getattr(module, "tmp_k_scales", [])
             v_scales = getattr(module, "tmp_v_scales", [])
             if k_scales:
@@ -3984,8 +3984,8 @@ class MXFP8LinearMethod(LinearMethodBase):
     def load_kv_cache_scales(self, module: Linear, weights: List[Dict]) -> None:
         """Load per-tensor KV calibration for ordinary and prepacked QKV."""
         # Do not materialize checkpoint slices when calibration is disabled.
-        if not hasattr(module, "kv_scales") or os.environ.get(
-                "TRTLLM_LOAD_KV_SCALES", "1") != "1":
+        if not hasattr(module, "kv_scales") or not get_env_flag(
+                "TRTLLM_LOAD_KV_SCALES", True):
             return
         _load_kv_cache_scales(
             module,
@@ -4772,7 +4772,7 @@ class Linear(nn.Module):
             quant_valid,
             get_sm_version() >= 100,
             self._enable_gemm_allreduce_fusion,
-            os.environ.get("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1",
+            get_env_flag("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", False),
         ])
         self.use_fused_gemm_allreduce = enabled and ipc_nvls_supported()
 

@@ -30,7 +30,7 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
-from tensorrt_llm._utils import get_sm_version, mpi_disabled
+from tensorrt_llm._utils import get_env_flag, get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -64,7 +64,7 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, moe_experts_quant_config,
                              register_auto_model)
 
-DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
+DISAGG = get_env_flag('TLLM_MULTIMODAL_DISAGGREGATED', False)
 
 try:
     # Available in transformers<5
@@ -445,8 +445,8 @@ class Llama4DecoderLayer(DecoderLayer):
         self.is_mlp_layer = (layer_idx +
                              1) % config.interleave_moe_layer_step != 0
 
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not get_env_flag(
+            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", False)
 
         # MLP layer supports pre and post AR + Res + RMSNorm + NVFP4/FP8
         # MOE layer supports pre AR + Res + RMSNorm
@@ -718,8 +718,8 @@ class LlamaDecoderLayer(DecoderLayer):
                     self.layer_idx,
                     self.num_hidden_layers) != self.mapping.pp_rank_of_layer(
                         prev_layer_idx, self.num_hidden_layers))
-        self.disable_nvfp4_layernorm_fusion = os.environ.get(
-            "TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", "1") == "1"
+        self.disable_nvfp4_layernorm_fusion = get_env_flag(
+            "TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", True)
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -749,13 +749,13 @@ class LlamaDecoderLayer(DecoderLayer):
         if not model_config.is_generation:
             self.attention_mask = PredefinedAttentionMask.FULL
 
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not get_env_flag(
+            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", False)
         # Disable fusion for small models due to accuracy issues
         self.enable_fusion &= config.hidden_size > 4096
 
-        enable_gemm_allreduce_fusion = (os.environ.get(
-            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
+        enable_gemm_allreduce_fusion = get_env_flag(
+            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", False)
         mpi_enabled = not mpi_disabled()
         dtype_supported = config.torch_dtype in (torch.float16, torch.bfloat16)
         tp_valid = self.mapping.tp_size > 1

@@ -47,12 +47,13 @@ the call (as ``test_k3_sandwich.py``'s ``check_fold_wrap`` does), or run without
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 MAX_TOKENS = 8
 EMPTY_WORD = -(2**31)
@@ -83,7 +84,7 @@ def _tap_words(tap: torch.Tensor) -> torch.Tensor:
 
 
 def _use_pdl() -> bool:
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    return get_env_flag("TRTLLM_ENABLE_PDL", True)
 
 
 def slab_tensor(device) -> torch.Tensor:

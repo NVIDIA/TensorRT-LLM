@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import functools
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, FrozenSet, List, Optional, Tuple
 
@@ -16,7 +15,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import get_env_flag, get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
@@ -60,7 +59,7 @@ def _fused_dsa_meta_enabled() -> bool:
     otherwise let the first fused launch happen inside CUDA-graph capture,
     voiding the "pre-compiled at warmup" capture-safety guarantee.
     """
-    return os.environ.get("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0") == "0"
+    return not get_env_flag("TRTLLM_DISABLE_FUSED_DSA_METADATA", False)
 
 
 def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:

@@ -38,7 +38,8 @@ from tensorrt_llm._torch.nccl_window_graph import (
     release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
-from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
+from tensorrt_llm._utils import (confidential_compute_enabled, get_env_flag,
+                                 nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
 from tensorrt_llm.logger import logger
@@ -935,8 +936,8 @@ class AutoTuner:
 
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
         # Increase log level for AutoTuner associated logger`
-        self._log_level_to_info = os.getenv(
-            "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO", '0') == '1'
+        self._log_level_to_info = get_env_flag(
+            "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO", False)
         self._debug_logger = logger.info if self._log_level_to_info else logger.debug
 
         self.repeat = repeat
@@ -1178,8 +1179,8 @@ class AutoTuner:
                     f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
             if logger.level == 'debug':
-                fine_grained_on = os.environ.get("TLLM_USE_FINE_GRAINED_SYNC",
-                                                 "0") == "1"
+                fine_grained_on = get_env_flag("TLLM_USE_FINE_GRAINED_SYNC",
+                                               False)
                 logger.debug_once(
                     f"[Autotuner] Inference dispatch: custom_op={custom_op}, runner={best_runner}, "
                     f"tactic={best_tactic}, fine_grained={'ON' if fine_grained_on else 'OFF'}",
@@ -1270,7 +1271,7 @@ class AutoTuner:
         **kwargs,
     ) -> None:
         """Compile cached winners in this process during tuning, not inference."""
-        if os.environ.get("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1") != "1":
+        if not get_env_flag("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", True):
             return
         # Cache hits may differ across ranks; collective runners must stay
         # inside lockstep profiling, including profiling scratch allocation.
@@ -1680,8 +1681,8 @@ class AutoTuner:
 
         fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
 
-        disable_short_profile = os.environ.get(
-            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
+        disable_short_profile = get_env_flag(
+            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", False)
 
         # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
         if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \

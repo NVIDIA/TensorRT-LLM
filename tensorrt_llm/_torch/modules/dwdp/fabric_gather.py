@@ -30,6 +30,8 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import get_env_flag
+
 try:
     from tensorrt_llm.logger import logger
 except ImportError:
@@ -84,7 +86,7 @@ _probed = False
 
 def is_enabled() -> bool:
     """True if the env knob asks for the gather transport."""
-    return os.environ.get(_ENABLE_ENV, "0") not in ("", "0", "false", "False")
+    return get_env_flag(_ENABLE_ENV, False)
 
 
 def total_blocks() -> int:

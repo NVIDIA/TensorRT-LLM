@@ -4,7 +4,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import os
 import weakref
 from typing import Optional
 
@@ -26,7 +25,7 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from tensorrt_llm._torch.modules.fla.utils import tensor_cache
-from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
+from tensorrt_llm._utils import get_env_flag, is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -61,7 +60,7 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 def _use_flashinfer_gdn_prefill() -> bool:
     """Check the prefill backend setting and supported GPU architecture."""
     return (
-        os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
+        get_env_flag("TLLM_USE_FLASHINFER_GDN_PREFILL", True)
         and is_flashinfer_gdn_prefill_supported_arch()
     )
 
@@ -797,7 +796,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         split_decode = (
             num_decode_tokens > 0
             and not is_target_verify
-            and os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+            and get_env_flag("FORCE_DETERMINISTIC", False)
         )
 
         conv_states_to_use = conv_states

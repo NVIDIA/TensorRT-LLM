@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 from typing import Optional
 
 import torch
@@ -10,7 +9,8 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.utils import custom_device_ctx
-from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
+from tensorrt_llm._utils import (get_env_flag,
+                                 is_flashinfer_gdn_decode_supported_arch)
 from tensorrt_llm.logger import logger
 
 try:
@@ -211,7 +211,7 @@ def _can_use_flashinfer_gdn_decode(
 ) -> bool:
     """Check whether FlashInfer GDN bf16-state decode kernel can be used."""
     # Env-var escape hatch for A/B comparison against the Triton fallback.
-    if os.environ.get("TRTLLM_FLA_DISABLE_FLASHINFER_GDN", "0") == "1":
+    if get_env_flag("TRTLLM_FLA_DISABLE_FLASHINFER_GDN", False):
         return False
     if not _FLASHINFER_GDN_BF16_STATE_AVAILABLE:
         return False
@@ -346,9 +346,9 @@ def _can_use_flashinfer_gdn_verify(
     arch, FI MTP API available) plus a per-sequence draft length in
     [1, _FI_GDN_MAX_MTP_T]; longer drafts fall back to Triton.
     """
-    if os.environ.get("TRTLLM_FLA_DISABLE_FLASHINFER_GDN", "0") == "1":
+    if get_env_flag("TRTLLM_FLA_DISABLE_FLASHINFER_GDN", False):
         return False
-    if os.environ.get("TRTLLM_FLA_DISABLE_FLASHINFER_GDN_VERIFY", "0") == "1":
+    if get_env_flag("TRTLLM_FLA_DISABLE_FLASHINFER_GDN_VERIFY", False):
         return False
     if not _FLASHINFER_GDN_BF16_STATE_AVAILABLE:
         return False

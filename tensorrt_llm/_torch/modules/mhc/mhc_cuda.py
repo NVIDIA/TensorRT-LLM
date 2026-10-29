@@ -17,7 +17,6 @@ all available backends (FMA, DeepGEMM split-K, DeepGEMM no-split) at warmup.
 Falls back to FMA when DeepGEMM is unavailable or autotuner cache misses.
 """
 
-import os
 from functools import lru_cache, partial
 from typing import Any, List
 
@@ -32,7 +31,7 @@ from tensorrt_llm._torch.autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 
 
 @lru_cache(maxsize=1)
@@ -1151,7 +1150,7 @@ def mhc_fused_hc(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
-    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+    if get_env_flag("FORCE_DETERMINISTIC", False):
         # This fixed FMA tactic has no cross-CTA floating-point atomics and
         # uses the same reduction order for context and generation shapes.
         # Bypass tuning so an existing cache cannot reintroduce atomic split-K.

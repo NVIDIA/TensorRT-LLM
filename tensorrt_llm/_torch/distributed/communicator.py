@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import math
-import os
 import pickle  # nosec B403
 import threading
 from abc import ABC, abstractmethod
@@ -35,8 +34,8 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
-from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
-                                 mpi_comm, mpi_disabled, mpi_isend,
+from tensorrt_llm._utils import (get_env_flag, local_mpi_size, mpi_allgather,
+                                 mpi_barrier, mpi_comm, mpi_disabled, mpi_isend,
                                  mpi_isend_object, mpi_recv, mpi_recv_object,
                                  mpi_send, mpi_send_object, mpi_world_size,
                                  prefer_pinned, torch_pybind11_abi)
@@ -1047,8 +1046,7 @@ class TorchDist(Distributed):
         # creation entirely -- and ranks disagreeing on that would deadlock
         # in new_group.  This gather rides the CPU (gloo) path and is safe
         # either way.
-        local_enabled = os.environ.get("TLLM_CUDA_OBJECT_COLLECTIVES",
-                                       "1") != "0"
+        local_enabled = get_env_flag("TLLM_CUDA_OBJECT_COLLECTIVES", True)
         gathered = [None] * self.mapping.world_size
         torch.distributed.all_gather_object(gathered,
                                             (member_dims, local_enabled))

@@ -9,13 +9,11 @@ operations. The two low-rank projections remain regular GEMMs so TRT-LLM can
 select the best cuBLAS or low-M CuTe DSL implementation for each token count.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 
 #: Widest element block ``hc_combine_norm`` will ask for in one tile. 4096
 #: lanes is what the previous fixed 512-wide tiling already held in registers
@@ -29,7 +27,7 @@ def _pdl_enabled(rows: int) -> bool:
     # synchronization overhead becomes measurable once M supplies enough CTA
     # parallelism on its own. Keep the shape-aware boundary used by the HC
     # low-latency path rather than regressing prefill or large IFB batches.
-    return rows <= 16 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
+    return rows <= 16 and get_env_flag("TRTLLM_ENABLE_PDL", True) and get_sm_version() >= 90
 
 
 @triton.jit

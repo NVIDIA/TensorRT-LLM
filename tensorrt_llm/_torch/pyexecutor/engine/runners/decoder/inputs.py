@@ -3,7 +3,6 @@
 """Decoder input preparation state."""
 
 import math
-import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
@@ -41,7 +40,7 @@ from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_l
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import helix_local_len, set_per_request_prefill_cuda_graph_flag
-from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
+from tensorrt_llm._utils import get_env_flag, maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
@@ -380,9 +379,7 @@ class DecoderInputPreparer:
         # None) by every full prepare_inputs pass.
         self._steady_gen_cache: dict[str, Any] | None = None
         # Log cached prefixes in model-input sequence order when enabled.
-        self.log_cached_kv_tokens_per_req = (
-            os.getenv("TLLM_LOG_CACHED_KV_TOKENS_PER_REQ", "0") == "1"
-        )
+        self.log_cached_kv_tokens_per_req = get_env_flag("TLLM_LOG_CACHED_KV_TOKENS_PER_REQ", False)
 
         spec_config = self._config.spec_config if self._config is not None else None
         self._dspark_confidence_enabled = bool(

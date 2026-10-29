@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PositionalEmbeddingParams,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .indexer import (
@@ -39,7 +40,7 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # path. Applies only to the generation forward (MLA path); context and MTP draft
 # passes keep the per-layer path. Auto-inert on models without shared indexer
 # layers (every group is a singleton -> per-layer fallback).
-_GROUP_REMAP = os.environ.get("TRTLLM_DISABLE_DSA_GROUP_REMAP", "0") != "1"
+_GROUP_REMAP = not get_env_flag("TRTLLM_DISABLE_DSA_GROUP_REMAP", False)
 
 _NVFP4_MAX_BLOCK_SCALE = 448.0
 _NVFP4_MAX_VALUE = 6.0

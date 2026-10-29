@@ -27,14 +27,13 @@ lengths provide the same cache contract for prefill, decode and verification.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_env_flag, get_sm_version, is_sm_100f
 
 from ...interface import (
     AttentionForwardArgs,
@@ -274,7 +273,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         self._native_bmm1_scale: float | None = None
         #: Packed context rows score pools in FP8 with DeepGEMM MQA logits on SM100-family
         #: GPUs; TRTLLM_GLM_INDEXER_BF16=1 keeps the BF16 Triton scorer for them.
-        self._indexer_fp8 = is_sm_100f() and os.environ.get("TRTLLM_GLM_INDEXER_BF16", "0") != "1"
+        self._indexer_fp8 = is_sm_100f() and not get_env_flag("TRTLLM_GLM_INDEXER_BF16", False)
 
     @classmethod
     def support_fused_rope(cls) -> bool:

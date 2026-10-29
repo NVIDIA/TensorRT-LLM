@@ -5,7 +5,6 @@
 
 import contextlib
 import inspect
-import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -52,7 +51,7 @@ from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_env_flag, nvtx_range
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
 
@@ -341,7 +340,7 @@ class DecoderRunner(ScheduledModelRunner):
         """Create the native workspace owner for this runner's lifetime."""
         self._moe_workspace_reclaimer = None
         if (
-            os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") != "0"
+            get_env_flag("TRTLLM_RECLAIM_WORKSPACE", True)
             and not self._config.is_spec_decode
             and self._mapping.cp_size == 1
             and self._eager_workspace_reclaim_supported

@@ -27,12 +27,13 @@ call for each configuration, which must happen outside CUDA-graph capture.
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 HIDDEN_SIZE = 3584
 MAX_TOKENS = 8
@@ -143,7 +144,7 @@ def k3_latent_reduce(
 
     args = (arg(lat_uc.view(-1)), arg(lat_flags.view(-1)), arg(out.view(-1).view(torch.int32)))
     stream = cuda_driver.CUstream(torch.cuda.current_stream(lat_uc.device).cuda_stream)
-    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    use_pdl = get_env_flag("TRTLLM_ENABLE_PDL", True)
     key = (world, ctas, use_pdl)
     fn = _compiled.get(key)
     if fn is None:

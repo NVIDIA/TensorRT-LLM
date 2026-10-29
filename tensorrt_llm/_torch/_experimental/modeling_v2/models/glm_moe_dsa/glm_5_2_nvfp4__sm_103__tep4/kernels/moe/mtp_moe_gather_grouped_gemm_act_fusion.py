@@ -69,14 +69,14 @@ Runs on SM100+ (Blackwell) GPUs.
 
 from __future__ import annotations
 
-import os
-
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import torch
 from cutlass.experimental import primitives as prims
+
+from tensorrt_llm._utils import get_env_flag
 
 from ..common import compat48 as _compat48
 from .device_bound_scheduler import DeviceBoundPersistentTileScheduler
@@ -167,7 +167,7 @@ L2_POLICY_B = "evict_first"
 # Programmatic dependent launch, matching what TRT-LLM sets for the production kernels.
 # Defaults on so a model run overlaps the same way production does; the standalone
 # benchmarks are unaffected because a single kernel has no predecessor to overlap with.
-USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1").lower() in ("1", "true", "yes", "on")
+USE_PDL = get_env_flag("TRTLLM_ENABLE_PDL", True)
 # `no_allocate` is deliberately absent: it is a direct `.L2::no_allocate` qualifier on
 # ld/st, not a `createpolicy.fractional` priority, and libNVVM rejects it there. Catching
 # it here gives a readable message instead of "NVVM backend compilation failed".

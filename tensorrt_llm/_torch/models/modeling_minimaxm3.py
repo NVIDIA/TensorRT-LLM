@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import os
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
@@ -30,7 +29,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -2556,7 +2555,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         # cross-rank reduction to fold, i.e. TP>1 and not attention-DP (each DP
         # rank owns independent tokens, so no attention/MoE AllReduce happens
         # there). An env override matches the DeepSeek-V3 escape hatch.
-        self.enable_fusion = os.environ.get("TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not get_env_flag("TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED", False)
         self.enable_fusion &= (not self.enable_attention_dp) and self.mapping.tp_size > 1
         self.pre_feed_forward_fusion = self.enable_fusion
         self.post_feed_forward_fusion = self.enable_fusion

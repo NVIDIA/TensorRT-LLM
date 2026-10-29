@@ -15,7 +15,8 @@ import torch
 from torch.nn import functional as F
 
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
-                                 get_sm_version, torch_dtype_to_str)
+                                 get_env_flag, get_sm_version,
+                                 torch_dtype_to_str)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
@@ -48,7 +49,7 @@ EventType = Enum(
 
 def is_gdn_replay_enabled() -> bool:
     """Return whether GDN replay is enabled (default: enabled)."""
-    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "1") == "1"
+    return get_env_flag("TRTLLM_USE_GDN_REPLAY", True)
 
 
 def is_gdn_flashinfer_replay_enabled() -> bool:
@@ -638,7 +639,7 @@ def _fused_relu2_impl() -> (tuple[Callable[[torch.Tensor], torch.Tensor],
     Kept lazy so importing this module does not pull in Triton, and so a build
     without a working Triton falls back instead of failing at import time.
     """
-    if os.environ.get("TRTLLM_FUSED_RELU2", "1") != "1":
+    if not get_env_flag("TRTLLM_FUSED_RELU2", True):
         return None
     try:
         from .fused_relu2_triton import fused_relu2, is_eligible

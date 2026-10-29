@@ -46,8 +46,8 @@ from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
-from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
-                      prefer_pinned)
+from .._utils import (_str_to_torch_dtype_dict, get_env_flag, is_sm_100f,
+                      mpi_rank, prefer_pinned)
 
 # yapf: disable
 # isort: off
@@ -5655,7 +5655,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         if self.backend != "DEFAULT":
             return self.backend, None
         for env_var, backend in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
-            if os.getenv(env_var) == "1":
+            if get_env_flag(env_var, False):
                 return backend, env_var
         return "NIXL", None
 
@@ -7331,7 +7331,7 @@ class TorchLlmArgs(BaseLlmArgs):
         model config at load time; they are treated as estimating here,
         which errs toward the looser arena budget.
         """
-        if os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0") == "1":
+        if get_env_flag("TRTLLM_SKIP_KV_CACHE_ESTIMATION", False):
             return False
         if self.attn_backend == "VANILLA":
             return False

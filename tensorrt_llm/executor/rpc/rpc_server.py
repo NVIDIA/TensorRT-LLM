@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import zmq
 
+from tensorrt_llm._utils import get_env_flag
+
 from ...llmapi.utils import logger_debug
 from ...logger import logger
 from ..ipc import ZeroMqQueue
@@ -102,7 +104,7 @@ class RPCServer:
         self._address = address
 
         # Check if PAIR mode is enabled via environment variable
-        use_pair_mode = os.environ.get('TLLM_LLMAPI_ZMQ_PAIR', '0') != '0'
+        use_pair_mode = get_env_flag('TLLM_LLMAPI_ZMQ_PAIR', False)
         socket_type = zmq.PAIR if use_pair_mode else zmq.ROUTER
 
         if use_pair_mode:

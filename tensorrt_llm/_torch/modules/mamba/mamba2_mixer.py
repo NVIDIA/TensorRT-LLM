@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import functools
-import os
 import weakref
 from typing import Optional
 
@@ -26,6 +25,7 @@ from torch import nn
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -299,8 +299,8 @@ class Mamba2Mixer(nn.Module):
             and self._mamba_ssm_cache_dtype == torch.float16)
         self._stochastic_rounding_for_flashinfer = self._stochastic_rounding_for_replay and self._use_flashinfer
 
-        self._use_mtp_custom_op = os.environ.get(
-            "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
+        self._use_mtp_custom_op = get_env_flag(
+            "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", False)
 
         # in_proj emits token-major and the SSD consumes token-major; the two
         # transposes around the prefill conv exist only to satisfy the
@@ -316,8 +316,8 @@ class Mamba2Mixer(nn.Module):
         # Results move by up to one bf16 ulp -- the layout change is bit-exact,
         # the accumulation order is not. Set TRTLLM_MAMBA_TOKEN_MAJOR_CONV=0 to
         # fall back to the channel-major kernel plus transposes.
-        self._token_major_conv = os.environ.get("TRTLLM_MAMBA_TOKEN_MAJOR_CONV",
-                                                "1") == "1"
+        self._token_major_conv = get_env_flag("TRTLLM_MAMBA_TOKEN_MAJOR_CONV",
+                                              True)
 
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",

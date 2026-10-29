@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 import abc
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
+
+from tensorrt_llm._utils import get_env_flag
 
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, is_gated_activation
@@ -141,7 +142,7 @@ def apply_moe_impl_construction_state(
     # same None it saw when ``reduce_results`` was False, rather than an
     # AttributeError from a completely different-looking place.
     module.all_reduce = None
-    module.enable_dummy_allreduce = os.environ.get("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+    module.enable_dummy_allreduce = get_env_flag("TRTLLM_ENABLE_DUMMY_ALLREDUCE", False)
 
     # Same defaults ``MoE.__init__`` used when ``init_load_balancer=False``.
     # ConfigurableMoE overwrites the EPLB fields via ``_BACKEND_SYNC_ATTRS``.

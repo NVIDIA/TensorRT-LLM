@@ -86,7 +86,7 @@ import torch.distributed as dist
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
 )
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_env_flag, get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -138,7 +138,7 @@ class MegaMoeCuteDslUnavailable(RuntimeError):
 
 _RUNTIME_PROBE_CACHE: Dict[int, Union[bool, str]] = {}
 
-_MEGAMOE_PRIME_LADDER = os.environ.get("MEGAMOE_PRIME_LADDER", "1") == "1"
+_MEGAMOE_PRIME_LADDER = get_env_flag("MEGAMOE_PRIME_LADDER", True)
 _MEGAMOE_PRIMED_LADDERS: set = set()
 
 
@@ -614,7 +614,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # (bench-only knob; default OFF so serving warmup never pays the
         # MERGE lockstep sweep). Must be set identically on ALL ranks (it
         # gates collective tuning behavior).
-        self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
+        self.tactic_autotune = get_env_flag("MEGAMOE_TACTIC_AUTOTUNE", False)
 
         # Buffer sizing. MoE layers execute serially per forward; one pool
         # sized to the worst-case per-rank tokens covers every layer. The

@@ -1,14 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 from collections.abc import Callable
 from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ..custom_ops.nvfp4_sfc_finalize import FP8_MAX
@@ -303,8 +302,8 @@ class MLP(nn.Module):
         fp4_ok = (bf16_ok and hasattr(
             torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
                   and is_static_nvfp4_input_eligible(self.down_proj))
-        deferred_enabled = os.environ.get("TRTLLM_ENABLE_NVFP4_DEFERRED_GELU",
-                                          "1") == "1"
+        deferred_enabled = get_env_flag("TRTLLM_ENABLE_NVFP4_DEFERRED_GELU",
+                                        True)
         deferred_fp4_ok = (bf16_ok and deferred_enabled and hasattr(
             torch.ops.trtllm,
             "cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell")

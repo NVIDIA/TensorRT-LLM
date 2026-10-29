@@ -22,6 +22,7 @@ import uvloop
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._frontend_processes import (
@@ -309,7 +310,7 @@ def _disable_gc_if_requested() -> None:
     collection pauses the event loop, and with it every stream this process
     serves.
     """
-    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+    if get_env_flag("TRTLLM_SERVER_DISABLE_GC", False):
         gc.disable()
         logger.info("Python cyclic GC disabled (TRTLLM_SERVER_DISABLE_GC=1)")
 

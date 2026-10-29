@@ -3,14 +3,13 @@
 
 import bisect
 import contextlib
-import os
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
                     Tuple, TypeAlias)
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_env_flag, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
                                           EncodeExtraInputSpec,
@@ -42,7 +41,7 @@ from .scheduler import ScheduledRequests
 # and replay. Off by default since replay() is on the per-token critical path.
 def _strict_buffer_check_enabled() -> bool:
     """Whether TLLM_CUDA_GRAPH_STRICT_BUFFERS enables strict buffer checking."""
-    return os.getenv("TLLM_CUDA_GRAPH_STRICT_BUFFERS", "0") == "1"
+    return get_env_flag("TLLM_CUDA_GRAPH_STRICT_BUFFERS", False)
 
 
 _STRICT_BUFFER_CHECK = _strict_buffer_check_enabled()

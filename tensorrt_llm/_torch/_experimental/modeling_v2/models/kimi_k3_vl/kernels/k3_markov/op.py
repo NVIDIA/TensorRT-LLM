@@ -37,6 +37,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import get_env_flag
+
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
 _workspaces: Dict[object, dict] = {}
@@ -117,9 +119,7 @@ def markov_workspace(mapping, push_copies: int = 1) -> dict:
     slots = world * push_copies
     buf_words = kern.buffer_words(WORKSPACE_MAX_BLOCK, kern.MAX_BATCH, slots, WORKSPACE_MAX_GRID)
     comm = _get_mnnvl_workspace_comm(mapping)
-    use_fabric_handle = (
-        os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-    )
+    use_fabric_handle = get_env_flag("TRTLLM_FORCE_MNNVL_AR", False) or mapping.is_multi_node()
     error: Optional[Exception] = None
     try:
         words = kern.BUFFERS * buf_words
@@ -253,7 +253,7 @@ def k3_markov(
     )
     scalars = (int(markov_w1.shape[0]), int(shard_offset), int(rank), int(accepted.shape[1]), int(rewind_first),
                int(rewind_count))  # fmt: skip
-    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    use_pdl = get_env_flag("TRTLLM_ENABLE_PDL", True)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     consts = (grid, rows, shard, block, batch, slots, push_copies, buf_words, base_bf16)
     key = consts + (use_pdl,)

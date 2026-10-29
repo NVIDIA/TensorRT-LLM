@@ -28,12 +28,13 @@ kernel compiles on the first call for its shape, which must also happen outside 
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Dict
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 MAX_TOKENS = 8
 UNITS_PER_CTA = 4  # the chunk choice keeps at least this many units per CTA for the dynamic balance
@@ -50,7 +51,7 @@ def _arg(t: torch.Tensor):
 
 
 def _use_pdl() -> bool:
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    return get_env_flag("TRTLLM_ENABLE_PDL", True)
 
 
 def _stream(t: torch.Tensor):

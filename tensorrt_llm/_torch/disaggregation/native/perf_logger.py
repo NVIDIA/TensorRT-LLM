@@ -21,6 +21,7 @@ import threading
 import time
 
 from tensorrt_llm import logger
+from tensorrt_llm._utils import get_env_flag
 
 # CSV header for performance log files
 _PERF_CSV_HEADER = (
@@ -165,7 +166,7 @@ class PerfLogManager:
             self._use_cpp_naming = True
         else:
             # Fallback: existing Python env vars
-            self._perf_enabled = os.getenv("TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO", "0") == "1"
+            self._perf_enabled = get_env_flag("TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO", False)
             self._log_file_base = os.getenv("TLLM_KV_TRANSFER_PERF_LOG_FILE")
             self._use_cpp_naming = False
 

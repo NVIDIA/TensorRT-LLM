@@ -33,7 +33,7 @@ except ImportError:
     # Older Ray re-exported it from ray.util.placement_group
     from ray.util.placement_group import PlacementGroupSchedulingStrategy
 
-from tensorrt_llm._utils import nvtx_range_debug
+from tensorrt_llm._utils import get_env_flag, nvtx_range_debug
 from tensorrt_llm.executor.ray.utils import unwrap_ray_errors
 from tensorrt_llm.logger import logger
 
@@ -79,7 +79,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         }
 
         try:
-            if os.environ.get("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0") != "1":
+            if not get_env_flag("TLLM_RAY_FORCE_LOCAL_CLUSTER", False):
                 try:
                     ray.init(address="auto", **ray_init_args)
                     logger.info(f"Attached to an existing Ray cluster.")

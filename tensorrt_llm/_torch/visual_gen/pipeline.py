@@ -32,7 +32,7 @@ from tensorrt_llm._torch.nccl_window_tensor_scope import (
     nccl_window_tensor_scope,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_env_flag, nvtx_range
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
@@ -879,7 +879,7 @@ class BasePipeline(nn.Module):
         mapping = getattr(self, "mapping", None)
         tp_size = getattr(mapping, "tp_size", 1)
         return (
-            os.environ.get("TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1"
+            get_env_flag("TLLM_NCCL_SYMMETRIC_ZERO_COPY", True)
             and isinstance(tp_size, int)
             and tp_size > 1
             and strategy

@@ -18,7 +18,6 @@
 
 import functools
 import math
-import os
 from typing import (Any, Callable, Dict, List, Optional, Tuple, TypedDict,
                     Union, cast)
 
@@ -29,6 +28,7 @@ from PIL import Image
 from torchvision.transforms import Normalize, Resize, ToTensor
 
 from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
@@ -38,7 +38,7 @@ _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 # MM E/P split flag. Not generic disaggregated serving.
 def _is_mm_disagg() -> bool:
-    return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
+    return get_env_flag(_MULTIMODAL_ENV_NAME, False)
 
 
 def has_raw_multimodal_payload(param: MultimodalParams) -> bool:

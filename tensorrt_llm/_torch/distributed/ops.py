@@ -29,7 +29,8 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (HelixCpMnnvlMemory,
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
-from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_pybind11_abi
+from tensorrt_llm._utils import (get_env_flag, mpi_comm, mpi_disabled,
+                                 torch_pybind11_abi)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -43,8 +44,8 @@ from tensorrt_llm.mapping import Mapping
 # (1); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=0 to disable.
 # Evaluated once at import — O(1) module-global lookup on every call,
 # equivalent to a C++ static-bool cached env var.
-_NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
-    "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
+_NCCL_SYMMETRIC_ZERO_COPY: bool = get_env_flag("TLLM_NCCL_SYMMETRIC_ZERO_COPY",
+                                               True)
 
 # Bytes of the full all-reduce message (tokens * hidden * ranks * element size) up to which the
 # MNNVL path uses the one-shot kernel; mirrors kOneShotSizeThreshold in thop/allreduceOp.cpp and
@@ -359,7 +360,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
-    force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
+    force_mn = get_env_flag("TRTLLM_FORCE_MNNVL_AR", False)
     use_fabric_handle = force_mn or mapping.is_multi_node()
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
@@ -1369,8 +1370,8 @@ class AllReduce(nn.Module):
 
         # In case that AutoTuner brings potential perf regression
         # TODO: Remove this if no perf regression is observed.
-        disable_allreduce_autotune = os.environ.get(
-            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
+        disable_allreduce_autotune = get_env_flag(
+            "TLLM_DISABLE_ALLREDUCE_AUTOTUNE", False)
 
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
             # Use native lookup after tuning unless its Python/C++ contract

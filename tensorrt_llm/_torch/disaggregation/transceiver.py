@@ -66,7 +66,13 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
-from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvtx_range
+from tensorrt_llm._utils import (
+    ENABLE_MULTI_DEVICE,
+    get_env_flag,
+    mpi_comm,
+    mpi_disabled,
+    nvtx_range,
+)
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -196,7 +202,7 @@ def _validate_fp4_mla_bridge_profile(
     cache_transceiver_config: CacheTransceiverConfig,
 ) -> bool:
     """Select the bridge only for its explicit no-retry FP4-MLA deployment cell."""
-    if os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") != "1":
+    if not get_env_flag(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, False):
         return False
     fp4_mla_layout = (
         isinstance(kv_cache_manager, KVCacheManagerV2)
@@ -206,7 +212,7 @@ def _validate_fp4_mla_bridge_profile(
     )
     supported = (
         fp4_mla_layout
-        and os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
+        and get_env_flag("TRTLLM_DISAGG_NO_RETRY", False)
         and not use_pure_python_transfer_agent()
         and cache_transceiver_config.kv_transfer_timeout_ms is not None
         and cache_transceiver_config.kv_transfer_timeout_ms > 0
@@ -215,8 +221,8 @@ def _validate_fp4_mla_bridge_profile(
         and mapping.cp_size == 1
         and cache_transceiver_config.kv_cache_bounce_size_mb == 0
         and not cache_transceiver_config.enable_pipelined_transfer
-        and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
-        and os.getenv("TRTLLM_DISAGG_LAYERWISE") != "1"
+        and not get_env_flag("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", False)
+        and not get_env_flag("TRTLLM_DISAGG_LAYERWISE", False)
     )
     if not supported:
         raise ValueError(
