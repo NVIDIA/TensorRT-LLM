@@ -171,6 +171,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
+        never_mix_context_and_generation: bool = False,
+        min_decode_steps_between_context: int = 0,
     ) -> None:
         self.remote_tail_phase: RemoteTailPhase | None = None
         self._remote_tail_context_ids: frozenset[int] = frozenset()
@@ -297,6 +299,25 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
+
+        # Never-mix scheduling (SchedulerConfig.never_mix_context_and_generation,
+        # SGLang's enable_mixed_chunk=False). A step that would carry both
+        # context chunks and generation rows runs the context chunks alone
+        # (prefill first); the generation rows run in the next step, which is
+        # generation-only and so replays the full decode CUDA graph. With
+        # min_decode_steps_between_context > 0 (SGLang's
+        # --prefill-decode-interval), each context step is followed by that many
+        # generation-only steps before context is admitted again. See
+        # _never_mix_pre_phase2 and _never_mix_split.
+        self._never_mix = never_mix_context_and_generation
+        self._never_mix_decode_interval = max(0, int(min_decode_steps_between_context))
+        self._never_mix_interval_remaining = 0
+        self._never_mix_counts = Counter()
+        if self._never_mix:
+            logger.info(
+                "KVCacheV2Scheduler: never-mix scheduling enabled (prefill first, "
+                f"min_decode_steps_between_context={self._never_mix_decode_interval})"
+            )
 
         # `is True`: a manager without the flag reads as off.
         self._swa_scratch_reuse = (
@@ -671,7 +692,24 @@ class KVCacheV2Scheduler(RequestScheduler):
                 ),
             )
 
-        for req in pending_ctx:
+        # Never-mix: decide whether this step is context-only (prefill first)
+        # or generation-only (the decode-interval hold).
+        never_mix_ctx_first = False
+        never_mix_gen_tokens = None
+        ctx_candidates = pending_ctx
+        if self._never_mix:
+            never_mix_ctx_first, ctx_candidates = self._never_mix_pre_phase2(
+                pending_ctx, scheduled_gen, exclusive_remote_mode
+            )
+            if never_mix_ctx_first:
+                # The context chunks get the whole token budget. The generation
+                # rows still count toward the request cap (they resume next
+                # step) and keep their KV growth (a one-step reservation, so
+                # phase 2 cannot take their pages) until _never_mix_split.
+                never_mix_gen_tokens = budget.num_tokens
+                budget.num_tokens = 0
+
+        for req in ctx_candidates:
             if budget.requests_full:
                 break
             if req.py_request_id in prefix_waits:
@@ -775,6 +813,23 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        if never_mix_ctx_first:
+            if scheduled_ctx or scheduled_encoder:
+                scheduled_gen = self._never_mix_split(scheduled_gen, len(scheduled_ctx))
+            else:
+                # No context fit (KV, budget, prefix deferral): generation runs.
+                budget.num_tokens = never_mix_gen_tokens
+                self._never_mix_counts["ctx_none_gen_runs"] += 1
+        if (
+            self._never_mix
+            and self._never_mix_decode_interval > 0
+            and (scheduled_ctx or scheduled_encoder)
+            and self.remote_tail_phase is None
+            and exclusive_remote_mode is None
+        ):
+            # Armed by every context step.
+            self._never_mix_interval_remaining = self._never_mix_decode_interval
+
         made_progress = bool(
             scheduled_gen
             or scheduled_ctx
@@ -868,6 +923,59 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req.py_uncached_prefill_tokens = None
             keep.append(req)
         return keep + deferred, {req.py_request_id for req in deferred}
+
+    # ---- Never-mix scheduling ----
+
+    def _never_mix_pre_phase2(
+        self,
+        pending_ctx: RequestList,
+        scheduled_gen: RequestList,
+        exclusive_remote_mode,
+    ) -> tuple[bool, RequestList]:
+        """Choose between a context-only and a generation-only step.
+
+        Returns ``(ctx_first, ctx_candidates)``. Context is tried first and the
+        step runs generation only when no context fits, except during the
+        decode-interval hold that follows each context step (counted down once
+        per scheduling call), when there is generation to run. Remote-tail
+        (attention-DP CSA2) phases keep their own separation and are left alone.
+        """
+        if self.remote_tail_phase is not None or exclusive_remote_mode is not None:
+            return False, pending_ctx
+        if self._never_mix_interval_remaining > 0:
+            self._never_mix_interval_remaining -= 1
+            if scheduled_gen:
+                self._never_mix_counts["ctx_held"] += int(bool(pending_ctx))
+                return False, []
+        if not pending_ctx or not scheduled_gen:
+            return False, pending_ctx
+        return True, pending_ctx
+
+    def _never_mix_split(self, scheduled_gen: RequestList, num_ctx: int) -> RequestList:
+        """Drop the generation rows from a step that also runs context chunks.
+
+        Each dropped row gives back the KV growth phase 1 gave it (the same
+        revert the executor applies to a skipped attention-DP batch) and loses
+        its overlap bookkeeping (``py_batch_idx``): its previous step's sample
+        is harvested on the host while this context step runs, so its next
+        step reads the host token instead of a stale overlap tensor, as a
+        resumed request does.
+        """
+        for req in scheduled_gen:
+            self.kv_cache_manager.revert_allocate_generation(req)
+            if self._joint_draft_manager is not None:
+                self._joint_draft_manager.revert_allocate_generation(req)
+            self._clear_request_runtime_state(req)
+        counts = self._never_mix_counts
+        counts["ctx_only"] += 1
+        counts["gen_rows_deferred"] += len(scheduled_gen)
+        if counts["ctx_only"] == 1 or counts["ctx_only"] % 1000 == 0:
+            logger.debug(
+                f"KVCacheV2Scheduler never-mix: context-only step #{counts['ctx_only']} ran "
+                f"{num_ctx} context request(s) and deferred {len(scheduled_gen)} generation "
+                f"row(s) (totals: {dict(counts)})"
+            )
+        return []
 
     # ---- Prefix-aware skip ----
 
