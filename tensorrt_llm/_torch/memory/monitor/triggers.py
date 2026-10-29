@@ -19,17 +19,28 @@ The memory lives in the executor's process, not the one that created the
 context and nothing else -- so every trigger here has to fire inside the
 worker.
 
-Out of memory is the trigger worth having: it is the moment the breakdown
-answers a question somebody is actually asking. The handler runs while an
-allocation is failing, so it allocates no device memory, swallows every
-exception, and reports at most once per process by default -- a retry loop
-that OOMs repeatedly would otherwise bury the first and most informative
-report under identical copies.
+Two triggers fire there. Startup ends with one breakdown -- tagged
+``startup_failed`` if startup raised, which includes an unhandled OOM while
+loading. After that, out of memory reports, which is the moment the
+breakdown answers a question somebody is actually asking.
+
+The OOM observer is only armed once startup is over. KV cache sizing,
+warmup and graph capture deliberately run allocations into the wall and
+catch the error -- the flashinfer planner, for one, notes that estimation
+forwards "run with device memory deliberately exhausted". torch's observer
+fires before anyone catches, so arming it earlier reports every one of
+those as if it were a failure.
+
+The handler runs while an allocation is failing, so it allocates no device
+memory and swallows every exception. Reports are limited by time rather
+than by count: a retry loop that OOMs repeatedly collapses to one report
+per interval, while an unrelated OOM hours later is still reported.
 """
 
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 
@@ -41,8 +52,9 @@ __all__ = [
     "uninstall_oom_reporter",
 ]
 
-#: Set to an integer to allow more than one OOM report per process.
-_MAX_REPORTS_VAR = "TLLM_MEM_MONITOR_OOM_REPORTS"
+#: Minimum seconds between two OOM reports. ``0`` reports every one.
+_INTERVAL_VAR = "TLLM_MEM_MONITOR_OOM_INTERVAL"
+_DEFAULT_INTERVAL_S = 60.0
 
 #: Whether the callback is attached to torch. Never cleared: torch keeps
 #: every observer it is handed and offers no way to remove one, so a second
@@ -50,17 +62,17 @@ _MAX_REPORTS_VAR = "TLLM_MEM_MONITOR_OOM_REPORTS"
 _attached = False
 
 _enabled_flag = False
-_reports_emitted = 0
+_last_report_at: float | None = None
 
 
-def _max_reports() -> int:
-    raw = os.environ.get(_MAX_REPORTS_VAR, "")
+def _interval_s() -> float:
+    raw = os.environ.get(_INTERVAL_VAR, "")
     if not raw:
-        return 1
+        return _DEFAULT_INTERVAL_S
     try:
-        return max(0, int(raw))
+        return max(0.0, float(raw))
     except ValueError:
-        return 1
+        return _DEFAULT_INTERVAL_S
 
 
 def report_now(tag: str, rank: int | None = None) -> str | None:
@@ -88,11 +100,14 @@ def report_now(tag: str, rank: int | None = None) -> str | None:
 
 
 def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserved: int) -> None:
-    global _reports_emitted
+    global _last_report_at
 
-    if not _enabled_flag or _reports_emitted >= _max_reports():
+    if not _enabled_flag:
         return
-    _reports_emitted += 1
+    now = time.monotonic()
+    if _last_report_at is not None and now - _last_report_at < _interval_s():
+        return
+    _last_report_at = now
 
     gib = 1 << 30
     try:
@@ -103,7 +118,9 @@ def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserv
             f"torch reserved {reserved / gib:.2f} GiB"
         )
         report = report_now(tag="out_of_memory")
-        logger.error(header if report is None else f"{header}\n{report}")
+        # WARNING rather than ERROR: the caller may yet handle the OOM, and
+        # the OutOfMemoryError itself is what reports the failure.
+        logger.warning(header if report is None else f"{header}\n{report}")
     except Exception:  # noqa: BLE001 - never add a second failure to an OOM
         pass
 
@@ -111,7 +128,8 @@ def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserv
 def install_oom_reporter(rank: int | None = None) -> bool:
     """Report the monitor the next time an allocation runs out of memory.
 
-    Returns whether reporting is active. Safe to call repeatedly: the
+    Call once startup is over; see the module docstring for why earlier is
+    wrong. Returns whether reporting is active. Safe to call repeatedly: the
     callback is attached to torch at most once per process, because torch
     keeps every observer it is handed and cannot remove one, so attaching
     again would duplicate every report.
@@ -152,6 +170,6 @@ def uninstall_oom_reporter() -> None:
     attached and is made inert instead. ``_attached`` deliberately survives:
     re-installing must not attach a second copy.
     """
-    global _enabled_flag, _reports_emitted
+    global _enabled_flag, _last_report_at
     _enabled_flag = False
-    _reports_emitted = 0
+    _last_report_at = None

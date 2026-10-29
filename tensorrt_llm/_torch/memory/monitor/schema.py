@@ -116,7 +116,8 @@ class Category(StrEnum):
 class Source(StrEnum):
     """How a number was obtained -- i.e. how much to trust it."""
 
-    #: Per-allocation attribution from allocator metadata.
+    #: Attributed to code: a claimed module's parameters and buffers, or an
+    #: allocation tagged through allocator metadata.
     TAG = "tag"
     #: Read from a component that keeps its own accounting.
     COMPONENT = "component"
@@ -143,20 +144,16 @@ class Placement(StrEnum):
 class Basis(StrEnum):
     """What the number measures.
 
-    The distinction is load bearing. ``PagePool`` can report a configured
-    capacity for pages it has already released, and symmetric-memory wrappers
-    report the size they asked for rather than the heap actually reserved.
-    Mixing these with physical backing produces a plausible, wrong total.
+    The distinction is load bearing. DeepEP reports the size it asked for
+    rather than the heap actually reserved, and a KV pool's in-use split is
+    a division of memory already counted as physical. Mixing these with
+    physical backing produces a plausible, wrong total.
     """
 
     #: Device memory actually backed by physical pages right now.
     PHYSICAL_BACKING = "physical_backing"
     #: Bytes the component asked for; the real reservation may be larger.
     REQUESTED = "requested"
-    #: Capacity from configuration, which may outlive the pages themselves.
-    CONFIGURED_CAPACITY = "configured_capacity"
-    #: An allocator pool's reserved/used counters.
-    POOL_RESERVED = "pool_reserved"
     #: A logical/virtual-address view that can exceed physical backing, e.g.
     #: torch's accounting for a VMM-backed pool whose pages were released.
     LOGICAL = "logical"

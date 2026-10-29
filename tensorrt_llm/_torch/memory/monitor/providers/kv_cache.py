@@ -82,24 +82,32 @@ def kv_pool_group_stats(manager) -> list[dict]:
 
 
 class KvCacheProvider:
-    """KV cache v2 pools.
+    """One KV cache pool: the target model's, a draft model's, or the
+    cross-attention pool.
 
     Takes the manager explicitly: it lives in a ``ResourceManager`` owned by
     the executor, with no process-wide accessor, so it cannot be discovered
     the way ``MnnvlMemory`` can. The code that builds it registers one of
-    these via ``register_provider``.
+    these via ``register_provider``. ``role`` keeps the pools apart -- the
+    registry replaces providers by name, so two pools sharing a name would
+    leave one of them unreported.
 
     The reference is weak. A monitor that kept the manager alive would pin
     the largest allocation in the process -- the pool is tens of GiB -- and
     a diagnostic that prevents memory from being released is worse than one
     that reports nothing. Once the manager is gone the provider reports
     unavailable, which is the truth: there is no pool left to measure.
+
+    A manager without storage statistics (KV cache manager V1) still yields
+    a row, sized as unknown. Leaving it out would let the pool fall into the
+    unexplained residual with nothing to say it is missing.
     """
 
-    name = "kv_cache_v2"
     category = Category.KV_CACHE_POOL
 
-    def __init__(self, manager=None) -> None:
+    def __init__(self, manager=None, role: str = "main") -> None:
+        self.role = role
+        self.name = f"kv_cache.{role}"
         self._ref = None
         if manager is None:
             return
@@ -113,7 +121,7 @@ class KvCacheProvider:
             # in the module-level registry and pin the pool forever.
             logger.warning(
                 f"memory monitor: {type(manager).__name__} cannot be "
-                "referenced weakly; KV cache rows will be absent"
+                f"referenced weakly; the {role} KV cache pool will be absent"
             )
 
     @property
@@ -121,17 +129,46 @@ class KvCacheProvider:
         return self._ref() if self._ref is not None else None
 
     def available(self) -> bool:
-        manager = self._manager
-        return manager is not None and hasattr(manager, "_get_storage_statistics")
+        return self._manager is not None
 
     def collect(self) -> list[Entry]:
-        if not self.available():
+        manager = self._manager
+        if manager is None:
             return []
 
-        rows = kv_pool_group_stats(self._manager)
-        entries = []
+        if not hasattr(manager, "_get_storage_statistics"):
+            return [
+                Entry(
+                    category=Category.KV_CACHE_POOL,
+                    size_bytes=None,
+                    source=Source.COMPONENT,
+                    placement=Placement.NON_TORCH,
+                    basis=Basis.PHYSICAL_BACKING,
+                    owner=f"kv_cache.{self.role} ({type(manager).__name__})",
+                    note="this manager exposes no storage statistics; pool size not attributed",
+                )
+            ]
 
-        for row in rows:
+        entries = []
+        for row in kv_pool_group_stats(manager):
+            owner = f"kv_cache.{self.role}.pool_group[{row['pool_group_id']}]"
+            in_use = row["in_use_bytes"]
+            consistent = in_use >= 0
+            if consistent:
+                split = (
+                    f"{in_use} B in use, {row['free_bytes']} B free, "
+                    f"{row['evictable_bytes']} B evictable"
+                )
+            else:
+                # free + evictable exceeds total. The capacity is still
+                # trustworthy -- it comes from the configured slot count --
+                # so it is kept; only the split is withheld. Raising here
+                # would drop the whole pool from the report at exactly the
+                # moment its accounting is worth looking at.
+                split = (
+                    f"free + evictable exceed total by {-in_use // max(row['slot_bytes'], 1)} "
+                    "slots; split withheld"
+                )
             entries.append(
                 Entry(
                     category=Category.KV_CACHE_POOL,
@@ -139,13 +176,8 @@ class KvCacheProvider:
                     source=Source.COMPONENT,
                     placement=Placement.NON_TORCH,
                     basis=Basis.PHYSICAL_BACKING,
-                    owner=f"kv_cache_v2.pool_group[{row['pool_group_id']}]",
-                    note=(
-                        f"{row['total_slots']} slots resident; "
-                        f"{row['in_use_bytes']} B in use, "
-                        f"{row['free_bytes']} B free, "
-                        f"{row['evictable_bytes']} B evictable"
-                    ),
+                    owner=owner,
+                    note=f"{row['total_slots']} slots resident; {split}",
                 )
             )
             # The split is reported for diagnosis but never summed: these
@@ -153,11 +185,11 @@ class KvCacheProvider:
             entries.append(
                 Entry(
                     category=Category.KV_CACHE_POOL,
-                    size_bytes=row["in_use_bytes"],
+                    size_bytes=in_use if consistent else None,
                     source=Source.COMPONENT,
                     placement=Placement.NON_TORCH,
                     basis=Basis.LOGICAL,
-                    owner=f"kv_cache_v2.pool_group[{row['pool_group_id']}]",
+                    owner=owner,
                     note="in use within the resident pool",
                     counts_toward_total=False,
                 )

@@ -80,18 +80,15 @@ class DeepEpProvider:
 class DwdpPagePoolProvider:
     """DWDP page pool.
 
-    Reports ``unavailable`` until ``PagePool`` grows a read-only statistics
-    interface, because no public accessor currently gives physical occupancy.
+    Reads ``held_pages``, the handles the pool owns now, not
+    ``num_pages``/``configured_pages``, which keep their value after
+    ``release()`` has handed every page back. Measured on a live pool: after
+    releasing every page, ``sum(num_pages(s)) * page_size`` still reported
+    128 MiB while the device had taken all 128 MiB back.
 
-    ``num_pages(slot)`` returns the *configured* ``_slot_pages``, and
-    ``release()`` clears only ``_page_handles``. Measured on a live pool:
-    after releasing every page, ``sum(num_pages(s)) * page_size`` still
-    reported 128 MiB while the device had taken all 128 MiB back. Publishing
-    that as occupancy would invent an entire pool's worth of memory.
-
-    ``len(_page_handles[slot])`` does track reality (0 after release), but it
-    is private; the fix belongs in ``PagePool`` as
-    ``configured_pages`` / ``held_pages`` / ``release_failed``.
+    A handle whose release raised is no longer held but may still be mapped,
+    so a non-zero ``release_failed`` turns the figure into a lower bound and
+    the note says so.
     """
 
     name = "dwdp_page_pool"
@@ -122,24 +119,8 @@ class DwdpPagePoolProvider:
         pool = self._pool()
         if pool is None:
             return []
-        if not all(hasattr(pool, attr) for attr in ("held_pages", "configured_pages")):
-            return [
-                Entry(
-                    category=Category.DWDP_PAGES,
-                    size_bytes=None,
-                    source=Source.COMPONENT,
-                    placement=Placement.NON_TORCH,
-                    basis=Basis.CONFIGURED_CAPACITY,
-                    owner="dwdp.PagePool",
-                    note=(
-                        "no physical-occupancy accessor; num_pages() "
-                        "reports configured capacity even after release"
-                    ),
-                )
-            ]
-
         held = sum(pool.held_pages(slot) for slot in range(pool.num_slots))
-        failed = getattr(pool, "release_failed", 0)
+        failed = pool.release_failed
 
         note = None
         if failed:
