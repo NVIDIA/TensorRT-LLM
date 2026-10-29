@@ -107,6 +107,11 @@ class Category(StrEnum):
     #: ``cudaMalloc`` and must not be reported as a leak.
     NONTORCH_RESIDUAL = "nontorch_residual"
 
+    #: Sleep-mode pools whose physical memory is released. torch still counts
+    #: them as reserved and their blocks as live, so the rows above include
+    #: them; this negative entry takes them back out.
+    SLEEP_RELEASED = "sleep_released"
+
 
 class Source(StrEnum):
     """How a number was obtained -- i.e. how much to trust it."""
@@ -177,6 +182,8 @@ class Entry:
             self.size_bytes is not None
             and self.size_bytes < 0
             and self.source is not Source.RESIDUAL
+            # A correction by construction: memory counted elsewhere.
+            and self.category is not Category.SLEEP_RELEASED
         ):
             raise ValueError(
                 f"Entry {self.category} has negative size {self.size_bytes}; use None for unknown."

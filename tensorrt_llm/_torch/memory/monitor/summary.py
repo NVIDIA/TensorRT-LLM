@@ -55,6 +55,7 @@ class Group(Enum):
     COMMUNICATION = "Communication buffers"
     OVERHEAD = "CUDA and library overhead"
     OTHER = "Other tagged memory"
+    SLEEP_RELEASED = "Released by sleep mode"
 
 
 _NOTES = {
@@ -67,6 +68,7 @@ _NOTES = {
     Group.COMMUNICATION: "multi-GPU communication buffers",
     Group.OVERHEAD: "CUDA context, cuBLAS, NCCL internals and other driver memory",
     Group.OTHER: "tagged with a name the report does not group",
+    Group.SLEEP_RELEASED: "included in the rows above but returned to the driver",
 }
 
 #: Every category that can count toward a total, by the group it belongs to.
@@ -90,6 +92,7 @@ GROUP_OF: dict[Category, Group | None] = {
     Category.TAGGED_OTHER: Group.OTHER,
     Category.CUDA_GRAPHS: Group.CUDA_GRAPHS,
     Category.CPP_BUFFERS: None,
+    Category.SLEEP_RELEASED: Group.SLEEP_RELEASED,
 }
 
 
@@ -312,7 +315,9 @@ def _conclusion(
             for g, s in known.items()
             if g is not Group.TORCH_CACHE and baseline.get(g) is not None
         }
-        grown = {g: d for g, d in growth.items() if d > 0}
+        # Growth too small to print is not growth; naming it would point
+        # the reader at a row showing +0.00.
+        grown = {g: d for g, d in growth.items() if d >= _SHOWN}
         if grown:
             focus = max(grown, key=grown.get)
             lines.append(

@@ -4408,9 +4408,12 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
-    kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+    # Disaggregated serving's KV transfer buffers are allocated in C++ with
+    # no size exposed to Python; the memory monitor names them by measuring.
+    with _monitor_startup.region("KV cache transfer buffers"):
+        kv_cache_transceiver = create_kv_cache_transceiver(
+            mapping, dist, kv_cache_manager, attention_type,
+            cache_transceiver_config, mamba_cache_manager)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

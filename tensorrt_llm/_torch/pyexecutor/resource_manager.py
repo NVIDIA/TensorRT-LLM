@@ -28,6 +28,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.memory.monitor.startup import region as monitor_region
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
 from tensorrt_llm._utils import (get_size_in_bytes, prefer_pinned,
@@ -3314,10 +3315,13 @@ class PeftCacheManager(BaseResourceManager):
         logger.info(
             f"[PeftCacheManager] buffer_manager_stream: {buffer_manager_stream}"
         )
-        self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
-                                        model_config=model_config,
-                                        world_config=world_config,
-                                        buffer_manager=buffer_manager)
+        # The device LoRA cache is allocated here, in C++, with no size
+        # exposed to Python; the memory monitor names it by measuring.
+        with monitor_region("LoRA device cache"):
+            self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
+                                            model_config=model_config,
+                                            world_config=world_config,
+                                            buffer_manager=buffer_manager)
         if initial_data_type is not None:
             self.impl.configure_data_type(
                 torch_dtype_to_binding(initial_data_type))

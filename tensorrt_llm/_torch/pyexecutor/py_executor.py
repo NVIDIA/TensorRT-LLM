@@ -3770,6 +3770,9 @@ class PyExecutor:
                     error_msg = (f"rank {self.dist.rank} '{action}' failed: "
                                  f"{exc}\n{traceback.format_exc()}")
                     logger.error(f"Sleep/wakeup listener: {error_msg}")
+                    # Rematerializing on wakeup allocates outside PyTorch, and
+                    # this handler, not _handle_errors, catches its failure.
+                    monitor_notify_error(str(exc))
                 finally:
                     # Always ACK so rank-0 does not deadlock; carry error
                     # details so rank-0 can raise after all ranks respond.

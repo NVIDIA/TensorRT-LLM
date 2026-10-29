@@ -105,8 +105,8 @@ def report_now(
 ) -> str | None:
     """Render the monitor for this process, or ``None`` if it is disabled.
 
-    Returns the text as well as logging it so a caller can attach it to an
-    exception or a crash dump rather than hoping the log survives.
+    Returns the text without logging it; the caller decides where it goes
+    (the log, an exception message, a crash dump).
     ``record_baseline`` makes this reading the one later reports compare
     against.
     """

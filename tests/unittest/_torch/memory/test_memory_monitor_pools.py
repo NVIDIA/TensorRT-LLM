@@ -93,6 +93,64 @@ class TestClassification:
         assert ("mempool", "sleep: unit_scope") in kinds
         del held, proxy
 
+    def test_resumed_parent_pool_keeps_the_parent_tag(self):
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+        from tensorrt_llm._torch.virtual_memory import scope as vm_scope
+
+        pool_mod.clear_registered_pools()
+        with vm_scope("unit_outer", RestoreMode.NONE) as proxy:
+            with vm_scope("unit_inner", RestoreMode.NONE):
+                inner = torch.empty(8 * MB, dtype=torch.uint8, device="cuda")
+            after = torch.empty(8 * MB, dtype=torch.uint8, device="cuda")
+        labels = {
+            pool_mod.classify(seg["segment_pool_id"])[1]
+            for seg in torch.cuda.memory._snapshot()["segments"]
+            if seg["allocated_size"]
+        }
+        # Memory allocated after the inner scope still belongs to the outer
+        # tag and is released with it.
+        assert "sleep: unit_outer" in labels
+        assert "sleep: resumed parent scope" not in labels
+        del inner, after, proxy
+
+
+class TestSleepRelease:
+    """Released sleep-mode memory: torch keeps counting it, the GPU does not."""
+
+    def _scoped(self, tag, size):
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+        from tensorrt_llm._torch.virtual_memory import scope as vm_scope
+
+        with vm_scope(tag, RestoreMode.NONE) as proxy:
+            held = torch.empty(size, dtype=torch.uint8, device="cuda")
+        return proxy, held
+
+    def test_released_memory_leaves_the_footprint(self):
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag, release_with_tag
+
+        pool_mod.clear_registered_pools()
+        proxy, held = self._scoped("unit_sleep", 256 * MB)
+        try:
+            torch.cuda.synchronize()
+            awake = _capture().frame
+            release_with_tag("unit_sleep")
+            torch.cuda.synchronize()
+            asleep = _capture().frame
+            # torch's own counter does not move ...
+            assert asleep.torch.reserved == awake.torch.reserved
+            # ... but the footprint does, so the residual stays put instead
+            # of dropping by the released size.
+            assert asleep.torch.released >= 256 * MB
+            assert abs(asleep.nontorch_residual - awake.nontorch_residual) < 64 * MB
+            totals = group_totals(asleep)
+            assert totals.sizes[Group.SLEEP_RELEASED] == -asleep.torch.released
+            assert sum(s for s in totals.sizes.values() if s is not None) == totals.process_total
+            materialize_with_tag("unit_sleep")
+            torch.cuda.synchronize()
+            assert _capture().frame.torch.released == 0
+        finally:
+            del held, proxy
+
 
 class TestGraphMemory:
     def test_graph_blocks_are_cuda_graphs_even_inside_a_tagged_step(self):
@@ -141,3 +199,43 @@ def test_graph_rows_use_a_readable_owner():
         assert rows and rows[0].owner == "in use by graphs"
     finally:
         del graph, kept
+
+
+class TestUnregisteredMemPool:
+    """A MemPool created by code that never registers, e.g. GMS weight sharing."""
+
+    def test_is_a_mempool_not_a_graph_pool(self):
+        pool_mod.clear_registered_pools()
+        mem = torch.cuda.MemPool()  # deliberately not registered
+        with torch.cuda.use_mem_pool(mem):
+            held = torch.empty(32 * MB, dtype=torch.uint8, device="cuda")
+        try:
+            usage = {
+                p.pool_id: p for p in pool_mod.pool_usage(torch.cuda.memory._snapshot()["segments"])
+            }
+            assert usage[tuple(mem.id)].kind == "mempool"
+            assert usage[tuple(mem.id)].label == "unnamed MemPool"
+        finally:
+            del held
+
+    def test_its_blocks_are_not_counted_as_cuda_graphs(self):
+        pool_mod.clear_registered_pools()
+        mem = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(mem):
+            held = torch.empty(32 * MB, dtype=torch.uint8, device="cuda")
+        try:
+            by_tag = tagging.live_bytes_by_tag(tagging.TagSnapshot(supported=True))
+            assert by_tag.get(tagging.CUDA_GRAPHS, 0) == 0
+        finally:
+            del held
+
+    def test_graph_pools_are_still_graph_pools(self):
+        pool_mod.clear_registered_pools()
+        mem = torch.cuda.MemPool()
+        graph, pool, kept = _capture_graph(16 * MB)
+        try:
+            kinds = pool_mod.classify_all([tuple(mem.id), tuple(pool)])
+            assert kinds[tuple(pool)][0] == "graph"
+            assert kinds[tuple(mem.id)][0] == "mempool"
+        finally:
+            del graph, kept
