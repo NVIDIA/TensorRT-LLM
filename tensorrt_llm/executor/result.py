@@ -1023,9 +1023,19 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 is not None) and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
-                if hasattr(
-                        self.tokenizer, 'decode_incrementally'
-                ) and self._streaming and not self.sampling_params.use_beam_search:
+                # A stop word matched by token id is trimmed from token_ids in
+                # _handle_sequence. If some of its ids came in earlier streamed
+                # responses, the incremental decoder has already turned them
+                # into text, or holds the lead bytes of a character that the
+                # final flush would emit as U+FFFD. Decode the kept ids afresh
+                # instead, as the non-streaming path does.
+                trimmed_streamed_ids = (len(beam_output.token_ids)
+                                        < beam_output._last_token_ids_len)
+                use_incremental = (self._streaming
+                                   and not self.sampling_params.use_beam_search
+                                   and not trimmed_streamed_ids and hasattr(
+                                       self.tokenizer, 'decode_incrementally'))
+                if use_incremental:
                     beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
                         beam_output.token_ids_diff,
                         prev_text=beam_output.text,
@@ -1036,6 +1046,13 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
+                    if trimmed_streamed_ids:
+                        # Drop the pending flush, and move the watermark to the
+                        # kept ids so that later responses for sibling
+                        # candidates (n > 1) do not decode this output again.
+                        beam_output._incremental_states = None
+                        beam_output._last_token_ids_len = len(
+                            beam_output.token_ids)
 
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
