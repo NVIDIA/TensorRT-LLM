@@ -11,7 +11,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
@@ -146,7 +145,8 @@ def create_moe_backend(
             activation=activation,
         )
 
-    if moe_cls is CutlassFusedMoE or issubclass(moe_cls, MarlinFusedMoE):
+    if issubclass(moe_cls, CutlassFusedMoE) or issubclass(
+            moe_cls, MarlinFusedMoE):
         # The two whose constructor takes an expert-bias flag. Marlin declines
         # the flag itself, so the check above already rejected a True.
         return moe_cls(
@@ -179,11 +179,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE, CuteDslFc12FusedMoE):
-        # Both are constructed through the narrower CuteDsl argument set (no
-        # bias / swiglu_alpha-beta-limit). CuteDslB12xFusedMoE now delegates to
-        # CutlassFusedMoE.__init__, which does accept those four, so widening
-        # this branch would need the allow-lists above to admit b12x first.
+    elif issubclass(moe_cls, (CuteDslFusedMoE, CuteDslFc12FusedMoE)):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -283,6 +279,7 @@ def create_moe(
     communication_method: Optional[str] = None,
     unfinalized_combine_fn: Optional[Callable[..., torch.Tensor]] = None,
     allow_backend_degradation: bool = True,
+    accepts_global_routed_output: bool = False,
 ) -> MoE | VanillaMoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
@@ -314,6 +311,8 @@ def create_moe(
             serve this layer raises with the rejection trail instead of falling
             back. For callers that must know they got the backend they asked
             for, e.g. because they are measuring it.
+        accepts_global_routed_output: See ``ConfigurableMoE.__init__``. Other
+            layers have no ``FUSED_COMM`` backend, so they ignore it.
 
     Returns:
         A complete MoE layer: a ``MoE`` (``ConfigurableMoE`` around an
@@ -384,6 +383,7 @@ def create_moe(
             activation=activation,
             communication_method=communication_method,
             unfinalized_combine_fn=unfinalized_combine_fn,
+            accepts_global_routed_output=accepts_global_routed_output,
         )
 
     # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE

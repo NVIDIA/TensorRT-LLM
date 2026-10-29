@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+l0_gr100:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    terms:
+      compute_capability: '10.7'
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
+  - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
+  # The GLM-5.2 target's unit tests, one entry per op directory. Its comm tests
+  # run 4 ranks, and CI has no 4-GPU GR100 stage yet.
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/attention
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/dsa
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/embedding
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/gemm
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/moe
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/quantization
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec

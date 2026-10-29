@@ -341,7 +341,7 @@ TEST_F(PeftCacheManagerTest, putToCapacity)
             {
                 EXPECT_THAT([&]() { mPeftManager->addRequestPeft(llmRequest); },
                     testing::Throws<std::runtime_error>(testing::Property(
-                        &std::runtime_error::what, testing::HasSubstr("There are no done tasks to evict"))));
+                        &std::runtime_error::what, testing::HasSubstr("PEFT Cache is full. Could not store taskId="))));
                 break;
             }
             reqTable.insert_or_assign(llmRequest->mRequestId, llmRequest);
@@ -502,8 +502,8 @@ TEST_F(PeftCacheManagerTest, gptManagerSim)
                             *ITensor::wrap(weightsInPtr, ITensor::makeShape({v.inSize})), runtime::MemoryType::kCPU);
                         TensorPtr hostWeightsOut = mManager->copyFrom(
                             *ITensor::wrap(weightsOutPtr, ITensor::makeShape({v.outSize})), runtime::MemoryType::kCPU);
-                        float* hostWeightsInPtr = bufferCast<float>(*hostWeightsIn);
-                        float* hostWeightsOutPtr = bufferCast<float>(*hostWeightsOut);
+                        float* hostWeightsInPtr = hostWeightsIn->getBufferPtr<float>();
+                        float* hostWeightsOutPtr = hostWeightsOut->getBufferPtr<float>();
 
                         float* targetWeightsInPtr = reinterpret_cast<float*>(targetValue.weightsInPointer);
                         float* targetWeightsOutPtr = reinterpret_cast<float*>(targetValue.weightsOutPointer);

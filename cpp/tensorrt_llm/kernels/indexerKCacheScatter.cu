@@ -103,7 +103,7 @@ __global__ void indexerKCacheScatterUnifiedKernel(uint8_t const* __restrict__ k_
     // Convert flat index to memory offset using strides (k cache pool from cpp kv cache manager is non-contiguous)
     int64_t dst_offset = flatIndexToMemoryOffset(flat_idx, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3,
         cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3);
-    int64_t src_offset = token_idx * head_dim + head_dim_idx;
+    int64_t src_offset = static_cast<int64_t>(token_idx) * head_dim + head_dim_idx;
 
     // 4 bytes write
     *reinterpret_cast<uint32_t*>(&k_cache[dst_offset]) = *reinterpret_cast<uint32_t const*>(&k_fp8_bytes[src_offset]);
@@ -113,7 +113,7 @@ __global__ void indexerKCacheScatterUnifiedKernel(uint8_t const* __restrict__ k_
     {
         int64_t dst_offset_scale = flatIndexToMemoryOffset(flat_idx_scale_base, cache_dim_0, cache_dim_1, cache_dim_2,
             cache_dim_3, cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3);
-        int64_t src_offset_scale = token_idx * scale_size; // scale_size = 4
+        int64_t src_offset_scale = static_cast<int64_t>(token_idx) * scale_size; // scale_size = 4
 
         // 4 bytes write for scale
         *reinterpret_cast<uint32_t*>(&k_cache[dst_offset_scale])

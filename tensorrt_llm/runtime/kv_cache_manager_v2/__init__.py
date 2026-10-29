@@ -52,6 +52,8 @@ def _load_cpp_module():
 
 _cpp = _load_cpp_module()
 
+DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
 AttentionReusePolicy = _cpp.AttentionReusePolicy
@@ -81,11 +83,14 @@ CoalescedBuffer = _cpp.CoalescedBuffer
 CacheTier = _cpp.CacheTier
 CorruptedError = _cpp.CorruptedError
 CuError = _cpp.CuError
+CuOOMError = _cpp.CuOOMError
 DiskCacheTierConfig = _cpp.DiskCacheTierConfig
+DiskOOMError = _cpp.DiskOOMError
 GpuCacheTierConfig = _cpp.GpuCacheTierConfig
 ExpandedBuffer = _cpp.ExpandedBuffer
 HalfOpenRange = _cpp.HalfOpenRange
 HostCacheTierConfig = _cpp.HostCacheTierConfig
+HostOOMError = _cpp.HostOOMError
 KVCacheDesc = _cpp.KVCacheDesc
 KVCacheCreatedData = _cpp.KVCacheCreatedData
 KVCacheEvent = _cpp.KVCacheEvent
@@ -129,6 +134,8 @@ class _KVCacheManagerConfigFieldSpec:
     enable_stats: bool = True
     text_only: bool = False
     enable_partial_commit: bool = True
+    pool_rebalance: object = None
+    cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -152,6 +159,7 @@ PlannedDropHandle = _cpp.PlannedDropHandle
 PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
 PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
+PoolRebalanceConfig = _cpp.PoolRebalanceConfig
 ReuseGroupStatus = _cpp.ReuseGroupStatus
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
@@ -221,6 +229,7 @@ __all__ = [
     "CacheTierConfig",
     "CudaStream",
     "DEFAULT_BEAM_INDEX",
+    "DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY",
     "DataRole",
     "DiskCacheTierConfig",
     "ExpandedBuffer",
@@ -271,6 +280,7 @@ __all__ = [
     "SlidingWindowSize",
     "SlotDesc",
     "SlotDescVariant",
+    "PoolRebalanceConfig",
     "SsmLayerConfig",
     "StreamingBlockRemovedData",
     "StreamingBlockStoredData",
@@ -283,6 +293,9 @@ __all__ = [
     "AttnLifeCycle",
     "CorruptedError",
     "CuError",
+    "CuOOMError",
+    "DiskOOMError",
+    "HostOOMError",
     "OutOfMemoryError",
     "_KVCache",
     "create_default_kv_cache_cold_page_codec",

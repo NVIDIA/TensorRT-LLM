@@ -29,6 +29,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -166,10 +167,9 @@ def markov_prev_embeddings(prev_tokens: torch.Tensor,
     """``markov_w1[prev_tokens]`` with out-of-vocab anchors masked to zero.
 
     The anchor is the last accepted token, which on the one-model rejection path
-    comes from flashinfer's ``chain_speculative_sampling``: it pads non-accepted
-    positions with ``-1`` and returns an out-of-range id for a row whose
-    ``relu(target - draft)`` residual has no mass. Mask like modules/embedding.py
-    does, so such a row contributes no bias instead of tripping a device assert.
+    comes from ``trtllm::chain_speculative_sampling``: it pads non-accepted
+    positions with ``-1``. Mask like modules/embedding.py does, so such a
+    position contributes no bias instead of tripping a device assert.
 
     Args:
         prev_tokens: previous token ids (draft vocab), any shape.
@@ -272,31 +272,6 @@ def dspark_markov_chain(
             prev = next_token_fn(step_logits).long()
         sampled.append(prev)
     return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
-
-
-def dspark_markov_chain_logits(base_logits: torch.Tensor,
-                               first_prev_tokens: torch.Tensor,
-                               markov_w1: torch.Tensor,
-                               markov_w2: torch.Tensor,
-                               argmax_fn=None) -> torch.Tensor:
-    """Raw-tensor entry to :func:`dspark_markov_chain`, corrected logits only.
-
-    For drafters that keep the Markov head as plain checkpoint tensors rather
-    than a :class:`VanillaMarkov` module (the DFlash path). ``markov_w2`` may
-    already be sliced down to this rank's TP vocab shard, in which case
-    ``argmax_fn`` must map a shard-local row back to a full-vocab token id.
-    """
-
-    def _step_bias(prev_tokens, step_hidden):
-        del step_hidden
-        return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
-
-    _, corrected = dspark_markov_chain(base_logits,
-                                       first_prev_tokens,
-                                       _step_bias,
-                                       next_token_fn=argmax_fn,
-                                       cast_bias_to_logits=True)
-    return corrected
 
 
 class VanillaMarkov(nn.Module):
@@ -1464,6 +1439,10 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None and mtp_repeat_count > 1:
+            for layer_idx in range(mtp_num_layers):
+                dwdp_manager.add_repeated_layer(layer_idx + start_layer_idx)
         self.owns_lm_head = lm_head_quant_config is not None
         if self.owns_lm_head:
             if getattr(model_config.pretrained_config, "tie_word_embeddings",
@@ -1596,7 +1575,9 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
         moe_backend=_get_requested_draft_moe_backend(model_config, spec_config),
-        mapping=model_config.mapping,
+        # The drafter runs on every row; keep it TP where the TP group shares
+        # requests (helix + attention DP at tp_size 1).
+        mapping=model_config.mapping.mapping_for_full_rows(),
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
@@ -1761,7 +1742,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             MistralConfigLoader
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
-                            mapping=model_config.mapping,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             moe_backend=requested_draft_moe_backend,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
@@ -1782,7 +1764,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
                             moe_backend=requested_draft_moe_backend,
-                            mapping=model_config.mapping,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1800,7 +1783,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
                         moe_backend=requested_draft_moe_backend,
-                        mapping=model_config.mapping,
+                        mapping=model_config.mapping.mapping_for_full_rows(),
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1842,13 +1825,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
-                model_config.mapping,
+                model_config.mapping.mapping_for_full_rows(),
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
                 # draft_model.model.d2t on every forward.
                 self.spec_worker.set_draft_model(self.draft_model)
+                self.spec_worker.set_target_model(self)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
@@ -1895,12 +1879,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # get logits
-            logits = self.logits_processor.forward(
+            # The target logits, in the layout the worker's acceptance reads.
+            logits = self.spec_worker.target_logits(
                 hidden_states[spec_metadata.gather_ids],
                 self.lm_head,
+                self.logits_processor,
                 attn_metadata,
-                True,
+                spec_metadata,
+                self.draft_model,
             )
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with

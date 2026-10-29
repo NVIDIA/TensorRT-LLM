@@ -504,6 +504,22 @@ class TestFanInReserve:
         t = _make_transport(monkeypatch, block_bytes_per_group=[1000], capacity=500)
         assert t.reserve(_recv_req([2]), num_writers=1) is False  # total 2000 > cap 500
 
+    def test_reserve_does_not_wait_for_recv_space(self, monkeypatch):
+        # The receiver reserves on the executor thread, so a full recv region must fall back to
+        # the per-fragment path at once instead of waiting for space to free up.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        timeouts = []
+
+        def full_region(size, timeout=None):
+            timeouts.append(timeout)
+            return None
+
+        monkeypatch.setattr(t._recv_alloc, "reserve", full_region)
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=1) is False
+        assert timeouts == [0.0]
+        assert req.bounce_dst_base is None
+
     def test_reserve_state_group_fanin_falls_back(self, monkeypatch):
         # STATE groups (None bytes) with num_writers > 1 must disable bounce even
         # when extra_bytes == 0: the representative sender may have no mamba
@@ -770,11 +786,12 @@ def _k3_page_table() -> KVCachePageTable:
     )
 
 
-def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0):
+def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0, attention_dp=None):
     # MambaPolicy reads tp_size / tp_rank / cp_size / cp_rank /
     # attention.enable_attention_dp.
+    attention = None if attention_dp is None else SimpleNamespace(enable_attention_dp=attention_dp)
     return SimpleNamespace(
-        tp_size=tp_size, tp_rank=tp_rank, cp_size=cp_size, cp_rank=cp_rank, attention=None
+        tp_size=tp_size, tp_rank=tp_rank, cp_size=cp_size, cp_rank=cp_rank, attention=attention
     )
 
 
@@ -860,6 +877,24 @@ class TestMambaHelixCP:
             7,
         )
 
+    def test_mamba_tp_helix_attention_dp_shards_over_cp(self):
+        # Helix + attention DP (K3 helix_a2a): the CP group shares every
+        # request, so the state stays head-sharded across it; must match the
+        # executor's pool sizing in config_utils.mamba_effective_tp_size.
+        from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
+
+        ri = _k3_rank_info(cp_size=16, cp_rank=5, attention_dp=True)
+        assert MambaPolicy._mamba_tp(ri) == (16, 5)
+        mapping = SimpleNamespace(
+            enable_attention_dp=True, tp_size=1, cp_size=16, has_cp_helix=lambda: True
+        )
+        assert mamba_effective_tp_size(mapping) == 16
+        # Attention DP without CP still replicates.
+        assert MambaPolicy._mamba_tp(_k3_rank_info(tp_size=4, tp_rank=2, attention_dp=True)) == (
+            1,
+            0,
+        )
+
     def test_equal_width_unpaired_sender_sends_nothing(self):
         # Regression lock for the fan-in collapse: with equal shard widths the
         # mapper is a whole-slot copy, so an unpaired sender must return zero
@@ -928,6 +963,12 @@ class TestSlotAllocator:
         a = self._alloc(monkeypatch, cap=512)  # single slot
         a.reserve(512)
         assert a.reserve(512, timeout=0.05) is None  # full -> times out
+
+    def test_zero_timeout_does_not_wait_when_full(self, monkeypatch):
+        a = self._alloc(monkeypatch, cap=512)  # single slot
+        a.reserve(512)
+        monkeypatch.setattr(a._cv, "wait", lambda *args, **kwargs: pytest.fail("reserve waited"))
+        assert a.reserve(512, timeout=0.0) is None
 
 
 # --------------------------------------------------------------------------- #

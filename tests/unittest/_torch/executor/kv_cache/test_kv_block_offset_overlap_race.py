@@ -118,7 +118,7 @@ def test_copy_batch_block_offsets_max_blocks_staging_width():
 
     ids = list(range(1, 1 + _BATCH))
     toks = [_TOKENS_PER_SEQ] * _BATCH  # 5 allocated blocks per sequence
-    mgr.add_dummy_requests(request_ids=ids, token_nums=toks, prepare_resource=True)
+    mgr.add_dummy_requests(request_ids=ids, token_nums=toks)
     allocated_blocks = _TOKENS_PER_SEQ // _TOKENS_PER_BLOCK
 
     ref = _reference_offsets(mgr, ids)
@@ -157,8 +157,8 @@ def test_copy_batch_block_offsets_survives_overlap_overwrite():
     ids_a = list(range(1, 1 + _BATCH))
     ids_b = list(range(101, 101 + _BATCH))
     toks = [_TOKENS_PER_SEQ] * _BATCH
-    mgr.add_dummy_requests(request_ids=ids_a, token_nums=toks, prepare_resource=True)
-    mgr.add_dummy_requests(request_ids=ids_b, token_nums=toks, prepare_resource=True)
+    mgr.add_dummy_requests(request_ids=ids_a, token_nums=toks)
+    mgr.add_dummy_requests(request_ids=ids_b, token_nums=toks)
 
     ref_a = _reference_offsets(mgr, ids_a)
     ref_b = _reference_offsets(mgr, ids_b)

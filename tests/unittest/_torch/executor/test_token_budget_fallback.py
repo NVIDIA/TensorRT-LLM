@@ -119,7 +119,7 @@ def _make_batch(context_requests=(), generation_requests=()):
 
 
 def _forward_tokens(mgr, batch):
-    """What _prepare_tp_inputs will materialize for this batch."""
+    """What prepare_inputs will materialize for this batch."""
     return sum(
         mgr._request_forward_tokens(r, is_context=False) for r in batch.generation_requests
     ) + sum(
@@ -165,7 +165,7 @@ class TestReuseDiscountedChunk(unittest.TestCase):
             self.assertEqual(req.context_chunk_size, 12, "chunk must be untouched")
 
     def test_chunk_beyond_prompt_end_is_clamped(self):
-        # _prepare_tp_inputs slices all_prompt_tokens[pos:pos + chunk], and
+        # _pack_context_requests slices all_prompt_tokens[pos:pos + chunk], and
         # Python clamps that to the end of the list. A chunk that overhangs the
         # prompt must be costed at what is actually left, not at its nominal
         # size.

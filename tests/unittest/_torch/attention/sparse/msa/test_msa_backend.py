@@ -226,6 +226,7 @@ def test_cache_manager_honors_executor_sparse_attention_config(
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", fake_get_index_k_buffer)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
     sparse_config = SimpleNamespace(
         sparse_index_dim=configured_sparse_index_dim,
         indexer_kv_dtype=indexer_kv_dtype,
@@ -257,7 +258,7 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
     block_scale = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
     global_scale = torch.ones(1)
 
-    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103"):
+    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103/SM107"):
         minimax_m3_sparse_attn_decode(
             q,
             kv,
@@ -272,6 +273,34 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
             v_block_scale=block_scale,
             k_global_scale=global_scale,
             v_global_scale=global_scale,
+        )
+    get_capability.assert_called_once_with(q.device)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+def test_nvfp4_sparse_decode_admits_the_sm100_family(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    """SM100-family devices, Rubin included, pass the device check and reach
+    input validation, which here rejects the missing scales."""
+    get_capability = Mock(spec_set=torch.cuda.get_device_capability, return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    q = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 128, 64), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="needs all four"):
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv,
+            kv,
+            torch.zeros((1, 1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            sm_scale=128**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=1,
+            k_block_scale=torch.empty((1, 1, 128, 8), dtype=torch.uint8),
         )
     get_capability.assert_called_once_with(q.device)
 
@@ -307,6 +336,7 @@ def test_index_k_views_are_fullgraph_safe(
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", resolve_index_view)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
     config = SimpleNamespace(implementation=implementation, indexer_kv_dtype=indexer_kv_dtype)
     managers = [
         MiniMaxM3KVCacheManagerV2(
@@ -445,15 +475,19 @@ def test_msa_buffers_include_graph_stable_block_table():
 
 
 @pytest.mark.cpu_only
-def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("nvfp4", [False, True])
+def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch, nvfp4: bool) -> None:
     """Stage zero-copy cache views only for sparse layers on the local rank."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
     metadata = _buffer_metadata(sparse_layer_ids=[3, 4], layer_offsets={3: 0})
     main_cache = torch.zeros(2, 2, 1, 128, 128)
     index_cache = torch.zeros(2, 1, 128, 128)
+    scale_cache = torch.zeros(2, 2, 1, 128, 8, dtype=torch.uint8)
     manager = metadata.kv_cache_manager
     manager.get_buffers = Mock(return_value=main_cache)
+    manager.is_nvfp4_layer = lambda layer_idx: nvfp4
+    manager.get_block_scale_buffers = Mock(return_value=scale_cache)
     manager.get_index_k_buffer = create_autospec(
         MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True
     ).get_index_k_buffer
@@ -469,8 +503,14 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch) ->
     manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
     manager.get_index_k_buffer.assert_called_once_with(3)
     assert set(metadata.msa_layer_cache_tensors) == {3}
-    main, index = metadata.msa_layer_cache_tensors[3]
+    main, index, scales = metadata.msa_layer_cache_tensors[3]
     assert main is main_cache and index is index_cache
+    if nvfp4:
+        manager.get_block_scale_buffers.assert_called_once_with(3, kv_layout="HND")
+        assert scales is scale_cache
+    else:
+        manager.get_block_scale_buffers.assert_not_called()
+        assert scales is None
     main.fill_(2)
     index.fill_(3)
     torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
@@ -792,7 +832,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
         msa_decode_span = None
         msa_prefill_proxy_plan = (False, 0, 2, {}, None)
         msa_prefill_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
-        msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
+        msa_prefill_proxy_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
         msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
@@ -911,7 +951,7 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
         msa_prefill_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_worst_case_max_k_tiles = 8
-        msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
+        msa_prefill_proxy_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
         msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_kv_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
@@ -970,6 +1010,7 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
     )
 
     assert result.shape == (num_tokens, 1, 16)
+    assert captured["kv_indices"] is metadata.msa_prefill_proxy_kv_indices
     assert captured["gen_token_first"] == expected_gen_first
     assert captured["ctx_rows"] == expected_ctx_rows
     # Set together with the rest of the scorer's inputs, so it says whether the
@@ -1362,6 +1403,43 @@ def test_plan_rows_narrow_to_the_rows_fmha_sm100_still_runs():
     # No generation row, so the proxy scores every row.
     assert prefill._msa_proxy_plan_rows() == (0, 2)
     assert prefill._msa_attn_plan_rows() == (0, 2)
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+def test_nvfp4_step_plans_skip_the_sparse_attention_plan(monkeypatch, dtype):
+    """NVFP4 sparse layers run the CSR kernel, so only FP8 caches plan sparse GQA."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    planned = []
+
+    def fmha_sm100_plan(qo_lens, kv_lens, **kwargs):
+        planned.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(
+        msa_backend, "require_msa_module", lambda: SimpleNamespace(fmha_sm100_plan=fmha_sm100_plan)
+    )
+    monkeypatch.setattr(msa_backend, "_cache_device", lambda metadata: torch.device("cpu"))
+    metadata = _span_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(5, 7))
+    metadata._set_decode_span()
+    metadata._msa_fields_ready = True
+    metadata._msa_params = SimpleNamespace(
+        sharded_index_head_count=lambda mapping: 4,
+        sharded_head_counts=lambda mapping: (8, 2),
+        topk=16,
+    )
+    metadata.kv_cache_manager = SimpleNamespace(tokens_per_block=128, dtype=dtype)
+
+    metadata._build_step_plans()
+
+    assert metadata.msa_prefill_proxy_plan["output_maxscore"]
+    assert "kv_block_num" not in metadata.msa_prefill_dense_plan
+    if dtype == DataType.NVFP4:
+        assert metadata.msa_prefill_gqa_plan is None
+        assert len(planned) == 2
+    else:
+        assert metadata.msa_prefill_gqa_plan["kv_block_num"] == 16
+        assert len(planned) == 3
 
 
 @pytest.mark.parametrize("head_major", [False, True])

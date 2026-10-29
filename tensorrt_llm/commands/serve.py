@@ -32,7 +32,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
-                    Sequence, Set)
+                    Sequence, Set, Tuple)
 
 import click
 import torch
@@ -55,16 +55,14 @@ from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
-                                              MetadataServerConfig, ServerRole,
-                                              extract_disagg_cluster_config,
-                                              parse_disagg_config_file,
-                                              parse_metadata_server_config_file,
-                                              validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig,
-                                          MultimodalConfig, SleepConfig,
-                                          TorchLlmArgs)
+from tensorrt_llm.llmapi.disagg_utils import (
+    DisaggClusterConfig, MetadataServerConfig, ServerRole,
+    extract_disagg_cluster_config, parse_disagg_config_file,
+    parse_metadata_server_config_file, validate_config_bool,
+    validate_internal_request_auth_key)
+from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
+                                          KvCacheConnectorConfig, SleepConfig,
+                                          TorchLlmArgs, build_cli_config)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -74,7 +72,11 @@ from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve._frontend_processes import (
     _init_multi_frontend_mode, _signal_frontend_ready,
-    _spawn_attached_frontends, _terminate_attached_frontends)
+    _spawn_attached_frontends, _terminate_attached_frontends,
+    _watch_attached_frontends)
+from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
+                                               LAUNCHER_UDS_NAME,
+                                               MultiFrontendServing)
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -90,7 +92,7 @@ if TYPE_CHECKING:
     # code paths so plain LLM serving never pays its import cost.
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-# Global variable to store the Popen object of the child process
+# Popen for the disaggregated proxy's process guard.
 _child_p_global: Optional[subprocess.Popen] = None
 
 
@@ -156,16 +158,6 @@ def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
 
 
-def _pop_optional_str_config_option(config: dict[str, Any],
-                                    key: str) -> Optional[str]:
-    value = config.pop(key, None)
-    if value is None:
-        return None
-    if isinstance(value, str) and value:
-        return value
-    raise ValueError(f"{key} must be a non-empty string")
-
-
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
     for middleware in middlewares:
@@ -212,10 +204,9 @@ def is_non_default_or_required(param_name, value, explicit_cli_keys):
     # LlmArgs fields built from CLI scalars whose names differ from the field
     # name (e.g. `--free_gpu_memory_fraction` constructs `kv_cache_config`).
     cli_derived_fields = {
-        "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
+        **SERVE_CLI_CONFIG_FIELDS,
         "build_config":
         ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
-        "multimodal_config": ("video_pruning_rate", ),
     }
     if any(s in explicit_cli_keys
            for s in cli_derived_fields.get(param_name, ())):
@@ -329,8 +320,9 @@ def get_llm_args(
         "postprocess_tokenizer_dir":
         tokenizer or model,
         "kv_cache_config":
-        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction,
-                      dtype=kv_cache_dtype),
+        build_cli_config("kv_cache_config",
+                         free_gpu_memory_fraction=free_gpu_memory_fraction,
+                         kv_cache_dtype=kv_cache_dtype),
         "cp_config":
         cp_config,
         "scheduler_config":
@@ -372,7 +364,8 @@ def get_llm_args(
         "otlp_traces_endpoint":
         otlp_traces_endpoint,
         "multimodal_config":
-        MultimodalConfig(video_pruning_rate=video_pruning_rate)
+        build_cli_config("multimodal_config",
+                         video_pruning_rate=video_pruning_rate)
         if video_pruning_rate is not None else None,
         "telemetry_config":
         _telemetry_config.TelemetryConfig(
@@ -528,6 +521,43 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield
 
 
+def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
+    """Bind the Unix socket attached frontends forward launcher-owned routes to.
+
+    It lives in the multi-frontend ipc dir, which is private to the user and
+    removed, socket file included, when the executor proxy shuts down.
+    """
+    # Only the classic IPC proxy has the attribute.
+    ipc_dir = getattr(llm._executor, "_multi_frontend_ipc_dir", None)
+    if not ipc_dir:
+        raise ValueError(
+            "num_serve_frontends > 1 requires the classic IPC executor "
+            "proxy in multi-frontend mode")
+    path = os.path.join(ipc_dir, LAUNCHER_UDS_NAME)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(path)
+    except OSError:
+        sock.close()
+        raise
+    return sock, path
+
+
+def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
+    """Give every frontend one PROMETHEUS_MULTIPROC_DIR before spawning them.
+
+    Not via set_prometheus_multiproc_dir(): it keeps only its latest
+    TemporaryDirectory alive, so OpenAIServer's later call would delete this one.
+    """
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        return
+    if llm.args.return_perf_metrics or llm.args.perf_metrics_output_dir:
+        path = tempfile.mkdtemp(prefix="prometheus_", dir=ipc_dir)
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = path
+        logger.info(
+            f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
+
+
 def launch_server(
         host: str,
         port: int,
@@ -559,6 +589,16 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    # An attached frontend gets the launcher's socket from its spawn env; the
+    # launcher is its parent.
+    multi_frontend_serving = None
+    if multi_frontend.is_attached_frontend:
+        attached_launcher_uds = os.environ.pop(LAUNCHER_UDS_ENV, None)
+        if attached_launcher_uds is not None:
+            multi_frontend_serving = MultiFrontendServing(
+                launcher_uds=attached_launcher_uds,
+                is_launcher=False,
+                launcher_pid=os.getppid())
     if enable_runtime_control_endpoints and multi_frontend.num_frontends > 1:
         raise click.BadParameter(
             "Runtime control endpoints require num_serve_frontends=1 because "
@@ -636,12 +676,25 @@ def launch_server(
             # server construction, middleware registration, and runtime, or a
             # failure in between leaks the child processes.
             frontend_children = []
+            stop_watching_frontends = None
+            sockets = [s]
+            launcher_uds_sock = None
             try:
                 if multi_frontend.is_launcher:
+                    launcher_uds_sock, launcher_uds_path = _bind_launcher_uds(
+                        llm)
+                    _share_prometheus_multiproc_dir(
+                        llm, os.path.dirname(launcher_uds_path))
                     frontend_children = _spawn_attached_frontends(
                         llm,
                         multi_frontend.num_frontends,
+                        extra_env={LAUNCHER_UDS_ENV: launcher_uds_path},
                         report_failure=_report_observed_child_failure)
+                    stop_watching_frontends = _watch_attached_frontends(
+                        frontend_children)
+                    multi_frontend_serving = MultiFrontendServing(
+                        launcher_uds=launcher_uds_path, is_launcher=True)
+                    sockets.append(launcher_uds_sock)
 
                 server = OpenAIServer(
                     generator=llm,
@@ -658,7 +711,8 @@ def launch_server(
                     internal_disagg_auth_key=internal_disagg_auth_key,
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
-                    runtime_control_api_key=runtime_control_api_key)
+                    runtime_control_api_key=runtime_control_api_key,
+                    multi_frontend_serving=multi_frontend_serving)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -666,10 +720,15 @@ def launch_server(
                     gc.disable()
 
                 _signal_frontend_ready(multi_frontend)
-                uvloop.run(server(host, port, sockets=[s]))
+                uvloop.run(server(host, port, sockets=sockets))
             finally:
+                if stop_watching_frontends is not None:
+                    stop_watching_frontends.set()
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)
+                if launcher_uds_sock is not None:
+                    # Its file goes with the ipc dir (see _bind_launcher_uds).
+                    launcher_uds_sock.close()
 
 
 def launch_mm_encoder_server(
@@ -1353,7 +1412,6 @@ def serve(
         raise click.UsageError(
             "--openengine-enable-load-metrics requires --grpc --grpc-protocol openengine"
         )
-
     if moe_cluster_parallel_size is not None:
         logger.warning(
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
@@ -1477,8 +1535,8 @@ def serve(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
-        internal_disagg_auth_key = _pop_optional_str_config_option(
-            llm_args_extra_dict, "internal_request_auth_key")
+        internal_disagg_auth_key = validate_internal_request_auth_key(
+            llm_args_extra_dict.pop("internal_request_auth_key", None))
         # Apply to the raw mapping first so a higher-precedence override can
         # replace an invalid YAML value before nested config construction.
         llm_args_extra_dict = _apply_config_overrides(llm_args_extra_dict,
@@ -1597,7 +1655,8 @@ def serve(
                     raise click.ClickException(
                         f"Failed to import OpenEngine support: {error}. "
                         "Restore the required gRPC runtime with `python -m pip "
-                        "install \"grpcio>=1.67.1,<2\"`.") from error
+                        "install \"grpcio>=1.73.1,<2\" "
+                        "\"grpcio-health-checking>=1.73.1,<1.82\"`.") from error
 
                 grpc_multi_frontend = _init_multi_frontend_mode(llm_args,
                                                                 enabled=True)
@@ -2704,9 +2763,14 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     # 1. Run the LLM-API Proxy in a separate process for streaming performance.
     #      The Proxy will create a RemoteMpiSessionClient as mpi_session in LLM
     #      class.
+    guard_path = Path(
+        __file__).resolve().parents[1] / "llmapi" / "_llmapi_process_guard.py"
     command = [
-        "python3", sys.argv[0], "disaggregated_mpi_worker", "-c", config_file,
-        "--log_level", log_level
+        sys.executable, "-S",
+        str(guard_path), "--parent-pid",
+        str(os.getpid()), "--term-grace", "5", "--autonomous", "--role",
+        "proxy", "--", "python3", sys.argv[0], "disaggregated_mpi_worker", "-c",
+        config_file, "--log_level", log_level
     ]
     logger.info(
         f"rank {mpi_rank()} step1: preparing to launch command: {command}")
@@ -2719,7 +2783,11 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     signal.signal(signal.SIGTERM, _command_telemetry.raise_signal_exit)
     signal.signal(signal.SIGINT, _command_telemetry.raise_signal_exit)
 
+    _child_p_global = None
+    failure_pending = False
     try:
+        # MPI_Abort and SIGKILL bypass finally. The guard remains the owner of
+        # the proxy group and reclaims it when this leader disappears.
         _child_p_global = subprocess.Popen(
             command,
             env=non_mpi_env,
@@ -2728,7 +2796,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
             start_new_session=True)
 
         logger.info(
-            f"Parent process (PID {os.getpid()}) launched child process (PID {_child_p_global.pid})."
+            f"Parent process (PID {os.getpid()}) launched proxy guard (PID {_child_p_global.pid})."
         )
 
         logger.info(f"rank {mpi_rank()} step2: start the mpi session server")
@@ -2738,6 +2806,9 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         # This is a blocking call
         launch_remote_mpi_session_server(sub_comm)
 
+    except BaseException:
+        failure_pending = True
+        raise
     finally:
         # Restore original signal handlers
         signal.signal(signal.SIGTERM, original_sigterm_handler)
@@ -2745,26 +2816,23 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
         if _child_p_global:  # If Popen was successful and object exists
             logger.info(
-                f"Parent process (PID {os.getpid()}) in finally block. Cleaning up child process (PID: {_child_p_global.pid})."
+                f"Parent process (PID {os.getpid()}) in finally block. Stopping proxy guard (PID: {_child_p_global.pid})."
             )
             # Check if child is still running
             if _child_p_global.poll() is None:
                 _child_p_global.terminate()
                 try:
                     _child_p_global.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    logger.warning(
-                        f"Child process {_child_p_global.pid} timed out on terminate (30s), killing."
+                except subprocess.TimeoutExpired as error:
+                    message = (
+                        f"Proxy guard {_child_p_global.pid} cleanup is "
+                        "still pending after 30s; retaining its process-group ownership"
                     )
-                    _child_p_global.kill()
-                    try:
-                        _child_p_global.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        logger.error(
-                            f"Child process {_child_p_global.pid} failed to be killed even after 30s."
-                        )
-            assert _child_p_global.poll(
-            ) is not None, f"the subprocess should be terminated"
+                    logger.error(message)
+                    # Killing the guard could strand its payload. Leave it
+                    # responsible for cleanup and preserve an existing failure.
+                    if not failure_pending:
+                        raise RuntimeError(message) from error
 
     # Check if the process was launched and assert it's terminated
     if _child_p_global and hasattr(_child_p_global,

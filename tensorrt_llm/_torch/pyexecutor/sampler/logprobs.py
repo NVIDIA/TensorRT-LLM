@@ -40,6 +40,7 @@ from tensorrt_llm.executor.result import Logprob, SimpleTokenLogprobs, TokenLogp
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, check_logprobs_limit
 
 from ..llm_request import LlmRequest
+from .ops.triton import selected_raw_logprobs, store_selected_logprobs
 from .ops.vanilla import Fusions
 from .sampler_common import _BatchedSamplingResult
 from .sampler_features import _UnpackedStepIndexer
@@ -333,37 +334,12 @@ class LogProbsHandler:
         assert logprobs_cuda is not None  # _process_logprobs call is gated by return_log_probs
 
         raw_logprobs_reqs_indices = batched_sampling_result.raw_logprobs_reqs_indices
-        if raw_logprobs_reqs_indices:
-            # Insert raw logprobs into logprobs_cuda.
-            #
-            # NB: Cannot reuse softmax from _sample_batched_by_strategy, because raw logprobs are specified
-            #     to correspond to temperature=1.
-            raw_logprobs_logit_indices_cuda = (
-                batched_sampling_result.raw_logprobs_logit_indices_cuda
-            )
-            assert raw_logprobs_logit_indices_cuda is not None
-            raw_logprobs_start = batched_sampling_result.processed_logprobs_end
-            raw_logprobs_end = raw_logprobs_start + raw_logprobs_logit_indices_cuda.size(0)
-            # NB: There is no separate code path resolving contiguous ranges to 'slice', because the performance
-            #     impact after kernel fusion is anticipated to be small (raw_logprobs_logit_indices_cuda is sorted).
-            Fusions.gather_log_softmax_with_output(
-                logits_cuda,
-                raw_logprobs_logit_indices_cuda,
-                out=logprobs_cuda[raw_logprobs_start:raw_logprobs_end],
-            )
-            logprobs_end = raw_logprobs_end
-        else:
-            logprobs_end = batched_sampling_result.processed_logprobs_end
-
-        # Process raw and processed logprobs jointly from here on
+        raw_indices = batched_sampling_result.raw_logprobs_logit_indices_cuda
+        processed_rows = batched_sampling_result.processed_logprobs_end
+        logprobs_cuda = logprobs_cuda[:processed_rows]
         logprobs_reqs_indices = (
             batched_sampling_result.processed_logprobs_reqs_indices + raw_logprobs_reqs_indices
         )
-        logprobs_cuda = logprobs_cuda[:logprobs_end]
-
-        # NB: The amount of data copied into logprobs_cuda could be reduced by performing the
-        #     sampled-token / top-k selection earlier, since most logprobs are discarded when
-        #     returning only sampled-token logprobs / top-k logprobs.
 
         log_probs_store = self._sampler.store.log_probs_store
 
@@ -438,56 +414,44 @@ class LogProbsHandler:
                     dim=0, index=src_indices_cuda
                 )
 
-                # Get the sampled logprobs
-                # NB: logprobs_cuda contains logprobs only for the single-beam requests, since beam search handles
-                #     logprobs elsewhere.
-                sampled_vals_cuda = torch.gather(
-                    logprobs_cuda, dim=1, index=sampled_indices_cuda.unsqueeze(-1)
-                ).squeeze(-1)  # flattened (step, slot)
-
-                # sampled_rank_cuda contains the 0-based rank, it will be corrected to 1-based in handle_logprobs
-                # NB: Computation of sampled rank could be lowered into FlashInferGroupedStrategySampler, s.t., e.g.,
-                #     for greedy sampling, logits management and log_softmax could be completely skipped (sampled rank
-                #     computation is trivial in this case).
-                sampled_rank_cuda = Fusions.determine_sampled_rank(
-                    logprobs_cuda,
-                    sampled_vals_cuda.unsqueeze(-1),
-                )
-
-                sampled_log_prob_indices.view(slot_and_step_size).scatter_(
-                    dim=0, index=dst_indices_cuda, src=sampled_indices_cuda
-                )
-                sampled_log_probs.view(slot_and_step_size).scatter_(
-                    dim=0, index=dst_indices_cuda, src=sampled_vals_cuda
-                )
-                sampled_log_prob_ranks.view(slot_and_step_size).scatter_(
-                    dim=0, index=dst_indices_cuda, src=sampled_rank_cuda
-                )
-
-                # Process the topk logprobs
-                if self.batch_max_topk_logprobs > 0:
-                    # Get the topk logprobs
-                    topk_vals_cuda, topk_indices_cuda = torch.topk(
+                selected = []
+                if processed_rows:
+                    sampled_vals_cuda = torch.gather(
                         logprobs_cuda,
-                        k=self.batch_max_topk_logprobs,
-                        dim=-1,
+                        dim=1,
+                        index=sampled_indices_cuda[:processed_rows].unsqueeze(-1),
+                    ).squeeze(-1)
+                    sampled_rank_cuda = Fusions.determine_sampled_rank(
+                        logprobs_cuda, sampled_vals_cuda.unsqueeze(-1)
                     )
-
-                    topk_expanded_indices_cuda = dst_indices_cuda.view(-1, 1).expand(
-                        -1, topk_vals_cuda.size(-1)
+                    topk_vals_cuda, topk_indices_cuda = torch.topk(
+                        logprobs_cuda, k=self.batch_max_topk_logprobs, dim=-1
                     )
-                    log_probs_store.topk_vals[..., : self.batch_max_topk_logprobs].view(
-                        self._sampler.max_num_sequences * self._sampler.max_tokens,
-                        self.batch_max_topk_logprobs,
-                    ).scatter_(dim=0, index=topk_expanded_indices_cuda, src=topk_vals_cuda)
-                    log_probs_store.topk_indices[..., : self.batch_max_topk_logprobs].view(
-                        self._sampler.max_num_sequences * self._sampler.max_tokens,
-                        self.batch_max_topk_logprobs,
-                    ).scatter_(
-                        dim=0,
-                        index=topk_expanded_indices_cuda,
-                        src=topk_indices_cuda.to(torch.int32),
+                    selected.append(
+                        (sampled_vals_cuda, sampled_rank_cuda, topk_vals_cuda, topk_indices_cuda)
                     )
+                if raw_indices is not None and raw_indices.numel():
+                    selected.append(
+                        selected_raw_logprobs(
+                            logits_cuda,
+                            raw_indices,
+                            sampled_indices_cuda[processed_rows:],
+                            self.batch_max_topk_logprobs,
+                        )
+                    )
+                store_selected_logprobs(
+                    selected[0],
+                    selected[-1],
+                    processed_rows,
+                    sampled_indices_cuda,
+                    dst_indices_cuda,
+                    sampled_log_probs.view(slot_and_step_size),
+                    sampled_log_prob_ranks.view(slot_and_step_size),
+                    sampled_log_prob_indices.view(slot_and_step_size),
+                    log_probs_store.topk_vals.view(-1, self.max_topk_logprobs),
+                    log_probs_store.topk_indices.view(-1, self.max_topk_logprobs),
+                    self.batch_max_topk_logprobs,
+                )
 
             # Because req_num_generated_tokens may differ from the number of sampled tokens in
             # beam search, the sampled rank computation would entail extra complexity to resolve

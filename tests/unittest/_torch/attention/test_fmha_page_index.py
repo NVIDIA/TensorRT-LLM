@@ -316,6 +316,43 @@ def _cute_dsl_mla_helix_support(
     return fmha._is_supported_with_reason(q, attn, metadata, forward_args)
 
 
+def test_cute_dsl_mla_rejects_h96_mixed_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The generation slice of a mixed H96 batch must decline CuTe DSL."""
+    q = torch.empty((1, 96 * 576), dtype=torch.bfloat16)
+    attn = SimpleNamespace(
+        num_heads=96,
+        has_fp8_kv_cache=False,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_idx=0,
+    )
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        num_generations=1,
+        beam_width=1,
+        helix_position_offsets=None,
+        tokens_per_block=64,
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda _layer_idx: torch.empty(0, dtype=torch.bfloat16)
+        ),
+    )
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((1, 96 * 512), dtype=torch.bfloat16),
+        attention_input_type=AttentionInputType.generation_only,
+    )
+    monkeypatch.setattr(
+        AutoTuner, "get", classmethod(lambda _cls: SimpleNamespace(is_tuning_mode=False))
+    )
+    monkeypatch.setattr(
+        CuteDslMlaFmha, "_kernel_can_implement", staticmethod(lambda *_args: (True, ""))
+    )
+    fmha = object.__new__(CuteDslMlaFmha)
+    supported, reason = fmha._is_supported_with_reason(q, attn, metadata, forward_args)
+
+    assert not supported
+    assert reason == "CuTe DSL MLA FMHA only supports decode-only batches."
+
+
 def test_cute_dsl_mla_accepts_single_token_helix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -366,6 +403,7 @@ def test_mla_generation_declines_slower_trtllm_gen_decode_kernel() -> None:
     # backend must decline and let selection fall through.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=32,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -383,7 +421,38 @@ def test_mla_generation_gate_is_scoped_to_one_page_size(tokens_per_block: int) -
     # served by this backend. Real configs run tokens_per_block=64.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=tokens_per_block,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert supported, reason
+    assert reason == ""
+
+
+@pytest.mark.parametrize("tokens_per_block", [32, 64])
+@pytest.mark.parametrize("num_heads", [80, 96])
+def test_mla_generation_declines_unsupported_head_range_for_flashinfer_trtllm_gen(
+    tokens_per_block: int,
+    num_heads: int,
+) -> None:
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        num_heads=num_heads,
+        tokens_per_block=tokens_per_block,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert not supported
+    assert f"num_heads={num_heads}" in reason
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_mla_generation_allows_head_range_boundaries(num_heads: int) -> None:
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        num_heads=num_heads,
+        tokens_per_block=64,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
@@ -395,6 +464,7 @@ def test_mla_generation_allows_other_supported_head_dims() -> None:
     # (320, 256) is unaffected at every page size.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=320,
+        num_heads=128,
         tokens_per_block=32,
         kv_lora_rank=256,
         qk_rope_head_dim=64,

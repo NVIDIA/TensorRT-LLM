@@ -47,10 +47,9 @@ class FlashInferSparseMlaFmha(Fmha):
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
-        # Imported here, not at module level: rotary_embedding imports
-        # backends.interface, and loading the backends package imports this
-        # module, so a module-level import closes a cycle whenever
-        # rotary_embedding is the first of them to be imported.
+        # Imported here, not at module level: loading the backends package
+        # imports this module, and importing the backends must not load the
+        # module-layer rotary_embedding.
         from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 
         self.rotary_emb: RotaryEmbedding = RotaryEmbedding(

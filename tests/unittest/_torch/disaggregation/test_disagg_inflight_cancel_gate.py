@@ -29,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2,
@@ -297,7 +298,7 @@ def test_context_transfer_error_keeps_request_active_until_all_owners_release():
     effects.terminate_request.assert_not_called()
 
 
-def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
+def test_user_cancel_waits_for_context_transfer_owners(monkeypatch: pytest.MonkeyPatch) -> None:
     request = SimpleNamespace(
         state=LlmRequestState.DISAGG_TRANS_ERROR,
         py_request_id=7,
@@ -308,6 +309,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
         finish_by_reason=Mock(),
     )
     executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
     executor.active_requests = [request]
     executor.canceled_req_ids = [request.py_request_id]
     executor.waiting_queue = Mock()
@@ -507,7 +509,9 @@ def test_flag_unset_preserves_python_transceiver(monkeypatch):
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
     monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
 
-    result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+    result = transceiver_module.create_kv_cache_transceiver(
+        Mock(), Mock(), Mock(spec=KVCacheManagerV2), Mock(), config
+    )
 
     assert result is expected
     constructor.assert_called_once()

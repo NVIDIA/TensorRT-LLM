@@ -15,6 +15,20 @@ Python and C++ codebase with a PyTorch execution path.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
   `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
+- Changes to serving YAML fields, aliases, defaults, types, or constraints (including nested,
+  disaggregated, and VisualGen configs) must regenerate and inspect the editor JSON Schemas with
+  `python3 scripts/generate_trtllm_serve_schemas.py`, using a
+  TensorRT-LLM build matching the checkout. Update the generator's YAML-specific adaptations when
+  configuration annotations alone do not capture the change, and add regression coverage for the
+  affected accepted/rejected values. Run
+  `pytest -m cpu_only tests/unittest/llmapi/test_trtllm_serve_config_schemas.py`.
+  Commit the generated `tensorrt_llm/schemas/*.json` snapshots; never hand-edit them.
+  Version bumps in `tensorrt_llm/version.py` also require regeneration: the snapshots
+  include the package version in their `$id` and `title`. For an automated version-only
+  bump, `python3 scripts/generate_trtllm_serve_schemas.py --sync-version` updates only
+  that metadata without importing TensorRT-LLM or requiring a matching build.
+  `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
+  reject missing or stale snapshots. Wheels and HTML docs publish these same files.
 - When adding or renaming a public model architecture identifier, update
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
   documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
@@ -80,6 +94,12 @@ HuggingFace Model → LLM API → PyTorch Executor
 - `trtllm-serve`: OpenAI-compatible REST + gRPC server, supports all backends
 - **Disaggregated serving**: separates prefill (context) and decode (generation) across GPUs
   - KV cache exchange via NIXL (default), UCX, or MPI
+
+### Multimodal request data
+
+Read the [multimodal developer guide](docs/source/developer-guide/multimodal.md) before changing multimodal paths.
+Reuse `MultimodalParams`; request Params own cache references.
+Encoder and LLM forward Params are execution views.
 
 ## Key Files
 
@@ -172,7 +192,8 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
+for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
+CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
 
 ### Advisory semantic review
@@ -180,6 +201,13 @@ continues to build all C++ tests; component aggregate targets build migrated tes
 The bot-to-bot semantic review workflow is disabled. See
 [.github/semantic-review.md](.github/semantic-review.md) for its current status and
 historical implementation details.
+
+### Vendor source tools and promotion
+
+Use the tools under `scripts/vendor/` to manage locked vendor sources, prepare
+lock-only promotions, and optionally monitor source-update PRs. Read
+[Vendored Sources](3rdparty/vendor-sources.md) for commands, contributor metadata,
+and operator guidance before changing vendor state or publishing promotions.
 
 ### Triggering CI
 

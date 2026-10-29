@@ -1,0 +1,24 @@
+# Wan-AI/Wan2.2-I2V-A14B-Diffusers  ·  WanImageToVideoPipeline  ·  i2v
+# guidance_scale · max_sequence_length: _WAN22_14B_PARAMS defaults.
+backend: openai-videos
+
+common_params:
+  width: 1280
+  height: 720
+  num_frames: 81
+  frame_rate: 16.0
+  num_inference_steps: 40
+  guidance_scale: 4.0
+  max_sequence_length: 512
+  seed: 42
+
+# Prompt from wan_i2v.py's `main`, minus its audio clause -- Wan 2.2-I2V renders
+# no audio.
+# The reference is pre-resampled to the shape pinned above: Wan preprocesses through
+# diffusers' VaeImageProcessor at its default resize_mode, a plain resize, so an
+# off-shape reference is distorted.
+requests:
+  - prompt: A cat presses the piano keys with its paws
+    image_reference:
+      content: ../media/cat_piano.png
+      format: path

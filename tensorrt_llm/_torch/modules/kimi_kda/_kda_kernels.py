@@ -1,24 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kernel dispatch for the in-tree KDA module.
-
-Both optimized KDA kernels are source-integrated into TensorRT-LLM: the
-chunked prefill (CuTe DSL ``trtllm::kda_prefill``, see
-``tensorrt_llm/_torch/custom_ops/cute_dsl_kimi_k3_custom_ops.py``) and the
-fused CUDA C++ single-token decode (``trtllm::kda_decode`` thop op wrapped
-by ``_kda_decode``). Neither requires the external
-``exisiting_optimization_work`` collection at runtime.
-
-On Blackwell (sm_100/sm_103) with the CuTe DSL toolchain available the
-dispatch runs the optimized kernels. On any other arch (or when the in-tree
-prefill op is unavailable) the dispatch falls back to FLA's ``chunk_kda`` /
-``fused_recurrent_kda`` on-device references.
-
-Callers are the ``KimiKDALinearAttention`` module. The module owns the
-HF-parity semantics (Q/K/V projections, conv, gating, ``o_norm``,
-``o_proj``); the dispatch here only wraps the kernel-level computation of
-the delta-rule inner loop plus its state update.
-"""
+"""KDA FlashInfer prefill, native decode/verification and portable FLA dispatch."""
 
 from __future__ import annotations
 
@@ -64,78 +46,8 @@ def get_kda_sm_version() -> int:
 
 
 def is_kda_optimized_supported() -> bool:
-    """The optimized prefill/decode kernels are Blackwell sm_100 only."""
-    return get_kda_sm_version() in (100, 103)
-
-
-@triton.jit(do_not_specialize=["num_tokens", "feature_stride"])
-def _fused_kda_post_conv_kernel(
-    packed_ptr,
-    q_out_ptr,
-    k_out_ptr,
-    v_out_ptr,
-    num_tokens,
-    token_stride,
-    feature_stride,
-    l2_norm_eps,
-    NUM_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_TOKENS: tl.constexpr,
-    BLOCK_DIM: tl.constexpr,
-    TOKEN_MAJOR: tl.constexpr,
-):
-    """Normalize and transpose packed Q/K/V in one launch.
-
-    ``packed`` is ``[3 * NUM_HEADS * HEAD_DIM, num_tokens]`` with one unit
-    stride: along tokens (channel-major) or, with ``TOKEN_MAJOR``, along
-    features. ``token_stride`` stays specialized so Triton sees when
-    token-major rows start 16-byte aligned and vectorizes their loads.
-    ``feature_stride`` is the token count in channel-major mode, where
-    specializing it selects a slower layout.
-    """
-    token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
-    head_idx = tl.program_id(1)
-    dim_offsets = tl.arange(0, BLOCK_DIM)
-    token_mask = token_offsets < num_tokens
-    dim_mask = dim_offsets < HEAD_DIM
-    mask = token_mask[:, None] & dim_mask[None, :]
-
-    feature_offsets = head_idx * HEAD_DIM + dim_offsets
-    projection_size = NUM_HEADS * HEAD_DIM
-    if TOKEN_MAJOR:
-        outer_stride_i64 = token_stride.to(tl.int64)
-        source_offsets = token_offsets[:, None].to(tl.int64) * outer_stride_i64 + feature_offsets[
-            None, :
-        ].to(tl.int64)
-        section_stride = projection_size
-    else:
-        outer_stride_i64 = feature_stride.to(tl.int64)
-        source_offsets = feature_offsets[None, :].to(tl.int64) * outer_stride_i64 + token_offsets[
-            :, None
-        ].to(tl.int64)
-        section_stride = projection_size * outer_stride_i64
-    output_offsets = (
-        token_offsets[:, None].to(tl.int64) * projection_size + feature_offsets[None, :]
-    )
-
-    q = tl.load(packed_ptr + source_offsets, mask=mask, other=0.0).to(tl.float32)
-    q /= tl.sqrt(tl.sum(q * q, axis=1) + l2_norm_eps)[:, None]
-    tl.store(q_out_ptr + output_offsets, q, mask=mask)
-
-    k = tl.load(
-        packed_ptr + section_stride + source_offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    k /= tl.sqrt(tl.sum(k * k, axis=1) + l2_norm_eps)[:, None]
-    tl.store(k_out_ptr + output_offsets, k, mask=mask)
-
-    v = tl.load(
-        packed_ptr + 2 * section_stride + source_offsets,
-        mask=mask,
-        other=0.0,
-    )
-    tl.store(v_out_ptr + output_offsets, v, mask=mask)
+    """The optimized prefill/decode kernels need Blackwell sm_100 or Rubin sm_107."""
+    return get_kda_sm_version() in (100, 103, 107)
 
 
 def fused_kda_post_conv(
@@ -143,58 +55,44 @@ def fused_kda_post_conv(
     num_heads: int,
     head_dim: int,
     l2_norm_eps: float = 1e-6,
+    *,
+    normalize_qk: bool = True,
+    out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert packed convolution output to KDA Q/K/V.
+    """Portable layout conversion for the unfused convolution fallback.
 
-    ``packed`` has shape ``[3 * num_heads * head_dim, tokens]`` and is either
-    channel-major (unit token stride) or a transposed view of token-major
-    rows (unit feature stride). The returned tensors are contiguous
-    ``[1, tokens, num_heads, head_dim]``; Q and K are L2-normalized along the
-    head dimension.
+    The production FlashInfer path produces this layout directly in the
+    convolution kernel and normalizes Q/K within the recurrent kernel.
     """
-    projection_size = num_heads * head_dim
-    if packed.ndim != 2 or packed.shape[0] != 3 * projection_size:
-        raise ValueError(
-            "Packed KDA post-conv expected shape "
-            f"[{3 * projection_size}, tokens], got {tuple(packed.shape)}"
-        )
-    num_tokens = packed.shape[1]
-    feature_stride, token_stride = packed.stride()
-    token_major = feature_stride == 1 and num_tokens > 1
-    if not token_major and token_stride != 1 and num_tokens > 1:
-        raise ValueError(
-            "Packed KDA post-conv requires a unit stride along tokens or features, "
-            f"got strides {packed.stride()}"
-        )
-
-    output_shape = (1, num_tokens, num_heads, head_dim)
-    q_out = torch.empty(output_shape, dtype=packed.dtype, device=packed.device)
-    k_out = torch.empty_like(q_out)
-    v_out = torch.empty_like(q_out)
-    if num_tokens == 0:
-        return q_out, k_out, v_out
-
-    block_tokens = 16
-    block_dim = triton.next_power_of_2(head_dim)
-    grid = (triton.cdiv(num_tokens, block_tokens), num_heads)
-    _fused_kda_post_conv_kernel[grid](
-        packed,
-        q_out,
-        k_out,
-        v_out,
-        num_tokens,
-        token_stride,
-        feature_stride,
-        l2_norm_eps,
-        num_heads,
-        head_dim,
-        block_tokens,
-        block_dim,
-        token_major,
-        num_warps=8,
-        num_stages=3,
+    if packed.ndim != 2 or packed.shape[0] != 3 * num_heads * head_dim:
+        raise ValueError("Expected packed [3 * H * D, T] convolution output")
+    if packed.shape[1] > 1 and 1 not in packed.stride():
+        raise ValueError("Packed KDA post-conv requires a unit stride along tokens or features")
+    qkv = tuple(
+        t.t().reshape(1, packed.shape[1], num_heads, head_dim).contiguous()
+        for t in packed.chunk(3, dim=0)
     )
-    return q_out, k_out, v_out
+    if normalize_qk:
+        q, k, v = qkv
+
+        def normalize(t):
+            f = t.float()
+            return (f * torch.rsqrt((f * f).sum(-1, keepdim=True) + l2_norm_eps)).to(t.dtype)
+
+        qkv = (normalize(q), normalize(k), v)
+    if out is not None:
+        if len(out) != 3 or any(
+            dst.shape != src.shape
+            or dst.dtype != src.dtype
+            or dst.device != src.device
+            or not dst.is_contiguous()
+            for dst, src in zip(out, qkv)
+        ):
+            raise ValueError("Invalid KDA layout output buffers")
+        for dst, src in zip(out, qkv):
+            dst.copy_(src)
+        return out
+    return qkv
 
 
 @triton.jit
@@ -434,17 +332,24 @@ def replay_kda_token_records(
     num_accepted_tokens: torch.Tensor,
 ) -> None:
     """Replay each selected slot's accepted drafts onto its pool state from
-    the per-draft records the Kimi K3 verify kernels keep in the slot's
-    per-token state region.
+    the per-draft records the Kimi K3 verify kernels keep in ``state_tok``.
 
-    A slot's region of ``state_tok`` (``[slots, num_spec, H, V, K]`` fp32)
-    starts with the records of the last round's drafts: the row innovations
-    ``vn`` ``[num_spec][H][V]``, then ``beta * k`` and the decay
-    ``[num_spec][H][K]``. Draft ``t`` updates the state as the kernels do,
-    ``S = fma(decay, S, vn (beta * k))``, so the result is bit-identical to the
-    state their next verify starts from.
+    A slot of ``state_tok`` (``[slots, 3, num_spec, H, K]`` fp32) holds the
+    records of the last round's drafts: the row innovations ``vn``
+    ``[num_spec][H][V]``, then ``beta * k`` and the decay
+    ``[num_spec][H][K]`` (V = K). Draft ``t`` updates the state as the
+    kernels do, ``S = fma(decay, S, vn (beta * k))``, so the result is
+    bit-identical to the state their next verify starts from.
     """
-    num_spec, num_heads, v_dim, k_dim = state_tok.shape[1:]
+    _, num_spec, num_heads, k_dim = state_tok.shape[1:]
+    v_dim = recurrent_state.shape[-2]
+    if state_tok.shape[1] != 3 or v_dim != k_dim:
+        raise ValueError(
+            "replay_kda_token_records: expected the drafts' records "
+            "[slots, 3, num_spec, H, K] with V = K, got "
+            f"{tuple(state_tok.shape)} for a state of "
+            f"{tuple(recurrent_state.shape)}"
+        )
     if state_indices.numel() == 0:
         return
     block_v = 32
@@ -471,9 +376,10 @@ def commit_kda_pending_drafts(
     conv_q: torch.Tensor,
     conv_k: torch.Tensor,
     conv_v: torch.Tensor,
-    qkg_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    beta_cache: torch.Tensor,
+    k_cache: Optional[torch.Tensor],
+    g_cache: Optional[torch.Tensor],
+    v_cache: Optional[torch.Tensor],
+    beta_cache: Optional[torch.Tensor],
     state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     state_tok: Optional[torch.Tensor] = None,
@@ -483,25 +389,35 @@ def commit_kda_pending_drafts(
     ``num_accepted_tokens[n]`` is the number of drafts of slot
     ``state_indices[n]`` the last verify accepted, which the next verify
     would take up first. Afterwards ``recurrent_state`` and ``conv_pool``
-    hold the state and the conv window that verify would start from, bit for
-    bit, and the caller clears the slot's count:
+    hold the state and the conv window that verify would start from (the
+    window bit for bit), and the caller clears the slot's count:
 
-    * with per-token states (``state_tok``), the drafts are replayed from the
-      per-draft records the Kimi K3 verify kernels keep there
-      (``replay_kda_token_records``);
+    * with the Kimi K3 verify kernels' draft records (``state_tok``), the
+      drafts are replayed from those (``replay_kda_token_records``), and the
+      replay caches, which are then not allocated, may be None;
     * otherwise they are replayed from the replay caches by the fused verify
-      kernel's own replay steps (``kda_mtp_commit_pending_drafts``).
+      kernel's own replay steps (``kda_mtp_commit_pending_drafts``). The
+      tensor-core verify computes a chunk in one pass, so this commit
+      rounds the state differently from a verify that replays the drafts
+      itself.
     """
     num_spec = conv_q.shape[2] - conv_pool.shape[2]
     if state_tok is not None:
         replay_kda_token_records(recurrent_state, state_tok, state_indices, num_accepted_tokens)
     else:
+        assert (
+            k_cache is not None
+            and g_cache is not None
+            and v_cache is not None
+            and beta_cache is not None
+        )
         _load_mtp_module().kda_mtp_commit_pending_drafts(
             recurrent_state,
             conv_q,
             conv_k,
             conv_v,
-            qkg_cache,
+            k_cache,
+            g_cache,
             v_cache,
             beta_cache,
             state_indices,
@@ -533,7 +449,7 @@ def _load_prefill_module() -> ModuleType:
         module = importlib.import_module(
             "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_custom_ops"
         )
-    except Exception as exc:  # typically ImportError when CuTe DSL is unavailable
+    except ImportError as exc:
         _PREFILL_IMPORT_ERROR = exc
         raise
     _PREFILL_MODULE = module
@@ -541,11 +457,15 @@ def _load_prefill_module() -> ModuleType:
 
 
 def is_intree_prefill_available() -> bool:
-    """True when the in-tree CuTe DSL prefill op can be imported."""
+    """True when the vendored prefill toolchain and operator are available."""
+    from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return False
     try:
         _load_prefill_module()
         return True
-    except Exception:
+    except ImportError:
         return False
 
 
@@ -592,6 +512,37 @@ def is_kda_mtp_verify_available() -> bool:
     verification buffers.
     """
     return is_kda_optimized_supported() and is_intree_mtp_available()
+
+
+def kda_mtp_max_num_spec() -> int:
+    """Largest draft count the fused multi-token verify kernel supports."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
+        MAX_NUM_SPEC,
+    )
+
+    return MAX_NUM_SPEC
+
+
+def kda_mtp_replay_num_spec(num_spec: int) -> Optional[int]:
+    """Draft count to size the KDA replay caches for, or ``None``.
+
+    ``None`` keeps the legacy intermediate verification buffers, so the
+    module runs the sequential FLA verify: either the fused kernel cannot
+    run here, or ``num_spec`` exceeds what it supports.
+    """
+    if not is_kda_mtp_verify_available():
+        return None
+    max_num_spec = kda_mtp_max_num_spec()
+    if num_spec > max_num_spec:
+        from tensorrt_llm.logger import logger
+
+        logger.warning_once(
+            f"KDA fused multi-token verify supports at most {max_num_spec} draft "
+            f"tokens, got {num_spec}; using the sequential FLA verify.",
+            key="kda_mtp_num_spec_fallback",
+        )
+        return None
+    return num_spec
 
 
 # ---------------------------------------------------------------------------
@@ -653,10 +604,15 @@ class KDAKernelDispatch:
                     f"verify={self.verify_kernel_path}"
                 )
 
-    def mtp_verify(self, **kwargs) -> torch.Tensor:
+    def mtp_verify(
+        self, *, mxfp8_output: bool = False, **kwargs
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the fused KDA multi-token verify kernel.
 
-        Thin passthrough to ``trtllm::kda_mtp_decode`` (see
+        Thin passthrough to ``trtllm::kda_mtp_decode``, or with
+        ``mxfp8_output`` to ``trtllm::kda_mtp_decode_fp8``, which always
+        fuses the output norm and returns the E4M3 core and its R128c4
+        scales (see
         ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py`` for the full
         argument and state-management contract). Only defined on the
         optimized path; the FLA fallback is the module's sequential
@@ -667,7 +623,11 @@ class KDAKernelDispatch:
                 "mtp_verify called on non-optimized path; use the module's "
                 "sequential FLA verify fallback instead."
             )
-        _load_mtp_module()  # registers trtllm::kda_mtp_decode
+        _load_mtp_module()  # registers both the BF16 and the MXFP8-output ops
+        if mxfp8_output:
+            if not kwargs.pop("fuse_output_norm", True):
+                raise ValueError("the MXFP8-output KDA MTP op always fuses the output norm")
+            return torch.ops.trtllm.kda_mtp_decode_fp8(**kwargs)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
 
     def can_use_indexed_prefill(
@@ -683,26 +643,32 @@ class KDAKernelDispatch:
         """Return whether prefill can update this V-first pool directly."""
         if self.prefill_kernel_path != "optimized" or num_tokens == 0:
             return False
-        if cu_seqlens is not None:
-            if cu_seqlens.shape[0] - 1 != num_sequences:
-                return False
-        if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
+        if (
+            cu_seqlens is None
+            or cu_seqlens.dtype != torch.int64
+            or cu_seqlens.shape != (num_sequences + 1,)
+            or not cu_seqlens.is_contiguous()
+        ):
+            return False
+        if state_pool.dtype not in (torch.bfloat16, torch.float32) or state_pool.ndim != 4:
             return False
         _, H, V, K = state_pool.shape
         if state_pool.stride()[1:] != (V * K, K, 1):
             return False
-        if state_pool.stride(0) < H * V * K or state_pool.stride(0) % 4:
+        if (
+            (V, K) != (128, 128)
+            or state_pool.stride(0) < H * V * K
+            or state_pool.stride(0) * state_pool.element_size() % 16
+        ):
             return False
         if state_pool.data_ptr() % 16:
             return False
         if (
             state_indices.ndim != 1
             or state_indices.shape[0] != num_sequences
-            or state_indices.dtype not in (torch.int32, torch.int64)
+            or state_indices.dtype != torch.int32
             or not state_indices.is_contiguous()
         ):
-            return False
-        if state_indices.data_ptr() % 16:
             return False
         if (
             has_initial_states.ndim != 1
@@ -739,84 +705,44 @@ class KDAKernelDispatch:
         state_indices: Optional[torch.Tensor] = None,
         varlen_is_aligned: Optional[bool] = None,
         single_sequence_length: Optional[int] = None,
+        max_seqlen: int = 0,
+        seq_order: Optional[torch.Tensor] = None,
+        cu_chunks: Optional[torch.Tensor] = None,
+        sm_reserve: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Run KDA chunked prefill.
+        """Run prefill on raw Q/K/V and gate/beta logits.
 
-        Q and K must be L2-normalized by the caller. On the optimized path,
-        beta sigmoid runs inside the in-tree CuTe DSL op.
+        FlashInfer updates indexed BF16/FP32 V-first state directly; FLA uses
+        dense FP32 initial/final states. Both normalize Q/K internally.
 
-        On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
-        matching flags so the semantics are byte-equivalent.
-
-        The optimized kernel always reads and writes indexed V-first
-        ``[slots, H, V, K]`` state-pool rows. Callers provide the executor
-        pool and reset fresh rows before entering the kernel. The FLA fallback
-        retains the batch-dense ``initial_state``/``final_state`` contract.
-
-        ``chunk_indices``, ``varlen_is_aligned``, and
-        ``single_sequence_length`` are prepared once from Kimi K3 runtime
-        metadata. They keep the optimized path from reading ``cu_seqlens``
-        back from the GPU in every KDA layer.
+        ``sm_reserve`` SMs are left out of the optimized kernels' persistent
+        grids for a kernel that runs concurrently with prefill.
         """
-        use_indexed_state = state_pool is not None
-        if use_indexed_state and (initial_state is not None or state_indices is None):
-            raise ValueError(
-                "Indexed KDA prefill requires state_indices and does not accept initial_state."
-            )
-        use_optimized = self.prefill_kernel_path == "optimized" and use_indexed_state
-
-        if use_indexed_state and not use_optimized:
-            raise RuntimeError(
-                "Indexed KDA prefill requires the optimized prefill path; "
-                "use the FLA state path for this batch."
-            )
-
-        if use_optimized:
-            import torch.nn.functional as F
-
-            real_T = q.shape[1]
-            if cu_seqlens is not None:
-                # The op's varlen single-seq path (Phase 2.1) expects the
-                # caller to zero-pad the packed tensors to a chunk multiple
-                # (FLA convention) while cu_seqlens keeps the real length;
-                # the op re-sentinels g's tail itself. Without this the op
-                # would run the mask-free kernel on a partial final chunk.
-                # Multi-seq varlen runs the masked path and needs no pad.
-                if cu_seqlens.shape[0] == 2 and real_T % chunk_size != 0:
-                    pad = chunk_size - real_T % chunk_size
-                    q = F.pad(q, (0, 0, 0, 0, 0, pad))
-                    k = F.pad(k, (0, 0, 0, 0, 0, pad))
-                    v = F.pad(v, (0, 0, 0, 0, 0, pad))
-                    g = F.pad(g, (0, 0, 0, 0, 0, pad))
-                    beta = F.pad(beta, (0, 0, 0, pad))
-
-            A_log_kernel = A_log.detach() if A_log is not None else None
-            dt_bias_kernel = dt_bias.detach() if dt_bias is not None else None
-
-            _load_prefill_module()  # registers trtllm::kda_prefill
+        if state_pool is not None:
+            if self.prefill_kernel_path != "optimized" or initial_state is not None:
+                raise ValueError("Indexed prefill requires FlashInfer and no dense initial state")
+            if not safe_gate or lower_bound is None:
+                raise ValueError("FlashInfer requires a finite negative gate bound")
+            _load_prefill_module()
             out = torch.ops.trtllm.kda_prefill(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                state_pool=state_pool,
-                state_indices=state_indices,
-                scale=scale,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                chunk_size=chunk_size,
-                safe_gate=safe_gate,
-                lower_bound=lower_bound,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
-                A_log=A_log_kernel,
-                dt_bias=dt_bias_kernel,
-                varlen_is_aligned=varlen_is_aligned,
-                single_sequence_length=single_sequence_length,
+                q,
+                k,
+                v,
+                g,
+                beta.to(torch.bfloat16),
+                state_pool,
+                state_indices,
+                cu_seqlens,
+                A_log.float().contiguous(),
+                dt_bias.float().contiguous(),
+                scale,
+                lower_bound,
+                getattr(self, "prefill_mode", "auto"),
+                max_seqlen,
+                seq_order,
+                cu_chunks,
+                sm_reserve,
             )
-            if out.shape[1] != real_T:
-                out = out[:, :real_T]
             return out, None
 
         from fla.ops.kda import chunk_kda
@@ -832,7 +758,7 @@ class KDAKernelDispatch:
             scale=scale,
             initial_state=initial_state,
             output_final_state=True,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             use_beta_sigmoid_in_kernel=True,
             safe_gate=safe_gate,

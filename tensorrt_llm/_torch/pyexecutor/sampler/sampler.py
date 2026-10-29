@@ -19,28 +19,15 @@ early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
 :class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
 sampling logic of its own beyond batching and orchestration: each feature
 (beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
-two-model speculation, seeds) lives in its own module and is held here as a
-handler, driven through ``setup_sampler_step`` / ``sample_async`` /
-``update_requests``.
+seeds) lives in its own module and is held here as a handler, driven through
+``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
 """
 
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Final,
-    Generic,
-    List,
-    Optional,
-    Type,
-    TypeAlias,
-    TypeVar,
-    cast,
-)
+from collections.abc import Hashable, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Dict, Generic, List, Optional, TypeAlias, TypeVar, cast
 
 import torch
 
@@ -50,16 +37,26 @@ from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.logger import logger
-from tensorrt_llm.sampling_params import SamplingParams
 
 from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager
 from ..scheduler import ScheduledRequests
-from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
+from .beam_search import (
+    BeamHistory,
+    BeamHistoryBuilder,
+    BeamSearchHandler,
+    BeamSearchParams,
+    BeamSearchStep,
+    BeamSearchStore,
+    PendingBeamHistories,
+    finalize_beam,
+    prepare_beam_search,
+)
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import LogProbsHandler, LogProbsState, LogProbsStateList, LogProbsStore
-from .ops.custom import fused_sample_from_logits
+from .ops.custom import fused_sample_from_logits, fused_sample_from_logits_with_probs
+from .ops.vanilla import greedy_search_sampling_batch
 from .penalties import PenaltyHandler, has_occurrence_penalty
 from .sampler_common import (
     DEFAULT_BEAM_IDX,
@@ -68,50 +65,24 @@ from .sampler_common import (
     SampleType,
     _BatchedSamplingResult,
     _get_beam_width_out,
-    _request_get_sampling_params,
     add_token,
     int_tensor,
-    top_p_decay_active,
 )
 from .sampler_features import (
     AsyncWorkerMixin,
     SamplerEvent,
     _PackedStepIndexer,
     _UnpackedStepIndexer,
-    apply_d2t,
     apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
     meet_stop_token_criteria,
     scatter_new_tokens,
 )
-from .sampler_strategy import (
-    FUSED_STRATEGY_KEYS,
-    GREEDY,
-    BeamHistory,
-    BeamSearchMetadata,
-    BeamSearchStore,
-    FlashInferGroupedStrategySampler,
-    GenericStrategyKeyType,
-    RequestGroupKey,
-    RequestGroupValue,
-    RequestGroupValueWithMetadata,
-    RequestSeeds,
-    Strategy,
-    StrategyMetadata,
-    TopPDecayMetadata,
-    _CachingRequestGrouper,
-    _request_strategy,
-    fused_row_params,
-)
+from .sampling_resolution import SamplingMode, SlotSamplingParams
 from .seed_manager import _SeedManager
 from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
 from .top_p_decay import TopPDecayHandler
-from .two_model_spec_dec import (
-    TwoModelSpecDecHandler,
-    get_rejected_indices,  # noqa: F401  (re-exported for tests via the package __getattr__)
-    sample_rejected,  # noqa: F401
-)
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -119,6 +90,9 @@ else:
     from typing_extensions import override
 
 T = TypeVar("T")
+
+# Seed of every unseeded request, the same on every rank.
+_GLOBAL_SEED = 42
 
 
 @dataclass(kw_only=True)
@@ -146,19 +120,69 @@ class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTenso
 GenericSampleState = TypeVar("GenericSampleState", bound=SampleState)  # type: ignore
 
 
-def _fast_strategy_params(strategy: Strategy) -> tuple[float, int, float, float]:
-    """Flatten a fast-tier strategy into per-row ``(temperature, top_k, top_p, min_p)``."""
-    if strategy == GREEDY:
-        # Only padding dummies reach this: they carry no sampling params of
-        # their own, and the graph samples their rows only to discard them.
-        # Neutral filters keep them out of the way of the live rows.
-        return 1.0, 0, 1.0, 0.0
-    return fused_row_params(strategy)
+@dataclass(frozen=True, kw_only=True)
+class _FusedRowParamsBuffers:
+    """Per-row fused-kernel params the in-graph fast tier samples from.
+
+    A captured graph holds these addresses, so they are allocated once for the
+    widest batch and only their leading rows are written. ``floats`` stacks
+    temperature, top_p and min_p, in the layout of ``SlotSamplingParams.floats``.
+    """
+
+    floats: torch.Tensor
+    top_k: torch.Tensor
+    seed: torch.Tensor
+    offset: torch.Tensor
+
+    @classmethod
+    def allocate(cls, capacity: int, device: torch.device) -> "_FusedRowParamsBuffers":
+        """Initial values are neutral (temperature 1, top_k 0 = keep all, top_p 1,
+        min_p 0), so rows past the staged batch filter nothing even if a replay
+        reads them."""
+        floats = torch.zeros((3, capacity), dtype=torch.float32, device=device)
+        floats[:2] = 1.0
+        return cls(
+            floats=floats,
+            top_k=torch.zeros(capacity, dtype=torch.int32, device=device),
+            seed=torch.zeros(capacity, dtype=torch.int64, device=device),
+            offset=torch.zeros(capacity, dtype=torch.int64, device=device),
+        )
+
+    @property
+    def capacity(self) -> int:
+        return self.top_k.numel()
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        return self.floats[0]
+
+    @property
+    def top_p(self) -> torch.Tensor:
+        return self.floats[1]
+
+    @property
+    def min_p(self) -> torch.Tensor:
+        return self.floats[2]
+
+
+@dataclass(kw_only=True)
+class _SamplingGroup:
+    """Requests of one batch sampled together, by ``TorchSampler._group_requests``."""
+
+    mode: SamplingMode
+    needs_probs: bool
+    req_indices: list[int] = field(default_factory=list)
+    """Indices into the batch's requests, ascending."""
+    beam_params: list[BeamSearchParams] = field(default_factory=list)
+    """Per request of a beam-search group; empty otherwise."""
 
 
 class Sampler(ABC, Generic[GenericSampleState]):
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         pass
+
+    def release_request(self, request: LlmRequest) -> None:
+        """Release sampler-owned state before the request's slot is returned."""
 
     def get_cache_indirection(self) -> torch.Tensor | None:
         return None
@@ -188,7 +212,7 @@ class Sampler(ABC, Generic[GenericSampleState]):
         Implementations must stay capture-safe: device work only, no host
         synchronization, no allocation, and no dependence on tensor shapes that
         vary across replays. Any host-side preparation (index computation,
-        strategy resolution) belongs outside the graph, staged into persistent
+        parameter staging) belongs outside the graph, staged into persistent
         buffers that this method reads.
 
         The base implementation is a no-op, which keeps samplers that do not
@@ -229,10 +253,6 @@ class Sampler(ABC, Generic[GenericSampleState]):
         Raises:
             Appropriate exception if request is not supported by sampler.
         """
-
-    def should_provide_draft_probs(self, request: LlmRequest) -> bool:
-        """Check if sampler wants to receive draft token probabilities."""
-        return True  # conservative default
 
 
 class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensors]]):
@@ -481,9 +501,6 @@ class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTenso
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
-    DEFAULT_MAX_STOP_WORD_LENGTH: Final[int] = 20
-    DEFAULT_MAX_STOP_WORDS: Final[int] = 10
-
     SampleState = SampleStateTorch
 
     @override
@@ -491,6 +508,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if (beam_search_store := self.store.beam_search_store) is not None:
             return beam_search_store.cache_indirection
         return None
+
+    def start_beam_histories(self, requests: list[LlmRequest]) -> PendingBeamHistories:
+        """Start copying the generated tokens of each live beam of each beam-search request.
+
+        See ``BeamSearchHandler.start_beam_histories``; used by the model engine
+        to give logits post-processors each beam's real hypothesis.
+        """
+        return self._beam_search.start_beam_histories(requests)
 
     @override
     def is_generation_model(self) -> bool:
@@ -607,7 +632,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 "flashinfer is not available, please install the version pinned "
                 "in requirements.txt."
             )
-        self._grouped_sampler_cls = FlashInferGroupedStrategySampler
         # Per-slot Top-P Decay runtime state. Allocated for all
         # sampler instances; only decay-admitted slots are ever read.
         self._top_p_decay = TopPDecayHandler(self.max_num_sequences)
@@ -636,25 +660,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._in_graph_request_ids: list[int] = []
         self._in_graph_live_rows: int = 0
         # Per-row sampling params for the fast tier.
-        self._fast_temperatures: torch.Tensor | None = None
-        self._fast_top_ks: torch.Tensor | None = None
-        self._fast_top_ps: torch.Tensor | None = None
-        self._fast_min_ps: torch.Tensor | None = None
-        self._fast_seeds: torch.Tensor | None = None
-        self._fast_offsets: torch.Tensor | None = None
-        # Number of leading rows of the fast-tier buffers the staged batch fills.
-        self._fast_num_rows: int = 0
+        self._fast_params: _FusedRowParamsBuffers | None = None
 
         # The sampler can be created in inference mode, which disallows
         # in-place mutation of new_tokens. Temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self._create_store()
-            self._request_grouper: _CachingRequestGrouper[Any] = _CachingRequestGrouper(
-                self.max_num_sequences
-            )
+            # One row per sequence slot plus the scratch row (dummy_slot_row).
+            self._slot_params = SlotSamplingParams(self.max_num_sequences + 1, device="cuda")
             self._finish_reasons_handler = FinishReasonsHandler(
-                max_stop_word_length=self.DEFAULT_MAX_STOP_WORD_LENGTH,
-                max_num_stop_words=self.DEFAULT_MAX_STOP_WORDS,
                 max_num_sequences=self.max_num_sequences,
                 max_beam_width=self.max_beam_width,
                 max_tokens=self.max_tokens,
@@ -678,16 +692,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 device="cuda",
             )
 
-        # Initialize seed for multi-GPU consistency
-        self._global_seed = 42
-        self._generator: torch.Generator | None = None
-
         # Per-request RNG state backing SamplingParams.seed. Kept per sequence
         # slot so a seeded request's stream depends only on its own step count,
-        # not on batch composition.
+        # not on batch composition. The global seed (for unseeded requests) is
+        # fixed for multi-GPU consistency.
         self._seed_manager = _SeedManager(
             max_num_sequences=self.max_num_sequences,
-            global_seed=self._global_seed,
+            global_seed=_GLOBAL_SEED,
         )
 
         # Force number of accepted tokens for speculative decoding testing.
@@ -697,8 +708,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         from ...speculative.interface import get_force_num_accepted_tokens
 
         self._force_num_accepted_tokens = get_force_num_accepted_tokens()
-
-        self._two_model_spec_dec = TwoModelSpecDecHandler(self)
 
         self._async_worker_init(args.enable_async_worker)
 
@@ -733,50 +742,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             make_side_stream_copier=self._make_side_stream_copier,
         )
 
-    @staticmethod
-    def _is_draft_batch(requests: list[LlmRequest]) -> bool:
-        """Whether this batch belongs to the draft model.
-
-        Batches are homogeneous by construction: a drafter builds all-draft
-        batches for its sample_async/update_requests calls on this shared
-        sampler, and PyExecutor's batches are all-target. The pending-steps
-        accounting relies on this to skip draft batches wholesale; assert it so
-        a mixed batch fails loudly instead of silently corrupting the counters.
-        """
-        is_draft: bool = requests[0].py_is_draft
-        assert all(r.py_is_draft == is_draft for r in requests), (
-            "sampler batch must be homogeneous (all-draft or all-target)"
-        )
-        return is_draft
-
-    def get_generator(self, device: torch.device) -> torch.Generator:
-        """Get a deterministic generator for the specified device.
-
-        Args:
-            device: The device to create the generator on
-
-        Returns:
-            A torch.Generator with the global seed set
-        """
-        if self._generator is None:
-            # Fallback to a default seed if not set
-            self._generator = torch.Generator(device=device)
-            self._generator.manual_seed(self._global_seed)
-        assert self._generator.device == device
-        return self._generator
-
     @property
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
-
-    # Strategy tags the fast tier can sample: every one the fused kernel takes
-    # per row as (temperature, top_k, top_p, min_p). "greedy"
-    # is absent on purpose: greedy batches stay on the eager path. Capturing
-    # argmax saves about as much launch overhead as staging for it costs (on
-    # Qwen2-0.5B the two cancelled out), the eager stable-greedy path already
-    # handles them, and expressing greedy rows as top_k=1 would drag them onto
-    # the seeded sampling path for no gain.
-    _FAST_STRATEGY_TAGS: Final[frozenset[str]] = FUSED_STRATEGY_KEYS
 
     @staticmethod
     def _request_rewrites_logits(request: LlmRequest) -> bool:
@@ -811,21 +779,28 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _can_use_fast_path(self, requests: list[LlmRequest]) -> bool:
         """Whether every request is plain temperature / top_k / top_p / min_p sampling.
 
-        Rejects anything the fast-tier kernel cannot express per row: beam search
-        (a different strategy tag), top-p decay (its top_p is per-step
-        state, not a fixed per-row value), and the feature handlers that rewrite
-        logits or need extra outputs -- penalties, token bans, embedding bias,
-        logprobs and speculation, none of which the fast path runs.
+        Rejects anything the fast-tier kernel cannot express per row: beam search,
+        top-p decay (its top_p is per-step state, not a fixed per-row value),
+        and the feature handlers that rewrite logits or need extra outputs --
+        penalties, token bans, embedding bias, logprobs and speculation, none of
+        which the fast path runs.
         """
         if self._use_beam_search:
             return False
+        modes = self._slot_params.modes
         for req in requests:
-            # vocab_size only decides top_k/top_p redundancy, not the tag set
-            # the tier check below keys on.
-            strategy = _request_strategy(req, vocab_size=2**31)
-            if strategy[0] not in self._FAST_STRATEGY_TAGS:
+            slot = req.py_seq_slot
+            assert slot is not None
+            self._slot_params.assert_admitted(req, slot)
+            # Greedy is left out on purpose: greedy batches stay on the eager
+            # path. Capturing argmax saves about as much launch overhead as
+            # staging for it costs (on Qwen2-0.5B the two cancelled out), the
+            # eager stable-greedy path already handles them, and expressing
+            # greedy rows as top_k=1 would drag them onto the seeded sampling
+            # path for no gain.
+            if modes[slot] is not SamplingMode.SAMPLING:
                 return False
-            if top_p_decay_active(_request_get_sampling_params(req)):
+            if self._top_p_decay.uses_decay(slot):
                 return False
             # The fast tier emits tokens only and samples the raw logits, so
             # anything that rewrites them first is excluded. Stop words are
@@ -846,15 +821,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         ``_forward_step`` has returned, so sampling in-graph would read unmasked
         logits and emit a token they were meant to forbid, while their output is
         discarded. Any future post-forward logits mutator belongs here too.
-
-        Draft requests are excluded as well: the draft engine registers neither
-        hook yet shares this sampler, so a draft batch must not be served from
-        state staged for its target.
         """
-        return (
-            request.py_guided_decoding_params is not None
-            or bool(getattr(request, "py_logits_post_processors", None))
-            or bool(getattr(request, "py_is_draft", False))
+        return request.py_guided_decoding_params is not None or bool(
+            getattr(request, "py_logits_post_processors", None)
         )
 
     def get_sample_type(self, requests: list[LlmRequest]) -> SampleType:
@@ -974,13 +943,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._in_graph_dest_indices[:num_rows].copy_(seq_slots_host, non_blocking=True)
 
         if sample_type is SampleType.FAST:
-            # Padding dummies carry no sampling params of their own and resolve
-            # to greedy, which the fast-tier kernels cannot express. Their rows
-            # are sampled but discarded, so stage neutral filters for them.
             self.stage_fast_sampling_params(
                 requests,
                 slots_per_row=seq_slots,
-                rows_per_request=[1] * len(requests),
                 live_rows=len(live_requests),
             )
 
@@ -990,89 +955,44 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._in_graph_staged = True
         self._current_sample_type = sample_type
 
-    def _ensure_fast_buffers(self, num_rows: int) -> None:
-        """Allocate the fast-tier per-row param buffers, once, for the widest batch.
+    def _ensure_fast_buffers(self, num_rows: int) -> _FusedRowParamsBuffers:
+        """The fast-tier per-row param buffers, allocated once for the widest batch.
 
         Never reallocated for a batch that already fits, since a captured graph
-        holds these addresses. Initial values are neutral (temperature 1,
-        top_k 0 = keep all, top_p 1, min_p 0), so rows past the staged batch
-        filter nothing even if a replay reads them.
+        holds these addresses.
         """
-        if self._fast_temperatures is not None and (self._fast_temperatures.numel() >= num_rows):
-            return
-        capacity = max(num_rows, self.max_num_sequences * self.max_tokens)
-        device = self.store.new_tokens.device
-        self._fast_temperatures = torch.ones(capacity, dtype=torch.float32, device=device)
-        self._fast_top_ks = torch.zeros(capacity, dtype=torch.int32, device=device)
-        self._fast_top_ps = torch.ones(capacity, dtype=torch.float32, device=device)
-        self._fast_min_ps = torch.zeros(capacity, dtype=torch.float32, device=device)
-        self._fast_seeds = torch.zeros(capacity, dtype=torch.int64, device=device)
-        self._fast_offsets = torch.zeros(capacity, dtype=torch.int64, device=device)
+        if self._fast_params is None or self._fast_params.capacity < num_rows:
+            self._fast_params = _FusedRowParamsBuffers.allocate(
+                max(num_rows, self.max_num_sequences * self.max_tokens),
+                self.store.new_tokens.device,
+            )
+        return self._fast_params
 
     def stage_fast_sampling_params(
         self,
         requests: list[LlmRequest],
         slots_per_row: list[int],
-        rows_per_request: list[int],
         live_rows: int,
     ) -> None:
         """Stage this batch's per-row sampling params for the in-graph fast-tier step.
 
-        Runs on the host *before* the forward graph, because resolving each
-        request's strategy and expanding it per logits row is host work that
-        cannot happen during capture. ``slots_per_row`` gives the sequence slot
-        of each logits row and ``rows_per_request`` how many rows each request
-        owns, matching the expansion the spec-decoding path performs for its own
-        per-token param buffers.
+        Runs *before* the forward graph, because picking each row's params and
+        seeds is host work that cannot happen during capture. ``requests`` owns
+        one logits row each, and ``slots_per_row`` gives the sequence slot of
+        each row; the first ``live_rows`` rows are live, the rest padding.
         """
         num_rows = len(slots_per_row)
-        self._ensure_fast_buffers(num_rows)
-        temperatures_buf = self._fast_temperatures
-        top_ks_buf = self._fast_top_ks
-        top_ps_buf = self._fast_top_ps
-        min_ps_buf = self._fast_min_ps
-        seeds_buf = self._fast_seeds
-        offsets_buf = self._fast_offsets
-        assert (
-            temperatures_buf is not None
-            and top_ks_buf is not None
-            and top_ps_buf is not None
-            and min_ps_buf is not None
-            and seeds_buf is not None
-            and offsets_buf is not None
-        ), "_ensure_fast_buffers must have allocated every fast-tier buffer"
+        params = self._ensure_fast_buffers(num_rows)
 
-        # The real vocab size is only known from the logits at sample time, so
-        # resolve with the same 2**31 probe the greedy check uses: it only makes
-        # resolve_sampling_strategy keep a top_k it would otherwise drop as
-        # redundant, and the fused kernel treats a top_k at or above the actual
-        # vocab size as disabled anyway.
-        vocab_size = 2**31
-        temperatures: list[float] = []
-        top_ks: list[int] = []
-        top_ps: list[float] = []
-        min_ps: list[float] = []
-        for request, num_request_rows in zip(requests, rows_per_request, strict=True):
-            strategy = _request_strategy(request, vocab_size=vocab_size)
-            temperature, top_k, top_p, min_p = _fast_strategy_params(strategy)
-            temperatures.extend([temperature] * num_request_rows)
-            top_ks.extend([top_k] * num_request_rows)
-            top_ps.extend([top_p] * num_request_rows)
-            min_ps.extend([min_p] * num_request_rows)
-
-        pin = prefer_pinned()
-        temperatures_buf[:num_rows].copy_(
-            torch.tensor(temperatures, dtype=torch.float32, pin_memory=pin), non_blocking=True
-        )
-        top_ks_buf[:num_rows].copy_(
-            torch.tensor(top_ks, dtype=torch.int32, pin_memory=pin), non_blocking=True
-        )
-        top_ps_buf[:num_rows].copy_(
-            torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin), non_blocking=True
-        )
-        min_ps_buf[:num_rows].copy_(
-            torch.tensor(min_ps, dtype=torch.float32, pin_memory=pin), non_blocking=True
-        )
+        # Live rows read their slot's params. Padding rows are sampled only to
+        # be discarded, so they read the scratch row's neutral params.
+        param_slots = slots_per_row[:live_rows] + [self.dummy_slot_row] * (num_rows - live_rows)
+        param_slots_cuda = torch.tensor(
+            param_slots, dtype=torch.int64, pin_memory=prefer_pinned()
+        ).to(params.floats.device, non_blocking=True)
+        slot_params = self._slot_params
+        params.floats[:, :num_rows].copy_(slot_params.floats.index_select(1, param_slots_cuda))
+        params.top_k[:num_rows].copy_(slot_params.top_k.index_select(0, param_slots_cuda))
 
         # Philox (seed, offset) per row, from the sampler's own seed manager so
         # a request's stream stays tied to how far it has decoded.
@@ -1086,11 +1006,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # depends on concurrent load, breaking the guarantee _SeedManager exists
         # for -- that a seeded request's stream depends only on its own draws.
         live_slots_per_row = slots_per_row[:live_rows]
-        row_seeds = self._seed_manager.take_row_seeds(live_slots_per_row, device=seeds_buf.device)
-        seeds_buf[:live_rows].copy_(row_seeds.seed, non_blocking=True)
-        offsets_buf[:live_rows].copy_(row_seeds.offset, non_blocking=True)
-
-        self._fast_num_rows = num_rows
+        row_seeds = self._seed_manager.take_row_seeds(live_slots_per_row, device=params.seed.device)
+        params.seed[:live_rows].copy_(row_seeds.seed, non_blocking=True)
+        params.offset[:live_rows].copy_(row_seeds.offset, non_blocking=True)
 
     @override
     def sample_in_graph(
@@ -1117,7 +1035,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return
 
         logits_cuda = model_outputs["logits"]
-        d2t = model_outputs.get("d2t", None)
 
         # Staging runs after the batch is settled, so the staged width has to
         # equal the rows the forward produced. A mismatch means an unexpected
@@ -1135,13 +1052,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
         dest_indices = dest_indices[: self._in_graph_rows]
 
-        self._fast_sample_in_graph(logits_cuda, dest_indices, d2t)
+        self._fast_sample_in_graph(logits_cuda, dest_indices)
 
     def _fast_sample_in_graph(
         self,
         logits_cuda: torch.Tensor,
         dest_indices: torch.Tensor,
-        d2t: torch.Tensor | None,
     ) -> None:
         """Sample the fast tier from the staged per-row params.
 
@@ -1150,34 +1066,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         host synchronization, so it is capture-safe. The row index is kept out
         of the RNG so a row's draws depend only on its own (seed, offset).
         """
-        temperatures_buf = self._fast_temperatures
-        top_ks_buf = self._fast_top_ks
-        top_ps_buf = self._fast_top_ps
-        min_ps_buf = self._fast_min_ps
-        seeds_buf = self._fast_seeds
-        offsets_buf = self._fast_offsets
-        assert (
-            temperatures_buf is not None
-            and top_ks_buf is not None
-            and top_ps_buf is not None
-            and min_ps_buf is not None
-            and seeds_buf is not None
-            and offsets_buf is not None
-        ), "fast-tier sampling params were not staged; call stage_fast_sampling_params"
+        params = self._fast_params
+        assert params is not None, (
+            "fast-tier sampling params were not staged; call stage_fast_sampling_params"
+        )
         # Rows staged for this batch, padding included; the buffers are wider.
         num_rows = dest_indices.shape[0]
         logits_cuda = logits_cuda[:num_rows]
         next_tokens = fused_sample_from_logits(
             logits_cuda,
-            temperatures_buf[:num_rows],
-            top_ks_buf[:num_rows],
-            top_ps_buf[:num_rows],
-            min_ps_buf[:num_rows],
-            seed=seeds_buf[:num_rows],
-            offset=offsets_buf[:num_rows],
+            params.temperature[:num_rows],
+            params.top_k[:num_rows],
+            params.top_p[:num_rows],
+            params.min_p[:num_rows],
+            seed=params.seed[:num_rows],
+            offset=params.offset[:num_rows],
         )
-        if d2t is not None:
-            next_tokens = next_tokens + d2t[next_tokens]
         scatter_new_tokens(next_tokens, self.store.new_tokens, dest_indices, self.max_beam_width)
 
     def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
@@ -1186,9 +1090,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         # Check if all requests use greedy sampling and don't require features
         # that the fast path skips
+        modes = self._slot_params.modes
         for req in requests:
-            # vocab_size doesn't affect greediness check
-            if _request_strategy(req, vocab_size=2**31) != GREEDY:
+            if modes[cast(int, req.py_seq_slot)] is not SamplingMode.GREEDY:
                 return False
 
             # Fast path skips logprobs handling
@@ -1281,6 +1185,48 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return True
         return False
 
+    def _process_draft_tokens(
+        self,
+        request: LlmRequest,
+        new_tokens_list: list[list[list[int]]],
+        finish_reasons: FinishReasonsList,
+    ) -> int:
+        """Add the target's tokens up to the first rejected draft token.
+
+        Only drafter-based speculation (NGram, user-provided) attaches draft tokens
+        to requests sampled here; a draft token is accepted while it matches the
+        token the target sampled at the same position. When
+        TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS is set, up to that many draft
+        tokens are accepted without comparing them.
+
+        Returns the number of accepted draft tokens.
+        """
+        new_token = add_token(request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX)
+        if (
+            self.finish_if_reason(request, finish_reasons, step=0, beam_idx=DEFAULT_BEAM_IDX)
+            or get_draft_token_length(request) == 0
+        ):
+            return 0
+        force_accept = self._force_num_accepted_tokens != 0
+        draft_tokens = (
+            request.py_draft_tokens[: self._force_num_accepted_tokens]
+            if force_accept
+            else request.py_draft_tokens
+        )
+        num_accepted = 0
+        for draft_token in draft_tokens:
+            if not force_accept and draft_token != new_token:
+                break
+            num_accepted += 1
+            new_token = add_token(
+                request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX, step=num_accepted
+            )
+            if self.finish_if_reason(
+                request, finish_reasons, step=num_accepted, beam_idx=DEFAULT_BEAM_IDX
+            ):
+                break
+        return num_accepted
+
     @classmethod
     def _collect_new_requests_for_setup(
         cls, scheduled_requests: ScheduledRequests
@@ -1291,7 +1237,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         context_new_requests = [
             request
             for request in scheduled_requests.context_requests_last_chunk
-            if not request.is_finished and not request.py_is_draft
+            if not request.is_finished
         ]
         adp_dummy_generation_requests = [
             request
@@ -1321,6 +1267,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Every early_stopping mode is served by the candidate-beams-array
             # path (see beam_search_sampling_batch_cba); the mode only selects
             # the done verdict computed there.
+
+    @override
+    def release_request(self, request: LlmRequest) -> None:
+        self._finish_reasons_handler.release_request(request)
 
     @override
     @nvtx_range("setup_sampler_step")
@@ -1358,7 +1308,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # Drop stale predictor state from any prior occupant of this slot.
                     self._beam_search.clear_slot(slot)
 
-            self._request_grouper.prepare_for_new_request(request, slot)
             self._penalty_handler.prepare_for_new_request(request, slot)
 
         max_lens = self._finish_reasons_handler.new_max_lens
@@ -1387,8 +1336,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_lengths_cuda=max_lens_tensor_cuda,
             end_ids_cuda=end_ids_tensor_cuda,
             seq_slots_host=seq_slots_tensor_host,
-            all_sampling_requests=new_requests + scheduled_requests.generation_requests,
         )
+
+        self._slot_params.admit(new_requests, seq_slots_tensor_cuda_long)
 
         self._top_p_decay.setup_for_new_requests(
             new_requests, new_seq_slots_cuda_long=seq_slots_tensor_cuda_long
@@ -1413,61 +1363,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 beam_caps_cuda=beam_caps_tensor_cuda,
             )
 
-    def _add_metadata_to_grouped_requests(
-        self,
-        requests: list[LlmRequest],
-        grouped_requests: dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValue],
-        seq_slots: torch.Tensor,
-        seq_lens: torch.Tensor | None,
-        get_metadata_type_for_group_fn: Callable[
-            [GenericStrategyKeyType], Type[StrategyMetadata] | None
-        ],
-        *,
-        seq_slots_cuda: torch.Tensor,
-        seq_lens_cuda: torch.Tensor,
-        req_num_steps: torch.Tensor,
-    ) -> dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata]:
-        grouped_requests_with_metadata: dict[
-            RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata
-        ] = {}
-        log_probs_store = self.store.log_probs_store
-        num_requests = len(requests)
-        for key, value in grouped_requests.items():
-            metadata_type = get_metadata_type_for_group_fn(key.strategy_key)
-            metadata: StrategyMetadata | None
-            if metadata_type is BeamSearchMetadata:
-                metadata = self._beam_search.build_metadata(
-                    requests=requests,
-                    group_req_indices=value.indices,
-                    seq_slots=seq_slots,
-                    seq_lens=seq_lens,
-                    seq_slots_cuda=seq_slots_cuda,
-                    seq_lens_cuda=seq_lens_cuda,
-                    num_requests=num_requests,
-                    new_log_probs=log_probs_store.sampled_log_probs[..., DEFAULT_STEP_IDX],
-                    end_ids_cuda=self._finish_reasons_handler.store.end_ids_cuda,
-                    past_tokens_cuda=self._finish_reasons_handler.store.past_tokens_cuda,
-                )
-            elif metadata_type is TopPDecayMetadata:
-                metadata = self._top_p_decay.build_metadata(
-                    group_req_indices=value.indices,
-                    req_num_steps=req_num_steps,
-                    seq_slots=seq_slots,
-                    seq_slots_cuda=seq_slots_cuda,
-                )
-            elif metadata_type is None:
-                metadata = None
-            else:
-                raise ValueError(f"Unsupported metadata type: {metadata_type}")
-            grouped_requests_with_metadata[key] = RequestGroupValueWithMetadata(
-                indices=value.indices,
-                strategies=value.strategies,
-                speculation_needs_probs_indices=value.speculation_needs_probs_indices,
-                need_processed_logprobs=value.need_processed_logprobs,
-                metadata=metadata,
-            )
-        return grouped_requests_with_metadata
-
     @override
     @nvtx_range("update_requests")
     @torch.inference_mode()
@@ -1482,7 +1377,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if not state.requests:
             return
 
-        if self._track_pending_steps and not self._is_draft_batch(state.requests):
+        if self._track_pending_steps:
             for req in state.requests:
                 slot = req.py_seq_slot
                 if slot is not None and self._pending_steps[slot] > 0:
@@ -1496,7 +1391,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return
 
         new_tokens = state.host.new_tokens
-        finish_reasons = state.host.finish_reasons_list()
         first_finish_reasons_host = state.host.first_finish_reasons
         if first_finish_reasons_host is not None:
             first_finish_reasons = first_finish_reasons_host.tolist()
@@ -1514,6 +1408,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         logprobs_state_list: LogProbsStateList | None = None
         if state.host.logprobs_state is not None:
             logprobs_state_list = LogProbsStateList.from_logprobs_state(state.host.logprobs_state)
+
+        # Beam-search requests read their finish reasons from
+        # first_finish_reasons; only single-beam requests (and the batched
+        # fast path below) consume the per-step finish_reasons list, whose
+        # conversion scales with max_num_sequences x max_beam_width.
+        finish_reasons: FinishReasonsList = []
+        if (self._batch_fastpath_eligible and logprobs_state_list is None) or any(
+            req.py_beam_width == 1 for req in state.requests
+        ):
+            finish_reasons = state.host.finish_reasons_list()
 
         beam_history_builders = state.beam_history_builders
         assert (beam_history_builders is not None) == self._use_beam_search
@@ -1607,9 +1511,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # visible to streaming consumers and to anything reading
                     # get_tokens() mid-flight (e.g. the token-ban suffix
                     # matching) even though finalization later rewrites it.
-                    for beam_idx in range(_get_beam_width_out(req)):
-                        # Beam search does not support speculative decoding.
-                        add_token(req, new_tokens_list, beam_idx=beam_idx)
+                    beam_width_out = _get_beam_width_out(req)
+                    if beam_width_out == req.py_beam_width:
+                        # One binding call appends this step's token to every
+                        # beam; the C++ side requires exactly beam_width tokens.
+                        assert req.py_seq_slot is not None
+                        req.add_new_tokens(new_tokens_list[0][req.py_seq_slot][:beam_width_out])
+                    else:
+                        for beam_idx in range(beam_width_out):
+                            # Beam search does not support speculative decoding.
+                            add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self._log_probs.handle_logprobs(
                         req, logprobs_state_list=logprobs_state_list, count=1
                     )
@@ -1649,9 +1560,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 processed = 1
                 num_tokens_before = req.get_num_tokens(DEFAULT_BEAM_IDX)
-                num_accepted = self._two_model_spec_dec.process_draft_tokens(
+                num_accepted = self._process_draft_tokens(
                     req,
-                    new_tokens_tensor=new_tokens,
                     new_tokens_list=new_tokens_list,
                     finish_reasons=finish_reasons,
                 )
@@ -1754,11 +1664,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateTorch:
-        # NB: The sampler is either called directly by PyExecutor, for the target model,
-        #     or by a drafter's prepare_draft_tokens(), for the draft model. In the former
-        #     case there are 1 + get_draft_token_length(request) tokens per request. In the
-        #     latter case, there is always only 1 token per request because draft
-        #     tokens are sampled one-by-one.
+        # NB: There are 1 + get_draft_token_length(request) tokens per request.
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
 
@@ -1768,9 +1674,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # update_requests. Must happen before _process_requests, which
             # reads the counters for bad-words staleness.
             for r in scheduled_requests.context_requests:
-                if not r.py_is_draft:
-                    assert r.py_seq_slot is not None
-                    self._pending_steps[r.py_seq_slot] = 0
+                assert r.py_seq_slot is not None
+                self._pending_steps[r.py_seq_slot] = 0
 
         # seq_slots_cuda / seq_lens_cuda are cast once inside
         # _process_requests and shared with the beam-search metadata builder.
@@ -1789,7 +1694,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             num_context_logits_prefix_sum,
         )
 
-        if self._track_pending_steps and requests and not self._is_draft_batch(requests):
+        if self._track_pending_steps and requests:
             for r in requests:
                 assert r.py_seq_slot is not None
                 self._pending_steps[r.py_seq_slot] += 1
@@ -1803,17 +1708,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if requests:
             beam_search_store = self.store.beam_search_store
             assert self._use_beam_search == (beam_search_store is not None)
-            # Prepare stop word handling
-            # Draft requests need to be ignored for stop word handling as they never set up
-            # their buffers in the store.
-            # Assume that either all requests are drafts or none are drafts
-            is_draft_batch = requests[0].py_is_draft
             if not single_step_greedy:
                 assert seq_lens_host is not None
                 assert seq_lens_cuda is not None
                 finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
                     seq_slots_host=seq_slots_host,
-                    is_draft_batch=is_draft_batch,
                     seq_slots_cuda=seq_slots_cuda,
                     seq_lens_cuda=seq_lens_cuda,
                     new_tokens_cuda=new_tokens,
@@ -1877,13 +1776,79 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sample_type=self._current_sample_type,
         )
 
+    def _group_requests(
+        self, requests: list[LlmRequest], seq_slots: list[int]
+    ) -> list[_SamplingGroup]:
+        """Split the batch into the groups sampled by one call each.
+
+        Requests are grouped by sampling mode and by whether they need probs.
+        Beam-search requests are further split by what one beam-search step
+        must share (``BeamSearchParams.group_key``). Request indices within a
+        group are ascending.
+        """
+        slot_params = self._slot_params
+        modes = slot_params.modes
+        need_processed_logprobs = slot_params.need_processed_logprobs
+        groups: dict[Hashable, _SamplingGroup] = {}
+        for req_idx, (request, slot) in enumerate(zip(requests, seq_slots)):
+            slot_params.assert_admitted(request, slot)
+            mode = modes[slot]
+            needs_probs = need_processed_logprobs[slot]
+            beam_params = None
+            key: Hashable
+            if mode is SamplingMode.BEAM:
+                beam_params = BeamSearchParams.from_request(request)
+                key = (mode, needs_probs, beam_params.group_key)
+            else:
+                key = (mode, needs_probs)
+            group = groups.get(key)
+            if group is None:
+                group = groups[key] = _SamplingGroup(mode=mode, needs_probs=needs_probs)
+            group.req_indices.append(req_idx)
+            if beam_params is not None:
+                group.beam_params.append(beam_params)
+        return list(groups.values())
+
+    def _sample_fused(
+        self,
+        logits_cuda: torch.Tensor,
+        slots_per_row: list[int],
+        *,
+        return_probs: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Sample rows with the fused kernel, from their slots' params and seeds.
+
+        Returns the tokens, the probs when ``return_probs``, and the per-row
+        temperature.
+        """
+        device = logits_cuda.device
+        seeds = self._seed_manager.take_row_seeds(slots_per_row, device=device)
+        slots_cuda = torch.tensor(slots_per_row, dtype=torch.int64, pin_memory=prefer_pinned()).to(
+            device, non_blocking=True
+        )
+        temperature, top_k, top_p, min_p = self._slot_params.gather(slots_cuda)
+        top_p = self._top_p_decay.override_top_p(top_p, slots_cuda)
+        # A device-side assert rather than a host-side check, which would force a
+        # device sync on every call.
+        torch._assert_async(~torch.any(torch.isnan(logits_cuda)))
+        params = (logits_cuda, temperature, top_k, top_p, min_p)
+        if return_probs:
+            tokens, probs = fused_sample_from_logits_with_probs(
+                *params, seed=seeds.seed, offset=seeds.offset
+            )
+            return tokens, probs, temperature
+        return (
+            fused_sample_from_logits(*params, seed=seeds.seed, offset=seeds.offset),
+            None,
+            temperature,
+        )
+
     @nvtx_range("sample_batched_by_strategy")
     @torch.inference_mode()
     def _sample_batched_by_strategy(
         self,
         logits_cuda: torch.Tensor,
         requests: list[LlmRequest],
-        model_outputs: dict[str, Any],
         *,
         logits_cuda_indexer: _PackedStepIndexer,
         req_num_generated_tokens: torch.Tensor,
@@ -1900,45 +1865,36 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._seed_manager.observe(requests)
 
-        grouped_requests, need_raw_logprobs = self._request_grouper.group_requests_by_strategy_key(
-            requests,
-            pin_memory=prefer_pinned(),
-            strategy_to_key=self._grouped_sampler_cls.strategy_grouping_key,
-            seq_slots=seq_slots,
-            vocab_size=logits_cuda.size(1),  # Dummy value; strategy should already be cached
-        )
-        grouped_requests_with_metadata = self._add_metadata_to_grouped_requests(
-            requests,
-            grouped_requests,
-            seq_slots,
-            seq_lens,
-            get_metadata_type_for_group_fn=self._grouped_sampler_cls.get_metadata_type_for_group,
-            seq_slots_cuda=seq_slots_cuda,
-            seq_lens_cuda=seq_lens_cuda,
-            req_num_steps=req_num_steps,
-        )
-        generator_cuda = self.get_generator(cuda_device)
-
-        # NB: Currently, "d2t" is applied to draft tokens, but not to draft logits,
-        #     breaking _process_draft_tokens_rejection_sampling.
-        needs_d2t = "d2t" in model_outputs
-        if needs_d2t and (
-            len(grouped_requests_with_metadata) > 1
-            or (
-                grouped_requests_with_metadata
-                and next(iter(grouped_requests_with_metadata.values())).strategies[0] != GREEDY
-            )
-        ):
-            raise ValueError("d2t does not yet support non-greedy sampling")
+        seq_slots_list = seq_slots.tolist()
+        groups = self._group_requests(requests, seq_slots_list)
 
         # Tensors for collecting sampling results (in batch ordering)
         batch_req_indices = torch.empty((len(requests),), dtype=torch.int32)
         batch_next_tokens_cuda_int = torch.empty(
             (logits_cuda.size(0), self.max_beam_width), device=cuda_device, dtype=token_dtype
         )
+        # Only processed logprobs need a full-vocabulary buffer. Raw logprobs
+        # are selected directly from logits; beam search uses its own history.
+        reqs_indices_needing_raw_logprobs: list[int] = []
+        reqs_indices_needing_raw_logits: list[int] = []
+        num_logprobs_rows = 0
+        if return_log_probs:
+            need_raw_logprobs = self._slot_params.need_raw_logprobs
+            need_processed_logprobs = self._slot_params.need_processed_logprobs
+            for req_idx, (request, slot, num_generated_tokens) in enumerate(
+                zip(requests, seq_slots_list, req_num_generated_tokens.tolist())
+            ):
+                if need_raw_logprobs[slot]:
+                    reqs_indices_needing_raw_logprobs.append(req_idx)
+                if self._use_beam_search and request.py_beam_width != 1:
+                    continue
+                if need_raw_logprobs[slot]:
+                    reqs_indices_needing_raw_logits.append(req_idx)
+                if need_processed_logprobs[slot]:
+                    num_logprobs_rows += num_generated_tokens
         batch_processed_logprobs_cuda = (
-            torch.empty(  # NB: overprovisioning buffer for simplicity and later reuse in _process_logprobs
-                (logits_cuda.size(0), logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
+            torch.empty(
+                (num_logprobs_rows, logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
             )
             if return_log_probs
             else None
@@ -1947,79 +1903,77 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batch_processed_logprobs_offset = 0
         batch_req_idx_offset_start = 0
         batch_next_tokens_offset_start = 0
-        for group_key, group_val_with_metadata in grouped_requests_with_metadata.items():
-            strategy_key = group_key.strategy_key
-            needs_probs = group_key.needs_probs
-            group_req_indices = group_val_with_metadata.indices
-            group_strategies = group_val_with_metadata.strategies
-            group_speculation_needs_probs_indices = (
-                group_val_with_metadata.speculation_needs_probs_indices
-            )
-            group_need_processed_logprobs = group_val_with_metadata.need_processed_logprobs
-            group_metadata = group_val_with_metadata.metadata
-
-            # group_req_indices: Indices of 'requests' entries having the same sampling
-            # strategy, ordered ascending.
-            batch_req_idx_offset_end = batch_req_idx_offset_start + group_req_indices.size(0)
+        for group in groups:
+            group_req_indices = torch.tensor(group.req_indices, dtype=torch.int32)
+            batch_req_idx_offset_end = batch_req_idx_offset_start + len(group.req_indices)
             batch_req_indices[batch_req_idx_offset_start:batch_req_idx_offset_end] = (
                 group_req_indices
             )
 
-            # NB: Assuming that group_req_indices are sorted
-            group_req_1st_index = cast(int, group_req_indices[0].item())
-            group_req_last_index = cast(int, group_req_indices[-1].item())
-            group_logits_cuda_indices_cuda: torch.Tensor | slice
-            logit_indices_for_sampler: Optional[torch.Tensor]
-            if group_req_last_index - group_req_1st_index + 1 == len(group_req_indices):
+            # The group's logits rows, one per step of each request.
+            group_req_1st_index = group.req_indices[0]
+            group_req_last_index = group.req_indices[-1]
+            if group_req_last_index - group_req_1st_index + 1 == len(group.req_indices):
                 # Avoid data movement if indices are contiguous
-                group_logits_cuda_indices_cuda = slice(
-                    req_offsets[group_req_1st_index],
-                    req_offsets[group_req_last_index]
-                    + req_num_generated_tokens[group_req_last_index],
-                )
-                group_logits_cuda = logits_cuda[group_logits_cuda_indices_cuda]
-                logit_indices_for_sampler = None
+                group_logits_cuda = logits_cuda[
+                    req_offsets[group_req_1st_index] : req_offsets[group_req_last_index]
+                    + req_num_generated_tokens[group_req_last_index]
+                ]
             else:
-                group_logits_cuda_indices = logits_cuda_indexer[group_req_indices]
-                group_logits_cuda_indices_cuda = group_logits_cuda_indices.to(
-                    device=logits_cuda.device, non_blocking=True
+                group_logits_cuda = logits_cuda.index_select(
+                    0,
+                    logits_cuda_indexer[group_req_indices].to(
+                        device=cuda_device, non_blocking=True
+                    ),
                 )
-                group_logits_cuda = logits_cuda
-                logit_indices_for_sampler = group_logits_cuda_indices_cuda
 
-            group_steps_per_request = req_num_steps[group_req_indices].tolist()
-            group_strategies_per_step = [  # convert from per-request to per-step
-                strat
-                for strat, steps in zip(group_strategies, group_steps_per_request)
-                for _ in range(steps)
-            ]
-
-            # Every row of a fused-kernel group gets its own Philox (seed, offset).
-            group_seeds: Optional[RequestSeeds] = None
-            if strategy_key in FUSED_STRATEGY_KEYS:
+            group_temperature_cuda: torch.Tensor | None = None
+            if group.mode is SamplingMode.GREEDY:
+                group_next_tokens_cuda, group_softmax_cuda = greedy_search_sampling_batch(
+                    group_logits_cuda, return_probs=group.needs_probs
+                )
+            elif group.mode is SamplingMode.SAMPLING:
                 group_slots_per_step = [
-                    slot
-                    for slot, steps in zip(
-                        seq_slots[group_req_indices].tolist(), group_steps_per_request
+                    seq_slots_list[req_idx]
+                    for req_idx, steps in zip(
+                        group.req_indices, req_num_steps[group_req_indices].tolist()
                     )
                     for _ in range(steps)
                 ]
-                group_seeds = self._seed_manager.take_row_seeds(
-                    group_slots_per_step, device=cuda_device
+                group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
+                    self._sample_fused(
+                        group_logits_cuda, group_slots_per_step, return_probs=group.needs_probs
+                    )
                 )
-
-            group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
-                self._grouped_sampler_cls.sample_grouped_strategies(
-                    strategy_key,
-                    group_strategies_per_step,
+            else:
+                stop_words_metadata_cuda: torch.Tensor | None = None
+                if self._finish_reasons_handler.has_stop_word_history:
+                    self._finish_reasons_handler.record_stop_word_stream()
+                    stop_words_metadata_cuda = (
+                        self._finish_reasons_handler.store.stop_words_metadata_cuda
+                    )
+                beam_step = BeamSearchStep.from_params(
+                    group.beam_params, cuda_device, return_probs=group.needs_probs
+                )
+                group_next_tokens_cuda, group_softmax_cuda = beam_step.sample(
                     group_logits_cuda,
-                    generator=generator_cuda,
-                    return_probs=needs_probs,
-                    group_logit_indices=logit_indices_for_sampler,
-                    group_metadata=group_metadata,
-                    seeds=group_seeds,
+                    metadata=self._beam_search.build_metadata(
+                        requests=requests,
+                        group_req_indices=group_req_indices,
+                        seq_slots=seq_slots,
+                        seq_lens=seq_lens,
+                        seq_slots_cuda=seq_slots_cuda,
+                        seq_lens_cuda=seq_lens_cuda,
+                        num_requests=len(requests),
+                        new_log_probs=self.store.log_probs_store.sampled_log_probs[
+                            ..., DEFAULT_STEP_IDX
+                        ],
+                        end_ids_cuda=self._finish_reasons_handler.store.end_ids_cuda,
+                        stop_words_metadata_cuda=stop_words_metadata_cuda,
+                    ),
                 )
-            )
+                group_temperature_cuda = beam_step.temperature
+
             batch_next_tokens_offset_end = (
                 batch_next_tokens_offset_start + group_next_tokens_cuda.size(0)
             )
@@ -2030,9 +1984,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 batch_next_tokens_offset_start:batch_next_tokens_offset_end
             ].copy_(group_next_tokens_cuda, non_blocking=True)
 
-            # --- Prepare data for logprobs ---
-            if return_log_probs:
+            # --- Processed logprobs: every request of a group with needs_probs wants them ---
+            if group.needs_probs:
                 assert batch_processed_logprobs_cuda is not None
+                assert group_softmax_cuda is not None
                 if logits_cuda.dtype != batch_processed_logprobs_cuda.dtype:
                     # NB: tensorrt_llm._torch.modules.logits_processor.LogitsProcessor forces logits
                     #     to float32, so this warning is not expected to get triggered. To support, e.g.,
@@ -2044,225 +1999,102 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         "precision logits may be inaccurate.",
                         key="WARN_INACCURATE_PROCESSED_LOGPROBS",
                     )
-                need_processed_logprobs_req_indices = group_req_indices[
-                    group_need_processed_logprobs
-                ]
-                group_num_requests_needing_processed_logprobs = (
-                    need_processed_logprobs_req_indices.size(0)
+                reqs_indices_needing_processed_logprobs += group.req_indices
+
+                # Beam-search requests get theirs from the beam history instead,
+                # so gather logprobs only for the single-beam ones.
+                gather_processed_logprobs = (
+                    [requests[req_idx].py_beam_width == 1 for req_idx in group.req_indices]
+                    if self._use_beam_search
+                    else None
                 )
-                if group_num_requests_needing_processed_logprobs > 0:
-                    need_processed_logprobs_req_indices_list = (
-                        need_processed_logprobs_req_indices.tolist()
-                    )
-                    reqs_indices_needing_processed_logprobs += (
-                        need_processed_logprobs_req_indices_list
-                    )
-
-                    # Gather logprobs only for non-beam search requests
-                    if self._use_beam_search:
-                        skip_processed_logprobs_group_req_indices_list = [
-                            grp_idx
-                            for grp_idx, req_idx in enumerate(
-                                need_processed_logprobs_req_indices_list
-                            )
-                            if requests[req_idx].py_beam_width != 1
-                        ]
-
-                        # repurpose group_need_processed_logprobs
-                        group_gather_processed_logprobs = group_need_processed_logprobs
-                        del group_need_processed_logprobs
-                        skip_processed_logprobs_group_req_indices = torch.tensor(
-                            skip_processed_logprobs_group_req_indices_list,
-                            dtype=need_processed_logprobs_req_indices.dtype,
-                        )
-                        group_gather_processed_logprobs[
-                            skip_processed_logprobs_group_req_indices
-                        ] = False
-                        num_gather_processed_logprobs_req_indices = len(
-                            need_processed_logprobs_req_indices_list
-                        ) - len(skip_processed_logprobs_group_req_indices_list)
-                    else:
-                        # repurpose group_need_processed_logprobs
-                        group_gather_processed_logprobs = group_need_processed_logprobs
-                        del group_need_processed_logprobs
-                        num_gather_processed_logprobs_req_indices = len(
-                            need_processed_logprobs_req_indices_list
-                        )
-
-                    # Gather relevant logits and probs; using prefix 'proc_lp' for subset of
-                    # requests in current sampling requests group which require processed logprobs.
-                    assert group_softmax_cuda is not None
-                    if num_gather_processed_logprobs_req_indices == group_req_indices.size(0):
-                        if logit_indices_for_sampler is None:
-                            proc_lp_logits_cuda = group_logits_cuda
-                        else:
-                            proc_lp_logits_cuda = group_logits_cuda[logit_indices_for_sampler]
-                        proc_lp_softmax_cuda = group_softmax_cuda
-                        proc_lp_temperature_cuda = group_temperature_cuda
-                        if isinstance(proc_lp_temperature_cuda, torch.Tensor):
-                            proc_lp_temperature_cuda = proc_lp_temperature_cuda.unsqueeze(-1)
-                    else:
-                        proc_lp_group_steps = req_num_generated_tokens[group_req_indices]
-                        proc_lp_step_mask_cuda = torch.repeat_interleave(
-                            group_gather_processed_logprobs.to(
-                                device=logits_cuda.device, non_blocking=True
-                            ),
-                            proc_lp_group_steps.to(device=logits_cuda.device, non_blocking=True),
-                            output_size=cast(int, proc_lp_group_steps.sum().item()),
-                        ).unsqueeze(-1)
-                        proc_lp_steps_num_selected = cast(
-                            int,
-                            (
-                                group_gather_processed_logprobs.to(dtype=proc_lp_group_steps.dtype)
-                                * proc_lp_group_steps
-                            )
-                            .sum()
-                            .item(),
-                        )
-                        if logit_indices_for_sampler is None:
-                            proc_lp_logits_cuda = group_logits_cuda.new_empty(
-                                (proc_lp_steps_num_selected, *group_logits_cuda.shape[1:]),
-                            )
-                            torch.masked_select(
-                                group_logits_cuda,
-                                proc_lp_step_mask_cuda,
-                                out=proc_lp_logits_cuda.view(-1),
-                            )
-                        else:
-                            logit_indices_for_sampler_cuda = logit_indices_for_sampler.to(
-                                device=logits_cuda.device, non_blocking=True
-                            )
-                            proc_lp_logits_indices_cuda = logit_indices_for_sampler_cuda.new_empty(
-                                (
-                                    proc_lp_steps_num_selected,
-                                    *logit_indices_for_sampler_cuda.shape[1:],
-                                ),
-                            )
-                            torch.masked_select(
-                                logit_indices_for_sampler_cuda,
-                                proc_lp_step_mask_cuda.squeeze(-1),
-                                out=proc_lp_logits_indices_cuda.view(-1),
-                            )
-                            proc_lp_logits_cuda = group_logits_cuda[proc_lp_logits_indices_cuda]
-                        proc_lp_softmax_cuda = group_softmax_cuda.new_empty(
-                            (proc_lp_steps_num_selected, *group_softmax_cuda.shape[1:]),
-                        )
-                        torch.masked_select(
-                            group_softmax_cuda,
-                            proc_lp_step_mask_cuda,
-                            out=proc_lp_softmax_cuda.view(-1),
-                        )
-                        if isinstance(group_temperature_cuda, torch.Tensor):
-                            proc_lp_temperature_cuda = group_temperature_cuda.new_empty(
-                                (proc_lp_steps_num_selected, *group_temperature_cuda.shape[1:]),
-                            )
-                            torch.masked_select(
-                                group_temperature_cuda,
-                                proc_lp_step_mask_cuda.squeeze(-1),
-                                out=proc_lp_temperature_cuda.view(-1),
-                            )
-                            proc_lp_temperature_cuda = proc_lp_temperature_cuda.unsqueeze(-1)
-                        else:
-                            proc_lp_temperature_cuda = group_temperature_cuda
-
-                    # Apply temperature
+                proc_lp_temperature_cuda: torch.Tensor | None
+                if gather_processed_logprobs is None or all(gather_processed_logprobs):
+                    proc_lp_logits_cuda = group_logits_cuda
+                    proc_lp_softmax_cuda = group_softmax_cuda
+                    proc_lp_temperature_cuda = group_temperature_cuda
                     if proc_lp_temperature_cuda is not None:
-                        if proc_lp_logits_cuda is group_logits_cuda:
-                            proc_lp_logits_cuda = proc_lp_logits_cuda / proc_lp_temperature_cuda
-                        else:
-                            proc_lp_logits_cuda /= proc_lp_temperature_cuda
+                        proc_lp_temperature_cuda = proc_lp_temperature_cuda.unsqueeze(-1)
+                else:
+                    # Masked with an output size computed on the host, so that
+                    # selecting the rows does not sync with the device.
+                    proc_lp_group_steps = req_num_generated_tokens[group_req_indices]
+                    proc_lp_req_mask = torch.tensor(gather_processed_logprobs, dtype=torch.bool)
+                    proc_lp_step_mask_cuda = torch.repeat_interleave(
+                        proc_lp_req_mask.to(device=cuda_device, non_blocking=True),
+                        proc_lp_group_steps.to(device=cuda_device, non_blocking=True),
+                        output_size=cast(int, proc_lp_group_steps.sum().item()),
+                    ).unsqueeze(-1)
+                    proc_lp_steps_num_selected = cast(
+                        int,
+                        (proc_lp_req_mask.to(dtype=proc_lp_group_steps.dtype) * proc_lp_group_steps)
+                        .sum()
+                        .item(),
+                    )
 
-                    # Reconstruct processed logprobs from softmax and logits
-                    proc_lp_max_logits_cuda, proc_lp_max_logit_indices = proc_lp_logits_cuda.max(
-                        dim=-1
-                    )
-                    # NB: The operations below could be fused using torch.compile (cf. Fusions) for performance.
-                    proc_lp_renorm_offset_cuda = (
-                        proc_lp_softmax_cuda.gather(
-                            dim=1, index=proc_lp_max_logit_indices.unsqueeze(-1)
-                        )
-                        .log()
-                        .squeeze(-1)
-                        - proc_lp_max_logits_cuda
-                    )
+                    def _select_steps(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+                        selected = t.new_empty((proc_lp_steps_num_selected, *t.shape[1:]))
+                        torch.masked_select(t, mask, out=selected.view(-1))
+                        return selected
 
-                    batch_processed_logprobs_offset_next = (
-                        batch_processed_logprobs_offset + proc_lp_max_logits_cuda.size(0)
-                    )
-                    proc_lp_dest_cuda_view = batch_processed_logprobs_cuda[
-                        batch_processed_logprobs_offset:batch_processed_logprobs_offset_next
-                    ]
-                    batch_processed_logprobs_offset = batch_processed_logprobs_offset_next
-                    torch.add(
-                        proc_lp_logits_cuda,
-                        proc_lp_renorm_offset_cuda.unsqueeze(-1),
-                        out=proc_lp_dest_cuda_view,
-                    )
-                    # NB: In principle. copying and masking whole-vocab tensors could be avoided by storing:
-                    #        -  the number of unmasked tokens 'nu'
-                    #        -  r := log(max(probs)) - max(logits)
-                    #   Later, processed logprobs can be reconstructed from logits _after_ applying
-                    #   top-k: Add 'r' and mask smallest entries so that only min(k, nu) tokens remain.
-                    #   Currently, this approach is not viable because various tie-breaking behaviors are
-                    #   unspecified for several of the kernels involved.
-                    proc_lp_dest_cuda_view.masked_fill_(proc_lp_softmax_cuda == 0, float("-inf"))
+                    proc_lp_logits_cuda = _select_steps(group_logits_cuda, proc_lp_step_mask_cuda)
+                    proc_lp_softmax_cuda = _select_steps(group_softmax_cuda, proc_lp_step_mask_cuda)
+                    proc_lp_temperature_cuda = None
+                    if group_temperature_cuda is not None:
+                        proc_lp_temperature_cuda = _select_steps(
+                            group_temperature_cuda, proc_lp_step_mask_cuda.squeeze(-1)
+                        ).unsqueeze(-1)
 
-            # Set LlmRequest.py_target_probs
-            if group_speculation_needs_probs_indices.size(0) > 0:
-                assert group_softmax_cuda is not None
-                current_offset = 0
-                for req_idx, steps in zip(
-                    group_speculation_needs_probs_indices.tolist(),
-                    req_num_steps[group_speculation_needs_probs_indices].tolist(),
-                ):
-                    next_offset = current_offset + steps
-                    # using view avoids copy
-                    requests[req_idx].py_target_probs = group_softmax_cuda[
-                        current_offset:next_offset
-                    ]
-                    current_offset = next_offset
+                # Apply temperature
+                if proc_lp_temperature_cuda is not None:
+                    if proc_lp_logits_cuda is group_logits_cuda:
+                        proc_lp_logits_cuda = proc_lp_logits_cuda / proc_lp_temperature_cuda
+                    else:
+                        proc_lp_logits_cuda /= proc_lp_temperature_cuda
+
+                # Reconstruct processed logprobs from softmax and logits
+                proc_lp_max_logits_cuda, proc_lp_max_logit_indices = proc_lp_logits_cuda.max(dim=-1)
+                # NB: The operations below could be fused using torch.compile (cf. Fusions) for performance.
+                proc_lp_renorm_offset_cuda = (
+                    proc_lp_softmax_cuda.gather(
+                        dim=1, index=proc_lp_max_logit_indices.unsqueeze(-1)
+                    )
+                    .log()
+                    .squeeze(-1)
+                    - proc_lp_max_logits_cuda
+                )
+
+                batch_processed_logprobs_offset_next = (
+                    batch_processed_logprobs_offset + proc_lp_max_logits_cuda.size(0)
+                )
+                proc_lp_dest_cuda_view = batch_processed_logprobs_cuda[
+                    batch_processed_logprobs_offset:batch_processed_logprobs_offset_next
+                ]
+                batch_processed_logprobs_offset = batch_processed_logprobs_offset_next
+                torch.add(
+                    proc_lp_logits_cuda,
+                    proc_lp_renorm_offset_cuda.unsqueeze(-1),
+                    out=proc_lp_dest_cuda_view,
+                )
+                # NB: In principle. copying and masking whole-vocab tensors could be avoided by storing:
+                #        -  the number of unmasked tokens 'nu'
+                #        -  r := log(max(probs)) - max(logits)
+                #   Later, processed logprobs can be reconstructed from logits _after_ applying
+                #   top-k: Add 'r' and mask smallest entries so that only min(k, nu) tokens remain.
+                #   Currently, this approach is not viable because various tie-breaking behaviors are
+                #   unspecified for several of the kernels involved.
+                proc_lp_dest_cuda_view.masked_fill_(proc_lp_softmax_cuda == 0, float("-inf"))
 
             batch_next_tokens_offset_start = batch_next_tokens_offset_end
             batch_req_idx_offset_start = batch_req_idx_offset_end
 
-        # Prepare logit indices for raw logprobs
-        reqs_indices_needing_raw_logprobs = []
+        # Prepare logit indices for raw logprobs; beam-search requests get theirs
+        # from the beam history instead.
         batch_raw_logprob_indices_cuda = None
-        if return_log_probs:
-            reqs_indices_needing_raw_logprobs_tensor = torch.nonzero(need_raw_logprobs).view(-1)
-            num_requests_needing_raw_logprobs = reqs_indices_needing_raw_logprobs_tensor.size(0)
-            if num_requests_needing_raw_logprobs > 0:
-                # Gather logprobs only for non-beam search requests
-                if self._use_beam_search:
-                    gather_raw_logprobs_req_indices_list = [
-                        idx
-                        for idx in reqs_indices_needing_raw_logprobs_tensor.tolist()
-                        if requests[idx].py_beam_width == 1
-                    ]
-                    gather_raw_logprobs_req_indices_tensor = torch.tensor(
-                        gather_raw_logprobs_req_indices_list,
-                        dtype=reqs_indices_needing_raw_logprobs_tensor.dtype,
-                    )
-                else:
-                    gather_raw_logprobs_req_indices_tensor = (
-                        reqs_indices_needing_raw_logprobs_tensor
-                    )
-                    gather_raw_logprobs_req_indices_list = (
-                        gather_raw_logprobs_req_indices_tensor.tolist()
-                    )
-
-                batch_raw_logprob_indices_cuda = logits_cuda_indexer[
-                    gather_raw_logprobs_req_indices_tensor
-                ].to(device=logits_cuda.device, non_blocking=True)
-                reqs_indices_needing_raw_logprobs = gather_raw_logprobs_req_indices_list
-
-        # NB: 'd2t' contains offsets for transforming draft vocab token IDs into
-        #     the target vocab. This is used by Eagle3ForCausalLM, whose input domain
-        #     is the target vocab, whereas the output logits correspond to the draft
-        #     vocab. Since the inputs/outputs are linked by TorchSampler.update_requests,
-        #     they currently need to be handled within TorchSampler.
-        if needs_d2t:
-            apply_d2t(batch_next_tokens_cuda_int, model_outputs)
+        if reqs_indices_needing_raw_logits:
+            batch_raw_logprob_indices_cuda = logits_cuda_indexer[
+                torch.tensor(reqs_indices_needing_raw_logits, dtype=torch.int64)
+            ].to(device=cuda_device, non_blocking=True)
 
         return _BatchedSamplingResult(
             req_indices=batch_req_indices,
@@ -2336,10 +2168,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Length-based bans (min_length) add it back to recover the real generated
         length. Unlike the suffix-rule staleness this needs no device-side
         lookup, so it is not restricted to the single-step / single-beam case.
-        Returns None when the overlap scheduler is off, on a draft batch, or
-        when nothing is pending, so callers can skip the correction entirely.
+        Returns None when the overlap scheduler is off or when nothing is
+        pending, so callers can skip the correction entirely.
         """
-        if not self._track_pending_steps or self._is_draft_batch(requests):
+        if not self._track_pending_steps:
             return None
         pending = [
             self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0 for r in requests
@@ -2356,9 +2188,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         speculative decoding or beam search the missing history cannot be
         recovered, so bans are matched against the lagging host history and may
         be enforced one step late (warned once). Returns None when the overlap
-        scheduler is off, on a draft batch, or when nothing is pending.
+        scheduler is off or when nothing is pending.
         """
-        if not self._track_pending_steps or self._is_draft_batch(requests):
+        if not self._track_pending_steps:
             return None
         pending = [
             self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0 for r in requests
@@ -2527,7 +2359,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             and self.max_beam_width == 1
             and scheduled_requests.num_context_requests == 0
             and len(generation_requests) <= raw_logits_cuda.shape[0]
-            and model_outputs.get("d2t") is None
             and all(
                 not request.is_dummy and get_draft_token_length(request) == 0
                 for request in generation_requests
@@ -2545,7 +2376,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # _update_requests_single_beam_single_step, like py_end_id;
                     # only multi-token ones need the finish-reason kernel.
                     and not check_stop_words_length(request)
-                    and _request_strategy(request, vocab_size=2**31) == GREEDY
+                    and self._slot_params.modes[cast(int, request.py_seq_slot)]
+                    is SamplingMode.GREEDY
                     for request in generation_requests
                 )
             )
@@ -2557,17 +2389,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         #
         # Staging happened before the forward, so verify the staged buffers
         # really describe this batch: a forward that was skipped, repeated or
-        # replaced (context-only steps, draft batches, eager fallbacks) would
+        # replaced (context-only steps, eager fallbacks) would
         # otherwise be sampled against another batch's destinations.
         if self._current_sample_type is not SampleType.FULL:
             live_requests = [request for request in generation_requests if not request.is_dummy]
             staged_matches_batch = (
                 self._in_graph_staged
                 and self._in_graph_dest_indices is not None
-                # A draft request reuses its target's py_request_id, so the id
-                # list alone cannot tell a drafter batch from the target batch
-                # that staged it.
-                and not any(request.py_is_draft for request in live_requests)
                 and [request.py_request_id for request in live_requests]
                 == self._in_graph_request_ids
             )
@@ -2622,11 +2450,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     if single_step_greedy
                     else new_tokens_cuda
                 )
-                # Consumption is one-shot. The id list is not a unique key for a
-                # batch -- a draft request reuses its target's py_request_id and
-                # the drafter shares this sampler -- so leaving the state staged
-                # would let a later drafter step with the same ids be served
-                # these tokens as draft tokens. The next forward restages.
+                # Consumption is one-shot; the next forward restages.
                 self._consume_in_graph_staging()
                 return (
                     live_requests,
@@ -2665,7 +2489,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 new_tokens_cuda,
                 seq_slots_cuda,
                 self.max_beam_width,
-                None,
             )
             new_tokens_host = self._copy_to_host(next_tokens)
             return (
@@ -2731,9 +2554,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             predecessor_beams=(
                 beam_search_store.predecessor_beams if beam_search_store is not None else None
             ),
-            # _is_draft_batch reads requests[0]; an empty batch has no penalties to apply
-            # anyway, so short-circuit rather than index into it.
-            is_draft_batch=bool(sampling_requests) and self._is_draft_batch(sampling_requests),
         )
 
         has_min_length = any(getattr(r, "py_min_length", None) for r in sampling_requests)
@@ -2789,16 +2609,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 new_tokens_cuda.device, non_blocking=True
             )
 
-            # Get d2t tensor if present
-            d2t = model_outputs.get("d2t", None)
-
-            # Run compiled kernel for argmax, d2t application, and scatter
+            # Run compiled kernel for argmax and scatter
             fast_greedy_sample_kernel(
                 logits_cuda,
                 new_tokens_cuda,
                 batch_dest_indices_cuda,
                 self.max_beam_width,
-                d2t,
             )
 
             new_tokens_host = self._copy_to_host(new_tokens_cuda)
@@ -2825,7 +2641,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
             sampling_requests,
-            model_outputs,
             logits_cuda_indexer=logits_cuda_indexer,
             req_offsets=sampling_requests_metadata.req_offsets,
             seq_slots=seq_slots_host,
@@ -2871,21 +2686,4 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_lens_cuda,
             new_tokens_host,
             False,
-        )
-
-    @override
-    def should_provide_draft_probs(self, request: LlmRequest) -> bool:
-        params = _request_get_sampling_params(request)
-        temperature = params.temperature
-        top_p = params.top_p
-        top_k = params.top_k
-        min_p = params.min_p
-
-        # Do not request draft probs when sampling is greedy.
-        return not SamplingParams.params_imply_greedy_decoding(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            use_beam_search=self._use_beam_search,
-            min_p=min_p,
         )

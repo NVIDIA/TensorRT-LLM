@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -270,7 +270,7 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
 
     auto tmpResultTensor
         = BufferManager::pinned(ITensor::makeShape({SizeType32(rotaryEmbeddingDim)}), TRTDataType<fpType>::value);
-    auto tmpResultPtr = bufferCast<fpType>(*tmpResultTensor);
+    auto tmpResultPtr = tmpResultTensor->template getBufferPtr<fpType>();
     // keeps the current token we are looking at (both padded and non-padded version). Needed due to lack of padding
     SizeType32 tokenIt{};
 
@@ -588,7 +588,7 @@ protected:
         SizeType32 maxOutputSize{generateRandomSizeSmallerThan(1024)};
         rotary_cos_sin_tensor = this->mBufferManager->pinned(
             ITensor::makeShape({mRotaryEmbeddingMaxPositions, mRotaryEmbeddingDim}), tensorrt_llm::DataType::kFLOAT);
-        rotary_fill_help = bufferCast<float>(*(rotary_cos_sin_tensor));
+        rotary_fill_help = rotary_cos_sin_tensor->getBufferPtr<float>();
         // createCosSinBuf(rotary_fill_help, mRotaryEmbeddingMaxPositions, mRotaryEmbeddingDim); //currently broken
         // fillWithOnesAndZerosInterleaved(rotary_fill_help, mRotaryEmbeddingMaxPositions*
         // mRotaryEmbeddingDim); //maxes the cos to 1 so it's an identity op
@@ -598,7 +598,7 @@ protected:
         batch_size = generateRandomSizeSmallerThan(12);
 
         q_seq_lengths_tensor = mBufferManager->pinned(ITensor::makeShape({batch_size}), tensorrt_llm::DataType::kINT32);
-        q_seq_lengths = bufferCast<int32_t>(*(q_seq_lengths_tensor));
+        q_seq_lengths = q_seq_lengths_tensor->getBufferPtr<int32_t>();
 
         for (SizeType32 ii = 0; ii < batch_size; ++ii)
         {
@@ -623,13 +623,13 @@ protected:
     void buildDecoderParams()
     {
         fpType* attention_mask{};
-        cu_q_seqlens = bufferCast<int32_t>(*(this->cu_q_seqlens_tensor));
-        int* cu_kv_seqlens = bufferCast<int32_t>(*(this->cu_kv_seqlens_tensor));
-        int* padding_offset = bufferCast<int32_t>(*(this->padding_offset_tensor));
-        int* encoder_padding_offset = bufferCast<int32_t>(*(this->encoder_padding_offset_tensor));
-        uint32_t* fmha_tile_counter_ptr = bufferCast<uint32_t>(*(this->fmha_tile_counter_ptr_tensor));
-        rotary_inv_freq_buf = bufferCast<float>(*(this->rotary_inv_freq_buf_tensor));
-        tokens_info = bufferCast<int>(*(this->tokens_info_tensor));
+        cu_q_seqlens = this->cu_q_seqlens_tensor->template getBufferPtr<int32_t>();
+        int* cu_kv_seqlens = this->cu_kv_seqlens_tensor->template getBufferPtr<int32_t>();
+        int* padding_offset = this->padding_offset_tensor->template getBufferPtr<int32_t>();
+        int* encoder_padding_offset = this->encoder_padding_offset_tensor->template getBufferPtr<int32_t>();
+        uint32_t* fmha_tile_counter_ptr = this->fmha_tile_counter_ptr_tensor->template getBufferPtr<uint32_t>();
+        rotary_inv_freq_buf = this->rotary_inv_freq_buf_tensor->template getBufferPtr<float>();
+        tokens_info = this->tokens_info_tensor->template getBufferPtr<int>();
 
         BuildDecoderInfoParams<fpType> decoderParams;
         memset(&decoderParams, 0, sizeof(decoderParams));
@@ -684,7 +684,7 @@ protected:
 
         if (global_scale_tensor)
         {
-            kv_scale_orig_quant = bufferCast<float>(*(global_scale_tensor));
+            kv_scale_orig_quant = global_scale_tensor->getBufferPtr<float>();
             kv_scale_orig_quant[0] = 5.1f;
             kv_scale_orig_quant[1] = 0.25f;
         }
@@ -694,7 +694,7 @@ protected:
         attention_input_buf = this->mBufferManager->pinned(
             ITensor::makeShape({num_tokens, 3, mNumHeads, mHeadSize}), TRTDataType<fpType>::value);
         // ITensor::volume(attention_input_buf->getShape())
-        attention_input = bufferCast<fpType>(*attention_input_buf);
+        attention_input = attention_input_buf->getBufferPtr<fpType>();
         this->fillRandomNormal(attention_input, qkv_size);
 
         preprocessingParams.qkv_input = const_cast<fpType*>(attention_input);
@@ -867,7 +867,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
     bool allEqual{true};
     BufferManager::ITensorPtr reference_qkv_buf
         = this->mBufferManager->copyFrom(*(this->attention_input_buf), tensorrt_llm::runtime::MemoryType::kPINNEDPOOL);
-    fpType* reference_qkv = bufferCast<fpType>(*reference_qkv_buf);
+    fpType* reference_qkv = reference_qkv_buf->getBufferPtr<fpType>();
 
     for (SizeType32 iAssert = 0; iAssert < this->qkv_size; iAssert++)
     {

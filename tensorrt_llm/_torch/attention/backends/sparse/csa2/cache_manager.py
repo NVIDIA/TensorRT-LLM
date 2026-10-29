@@ -297,7 +297,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                     f"checkpoint_capacity_upper_bound={stats.total // optional_pages if optional_pages else 0}"
                 )
 
-    def _derive_reuse_salt(self, cache_salt: str | None) -> int | None:
+    def _derive_reuse_salt(self, cache_salt: str | None) -> str | None:
         if self._encoder_replay_enabled:
             # Preserve None vs empty-string and compose with the user namespace.
             cache_salt = "deepseek-v41-csa2-encoder:approximate:" + repr(cache_salt)
