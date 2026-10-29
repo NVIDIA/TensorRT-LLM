@@ -155,7 +155,7 @@ cache_transceiver_config:
 
 `max_tokens_in_buffer` is best left unset. It bounds how many KV transfers a generation worker admits concurrently, and the built-in default is derived from the model's maximum sequence length, so a small hand-written value only throttles the transfer path.
 
-`kv_transfer_timeout_ms` bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is `60000`.
+`kv_transfer_timeout_ms` bounds the KV transfer wait. The default is `60000`. In ownership-enabled configurations, expiry cancels logical work but does not itself authorize releasing memory that a transfer may still access.
 
 The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` in `kv_cache_config` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, set `use_kv_cache_manager_v2: false` and select `transceiver_runtime: CPP` for a model that supports V1.
 
@@ -163,7 +163,23 @@ The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) r
 
 `agent_bounce_buffer_enable` (default `false`) switches to the C++ transfer-agent bounce implementation, which uses one buffer of `kv_cache_bounce_size_mb` MiB shared by send and receive (prefer a power of two; the usable capacity rounds down to one). By default it engages only for KV writes with many small descriptors (at least 1024, averaging at most 16 KiB), i.e. head-mismatch layouts such as context TP != generation TP or DP; head-matched layouts (MLA, symmetric TP) stay on the standard NIXL path unless `agent_bounce_params` relaxes the gate (lower `min_descriptor_count`, where `0` means no minimum; raise `max_average_descriptor_size`, e.g. `4MB`; `max_average_descriptor_size: 0` routes every outbound write to standard NIXL, acting as an outbound gate off switch — it disables outbound routing only: the arena is still allocated, the handshake still advertised and inbound transfers still served; set `agent_bounce_buffer_enable: false` to turn the feature off). Set it consistently on the context and generation workers; in particular `request_timeout_ms` and the effective chunk cap must match on both sides, otherwise the pair falls back to standard NIXL with a WARNING when the peer is loaded (transfers are then routed silently). The compared chunk cap is the effective one, min(`max_chunk_size`, the arena's usable capacity): `kv_cache_bounce_size_mb` matters only when its usable capacity (rounded down to a power of two) is below `max_chunk_size`; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL.
 
-For example, you could launch two context servers and one generation server as follows:
+#### Context-first BF16 transfer ownership
+
+Physical ownership enforcement is automatic for explicit context-first requests with a non-negative integer `disagg_request_id` when **all** of these conditions hold on both endpoints:
+
+- Full-context BF16 MHA/GQA K/V in KV cache manager V2, ordinary HND page views, symmetric TP1 or TP2, attention-DP disabled, PP1 and CP1.
+- `transceiver_runtime: PYTHON`, `backend: NIXL`, the C++ agent binding (`TRTLLM_USE_PY_NIXL_KVCACHE=0`), and `TRTLLM_NIXL_KVCACHE_BACKEND=UCX`.
+- Direct asynchronous transfer with a finite timeout: no Python/agent bounce buffer, pipelined or layerwise transfer, or disabled transfer overlap.
+- `TRTLLM_DISAGG_NO_RETRY=1` on the coordinator and every worker; no rerouting/replay of a published pairing ID.
+- MPI executor workers with a matching rank/world mapping and `MPI_THREAD_MULTIPLE`, so the existing fatal policy can stop the executor.
+
+Use identical images and effective BF16 configuration on all participants; topology/layout checks do not negotiate dtype, version or activation. Each participating rank logs `Context-first BF16 KV ownership ENABLED` on its first protected request. Omitted scheduling style, other configurations and the existing opt-in FP4 generation-first bridge retain their previous behavior.
+
+The sender and receiver retain resources until access is proven safe. An unresolved failure, cancellation or timeout starts the existing non-resettable quiescence grace (also `kv_transfer_timeout_ms`); expiry retains those resources and fail-stops the executor, potentially the entire shared MPI launcher job. This does not provide automatic replacement or generalized in-flight cancellation delivery.
+
+#### Basic serving example
+
+The following example illustrates general serving setup, not the ownership-enabled profile above. You could launch two context servers and one generation server as follows:
 
 ```bash
 

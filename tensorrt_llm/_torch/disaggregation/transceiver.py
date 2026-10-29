@@ -42,6 +42,9 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
 )
+from tensorrt_llm._torch.disaggregation.native.context_first_profile import (
+    supports_context_first_bf16,
+)
 from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
@@ -133,7 +136,7 @@ def _fail_unproven_kv_transfer(
         hang_detector.propagate_hard_kill(diagnostics=False, communicator=communicator)
 
 
-def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
+def _retirement_executor_comm(mapping: Mapping, *, warn: bool = True) -> "MPI.Comm":
     """Capture the MPI executor world that the deadline watchdog may abort.
 
     Rank/size validation does not isolate termination. Shared MPI launches can
@@ -141,6 +144,7 @@ def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
 
     Args:
         mapping: The executor's expected worker rank and world size.
+        warn: Emit the launcher-wide termination warning when selecting the communicator.
 
     Returns:
         The exact communicator, retained rather than resolved on another thread.
@@ -167,7 +171,7 @@ def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
         or communicator.Get_rank() != mapping.rank
     ):
         raise ValueError(message)
-    if mapping.rank == 0:
+    if warn and mapping.rank == 0:
         logger.warning(
             "KV retirement fail-stop may terminate the entire MPI job, including other "
             "CTX/GEN executors sharing the launch. A split communicator does not isolate "
@@ -315,6 +319,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._retirement_mpi_comm = (
             _retirement_executor_comm(mapping) if enforce_physical_ownership else None
         )
+        self._context_first_ownership = False
+        self._context_first_ownership_logged = False
+        if not enforce_physical_ownership and supports_context_first_bf16(
+            mapping, kv_cache_manager, cache_transceiver_config
+        ):
+            try:
+                self._retirement_mpi_comm = _retirement_executor_comm(mapping, warn=False)
+            except ValueError:
+                # Non-MPI launchers retain their existing transfer behavior;
+                # only a qualified executor can activate bounded containment.
+                logger.info("Context-first KV ownership inactive: executor MPI is not qualified")
+            else:
+                self._context_first_ownership = True
+        ownership_capable = enforce_physical_ownership or self._context_first_ownership
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -344,8 +362,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tx_overall_timeout_s=transfer_timeout_s,
                 rx_timeout_s=transfer_timeout_s,
                 enforce_physical_ownership=enforce_physical_ownership,
+                context_first_ownership=self._context_first_ownership,
                 quiescence_fatal_callback=(
-                    self._fail_unproven_transfer if enforce_physical_ownership else None
+                    self._fail_unproven_transfer if ownership_capable else None
                 ),
                 # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
                 # routes it to exactly one implementation: the Python bounce below (per-region,
@@ -715,23 +734,44 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
     def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> bool:
-        if not getattr(self, "_fp4_mla_bridge_enabled", False):
-            return True
         params = req.py_disaggregated_params
+        fp4_bridge = getattr(self, "_fp4_mla_bridge_enabled", False)
+        context_first = (
+            getattr(self, "_context_first_ownership", False)
+            and params is not None
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
+        if not fp4_bridge and not context_first:
+            return True
+        required_schedule = (
+            DisaggScheduleStyle.GENERATION_FIRST
+            if fp4_bridge
+            else DisaggScheduleStyle.CONTEXT_FIRST
+        )
         rid = None if params is None else params.disagg_request_id
         if (
             synchronous
             or params is None
-            or params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST
+            or params.schedule_style != required_schedule
             or type(rid) is not int
             or rid < 0
         ):
             logger.error(
-                "FP4 MLA lifecycle bridge requires async generation-first requests "
+                f"KV ownership requires async {required_schedule.name} requests "
                 "with a non-negative integer disagg_request_id"
             )
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
             return False
+        if context_first and not self._context_first_ownership_logged:
+            logger.info(
+                "Context-first BF16 KV ownership ENABLED: "
+                f"rank={self._mapping.rank}/{self._mapping.world_size}, "
+                "backend=NIXL/UCX, runtime=PYTHON, attention_dp=False, pp=1, cp=1, "
+                "retry=False, async=True, layerwise=False, bounce_mb=0, "
+                "unproven_retirement=fail_stop, termination_scope=mpi_job_or_launcher; "
+                "MPI abort may terminate other CTX/GEN executors in the same launcher job"
+            )
+            self._context_first_ownership_logged = True
         return True
 
     def _ctx_consensus(self, local_ids: list) -> list:
@@ -1147,7 +1187,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session = self._get_or_create_send_session(req)
         if session is None:
             return
-        bridge_enabled = getattr(self, "_fp4_mla_bridge_enabled", False)
+        bridge_enabled = getattr(session, "_enforce_physical_ownership", False)
         if bridge_enabled:
             # Root the request before backend admission so its source pages
             # outlive every ownership-enabled NIXL operation.
@@ -1369,6 +1409,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
         failed = [rid for rid in failed if rid in quiesced]
+        owned_cancelled = [
+            rid
+            for rid in cancelled
+            if getattr(self._send_sessions[rid], "_enforce_physical_ownership", False)
+        ]
 
         for rid in cancelled:
             self._retire_send_session(rid, outcome="cancelled")
@@ -1384,12 +1429,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
-        if getattr(self, "_fp4_mla_bridge_enabled", False):
-            # CtxTransferStatus has no cancellation channel. In the qualified
-            # no-retry bridge, a globally quiesced cancellation is a terminal
-            # send failure that the executor must consume to release its
-            # matching AsyncTransferManager claim.
-            failed.extend(rid for rid in cancelled if rid not in failed)
+        # CtxTransferStatus has no cancellation channel. An owned session's
+        # quiesced cancellation must release its AsyncTransferManager claim.
+        failed.extend(rid for rid in owned_cancelled if rid not in failed)
         return CtxTransferStatus(completed, failed)
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:

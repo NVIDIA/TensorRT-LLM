@@ -1380,6 +1380,7 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
     session = SimpleNamespace(
         disagg_request_id=rid,
         _need_aux=True,
+        _enforce_physical_ownership=True,
         lock=threading.Lock(),
         has_failed=Mock(return_value=True),
         resources_drained=Mock(return_value=True),
@@ -2466,6 +2467,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     send_session = SimpleNamespace(
         send=send_after_rooting,
         kv_tasks=send_tasks,
+        _enforce_physical_ownership=True,
         set_exception=Mock(),
         has_failed=Mock(return_value=False),
     )
