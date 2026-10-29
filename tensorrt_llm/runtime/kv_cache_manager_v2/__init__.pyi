@@ -800,8 +800,13 @@ class _KVCache:
         cuda_stream: CudaStream | None = None,
         is_decoding: bool | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
+        defer_onboard: bool = False,
     ) -> bool:
         """Lock this cache's pages at their required levels.
+
+        ``defer_onboard`` (prefill only, layer-wise onboarding enabled): host->GPU copies wait for
+        ``KVCacheManager.flush_onboard`` and this stream does not wait for them; readers must call
+        ``wait_layer_onboard`` per layer.
 
         Returns ``False`` when utilisation is too high or pages cannot be had. Raises while
         it belongs to a :class:`Batch`, for the same reason as :meth:`suspend` -- locking
@@ -1662,6 +1667,20 @@ class KVCacheManager:
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
+    def set_layerwise_onboard(self, enable: bool, layer_groups: int) -> None:
+        """Defer host->GPU copies of ``resume(defer_onboard=True)`` and issue them per layer group."""
+    def flush_onboard(self, cuda_stream: CudaStream) -> bool:
+        """Issue deferred copies in layer order on a dedicated stream.
+
+        ``cuda_stream`` waits only for copies into private (partial-block) slots. True when
+        anything was issued.
+        """
+    def wait_layer_onboard(self, layer_id: LayerId, cuda_stream: CudaStream) -> None:
+        """Make ``cuda_stream`` wait for the issued copies of one layer."""
+    def wait_all_onboard(self, cuda_stream: CudaStream) -> None:
+        """Flush, make ``cuda_stream`` wait for every issued copy, and retire the per-layer events."""
+    @property
+    def has_onboard_events(self) -> bool: ...
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
     ) -> MemAddress: ...

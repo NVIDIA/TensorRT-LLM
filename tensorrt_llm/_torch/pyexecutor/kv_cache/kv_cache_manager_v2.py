@@ -137,6 +137,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from .kv_layerwise_onboard import LayerwiseOnboard, layerwise_consumer_registered
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1761,6 +1762,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
+    # Set in __init__ with KvCacheConfig.layerwise_host_onboard and a host tier (see kv_layerwise_onboard).
+    layerwise_onboard: Optional[LayerwiseOnboard] = None
     # Declared on the class for the same reason: prepare_context and the
     # connector-reservation cap read it on instances tests build without
     # running __init__. Zero disables the spec recompute tail.
@@ -2394,6 +2397,16 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_manager_py_config = config
         self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
+        # Layer-wise onboarding only pays off with a host tier to onboard from.
+        self.layerwise_onboard = (
+            LayerwiseOnboard(
+                self.impl,
+                lambda idx: self.layer_offsets.get(idx),
+                self._layerwise_last_target_layer,
+            )
+            if self.can_evict and getattr(kv_cache_config, "layerwise_host_onboard", False)
+            else None
+        )
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group(
@@ -4884,26 +4897,58 @@ class KVCacheManagerV2(BaseResourceManager):
             index = self.index_mapper.get_index(request_id)
             self.sparse_metadata_batch.add(kv_cache, index)
 
-    def _resume_and_restore(self, req_id: int, kv_cache, optional_reuse_groups=None) -> bool:
+    def _resume_and_restore(
+        self, req_id: int, kv_cache, optional_reuse_groups=None, defer_onboard: bool = False
+    ) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
+        ``defer_onboard`` (prefill only) leaves host->GPU copies to
+        ``_flush_layerwise_onboard`` when layer-wise onboarding is on.
         Returns True if the cache is (or becomes) active, False on failure.
         """
         if kv_cache.is_active:
             return True
         stream = self._cache_stream(req_id)
-        if not (
-            kv_cache.resume(stream)
-            if optional_reuse_groups is None
-            else kv_cache.resume(stream, optional_reuse_groups=optional_reuse_groups)
-        ):
+        kwargs = {}
+        if optional_reuse_groups is not None:
+            kwargs["optional_reuse_groups"] = optional_reuse_groups
+        if defer_onboard:
+            kwargs["defer_onboard"] = True
+        if not kv_cache.resume(stream, **kwargs):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
 
+    def _defers_context_onboard(self) -> bool:
+        """Whether context resumes leave their host->GPU copies to the per-layer flush.
+
+        Only with an attention backend that waits per layer, and without a KV
+        connector, whose transfers do not take the per-layer events.
+        """
+        return (
+            self.layerwise_onboard is not None
+            and self.kv_connector_manager is None
+            and layerwise_consumer_registered()
+        )
+
     def _resume_context_cache(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
         """Resume context pages; subclasses may select model-specific reuse groups."""
-        return self._resume_and_restore(req.py_request_id, kv_cache)
+        return self._resume_and_restore(
+            req.py_request_id, kv_cache, defer_onboard=self._defers_context_onboard()
+        )
+
+    def _layerwise_last_target_layer(self) -> Optional[int]:
+        """Last local layer the target forward attends; it retires all onboarding events."""
+        if self.is_draft:
+            return None
+        shared_draft = set(getattr(self, "_shared_draft_layer_ids", ()))
+        target_layers = [layer for layer in self.layer_offsets if layer not in shared_draft]
+        return max(target_layers) if target_layers else None
+
+    def _flush_layerwise_onboard(self) -> None:
+        """Issue this step's deferred onboarding copies, layer by layer, ahead of the forward."""
+        if self._defers_context_onboard():
+            self.layerwise_onboard.flush(self._stream.cuda_stream)
 
     def _context_reuse_tokens(
         self, req: LlmRequest, reuse_limit: int | None = None
@@ -5597,6 +5642,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Mirror the main manager. Under one-model spec decoding the
             # scheduler may already have created the context cache.
             self._prepare_draft_resources(scheduled_batch)
+            self._flush_layerwise_onboard()
             self._publish_sparse_metadata()
             return
 
@@ -5606,6 +5652,7 @@ class KVCacheManagerV2(BaseResourceManager):
         #
         # A capacity-only connector cannot reach those pages, so reporting them
         # would cost a page index gather per context request for nothing.
+        self._flush_layerwise_onboard()
         if self.kv_connector_manager is not None and not self.kv_connector_manager.capacity_only:
             self._run_kv_connector_hooks(scheduled_batch)
         self._publish_sparse_metadata()
@@ -7447,6 +7494,9 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        if self.layerwise_onboard is not None:
+            self.layerwise_onboard.wait_all(self._stream.cuda_stream)
+        self.release_offload_headroom()
         if self._sharing is not None:
             self._sharing._on_shutdown()
         if self.sparse_metadata_batch is not None:

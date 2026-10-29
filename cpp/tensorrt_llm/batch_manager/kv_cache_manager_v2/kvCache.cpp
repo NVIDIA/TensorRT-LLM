@@ -482,7 +482,8 @@ void KvCache::activate()
     }
 }
 
-bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<LifeCycleId>> optionalReuseGroups)
+bool KvCache::resume(
+    std::optional<CUstream> stream, std::optional<std::vector<LifeCycleId>> optionalReuseGroups, bool deferOnboard)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
@@ -520,6 +521,21 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
+
+    // The caller passes deferOnboard for prefill only (see the declaration).
+    bool const deferringOnboard = deferOnboard && storageMgr.layerwiseOnboardEnabled();
+    if (deferringOnboard)
+    {
+        storageMgr.beginOnboardDeferral();
+    }
+    auto endOnboardDeferral = FuncGuard(
+        [&]()
+        {
+            if (deferringOnboard)
+            {
+                storageMgr.endOnboardDeferral();
+            }
+        });
 
     // Snapshot source levels before allocation or activation can migrate the selected pages.
     ReusedBlocksByLevelByLifeCycle optionalReusedByLevel;
@@ -757,8 +773,15 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             srcLocks.push_back(lock);
             copiedSources[lcIdx] = lock->page();
 
-            CacheLevel const sourceLevel = lock->page()->cacheLevel;
-            storageMgr.copySlotData(lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            // A source whose own onboarding is deferred is copied from its host copy instead.
+            std::optional<CacheLevel> const deferredSourceLevel
+                = storageMgr.deferCopyFromPendingPage(lcIdx, newSlot, *lock->page());
+            CacheLevel const sourceLevel = deferredSourceLevel.value_or(lock->page()->cacheLevel);
+            if (!deferredSourceLevel.has_value())
+            {
+                storageMgr.copySlotData(
+                    lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            }
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
                 bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
@@ -921,6 +944,12 @@ void KvCache::suspend()
     TLLM_CHECK_DEBUG(_checkSanity());
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
+    // Unlocking may hand pending pages or private slots with deferred copies to other owners.
+    if (auto& storage = mManager->storage(); storage.hasPendingOnboard())
+    {
+        storage.flushPendingOnboard(cudaStream());
+    }
+
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
     for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
         for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
@@ -998,6 +1027,11 @@ void KvCache::close()
         mManager->tryUpdateTargetRatios();
     }
 
+    // Only an active cache holds locks on pending pages or private slots with deferred copies.
+    if (auto& storage = mManager->storage(); mStatus == Status::ACTIVE && storage.hasPendingOnboard())
+    {
+        storage.flushPendingOnboard(cudaStream());
+    }
     // Record event scope — mirrors Python's `with self._record_event()`.
     // Python always enters _record_event() here; _cuda_stream is valid for both ACTIVE and SUSPENDED.
     {

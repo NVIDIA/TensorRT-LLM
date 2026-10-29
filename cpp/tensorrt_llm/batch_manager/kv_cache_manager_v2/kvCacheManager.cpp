@@ -435,6 +435,42 @@ void KvCacheManager::shutdown()
     mStorage->destroy();
 }
 
+void KvCacheManager::setLayerwiseOnboard(bool enable, int layerGroups)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    mStorage->setLayerwiseOnboard(enable, layerGroups);
+}
+
+bool KvCacheManager::flushOnboard(CUstream waiter)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    return mStorage->flushPendingOnboard(waiter);
+}
+
+void KvCacheManager::waitLayerOnboard(LayerId layerId, CUstream stream) const
+{
+    KVCM2_API_GUARD();
+    // Exclusive: copies raw event handles out of the storage manager.
+    auto const apiLock = lockExclusive();
+    mStorage->waitLayerOnboard(layerId, stream);
+}
+
+void KvCacheManager::waitAllOnboard(CUstream stream)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    mStorage->waitAllOnboard(stream);
+}
+
+bool KvCacheManager::hasOnboardEvents() const
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockShared();
+    return mStorage->hasOnboardEvents() || mStorage->hasPendingOnboard();
+}
+
 void KvCacheManager::clearReusableBlocks()
 {
     KVCM2_API_GUARD();

@@ -295,8 +295,13 @@ public:
     //
     // Refused while the cache belongs to a Batch: locking pages writes through the bound
     // Span, which is the Batch's staged row, so a member is resumed before it joins.
+    //
+    // deferOnboard: with layer-wise onboarding enabled on the manager, host->GPU copies are deferred
+    // to KvCacheManager::flushOnboard() and this cache's stream does not wait for them; its readers
+    // must wait per layer (KvCacheManager::waitLayerOnboard). Pass it for prefill only: decode
+    // readers run in CUDA graphs that cannot take per-layer waits.
     bool resume(std::optional<CUstream> stream = std::nullopt,
-        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
+        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt, bool deferOnboard = false);
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     //

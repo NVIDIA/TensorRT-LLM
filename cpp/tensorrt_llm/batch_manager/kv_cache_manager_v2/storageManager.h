@@ -296,6 +296,69 @@ public:
 
     void copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
         SlotId srcSlotId, CUstream stream);
+
+    // ---- Layer-wise onboarding -------------------------------------------
+    //
+    // While a deferral is open (beginOnboardDeferral), host->GPU migrations of unlocked pages only
+    // claim their GPU slots: the pages report the GPU level and their page indices are final, but no
+    // data moves. flushPendingOnboard() then issues every deferred copy on one dedicated
+    // high-priority stream in layer order and records one event per layer group, so a reader of
+    // layer i waits for layer i alone (waitLayerOnboard) instead of the whole migration and the
+    // offloads that freed its slots.
+    //
+    // Until a flush, a pending page's readyEvent is its host source's, and its host slot stays
+    // claimed so nothing can overwrite the source. Anything that would read, move or drop a pending
+    // page flushes first. After a flush its readyEvent covers the copy, so readers that skip the
+    // per-layer events stay correct at whole-migration granularity.
+
+    //! Enables deferral for host->GPU migrations. `layerGroups` bounds the number of per-layer events
+    //! (and, on the copy-engine path, the descriptor count); layers are split into that many
+    //! contiguous groups. Disabling requires that nothing be pending.
+    void setLayerwiseOnboard(bool enable, int layerGroups);
+
+    [[nodiscard]] bool layerwiseOnboardEnabled() const noexcept
+    {
+        return mLayerwiseOnboard;
+    }
+
+    //! Nested; host->GPU migrations are deferred while any deferral is open.
+    void beginOnboardDeferral() noexcept;
+    void endOnboardDeferral() noexcept;
+
+    [[nodiscard]] bool deferringOnboard() const noexcept
+    {
+        return mLayerwiseOnboard && mOnboardDeferralDepth > 0;
+    }
+
+    [[nodiscard]] bool hasPendingOnboard() const noexcept
+    {
+        return !mPendingOnboardPages.empty();
+    }
+
+    [[nodiscard]] bool isOnboardPending(Page const& page) const;
+
+    //! Defers a whole-page copy of a pending page into `dstSlot` (a private GPU slot), reading from
+    //! the page's host source. Returns the source level when deferred, nullopt when `src` is not
+    //! pending. The flush's waiter stream (or, failing that, the next waitAllOnboard stream) waits
+    //! for these copies before any per-layer work, because the caller writes into `dstSlot`.
+    std::optional<CacheLevel> deferCopyFromPendingPage(LifeCycleId lifeCycle, Slot const& dstSlot, Page const& src);
+
+    //! Issues every deferred copy. `waiter`, when given, waits only for the deferred whole-page
+    //! copies, including those of earlier flushes that had no waiter. Returns true when anything
+    //! was issued.
+    bool flushPendingOnboard(std::optional<CUstream> waiter);
+
+    //! Makes `stream` wait for the flushed copies of one layer.
+    void waitLayerOnboard(LayerId layerId, CUstream stream) const;
+
+    //! Flushes, makes `stream` wait for every flushed copy, and forgets the per-layer events.
+    void waitAllOnboard(CUstream stream);
+
+    [[nodiscard]] bool hasOnboardEvents() const noexcept
+    {
+        return !mOnboardDoneEvents.empty() || !mUnwaitedOnboardCopyEvents.empty();
+    }
+
     // Pool group base address without per-layer offset.
     MemAddress getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
@@ -455,6 +518,17 @@ private:
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
         PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
 
+    //! Defers a host->GPU migration of unlocked pages; see setLayerwiseOnboard().
+    void _deferOnboard(
+        CacheLevel srcLevel, std::vector<SharedPtr<Page>> const& srcPages, MigrationRecorder const& migrationRecorder);
+    [[nodiscard]] bool _canDeferOnboard(CacheLevel dstLevel, CacheLevel srcLevel,
+        std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, bool defrag) const;
+    template <typename Pages>
+    void _flushIfAnyPending(Pages const& pages, std::optional<CUstream> waiter = std::nullopt);
+    void _buildLayerCopyPlans(int layerGroups);
+    CUstream _onboardStream();
+    void _releaseOnboardResources() noexcept;
+
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
         CUstream stream, Submit&& submit);
@@ -534,6 +608,50 @@ private:
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.
     std::unique_ptr<StagingBufferManager> mIndexStagingManager;
+
+    // ---- Layer-wise onboarding state (see setLayerwiseOnboard) ----
+    struct LayerCopyRange
+    {
+        PoolIndex poolIndex{0};
+        size_t offset = 0;
+        size_t numBytes = 0;
+    };
+
+    //! One event's worth of copying: contiguous layers and the slot ranges holding them.
+    struct LayerCopyStep
+    {
+        std::vector<LayerId> layers;
+        std::vector<LayerCopyRange> ranges;
+    };
+
+    struct PendingOnboardPage
+    {
+        SharedPtr<Page> page;
+        //! The readyEvent the page was given when deferred; anything else means it changed since.
+        CachedCudaEvent deferredReadyEvent = CachedCudaEvent::makeNull();
+        CacheLevel srcLevel{0};
+        //! The page's host source, held out of its pool until the copy is issued.
+        Slot hostSlot;
+    };
+
+    using PendingCopyKey = std::pair<CacheLevel, LifeCycleId>;
+
+    bool mLayerwiseOnboard = false;
+    int mOnboardDeferralDepth = 0;
+    //! Per lifecycle; empty when its slot is not fully covered by per-layer buffers.
+    TypedVec<LifeCycleId, std::vector<LayerCopyStep>> mLayerCopyPlans;
+    std::unordered_map<Page const*, PendingOnboardPage> mPendingOnboardPages;
+    std::map<PendingCopyKey, std::vector<PageIndexPair>> mPendingOnboardMigrations;
+    std::map<PendingCopyKey, std::vector<PageIndexPair>> mPendingOnboardCopies;
+    std::vector<CachedCudaEvent> mPendingOnboardPriorEvents;
+    std::vector<CachedCudaEvent> mPendingOnboardCopyPriorEvents;
+    //! Whole-page copy completions no stream has waited for yet.
+    std::vector<CachedCudaEvent> mUnwaitedOnboardCopyEvents;
+    std::map<LayerId, std::vector<CachedCudaEvent>> mLayerOnboardEvents;
+    std::vector<CachedCudaEvent> mOnboardDoneEvents;
+    CUstream mOnboardStream = nullptr;
+    CUdeviceptr mOnboardIndexBuffer = 0;
+    size_t mOnboardIndexBytes = 0;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

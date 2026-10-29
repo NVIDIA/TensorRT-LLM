@@ -38,6 +38,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_layerwise_onboard import register_layerwise_consumer
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1291,6 +1292,18 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         self.indexer_kv_dtype = str(sparse_params.indexer_kv_dtype)
         self._validate_msa_preconditions()
         self.indexer = MsaIndexer(self.m3_config)
+        # Cache reads below wait for this layer's onboarding alone (_wait_kv_onboard).
+        register_layerwise_consumer()
+
+    def _wait_kv_onboard(self, metadata) -> None:
+        """Order this layer's cache reads after its host->GPU onboarding copies."""
+        onboard = getattr(metadata.kv_cache_manager, "layerwise_onboard", None)
+        if onboard is not None and onboard.armed:
+            onboard.wait_layer(self.layer_idx)
+
+    def forward(self, q, k, v, metadata, forward_args=None, **kwargs):
+        self._wait_kv_onboard(metadata)
+        return super().forward(q, k, v, metadata, forward_args, **kwargs)
 
     def _validate_msa_preconditions(self) -> None:
         config = self.m3_config
@@ -1447,6 +1460,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         `idx_k_prewritten` marks that the fused per-layer cache write
         (write_layer_caches) already stored this layer's index-K.
         """
+        self._wait_kv_onboard(metadata)
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])

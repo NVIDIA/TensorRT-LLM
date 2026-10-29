@@ -545,12 +545,32 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder);
     }
 
-    // Wait for all ready events on KvCache's stream (deduplicated).
+    // Wait for all ready events on KvCache's stream (deduplicated). Under an onboarding deferral the
+    // stream skips pages whose copy is still pending: its readers wait per layer instead (see
+    // StorageManager::setLayerwiseOnboard). Without one, a pending page must be copied first.
     {
+        bool const deferring = storeMgr->deferringOnboard();
+        if (!deferring && storeMgr->hasPendingOnboard())
+        {
+            for (auto const& t : targets)
+            {
+                if (storeMgr->isOnboardPending(*t.page))
+                {
+                    storeMgr->flushPendingOnboard(kvCache.cudaStream());
+                    break;
+                }
+            }
+        }
         std::vector<CUevent> readyEvents;
         readyEvents.reserve(targets.size());
         for (auto const& t : targets)
+        {
+            if (deferring && storeMgr->isOnboardPending(*t.page))
+            {
+                continue;
+            }
             readyEvents.push_back(t.page->readyEvent.handle());
+        }
         streamWaitEvents(reinterpret_cast<CudaStream>(kvCache.cudaStream()), std::move(readyEvents));
     }
 

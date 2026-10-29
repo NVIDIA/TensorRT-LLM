@@ -304,6 +304,20 @@ public:
     // Mirrors Python's clamp_max_seq_len_for_mem().
     int clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) const;
 
+    // ---- Layer-wise onboarding ---------------------------------------------
+    // See StorageManager::setLayerwiseOnboard. All of these take the exclusive API lock.
+
+    //! Enables deferred, layer-ordered host->GPU copies for KvCache::resume(deferOnboard=true).
+    void setLayerwiseOnboard(bool enable, int layerGroups);
+    //! Issues deferred copies; `waiter` waits for copies into private slots. True if any were issued.
+    bool flushOnboard(CUstream waiter);
+    //! Makes `stream` wait for the issued copies of one layer.
+    void waitLayerOnboard(LayerId layerId, CUstream stream) const;
+    //! Flushes, makes `stream` wait for every issued copy and forgets the per-layer events.
+    void waitAllOnboard(CUstream stream);
+    //! True while issued copies have per-layer events that no waitAllOnboard() has retired.
+    bool hasOnboardEvents() const;
+
     // ---- Resize -----------------------------------------------------------
 
     bool resize(CacheLevel level, size_t quota, bool bestEfforts = false);
