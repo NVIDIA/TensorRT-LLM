@@ -1,0 +1,46 @@
+Comfy checkpoint import — source attribution
+
+This component includes adaptations of the Apache-2.0 software listed below.
+The Apache License, Version 2.0 is included in the project root LICENSE and
+the distribution's license files. Modifications are by NVIDIA CORPORATION
+& AFFILIATES, 2026.
+
+comfy-kitchen
+Copyright (c) 2025 Comfy Org. All rights reserved.
+This product includes software developed at NVIDIA CORPORATION.
+Source revision: f8b7e97a1418d2e529bd5405fbf86312be198ae6
+https://github.com/Comfy-Org/comfy-kitchen/blob/f8b7e97a1418d2e529bd5405fbf86312be198ae6/comfy_kitchen/float_utils.py
+
+comfy_quant._linear_block_scales adapts from_blocked; convert_comfy_nvfp4
+uses the swap_nibbles operation. Changes add checkpoint shape/dtype/finite
+validation, byte-view operations for FP8 portability, and contiguous output.
+Only these layout operations are adapted. The PyTorch AO-derived floating
+point conversion functions in that source file are not incorporated here.
+The attribution above retains the relevant notices from comfy-kitchen's
+NOTICE; unrelated bundled libraries and binaries are not incorporated.
+
+SGLang
+Source revision: 855c092deb93104f1ad2844974fd2e4da7bb90f7
+https://github.com/sgl-project/sglang/blob/855c092deb93104f1ad2844974fd2e4da7bb90f7/LICENSE
+https://github.com/sgl-project/sglang/blob/855c092deb93104f1ad2844974fd2e4da7bb90f7/python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py
+
+models/minimax_h3/adaln_curves.interpolate_adaln_curve adapts
+MiniMaxH3DiTModel._time_embedding. Changes extract table interpolation into
+a standalone function, validate the table, and preserve arbitrary timestep
+batch shapes through flattened index selection. The source file declares
+SPDX-License-Identifier: Apache-2.0 and has no separate copyright notice.
+
+Additional format references at the same SGLang revision (reviewed as
+contracts; their loaders, model classes, and kernels are not vendored):
+  python/sglang/multimodal_gen/runtime/utils/quantization_utils.py
+  python/sglang/multimodal_gen/runtime/loader/comfyui_checkpoints/flux.py
+  python/sglang/multimodal_gen/configs/models/dits/flux.py
+  python/sglang/multimodal_gen/configs/models/dits/minimax_h3.py
+  python/sglang/multimodal_gen/runtime/loader/minimax_h3_weights.py
+  python/sglang/multimodal_gen/runtime/layers/quantization/modelopt_quant.py
+  python/sglang/multimodal_gen/runtime/models/dits/flux_2.py
+The last file carries: Copyright 2025 Black Forest Labs, The HuggingFace
+Team and The InstantX Team. All rights reserved. It is Apache-2.0.
+
+This notice covers software only. It does not grant rights to checkpoint
+weights or change the licenses of external validation tools.

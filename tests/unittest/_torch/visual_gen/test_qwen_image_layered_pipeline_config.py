@@ -26,7 +26,7 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image_layered.transformer_qwen_i
     QwenEmbedLayer3DRope,
     QwenImageLayeredTransformer2DModel,
 )
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 
@@ -67,7 +67,7 @@ def test_qwen_layered_pipeline_config_defaults_to_empty_dict(tmp_path):
     checkpoint_dir = _write_minimal_qwen_layered_checkpoint(tmp_path)
 
     args = VisualGenArgs(model=str(checkpoint_dir))
-    resolved = PipelineLoader(args)._resolve_pipeline_config(str(checkpoint_dir))
+    resolved = AutoPipeline.resolve(str(checkpoint_dir), args.pipeline_config).pipeline_config
 
     assert resolved == {}
 
@@ -82,7 +82,7 @@ def test_qwen_layered_pipeline_config_rejects_unknown_keys(tmp_path):
     with pytest.raises(
         ValueError, match="Unknown pipeline_config keys for QwenImageLayeredPipeline"
     ):
-        PipelineLoader(args)._resolve_pipeline_config(str(checkpoint_dir))
+        AutoPipeline.resolve(str(checkpoint_dir), args.pipeline_config).pipeline_config
 
 
 def test_qwen_layered_config_initializes_layered_transformer(tmp_path):

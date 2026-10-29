@@ -208,6 +208,7 @@ else:
     ]
 
 package_data += [
+    '_torch/visual_gen/checkpoints/COMFY_IMPORT_NOTICE',
     'bindings/*.pyi',
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',

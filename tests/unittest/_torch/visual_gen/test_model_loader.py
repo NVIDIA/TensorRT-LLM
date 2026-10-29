@@ -240,7 +240,10 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
     config = DiffusionPipelineConfig(runtime_lora=args.runtime_lora_config)
 
     monkeypatch.setattr(PipelineLoader, "_resolve_checkpoint_dir", lambda self, path: path)
-    monkeypatch.setattr(PipelineLoader, "_resolve_pipeline_config", lambda self, path: {})
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.pipeline_loader.AutoPipeline.resolve",
+        lambda path, options: SimpleNamespace(path=path, pipeline_config={}),
+    )
     monkeypatch.setattr(
         DiffusionPipelineConfig,
         "from_pretrained",
