@@ -99,13 +99,18 @@ class RayWorkerWrapper:
         return self.store.port
 
     def setup_distributed_env_and_worker(self, port: int):
+        # Imported here so that importing the Ray executor in the driver
+        # does not load the torch.distributed communication modules.
+        from tensorrt_llm._torch.distributed.initialization import \
+            init_torch_distributed
+
         if self.rank != 0:
             self.store = self._create_tcp_store(port)
 
-        torch.distributed.init_process_group(backend="cuda:nccl,cpu:gloo",
-                                             store=self.store,
-                                             world_size=self.world_size,
-                                             rank=self.rank)
+        init_torch_distributed(backend="cuda:nccl,cpu:gloo",
+                               store=self.store,
+                               world_size=self.world_size,
+                               rank=self.rank)
         assert torch.distributed.get_world_size(
         ) == self.world_size, "Process group world size must match the expected world size"
         logger.info(

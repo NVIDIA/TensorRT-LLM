@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLTextConfig,
     Qwen3VLVisionConfig,
@@ -5,9 +8,10 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "Qwen3VLForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Qwen3VLForConditionalGeneration")
 class Qwen3VLHfWeightMapper(HfWeightMapper):
     def preprocess_weights(self, weights: dict) -> dict:
         return weights

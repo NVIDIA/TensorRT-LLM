@@ -19,6 +19,7 @@ from torch import nn
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.modules.linear import W4A16_AWQ_LinearMethod
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 _LANG_PREFIX = "model.language_model."
 _MODEL_PREFIX = "model."
@@ -29,10 +30,10 @@ _K_PROJ_KEY_RE = re.compile(
 )
 
 
-@register_mapper("HF", "Gemma4ForCausalLM")
-@register_mapper("HF", "Gemma4ForConditionalGeneration")
-@register_mapper("HF", "Gemma4UnifiedForConditionalGeneration")
-@register_mapper("HF", "Gemma4AssistantForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Gemma4ForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Gemma4ForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Gemma4UnifiedForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Gemma4AssistantForCausalLM")
 class Gemma4HfWeightMapper(HfWeightMapper):
     @property
     def _is_vlm(self) -> bool:

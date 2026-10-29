@@ -10,6 +10,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 # 2D block edge of FP8 block-scale tensors (weight_scale_inv), matching
 # FP8BlockScalesLinearMethod.
@@ -92,7 +93,7 @@ def _permute_rows(tensor: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
     return out.squeeze(1) if squeeze else out
 
 
-@register_mapper("HF", "Qwen3NextForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen3NextForCausalLM")
 class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
 
     @staticmethod

@@ -23,6 +23,7 @@ from transformers import PretrainedConfig, WhisperConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -269,8 +270,8 @@ def _remap_moe_args(config: dict) -> dict:
 ######################
 
 
-@register_config_loader("mistral")
-@register_config_loader("mistral_large_3")
+@register_config_loader(CheckpointFormat.MISTRAL)
+@register_config_loader(CheckpointFormat.MISTRAL_LARGE_3)
 class MistralConfigLoader(BaseConfigLoader):
     def _load_mistral_config_dict(self, checkpoint_dir: str, config_file_name: str) -> dict | None:
         file_path = Path(checkpoint_dir) / Path(config_file_name)

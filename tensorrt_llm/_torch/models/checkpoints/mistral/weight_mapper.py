@@ -1,9 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("mistral", "MistralForCausalLM")
-@register_mapper("mistral", "PixtralForConditionalGeneration")
+@register_mapper(CheckpointFormat.MISTRAL, "MistralForCausalLM")
+@register_mapper(CheckpointFormat.MISTRAL, "PixtralForConditionalGeneration")
 class MistralWeightMapper(HfWeightMapper):
     def __init__(self):
         super().__init__()
@@ -105,10 +109,10 @@ class MistralWeightMapper(HfWeightMapper):
         return weights
 
 
-@register_mapper("mistral_large_3")
-@register_mapper("mistral_large_3", "PixtralForConditionalGeneration")
-@register_mapper("mistral_large_3", "MistralLarge3ForCausalLM")
-@register_mapper("mistral", "MistralLarge3ForCausalLM")
+@register_mapper(CheckpointFormat.MISTRAL_LARGE_3)
+@register_mapper(CheckpointFormat.MISTRAL_LARGE_3, "PixtralForConditionalGeneration")
+@register_mapper(CheckpointFormat.MISTRAL_LARGE_3, "MistralLarge3ForCausalLM")
+@register_mapper(CheckpointFormat.MISTRAL, "MistralLarge3ForCausalLM")
 class MistralLarge3WeightMapper(MistralWeightMapper):
     def __init__(self):
         super().__init__()
