@@ -663,6 +663,27 @@ def test_prims_ts_kimi_k3_full_attention(
     Head counts cover the TP16-local and attention-DP geometries, not distributed
     collectives. The full-model GB300 test covers those separately.
     """
+    _run_prims_ts_kimi_k3_full_attention(monkeypatch, num_heads, fp8_kv, chunked)
+
+
+@pytest.mark.parametrize("query_width", [6, 8], ids=["mtp5", "mtp7"])
+def test_prims_ts_kimi_k3_fp8_mla_linear_mtp(
+    monkeypatch: pytest.MonkeyPatch, query_width: int
+) -> None:
+    """Verify uniform MTP with the real K3 module, V2 FP8/page128 cache and graph."""
+    _run_prims_ts_kimi_k3_full_attention(
+        monkeypatch, 96, True, False, generation_query_width=query_width
+    )
+
+
+def _run_prims_ts_kimi_k3_full_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    num_heads: int,
+    fp8_kv: bool,
+    chunked: bool,
+    *,
+    generation_query_width: int = 1,
+) -> None:
     import tensorrt_llm
     from tensorrt_llm._torch.attention.backends import TrtllmAttention
     from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
@@ -670,10 +691,12 @@ def test_prims_ts_kimi_k3_full_attention(
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import KimiK3MLAAttention
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
     from tensorrt_llm._utils import torch_dtype_to_binding
     from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization import QuantAlgo
@@ -725,13 +748,32 @@ def test_prims_ts_kimi_k3_full_attention(
             prefill_reference = torch.cat(references).flatten(1).to(params.output.dtype)
 
     def record_generation(fmha, params):
+        assert params.input_seq_length == generation_query_width
+        assert params.attn.predicted_tokens_per_seq == 1
+        if generation_query_width > 1:
+            assert params.tokens_per_block == 128
+            assert params.fwd.quant_q_buffer.dtype == torch.uint8
+            assert isinstance(params.meta.kv_cache_manager, KVCacheManagerV2)
         generation_calls.append(params.batch_size)
         run_generation(fmha, params)
 
     monkeypatch.setattr(PrimsTSFmha, "run_mla_context", record_context)
     monkeypatch.setattr(PrimsTSFmha, "run_mla_generation", record_generation)
     kv_dtype = torch.float8_e4m3fn if fp8_kv else torch.bfloat16
-    lengths = [[129, 65], [17, 193], [1, 1]]
+    use_mtp = generation_query_width > 1
+    # The MTP verification group crosses a page boundary in both requests.
+    lengths = (
+        [[65, 129], [62, 126], [generation_query_width] * 2]
+        if use_mtp
+        else [[129, 65], [17, 193], [1, 1]]
+    )
+    spec_config = (
+        DSparkDecodingConfig(
+            max_draft_len=generation_query_width - 1, block_size=generation_query_width - 1
+        )
+        if use_mtp
+        else None
+    )
     torch.manual_seed(2718)
     hidden_steps = [
         torch.randn(sum(q_lengths), 256, dtype=torch.bfloat16, device="cuda")
@@ -755,6 +797,7 @@ def test_prims_ts_kimi_k3_full_attention(
                 model_config=ModelConfig(
                     mapping=mapping,
                     quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8 if fp8_kv else None),
+                    spec_config=spec_config,
                 ),
                 aux_stream_dict={},
             )
@@ -773,17 +816,23 @@ def test_prims_ts_kimi_k3_full_attention(
             k_weight, v_weight = module.kv_b_proj.weight.split(num_heads * 128)
             module.k_b_proj_trans.copy_(k_weight.view(num_heads, 128, 512).transpose(1, 2))
             module.v_b_proj.copy_(v_weight.view(num_heads, 128, 512))
-        manager = KVCacheManager(
+        manager_cls = KVCacheManagerV2 if use_mtp else KVCacheManager
+        manager = manager_cls(
             KvCacheConfig(max_tokens=1024, enable_block_reuse=False),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=1,
             num_kv_heads=1,
             head_dim=576,
-            tokens_per_block=64,
+            tokens_per_block=128 if use_mtp else 64,
             max_seq_len=512,
             max_batch_size=2,
             mapping=mapping,
             dtype=torch_dtype_to_binding(kv_dtype),
+            **(
+                {"spec_config": spec_config, "layer_mask": [True], "vocab_size": 128}
+                if use_mtp
+                else {}
+            ),
         )
         # Both decode implementations require finite values in unused cache
         # slots. Reused BF16 allocations can contain FP8 NaN byte patterns;
@@ -799,7 +848,13 @@ def test_prims_ts_kimi_k3_full_attention(
                 is_streaming=False,
             )
             request.paged_kv_block_ids = []
-            manager.impl.add_sequence_batch([(request_id, length, 1)], [request])
+            if use_mtp:
+                cache = manager._create_kv_cache(request_id, None, [1] * length)
+                assert cache is not None
+                assert cache.resume(torch.cuda.current_stream().cuda_stream)
+                assert cache.resize(length + manager.num_extra_kv_tokens)
+            else:
+                manager.impl.add_sequence_batch([(request_id, length, 1)], [request])
             requests.append(request)
         cached = [0, 0]
         results[library] = []
@@ -808,8 +863,14 @@ def test_prims_ts_kimi_k3_full_attention(
                 for step, q_lengths in enumerate(lengths):
                     if step:
                         for request_id, length in enumerate(q_lengths):
-                            for _ in range(length):
-                                manager.impl.add_token(request_id)
+                            if use_mtp:
+                                cache = manager.kv_cache_map[request_id]
+                                assert cache.resize(
+                                    cached[request_id] + length + manager.num_extra_kv_tokens
+                                )
+                            else:
+                                for _ in range(length):
+                                    manager.impl.add_token(request_id)
                     metadata = TrtllmAttention.Metadata(
                         seq_lens=torch.tensor(q_lengths, dtype=torch.int32),
                         request_ids=[0, 1],
@@ -819,7 +880,9 @@ def test_prims_ts_kimi_k3_full_attention(
                         max_num_tokens=512,
                         kv_cache_manager=manager,
                         kv_cache_params=KVCacheParams(
-                            use_cache=True, num_cached_tokens_per_seq=cached
+                            use_cache=True,
+                            num_cached_tokens_per_seq=cached,
+                            num_extra_kv_tokens=manager.num_extra_kv_tokens,
                         ),
                         mapping=mapping,
                         enable_context_mla_with_cached_kv=True,
@@ -828,9 +891,19 @@ def test_prims_ts_kimi_k3_full_attention(
                             chunked_prefill=chunked,
                             chunk_size=128,
                             chunked_prefill_buffer_batch_size=1,
+                            has_speculative_draft_tokens=use_mtp,
                         ),
                     )
                     metadata.prepare()
+                    if use_mtp:
+                        metadata.update_spec_dec_param(
+                            batch_size=2,
+                            is_spec_decoding_enabled=True,
+                            is_spec_dec_tree=False,
+                            is_spec_dec_dynamic_tree=False,
+                            max_draft_len=generation_query_width - 1,
+                            max_total_draft_tokens=generation_query_width - 1,
+                        )
                     hidden = hidden_steps[step]
                     positions = torch.cat(
                         [
@@ -925,6 +998,7 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
         num_ctx_tokens=0,
         num_generations=batch_size,
         tokens_per_block=32,
+        helix_position_offsets=None,
     )
     # Pool ownership/indexing is covered by the real v1/v2 preprocessing test.
     monkeypatch.setattr(
@@ -980,7 +1054,7 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
     fmha.run_mla_generation(params)
     if max_seq_len < 128:
         # Auto policy must fall back when the 1CTA profile cannot cover this capacity.
-        wrapper = fmha._mla_decode_wrappers[batch_size]
+        wrapper = fmha._mla_decode_wrappers[(batch_size, 1)]
         assert dict(wrapper._plan_state.policy)["kernel"] == "throughput_2cta"
     check_output()
     graph = torch.cuda.CUDAGraph()
