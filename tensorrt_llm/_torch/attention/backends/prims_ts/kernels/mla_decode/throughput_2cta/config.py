@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -273,6 +274,7 @@ class MlaDecodeConfig:
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
+    use_kv_bounds: bool = False
 
     @property
     def tokens_per_k_tile(self) -> int:
@@ -346,6 +348,7 @@ def make_mla_decode_config(
     is_var_seq: bool = False,
     is_var_split_kv: bool = False,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    use_kv_bounds: bool = False,
     sparse_gather_warps: int = 1,
     sparse_kv_stages: int = 0,
     cache_uniform_sparse_pages: bool = False,
@@ -365,6 +368,7 @@ def make_mla_decode_config(
     cfg.is_var_seq = is_var_seq
     cfg.is_var_split_kv = is_var_split_kv
     cfg.mask_type = normalize_mask_type(mask_type)
+    cfg.use_kv_bounds = use_kv_bounds
 
     def _require_positive(name: str, value: int) -> None:
         """Validate that a named configuration value is positive."""

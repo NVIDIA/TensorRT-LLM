@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -466,6 +467,7 @@ def build_throughput_latency_mla_task_manager(
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
+    kv_bounds=None,
     head_idx=None,
     batch_idx=None,
     cta_idx_q=None,
@@ -520,6 +522,7 @@ def build_throughput_latency_mla_task_manager(
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
+            kv_bounds=kv_bounds,
             head_idx=head_idx,
             batch_idx=batch_idx,
             cta_idx_q=cta_idx_q,
@@ -741,6 +744,7 @@ def build_throughput_latency_mla_task_manager(
     )
     tmem_s0 = TmemSResource(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         pipeline_config=tmem_s_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
@@ -756,6 +760,7 @@ def build_throughput_latency_mla_task_manager(
     )
     tmem_s1 = TmemSResource(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         pipeline_config=tmem_s1_cfg,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
@@ -1167,6 +1172,7 @@ def _make_single_kv_pipe_task_graph(
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
+    kv_bounds=None,
     head_idx=None,
     batch_idx=None,
     cta_idx_q=None,
@@ -1368,6 +1374,7 @@ def _make_single_kv_pipe_task_graph(
     )
     tmem_s = (TmemSResource if cfg.one_insts_kv_swap else TmemSKeepsResource)(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         page_offsets=page_offsets,
         pipeline_config=tmem_s_cfg,
         inst_id=0,
@@ -1693,6 +1700,7 @@ class ThroughputLatencyMlaDecodeTs:
         explicit_split_kv: int | None = None,
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        use_kv_bounds: bool = False,
         sparse_profile=None,
         finalize_output: bool = False,
     ):
@@ -1723,6 +1731,7 @@ class ThroughputLatencyMlaDecodeTs:
         self.explicit_split_kv = explicit_split_kv
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
+        self.use_kv_bounds = use_kv_bounds
         self.sparse_profile = sparse_profile
         self.finalize_output = finalize_output
         self.output_quant = None
@@ -1866,6 +1875,7 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
         )
+        cfg = dataclass_replace(cfg, use_kv_bounds=self.use_kv_bounds)
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
                 cfg,
@@ -1952,6 +1962,7 @@ class ThroughputLatencyMlaDecodeTs:
         stream: object,
         output_quant_args=None,
         softmax_stats: cute.Tensor | None = None,
+        kv_bounds: cute.Tensor | None = None,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self._make_config()
@@ -2251,6 +2262,10 @@ class ThroughputLatencyMlaDecodeTs:
         cluster_shape = None
         if cutlass.const_expr(cfg.use_cluster_reduction == 1):
             cluster_shape = (cfg.num_ctas_per_seq_kv, 1, 1)
+        if cutlass.const_expr(self.use_kv_bounds):
+            from ..helpers.kv_bounds import initialize_empty_rows
+
+            initialize_empty_rows(o, lse, softmax_stats, kv_bounds, stream)
         self.dense_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -2272,6 +2287,7 @@ class ThroughputLatencyMlaDecodeTs:
             output_quant_args,
             softmax_stats,
             softmax_stats_scale,
+            kv_bounds,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2392,6 +2408,7 @@ class ThroughputLatencyMlaDecodeTs:
         output_quant_args=None,
         softmax_stats: cute.Tensor | None = None,
         softmax_stats_scale=None,
+        kv_bounds: cute.Tensor | None = None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
@@ -2519,6 +2536,7 @@ class ThroughputLatencyMlaDecodeTs:
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
+            kv_bounds=kv_bounds,
             head_idx=head_idx,
             batch_idx=batch_idx,
             cta_idx_q=cta_idx_q,

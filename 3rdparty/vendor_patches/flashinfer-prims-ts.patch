@@ -419,15 +419,10 @@ index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/mla_decode.py b/mla_decode.py
-index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab92e630db 100644
+index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f683ab31eed 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -27,11 +28,7 @@ from ._hardware import get_max_active_clusters
+@@ -28,11 +28,7 @@ from ._hardware import get_max_active_clusters
  
  import torch
  
@@ -440,7 +435,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
  
  from .decode import (
      _WorkspaceSection,
-@@ -1080,11 +1077,35 @@ def _make_mla_decode_compile_spec(
+@@ -1133,11 +1129,35 @@ def _make_mla_decode_compile_spec(
      )
  
  
@@ -481,8 +476,8 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
  
      import cutlass
      import cutlass.cute as cute
-@@ -1697,7 +1718,7 @@ class BatchMLADecodePagedTSWrapper:
-             store_softmax_stats=store_softmax_stats,
+@@ -1776,7 +1796,7 @@ class BatchMLADecodePagedTSWrapper:
+             use_kv_bounds=use_kv_bounds,
          )
  
 -    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -490,7 +485,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
      def run(
          self,
          query: torch.Tensor,
-@@ -1814,7 +1835,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1905,7 +1925,7 @@ class BatchMLADecodePagedTSWrapper:
          )
  
  
@@ -499,7 +494,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2181,6 +2202,7 @@ def _prepare_sparse_output_quant(
+@@ -2284,6 +2304,7 @@ def _prepare_sparse_output_quant(
      )
  
  
@@ -507,7 +502,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
  def _resolve_sparse_mla_plan(
      device,
      batch_size,
-@@ -2201,17 +2223,17 @@ def _resolve_sparse_mla_plan(
+@@ -2304,17 +2325,17 @@ def _resolve_sparse_mla_plan(
  ):
      """Resolve sparse geometry and scratch sizing without allocation/compilation."""
      import cutlass
@@ -529,7 +524,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
          MlaDecodeTs,
      )
  
-@@ -2346,6 +2368,9 @@ def _resolve_sparse_mla_plan(
+@@ -2449,6 +2470,9 @@ def _resolve_sparse_mla_plan(
      return device, profile, spec, sections, byte_end, capacity, output_quant
  
  
@@ -539,7 +534,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
  class BatchSparseMLADecodePagedTSWrapper:
      """Plan native BF16/E4M3 attention, then bind one or two source index lists.
  
-@@ -2379,6 +2404,11 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2482,6 +2506,11 @@ class BatchSparseMLADecodePagedTSWrapper:
          self._workspace_buffer = workspace_buffer
          self._state = None
          self._scalar_cache = {}
@@ -551,7 +546,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
          self.workspace_size_bytes = 0
  
      def plan(
-@@ -2468,6 +2498,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2571,6 +2600,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                  kernel_signature=_mla_kernel_compile_signature(static_kernel),
              )
          )
@@ -559,7 +554,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
          self._state = dict(
              device=device,
              batch=batch_size,
-@@ -2690,6 +2721,38 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2793,6 +2823,38 @@ class BatchSparseMLADecodePagedTSWrapper:
          state = self._state
          if state is None:
              raise RuntimeError("plan() must be called before run()")
@@ -598,7 +593,7 @@ index 6ca10c5f7195531890abd3f0bf643f6ceab36e5e..594d160b83aaa1b7bde74aa691e5e4ab
          _validate_query(
              query,
              packed_query=state["packed"],
-@@ -2863,10 +2926,125 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2966,10 +3028,125 @@ class BatchSparseMLADecodePagedTSWrapper:
                  if static_scales
                  else state["compiled"],
              )

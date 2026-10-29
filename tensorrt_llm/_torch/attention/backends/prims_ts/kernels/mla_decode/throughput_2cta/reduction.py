@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -140,7 +141,9 @@ def run_reduction_kernel(
     tile_k = cache_seqs[batch_idx]
     row_k = tile_k
     if cutlass.const_expr(
-        cfg.mask_type == MaskType.CAUSAL.value and kernel.seq_len_q > 1
+        not cfg.use_kv_bounds
+        and cfg.mask_type == MaskType.CAUSAL.value
+        and kernel.seq_len_q > 1
     ):
         _, logical_seq_len_q = query_batch_bounds(
             cu_seqlens_q,

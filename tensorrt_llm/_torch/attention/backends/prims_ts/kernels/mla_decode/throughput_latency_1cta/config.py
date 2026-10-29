@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -98,6 +99,7 @@ class MlaConfig:
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
+    use_kv_bounds: bool = False
     head_dim_qk: int = 576
     head_dim_v: int = 512
     latent_dim: int = 512

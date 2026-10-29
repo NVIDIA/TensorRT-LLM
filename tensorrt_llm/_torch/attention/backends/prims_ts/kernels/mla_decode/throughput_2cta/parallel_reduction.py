@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -95,7 +96,11 @@ def _parallel_reduction_row_state(
     )
     tile_k = cache_seqs[batch_idx]
     row_k = tile_k
-    if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value and seq_len_q > 1):
+    if cutlass.const_expr(
+        not cfg.use_kv_bounds
+        and cfg.mask_type == MaskType.CAUSAL.value
+        and seq_len_q > 1
+    ):
         _, logical_seq_len_q = query_batch_bounds(
             cu_seqlens_q,
             batch_idx,
