@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+from tensorrt_llm._torch.models.checkpoints import model_hooks
 from tensorrt_llm._torch.weight_sharing import (
     PostTransformQualificationDecision,
     PostTransformQualificationReason,
@@ -228,15 +228,15 @@ def assert_post_transform_lifecycle_equivalent(
     )
 
     transform_calls = _install_transform_call_recorders(receiver)
-    ModelLoader._walk_full_post_load(producer)
-    ModelLoader._setup_aliases(receiver)
+    model_hooks.walk_full_post_load(producer)
+    model_hooks.setup_aliases(receiver)
     case.prepare_receiver(producer, receiver)
 
     # Runtime finalization repeats setup_aliases(), whose contract is
     # idempotent, after the checkpoint loader's pre-transfer preparation.
-    ModelLoader._setup_aliases(receiver)
-    ModelLoader._mark_weights_transformed(receiver)
-    ModelLoader._walk_cache_state(receiver)
+    model_hooks.setup_aliases(receiver)
+    model_hooks.mark_weights_transformed(receiver)
+    model_hooks.walk_cache_state(receiver)
 
     assert transform_calls == [], f"Staged receiver invoked transform_weights(): {transform_calls}"
     assert _transform_guard_state(receiver) == _transform_guard_state(producer)

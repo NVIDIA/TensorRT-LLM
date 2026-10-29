@@ -13,12 +13,14 @@ from torch import nn
 pytest.importorskip("fla")
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_kimi_k3_loader import (  # noqa: E402
+    _helix_cp_v_b_shard,
+    _shard_head_major_param,
+)
 from tensorrt_llm._torch.models.modeling_kimi_linear import (  # noqa: E402
     KimiLinearForCausalLM,
     KimiMLARuntime,
     _Fp8BlockScaleWeightReadLinear,
-    _helix_cp_v_b_shard,
-    _shard_head_major_param,
     resolve_attention_quant_config,
 )
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention

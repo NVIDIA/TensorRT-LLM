@@ -22,8 +22,6 @@ weight transform. The backend owns SymmBuffer allocation and reuse.
 
 from __future__ import annotations
 
-import os
-import socket
 from types import ModuleType
 from typing import Dict, List, Optional, Tuple
 
@@ -620,93 +618,9 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         on busy hosts. ``device_id`` uses intra-node local rank because
         ``global_rank % device_count`` is wrong on multi-node launches.
         """
-        try:
-            from mpi4py import MPI
-        except ImportError:
-            return
-        comm = MPI.COMM_WORLD
-        rank = comm.Get_rank()
-        world_size = comm.Get_size()
-        if world_size <= 1:
-            return
+        from tensorrt_llm._torch.distributed.initialization import ensure_deepgemm_torch_distributed
 
-        try:
-            local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
-            local_rank = local_comm.Get_rank()
-        except Exception:
-            local_rank = int(
-                os.environ.get(
-                    "OMPI_COMM_WORLD_LOCAL_RANK",
-                    os.environ.get(
-                        "MV2_COMM_WORLD_LOCAL_RANK", rank % max(1, torch.cuda.device_count())
-                    ),
-                )
-            )
-
-        def _pick_rendezvous():
-            if rank == 0:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.bind(("", 0))
-                    port = sock.getsockname()[1]
-                host = socket.gethostbyname(socket.gethostname())
-                return (host, port)
-            return None
-
-        # Respect launcher env vars only when they describe this MPI world.
-        # A disaggregated launcher may export its outer context/generation
-        # world into each server's independent model MPI world.
-        launcher_env_matches_mpi = False
-        launcher_port = None
-        if all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
-            try:
-                # Parse the port here too: accepting the launcher env on
-                # RANK/WORLD_SIZE alone and only converting MASTER_PORT later
-                # turns a non-numeric port into an uncaught ValueError instead
-                # of falling back to the MPI rendezvous.
-                launcher_port = int(os.environ["MASTER_PORT"])
-                launcher_env_matches_mpi = (
-                    int(os.environ["RANK"]) == rank and int(os.environ["WORLD_SIZE"]) == world_size
-                )
-            except ValueError:
-                launcher_env_matches_mpi = False
-
-        if not launcher_env_matches_mpi:
-            host, port = comm.bcast(_pick_rendezvous(), root=0)
-            os.environ["MASTER_ADDR"] = host
-            os.environ["MASTER_PORT"] = str(port)
-            os.environ["RANK"] = str(rank)
-            os.environ["WORLD_SIZE"] = str(world_size)
-        else:
-            host = os.environ["MASTER_ADDR"]
-            port = launcher_port
-
-        device_id = None
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            device_id = torch.device("cuda", local_rank % torch.cuda.device_count())
-        try:
-            dist.init_process_group(
-                backend="nccl",
-                rank=rank,
-                world_size=world_size,
-                device_id=device_id,
-            )
-        except RuntimeError:
-            # close()→bind() race: redraw a port and retry once.
-            new_host, new_port = comm.bcast(_pick_rendezvous(), root=0)
-            os.environ["MASTER_ADDR"] = new_host
-            os.environ["MASTER_PORT"] = str(new_port)
-            host, port = new_host, new_port
-            dist.init_process_group(
-                backend="nccl",
-                rank=rank,
-                world_size=world_size,
-                device_id=device_id,
-            )
-        logger.info(
-            f"[MegaMoE] Initialized torch.distributed from mpi4py "
-            f"(rank={rank}, local_rank={local_rank}, "
-            f"world_size={world_size}, master={host}:{port}, backend=nccl)"
-        )
+        ensure_deepgemm_torch_distributed()
 
     # ------------------------------------------------------------------
     # EP process-group resolution (no collective at forward time)
