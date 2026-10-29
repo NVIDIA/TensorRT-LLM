@@ -17,7 +17,6 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunnerConfig,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm.bindings import SamplingConfig
@@ -224,13 +223,11 @@ def _decoder_runner(
         max_num_tokens=2,
         use_mrope=False,
         spec_config=None,
-        cuda_graph_mem_pool=None,
         enable_attention_dp=False,
         original_max_total_draft_tokens=0,
         is_encoder_decoder=False,
         mapping=Mapping(),
         dist=None,
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
         sparse_attention_config=sparse_attention_config,
         short_long_seq_len_threshold=short_long_seq_len_threshold,
         private_metadata_buffers=private_metadata_buffers,
