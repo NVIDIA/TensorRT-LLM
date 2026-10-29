@@ -51,6 +51,7 @@ class Group(Enum):
     WORKSPACE = "Runtime buffers"
     TORCH_UNATTRIBUTED = "PyTorch, unattributed"
     TORCH_CACHE = "PyTorch cache (free)"
+    CUDA_GRAPHS = "CUDA graphs"
     COMMUNICATION = "Communication buffers"
     OVERHEAD = "CUDA and library overhead"
     OTHER = "Other tagged memory"
@@ -62,6 +63,7 @@ _NOTES = {
     Group.WORKSPACE: "buffers owned by named runtime components",
     Group.TORCH_UNATTRIBUTED: "in use by PyTorch, owner not identified; typically activations",
     Group.TORCH_CACHE: "held by the PyTorch allocator but not in use; reusable",
+    Group.CUDA_GRAPHS: "held by captured CUDA graphs for replay; not reusable",
     Group.COMMUNICATION: "multi-GPU communication buffers",
     Group.OVERHEAD: "CUDA context, cuBLAS, NCCL internals and other driver memory",
     Group.OTHER: "tagged with a name the report does not group",
@@ -83,6 +85,9 @@ GROUP_OF: dict[Category, Group | None] = {
     Category.SPECULATIVE: Group.WORKSPACE,
     Category.BUFFER_POOL: Group.WORKSPACE,
     Category.ACTIVATION: Group.WORKSPACE,
+    Category.MODEL_RUNTIME: Group.WORKSPACE,
+    Category.EXECUTOR_RUNTIME: Group.WORKSPACE,
+    Category.GUIDED_DECODER: Group.WORKSPACE,
     Category.UNATTRIBUTED_LIVE: Group.TORCH_UNATTRIBUTED,
     Category.COMM_MNNVL: Group.COMMUNICATION,
     Category.COMM_SYMM_MEM: Group.COMMUNICATION,
@@ -92,6 +97,7 @@ GROUP_OF: dict[Category, Group | None] = {
     Category.COMM_ULYSSES: Group.COMMUNICATION,
     Category.NONTORCH_RESIDUAL: Group.OVERHEAD,
     Category.TAGGED_OTHER: Group.OTHER,
+    Category.CUDA_GRAPHS: Group.CUDA_GRAPHS,
     Category.CPP_BUFFERS: None,
 }
 
@@ -107,6 +113,8 @@ class GroupTotals:
     unmeasured: tuple[str, ...]
     process_total: int
     process_total_is_upper_bound: bool
+    #: What each group is made of, by owner, largest first.
+    members: dict[Group, list[tuple[str, int]]] = None
 
 
 def group_totals(frame: Frame) -> GroupTotals:
@@ -114,6 +122,7 @@ def group_totals(frame: Frame) -> GroupTotals:
 
     sizes: dict[Group, int | None] = {}
     unmeasured: list[str] = []
+    members: dict[Group, dict[str, int]] = {}
 
     for entry in list(frame.entries) + derived_entries(frame):
         if not entry.counts_toward_total:
@@ -125,14 +134,33 @@ def group_totals(frame: Frame) -> GroupTotals:
             unmeasured.append(entry.owner or str(entry.category))
             continue
         sizes[group] = (sizes.get(group) or 0) + entry.size_bytes
+        name = entry.owner or str(entry.category)
+        by_owner = members.setdefault(group, {})
+        by_owner[name] = by_owner.get(name, 0) + entry.size_bytes
 
-    sizes[Group.TORCH_CACHE] = frame.torch.reserved_unallocated
+    pools = frame.torch.pools
+    if pools is None:
+        sizes[Group.TORCH_CACHE] = frame.torch.reserved_unallocated
+    else:
+        # Only the default pool's free space can serve the next allocation.
+        # A graph pool's is held for replay; a MemPool's serves its owner.
+        sizes[Group.TORCH_CACHE] = sum(p.free for p in pools if p.kind == "default")
+        for pool in pools:
+            kind, label, free = pool.kind, pool.label, pool.free
+            if kind == "default" or not free:
+                continue
+            group = Group.CUDA_GRAPHS if kind == "graph" else Group.OTHER
+            name = "free in graph pools" if kind == "graph" else f"{label} pool, free"
+            sizes[group] = (sizes.get(group) or 0) + free
+            by_owner = members.setdefault(group, {})
+            by_owner[name] = by_owner.get(name, 0) + free
 
     return GroupTotals(
         sizes=sizes,
         unmeasured=tuple(unmeasured),
         process_total=frame.device.effective_process_used,
         process_total_is_upper_bound=frame.device.process_used_is_upper_bound,
+        members={g: sorted(owners.items(), key=lambda kv: -kv[1]) for g, owners in members.items()},
     )
 
 
@@ -211,6 +239,11 @@ def render_summary(
         if group is Group.OVERHEAD and frame.residual_is_negative:
             note = "NEGATIVE: readings disagree; see details"
         out.append(f"{line}   {note}")
+        parts = [(n, b) for n, b in (totals.members or {}).get(group, []) if b >= _SHOWN]
+        if len(parts) > 1:
+            listed = ", ".join(f"{n} {b / _GIB:.2f}" for n, b in parts[:4])
+            more = f", +{len(parts) - 4} more" if len(parts) > 4 else ""
+            out.append(f"  {'':<28s}  of which (GiB): {listed}{more}")
 
     out.append("")
     plan = startup.render_plan_lines(
