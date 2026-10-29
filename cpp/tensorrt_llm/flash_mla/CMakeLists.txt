@@ -197,8 +197,7 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
   )
 endif()
 
-# Disable LTO before creating target (similar to DeepEP) Let CMake generate
-# fatbinData for CUDA separable compilation
+# Disable LTO before creating target (similar to DeepEP)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 
 pybind11_add_module(flash_mla_cpp_tllm ${FLASH_MLA_SOURCES})
@@ -210,8 +209,10 @@ set_target_properties(
              CXX_SCAN_FOR_MODULES OFF
              CUDA_STANDARD 20
              CUDA_STANDARD_REQUIRED ON
-             CUDA_SEPARABLE_COMPILATION ON
-             CUDA_RESOLVE_DEVICE_SYMBOLS ON
+             # Whole-program compilation, as FlashMLA's own build does:
+             # relocatable device code makes ptxas spill registers in the
+             # attention kernels.
+             CUDA_SEPARABLE_COMPILATION OFF
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/flash_mla_cpp_tllm.version
              INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
