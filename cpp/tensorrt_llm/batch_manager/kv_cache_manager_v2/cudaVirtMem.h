@@ -108,6 +108,7 @@ private:
     void selectDefaultProp();
     void selectLocalizedProp(int numLocalityDomains);
     PhysMemWrapper* createChunk(LocalityDomainId localityDomainId);
+    friend class KvCacheIntrospection;
 
     size_t mPhysMemSize{};
     int mDeviceId{};

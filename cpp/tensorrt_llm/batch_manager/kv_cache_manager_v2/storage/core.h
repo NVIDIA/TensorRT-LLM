@@ -453,6 +453,8 @@ public:
     void waitSlotUsable(SlotId slot) const override;
 
 private:
+    friend class KvCacheIntrospection;
+
     //! Declared before mHostMem: alignedSize() reads it while building mHostMem.
     size_t mCommitUnit;
     HostMem mHostMem;
@@ -624,6 +626,9 @@ public:
         return upperBound;
     }
 
+    //! Wait for all backing before publishing a completed memory restoration.
+    void waitUsable() const;
+
     // Addresses for all pools at a given slot id.
     TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
     // Sizes per pool.
@@ -698,6 +703,8 @@ public:
     }
 
 protected:
+    friend class KvCacheIntrospection;
+
     // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
     [[nodiscard]] virtual SlotCount getNumSlotsFromPools(
         LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept;

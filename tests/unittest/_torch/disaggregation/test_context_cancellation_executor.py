@@ -644,7 +644,6 @@ def test_draining_control_waits_for_retained_transfer(
     executor.hang_detector = SimpleNamespace(pause=nullcontext)
     executor.dwdp_manager = None
     executor._retire_inflight_batch_for_control = Mock()
-    executor._pop_sleep_wakeup_abort = Mock(return_value=None)
     synchronize = Mock()
     monkeypatch.setattr("torch.cuda.synchronize", synchronize)
     # Even an already-expired legacy timer cannot release protected ownership.
@@ -769,7 +768,6 @@ def test_control_drain_delivers_accumulated_and_live_aborts_on_every_rank(
         engine.control_request_barrier = Mock()
         engine.control_action_done = Mock()
         engine._retire_inflight_batch_for_control = Mock()
-        engine._pop_sleep_wakeup_abort = Mock(return_value=None)
         engine.dwdp_manager = None
     # Exercise the group control gate with asymmetric local readiness. This is
     # not a substitute for the native retirement agreement tests.
@@ -814,7 +812,6 @@ def test_adp_drain_delivers_parking_abort_to_the_owning_rank(
         engine.control_request_barrier = Mock()
         engine.control_action_done = Mock()
         engine._retire_inflight_batch_for_control = Mock()
-        engine._pop_sleep_wakeup_abort = Mock(return_value=None)
         engine.dwdp_manager = None
     monkeypatch.setattr("torch.cuda.synchronize", Mock())
 

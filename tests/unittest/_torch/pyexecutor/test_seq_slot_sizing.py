@@ -354,11 +354,9 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(
     selected = creator._validate_or_fallback_kv_cache_manager_v2(
         KVCacheManagerV2, model_config, kv_cache_config
     )
-    resolved = resolved_kv_cache_manager_is_v2(
-        kv_cache_config, max_beam_width, enable_sleep=enable_sleep
-    )
+    resolved = resolved_kv_cache_manager_is_v2(kv_cache_config, max_beam_width)
 
-    assert selected is (KVCacheManager if enable_sleep else KVCacheManagerV2)
+    assert selected is KVCacheManagerV2
     assert resolved is issubclass(selected, KVCacheManagerV2)
     assert selected is (KVCacheManagerV2 if resolved else KVCacheManager)
 
@@ -369,14 +367,14 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(
     [(1, False), (4, False), (1, True)],
 )
 def test_skip_softmax_selects_the_dense_manager_resolved_v2_predicts(
-    use_v2, max_beam_width, enable_sleep
-):
+    use_v2: bool, max_beam_width: int, enable_sleep: bool
+) -> None:
     """Skip Softmax keeps the dense KV cache, so it follows the dense V2 rules.
 
     ``resolved_kv_cache_manager_is_v2`` sizes the seat pool from the dense
     rules alone, so the manager the creator selects for a Skip Softmax model
     must be the one those rules predict: V2 when requested, including beam
-    search, and the plain V1 fallback only for a V2-incompatible feature.
+    search and sleep, or V1 when explicitly selected.
     """
     kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_v2)
     model_config = SimpleNamespace(
@@ -395,17 +393,18 @@ def test_skip_softmax_selects_the_dense_manager_resolved_v2_predicts(
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
 
     selected = creator._get_model_kv_cache_manager_cls()
-    resolved = resolved_kv_cache_manager_is_v2(
-        kv_cache_config, max_beam_width, enable_sleep=enable_sleep
-    )
+    resolved = resolved_kv_cache_manager_is_v2(kv_cache_config, max_beam_width)
 
-    assert selected is (KVCacheManagerV2 if use_v2 and not enable_sleep else KVCacheManager)
+    assert selected is (KVCacheManagerV2 if use_v2 else KVCacheManager)
     assert resolved is issubclass(selected, KVCacheManagerV2)
 
 
-@pytest.mark.parametrize("max_beam_width,enable_sleep", [(4, False), (1, True)])
-def test_sparse_kv_cache_manager_v2_does_not_fall_back(max_beam_width, enable_sleep):
-    """A sparse algorithm with its own cache manager still refuses the V1 fallback."""
+@pytest.mark.parametrize("max_beam_width", [1, 4])
+@pytest.mark.parametrize("enable_sleep", [False, True])
+def test_sparse_kv_cache_manager_v2_does_not_fall_back(
+    max_beam_width: int, enable_sleep: bool
+) -> None:
+    """Sparse V2 selection accepts sleep but still rejects unsupported beam search."""
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
         sparse_attention_config=SimpleNamespace(algorithm="dsa"),
@@ -414,10 +413,16 @@ def test_sparse_kv_cache_manager_v2_does_not_fall_back(max_beam_width, enable_sl
     creator._max_beam_width = max_beam_width
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
 
-    with pytest.raises(NotImplementedError, match="sparse-attention models.*'dsa'"):
-        creator._validate_or_fallback_kv_cache_manager_v2(
+    if max_beam_width > 1:
+        with pytest.raises(NotImplementedError, match="sparse-attention models.*'dsa'"):
+            creator._validate_or_fallback_kv_cache_manager_v2(
+                KVCacheManagerV2, model_config, KvCacheConfig()
+            )
+    else:
+        selected = creator._validate_or_fallback_kv_cache_manager_v2(
             KVCacheManagerV2, model_config, KvCacheConfig()
         )
+        assert selected is KVCacheManagerV2
 
 
 @pytest.mark.parametrize("max_beam_width", [1, 2, 4])
@@ -468,7 +473,7 @@ def test_resolved_v2_respects_an_explicit_v1_request():
     "block_reuse_config",
     [{"policy": "per_conversation"}, {"swa_endpoint_rewind_tokens": 32}],
 )
-def test_sleep_rejects_v2_only_block_reuse_config(block_reuse_config):
+def test_sleep_preserves_v2_only_block_reuse_config(block_reuse_config):
     creator = object.__new__(KvCacheCreator)
     creator._max_beam_width = 1
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig())
@@ -478,21 +483,17 @@ def test_sleep_rejects_v2_only_block_reuse_config(block_reuse_config):
     )
     kv_cache_config = KvCacheConfig(block_reuse_config=block_reuse_config)
 
-    with pytest.raises(NotImplementedError, match="requires KVCacheManagerV2.*SleepConfig"):
+    assert (
         creator._validate_or_fallback_kv_cache_manager_v2(
             KVCacheManagerV2, model_config, kv_cache_config
         )
+        is KVCacheManagerV2
+    )
 
 
-@pytest.mark.parametrize(
-    "algorithm,has_v1_manager",
-    [
-        ("rocket", True),
-        # MiniMax-M3 only has a V2 manager.
-        ("minimax_m3", False),
-    ],
-)
-def test_sparse_sleep_error_names_the_v1_manager(algorithm: str, has_v1_manager: bool) -> None:
+@pytest.mark.parametrize("algorithm", ["rocket", "minimax_m3"])
+def test_sleep_keeps_selected_sparse_v2_manager(algorithm: str) -> None:
+    """Sleep must not replace a sparse V2 manager, even if the algorithm also has V1."""
     creator = object.__new__(KvCacheCreator)
     creator._max_beam_width = 1
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig())
@@ -501,12 +502,14 @@ def test_sparse_sleep_error_names_the_v1_manager(algorithm: str, has_v1_manager:
         sparse_attention_config=SimpleNamespace(algorithm=algorithm),
     )
 
-    with pytest.raises(NotImplementedError, match="SleepConfig") as exc_info:
-        creator._validate_or_fallback_kv_cache_manager_v2(
-            KVCacheManagerV2, model_config, KvCacheConfig()
-        )
-
-    assert ("use_kv_cache_manager_v2=False" in str(exc_info.value)) is has_v1_manager
+    manager = util_module.get_sparse_attn_kv_cache_manager(
+        model_config.sparse_attention_config, use_kv_cache_manager_v2=True
+    )
+    assert issubclass(manager, KVCacheManagerV2)
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(manager, model_config, KvCacheConfig())
+        is manager
+    )
 
 
 @pytest.mark.parametrize("max_beam_width", [None, 1, 2, 4])

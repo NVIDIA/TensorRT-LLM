@@ -149,6 +149,17 @@ class Mamba2ReplayRegion:
     def request_indices(self, request_ids: Sequence[int]) -> list[int]:
         return [self._request_indices[rid] for rid in request_ids]
 
+    def restore_indices(self, caches: Mapping[int, _KVCache]) -> None:
+        """Refresh active slots after backing restoration without replacing graph buffers."""
+        if self.group_id is not None:
+            for request_id in self._request_indices:
+                cache = caches.get(request_id)
+                if cache is not None and cache.is_active:
+                    self._request_indices[request_id] = int(
+                        cache.get_ssm_block_base_index(self.group_id)
+                    )
+        self._last_index_key = None
+
     def prepare(
         self,
         requests: Sequence[LlmRequest],

@@ -20,7 +20,7 @@ via object.__new__ + manual attribute injection.
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -63,47 +63,117 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         abort_wakeup_transition=MagicMock(),
         fail_sleep_wakeup_transition=MagicMock(),
         validate_sleep_tags=MagicMock(),
+        validate_sleep_config=MagicMock(),
         invalidate_v1_prefix_cache_for_sleep=MagicMock(),
     )
     return w
 
 
-class TestV2KvCacheSleepRejection:
-    @pytest.mark.parametrize(
-        "use_v2,tags,should_raise",
-        [
-            (True, ["kv_cache"], True),
-            (True, ["model", "kv_cache"], True),
-            (True, ["model"], False),
-            (False, ["kv_cache"], False),
-        ],
-    )
-    def test_validation_conditions(self, use_v2, tags, should_raise):
+class TestRegisteredV2KvCacheSleepRejection:
+    @pytest.mark.parametrize("external_kv", ["transceiver", "connector"])
+    def test_rejection_keeps_v2_and_allows_weights_only(self, external_kv: str) -> None:
+        from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, KvCacheConfig, SleepConfig
+
+        creator = object.__new__(KvCacheCreator)
+        creator._max_beam_width = 1
+        creator._llm_args = SimpleNamespace(sleep_config=SleepConfig())
+        model_config = SimpleNamespace(
+            pretrained_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"], num_hidden_layers=2
+            ),
+            sparse_attention_config=None,
+        )
+        selected = creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig(use_kv_cache_manager_v2=True)
+        )
+        assert selected is KVCacheManagerV2
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = issubclass(selected, KVCacheManagerV2)
+        manager = executor.kv_cache_manager = MagicMock(spec=selected)
+        executor.resource_manager = SimpleNamespace(resource_managers={"main": manager})
+        executor.kv_cache_transceiver = object() if external_kv == "transceiver" else None
+        executor.kv_connector_manager = (
+            SimpleNamespace(capacity_only=False) if external_kv == "connector" else None
+        )
+        executor.executor_request_queue = MagicMock()
+
+        with pytest.raises(NotImplementedError, match="memory re-registration"):
+            executor.begin_sleep_transition([ExecutorMemoryType.KV_CACHE])
+
+        assert executor._is_kv_manager_v2
+        assert executor.kv_cache_manager is manager
+        manager.release_memory.assert_not_called()
+        executor.executor_request_queue.begin_sleep_transition.assert_not_called()
+        executor.begin_sleep_transition([ExecutorMemoryType.MODEL_WEIGHTS_MAIN])
+        executor.executor_request_queue.begin_sleep_transition.assert_called_once()
+
+    @pytest.mark.parametrize("use_v2", [False, True])
+    @pytest.mark.parametrize("has_transceiver", [False, True])
+    @pytest.mark.parametrize("connector_capacity_only", [None, False, True])
+    @pytest.mark.parametrize("tags", [["kv_cache"], ["model", "kv_cache"], ["model"]])
+    def test_validation_conditions(self, use_v2, has_transceiver, connector_capacity_only, tags):
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         executor = object.__new__(PyExecutor)
         executor._is_kv_manager_v2 = use_v2
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+        executor.resource_manager = SimpleNamespace(
+            resource_managers={"main": MagicMock(spec=KVCacheManagerV2)} if use_v2 else {}
+        )
+        executor.kv_cache_transceiver = MagicMock() if has_transceiver else None
+        executor.kv_connector_manager = (
+            None
+            if connector_capacity_only is None
+            else SimpleNamespace(capacity_only=connector_capacity_only)
+        )
         parsed_tags = [ExecutorMemoryType(tag) for tag in tags]
+        should_raise = (
+            use_v2 and "kv_cache" in tags and (has_transceiver or connector_capacity_only is False)
+        )
 
         if should_raise:
             with pytest.raises(
-                ValueError,
-                match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+                NotImplementedError,
+                match="memory re-registration",
             ):
                 executor.validate_sleep_tags(parsed_tags)
         else:
             executor.validate_sleep_tags(parsed_tags)
 
+    def test_connector_rejected_before_admission_changes(self):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = True
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+        executor.resource_manager = SimpleNamespace(
+            resource_managers={"main": MagicMock(spec=KVCacheManagerV2)}
+        )
+        executor.kv_cache_transceiver = None
+        executor.kv_connector_manager = SimpleNamespace(capacity_only=False)
+        executor.executor_request_queue = MagicMock()
+
+        with pytest.raises(NotImplementedError, match="connector"):
+            executor.begin_sleep_transition([ExecutorMemoryType.KV_CACHE])
+
+        executor.executor_request_queue.begin_sleep_transition.assert_not_called()
+
     def test_rejected_before_transition_or_mpi_dispatch(self):
         worker = _make_worker(world_size=2)
-        worker.engine.validate_sleep_tags.side_effect = ValueError(
-            "KV_CACHE sleep is not supported with KVCacheManagerV2"
+        worker.engine.validate_sleep_tags.side_effect = NotImplementedError(
+            "remote memory re-registration"
         )
 
         with pytest.raises(
-            ValueError,
-            match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+            NotImplementedError,
+            match="remote memory re-registration",
         ):
             worker.sleep(["kv_cache"])
 
@@ -299,7 +369,7 @@ class TestBaseWorkerRetrySemantics:
 
         expected = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
         w.engine.begin_wakeup_transition.assert_called_once_with(expected)
-        materialize.assert_called_once_with(*expected)
+        materialize.assert_called_once_with(*expected, resource=w.engine)
         w.engine.complete_wakeup_transition.assert_called_once_with()
 
     def test_transitional_state_rejects_operations(self):
@@ -564,6 +634,175 @@ class TestMultiRankAckErrorPropagation:
     Covers both single-peer and multi-peer error aggregation.
     """
 
+    @pytest.mark.parametrize("peer_ready", [True, False])
+    def test_mnnvl_waits_for_materialization(self, monkeypatch, peer_ready):
+        from tensorrt_llm._torch.pyexecutor import py_executor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        action = py_executor._SleepWakeupAction
+        reply = {"status": "ok"} if peer_ready else {"status": "error", "error": "out of memory"}
+        worker, _ = _make_proto_worker(
+            [{"status": "ok", "has_mnnvl_resources": True}, reply], world_size=2
+        )
+        comm = worker.engine._sleep_wakeup_comm
+        phases = []
+        send = comm.send
+        polls = 0
+
+        def observe(payload, **kwargs):
+            phases.append(payload["action"])
+            if payload["action"] == action.COMMIT:
+                assert polls == 3 and payload["materialized"]
+            send(payload, **kwargs)
+
+        def ready(source, tag):
+            nonlocal polls
+            if comm.phase_by_source[source] == action.MATERIALIZE:
+                polls += 1
+                return polls >= 3
+            return True
+
+        comm.send, comm.iprobe = observe, ready
+        worker.engine._run_mnnvl_checkpoint_resources = Mock()
+        worker._fail_stop_divergent_sleep_wakeup = Mock()
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_TIMEOUT_S", 0.0)
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S", 0.0)
+        tags = [ExecutorMemoryType.KV_CACHE, ExecutorMemoryType.MODEL_ENGINE_MAIN]
+        with (
+            patch("torch.cuda.synchronize"),
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag") as materialize,
+        ):
+            if peer_ready:
+                worker._multi_rank_sleep_wakeup("wakeup", tags)
+                assert phases == [action.PREPARE, action.MATERIALIZE, action.COMMIT]
+                worker.engine._run_mnnvl_checkpoint_resources.assert_called_once_with(
+                    action.WAKEUP, tags
+                )
+            else:
+                with pytest.raises(RuntimeError, match="out of memory"):
+                    worker._multi_rank_sleep_wakeup("wakeup", tags)
+                assert phases == [action.PREPARE, action.MATERIALIZE]
+                worker.engine._run_mnnvl_checkpoint_resources.assert_not_called()
+                worker._fail_stop_divergent_sleep_wakeup.assert_called_once()
+            materialize.assert_called_once_with(*tags, resource=worker.engine)
+
+    def test_wakeup_commit_waits_without_fixed_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Wait for slow reconstruction without relaxing the PREPARE deadline.
+
+        Args:
+            monkeypatch: Fixture used to make bounded ACK waits expire immediately.
+        """
+        from tensorrt_llm._torch.pyexecutor import py_executor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, received = _make_proto_worker([], world_size=2)
+        comm = worker.engine._sleep_wakeup_comm
+        polls = 0
+
+        def probe(source: int, tag: object) -> bool:
+            """Delay only the COMMIT acknowledgement past the bounded timeout."""
+            nonlocal polls
+            if comm.phase_by_source[source] == py_executor._SleepWakeupAction.COMMIT:
+                polls += 1
+                return polls > 2
+            return True
+
+        comm.iprobe = probe
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_TIMEOUT_S", 0.0)
+        monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S", 0.0)
+        with (
+            patch("torch.cuda.synchronize"),
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag") as materialize,
+        ):
+            worker._multi_rank_sleep_wakeup("wakeup", [ExecutorMemoryType.KV_CACHE])
+        assert polls == 3
+        assert received == [1, 1]
+        materialize.assert_called_once()
+
+    @pytest.mark.parametrize("transport_error", [False, True])
+    def test_wakeup_failure_not_hidden_by_silent_rank(self, transport_error):
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, received = _make_proto_worker(
+            [{"status": "ok"} for _ in range(3)] + [{"status": "error", "error": "peer failed"}],
+            world_size=4,
+        )
+        comm = worker.engine._sleep_wakeup_comm
+        worker._fail_stop_divergent_sleep_wakeup = Mock()
+        silent_polls = 0
+
+        def probe(source, tag):
+            nonlocal silent_polls
+            if comm.phase_by_source[source] == _SleepWakeupAction.COMMIT:
+                if source == 1:
+                    silent_polls += 1
+                    assert silent_polls == 1, "blocked on the silent rank"
+                    return False
+                if source == 2 and transport_error:
+                    raise RuntimeError("peer failed")
+            return True
+
+        comm.iprobe = probe
+        with (
+            patch("torch.cuda.synchronize"),
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            pytest.raises(RuntimeError, match="peer failed"),
+        ):
+            worker._multi_rank_sleep_wakeup("wakeup", [ExecutorMemoryType.KV_CACHE])
+        worker._fail_stop_divergent_sleep_wakeup.assert_called_once()
+        assert silent_polls == 1
+        assert received == ([1, 2, 3] if transport_error else [1, 2, 3, 2])
+
+    @pytest.mark.parametrize("recovered", [False, True])
+    @pytest.mark.parametrize("reuse_state_changed", [False, True])
+    def test_local_release_abort_requires_proven_recovery(self, recovered, reuse_state_changed):
+        from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, received = _make_proto_worker([{"status": "ok"} for _ in range(4)])
+        worker._fail_stop_divergent_sleep_wakeup = Mock()
+        error = (
+            MemoryReleaseAbortedError("release failed", reuse_state_changed=reuse_state_changed)
+            if recovered
+            else RuntimeError("release failed")
+        )
+        with (
+            patch("torch.cuda.synchronize"),
+            patch(
+                "tensorrt_llm._torch.virtual_memory.release_with_tag",
+                side_effect=error,
+            ),
+            pytest.raises(RuntimeError, match="release failed"),
+        ):
+            worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        assert len(received) == 4
+        assert worker._fail_stop_divergent_sleep_wakeup.call_count == int(
+            not recovered or reuse_state_changed
+        )
+
+    def test_capacity_failure_aborts_peers_before_release(self):
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, received = _make_proto_worker([{"status": "ok"} for _ in range(4)])
+        worker.engine.validate_memory_release = Mock(
+            side_effect=RuntimeError("insufficient offload capacity")
+        )
+        worker._fail_stop_divergent_sleep_wakeup = Mock()
+        with (
+            patch("torch.cuda.synchronize"),
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+            pytest.raises(RuntimeError, match="insufficient offload capacity"),
+        ):
+            worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        release.assert_not_called()
+        assert len(received) == 4
+        worker._fail_stop_divergent_sleep_wakeup.assert_not_called()
+
     def test_peer_error_ack_raises(self):
         """A non-ok ACK from a peer rank must cause RuntimeError with detail."""
         from unittest.mock import patch
@@ -685,7 +924,7 @@ class TestMnnvlSleepWakeupCoordination:
         with (
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=lambda *tags: events.append(("local_vmm", "sleep")),
+                side_effect=lambda *tags, resource=None: events.append(("local_vmm", "sleep")),
             ),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
             patch("torch.cuda.synchronize"),
@@ -1107,7 +1346,9 @@ class TestMultiRankSendFailureRecovery:
             _SleepWakeupAction.SLEEP,
             [ExecutorMemoryType.MODEL_ENGINE_MAIN],
         )
-        release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+        release.assert_called_once_with(
+            ExecutorMemoryType.MODEL_ENGINE_MAIN, resource=worker.engine
+        )
         fail_stop.assert_called_once()
 
     def test_mnnvl_all_commit_send_errors_are_treated_as_uncertain_delivery(self):
@@ -1180,7 +1421,9 @@ class TestMultiRankSendFailureRecovery:
             _SleepWakeupAction.SLEEP,
             [ExecutorMemoryType.MODEL_ENGINE_MAIN],
         )
-        release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+        release.assert_called_once_with(
+            ExecutorMemoryType.MODEL_ENGINE_MAIN, resource=worker.engine
+        )
         fail_stop.assert_called_once()
 
     def test_postcommit_non_runtime_error_fail_stops_worker(self):
@@ -1264,20 +1507,66 @@ class TestMultiRankSendFailureRecovery:
 
 
 class TestListenerUncaughtExceptionSendsErrorAck:
-    """An exception that bypasses the narrow except clause must still produce an error ACK.
+    """Control failures produce error ACKs without killing the listener."""
 
-    The sys.exc_info() check in the finally block detects uncaught exceptions so
-    rank-0 receives status=error rather than a false status=ok ACK while the
-    listener thread is unwinding.
-    """
+    @pytest.mark.parametrize("ack_failure", [False, True])
+    def test_materialized_peer_stays_parked_until_mnnvl_commit(self, ack_failure):
+        import threading
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        executor = object.__new__(PyExecutor)
+        executor.device_id = 0
+        executor.dist = SimpleNamespace(rank=1)
+        executor.control_request_barrier = threading.Event()
+        executor.control_request_barrier.set()
+        executor.control_action_done = threading.Event()
+        executor._active_control_id = "wake-1"
+        msg = {"target_action": "wakeup", "op_id": "wake-1", "tags": ["kv_cache"]}
+        comm = Mock()
+        comm.recv.side_effect = [
+            dict(msg, action="materialize"),
+            dict(msg, action="commit", materialized=True),
+            {"action": "shutdown"},
+        ]
+        states = []
+
+        def send_ack(ack, **kwargs):
+            states.append((ack["phase"], ack["status"], executor.control_action_done.is_set()))
+            if ack_failure:
+                raise OSError("MPI send failed")
+
+        comm.send.side_effect = send_ack
+        executor._sleep_wakeup_comm = comm
+        executor._run_mnnvl_checkpoint_resources = Mock()
+        with (
+            patch("torch.cuda.set_device"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
+            patch("tensorrt_llm._torch.pyexecutor.py_executor.propagate_hard_kill") as terminate,
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag") as materialize,
+            patch("torch.cuda.synchronize"),
+        ):
+            if ack_failure:
+                with pytest.raises(OSError, match="MPI send failed"):
+                    executor._sleep_wakeup_listener_loop()
+                terminate.assert_called_once_with(diagnostics=False, communicator=comm)
+                assert states == [("materialize", "ok", False)]
+                executor._run_mnnvl_checkpoint_resources.assert_not_called()
+                return
+            executor._sleep_wakeup_listener_loop()
+            terminate.assert_not_called()
+        assert states == [
+            ("materialize", "ok", False),
+            ("commit", "ok", True),
+            ("shutdown", "ok", True),
+        ]
+        materialize.assert_called_once()
+        executor._run_mnnvl_checkpoint_resources.assert_called_once()
 
     def test_uncaught_exception_sends_error_ack(self):
-        """MemoryError (not in narrow except) must reach rank-0 as status=error.
-
-        Without the sys.exc_info() guard, the finally block would send status=ok
-        because error_msg is still None when the exception bypasses the except
-        clause — leaving rank-0 with an inconsistent view of the operation.
-        """
+        """MemoryError must reach rank 0 while the listener remains available."""
         import threading
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -1285,8 +1574,10 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         sent_acks = []
 
         class FakeComm:
+            messages = iter([{"action": "sleep", "tags": ["kv_cache"]}, {"action": "shutdown"}])
+
             def recv(self, source, tag):
-                return {"action": "sleep", "tags": ["kv_cache"]}
+                return next(self.messages)
 
             def send(self, payload, dest, tag):
                 sent_acks.append(payload)
@@ -1305,6 +1596,10 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         executor._is_kv_manager_v2 = False
         executor.enable_kv_cache_reuse = False
 
+        def fail_release(*tags, resource):
+            assert resource is executor
+            raise MemoryError("simulated OOM outside except list")
+
         with (
             patch("torch.cuda.set_device"),
             patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
@@ -1312,17 +1607,15 @@ class TestListenerUncaughtExceptionSendsErrorAck:
             patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=MemoryError("simulated OOM outside except list"),
+                side_effect=fail_release,
             ),
             patch("torch.cuda.synchronize"),
         ):
-            with pytest.raises(MemoryError, match="simulated OOM outside except list"):
-                executor._sleep_wakeup_listener_loop()
+            executor._sleep_wakeup_listener_loop()
 
         assert sent_acks, "finally block must send an ACK even for uncaught exceptions"
         assert sent_acks[0]["status"] == "error", (
-            "ACK status must be 'error' when MemoryError bypasses the narrow "
-            f"except clause; got {sent_acks[0]!r}"
+            f"ACK status must be 'error' after MemoryError; got {sent_acks[0]!r}"
         )
         assert sent_acks[0]["error"] is not None
         assert "MemoryError" in sent_acks[0]["error"]
@@ -1333,7 +1626,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
 class TestListenerAbortAndShutdown:
     """Listener control messages must unblock cleanly and ACK rank-0."""
 
-    def test_prepare_does_not_execute_vmm_or_release_control(self):
+    @pytest.mark.parametrize("failure_stage", [None, "sync", "owner", "config", "capacity"])
+    def test_prepare_does_not_execute_vmm_or_release_control(self, failure_stage):
         """Prepare quiesces the peer but leaves VMM and control_action_done untouched."""
         import threading
         from unittest.mock import patch
@@ -1369,13 +1663,28 @@ class TestListenerAbortAndShutdown:
         executor.control_request_barrier.set()
         executor.control_action_done = threading.Event()
         executor._active_control_id = op_id
+        executor.resource_manager = SimpleNamespace(resource_managers={})
+        if failure_stage == "owner":
+            from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+            executor.resource_manager.resource_managers["kv"] = object.__new__(KVCacheManagerV2)
+            executor.kv_cache_transceiver = object()
+        executor.validate_sleep_config = MagicMock()
+        executor.validate_memory_release = MagicMock()
+        if failure_stage == "config":
+            executor.validate_sleep_config.side_effect = MemoryError("config failed")
+        elif failure_stage == "capacity":
+            executor.validate_memory_release.side_effect = MemoryError("capacity failed")
 
         with (
             patch("torch.cuda.set_device"),
             patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
             patch("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice"),
             patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
-            patch("torch.cuda.synchronize"),
+            patch(
+                "torch.cuda.synchronize",
+                side_effect=MemoryError("sync failed") if failure_stage == "sync" else None,
+            ),
             patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
         ):
             try:
@@ -1384,8 +1693,22 @@ class TestListenerAbortAndShutdown:
                 pass
 
         release.assert_not_called()
+        assert executor.validate_sleep_config.call_count == int(
+            failure_stage not in ("sync", "owner")
+        )
+        assert executor.validate_memory_release.call_count == int(
+            failure_stage not in ("sync", "owner", "config")
+        )
         assert executor.control_request_barrier.is_set()
         assert not executor.control_action_done.is_set()
+        if failure_stage is not None:
+            assert len(sent_acks) == 1
+            assert sent_acks[0]["status"] == "error"
+            expected = (
+                "memory re-registration" if failure_stage == "owner" else f"{failure_stage} failed"
+            )
+            assert expected in sent_acks[0]["error"]
+            return
         assert sent_acks == [
             {
                 "status": "ok",
@@ -1452,9 +1775,11 @@ class TestListenerAbortAndShutdown:
         assert sent_acks[0]["error"] is None
         assert "rank 0 send failed" in sent_acks[0]["reason"]
 
-    def test_abort_before_control_barrier_unblocks_later_control_request(self):
-        """An early ABORT is recorded and later consumed by matching control."""
+    @pytest.mark.parametrize("during_publication", [False, True])
+    def test_abort_before_control_barrier_unblocks_later_control_request(self, during_publication):
+        """ABORT retires the matching sentinel, including during publication of its barrier."""
         import threading
+        from contextlib import nullcontext
         from unittest.mock import patch
 
         from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
@@ -1495,6 +1820,27 @@ class TestListenerAbortAndShutdown:
         executor.control_requests = [RequestQueueItem(id=CONTROL_REQUEST_ID, control_id=op_id)]
         executor.active_requests = []
         executor.waiting_queue = []
+        executor.dwdp_manager = None
+        executor.hang_detector = SimpleNamespace(pause=nullcontext)
+        executor._sleep_wakeup_pending_abort_lock = threading.Lock()
+        executor._sleep_wakeup_pending_aborts = {}
+        publishing = threading.Event()
+        recording = threading.Event()
+        if during_publication:
+            set_barrier = executor.control_request_barrier.set
+            record_abort = executor._record_sleep_wakeup_abort
+
+            def publish():
+                publishing.set()
+                assert recording.wait(5)
+                set_barrier()
+
+            def record(*args, **kwargs):
+                recording.set()
+                return record_abort(*args, **kwargs)
+
+            executor.control_request_barrier.set = publish
+            executor._record_sleep_wakeup_abort = record
 
         with (
             patch("torch.cuda.set_device"),
@@ -1503,14 +1849,23 @@ class TestListenerAbortAndShutdown:
             patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
             patch("torch.cuda.synchronize"),
         ):
-            try:
-                executor._sleep_wakeup_listener_loop()
-            except StopIteration:
-                pass
-            assert sent_acks
-            assert not executor.control_request_barrier.is_set()
+            if during_publication:
+                from concurrent.futures import ThreadPoolExecutor
 
-            executor._handle_control_request()
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    handled = pool.submit(executor._handle_control_request)
+                    try:
+                        assert publishing.wait(5)
+                        with pytest.raises(StopIteration):
+                            executor._sleep_wakeup_listener_loop()
+                        handled.result(timeout=5)
+                    finally:
+                        executor.control_action_done.set()
+            else:
+                with pytest.raises(StopIteration):
+                    executor._sleep_wakeup_listener_loop()
+                assert not executor.control_request_barrier.is_set()
+                executor._handle_control_request()
 
         assert executor.control_requests == []
         assert not executor.control_request_barrier.is_set()
@@ -1678,6 +2033,30 @@ class TestSingleRankLockAcquired:
 
     The same Event-barrier race exists on the single-rank path.
     """
+
+    @pytest.mark.parametrize("recovered", [False, True])
+    def test_release_abort_only_reopens_known_good_state(self, recovered):
+        import threading
+        from contextlib import nullcontext
+
+        from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+
+        worker = _make_worker()
+        worker.engine._sleep_wakeup_lock = threading.Lock()
+        worker.engine.control_action = nullcontext
+        error_type = MemoryReleaseAbortedError if recovered else RuntimeError
+        with (
+            patch("torch.cuda.synchronize"),
+            patch(
+                "tensorrt_llm._torch.virtual_memory.release_with_tag",
+                side_effect=error_type("release failed"),
+            ),
+            pytest.raises(RuntimeError, match="release failed"),
+        ):
+            worker.sleep(["kv_cache"])
+        worker.engine.abort_sleep_transition.assert_called_once_with()
+        assert worker.engine.fail_sleep_wakeup_transition.call_count == int(not recovered)
+        worker.engine.complete_sleep_transition.assert_not_called()
 
     @pytest.mark.parametrize("method", ["sleep", "wakeup"])
     def test_single_rank_acquires_lock(self, method):
@@ -1894,6 +2273,7 @@ class TestWorkerCollectiveRpc:
         llm.shutdown = MagicMock()
         llm._executor = worker
         llm._encode_only = False
+        llm._orchestrator_type = None
         llm.args = SimpleNamespace(sleep_config=object())
 
         llm.release(["kv_cache"])

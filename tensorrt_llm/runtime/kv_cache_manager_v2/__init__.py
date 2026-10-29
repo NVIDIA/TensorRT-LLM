@@ -161,6 +161,7 @@ RemoteMemError = _cpp.RemoteMemError
 RemoteCacheTierConfig = _cpp.RemoteCacheTierConfig
 RemoteTransferConfig = _cpp.RemoteTransferConfig
 RemoteTransport = _cpp.RemoteTransport
+ResourceBusyError = _cpp.ResourceBusyError
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
@@ -285,6 +286,7 @@ __all__ = [
     "RemoteCacheTierConfig",
     "RemoteTransferConfig",
     "RemoteTransport",
+    "ResourceBusyError",
     "PageIndexConverter",
     "PlannedDropHandle",
     "PoolGroupPeakBlockStats",

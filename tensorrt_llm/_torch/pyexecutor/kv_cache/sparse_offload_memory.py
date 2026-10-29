@@ -46,7 +46,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Sequence
 
 from tensorrt_llm.math_utils import ceil_div, pad_up
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, SparseCacheConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttentionLayerConfig,
+    CacheTier,
+    SparseCacheConfig,
+    _introspection,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -144,8 +149,8 @@ class SparseArenaShape:
         """GPU bytes one lease adds to the arena."""
         return self.cells_per_buffer * sum(self.cell_bytes) + self.lease_metadata_bytes
 
-    def arena_bytes(self, max_leases: int) -> int:
-        """Return the GPU bytes of an arena sized for ``max_leases`` leases."""
+    def layout_bytes(self, max_leases: int) -> int:
+        """Return the bytes of pool cells, tails, shared tables and per-lease state."""
         # One region per pool. Buffers of one cell size share a pool, so a region
         # holds every lease's cells of every buffer of that size, then one fixed
         # over-read tail. The tail is not part of any lease's usable capacity.
@@ -168,6 +173,15 @@ class SparseArenaShape:
         )
         shared = sum(_index_array_bytes(n) for n in shared_arrays)
         return cell_regions + shared + max_leases * self.lease_metadata_bytes
+
+    def arena_bytes(self, max_leases: int) -> int:
+        """Return this arena's fully mapped device bytes, or zero when no rows are allocated."""
+        if max_leases <= 0:
+            return 0
+        layout = self.layout_bytes(max_leases)
+        # ArenaMemory chooses its GPU chunk size from this layout, not the total device quota.
+        chunk = _introspection.tier_allocation_granularity(CacheTier.GPU_MEM, layout)
+        return pad_up(layout, chunk)
 
 
 def _fetched_sparse_buffers(layer: LayerConfig) -> list[BufferConfig]:
@@ -910,18 +924,23 @@ def solve_sparse_offload_capacity(
         "host": host_pool_bytes // host_bytes_per_request,
         "gpu": gpu_pool_bytes // gpu_bytes_per_request,
     }
-    # The device budget pays for the pools, the arena and the buffers sized for
-    # max_batch_size rows. The arena's shared tables and padding leases are
-    # fixed; every batch slot adds a request's pages, the one lease its seated
-    # cache holds and its rows of those buffers.
+    # Whole chunks make the device cost monotone but not linear in the number of rows.
+    # Test each candidate against the same per-arena backing cost used for the reservation.
     padding_leases = max(0, num_leases - max_batch_size)
-    fixed_arena_bytes = sum(arena.arena_bytes(padding_leases) for arena in arenas)
-    batch_bytes_per_slot = ceil_div(batch_buffer_bytes, max(1, max_batch_size))
-    recommended = min(
-        max(0, gpu_pool_bytes + arena_bytes + batch_buffer_bytes - fixed_arena_bytes)
-        // (gpu_bytes_per_request + lease_bytes + batch_bytes_per_slot),
+    device_budget = gpu_pool_bytes + arena_bytes + batch_buffer_bytes
+    bytes_per_slot = gpu_bytes_per_request + ceil_div(batch_buffer_bytes, max(1, max_batch_size))
+    low = 0
+    high = min(
+        device_budget // (bytes_per_slot + lease_bytes),
         host_budget_bytes // host_bytes_per_request,
     )
+    while low < high:
+        rows = (low + high + 1) // 2
+        mapped = sum(arena.arena_bytes(rows + padding_leases) for arena in arenas)
+        if rows * bytes_per_slot + mapped <= device_budget:
+            low = rows
+        else:
+            high = rows - 1
     return SparseOffloadCapacity(
         num_tokens=num_tokens,
         max_batch_size=max_batch_size,
@@ -936,7 +955,7 @@ def solve_sparse_offload_capacity(
         lease_bytes=lease_bytes,
         batch_buffer_bytes=batch_buffer_bytes,
         by_limit=by_limit,
-        recommended_max_batch_size=recommended,
+        recommended_max_batch_size=low,
     )
 
 

@@ -36,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     StagingOptions,
     attach_lender,
 )
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm._utils import prefer_pinned
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates KV cache pools")
@@ -3708,6 +3709,37 @@ def test_resume_bounds_waits_on_nothing_and_settles_by_being_asked(kit, real_man
 
 
 # -- a reset of the manager's reuse state ----------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", list(RestoreMode))
+@pytest.mark.parametrize("open_lease", [False, True])
+def test_sleep_refusal_preserves_a_real_lender(kit, real_manager, mode, open_lease):
+    with real_manager() as mgr:
+        source = kit.published(mgr, SOURCE, PROMPT)
+        lender = attach(mgr, tokens_per_fetch=END)
+        lease = lender.lend_read(source, 0, END) if open_lease else None
+        before = state_of(kit, mgr, lender, source)
+        version = mgr.impl.get_reuse_state_version()
+        try:
+            for operation in (
+                mgr.validate_sleep_config,
+                mgr.validate_memory_release,
+                mgr.release_memory,
+            ):
+                with pytest.raises(ValueError, match="attached KV cache lender"):
+                    operation(mode)
+                assert mgr._sleep_restore_mode is None
+                assert mgr.impl.is_memory_ready()
+                assert mgr.impl.get_reuse_state_version() == version
+                assert state_of(kit, mgr, lender, source) == before
+            if lease is None:
+                lease = lender.lend_read(source, 0, END)
+            check_staged(kit, mgr, lender, source, ready_view(lease, mgr))
+        finally:
+            if lease is not None:
+                lease.release()
+            mgr.free_resources(source)
+
 
 RESET = "reset its reuse state"
 
