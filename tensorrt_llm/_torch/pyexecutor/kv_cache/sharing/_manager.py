@@ -75,11 +75,9 @@ def require_v2(manager: object) -> None:
 
 
 def model_has_recurrent_state(manager: KVCacheManagerV2) -> bool:
-    """Whether the manager serves a model with recurrent state: a hybrid manager, on every pipeline
-    stage, whichever layers this stage holds."""
-    from ..mamba_cache_manager import MambaHybridCacheManagerV2
-
-    return isinstance(manager, MambaHybridCacheManagerV2)
+    """Whether the manager serves a model with recurrent state, on every pipeline stage, whichever
+    layers this stage holds (``KVCacheManagerV2.model_has_recurrent_state``)."""
+    return bool(manager.model_has_recurrent_state)
 
 
 def model_has_attention_window(manager: KVCacheManagerV2) -> bool:

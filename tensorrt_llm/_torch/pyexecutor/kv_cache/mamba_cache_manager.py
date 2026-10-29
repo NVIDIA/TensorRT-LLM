@@ -3625,15 +3625,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """
         return super()._page_derived_roles() | self._kda_replay_roles()
 
-    def disagg_state_slot(self, request) -> Optional[int]:
+    def disagg_state_slot(self, request, layer_group: int) -> Optional[int]:
         """The request's recurrent-state slot, while this rank holds recurrent layers."""
         if self.local_num_mamba_layers == 0:
             return None
         return self._request_id_to_state_index[request.py_request_id]
 
-    def disagg_pipelined_transfer_blocker(self) -> Optional[str]:
-        """Recurrent state is one checkpoint at the end of the prompt, which no piece carries."""
-        return "a Mamba/hybrid cache manager"
+    @property
+    def model_has_recurrent_state(self) -> bool:
+        """A hybrid model keeps recurrent state, on whichever pipeline
+        stages its recurrent layers lie."""
+        return True
 
     def rebuild_disagg_imported_cache(self,
                                       requests: Iterable[LlmRequest]) -> None:

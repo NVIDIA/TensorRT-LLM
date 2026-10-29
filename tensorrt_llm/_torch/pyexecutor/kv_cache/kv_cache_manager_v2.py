@@ -3824,15 +3824,29 @@ class KVCacheManagerV2(BaseResourceManager):
         """Whether a transfer of the request carries its first generated and draft tokens: yes."""
         return True
 
-    def disagg_state_slot(self, request: LlmRequest) -> Optional[int]:
-        """The recurrent-state slot of the request, which its state layer groups transfer; None for
-        a manager keeping no recurrent state."""
-        return None
+    def disagg_state_slot(self, request: LlmRequest, layer_group: int) -> Optional[int]:
+        """The slot of layer group ``layer_group``'s recurrent state that a transfer of the request
+        moves: the one the request's cache holds in place, or None when it holds none."""
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return None
+        slot = int(kv_cache.get_ssm_block_base_index(layer_group))
+        return slot if slot >= 0 else None
 
     def disagg_pipelined_transfer_blocker(self) -> Optional[str]:
         """Why this manager's pages cannot move in pieces while the prompt is still computed, or
-        None when they can."""
+        None when they can: recurrent state is one checkpoint at the end of the prompt, which no
+        piece carries."""
+        if self.model_has_recurrent_state:
+            return "recurrent state, one checkpoint at the end of the prompt that no piece carries"
         return None
+
+    @property
+    def model_has_recurrent_state(self) -> bool:
+        """Whether the model keeps recurrent state on any pipeline stage, whichever layers this
+        stage holds: this stage's layer configs say so; a manager whose recurrent layers may all
+        lie on other stages overrides this."""
+        return any(is_recurrent_layer(config) for config in self._page_layer_configs().values())
 
     def rebuild_disagg_imported_cache(self, requests: Iterable[LlmRequest]) -> None:
         """Derive, before their first generation step, the caches of requests whose transfer just

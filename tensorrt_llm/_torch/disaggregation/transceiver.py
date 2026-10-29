@@ -523,8 +523,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         sides still hold. The only request-derived bound is prompt_len, which drops the
         speculative tail and the ctx first-token block (num_extra_kv_tokens slots are not
         transferred; both sides use prompt_len, so the ranges stay consistent). On the receiver
-        the already-cached prefix is masked so the sender skips it. A STATE group carries one
-        slot, or nothing when this rank has none.
+        the already-cached prefix is masked so the sender skips it. A STATE group carries its one
+        slot.
 
         How much of the prompt moves, which buffers the receiver rebuilds instead and which slot
         holds the recurrent state are the cache manager's to say (its ``disagg_*`` methods).
@@ -544,12 +544,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(kinds)
         )
 
-        empty = np.array([], dtype=np.int64)
         groups = []
         for idx, kind in enumerate(kinds):
             if kind == CacheKind.STATE:
-                slot = manager.disagg_state_slot(req)
-                group = np.array([slot], dtype=np.int64) if slot is not None else empty
+                slot = manager.disagg_state_slot(req, idx)
+                if slot is None:
+                    raise RuntimeError(
+                        f"request {req.py_request_id}: the cache manager names no slot of layer "
+                        f"group {idx}'s recurrent state, which would then not move"
+                    )
+                group = np.array([slot], dtype=np.int64)
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the

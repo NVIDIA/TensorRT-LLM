@@ -378,6 +378,9 @@ class Manager:
     _page_state_split = KVCacheManagerV2._page_state_split
     _page_derived_roles = KVCacheManagerV2._page_derived_roles
     rebuild_disagg_imported_cache = KVCacheManagerV2.rebuild_disagg_imported_cache
+    model_has_recurrent_state = KVCacheManagerV2.model_has_recurrent_state
+    disagg_state_slot = KVCacheManagerV2.disagg_state_slot
+    disagg_pipelined_transfer_blocker = KVCacheManagerV2.disagg_pipelined_transfer_blocker
     _page_layer_configs = KVCacheManagerV2._page_layer_configs
     _page_layer_ids = KVCacheManagerV2._page_layer_ids
     _page_kv_heads = KVCacheManagerV2._page_kv_heads
@@ -763,6 +766,24 @@ def test_ranks_holding_the_same_heads_of_every_layer_name_a_block_alike(case):
             assert (names[rank] == names[other]) == same, (rank, other, held_heads)
             if not same:
                 assert not set(names[rank]) & set(names[other]), (rank, other)
+
+
+@pytest.mark.cpu_only
+def test_recurrent_state_moves_from_the_slot_its_cache_holds_and_never_in_pieces():
+    """By default a transfer moves each state layer group's slot as the request's cache holds it,
+    and a manager of recurrent layers refuses pipelined transfers; the lender reads the same
+    answer."""
+    state = recurrent_state()
+    state.kv_cache_map = {7: SimpleNamespace(get_ssm_block_base_index=lambda group: 3 + group)}
+    assert state.disagg_state_slot(SimpleNamespace(py_request_id=7), 1) == 4
+    assert state.disagg_state_slot(SimpleNamespace(py_request_id=8), 0) is None
+    state.kv_cache_map[7] = SimpleNamespace(get_ssm_block_base_index=lambda group: -1)
+    assert state.disagg_state_slot(SimpleNamespace(py_request_id=7), 0) is None
+    assert state.model_has_recurrent_state and _manager.model_has_recurrent_state(state)
+    assert "recurrent state" in state.disagg_pipelined_transfer_blocker()
+    plain = attention(1, 0, 4)
+    assert not plain.model_has_recurrent_state and not _manager.model_has_recurrent_state(plain)
+    assert plain.disagg_pipelined_transfer_blocker() is None
 
 
 @pytest.mark.cpu_only

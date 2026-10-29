@@ -413,7 +413,7 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
         num_extra_kv_tokens=0,
         disagg_transfer_length=lambda req: req.prompt_len,
         disagg_untransferred_buffers=lambda req: frozenset(),
-        disagg_state_slot=lambda req: None,
+        disagg_state_slot=lambda req, layer_group: None,
     )
     transceiver._send_reqs = {}
 

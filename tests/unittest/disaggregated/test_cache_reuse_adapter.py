@@ -167,7 +167,7 @@ def _build_transceiver_for_kv_slice(
         num_extra_kv_tokens=num_extra_kv_tokens,
         disagg_transfer_length=transfer_length,
         disagg_untransferred_buffers=lambda req: frozenset(),
-        disagg_state_slot=lambda req: None,
+        disagg_state_slot=lambda req, layer_group: None,
     )
 
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -692,3 +692,20 @@ class TestTransceiverContextManager:
         tc.shutdown()
         tc.shutdown()  # second call short-circuits after completed teardown.
         tc._transfer_worker.shutdown.assert_called_once()
+
+
+def test_a_state_layer_group_carries_its_slot_or_the_transfer_is_refused():
+    """A recurrent-state group moves the one slot the cache manager names.
+
+    Naming none would leave the state behind while both sides expect no bytes of it, so the
+    transfer refuses it.
+    """
+    transceiver, req = _build_transceiver_for_kv_slice(0, 64, tokens_per_block=32)
+    transceiver._page_table = SimpleNamespace(
+        page_layout=SimpleNamespace(layer_groups=[SimpleNamespace(kind="state", kept_window=None)])
+    )
+    transceiver._kv_cache_manager.disagg_state_slot = lambda req, layer_group: 5 + layer_group
+    assert transceiver._create_chunk(req).block_ids_per_layer_groups[0].tolist() == [5]
+    transceiver._kv_cache_manager.disagg_state_slot = lambda req, layer_group: None
+    with pytest.raises(RuntimeError, match="names no slot of layer group 0's recurrent state"):
+        transceiver._create_chunk(req)
