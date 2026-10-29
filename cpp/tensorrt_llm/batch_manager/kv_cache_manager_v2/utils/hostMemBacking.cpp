@@ -184,9 +184,10 @@ MemAddress HostMemBacking::reserve(size_t size)
     // No alignment is asked of the mapping. Unit boundaries line up with slot
     // boundaries because slot 0 sits at the base and a unit is a whole number of
     // slots, wherever the base happens to land; registration needs no alignment,
-    // and the madvise and mprotect calls round to pages themselves. The mapped
-    // length is page-rounded so the guard below covers whole pages.
+    // and the madvise and mprotect calls round to pages themselves.
     mMapped = roundUp(size, commitAlignment());
+    // hostMmap maps the range PROT_NONE, so a read that runs ahead of the fill
+    // faults rather than returning zeros from an untouched page.
     mAddr = hostMmap(mMapped);
     mSize = size;
 
@@ -194,20 +195,6 @@ MemAddress HostMemBacking::reserve(size_t size)
     //! change VMA flags and split the mapping into one VMA per chunk.
     hostMadvisePageMode(mAddr, mSize, hostUseThp());
     bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
-
-    // Nothing is reachable until commit() opens it, so a read that runs ahead
-    // of the fill faults rather than returning zeros from an untouched page.
-    // Costs one VMA and is independent of the size: with no resident pages
-    // there are no page tables to rewrite.
-    auto const [guardAddr, guardSize] = pagesCovering(mAddr, mSize);
-    if (::mprotect(reinterpret_cast<void*>(guardAddr), guardSize, PROT_NONE) != 0)
-    {
-        hostMunmap(mAddr, mMapped);
-        mAddr = 0;
-        mSize = 0;
-        mMapped = 0;
-        throw HostOOMError(std::string("mprotect(PROT_NONE) failed: ") + std::strerror(errno));
-    }
     return mAddr;
 }
 

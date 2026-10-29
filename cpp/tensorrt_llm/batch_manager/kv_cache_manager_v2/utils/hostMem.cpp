@@ -53,10 +53,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 MemAddress hostMmap(size_t size)
 {
-    // MAP_NORESERVE: the mapping is a reservation sized to an upper bound, and
-    // only a prefix of it is ever committed. Without it a strict-overcommit
-    // system charges the whole range against swap and refuses the mapping.
-    void* ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    // The reservation is sized to an upper bound and commit() opens parts of it
+    // with mprotect. It is mapped PROT_NONE because vm.overcommit_memory=2
+    // ignores MAP_NORESERVE and charges a private writable mapping in full.
+    void* ptr = ::mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (ptr == MAP_FAILED || ptr == nullptr)
     {
         throw HostOOMError(std::string("mmap failed: ") + std::strerror(errno));

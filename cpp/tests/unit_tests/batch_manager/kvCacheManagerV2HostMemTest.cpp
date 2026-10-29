@@ -23,12 +23,15 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -158,6 +161,66 @@ TEST(KvCacheManagerV2HostMemTest, PropagatesOtherPrefaultErrors)
     {
         EXPECT_EQ(error.code().value(), EIO);
     }
+}
+
+//! VmData: the private writable address space RLIMIT_DATA is checked against.
+size_t privateWritableBytes()
+{
+    std::ifstream status("/proc/self/status");
+    std::string key;
+    while (status >> key)
+    {
+        if (key == "VmData:")
+        {
+            size_t kib = 0;
+            status >> kib;
+            return kib << 10;
+        }
+        status.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+    return 0;
+}
+
+//! RLIMIT_DATA, like vm.overcommit_memory=2, counts private writable mappings
+//! and ignores MAP_NORESERVE, so a low limit stands in for a strict-overcommit
+//! host.
+TEST(KvCacheManagerV2HostMemTest, ReservationIsChargedOnlyWhereOpened)
+{
+    size_t const reservation = size_t{64} << 30;
+    size_t const opened = size_t{16} << 20;
+    size_t const used = privateWritableBytes();
+    ASSERT_GT(used, 0U);
+
+    rlimit saved{};
+    ASSERT_EQ(::getrlimit(RLIMIT_DATA, &saved), 0);
+    rlim_t const limit = used + (size_t{1} << 30);
+    if (saved.rlim_cur != RLIM_INFINITY && saved.rlim_cur < limit)
+    {
+        GTEST_SKIP() << "RLIMIT_DATA is already below the test's limit";
+    }
+    rlimit const lowered{limit, saved.rlim_max};
+    ASSERT_EQ(::setrlimit(RLIMIT_DATA, &lowered), 0);
+
+    MemAddress addr = 0;
+    int protectResult = -1;
+    try
+    {
+        addr = hostMmap(reservation);
+        protectResult = ::mprotect(reinterpret_cast<void*>(addr), opened, PROT_READ | PROT_WRITE);
+    }
+    catch (HostOOMError const&)
+    {
+    }
+    ::setrlimit(RLIMIT_DATA, &saved);
+
+    ASSERT_NE(addr, 0U) << "a reservation larger than RLIMIT_DATA was refused";
+    EXPECT_EQ(protectResult, 0) << "opening a prefix within RLIMIT_DATA failed";
+    if (protectResult == 0)
+    {
+        std::memset(reinterpret_cast<void*>(addr), 0x5A, opened);
+        EXPECT_EQ(reinterpret_cast<unsigned char const*>(addr)[opened - 1], 0x5A);
+    }
+    hostMunmap(addr, reservation);
 }
 
 class HostMemPageModeTest : public testing::TestWithParam<char const*>
