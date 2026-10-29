@@ -2006,9 +2006,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         # The draft request view (LlmRequest.use_draft_model) reads the context
         # position and chunk a separate draft engine advances for its own
-        # prefill; a one-engine external drafter (DFlash, DSpark) has no such
-        # engine, so those fields stay at position 0 / chunk = prompt length
-        # and its mirror follows the target's chunking instead.
+        # prefill; a one-engine external drafter (DFlash, DSpark, PARD,
+        # DraftTarget one-model) has no such engine, so those fields stay at
+        # position 0 / chunk = prompt length and its mirror follows the
+        # target's chunking instead.
         self._mirror_uses_draft_view = not (
             is_draft and spec_config is not None and spec_config.spec_dec_mode.is_external_drafter()
         )
@@ -6002,15 +6003,19 @@ class KVCacheManagerV2(BaseResourceManager):
         message answers it rather than leaving post-hoc arithmetic over the split log.
 
         """
+        # num_blocks counts block ordinals up to the capacity, including the
+        # stale ones a sliding window left without a page, so these are logical
+        # blocks, not pages held.
         capacity = sum(c.capacity for c in self.kv_cache_map.values())
         blocks = sum(int(c.num_blocks) for c in self.kv_cache_map.values())
         per_cache = ", ".join(
-            f"{req_id}: capacity={c.capacity} history={c.history_length} blocks={c.num_blocks}"
+            f"{req_id}: capacity={c.capacity} history={c.history_length} "
+            f"logical_blocks={c.num_blocks}"
             for req_id, c in self.kv_cache_map.items()
         )
         return (
             f" [draft pool: {len(self.kv_cache_map)} live caches, capacity {capacity} tokens "
-            f"in {blocks} allocated blocks ({per_cache}), "
+            f"in {blocks} logical blocks ({per_cache}), "
             f"windows={self.max_attention_window_vec}, gpu_max_tokens={self._gpu_max_tokens}]"
         )
 
@@ -6060,25 +6065,28 @@ class KVCacheManagerV2(BaseResourceManager):
                     + draft_len
                     + self.num_extra_kv_tokens
                 )
-                # The chunk start is this cache's history: sliding-window layers
-                # keep pages only from history + 1 - window (AttnLifeCycle::
-                # getStaleRange), so a mirror holds its window plus the chunk
-                # it is computing rather than the whole prompt so far.
-                # The executor advances the draft history through
-                # update_context_resources only under joint reuse, and a reused
-                # target prefix starts the mirror at position > 0 with no pages
-                # of its own, so the resize carries the history itself.
-                history = max(kv_cache.history_length, req.context_current_position)
-                if req.is_disagg_generation_init_state:
-                    # A disaggregated generation worker receives the prompt KV
-                    # instead of prefilling it, and the standalone drafter
-                    # starts this request on a fresh slot (DFlash/DSpark
-                    # prepare): the mirror never holds drafter K/V for the
-                    # transferred prompt. The whole prompt is therefore
-                    # history, so the window trims the mirror to its tail
-                    # plus the generation headroom instead of one prompt-sized
-                    # chunk that a windowed draft pool cannot hold.
-                    history = max(history, req.context_current_position + req.context_chunk_size)
+                # None keeps the cache's current history, as every drafter
+                # that reads the draft request view (MTP, Eagle, two-engine)
+                # needs: that view's position is not where its layers write.
+                history = None
+                if not self._mirror_uses_draft_view:
+                    if req.is_disagg_generation_init_state:
+                        # The transferred prompt KV is the target's only. The
+                        # drafter (DFlash/DSpark: the only separate draft pool a
+                        # disaggregated worker keeps) starts this request on a
+                        # fresh slot at context length 0 and addresses its own
+                        # writes and reads from there, so the mirror is sized in
+                        # those slot-local positions: no page for the prompt.
+                        capacity = draft_len + self.num_extra_kv_tokens
+                    elif kv_cache.capacity >= req.context_current_position:
+                        # The chunk start is history for a mirror that already
+                        # holds [0, chunk start): sliding-window layers keep
+                        # pages only from history + 1 - window (AttnLifeCycle::
+                        # getStaleRange), so the mirror holds its window plus
+                        # the chunk in flight rather than the whole prompt so
+                        # far. A mirror first seen past position 0 is not one:
+                        # its drafter slot stores that chunk from 0.
+                        history = max(kv_cache.history_length, req.context_current_position)
                 if not kv_cache.resize(capacity, history):
                     raise self._mirror_resize_error(req, "context", capacity)
                 self._after_shrink(req.py_request_id, kv_cache)
@@ -6983,11 +6991,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 if not success:
                     release_resources(req, free_draft_resources=True)
                     return None
-                if is_gen and not materialize_history:
-                    draft_kv_cache.enable_swa_scratch_reuse = False
                 # Same history hint as the target cache above: a sliding-window
                 # draft pool then backs only the dummy's window, not its whole
-                # length.
+                # length. The hint exceeds the window only for the
+                # longest-length warmup dummies, which run before any request
+                # holds a draft page.
                 success = draft_kv_cache.resize(dummy_capacity, history_length=history_hint)
                 if not success:
                     release_resources(req, free_draft_resources=True)

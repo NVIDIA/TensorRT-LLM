@@ -45,7 +45,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _Req:
-    def __init__(self, req_id):
+    def __init__(self, req_id: int) -> None:
         self.py_request_id = req_id
         self.lora_task_id = None
         self.cache_salt = None
@@ -68,7 +68,7 @@ class _Batch:
         return self.context_requests + self.generation_requests
 
 
-def _manager(resume_ok):
+def _manager(resume_ok: bool) -> tuple[KVCacheManagerV2, MagicMock]:
     """A draft manager whose resume answers ``resume_ok``, with nothing else real.
 
     Built without ``__init__``: the method under test needs only the mirror
@@ -126,39 +126,6 @@ def test_context_request_is_prepared_normally_when_resume_succeeds():
 
     manager._resume_and_restore.assert_called_once()
     cache.resize.assert_called_once()
-
-
-def test_disagg_generation_init_sizes_the_mirror_from_history_and_chunk() -> None:
-    """A transferred prompt is history for the drafter's mirror, not a chunk to hold.
-
-    On a disaggregated generation worker the prompt KV arrives over the wire
-    and the one-engine drafter starts the request on a fresh slot, so the
-    mirror never holds drafter K/V for that prompt. The resize therefore
-    carries the whole prompt as history, which lets the attention window trim
-    the mirror to its tail plus the generation headroom; a history of 0 asks
-    a windowed draft pool for one prompt-sized chunk instead.
-    """
-    manager, cache = _manager(resume_ok=True)
-    req = _Req(9)
-    req.is_disagg_generation_init_state = True
-    req.context_current_position = 0
-    req.context_chunk_size = 200_000
-
-    manager._prepare_draft_resources(_Batch(context_requests=[req]))
-
-    cache.resize.assert_called_once_with(200_000, 200_000)
-
-
-def test_ordinary_context_chunk_keeps_its_start_as_history() -> None:
-    """The aggregated chunked path: history is the chunk start, not its end."""
-    manager, cache = _manager(resume_ok=True)
-    req = _Req(10)
-    req.context_current_position = 64
-    req.context_chunk_size = 8
-
-    manager._prepare_draft_resources(_Batch(context_requests=[req]))
-
-    cache.resize.assert_called_once_with(72, 64)
 
 
 def test_generation_request_still_raises_on_a_resume_refusal():

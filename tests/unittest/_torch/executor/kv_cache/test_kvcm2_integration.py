@@ -15,6 +15,7 @@
 
 import array
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -43,6 +44,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -51,7 +53,10 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheT
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
+    DecodingBaseConfig,
     DFlashDecodingConfig,
+    DraftTargetDecodingConfig,
+    DSparkDecodingConfig,
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
@@ -1819,44 +1824,75 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
 
 
 @pytest.mark.parametrize(
-    ("mirror_history", "expected_history"),
+    (
+        "uses_draft_view",
+        "disagg_gen_init",
+        "position",
+        "mirror_capacity",
+        "mirror_history",
+        "expected_resize",
+    ),
     [
-        # A fresh mirror for a request whose target prefix was reused: the
-        # history jumps to the chunk start so no page below the window is
-        # allocated for [0, position).
-        (0, 8192),
-        # A later chunk of the same request: the history follows the chunk.
-        (4096, 8192),
-        # Joint reuse already advanced the history past the chunk start; a
-        # resize may not decrease it.
-        (8704, 8704),
+        # External drafter (target view), aggregated chunked prefill. The
+        # prompt is 8192 + 2 * 1024 tokens, so the 1024-token chunk at 8192 is
+        # not the last one and carries no draft tokens.
+        pytest.param(False, False, 0, 0, 0, (1024, 0), id="first_chunk"),
+        # A later chunk of a mirror that holds [0, 8192): the chunk start is
+        # history, so a sliding window drops the pages below it.
+        pytest.param(False, False, 8192, 8192, 4096, (9216, 8192), id="later_chunk"),
+        # The history is already ahead of the chunk start; a resize never
+        # lowers it.
+        pytest.param(False, False, 8192, 8192, 8704, (9216, 8704), id="history_ahead"),
+        # A mirror first seen past position 0 (a target prefix this worker did
+        # not compute): its drafter slot stores the chunk from 0, so nothing
+        # below the chunk is history and the mirror covers [0, chunk end).
+        pytest.param(False, False, 8192, 0, 0, (9216, None), id="fresh_past_zero"),
+        # MTP, Eagle and two-engine drafters keep the draft request view: it
+        # reads position 0 with the whole prompt as its (last) chunk, and the
+        # resize keeps the cache's history.
+        pytest.param(True, False, 8192, 8192, 0, (10243, None), id="draft_view"),
+        # Disaggregated generation init: the drafter starts a fresh slot at
+        # context length 0, so the mirror holds no page for the transferred
+        # prompt (10240 tokens), only the draft headroom.
+        pytest.param(False, True, 0, 0, 0, (3, None), id="disagg_gen_init-target_view"),
+        pytest.param(True, True, 0, 0, 0, (10243, None), id="disagg_gen_init-draft_view"),
     ],
 )
-def test_unpaired_one_engine_draft_mirror_follows_the_target_chunk(
-    mirror_history: int, expected_history: int
+def test_unpaired_draft_mirror_context_resize(
+    uses_draft_view: bool,
+    disagg_gen_init: bool,
+    position: int,
+    mirror_capacity: int,
+    mirror_history: int,
+    expected_resize: tuple,
 ) -> None:
-    """A one-engine external drafter's mirror reads the target's position and
-    chunk, and its context resize carries the chunk start as history."""
-    position, chunk, draft_len = 8192, 1024, 3
+    """Which request view an unpaired draft mirror reads, and the capacity and
+    history its context resize asks for."""
+    prompt, chunk, draft_len = 8192 + 2 * 1024, 1024, 3
     request = LlmRequest(
         request_id=41,
         max_new_tokens=4,
-        input_tokens=[0] * (position + chunk),
+        input_tokens=[0] * prompt,
         sampling_config=SamplingConfig(1),
         is_streaming=False,
         draft_tokens=[1] * draft_len,
     )
-    request.state = LlmRequestState.CONTEXT_INIT
-    request.context_current_position = position
-    request.context_chunk_size = chunk
-    assert request.is_last_context_chunk
+    if disagg_gen_init:
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+        assert request.is_last_context_chunk
+    else:
+        request.state = LlmRequestState.CONTEXT_INIT
+        request.context_current_position = position
+        request.context_chunk_size = chunk
+        assert not request.is_last_context_chunk
 
-    kv_cache = Mock(is_active=True, capacity=mirror_history, history_length=mirror_history)
-    kv_cache.resize.return_value = True
+    kv_cache = Mock(is_active=True, capacity=mirror_capacity, history_length=mirror_history)
+    views = []
+    kv_cache.resize.side_effect = lambda *args: views.append(request.use_draft_model) or True
     manager = object.__new__(KVCacheManagerV2)
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = False
-    manager._mirror_uses_draft_view = False
+    manager._mirror_uses_draft_view = uses_draft_view
     manager.num_extra_kv_tokens = 0
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager._resume_and_restore = Mock(return_value=True)
@@ -1865,43 +1901,8 @@ def test_unpaired_one_engine_draft_mirror_follows_the_target_chunk(
     batch.context_requests_last_chunk.append(request)
     manager._prepare_draft_resources(batch)
 
-    kv_cache.resize.assert_called_once_with(position + chunk + draft_len, expected_history)
-    assert not request.use_draft_model
-
-
-def test_unpaired_two_engine_draft_mirror_reads_the_draft_request_view() -> None:
-    """The draft view starts at position 0 with the whole prompt as its chunk
-    until a separate draft engine advances it, so a two-engine mirror sizes
-    its cache for the prompt at once."""
-    position, chunk, draft_len = 8192, 1024, 3
-    request = LlmRequest(
-        request_id=42,
-        max_new_tokens=4,
-        input_tokens=[0] * (position + chunk),
-        sampling_config=SamplingConfig(1),
-        is_streaming=False,
-        draft_tokens=[1] * draft_len,
-    )
-    request.state = LlmRequestState.CONTEXT_INIT
-    request.context_current_position = position
-    request.context_chunk_size = chunk
-
-    kv_cache = Mock(is_active=True, capacity=0, history_length=0)
-    kv_cache.resize.return_value = True
-    manager = object.__new__(KVCacheManagerV2)
-    manager.is_draft = True
-    manager.enable_joint_kv_cache_reuse = False
-    manager._mirror_uses_draft_view = True
-    manager.num_extra_kv_tokens = 0
-    manager.kv_cache_map = {request.py_request_id: kv_cache}
-    manager._resume_and_restore = Mock(return_value=True)
-
-    batch = ScheduledRequests()
-    batch.context_requests_last_chunk.append(request)
-    manager._prepare_draft_resources(batch)
-
-    kv_cache.resize.assert_called_once_with(position + chunk + draft_len, 0)
-    assert not request.use_draft_model
+    kv_cache.resize.assert_called_once_with(*expected_resize)
+    assert views == [uses_draft_view]
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
@@ -1986,7 +1987,10 @@ def test_exhausted_pool_fails_explicitly_on_an_empty_fresh_mirror() -> None:
     request.context_current_position = 0
     request.context_chunk_size = prompt
 
-    occupant = Mock(is_active=True, capacity=1216, history_length=0, num_blocks=38)
+    # Two occupants with distinct fields, so a swapped field or a max in
+    # place of the sum changes the message.
+    occupant = Mock(is_active=True, capacity=1216, history_length=512, num_blocks=38)
+    small = Mock(is_active=True, capacity=64, history_length=0, num_blocks=2)
     fresh = Mock(is_active=True, capacity=0, history_length=0, num_blocks=0)
     fresh.resize.return_value = False
     manager = object.__new__(KVCacheManagerV2)
@@ -1994,7 +1998,7 @@ def test_exhausted_pool_fails_explicitly_on_an_empty_fresh_mirror() -> None:
     manager.enable_joint_kv_cache_reuse = False
     manager._mirror_uses_draft_view = False
     manager.num_extra_kv_tokens = 0
-    manager.kv_cache_map = {60: occupant, 61: fresh}
+    manager.kv_cache_map = {60: occupant, 62: small, 61: fresh}
     manager.max_attention_window_vec = [2048]
     manager._gpu_max_tokens = 1216
     manager._resume_and_restore = Mock(return_value=True)
@@ -2010,8 +2014,9 @@ def test_exhausted_pool_fails_explicitly_on_an_empty_fresh_mirror() -> None:
         f"context resize failed for request 61: could not resize to {prompt + draft_len} tokens"
         in message
     )
-    assert "2 live caches, capacity 1216 tokens in 38 allocated blocks" in message
-    assert "61: capacity=0 history=0 blocks=0" in message
+    assert "3 live caches, capacity 1280 tokens in 40 logical blocks" in message
+    assert "60: capacity=1216 history=512 logical_blocks=38" in message
+    assert "61: capacity=0 history=0 logical_blocks=0" in message
     assert "windows=[2048]" in message
     assert "gpu_max_tokens=1216" in message
 
@@ -2072,9 +2077,6 @@ def test_windowed_draft_pool_backs_only_the_window_of_a_generation_dummy() -> No
         dtype=DataType.HALF,
         spec_config=spec,
     )
-    # Only the external drafter's own manager follows the target's chunking.
-    assert not draft._mirror_uses_draft_view
-    assert target._mirror_uses_draft_view
     stream = torch.cuda.current_stream().cuda_stream
 
     def live_pages(cache: object) -> int:
@@ -2111,6 +2113,365 @@ def test_windowed_draft_pool_backs_only_the_window_of_a_generation_dummy() -> No
             target.free_resources(request)
         draft.shutdown()
         target.shutdown()
+
+
+def _small_spec_manager(
+    spec: DecodingBaseConfig,
+    is_draft: bool,
+    *,
+    window: int | None = None,
+    num_kv_heads: int = 2,
+    dtype: DataType = DataType.HALF,
+    max_gpu_total_bytes: int = 256 << 20,
+    max_seq_len: int = 16384,
+    max_num_tokens: int = 8192,
+) -> KVCacheManagerV2:
+    """A two-layer, head_dim 64, 32-token-page V2 manager for ``spec``,
+    optionally with a uniform sliding window and no block reuse."""
+    num_layers = 2
+    config = KvCacheConfig(
+        enable_block_reuse=False,
+        max_attention_window=None if window is None else [window] * num_layers,
+        max_gpu_total_bytes=max_gpu_total_bytes,
+    )
+    return KVCacheManagerV2(
+        config,
+        CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=max_seq_len,
+        max_batch_size=2,
+        max_num_tokens=max_num_tokens,
+        mapping=Mapping(),
+        dtype=dtype,
+        spec_config=spec,
+        is_draft=is_draft,
+    )
+
+
+def _backed_ordinals(cache: object) -> set[int]:
+    """Block ordinals of ``cache`` that have a page behind them."""
+    return {
+        ordinal
+        for ordinal, page in enumerate(cache.get_base_page_indices(0))
+        if page != BAD_PAGE_INDEX
+    }
+
+
+@pytest.mark.parametrize(
+    ("make_spec", "external_drafter"),
+    [
+        pytest.param(
+            lambda: DFlashDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="dflash",
+        ),
+        pytest.param(
+            lambda: DSparkDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="dspark",
+        ),
+        pytest.param(
+            lambda: PARDDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="pard",
+        ),
+        pytest.param(
+            lambda: DraftTargetDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="draft_target_one_model",
+        ),
+        pytest.param(lambda: MTPDecodingConfig(num_nextn_predict_layers=1), False, id="mtp"),
+        pytest.param(
+            lambda: Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"),
+            False,
+            id="eagle3_one_model",
+        ),
+    ],
+)
+def test_only_an_external_drafters_draft_manager_reads_the_target_view(
+    make_spec: Callable[[], DecodingBaseConfig], external_drafter: bool
+) -> None:
+    """The draft manager of a one-engine external drafter reads the target's
+    position and chunk; every other manager keeps the draft request view."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = make_spec()
+    assert spec.spec_dec_mode.is_external_drafter() is external_drafter
+    for is_draft in (False, True):
+        manager = _small_spec_manager(spec, is_draft, max_gpu_total_bytes=4 << 20)
+        try:
+            assert manager._mirror_uses_draft_view is not (is_draft and external_drafter)
+        finally:
+            manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("make_spec", "releases_below_window"),
+    [
+        # MTP/Eagle draft layers process the target's chunks through the draft
+        # pool but the mirror reads the draft request view, which nothing
+        # advances: it keeps the whole prompt backed.
+        pytest.param(
+            lambda: Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"),
+            False,
+            id="eagle3_one_model",
+        ),
+        # An external drafter follows the target's chunks and drops what falls
+        # out of the window.
+        pytest.param(
+            lambda: DFlashDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            True,
+            id="dflash",
+        ),
+    ],
+)
+def test_windowed_draft_mirror_backs_what_the_next_chunk_attends(
+    make_spec: Callable[[], DecodingBaseConfig], releases_below_window: bool
+) -> None:
+    """Chunked prefill with block reuse off on a sliding-window draft pool:
+    after the second chunk's resize, every page the chunk attends (its window
+    back from the chunk start, through the chunk end) is backed."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    window, page, prompt, chunk = 256, 32, 8192, 512
+    draft = _small_spec_manager(make_spec(), True, window=window)
+    request = LlmRequest(
+        request_id=101,
+        max_new_tokens=8,
+        input_tokens=[1] * prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    try:
+        request.context_chunk_size = chunk
+        batch = ScheduledRequests()
+        batch.context_requests_chunking.append(request)
+        draft._prepare_draft_resources(batch)
+
+        request.move_to_next_context_chunk()
+        request.context_chunk_size = chunk
+        assert request.context_current_position == chunk
+        batch = ScheduledRequests()
+        batch.context_requests_chunking.append(request)
+        draft._prepare_draft_resources(batch)
+
+        backed = _backed_ordinals(draft.kv_cache_map[request.py_request_id])
+        attended = set(range((chunk - window) // page, 2 * chunk // page))
+        assert attended <= backed
+        assert (0 in backed) is not releases_below_window
+        draft.free_resources(request)
+    finally:
+        draft.shutdown()
+
+
+class _PoolBoundDFlashDraftModel:
+    """Just enough of a DFlash draft model for the worker to bind the draft
+    KV pool and run its generation-step context store."""
+
+    block_size = 4
+    config = SimpleNamespace(max_position_embeddings=1 << 17)
+    dflash_attention_backend = "TRTLLM"
+    hidden_norm = object()
+
+    def __init__(self, num_layers: int, num_kv_heads: int, head_dim: int, hidden: int) -> None:
+        self.fc = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16, device="cuda"))
+        self._layers = (num_layers, num_kv_heads, head_dim)
+        embed_tokens = torch.nn.Embedding(16, hidden).cuda()
+        self.draft_model_full = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed_tokens))
+
+    def _build_fused_kv_buffers(self) -> None:
+        self._num_attn_layers, self._num_kv_heads, self._head_dim = self._layers
+        self._num_heads = self._num_kv_heads
+
+    def _get_attention_mask_args(self, layer_idx: int) -> tuple:
+        return True, (-1, -1)
+
+    def validate_block_attention_windows(self) -> None:
+        pass
+
+    def project_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+    def precompute_context_kv(
+        self, projected: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_layers, num_kv_heads, head_dim = self._layers
+        k = torch.full(
+            (projected.shape[0], num_layers, num_kv_heads, head_dim),
+            3.0,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        return k, k.clone()
+
+
+def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disaggregated generation worker receives a prompt far larger than its
+    sliding-window draft pool. The mirror must fit, and the drafter's first
+    generation step -- a fresh slot that stores the accepted tokens' context
+    K/V from position 0, then appends its block -- must write only pages its
+    own mirror holds, never one another request owns."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
+        lambda **kwargs: None,
+    )
+    num_layers, num_kv_heads, head_dim, hidden = 2, 1, 64, 8
+    window, prompt, occupant_prompt, max_draft_len = 256, 65536, 512, 3
+    bytes_per_token = num_layers * 2 * num_kv_heads * head_dim * 2
+    spec = DFlashDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model="draft",
+        attention_backend="TRTLLM",
+        mask_token_id=0,
+    )
+    # Room for 8192 tokens: the occupant and a windowed mirror fit, a mirror
+    # of the whole transferred prompt does not.
+    draft = _small_spec_manager(
+        spec,
+        True,
+        window=window,
+        num_kv_heads=num_kv_heads,
+        dtype=DataType.BF16,
+        max_gpu_total_bytes=8192 * bytes_per_token,
+        max_seq_len=1 << 17,
+        max_num_tokens=occupant_prompt,
+    )
+    occupant = LlmRequest(
+        request_id=1,
+        max_new_tokens=8,
+        input_tokens=[1] * occupant_prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    occupant.state = LlmRequestState.CONTEXT_INIT
+    occupant.context_chunk_size = occupant_prompt
+    request = LlmRequest(
+        request_id=2,
+        max_new_tokens=8,
+        input_tokens=[1] * prompt,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1] * max_draft_len,
+    )
+    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+    offsets = torch.zeros(
+        (getattr(draft, "num_attention_op_pools", draft.num_pools), 2, 2, draft.max_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    try:
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk.append(occupant)
+        draft._prepare_draft_resources(batch)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk.append(request)
+        draft._prepare_draft_resources(batch)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        batch = ScheduledRequests()
+        batch.generation_requests.append(request)
+        draft._prepare_draft_resources(batch)
+
+        worker = DFlashWorker(spec, Mapping())
+        draft_model = _PoolBoundDFlashDraftModel(num_layers, num_kv_heads, head_dim, hidden)
+        worker.set_draft_model(draft_model)
+        attn_metadata = SimpleNamespace(
+            max_seq_len=1 << 17,
+            draft_kv_cache_block_offsets=offsets,
+            num_contexts=0,
+            num_seqs=1,
+            num_ctx_tokens=0,
+            _seq_lens_cuda=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            _seq_lens=torch.zeros(1, dtype=torch.int32),
+        )
+        worker._lazy_init_ctx_buffers(
+            draft_model,
+            SimpleNamespace(max_num_requests=2),
+            attn_metadata,
+            draft_kv_cache_manager=draft,
+        )
+        assert worker._ctx_block_tables is not None, "the drafter did not bind the draft pool"
+        # V2 hands out per-layer views over one interleaved pool: a table entry
+        # names layer 0's slot of a page, and layer l of that page is slot
+        # entry + l of the same dense view, so view 0 sees every layer's write.
+        assert worker._ctx_block_divisor == draft.kv_factor
+        pool = worker._ctx_kv_buf[0]
+
+        def own_slots(req: LlmRequest) -> set[int]:
+            draft.copy_batch_block_offsets(offsets, [req.py_request_id], 1, 0, 1)
+            worker._refresh_ctx_block_tables(attn_metadata, 1)
+            row = worker._ctx_block_tables[0].tolist()
+            return {
+                row[ordinal] + layer
+                for ordinal in _backed_ordinals(draft.kv_cache_map[req.py_request_id])
+                for layer in range(num_layers)
+            }
+
+        occupant_slots = own_slots(occupant)
+        request_slots = own_slots(request)
+        assert occupant_slots and request_slots
+        assert not occupant_slots & request_slots
+
+        # As DFlashSpecMetadata.prepare() does for a new generation request.
+        slot = worker._assign_slot(request.py_request_id)
+        worker._rebuild_batch_to_slot([request.py_request_id])
+        assert worker._ctx_len_host[slot] == 0
+        pool.fill_(7.0)
+        before = pool.clone()
+
+        tokens_per_req = max_draft_len + 1
+        captured = torch.randn(tokens_per_req, hidden, device="cuda")
+        spec_metadata = SimpleNamespace(
+            hidden_size=hidden,
+            runtime_draft_len=max_draft_len,
+            captured_hidden_states=None,
+            get_hidden_states=lambda num_tokens: captured[:num_tokens],
+        )
+        inputs = worker.prepare_1st_drafter_inputs(
+            input_ids=torch.zeros(tokens_per_req, dtype=torch.long, device="cuda"),
+            position_ids=torch.zeros(tokens_per_req, dtype=torch.long, device="cuda"),
+            hidden_states=torch.zeros(tokens_per_req, hidden, device="cuda"),
+            accepted_tokens=torch.ones((1, tokens_per_req), dtype=torch.long, device="cuda"),
+            num_accepted_tokens=torch.tensor([tokens_per_req], dtype=torch.int32, device="cuda"),
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=draft_model,
+            total_target_tokens=tokens_per_req,
+        )
+        # The block decode then appends the block's own K/V right after the
+        # context it reads, through the same table row.
+        num_ctx = int(inputs["num_ctx_per_req"][0])
+        assert num_ctx == tokens_per_req
+        block = worker._compute_block_size
+        block_kv = torch.full(
+            (block, num_layers, num_kv_heads, head_dim), 5.0, dtype=torch.bfloat16, device="cuda"
+        )
+        worker._store_context_kv_paged(
+            block_kv,
+            block_kv.clone(),
+            torch.zeros(block, dtype=torch.long, device="cuda"),
+            torch.arange(num_ctx, num_ctx + block, dtype=torch.long, device="cuda"),
+        )
+        torch.cuda.synchronize()
+
+        written = set((pool != before).flatten(1).any(dim=1).nonzero().flatten().tolist())
+        assert written, "the drafter wrote nothing"
+        assert not written & occupant_slots, "the drafter wrote another request's draft pages"
+        assert written <= request_slots
+        draft.free_resources(request)
+        draft.free_resources(occupant)
+    finally:
+        draft.shutdown()
 
 
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
