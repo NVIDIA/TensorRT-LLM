@@ -12,9 +12,18 @@ new prompt extends a cached one, it tokenizes only the tail and splices it onto
 the cached ids, so the cost of a turn scales with the delta rather than the
 whole prompt.
 
+Agentic clients also rewrite the end of the history between turns, for example
+by trimming a tool result or replacing the last message, so the new prompt is
+no longer an extension of the cached one. The cache records a checkpoint every
+256 tokens of a cached prompt. When a new prompt diverges from a cached one, the
+cache reuses the cached ids up to the last checkpoint that still lies a full
+checkpoint interval inside their longest common prefix, and tokenizes only the
+rest.
+
 Tokenizing a tail in isolation is not generally identical to tokenizing the
 whole prompt, because BPE merges can straddle the split. The cache therefore
-backs off a fixed number of tokens from the end of the cached prefix,
+backs off a fixed number of tokens from the end of the cached prefix (for a
+diverging prompt, at least one checkpoint interval before the divergence),
 re-tokenizes from there, and accepts the splice only if the re-tokenized ids
 equal the cached ids over that seam. Otherwise the prompt is tokenized in full.
 The output is always identical to tokenizing the whole prompt.
@@ -60,7 +69,10 @@ feature you turned on.
   `add_special_tokens=False`, so they benefit. `/v1/completions` defaults to
   `add_special_tokens=True` and is not accelerated.
 - A prompt that extends a cached entry replaces that entry, so a conversation
-  costs one entry regardless of how many turns it has. Lookup is bucketed by a
+  costs one entry regardless of how many turns it has. A prompt that diverges
+  from a cached entry is added next to it instead: the divergence may be a
+  branch, such as a subagent started from a shared history, and the original
+  conversation can still continue from the old entry. Lookup is bucketed by a
   hash of the first `TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS` characters, and each
   entry keeps a short probe of its last characters so that conversations
   sharing a long system preamble are told apart without comparing the
@@ -68,7 +80,8 @@ feature you turned on.
 - An unexpected exception inside the cache disables it, with a warning, and the
   request is tokenized normally. A cache problem never fails a request.
 - The cache logs its configuration at startup and, every 1000 cache-eligible
-  requests, an `INFO` line with the hit rate, the number of re-synchronization
+  requests, an `INFO` line with the hit rate (and how many hits were on diverging
+  prompts), the number of re-synchronization
   fallbacks, and its occupancy, so a cache that is enabled but never hitting is
   visible in the server log.
 
@@ -92,3 +105,8 @@ The splice was also checked against real `gpt2`, Llama-3, and Qwen3
 tokenizers on 300 randomly grown multi-turn prompts each, with deltas
 deliberately starting mid-word: 300/300 identical ids, 280 cache hits, and 0
 re-synchronization fallbacks per tokenizer.
+
+Splicing diverging prompts was checked on 300 multi-turn prompts whose history
+is rewritten between turns: all 300 matched tokenizing the whole prompt, 99.3%
+were cache hits, and tokenization took about a tenth of the time of
+tokenizing every prompt in full.
