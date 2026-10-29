@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+from copy import deepcopy
+from pathlib import Path
 from typing import get_args
 from unittest import mock
 
@@ -27,6 +29,7 @@ from tensorrt_llm.bench.utils.data import (
     create_dataset_from_stream,
     initialize_tokenizer,
 )
+from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
@@ -78,6 +81,143 @@ def test_runtime_config_preserves_pytorch_performance_options():
 
     assert llm_args["cuda_graph_config"] == {"batch_sizes": [1, 2]}
     assert llm_args["disable_overlap_scheduler"] is True
+
+
+@pytest.mark.parametrize("capacity", [1, 3, 17, 65])
+@pytest.mark.parametrize(
+    "graph_options",
+    [None, {}, {"enable_padding": True}, {"batch_sizes": []}, {"batch_sizes": None}],
+    ids=["unspecified", "empty", "padding", "empty-sizes", "unset-sizes"],
+)
+def test_runtime_graph_defaults_follow_effective_capacity(
+    capacity: int, graph_options: dict | None
+) -> None:
+    config = _benchmark_runtime_config("pytorch")
+    config.settings_config.max_batch_size = capacity
+    options = config.performance_options.pytorch_config
+    if graph_options is None:
+        del options["cuda_graph_config"]
+    else:
+        options["cuda_graph_config"] = deepcopy(graph_options)
+
+    llm_args = config.get_llm_args()
+    graph = CudaGraphConfig(**llm_args["cuda_graph_config"])
+
+    assert graph.max_batch_size == capacity, "Graph defaults must follow runtime capacity"
+    assert graph.batch_sizes
+    assert graph.batch_sizes[-1] == capacity
+    assert all(0 < size <= capacity for size in graph.batch_sizes)
+    if graph_options and "enable_padding" in graph_options:
+        assert graph.enable_padding is graph_options["enable_padding"]
+
+
+@pytest.mark.parametrize("capacity", [3, 17, 65])
+@pytest.mark.parametrize("explicit_kind", ["maximum", "sizes", "both"])
+def test_runtime_graph_preserves_explicit_capture_domain(capacity: int, explicit_kind: str) -> None:
+    config = _benchmark_runtime_config("pytorch")
+    config.settings_config.max_batch_size = capacity
+    capture_maximum = capacity + 2
+    sizes = [capture_maximum, 1, capacity]
+    graph_options = {"enable_padding": True}
+    if explicit_kind in {"maximum", "both"}:
+        graph_options["max_batch_size"] = capture_maximum
+    if explicit_kind in {"sizes", "both"}:
+        graph_options["batch_sizes"] = sizes
+    config.performance_options.pytorch_config["cuda_graph_config"] = graph_options
+
+    llm_args = config.get_llm_args()
+    graph = CudaGraphConfig(**llm_args["cuda_graph_config"])
+
+    assert graph.max_batch_size == capture_maximum, "Explicit graph maximum must take precedence"
+    assert graph.enable_padding is True
+    if explicit_kind in {"sizes", "both"}:
+        assert graph.batch_sizes == sorted(sizes), "Explicit capture sizes must be preserved"
+    else:
+        assert graph.batch_sizes[-1] == capture_maximum
+        assert all(0 < size <= capture_maximum for size in graph.batch_sizes)
+
+
+def test_runtime_graph_none_disables_capture() -> None:
+    config = _benchmark_runtime_config("pytorch")
+    config.performance_options.pytorch_config["cuda_graph_config"] = None
+
+    assert config.get_llm_args()["cuda_graph_config"] is None
+
+
+def test_runtime_graph_zero_retains_public_default_sentinel() -> None:
+    config = _benchmark_runtime_config("pytorch")
+    config.performance_options.pytorch_config["cuda_graph_config"] = {"max_batch_size": 0}
+
+    graph_options = config.get_llm_args()["cuda_graph_config"]
+    assert graph_options["max_batch_size"] == 0, "Zero is an explicit public default sentinel"
+    graph = CudaGraphConfig(**graph_options)
+    assert graph.max_batch_size > 0
+    assert graph.batch_sizes == CudaGraphConfig(max_batch_size=0).batch_sizes
+
+
+def test_runtime_graph_defaults_do_not_mutate_repeated_calls() -> None:
+    config = _benchmark_runtime_config("pytorch")
+    config.performance_options.pytorch_config["cuda_graph_config"] = {"enable_padding": True}
+    original_options = deepcopy(config.performance_options.pytorch_config)
+    capacities = [3, 17, 5]
+    graphs = []
+
+    for capacity in capacities:
+        config.settings_config.max_batch_size = capacity
+        graph_options = config.get_llm_args()["cuda_graph_config"]
+        graphs.append(CudaGraphConfig(**graph_options))
+        assert config.performance_options.pytorch_config == original_options, (
+            "Deriving graph defaults must not mutate reusable performance options"
+        )
+
+    assert [graph.max_batch_size for graph in graphs] == capacities
+    assert [graph.batch_sizes[-1] for graph in graphs] == capacities
+
+
+@pytest.mark.parametrize("explicit_capacity", [False, True])
+@pytest.mark.parametrize("graph_source", ["performance", "yaml"])
+def test_runtime_graph_defaults_follow_yaml_cli_capacity_priority(
+    tmp_path: Path, explicit_capacity: bool, graph_source: str
+) -> None:
+    config = _benchmark_runtime_config("pytorch")
+    cli_capacity, yaml_capacity = 5, 19
+    config.settings_config.max_batch_size = cli_capacity
+    config.performance_options.pytorch_config["cuda_graph_config"] = {"enable_padding": True}
+    yaml_text = f"max_batch_size: {yaml_capacity}\n"
+    if graph_source == "yaml":
+        yaml_text += "cuda_graph_config:\n  enable_padding: false\n"
+    options_path = tmp_path / "runtime.yaml"
+    options_path.write_text(yaml_text)
+    config.extra_llm_api_options = str(options_path)
+    config.explicit_cli_keys = {"max_batch_size"} if explicit_capacity else set()
+    expected_capacity = cli_capacity if explicit_capacity else yaml_capacity
+
+    llm_args = config.get_llm_args()
+    graph = CudaGraphConfig(**llm_args["cuda_graph_config"])
+
+    assert llm_args["max_batch_size"] == expected_capacity
+    assert graph.max_batch_size == expected_capacity, (
+        "Graph defaults must follow the final capacity"
+    )
+    assert graph.batch_sizes[-1] == expected_capacity
+    assert graph.enable_padding is (graph_source == "performance")
+
+
+@pytest.mark.parametrize("explicit_graph", [False, True])
+def test_runtime_graph_yaml_cli_graph_priority(tmp_path: Path, explicit_graph: bool) -> None:
+    config = _benchmark_runtime_config("pytorch")
+    cli_sizes, yaml_sizes = [1, 3], [2, 7]
+    config.performance_options.pytorch_config["cuda_graph_config"] = {"batch_sizes": cli_sizes}
+    options_path = tmp_path / "graphs.yaml"
+    options_path.write_text(f"cuda_graph_config:\n  batch_sizes: {yaml_sizes}\n")
+    config.extra_llm_api_options = str(options_path)
+    config.explicit_cli_keys = {"cuda_graph_config"} if explicit_graph else set()
+    expected_sizes = cli_sizes if explicit_graph else yaml_sizes
+
+    graph = CudaGraphConfig(**config.get_llm_args()["cuda_graph_config"])
+
+    assert graph.batch_sizes == expected_sizes
+    assert graph.max_batch_size == max(expected_sizes)
 
 
 def test_format_startup_metrics() -> None:
