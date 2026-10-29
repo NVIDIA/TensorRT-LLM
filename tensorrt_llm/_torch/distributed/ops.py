@@ -1459,6 +1459,10 @@ class MoEAllReduce(nn.Module):
             output_add = expert_reduction + shared_expert_output
             output_residual = output_add + residual
             output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+
+            Outputs: [hidden_states, residual], or with
+            MoEAllReduceParams.mxfp8_out [hidden_states, hidden_states_mxfp8,
+            swizzled_scale_factor, residual]; residual only when one is given.
         """
         super().__init__()
         self.mapping = mapping
@@ -1520,6 +1524,8 @@ class MoEAllReduce(nn.Module):
                 rank=self.mapping.tp_rank,
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
+                match_unfused_numerics=all_reduce_params.match_unfused_numerics,
+                mxfp8_out=all_reduce_params.mxfp8_out,
             )
 
 

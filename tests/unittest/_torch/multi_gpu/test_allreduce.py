@@ -1090,3 +1090,120 @@ def test_allreduce_residual_rms_norm_mxfp8(seq_len, hidden_size, strategy,
     )
     for r in results:
         assert r is True
+
+
+def _valid_swizzled_ue8m0_scales(scale: torch.Tensor, rows: int,
+                                 hidden_size: int) -> torch.Tensor:
+    """The [rows, hidden_size / 32] UE8M0 scales out of a 128x4-swizzled buffer (padding excluded)."""
+    cols = hidden_size // 32
+    padded_cols = (cols + 3) // 4 * 4
+    r = torch.arange(rows, device=scale.device).view(-1, 1)
+    c = torch.arange(cols, device=scale.device).view(1, -1)
+    index = ((c % 4) + (c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 +
+             (r // 128) * (128 * padded_cols))
+    return scale.view(torch.uint8).reshape(-1)[index]
+
+
+@torch.inference_mode()
+def run_moe_finalize_allreduce_unfused_numerics_op(
+        fc2_output: torch.Tensor, residual: torch.Tensor,
+        shared_expert_output: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor, scale: torch.Tensor,
+        tensor_parallel_rank: int, tensor_parallel_size: int):
+    """match_unfused_numerics must equal finalize + add + RESIDUAL_RMS_NORM (+ mxfp8_quantize) bit for bit."""
+    fc2_output = fc2_output.cuda()
+    residual = residual.cuda()
+    shared_expert_output = shared_expert_output.cuda()
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.cuda()
+    scale = scale.cuda()
+    num_tokens, hidden_size = residual.shape
+    torch.manual_seed(7)
+    norm_weight = torch.randn((hidden_size, ),
+                              dtype=residual.dtype,
+                              device="cuda")
+    eps = 1e-6
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=tensor_parallel_rank)
+
+    # Unfused: the finalize kernel's FP32 sum over the top-k slots in slot
+    # order (each BF16 x BF16 product is exact in FP32) rounded to BF16, the
+    # BF16 shared-expert add, then the one-shot AllReduce + RMSNorm.
+    routed = torch.zeros((num_tokens, hidden_size),
+                         dtype=torch.float32,
+                         device="cuda")
+    for k in range(expanded_idx_to_permuted_idx.shape[1]):
+        rows = fc2_output[expanded_idx_to_permuted_idx[:, k].long()].float()
+        routed = routed + scale[:, k:k + 1].float() * rows
+    partial = routed.to(torch.bfloat16) + shared_expert_output
+    allreduce = AllReduce(mapping=mapping,
+                          strategy=AllReduceStrategy.ONESHOT).cuda()
+    norm_ref, residual_ref = allreduce(
+        partial,
+        all_reduce_params=AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=eps))
+    act_ref, act_scale_ref = torch.ops.trtllm.mxfp8_quantize(norm_ref, True)
+
+    moe_allreduce = MoEAllReduce(mapping=mapping)
+    for mxfp8_out in (False, True):
+        outputs = moe_allreduce(
+            fc2_output,
+            all_reduce_params=MoEAllReduceParams(
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                expert_scale_factor=scale,
+                shared_expert_output=shared_expert_output,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=eps,
+                match_unfused_numerics=True,
+                mxfp8_out=mxfp8_out,
+            ))
+        assert len(outputs) == (4 if mxfp8_out else 2)
+        assert torch.equal(outputs[0], norm_ref)
+        assert torch.equal(outputs[-1], residual_ref)
+        if mxfp8_out:
+            act, act_scale = outputs[1], outputs[2]
+            assert act.dtype == torch.float8_e4m3fn
+            assert torch.equal(act.view(torch.uint8), act_ref.view(torch.uint8))
+            assert torch.equal(
+                _valid_swizzled_ue8m0_scales(act_scale, num_tokens,
+                                             hidden_size),
+                _valid_swizzled_ue8m0_scales(act_scale_ref, num_tokens,
+                                             hidden_size))
+    return True
+
+
+@torch.inference_mode()
+@skip_pre_blackwell
+@pytest.mark.parametrize("seq_len", [1, 16, 128], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [3072, 7168],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_moe_finalize_allreduce_unfused_numerics(seq_len, hidden_size,
+                                                 mpi_pool_executor):
+    if torch.cuda.device_count() < mpi_pool_executor.num_workers:
+        pytest.skip(f"Requires {mpi_pool_executor.num_workers} GPUs")
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    top_k = 8
+    shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
+    fc2_output = torch.randn((seq_len * top_k, hidden_size), dtype=dtype)
+    scale = torch.rand((seq_len, top_k), dtype=dtype)
+    expanded_idx_to_permuted_idx = torch.randperm(seq_len * top_k,
+                                                  dtype=torch.int32).view(
+                                                      seq_len, top_k)
+    residual = torch.randn_like(shared_expert_output)
+
+    results = mpi_pool_executor.map(
+        run_moe_finalize_single_rank,
+        *zip(*[(tensor_parallel_size,
+                run_moe_finalize_allreduce_unfused_numerics_op, fc2_output,
+                residual, shared_expert_output, expanded_idx_to_permuted_idx,
+                scale)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True

@@ -1546,13 +1546,29 @@ def _register_fake():
         return torch.empty_like(sf, dtype=torch.uint8)
 
     @torch.library.register_fake("trtllm::moe_finalize_allreduce")
-    def _(input, residual, norm_weight, expanded_idx_to_permuted_idx,
-          shared_expert_output, expert_scale_factor, workspace, rank, nranks,
-          eps) -> List[torch.Tensor]:
-        return [
-            torch.empty_like(residual),
-            torch.empty_like(residual),
-        ]
+    def _(input,
+          residual,
+          norm_weight,
+          expanded_idx_to_permuted_idx,
+          shared_expert_output,
+          expert_scale_factor,
+          workspace,
+          rank,
+          nranks,
+          eps,
+          match_unfused_numerics=False,
+          mxfp8_out=False) -> List[torch.Tensor]:
+        num_tokens = expanded_idx_to_permuted_idx.shape[0]
+        shape = (num_tokens, norm_weight.shape[0])
+        outputs = [input.new_empty(shape)]
+        if mxfp8_out:
+            outputs.append(input.new_empty(shape, dtype=torch.float8_e4m3fn))
+            outputs.append(
+                input.new_empty(fp4_utils.get_fp4_shape(shape, 32)[1],
+                                dtype=torch.uint8))
+        if residual is not None:
+            outputs.append(torch.empty_like(residual))
+        return outputs
 
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
     def _(router_logits, topk, output_dtype: torch.dtype = None):
