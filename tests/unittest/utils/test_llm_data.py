@@ -25,8 +25,6 @@ def test_get_checkpoint_returns_staged_path(tmp_path, monkeypatch) -> None:
     (tmp_path / "my-model").mkdir()
 
     assert get_checkpoint("my-model") == str(tmp_path / "my-model")
-    # TEMPORARY (rerun policy validation): fails on every attempt. Revert before merging.
-    assert False, "fails on every attempt on purpose"
 
 
 @pytest.mark.cpu_only

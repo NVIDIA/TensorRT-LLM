@@ -32,12 +32,6 @@ pytestmark = pytest.mark.cpu_only
 
 def test_visual_gen_output_is_dataclass():
     """VisualGenOutput must be a flat @dataclass."""
-    # TEMPORARY (rerun policy validation): fails after 150 s, over the CPU stage's
-    # rerun_once_max_duration_s, so it is not rerun. Revert before merging.
-    import time
-
-    time.sleep(150)
-    assert False, "slow failure on purpose"
     assert is_dataclass(VisualGenOutput)
     field_names = {f.name for f in fields(VisualGenOutput)}
     assert field_names == {

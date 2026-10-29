@@ -198,9 +198,7 @@ l0_cpu:
   - unittest/dynamo
   - unittest/evaluate/test_image_generation_eval_cli.py
   - unittest/evaluate/test_json_mode_eval.py
-  # TEMPORARY (rerun policy validation): TIMEOUT (1) makes the deliberate hang in
-  # test_base_worker.py time out. Restore the plain ISOLATION entry before merging.
-  - unittest/executor/test_base_worker.py TIMEOUT (1) ISOLATION
+  - unittest/executor/test_base_worker.py ISOLATION
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py
   - unittest/executor/test_rpc.py
