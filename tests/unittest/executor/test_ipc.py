@@ -356,6 +356,52 @@ class TestIpcBasics:
         finally:
             server.close()
 
+    @staticmethod
+    def _orphaned_sender(linger_ms: int | None = None) -> ZeroMqQueue:
+        """Build a PUSH queue whose last message is queued for a peer that has exited.
+
+        Args:
+            linger_ms: LINGER to set on the sender before returning it, or None to
+                keep zmq's default.
+
+        Returns:
+            The sender, still open, with one undeliverable message queued.
+        """
+        receiver = ZeroMqQueue(
+            socket_type=zmq.PULL, is_server=True, is_async=False, name="test_exited_receiver"
+        )
+        sender = ZeroMqQueue(
+            address=receiver.address,
+            socket_type=zmq.PUSH,
+            is_server=False,
+            is_async=False,
+            name="test_orphaned_sender",
+        )
+        sender.put({"message": "delivered"})
+        assert receiver.get() == {"message": "delivered"}
+        receiver.socket.setsockopt(zmq.LINGER, 0)
+        receiver.close()
+        # The receiver is gone, so this message stays queued on the sender.
+        sender.put({"message": "undeliverable"})
+        if linger_ms is not None:
+            sender.socket.setsockopt(zmq.LINGER, linger_ms)
+        return sender
+
+    def test_close_does_not_wait_forever_for_an_exited_peer(self):
+        """close() returns while a queued message waits for a peer that is gone."""
+        sender = self._orphaned_sender()
+        closer = Thread(target=sender.close, daemon=True)
+        closer.start()
+        closer.join(timeout=10)
+        assert not closer.is_alive(), "close() blocked on a message for an exited peer"
+
+    def test_close_keeps_an_explicit_linger(self):
+        """A LINGER chosen by the caller is not replaced by the close default."""
+        sender = self._orphaned_sender(linger_ms=0)
+        start_time = time.monotonic()
+        sender.close()
+        assert time.monotonic() - start_time < 0.5
+
 
 class TestIpcAsyncBasics:
     """Test asynchronous IPC operations."""
