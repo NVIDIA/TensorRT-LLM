@@ -284,7 +284,7 @@ class CutlassMoELoraMixin:
 
         # Gather (ranks, weight_ptrs) per kernel slot. weight_pointers is built
         # flat ([num_seqs * 3], row-major (A, B, DoRA) per seq) in
-        # PyTorchModelEngine._build_lora_params; the op expects [num_seqs, 3].
+        # ModelEngine._build_lora_params; the op expects [num_seqs, 3].
         active_max_rank = 0
 
         def _source(module_type: LoraModuleType) -> _RanksAndPtrs | None:

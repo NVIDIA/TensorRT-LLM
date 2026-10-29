@@ -23,12 +23,11 @@ from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
     MoEProblem,
-    MoERejectReason,
     MoERunContext,
+    check_activation_support,
     require_comm_plan,
 )
 from ..impl_identity import register_moe_impl
-from ..interface import _reject
 from ..quantization import DeepSeekFP8BlockScalesFusedMoEMethod
 from .base import CutlassFusedMoEBase
 from .eligibility import BF16_ONLY, SmSupport, check_cutlass_leaf
@@ -65,23 +64,7 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        return check_cutlass_leaf(cls, p, d, cls._check_activation(p))
-
-    @classmethod
-    def _check_activation(cls, p: MoEProblem) -> MoEEligibility | None:
-        """Reject an activation ``activation_support`` does not cover.
-
-        Resolution runs the same check; this one answers a direct call.
-        """
-        detail = cls.activation_support.rejection_detail(
-            cls.__name__,
-            p.activation_type,
-            clamp_after_silu=p.clamp_after_silu,
-            constants=p.activation_constants,
-        )
-        if detail is None:
-            return None
-        return _reject(MoERejectReason.ACTIVATION_UNSUPPORTED, detail)
+        return check_cutlass_leaf(cls, p, d, check_activation_support(cls, p))
 
     def _get_quant_method(self) -> object:
         return DeepSeekFP8BlockScalesFusedMoEMethod()

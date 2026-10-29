@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 WORLD_SIZE = 4
-"""dep4's world size -- the topology these entries are certified for."""
+"""dep4's world size -- the default topology these entries are certified for (one node)."""
 
 _LAUNCHER_GRACE_S = 300
 """Headroom over the entry's own deadline, so its message wins the race."""
@@ -69,8 +69,7 @@ def _devices(world_size: int) -> str:
 
         devices = [str(i) for i in range(torch.cuda.device_count())]
     assert len(devices) >= world_size, (
-        f"this entry is certified at world size {world_size}; only "
-        f"{len(devices)} device(s) are visible"
+        f"this run is at world size {world_size}; only {len(devices)} device(s) are visible"
     )
     return ",".join(devices[:world_size])
 
@@ -90,18 +89,32 @@ def _load_launcher_constants(launcher: Path):
 
 
 def run(entry: str, world_size: int = WORLD_SIZE) -> None:
-    """Run ``_<entry>_op_matrix``'s launcher over ``world_size`` devices."""
+    """Run ``_<entry>_op_matrix``'s launcher over ``world_size`` devices of this node (its local ``mpirun``).
+
+    A launcher that takes ``--world-size`` (the stateful entries' ``_lockstep`` launchers) also runs as one of N
+    ranks started by an external launcher, ``--launcher srun --world-size N``: that is how a multi-node receipt is
+    recorded, outside pytest; the others ignore the argument and size themselves from CUDA_VISIBLE_DEVICES.
+    """
     launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices(world_size))
 
     # The ranks import tensorrt_llm absolutely, and a source checkout is not
-    # necessarily installed. tests/unittest/_torch/modeling_v2/comm -> repo root.
+    # necessarily installed. Hand them the checkout only when it is the
+    # tensorrt_llm this process resolves (an in-tree build, or nothing
+    # installed). Otherwise the installed package is already on their path,
+    # and the checkout must not come first: CI runs from an unbuilt checkout,
+    # whose tensorrt_llm/ has no compiled bindings, beside an installed wheel.
+    # tests/unittest/_torch/modeling_v2/comm -> repo root.
     repo_root = Path(__file__).resolve().parents[5]
-    assert (repo_root / "tensorrt_llm").is_dir(), (
-        f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
-        f"this file moved without its parents[] index following"
-    )
-    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p)
+    installed = importlib.util.find_spec("tensorrt_llm")
+    if installed is None or Path(installed.origin).resolve().parents[1] == repo_root:
+        assert (repo_root / "tensorrt_llm").is_dir(), (
+            f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
+            f"this file moved without its parents[] index following"
+        )
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p
+        )
 
     # Read the budget off the entry rather than restating it: an entry that
     # raises its own deadline would otherwise be killed by this one first,
@@ -111,7 +124,7 @@ def run(entry: str, world_size: int = WORLD_SIZE) -> None:
     timeout = constants.DEADLINE_S + getattr(constants, "WEDGE_CAP_S", 0) + _LAUNCHER_GRACE_S
 
     completed = subprocess.run(
-        [sys.executable, str(launcher)],
+        [sys.executable, str(launcher), "--world-size", str(world_size)],
         env=env,
         capture_output=True,
         text=True,

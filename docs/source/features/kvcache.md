@@ -22,7 +22,7 @@ One caveat in the current code is that only leaf blocks can be evicted (leaves a
 
 ### Retention Policy
 
-Blocks are assigned priority in line with the [retention policy](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. Blocks with lower priority scores will be freed preferentially to blocks with higher priority. The retention policy is a list of [TokenRangeRetentionConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig) objects, each specifying priority for a given range of tokens, such as "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect. Priority reverts to the default of 35 after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_policy``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect. Priority reverts to the default after expiration. Any property that expects a duration can be set to None. This indicates that particular part of the retention policy never expires.
+Blocks are assigned priority in line with the [retention policy](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig) of the request. Blocks with lower priority scores will be freed preferentially to blocks with higher priority. The retention policy is a list of [TokenRangeRetentionConfig](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig) objects, each specifying priority for a given range of tokens, such as "assign priority X to tokens 10 through 61". You can also assign a duration in milliseconds for this to remain in effect. Priority reverts to the default of 35 after a period of ```duration_ms``` has elapsed from the first time the block was made available for reuse. TokenRangeRetentionConfig only applies to input (prompt) tokens. The property ```decode_retention_priority``` specifies what priority to assign to blocks with generated (decoded) tokens and ```decode_duration_ms``` specifies how long this should remain in effect. Priority reverts to the default after expiration. Any property that expects a duration can be set to None. This indicates that particular part of the retention policy never expires.
 
 Not in use: ```transfer_mode``` is a debug option and should not be used.
 
@@ -77,11 +77,14 @@ scheduler_config:
 ### Selecting the KV Cache Manager
 
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
-selects between them and defaults to `auto`, which adopts the model's own
-preference and falls back to the V1 C++ manager for models that do not declare
-one. Set it to `true` or `false` to override the model default.
+selects between them and defaults to `true`, which selects the V2 manager. Set it
+to `false` to select the V1 C++ manager for models that support it. Set it to
+`auto` to adopt the model's own preference instead; `auto` falls back to the V1
+C++ manager for models that do not declare one. With `auto`, disaggregated
+serving keeps a V2 preference only with the Python NIXL transceiver
+(`transceiver_runtime: PYTHON`, `backend: NIXL`) and otherwise falls back to V1.
 
-Models that select the V2 manager by default:
+Models whose preference selects the V2 manager when the setting is `auto`:
 
 | Model | Reason |
 | --- | --- |

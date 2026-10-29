@@ -149,6 +149,11 @@ set_target_properties(
                                  CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_subdirectory(kernels)
+set(KIMI_K3_MODEL_CSRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/csrc"
+)
+add_subdirectory("${KIMI_K3_MODEL_CSRC}"
+                 "${CMAKE_CURRENT_BINARY_DIR}/kimi_k3_model")
 add_subdirectory(runtime)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
@@ -194,6 +199,7 @@ set(TRTLLM_LINK_LIBS
     mamba2_mtp_ssm_cache_src
     kda_decode_src
     kimi_k3_attn_res_src
+    kimi_k3_model_src
     ws_layernorm_src
     fusedGatedRMSNormQuant_src
     fpA_intB_gemm_src
@@ -341,6 +347,8 @@ endif()
 
 if(BUILD_PYT)
   add_subdirectory(thop)
+  # modeling_v2 family libraries: torch-op libraries loaded on demand.
+  add_subdirectory(modeling_v2)
 endif()
 
 add_subdirectory(nanobind)

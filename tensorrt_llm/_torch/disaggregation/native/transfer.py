@@ -130,6 +130,9 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # Context-first receivers send REQUEST_DATA only after the context phase
+    # produced the KV cache, so a TxSession must already exist (or have ended).
+    context_first: bool = False
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -145,6 +148,7 @@ class RecvReqInfo:
                 "aux_slot": self.aux_slot,
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
+                "context_first": self.context_first,
             }
         )
 
@@ -657,8 +661,12 @@ class Sender(SenderBase):
 
         Called from the executor's context-status poll. With gen-first ADP
         broadcast, non-assigned DP ranks accumulate entries that are never
-        consumed; this sweep prevents unbounded growth. Without attention DP an
-        evicted entry's peer is answered FAILED.
+        consumed; this sweep prevents unbounded growth.
+
+        A context-first entry that no TxSession claimed within the TTL never will
+        be (the session already ended, or the receiver names a request this rank
+        never had), so its receiver is told that the transfer failed instead of
+        waiting for data that will not arrive.
         """
         now = time.monotonic()
         with self._sessions_lock:
@@ -676,28 +684,32 @@ class Sender(SenderBase):
             ]
         if not stale_rids:
             return
-        # Without attention DP no request is broadcast, so an entry this old is a peer still
-        # waiting on a session that is long gone or never came, and it must be told: dropping
-        # it silently leaves the peer's receive unresolved for good. Under attention DP the
-        # entries of non-assigned DP ranks are expected and must stay silent, since a FAILED
-        # from them would fail a receive the assigned ranks are still writing.
-        answer_peers = self._registrar.self_rank_info.dp_size == 1
-        swept: list[RecvReqInfo] = []
+        orphaned_infos: list[RecvReqInfo] = []
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
                 if rid not in self._sessions and rid in self._peer_requests:
-                    infos = self._peer_requests.pop(rid, None) or {}
+                    req_info_map = self._peer_requests.pop(rid)
                     self._peer_requests_timestamps.pop(rid, None)
+                    orphaned_infos.extend(
+                        info for info in req_info_map.values() if info.context_first
+                    )
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
-                    if answer_peers:
-                        swept.extend(infos.values())
-        for info in swept:
-            logger.warning(
-                f"Answering FAILED to a REQUEST_DATA for rid={info.unique_rid} that no TxSession "
-                f"took within {self._STALE_REQ_INFO_TTL_S:.0f}s"
-            )
-            # Queue it on a worker: this runs on the executor thread, not the listener's.
-            self._send_failed_result_to_receiver(info, defer_to_worker=True)
+        for info in orphaned_infos:
+            self._fail_orphaned_receiver(info)
+
+    def _fail_orphaned_receiver(self, info: RecvReqInfo) -> None:
+        """Report FAILED for a context-first REQUEST_DATA that no TxSession claimed.
+
+        This resolves the receiver's task, so its RxSession fails through the
+        normal transfer-failure path. The sweep runs on the executor thread, not
+        the listener's, so the message goes through a worker queue.
+        """
+        logger.warning(
+            f"KV transfer request rid={info.unique_rid} from receiver "
+            f"{info.instance_name} rank {info.instance_rank} has no TxSession on this "
+            f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
+        )
+        self._send_failed_result_to_receiver(info, defer_to_worker=True)
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -2830,6 +2842,7 @@ class Receiver(ReceiverBase):
             dst_start_token=None,
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
+            context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
         )
 
     @staticmethod

@@ -2006,19 +2006,18 @@ def test_failed_receive_stops_waiting_for_a_silent_writer(monkeypatch: pytest.Mo
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("dp_size", "session_live", "answered"),
-    [(1, False, True), (2, False, False), (1, True, False)],
+    ("context_first", "session_live", "answered"),
+    [(True, False, True), (False, False, False), (True, True, False)],
 )
-def test_stale_request_data_is_answered_when_swept_without_attention_dp(
-    dp_size: int, session_live: bool, answered: bool, monkeypatch: pytest.MonkeyPatch
+def test_stale_context_first_request_data_is_answered_when_swept(
+    context_first: bool, session_live: bool, answered: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A REQUEST_DATA no session took within the TTL is answered FAILED, not dropped.
+    """A context-first REQUEST_DATA no session took within the TTL is answered FAILED.
 
     Dropping it leaves the peer's receive waiting for good, e.g. when it asks
-    after the cleared-session markers expire. Under attention DP the entries of
-    non-assigned DP ranks are expected and stay silent; a FAILED from them would
-    fail a receive the assigned ranks are still writing. An entry whose session
-    is live is neither dropped nor answered.
+    after the cleared-session markers expire. Generation-first entries may
+    legitimately stay unclaimed (ADP broadcast to non-assigned DP ranks) and are
+    only evicted. An entry whose session is live is neither dropped nor answered.
     """
     rid = 117
     clock = {"t": 1000.0}
@@ -2034,7 +2033,6 @@ def test_stale_request_data_is_answered_when_swept_without_attention_dp(
     sender._num_threads = 1
     sender._send_task_queues = [queue.Queue()]
     sender._registrar = SimpleNamespace(
-        self_rank_info=SimpleNamespace(dp_size=dp_size),
         get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="gen")),
     )
     info = transfer_mod.RecvReqInfo(
@@ -2044,6 +2042,7 @@ def test_stale_request_data_is_answered_when_swept_without_attention_dp(
         block_ids_per_layer_groups=[],
         unique_rid=rid,
         slice_id=0,
+        context_first=context_first,
     )
     sender._peer_requests = {rid: {info.instance_rank: info}}
     sender._peer_requests_timestamps = {rid: clock["t"]}
@@ -3041,6 +3040,8 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     receiver._recv_sessions = {}
     receiver._recv_reqs = {}
     receiver._kv_size_rank_factor = 1
+    receiver._page_table = None
+    receiver._mapping = SimpleNamespace(cp_size=1)
 
     recv_tasks = []
 
@@ -3053,7 +3054,6 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     )
     receiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=recv_session))
     receiver._create_cache_extent = Mock(return_value=CacheExtent(name=rid, local=kv_slice))
-    receiver._chunk_num_bytes = Mock(return_value=0)
 
     receiver.request_and_receive_async(recv_req)
 

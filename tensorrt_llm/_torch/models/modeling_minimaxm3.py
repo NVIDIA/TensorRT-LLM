@@ -79,6 +79,7 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
+from .checkpoints.hf.weight_mapper import convert_compressed_tensors_nvfp4_weights
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
     DecoderModel,
@@ -2993,6 +2994,10 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         params_map: Optional[Dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
+        # Accept compressed-tensors NVFP4 names before any loader below reads
+        # the dict. Keyed on the tensor names, not on the global quant config:
+        # that is MIXED_PRECISION when NVFP4 covers only some modules.
+        weights = convert_compressed_tensors_nvfp4_weights(weights)
         # Pack the opt-in five-way projection with MiniMax-specific TP
         # sharding before the generic mapper handles the compatibility path.
         packed_projection_modules = _load_qkv_index_proj_weights(self, weights)

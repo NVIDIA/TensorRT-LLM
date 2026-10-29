@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +21,8 @@ from typing import ClassVar
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint8
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import (
@@ -34,6 +37,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
     _TASK_CACHE_TMEM_BASE_OFFSET,
@@ -46,14 +50,27 @@ from .helpers_common import (
 from .smem_resources import SmemKvResource
 
 
+def _has_packed_e4m3_e2m1_mul() -> bool:
+    """Whether the compile target has the packed E4M3 x E2M1 multiply.
+
+    PTX 9.4 (CUDA 13.4) adds it for SM100 and SM103; ptxas rejects it for
+    SM107, which takes the f16x2 path instead.
+    """
+    if not cutlass.target_version(min_version="13.4"):
+        return False
+    if not is_rubin_cute_dsl_available():
+        return True
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return not (Arch.sm_107 <= arch <= Arch.sm_107f)
+
+
 @cute.jit
 def _mul_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
     """Apply four E4M3 scale factors to four unpacked E2M1 values.
 
-    PTX 9.4 (CUDA 13.4) supports the byte-padded E2M1 operand directly.
     Each FP4 value occupies the low nibble of one byte in the 32-bit input.
     """
-    if cutlass.const_expr(cutlass.target_version(min_version="13.4")):
+    if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
         return cute.arch.inline_ptx(
             "mul.e4m3x4.e2m1p4x4.e4m3x4.satfinite {$w0}, {$r0}, {$r1};",
             write_only_types=[Int32],

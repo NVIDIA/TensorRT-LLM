@@ -96,9 +96,9 @@ def _make_v2_kv_cache_manager() -> Mock:
 
 
 def _stub_transfer_entry_points(ex) -> None:
-    """Mock the coordinator's transfer polls and receive start once the
-    executor builds it; the build stays lazy so a test can finish configuring
-    the executor before the first ``ex.disagg`` use.
+    """Mock the coordinator's transfer polls, CP admission alignment and
+    receive start once the executor builds it; the build stays lazy so a test
+    can finish configuring the executor before the first ``ex.disagg`` use.
     """
     build = ex._build_disagg_coordinator
 
@@ -107,6 +107,7 @@ def _stub_transfer_entry_points(ex) -> None:
         coordinator.poll_gen_transfers = Mock()
         coordinator.check_transfer_timeouts = Mock()
         coordinator.reap_context_sends = Mock()
+        coordinator.align_gen_admission_across_cp = Mock(side_effect=lambda admitted: admitted)
         coordinator.receive_gen_init = Mock()
         return coordinator
 
@@ -738,7 +739,7 @@ class MockPadDummyExecutor:
         expected_num_active_requests: int = 1,
         num_fetch_requests: int = 0,
         benchmark_req_queues_size: int = 8,
-        tp_size: int = 1,
+        tp_size: int = 2,
     ):
         self.is_benchmark_disagg = is_benchmark_disagg
         self._benchmark_fill_phase_active = (
@@ -1278,6 +1279,7 @@ class TestFailFastDuringBenchmarkFill:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex.sampler = Mock(spec=["release_request"])
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
         # The fill-gate requests model "waiting for KV" / "generating", not
@@ -1581,6 +1583,8 @@ class TestFailFastDuringBenchmarkFill:
             assert request.state == LlmRequestState.GENERATION_COMPLETE
         freed = [call.args[0] for call in ex.resource_manager.free_resources.call_args_list]
         assert freed == requests
+        released = [call.args[0] for call in ex.sampler.release_request.call_args_list]
+        assert released == requests
         assert ex._fatal_error is None and not ex.is_shutdown
 
     def test_a_fitting_init_request_keeps_the_real_error_path_quiet(self, monkeypatch):
@@ -1594,6 +1598,7 @@ class TestFailFastDuringBenchmarkFill:
         assert ex.responses == {}
         assert ex.active_requests == requests
         ex.resource_manager.free_resources.assert_not_called()
+        ex.sampler.release_request.assert_not_called()
 
     def test_the_fail_fast_wakes_a_consumer_asleep_in_await_responses(self, monkeypatch):
         """The error responses are published under the response condition and

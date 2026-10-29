@@ -53,7 +53,7 @@ def forward_impl(self, x, router_logits, ...):
         self.dwdp_manager.wait_and_bind(self.backend, self.layer_idx)
     outputs = self.scheduler.forward(x, router_logits, ...)
     if self.enable_dwdp:
-        self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+        self.dwdp_manager.finish_layer(self.layer_idx)
     self.repeat_idx = (self.repeat_idx + 1) % self.repeat_count
     return outputs
 ```
@@ -79,12 +79,17 @@ Executor construction
   → after weight loading: create VMM transport + composite VA + page pool
 
 PyExecutor forward start
-  → DwdpManager.prefetch_first_layers() for the first two MoE layers
+  → DwdpManager.start_forward(): first MoE layers, unless the previous
+    pass already prefetched them
   → ConfigurableMoE.wait_and_bind(composite VA)
   → MoEScheduler.forward(... ordinary CuTeDSL kernel ...)
   → main stream joins scheduler auxiliary work
   → DwdpManager records current-slot consumption
-  → prefetch the MoE layer two positions ahead
+  → prefetch the next MoE layer in the cyclic sequence whose slot is now free
+    (the last layers of a pass prefetch the first layers of the next pass)
+
+Control action (weight update, sleep/wakeup)
+  → DwdpManager.invalidate_prefetch()
 
 Executor shutdown or construction rollback
   → detach model references
@@ -185,10 +190,10 @@ The codebase is transitioning between two architectures:
 
 ConfigurableMoE currently supports these backends (`create_moe.py`):
 - the `CutlassFusedMoEBase` leaves, the `TrtllmGenFusedMoEBase` leaves,
-  `DeepgemmCudaFp8BlockScalesImpl`, `CuteDslFusedMoE`, the two B12x leaves,
-  `TrtllmCutedslFusedFc12Nvfp4Impl`, `TrtllmCutedslDenseGemmNvfp4Impl`,
-  `DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `TrtllmCutedslMegaMoeNvfp4Impl`, the
-  `MarlinFusedMoEBase` leaves
+  `DeepgemmCudaFp8BlockScalesImpl`, the `CuteDslFusedMoEBase` leaves, the two
+  B12x leaves, `TrtllmCutedslFusedFc12Nvfp4Impl`,
+  `TrtllmCutedslDenseGemmNvfp4Impl`, `DeepgemmCudaW4a8Mxfp4Mxfp8Impl`,
+  `TrtllmCutedslMegaMoeNvfp4Impl`, the `MarlinFusedMoEBase` leaves
 
 Still on old path (standalone, with embedded communication):
 - `TritonFusedMoE`, `VanillaMoE`
@@ -225,10 +230,10 @@ Still on old path (standalone, with embedded communication):
 | `cutlass/` (+ the `fused_moe_cutlass.py` alias module) | the abstract `CutlassFusedMoEBase` and its twelve leaves (`CUTLASS_LEAVES`): one per quantization format, two for FP8 block scales (see [CUTLASS leaves](#cutlass-leaves-fused_moecutlass)) | SM80+ | High throughput, the widest quant support; the fallback family | `EXTERNAL_COMM` |
 | `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103/SM107 | Min-latency and high-throughput on Blackwell/Rubin; also serves unquantized BF16 through FlashInfer, on a gate of its own (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103/SM107 | FP8 Block Scales on Blackwell/Rubin | `EXTERNAL_COMM` |
-| `fused_moe_densegemm.py` | `TrtllmCutedslDenseGemmNvfp4Impl` (aliased as `DenseGEMMFusedMoE`) | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
-| `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103/SM107 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
-| `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xNvfp4FusedMoE` and `CuteDslB12xW4a16Nvfp4FusedMoE` (shared mixin `CuteDslB12xFusedMoEBase`, aliased as `CuteDslB12xFusedMoE`) | SM120/SM121 | NVFP4 (CUTLASS prefill, FlashInfer b12x decode) and W4A16 NVFP4 (b12x for every call), best on RTX PRO 6000 and DGX Spark. They head the `CUTEDSL` family, so they win on SM120/121 when flashinfer is present and yield to `CuteDslFusedMoE` otherwise. Single-GPU-shaped topology only: with no dispatch/combine kernel they reject `ep_size > 1` and attention-DP | `EXTERNAL_COMM` |
-| `fused_moe_cute_dsl_fc12.py` | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares `CuteDslFusedMoE`'s NVFP4 weight layout and autotune runner; reachable through the `CUTEDSL_FC12` family or a pinned `impl_id`; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU | `EXTERNAL_COMM` |
+| `cutedsl/dense_gemm.py` (+ the `fused_moe_densegemm.py` alias module) | `TrtllmCutedslDenseGemmNvfp4Impl` (aliased as `DenseGEMMFusedMoE`) | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
+| `cutedsl/grouped_gemm/` (+ the `fused_moe_cute_dsl.py` alias module) | the abstract `CuteDslFusedMoEBase` (aliased as `CuteDslFusedMoE`) and its two leaves, `TrtllmCutedslGroupedGemmNvfp4Impl` (`trtllm.cutedsl.grouped_gemm.nvfp4`) and `TrtllmCutedslGroupedGemmBf16Impl` (`trtllm.cutedsl.grouped_gemm.none`) | SM100/SM103/SM107; BF16 SM107 only | High throughput NVFP4, generally faster than Cutlass; unquantized BF16 SwiGLU on Rubin | `EXTERNAL_COMM` |
+| `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xNvfp4FusedMoE` and `CuteDslB12xW4a16Nvfp4FusedMoE` (shared mixin `CuteDslB12xFusedMoEBase`, aliased as `CuteDslB12xFusedMoE`) | SM120/SM121 | NVFP4 (CUTLASS prefill, FlashInfer b12x decode) and W4A16 NVFP4 (b12x for every call), best on RTX PRO 6000 and DGX Spark. They head the `CUTEDSL` family, so they win on SM120/121 when flashinfer is present and yield to the grouped-GEMM leaves otherwise. Single-GPU-shaped topology only: with no dispatch/combine kernel they reject `ep_size > 1` and attention-DP | `EXTERNAL_COMM` |
+| `cutedsl/fused_fc12.py` (+ the `fused_moe_cute_dsl_fc12.py` alias module) | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares `TrtllmCutedslGroupedGemmNvfp4Impl`'s NVFP4 weight layout and autotune runner; reachable through the `CUTEDSL_FC12` family or a pinned `impl_id`; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` (aliased as `MegaMoEDeepGemm`) | SM100/SM103/SM107 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `TrtllmCutedslMegaMoeNvfp4Impl` (aliased as `MegaMoECuteDsl`) | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects one of its per-architecture kernel variants. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models | `FUSED_COMM` |
 | `marlin/` (+ the `fused_moe_marlin.py` alias module) | the abstract `MarlinFusedMoEBase` and its two leaves, `MarlinCudaNvfp4Impl` and `MarlinCudaW4a16Nvfp4Impl` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, single-launch `marlin_nvfp4_moe_gemm`); attention-DP + EP via external comm (plain BF16 dispatch payload); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass, recorded in the `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
@@ -281,7 +286,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
 
 - **A leaf declares; the base derives.** A leaf states its `descriptor`, its
   SM and dtype sets, gpt-oss support and `FUSED_MOE_OP_FLAGS`, and implements
-  `can_implement` / `_get_quant_method`. `CutlassFusedMoEBase.__init_subclass__`
+  `can_implement` / `_get_quant_method`. `MoEImplBase.__init_subclass__`
   copies `scheduler_kind`, `capabilities` and `input_requirement` off the
   descriptor, so the contract has one source, and nothing in the base branches
   on `quant_config`.
@@ -383,6 +388,44 @@ publishes has to be the `quant` the request named — `check_quant_matches_ident
 this repo but its lineage is upstream's, which the device code still says
 (`MARLIN_NAMESPACE_NAME marlin_moe_wna16` in
 `cpp/tensorrt_llm/kernels/marlin/marlin_nvfp4_moe_gemm.cu`).
+
+### CuteDSL leaves (`fused_moe/cutedsl/`)
+
+The CuteDSL implementations that share code. An id here is
+`trtllm.cutedsl.<kernel>.<quant>`, and the layout follows it: one subpackage or
+module per kernel, one module per quant where a kernel serves several. The
+kernel segment says how much of the expert MLP one launch covers:
+`grouped_gemm` runs FC1 and FC2 as two grouped GEMMs, `fused_fc12` runs both in
+one persistent kernel, and `dense_gemm` packs every expert into one dense matrix
+for small token counts. Inheritance stays inside a kernel; kernels share only the
+package-level modules. `fused_moe_cute_dsl.py`, `fused_moe_cute_dsl_fc12.py` and
+`fused_moe_densegemm.py` above it hold no code: they define `CuteDslFusedMoE`,
+`CuteDslFc12FusedMoE` and `DenseGEMMFusedMoE`. The grouped-GEMM lookups,
+`cutedsl_grouped_gemm_leaf` / `find_cutedsl_grouped_gemm_leaf`, are exported by
+the package.
+
+| File | Role |
+|------|------|
+| `identity.py` | the identity segments (`PROVIDER_TRTLLM`, `TECHNIQUE_CUTEDSL`, `KERNEL_*`), and the grouped-GEMM query and id helper |
+| `kernel_inputs.py` | what more than one kernel takes: the `NvFp4WeightView` dataclass, and free functions taking the impl, `finalize_routing_scales` and `quantize_input_nvfp4`, which every NVFP4 leaf here binds as `quantize_input` |
+| `runners.py` | the outer autotune runners: NVFP4, which the fused-FC12 runner narrows to its tiles, and BF16 |
+| `grouped_gemm/base.py` | `CuteDslFusedMoEBase`, the abstract root of the two grouped-GEMM leaves: construction, the output-memset overlap stream, the locality-domain plan, the weight lifecycle |
+| `grouped_gemm/eligibility.py` | the checks both grouped-GEMM leaves' `can_implement` compose, as free functions |
+| `grouped_gemm/nvfp4.py` / `grouped_gemm/bf16.py` | one registered leaf each |
+| `fused_fc12.py` / `dense_gemm.py` | one registered leaf each, with what only that kernel needs |
+
+| kernel / `quant` | leaf | id |
+|---|---|---|
+| `grouped_gemm` / `nvfp4` | `TrtllmCutedslGroupedGemmNvfp4Impl` | `trtllm.cutedsl.grouped_gemm.nvfp4` |
+| `grouped_gemm` / `none` | `TrtllmCutedslGroupedGemmBf16Impl` | `trtllm.cutedsl.grouped_gemm.none` |
+| `fused_fc12` / `nvfp4` | `TrtllmCutedslFusedFc12Nvfp4Impl` | `trtllm.cutedsl.fused_fc12.nvfp4` |
+| `dense_gemm` / `nvfp4` | `TrtllmCutedslDenseGemmNvfp4Impl` | `trtllm.cutedsl.dense_gemm.nvfp4` |
+
+`trtllm.cutedsl.mega_moe.nvfp4` is CuteDSL too but lives in `mega_moe/`: it is a
+fused-communication kernel that shares its scheduler with the DeepGEMM MegaMoE
+and no code with this package. The B12x leaves, which the `CUTEDSL` backend
+literal also selects, descend from the CUTLASS family and stay in
+`fused_moe_cute_dsl_b12x.py`.
 
 ### MegaMoE (`fused_moe/mega_moe/`)
 
@@ -523,7 +566,7 @@ implementations' rejections only (the fallback candidates are asked after
 them): the highest-priority one that declined for a reason other than the
 layer's format or the SM. On SM100 the SM120-only b12x leaves lead the `CUTEDSL`
 family, so without the SM exclusion their `SM_UNSUPPORTED` would stand in for
-`CuteDslFusedMoE`'s rejection.
+the CuteDSL grouped-GEMM leaf's rejection.
 
 Two things fail hard, and they fail in different places. An unknown or retired
 backend literal raises `ValueError` before any candidate is considered, so there
@@ -543,8 +586,8 @@ raises with the whole rejection trail.
 The report is diagnostic rather than pinnable: `_legacy_backend_name` fills
 `winner`, `eligible` and `rejected[].legacy_backend` from `__name__`, so the
 report (including the `to_dict()` artifact a tuning result is replayed from)
-records class names. `CuteDslFusedMoE`, `TritonFusedMoE`, `VanillaMoE` and the
-two B12x leaves publish no `MoEImplId`. A class name is not an identity: read
+records class names. `TritonFusedMoE`, `VanillaMoE` and the two B12x leaves
+publish no `MoEImplId`. A class name is not an identity: read
 `descriptor.identity`.
 
 ### Cross-rank agreement
@@ -583,11 +626,11 @@ its layers.
 
 The model's `__post_init__` passes (`apply_layerwise_quant_config`,
 `apply_quant_config_exclude_modules`) can still rewrite a layer's
-`quant_config` before its weights are allocated. The CUTLASS, TRTLLM-Gen and
-B12x leaves check the final value in `create_weights` through
-`impl_contract.require_layer_quant_format` and raise if it no longer matches the
-format they were resolved for, instead of allocating weights the checkpoint
-cannot fill.
+`quant_config` before its weights are allocated. The CUTLASS, TRTLLM-Gen, B12x
+and CuteDSL grouped-GEMM leaves check the final value in `create_weights`
+through `impl_contract.require_layer_quant_format` and raise if it no longer
+matches the format they were resolved for, instead of allocating weights the
+checkpoint cannot fill.
 
 ## Backend Capability Matrix
 
@@ -626,16 +669,19 @@ passes it is `intermediate_size_per_partition`, so a non-aligned shard is
 `SHAPE_UNALIGNED` and falls back to Cutlass rather than dying in the kernel
 launcher — Qwen3.5-35B BF16 TP8 shards 512 → 64 and takes that path.
 
-¶ `CuteDslFusedMoE` on SM107 needs `MoEDep.CUTEDSL_RUBIN` (the installed CuTe DSL
-exposes the Rubin helpers) and carries three constraints the other SMs do not:
+¶ On SM107 both CuteDSL grouped-GEMM leaves need `MoEDep.CUTEDSL_RUBIN` (the
+installed CuTe DSL exposes the Rubin helpers), and the family carries three
+constraints the other SMs do not:
 
 - **Fused finalize is mandatory.** There is no unfused FC2 — NVFP4 has no plain
   grouped GEMM there, and the BF16 op fuses finalize unconditionally. Disabling
   finalize fusion, explicitly or by configuring LoRA, is
   `FINALIZE_FUSION_REQUIRED` rather than a late `NotImplementedError`.
-- **Unquantized is SwiGLU-only.** `cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin`
-  takes no activation argument, so any other activation is
-  `ACTIVATION_UNSUPPORTED`. NVFP4 forwards `activation_type` and serves Relu2 too.
+- **Unquantized is SwiGLU-only, without a clamp.**
+  `cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin` takes no activation argument
+  or constant, so another activation or a clamped SwiGLU is
+  `ACTIVATION_UNSUPPORTED`; NVFP4 forwards `activation_type` and the clamp, and
+  serves Relu2 and SiTU too.
 - **Locality domain excludes EPLB and DWDP.** Localized weight shards are built
   once from the loaded weights, so they cannot follow expert migration
   (`EPLB_UNSUPPORTED`) or parameter rebinding. DWDP is not an error: with
@@ -651,24 +697,11 @@ tensor cores. This is what makes Cutlass the landing spot when a W4A16 NVFP4
 layer finds no specialized backend — the B12x W4A16 leaf without flashinfer,
 or any SM outside Marlin's 89-99 and B12x's 120/121.
 
-‡ `CuteDslFusedMoE` has FP8-block-scale *plumbing* but no FP8-block-scale kernel:
-`run_moe_fp8_block_scales` ends in `cute_dsl_fp8_group_blockwise_gemm_ref`, a
-local pure-PyTorch helper that upcasts to fp32, materializes the expanded scales,
-and loops `torch.einsum` per expert. The only CuteDSL runners the file imports
-are the `Sm100BlockScaledContiguous*` NVFP4 ones. `can_implement` therefore
-declines FP8 block scales rather than claiming a reference path as a backend, and
-the algorithm's real owners are the DeepGEMM and TRTLLM-Gen leaves on
-SM100/103/107 and Cutlass on SM90/SM120. Consequence worth knowing before changing
-this: because a `CUTEDSL` request only ever considers the CuteDSL family plus the
-Cutlass fallback, and Cutlass's FP8-block kernel stops at SM90/SM120, an explicit
-`moe_backend="CUTEDSL"` on an FP8-block checkpoint at SM100 now fails resolution
-instead of silently running the reference GEMM. `test_cute_dsl_fp8_block_scales`
-and `test_cute_dsl_fp8_block_scales_4gpus` in
-`tests/integration/defs/accuracy/test_llm_api_pytorch.py` are exactly that
-configuration and are `pytest.mark.skip`-ed for this reason; they were never
-scheduled in any `tests/integration/test_lists/` entry, so the skip changes no CI
-stage. Point them at `DEEPGEMM` / `TRTLLM` if this checkpoint needs coverage
-again.
+‡ No CuteDSL leaf publishes `fp8_block_scales`; the DeepGEMM and TRTLLM-Gen
+leaves own the format on SM100/103/107 and Cutlass on SM90/SM120. Because a
+`CUTEDSL` request considers only the CuteDSL family plus the Cutlass fallback,
+an explicit `moe_backend="CUTEDSL"` on an FP8-block checkpoint at SM100 fails
+resolution; request `DEEPGEMM` or `TRTLLM` for that checkpoint instead.
 
 ### Activation Support
 
@@ -771,10 +804,10 @@ both OSS and bundled-internal MoE variants through CTest. With OSS kernels
 disabled, `mixtureOfExpertsTest` exercises the bundled runner directly.
 
 Declare `limit_when_absent` only when the ABI has no encoding for "no clamp":
-`CuteDslFusedMoE` passes `float("inf")` because its epilogue always applies the
-clamp functor. It is substituted *before* coercion, so a `PER_EXPERT_TENSOR`
-backend gets it broadcast like any other scalar, and `MoEActivationSupport`
-rejects it outright next to `limit=UNSUPPORTED`.
+`TrtllmCutedslGroupedGemmNvfp4Impl` passes `float("inf")` because its epilogue
+always applies the clamp functor. It is substituted *before* coercion, so a
+`PER_EXPERT_TENSOR` backend gets it broadcast like any other scalar, and
+`MoEActivationSupport` rejects it outright next to `limit=UNSUPPORTED`.
 
 TRTLLM-Gen is the one exception, and it is a per-class one: its clamp is a
 per-expert tensor for the FP4 fused-activation cubins but a by-value `float`
@@ -797,7 +830,7 @@ different kernels.
 and still reject the format it arrives with. The gpt-oss package (per-expert
 bias plus filled `alpha` / `beta` / `limit`, summarized as
 `MoEProblem.swiglu_gptoss_style`) is declined by every specialized backend whose
-`kinds` omit `SwigluBias` (`CuteDslFusedMoE`, the B12x leaves,
+`kinds` omit `SwigluBias` (the CuteDSL grouped-GEMM leaves, the B12x leaves,
 `DeepGemmFusedMoE`, `TrtllmCutedslDenseGemmNvfp4Impl`, the Marlin leaves). The
 TRTLLM-Gen and CUTLASS leaves admit it per format through
 `supports_gptoss_style` (on CUTLASS: unquantized, MXFP8, NVFP4 and the three
@@ -836,7 +869,7 @@ When adding new components, use these reference implementations:
 | New Communication Strategy | `communication/nvlink_one_sided.py` (`NVLinkOneSided`) | Subclass `Communication`, implement `prepare_dispatch`, `dispatch`, `combine`; also implement `CheckpointableCommunication` when native workspace mappings must follow executor sleep/wakeup |
 | New Scheduler | `moe_scheduler.py` (`ExternalCommMoEScheduler` / `FusedCommMoEScheduler`) | Subclass `MoEScheduler`, implement `forward`; add new `MoESchedulerKind` value and wire into `create_moe_scheduler` factory |
 | Backend Tests | `test_moe_backend.py` | Follow existing parametrize patterns |
-| Identity Tests | `test_moe_impl.py` | Test what selection can get wrong: the backend literal or a pinned id reaches the intended leaf, a leaf declines what its kernel does not run, a pin fails rather than degrades, and a leaf refuses a layer whose format moved after it was picked. Do not restate a declaration (an id string, a support set, a family's membership) across tests; a family with several leaves pins its leaves' declarations once, in one hand-written table (`test_cutlass_leaf_declarations`). Tests that merely *use* the class belong in `test_moe_backend.py` |
+| Identity Tests | `test_moe_impl.py` | Test what selection can get wrong: the backend literal or a pinned id reaches the intended leaf, a leaf declines what its kernel does not run, a pin fails rather than degrades, and a leaf refuses a layer whose format moved after it was picked. Do not restate a declaration (an id string, a support set, a family's membership) across tests; a family with several leaves pins its leaves' declarations once, in one hand-written table (`test_cutlass_leaf_declarations`, `test_cutedsl_leaf_declarations`). Tests that merely *use* the class belong in `test_moe_backend.py` |
 | Integration Tests | `test_moe_module.py` | Test Backend × Communication × EPLB combinations |
 
 **Note on backend inheritance:** new execution units inherit `MoEImplBase` (in
@@ -847,7 +880,7 @@ constructor. `MoE` is the complete-layer type (`ConfigurableMoE`,
 (`Llama4MinLatencyFusedMoE` extends `ConfigurableMoE` and picks its leaf with
 `cutlass_leaf`). A family's leaves inherit `MoEImplBase` through its
 abstract root (`CutlassFusedMoEBase`, `TrtllmGenFusedMoEBase`,
-`MarlinFusedMoEBase`).
+`MarlinFusedMoEBase`, `CuteDslFusedMoEBase`).
 
 The B12x pair is the one exception. `CuteDslB12xNvfp4FusedMoE`
 inherits the CUTLASS NVFP4 leaf because its prefill chunk *is* that grouped
@@ -880,9 +913,11 @@ implementation. The parent holds what they share, leaves at least
 because a descriptor is exactly one identity. How much else it implements
 follows how much the formats share: `TrtllmGenFusedMoEBase` implements none of
 the four (its formats differ in kernel ABI, so each leaf gets its methods
-through a per-ABI layer), `MarlinFusedMoEBase` three (one ABI serves both
-formats), and `CutlassFusedMoEBase` defaults for `quantize_input` and `run_moe`
-that most leaves keep.
+through a per-ABI layer), `CuteDslFusedMoEBase` none either (its two formats
+share construction, the locality-domain plan and the weight lifecycle, but run
+different ops), `MarlinFusedMoEBase` three (one ABI serves both formats), and
+`CutlassFusedMoEBase` defaults for `quantize_input` and `run_moe` that most
+leaves keep.
 
 Such a parent must not branch on the axis its subclasses divide: an
 `if self.<quant or provider flag>:` is a subclass difference expressed as data,
@@ -891,28 +926,40 @@ keeps only flags read off the class at resolution (`supports_gptoss_style`,
 `supports_situ`) and turns the rest into hooks; `CutlassFusedMoEBase` takes its
 per-format kernel configuration as `FUSED_MOE_OP_FLAGS`, its padding as
 `pad_hidden_and_intermediate_to`, and its build requirements as
-`requires_oss_cutlass_build` / `uses_dynamic_fc2_scale`.
+`requires_oss_cutlass_build` / `uses_dynamic_fc2_scale`; `CuteDslFusedMoEBase`
+reaches what only one format needs through the `_init_format_state` and
+`_locality_domain_scale_shard` hooks and the leaf-declared
+`_locality_domain_full_scale_params`.
 
 **Note on implementation class names:** the name is derived from the identity
-as `<Provider><Technique><Quant>Impl`. The kernel segment enters only when two
-ids differ in that segment alone: the class that would otherwise collide spells
-it out between technique and quant, in id order
+as `<Provider><Technique><Quant>Impl`. The kernel segment enters when two ids
+differ in that segment alone: the class that would otherwise collide spells it
+out between technique and quant, in id order
 (`DeepgemmCudaHopperFp8BlockScalesImpl` next to
 `DeepgemmCudaFp8BlockScalesImpl`). The `trtllm.cutedsl.*.nvfp4` ids
-(`mega_moe`, `fused_fc12`, `dense_gemm`) differ in `kernel_name` alone, so their classes
-spell the kernel out ahead of that collision. A bare `cutedsl` token matches
-several leaves; name the kernel segment to pin one.
+(`mega_moe`, `fused_fc12`, `dense_gemm`, `grouped_gemm`) differ in
+`kernel_name` alone, so their classes spell the kernel out;
+`TrtllmCutedslGroupedGemmBf16Impl` keeps it to match its NVFP4 sibling. Quant
+`none` is `Bf16` on a BF16-only kernel (`FlashinferTrtllmGenBf16Impl`,
+`TrtllmCutedslGroupedGemmBf16Impl`) and `Unquantized` on
+`TrtllmCutlassUnquantizedImpl`, which also takes FP16. A bare `cutedsl` token
+matches several leaves; name the kernel segment to pin one. A partial pin can
+also span techniques: `grouped_gemm.nvfp4` matches the CUTLASS and the CuteDSL
+grouped GEMM and resolves to the CuteDSL leaf by `IMPL_PRIORITY`; name the
+technique to pin either.
 
 **Note on family names:** the `XXFusedMoE` names are module-level aliases.
 `CutlassFusedMoE`, `TRTLLMGenFusedMoE` and `MarlinFusedMoE` name a family's
 abstract root, the parent of every leaf (the B12x leaves also descend from
-`CutlassFusedMoE`); `CuteDslB12xFusedMoE` names the B12x mixin;
-`DeepGemmFusedMoE`, `DenseGEMMFusedMoE`, `CuteDslFc12FusedMoE`, `MegaMoEDeepGemm`
-and `MegaMoECuteDsl` name single leaves. A family name publishes no descriptor,
+`CutlassFusedMoE`); `CuteDslFusedMoE` names the root of the two grouped-GEMM
+leaves only, not of the `CUTEDSL` family, which also holds the B12x leaves;
+`CuteDslB12xFusedMoE` names the B12x mixin; `DeepGemmFusedMoE`,
+`DenseGEMMFusedMoE`, `CuteDslFc12FusedMoE`, `MegaMoEDeepGemm` and
+`MegaMoECuteDsl` name single leaves. A family name publishes no descriptor,
 and every gate against it must be `issubclass` / `isinstance`: resolution hands
 over a leaf, so `type(x) is TRTLLMGenFusedMoE` matches nothing. Classes without
-an identity (`CuteDslFusedMoE`, `TritonFusedMoE`, `VanillaMoE`) carry the
-`XXFusedMoE` form as their real class name.
+an identity (`TritonFusedMoE`, `VanillaMoE`) carry the `XXFusedMoE` form as
+their real class name.
 
 ## Anti-Patterns
 

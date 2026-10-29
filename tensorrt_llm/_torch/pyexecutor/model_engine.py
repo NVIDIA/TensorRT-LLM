@@ -4,7 +4,6 @@
 import functools
 import math
 import os
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
@@ -21,7 +20,7 @@ from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._utils import mpi_disabled, release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
-from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
+from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           PrefillCudaGraphBackend,
                                           TorchCompileConfig, TorchLlmArgs)
@@ -50,12 +49,13 @@ from ..tensor_lru_cache import TensorLRUCache
 from ..utils import set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
-from .engine.cuda_graph import filter_cuda_graph_batch_sizes
+from .engine.cuda_graph import plan_cuda_graphs
 from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
-                                setup_mm_encoder_attn_metadata, use_mrope)
+                                setup_mm_encoder_attn_metadata,
+                                setup_mm_encoder_cuda_graphs, use_mrope)
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache)
@@ -73,34 +73,10 @@ from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest
-from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .model_loader import ModelLoader
 from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
-
-
-class ModelEngine(ABC):
-
-    @abstractmethod
-    def get_max_num_sequences(self) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def forward(self,
-                scheduled_requests: ScheduledRequests,
-                resource_manager: Optional[ResourceManager],
-                new_tensors_device: Optional[SampleStateTensors],
-                cache_indirection_buffer: Optional[torch.Tensor] = None):
-        raise NotImplementedError
-
-    def warmup(self, resource_manager: Optional[ResourceManager]) -> None:
-        """
-        This method is called after runtime resources are initialized. The
-        resource manager is absent for drivers that allocate none. Override to
-        perform warmup actions: instantiating CUDA graphs, torch.compile, etc.
-        """
-        return
-
 
 # Refit only needs the compile wrapper removed before weights are loaded: the
 # wrapper inserts "_orig_mod" into every parameter path, and load_weights()
@@ -121,54 +97,6 @@ class ModelEngine(ABC):
 # refit moves no tensor, so the captures stay valid and PWCG stays hot across a
 # refit (976 graphs measured still live) instead of going cold.
 
-
-def _filter_piecewise_capture_num_tokens(
-    candidate_num_tokens: list[int],
-    max_num_tokens: int,
-    max_batch_size: int,
-    max_seq_len: int,
-) -> Tuple[list[int], list[int]]:
-    """Cap piecewise CUDA graph capture candidates at the engine's reachable
-    `num_tokens` ceiling `max_batch_size * (max_seq_len - 1)`
-    clamping user-requested sizes above it down to the ceiling.
-
-    Each in-flight request must leave room for at least one decode token,
-    so the ceiling is the largest forward-pass `num_tokens` the warmup
-    builder can construct. Candidates above the ceiling cannot be
-    recorded; clamping them down to the ceiling preserves the user's
-    intent (a requested 128 becomes 127 when only 127 is recordable)
-    without inventing capture sizes the user never asked
-    for. Appending sizes beyond the user's list is harmful: runtime
-    padding rounds iterations up to the nearest captured size, so a far
-    appended ceiling (e.g. 65536 over a list topping at 13914) would
-    make every iteration in the gap execute the full ceiling shape.
-
-    Returns `(kept, unrecordable)` where `kept` is sorted ascending and
-    deduped, with above-ceiling candidates clamped to the ceiling.
-    `unrecordable` is the sorted unique set of input entries above the
-    ceiling but within `max_num_tokens` (the clamped ones, reported so
-    the caller's warning fires).
-    """
-    max_capturable_num_tokens = max(0, max_batch_size * (max_seq_len - 1))
-    piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
-    if piecewise_capacity_limit > 0:
-        kept = sorted({
-            min(i, piecewise_capacity_limit)
-            for i in candidate_num_tokens if 0 < i <= max_num_tokens
-        })
-    else:
-        kept = []
-    unrecordable = sorted({
-        i
-        for i in candidate_num_tokens
-        if max_capturable_num_tokens < i <= max_num_tokens
-    })
-    return kept, unrecordable
-
-
-# BCG uses the same capture-bucket filtering semantics as PCG.
-_filter_prefill_capture_num_tokens = _filter_piecewise_capture_num_tokens
-
 _DEEP_GEMM_PDL_CONFIGURED = False
 
 
@@ -183,14 +111,15 @@ def _configure_deep_gemm_pdl() -> None:
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 
-class PyTorchModelEngine(ModelEngine):
+class ModelEngine:
+    """Own model setup and coordinate runner execution and resource lifetimes."""
 
     def __init__(
         self,
         *,
         model_path: str,
         llm_args: TorchLlmArgs,
-        mapping: Optional[Mapping] = None,
+        mapping: Mapping,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[Distributed] = None,
         spec_config: Optional[DecodingBaseConfig] = None,
@@ -199,12 +128,46 @@ class PyTorchModelEngine(ModelEngine):
         model_weights_memory_tag: Optional[str] = None,
         model_weights_restore_mode=None,
     ):
+        # cleanup() also runs on an engine whose construction failed part-way.
+        self._cleanup_done = False
+        self.model_loader: Optional[ModelLoader] = None
+        self._runner: Optional[ModelRunner] = None
+        self._torch_compile_backend: Optional[Backend] = None
+        configured_encoder_max_num_tokens = self._init_from_args(
+            model_path=model_path,
+            llm_args=llm_args,
+            mapping=mapping,
+            attn_runtime_features=attn_runtime_features,
+            dist=dist,
+            spec_config=spec_config,
+        )
+        self._load_model(
+            model_path=model_path,
+            model=model,
+            checkpoint_loader=checkpoint_loader,
+            model_weights_memory_tag=model_weights_memory_tag,
+            model_weights_restore_mode=model_weights_restore_mode,
+        )
+        self._init_from_model()
+        self._size_cuda_graphs()
+        self._compile_model(configured_encoder_max_num_tokens)
+        self._init_execution_services()
+
+    def _init_from_args(
+        self,
+        *,
+        model_path: str,
+        llm_args: TorchLlmArgs,
+        mapping: Mapping,
+        attn_runtime_features: Optional[AttentionRuntimeFeatures],
+        dist: Optional[Distributed],
+        spec_config: Optional[DecodingBaseConfig],
+    ) -> Optional[int]:
+        """Resolve the requested sizes, the original speculation widths and the
+        services derived from the arguments; capacity may still be unset.
+        Returns the encoder token budget before any multimodal increase."""
         _configure_deep_gemm_pdl()
 
-        self._metrics: dict[str, float] = defaultdict(float)
-        self._cleanup_done = False
-        self._model_caller: Optional[ModelCaller] = None
-        self._runner: Optional[ModelRunner] = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -225,26 +188,14 @@ class PyTorchModelEngine(ModelEngine):
         # The multimodal encoder token budget falls back to the LLM-side value
         # when unset. It may be raised after model load because atomic MM items
         # cannot be split.
-        self.encoder_max_num_tokens = (llm_args.encoder_max_num_tokens
-                                       if llm_args.encoder_max_num_tokens
-                                       is not None else self.max_num_tokens)
-
-        if checkpoint_loader is None:
-            checkpoint_loader = _construct_checkpoint_loader(
-                llm_args.checkpoint_loader,
-                llm_args.checkpoint_format,
-                mx_config=llm_args.mx_config,
-                checkpoint_io_policy=llm_args.checkpoint_io_policy,
-                load_format=llm_args.load_format,
-                partial_model_loading=llm_args.is_partial_model_loading,
-            )
+        configured_encoder_max_num_tokens = (
+            llm_args.encoder_max_num_tokens if llm_args.encoder_max_num_tokens
+            is not None else self.max_num_tokens)
+        self.encoder_max_num_tokens = configured_encoder_max_num_tokens
 
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        from ._util import (compute_max_num_sequences,
-                            resolved_kv_cache_manager_is_v2,
-                            should_enable_overlap_headroom)
         self.dist = dist
         self.llm_args = llm_args
         if dist is not None:
@@ -292,17 +243,27 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_format=llm_args.checkpoint_format,
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
+        return configured_encoder_max_num_tokens
 
+    def _load_model(
+        self,
+        *,
+        model_path: str,
+        model: Optional[torch.nn.Module],
+        checkpoint_loader: Optional[BaseCheckpointLoader],
+        model_weights_memory_tag: Optional[str],
+        model_weights_restore_mode,
+    ) -> None:
+        """Load the model, or take the given one, at the requested capacity."""
         self.moe_load_balancer: Optional[MoeLoadBalancer] = None
-        self.model_loader: Optional[ModelLoader] = None
         if model is None:
-            lora_config: Optional[LoraConfig] = llm_args.lora_config
+            lora_config: Optional[LoraConfig] = self.llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
             self.model_loader = ModelLoader(
-                llm_args=llm_args,
+                llm_args=self.llm_args,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
-                sparse_attention_config=llm_args.sparse_attention_config,
+                sparse_attention_config=self.llm_args.sparse_attention_config,
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
@@ -317,6 +278,15 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.model = model
         self._validate_breakable_cuda_graph_compatibility()
+
+    def _init_from_model(self) -> None:
+        """Copy the loaded model's facts onto the engine, rewriting the requested
+        capacity, encoder token budget and in-graph sampling flag from them,
+        and leave the model in its final pre-compile form."""
+        from ._util import (compute_max_num_sequences,
+                            resolved_kv_cache_manager_is_v2,
+                            should_enable_overlap_headroom)
+
         # In-graph sampling needs the full vocabulary: top-k / top-p over a
         # tensor-parallel shard would rank against a slice of the logits and
         # emit the wrong token, silently. The LM head gathers by default, but
@@ -331,26 +301,27 @@ class PyTorchModelEngine(ModelEngine):
             self.enable_in_graph_sampling = False
         pretrained_config = self.model.model_config.pretrained_config
         self.enable_overlap_headroom = should_enable_overlap_headroom(
-            mapping,
-            llm_args.disable_overlap_scheduler,
+            self.mapping,
+            self.llm_args.disable_overlap_scheduler,
             kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
-                llm_args.kv_cache_config,
+                self.llm_args.kv_cache_config,
                 self.max_beam_width,
-                enable_sleep=llm_args.sleep_config is not None),
+                enable_sleep=self.llm_args.sleep_config is not None),
             is_hybrid=is_hybrid_linear(pretrained_config),
             has_mrope_delta_cache=resolve_mrope_position_deltas_cache(
                 self.model) is not None)
         self.max_num_seq_slots = compute_max_num_sequences(
-            mapping,
+            self.mapping,
             self.batch_size,
-            llm_args.disable_overlap_scheduler,
+            self.llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self.enable_overlap_headroom,
         )
-        # In case that some tests use stub models and override `_load_model`.
+        # AutoModelForCausalLM sets extra_attrs; a model passed in through
+        # `model=`, such as a test stub, may not have it.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        # Router Replay (R3) capturer owned by this engine (None when disabled or
-        # for draft engines). Registered in the model extra attrs so the MoE
+        # Router Replay (R3) capturer owned by this engine (None when disabled).
+        # Registered in the model extra attrs so the MoE
         # routing hook reaches this engine's capturer during its forward, the
         # same way ``moe_layers`` is looked up -- no process-wide state.
         self.route_capture = RouteCapture.create(
@@ -381,7 +352,7 @@ class PyTorchModelEngine(ModelEngine):
             self.mm_encoder_output_budget_bytes = mm_item_scheduler.output_budget_bytes
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
         if isinstance(self.model,
-                      MultimodalModelMixin) and mapping.is_first_pp_rank():
+                      MultimodalModelMixin) and self.mapping.is_first_pp_rank():
             multimodal_config = self.model.model_config.multimodal_config
             reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
                                     if self.model.encoder_cache_active else 0)
@@ -404,9 +375,10 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._torch_compile_backend = None
         self._init_model_capacity()
 
+    def _size_cuda_graphs(self) -> None:
+        """Size the decode and prefill CUDA graphs from the clamped capacity."""
         self.cuda_graph_config = self.llm_args.cuda_graph_config
 
         if (isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
@@ -419,22 +391,24 @@ class PyTorchModelEngine(ModelEngine):
                 "disabled.")
             self.cuda_graph_config = None
 
-        cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
-            'batch_sizes'].default
-        cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
-            'enable_padding'].default
+        plan = plan_cuda_graphs(
+            self.cuda_graph_config,
+            self.llm_args.prefill_capture_num_tokens,
+            max_batch_size=self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_seq_len=self.max_seq_len,
+            decode_tokens_per_request=1 + self.original_max_total_draft_tokens,
+        )
+        self._cuda_graph_padding_enabled = plan.padding_enabled
+        self._cuda_graph_batch_sizes = plan.batch_sizes
+        self.max_cuda_graph_batch_size = plan.max_batch_size
+        self._prefill_cuda_graph_num_tokens = plan.prefill_num_tokens
 
-        self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
-
-        decode_tokens_per_request = 1 + self.original_max_total_draft_tokens
-        self._cuda_graph_batch_sizes = filter_cuda_graph_batch_sizes(
-            cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
-            decode_tokens_per_request,
-            self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
-
-        self.max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
-                                          self._cuda_graph_batch_sizes else 0)
-
+    def _compile_model(
+            self, configured_encoder_max_num_tokens: Optional[int]) -> None:
+        """Compile the model, or install the eager NCCL window tensor scopes,
+        capture the local multimodal encoders' CUDA graphs, and wrap the result
+        in the model caller."""
         torch_compile_config = self.llm_args.torch_compile_config
         prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
         torch_compile_enabled = bool(torch_compile_config is not None)
@@ -455,32 +429,8 @@ class PyTorchModelEngine(ModelEngine):
 
         self._torch_compile_prefill_only = False
 
-        prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
-        if prefill_cuda_graph_num_tokens is None:
-            prefill_cuda_graph_num_tokens = cuda_graph_batch_sizes or []
-
-        self._prefill_cuda_graph_num_tokens, unrecordable = (
-            _filter_prefill_capture_num_tokens(
-                prefill_cuda_graph_num_tokens,
-                max_num_tokens=self.max_num_tokens,
-                max_batch_size=self.batch_size,
-                max_seq_len=self.max_seq_len,
-            ))
-        if unrecordable:
-            logger.warning(
-                f"Skipping prefill CUDA graph capture for num_tokens="
-                f"{unrecordable}: exceeds reachable ceiling "
-                f"max_batch_size*(max_seq_len-1)="
-                f"{max(0, self.batch_size * (self.max_seq_len - 1))}. "
-                f"Clamping them to the ceiling; raise max_seq_len for larger graphs."
-            )
-
         backend_num_streams = None
         try:
-            use_ub_for_nccl = (
-                self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
-                and self._init_userbuffers(self.model.config.hidden_size))
-            self._nccl_window_tensor_scope_hooks = []
             if torch_compile_enabled:
                 set_torch_compiling(True)
                 if mpi_disabled() and self.mapping.world_size > 1:
@@ -509,9 +459,8 @@ class PyTorchModelEngine(ModelEngine):
                                 f"{num_mnnvl_allreduces} modules to cover "
                                 f"max_num_tokens={self.max_num_tokens} before "
                                 "torch.compile.")
-                use_ub = not use_ub_for_nccl and (
-                    torch_compile_enable_userbuffers
-                    and self._init_userbuffers(self.model.config.hidden_size))
+                use_ub = (torch_compile_enable_userbuffers and
+                          self._init_userbuffers(self.model.config.hidden_size))
                 backend_num_streams = Backend.Streams([
                     torch.cuda.Stream()
                     for _ in range(torch_compile_max_num_streams - 1)
@@ -536,13 +485,29 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
-                self._nccl_window_tensor_scope_hooks = (
-                    install_eager_nccl_window_tensor_scopes(self.model))
+                install_eager_nccl_window_tensor_scopes(self.model)
+
+            # Capture local encoders after their metadata is sized and before
+            # KV-cache estimation, so graph memory is included in the profile.
+            mm_config = self.llm_args.multimodal_config
+            setup_mm_encoder_cuda_graphs(
+                self.model,
+                mm_config.encoder_cuda_graph if mm_config is not None else None,
+                max_num_tokens=configured_encoder_max_num_tokens)
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
+        self._model_caller = ModelCaller(
+            self.model,
+            compile_backend=self._torch_compile_backend,
+            aux_streams=backend_num_streams,
+            prefill_compile_only=self._torch_compile_prefill_only,
+        )
 
+    def _init_execution_services(self) -> None:
+        """Build the attention backend, update the speculation config from the
+        loaded model, and build the runner around the model caller."""
         # Start outside warmup: load-balancer statistics on, serving MoE
         # communication timeouts.
         self._warmup_depth = 0
@@ -566,25 +531,20 @@ class PyTorchModelEngine(ModelEngine):
             update_spec_config_from_loaded_model(self.spec_config, self.model)
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             )
-            self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            self.max_draft_len = spec_config.max_draft_len
+            self.max_total_draft_tokens = self.spec_config.tokens_per_gen_step - 1
+            self.max_draft_len = self.spec_config.max_draft_len
         else:
             self.without_logits = False
             self.max_draft_len = 0
             self.max_total_draft_tokens = 0
 
-        self.iter_states = {}
+        self._metrics: dict[str, float] = defaultdict(float)
+        self.iter_states: dict[str, Any] = {}
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._lora_owner: Optional[DecoderLoraOwner] = None
         self._lora_model: Optional[torch.nn.Module] = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
-        self._model_caller = ModelCaller(
-            self.model,
-            compile_backend=self._torch_compile_backend,
-            aux_streams=backend_num_streams,
-            prefill_compile_only=self._torch_compile_prefill_only,
-        )
         self._runner = self._initialize_runner(runner_cls)
 
         layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
@@ -708,7 +668,6 @@ class PyTorchModelEngine(ModelEngine):
             dtype=self.model.config.torch_dtype,
             enable_attention_dp=self.enable_attention_dp,
             disable_overlap_scheduler=self.llm_args.disable_overlap_scheduler,
-            is_encode_only=self.llm_args.encode_only,
             is_spec_decode=self.is_spec_decode,
             max_draft_len=self.max_draft_len,
             max_total_draft_tokens=self.max_total_draft_tokens,
@@ -794,22 +753,95 @@ class PyTorchModelEngine(ModelEngine):
         return self._runner.cuda_graph_runner
 
     @property
+    def cuda_graph_batch_sizes(self) -> list[int]:
+        """Return the resolved decode graph batch sizes."""
+        return self._cuda_graph_batch_sizes
+
+    @property
+    def cuda_graph_padding_enabled(self) -> bool:
+        """Return whether decode graph batches are padded to capture sizes."""
+        return self._cuda_graph_padding_enabled
+
+    @property
+    def _dspark_confidence_enabled(self) -> bool:
+        return isinstance(
+            self._runner,
+            DecoderRunner) and self._runner._dspark_confidence_enabled
+
+    @property
+    def _dspark_trims_submitted_tokens(self) -> bool:
+        return isinstance(
+            self._runner,
+            DecoderRunner) and self._runner._dspark_trims_submitted_tokens
+
+    @property
+    def _dspark_sps_cost_table(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return None
+        return self._runner._dspark_sps_cost_table
+
+    @property
+    def _dspark_exact_candidate_cells(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return ()
+        return self._runner._dspark_exact_candidate_cells
+
+    @property
+    def _dspark_exact_identity_words(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return (0, ) * 8
+        return self._runner._dspark_exact_identity_words
+
+    @property
+    def _dspark_device_budget(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return None
+        return getattr(self._runner, "_dspark_device_budget", None)
+
+    @_dspark_device_budget.setter
+    def _dspark_device_budget(self, value) -> None:
+        if isinstance(self._runner, DecoderRunner):
+            self._runner._dspark_device_budget = value
+
+    def ragged_verify_token_buckets(self, batch_size: int):
+        if not isinstance(self._runner, DecoderRunner):
+            return ()
+        return self._runner.ragged_verify_token_buckets(batch_size)
+
+    def fit_ragged_verify_lens(self, *args, **kwargs):
+        assert isinstance(self._runner, DecoderRunner)
+        return self._runner.fit_ragged_verify_lens(*args, **kwargs)
+
+    def _get_spec_worker(self):
+        if isinstance(self._runner, DecoderRunner):
+            return self._runner._get_spec_worker()
+        return None
+
+    @property
     def metrics(self) -> dict[str, float]:
         """Return model-engine warmup time metrics."""
         return self._metrics
 
-    def register_forward_pass_callable(self, callable: Callable):
+    def register_forward_pass_callable(self, callable: Callable) -> None:
+        """Install the KV connector hook on the decoder runner."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.forward_pass_callable = callable
 
-    def register_sample_in_graph_callable(self, callable: Optional[Callable]):
+    def register_sample_in_graph_callable(self,
+                                          callable: Optional[Callable]) -> None:
         """Register the hook that samples at the tail of the forward graph."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.sample_in_graph_callable = callable
 
+    def register_beam_histories_callable(self,
+                                         callable: Optional[Callable]) -> None:
+        """Register where logits post-processors get live beam histories."""
+        if isinstance(self._runner, DecoderRunner):
+            self._runner.start_beam_histories_callable = callable
+
     def register_sample_type_resolver(self,
                                       resolver: Optional[Callable],
-                                      stage: Optional[Callable] = None):
+                                      stage: Optional[Callable] = None) -> None:
         """Register how a batch maps to its sampling tier, for the graph key."""
         assert isinstance(self._runner, DecoderRunner)
         self._runner.register_sample_type_resolver(resolver, stage)
@@ -939,7 +971,6 @@ class PyTorchModelEngine(ModelEngine):
         outputs = self._runner.forward_encoder(
             ScheduledInputs(batch=scheduled_requests),
             resource_manager=resource_manager,
-            is_dummy=self._warmup_depth > 0,
         )
         return (
             outputs["encoder_hidden_states"],
@@ -1099,8 +1130,8 @@ class PyTorchModelEngine(ModelEngine):
         try:
             self.cleanup()
         except (RuntimeError, AttributeError) as e:
-            logger.warning(
-                "PyTorchModelEngine cleanup failed during destruction: %s", e)
+            logger.warning("ModelEngine cleanup failed during destruction: %s",
+                           e)
 
     def _init_max_seq_len(self):
         # Allow user to override the inferred max_seq_len with a warning.
@@ -1440,7 +1471,7 @@ class PyTorchModelEngine(ModelEngine):
 
         return True
 
-    def wait_for_input_copy(self):
+    def wait_for_input_copy(self) -> None:
         """
         Wait for input preparation and H2D copy of previous iteration before modifying host input,
         otherwise the input of previous iteration will be overwritten.
