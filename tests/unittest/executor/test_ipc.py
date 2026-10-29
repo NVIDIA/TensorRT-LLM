@@ -358,7 +358,10 @@ class TestIpcBasics:
 
     @staticmethod
     def _orphaned_sender(linger_ms: int | None = None) -> ZeroMqQueue:
-        """Build a PUSH queue whose last message is queued for a peer that has exited.
+        """Build a PUSH queue whose only message is queued for a peer that has exited.
+
+        The receiver that provides the address is closed before the sender
+        connects, so no connection ever accepts the message.
 
         Args:
             linger_ms: LINGER to set on the sender before returning it, or None to
@@ -370,37 +373,57 @@ class TestIpcBasics:
         receiver = ZeroMqQueue(
             socket_type=zmq.PULL, is_server=True, is_async=False, name="test_exited_receiver"
         )
+        address = receiver.address
+        receiver.socket.setsockopt(zmq.LINGER, 0)
+        receiver.close()
         sender = ZeroMqQueue(
-            address=receiver.address,
+            address=address,
             socket_type=zmq.PUSH,
             is_server=False,
             is_async=False,
             name="test_orphaned_sender",
         )
-        sender.put({"message": "delivered"})
-        assert receiver.get() == {"message": "delivered"}
-        receiver.socket.setsockopt(zmq.LINGER, 0)
-        receiver.close()
-        # The receiver is gone, so this message stays queued on the sender.
         sender.put({"message": "undeliverable"})
         if linger_ms is not None:
             sender.socket.setsockopt(zmq.LINGER, linger_ms)
         return sender
 
+    @staticmethod
+    def _close_within(queue: ZeroMqQueue, timeout: float) -> float:
+        """Close a queue on a watchdog thread, so a blocking close() fails the test.
+
+        Args:
+            queue: The queue to close.
+            timeout: Seconds to wait for close() to return.
+
+        Returns:
+            The seconds close() took.
+        """
+        errors = []
+
+        def close() -> None:
+            try:
+                queue.close()
+            except Exception as error:  # Re-raised on the test thread below.
+                errors.append(error)
+
+        start_time = time.monotonic()
+        closer = Thread(target=close, daemon=True)
+        closer.start()
+        closer.join(timeout=timeout)
+        elapsed = time.monotonic() - start_time
+        assert not closer.is_alive(), f"close() still blocked after {timeout}s"
+        if errors:
+            raise errors[0]
+        return elapsed
+
     def test_close_does_not_wait_forever_for_an_exited_peer(self):
         """close() returns while a queued message waits for a peer that is gone."""
-        sender = self._orphaned_sender()
-        closer = Thread(target=sender.close, daemon=True)
-        closer.start()
-        closer.join(timeout=10)
-        assert not closer.is_alive(), "close() blocked on a message for an exited peer"
+        self._close_within(self._orphaned_sender(), timeout=10)
 
     def test_close_keeps_an_explicit_linger(self):
         """A LINGER chosen by the caller is not replaced by the close default."""
-        sender = self._orphaned_sender(linger_ms=0)
-        start_time = time.monotonic()
-        sender.close()
-        assert time.monotonic() - start_time < 0.5
+        assert self._close_within(self._orphaned_sender(linger_ms=0), timeout=10) < 0.5
 
 
 class TestIpcAsyncBasics:
