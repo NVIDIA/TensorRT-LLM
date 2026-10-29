@@ -14,6 +14,7 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
+import collections
 import dataclasses
 import importlib
 import itertools
@@ -102,6 +103,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
     MoEEnvironment,
+    MoEInputRequirement,
     MoEProblem,
     MoERejection,
     MoERejectReason,
@@ -2673,6 +2675,7 @@ def _fused_comm_scheduler(
     enable_attention_dp: bool = False,
     reduce_results: bool = False,
     accepts_global_routed_output: bool = False,
+    run_moe_reuses_buffers: bool = False,
 ) -> FusedCommMoEScheduler:
     mapping = Mapping(
         world_size=tp_size,
@@ -2689,6 +2692,7 @@ def _fused_comm_scheduler(
             "reduce_results",
             "accepts_global_routed_output",
             "mapping",
+            "backend",
         ]
     )
     moe.parallel_size = tp_size
@@ -2696,6 +2700,10 @@ def _fused_comm_scheduler(
     moe.reduce_results = reduce_results
     moe.accepts_global_routed_output = accepts_global_routed_output
     moe.mapping = mapping
+    # ``forward`` reads the declaration off the backend before it chunks.
+    moe.backend = SimpleNamespace(
+        input_requirement=MoEInputRequirement(run_moe_reuses_buffers=run_moe_reuses_buffers)
+    )
     return FusedCommMoEScheduler(moe)
 
 
@@ -2794,6 +2802,26 @@ def test_fused_comm_forward_returns_what_the_caller_reduces(
             assert torch.equal(output, global_output)
         else:
             assert not output.any()
+
+
+@pytest.mark.cpu_only
+def test_fused_comm_forward_refuses_a_backend_that_reuses_its_buffers() -> None:
+    """``_run_chunks`` keeps the tensor each chunk returned, so a backend whose
+    next ``run_moe`` overwrites it would collect the same storage for every
+    chunk. Only ``ExternalCommMoEScheduler`` copies chunks out; here the
+    combination is a named refusal rather than the last chunk's rows repeated."""
+    scheduler = _fused_comm_scheduler(rank=0, run_moe_reuses_buffers=True)
+
+    with pytest.raises(NotImplementedError, match="run_moe_reuses_buffers"):
+        scheduler.forward(
+            torch.randn(5, 16, dtype=torch.bfloat16),
+            torch.randn(5, 8),
+            do_finalize=True,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=None,
+            use_dp_padding=None,
+            input_ids=None,
+        )
 
 
 @pytest.mark.cpu_only
@@ -5636,6 +5664,165 @@ def test_b12x_reaches_the_cutlass_op_only_for_an_nvfp4_prefill_chunk(
     assert len(calls) == int(reaches_cutlass)
     assert leaf._run_b12x_decode.called is not reaches_cutlass
     assert out.shape == (num_tokens, 8)
+
+
+# =====================================================================
+# Multi-chunk forwards: a backend whose run_moe reuses its buffers
+# across calls.
+# =====================================================================
+
+_MAIN_STREAM = "main"
+_AUX_STREAM = "aux"
+
+
+def _record_streams(monkeypatch) -> list:
+    """Replace ``torch.cuda.stream`` with a CPU stand-in; the returned stack's
+    top is the stream work is being issued on."""
+    stack = [_MAIN_STREAM]
+
+    @contextmanager
+    def stream(s):
+        stack.append(s)
+        try:
+            yield
+        finally:
+            stack.pop()
+
+    monkeypatch.setattr(torch.cuda, "stream", stream)
+    return stack
+
+
+class _OneBufferB12xWrapper:
+    """``B12xMoEWrapper`` as built with ``use_cuda_graph=True``: every call
+    writes into one preallocated buffer and returns its leading rows, so
+    consecutive calls hand back the same storage."""
+
+    def __init__(self, max_num_tokens: int, hidden_size: int, stream_stack: list) -> None:
+        self._moe_output = torch.empty((max_num_tokens, hidden_size), dtype=torch.bfloat16)
+        self._stream_stack = stream_stack
+        self.streams = []
+
+    def run(self, *, x, token_selected_experts, token_final_scales, **weights) -> torch.Tensor:
+        self.streams.append(self._stream_stack[-1])
+        out = self._moe_output[: x.shape[0]]
+        out.copy_(x * 2)  # any per-token function of the input
+        return out
+
+
+class _FreshOutputBackend:
+    """A backend whose ``run_moe`` allocates its output, as the CUTLASS op does."""
+
+    capabilities = MoEStaticCapability()
+    input_requirement = MoEInputRequirement()
+
+    def __init__(self, stream_stack: list) -> None:
+        self._stream_stack = stream_stack
+        self.streams = []
+
+    def _supports_load_balancer(self) -> bool:
+        return True
+
+    def try_fused_route_quant(self, x, router_logits):
+        return None
+
+    def quantize_input(self, x, post_quant_comm=True):
+        return x, None
+
+    def run_moe(self, ctx: MoERunContext, *, workspace=None) -> torch.Tensor:
+        self.streams.append(self._stream_stack[-1])
+        return ctx.x * 2
+
+
+def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
+    """What ``ExternalCommMoEScheduler`` reads off a single-rank layer with no
+    communication strategy and no EPLB, whose ``moe_max_num_tokens`` is below
+    the batch so it has an aux stream for chunk overlap."""
+
+    def no_op(*args, **kwargs):
+        return None
+
+    def route(router_logits, input_ids=None):
+        num_tokens = router_logits.shape[0]
+        return (
+            torch.zeros((num_tokens, 1), dtype=torch.int32),
+            torch.ones((num_tokens, 1), dtype=torch.float32),
+        )
+
+    return SimpleNamespace(
+        backend=backend,
+        comm=None,
+        use_dp=False,
+        enable_alltoall=False,
+        parallel_size=1,
+        reduce_results=False,
+        apply_router_weight_on_input=False,
+        layer_idx=0,
+        num_slots=4,
+        repeat_idx=0,
+        repeat_count=1,
+        layer_load_balancer=None,
+        aux_stream=_AUX_STREAM,
+        event_dict=collections.defaultdict(Mock),
+        routing_method=SimpleNamespace(
+            experts_per_token=1, requires_separated_routing=True, apply=route
+        ),
+        calculate_num_chunks=lambda all_rank_num_tokens: num_chunks,
+        split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
+        determine_communication_method=no_op,
+        _using_load_balancer=lambda: False,
+        _load_balancer_start_wait_gpu_stage=no_op,
+        _load_balancer_start_set_cpu_stage=no_op,
+        _load_balancer_done_set_cpu_stage=no_op,
+    )
+
+
+def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Eight tokens through the external-comm scheduler, split into two chunks
+    of four. Integer-valued, so the expected ``x * 2`` is exact in bfloat16."""
+    x = torch.arange(8 * 8, dtype=torch.bfloat16).reshape(8, 8)
+    out = ExternalCommMoEScheduler(_chunking_moe(backend, num_chunks=2)).forward(
+        x,
+        torch.zeros((8, 4)),
+        do_finalize=True,
+        output_dtype=torch.bfloat16,
+        all_rank_num_tokens=None,
+        use_dp_padding=None,
+    )
+    return x, out
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "leaf_cls", [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE], ids=["nvfp4", "w4a16"]
+)
+def test_b12x_multi_chunk_forward_keeps_every_chunk(leaf_cls, monkeypatch):
+    """Every b12x call returns the same storage, so a two-chunk forward has to
+    copy the first chunk out before the second overwrites it. The two calls
+    also share the wrapper's workspace, so they must not be in flight on two
+    streams at once. Chunks of four tokens stay below the NVFP4 leaf's
+    CUTLASS threshold, so both leaves run the b12x kernel."""
+    stream_stack = _record_streams(monkeypatch)
+    leaf = leaf_cls.__new__(leaf_cls)
+    leaf.fc31_act_scale = None
+    leaf.b12x_wrapper = _OneBufferB12xWrapper(4, 8, stream_stack)
+    leaf._b12x_weights = {}
+
+    x, out = _forward_in_two_chunks(leaf)
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert leaf.b12x_wrapper.streams == [_MAIN_STREAM, _MAIN_STREAM]
+
+
+@pytest.mark.cpu_only
+def test_multi_chunk_forward_overlaps_chunks_of_a_backend_that_allocates_its_output(monkeypatch):
+    """The serialization is the declaration's doing: a backend that does not
+    declare ``run_moe_reuses_buffers`` keeps the aux-stream overlap."""
+    backend = _FreshOutputBackend(_record_streams(monkeypatch))
+
+    x, out = _forward_in_two_chunks(backend)
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert backend.streams == [_AUX_STREAM, _MAIN_STREAM]
 
 
 @pytest.mark.cpu_only
