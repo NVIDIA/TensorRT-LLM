@@ -319,6 +319,58 @@ def test_server_base_url(server, expected):
     assert _server_base_url(server) == expected
 
 
+class _RecordingSession:
+    """Stands in for an aiohttp session and records the URLs it is asked for."""
+
+    def __init__(self, status=200):
+        self.urls = []
+        self._status = status
+
+    def _respond(self, url, **kwargs):
+        self.urls.append(url)
+        response = mock.MagicMock(status=self._status)
+        response.json = mock.AsyncMock(return_value={})
+        context = mock.MagicMock()
+        context.__aenter__ = mock.AsyncMock(return_value=response)
+        context.__aexit__ = mock.AsyncMock(return_value=False)
+        return context
+
+    get = post = _respond
+
+
+SERVER_ENTRIES = [
+    ("127.0.0.1:8001", "http://127.0.0.1:8001"),
+    ("http://127.0.0.1:8001", "http://127.0.0.1:8001"),
+    ("https://worker:8443/", "https://worker:8443"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server,base_url", SERVER_ENTRIES)
+async def test_json_requests_use_the_server_base_url(
+    isolated_prometheus_registry, server, base_url
+):
+    client = OpenAIHttpClient(mock.AsyncMock(), ServerRole.CONTEXT, timeout_secs=10)
+    await client._session.close()
+    session = _RecordingSession()
+    client._session = session
+
+    await client.get_json("v1/models", dict, server)
+    await client.post_json(
+        "v1/count_tokens", CompletionRequest(model="m", prompt="hi"), dict, server
+    )
+    assert session.urls == [f"{base_url}/v1/models", f"{base_url}/v1/count_tokens"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server,base_url", SERVER_ENTRIES)
+async def test_readiness_check_uses_the_server_base_url(server, base_url):
+    session = _RecordingSession()
+    ready, unready = await OpenAIHttpClient.check_ready_for_servers(session, [server])
+    assert session.urls == [f"{base_url}/health"]
+    assert (ready, unready) == ([server], [])
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_scheme", [False, True])
 async def test_send_request_reaches_server_url(isolated_prometheus_registry, with_scheme):
