@@ -22,7 +22,6 @@ import pytest
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.commands import serve as serve_cmd
 from tensorrt_llm.commands.serve import (
-    DEFAULT_NUM_SERVE_FRONTENDS,
     _reserve_multi_frontend_port,
     _resolve_default_num_serve_frontends,
 )
@@ -44,7 +43,7 @@ pytestmark = pytest.mark.cpu_only
 def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, reason) -> None:
     messages = []
     monkeypatch.setattr(serve_cmd.logger, "info", lambda msg, *a, **k: messages.append(msg))
-    llm_args = {"num_serve_frontends": DEFAULT_NUM_SERVE_FRONTENDS, **llm_args}
+    llm_args = {"num_serve_frontends": 8, **llm_args}
     no_conflict = dict(
         requested=False,
         port=8000,
@@ -62,7 +61,7 @@ def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, rea
 @pytest.mark.parametrize(
     "args,config,expected",
     [
-        pytest.param([], None, DEFAULT_NUM_SERVE_FRONTENDS, id="default"),
+        pytest.param([], None, 8, id="default"),
         pytest.param([], "num_serve_frontends: 1", 1, id="yaml_opt_out"),
         pytest.param(["--port", "0"], None, 1, id="port0"),
         pytest.param(["--enable_sleep_mode"], None, 1, id="sleep_mode"),

@@ -586,11 +586,6 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
             f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
 
 
-# One serving process is host-bound at high concurrency. LlmArgs keeps
-# default 1: only trtllm-serve spawns frontends.
-DEFAULT_NUM_SERVE_FRONTENDS = 8
-
-
 def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
                                          port: int, grpc: bool,
                                          report_addr: Optional[str],
@@ -1179,7 +1174,8 @@ def launch_visual_gen_server(
 @stability_option(
     "--num_serve_frontends",
     type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
-    default=DEFAULT_NUM_SERVE_FRONTENDS,
+    # LlmArgs keeps 1: only trtllm-serve spawns frontends.
+    default=8,
     help="Number of HTTP or OpenEngine frontend processes serving one "
     "executor; values > 1 share the serving port via "
     "SO_REUSEPORT (classic IPC executor path only). Without an explicit "
