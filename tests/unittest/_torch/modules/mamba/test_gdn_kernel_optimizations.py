@@ -683,6 +683,8 @@ def test_gdn_attaches_only_static_fp8_scale():
 
 @pytest.mark.parametrize("ring_mode", [False, True], ids=["triton", "flashinfer_ring"])
 def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
+    """Triton replay addresses the history by the replay slots; ring replay gathers the
+    cursors at the replay slots, which equal the state slots for rings."""
     from tensorrt_llm._torch.modules.fla.cache_manager import ReplayStateUpdateMetadata
     from tensorrt_llm._torch.modules.mamba import gdn_mixer
 
@@ -731,6 +733,7 @@ def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
         layer_cache=layer_cache,
         replay_work_items=None,
         replay_n_writes=None,
+        replay_indices_d=torch.tensor([3, 1, 5, 0] if ring_mode else [4, 2, 0, 1]).int(),
     )
 
     if ring_mode:
@@ -744,6 +747,7 @@ def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
         assert set(calls) == {"triton"}
         kwargs = calls["triton"]
         assert kwargs["state_indices"].tolist() == [3, 1, 5]
+        assert kwargs["replay_indices"].tolist() == [4, 2, 0]
         assert kwargs["old_u"] == "old_x"
 
 

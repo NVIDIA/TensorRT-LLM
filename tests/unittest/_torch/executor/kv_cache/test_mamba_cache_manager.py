@@ -28,7 +28,23 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     Qwen35HybridCacheManager,
     _use_flashinfer_ring_replay,
 )
-from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import FLASHINFER_REPLAY_RING_SIZE
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    ReplayStateUpdateMetadata as GDNReplayStateUpdateMetadata,
+)
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    _advance_replay_state as _advance_gdn_replay_state,
+)
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    _advance_ring_start as _advance_gdn_ring_start,
+)
+from tensorrt_llm._torch.modules.fla.cached_replay import (
+    fused_recurrent_gated_delta_rule_cached_replay_update,
+)
+from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
+    FLASHINFER_REPLAY_RING_SIZE,
+    flashinfer_cached_replay_update,
+    is_flashinfer_cached_replay_available,
+)
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     _KDA_BETA_CACHE_ALIGNMENT_BYTES,
     KDAIntermediateState,
@@ -46,6 +62,7 @@ from tensorrt_llm._torch.modules.mamba.cache_manager import (
     _advance_replay_state,
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
     _create_kv_cache_manager,
@@ -4492,6 +4509,8 @@ def test_gdn_flashinfer_ring_replay_gate_force_replay_disabled(monkeypatch):
 
 @skip_no_cuda
 def test_v2_gdn_ring_replay_allocates_rings_instead_of_double_buffer():
+    """Ring replay binds per-layer rings and the ring start, as views of the manager's recurrent-state pool, instead
+    of the double-buffered history."""
     policy = GDNReplayState(tokens_per_gen_step=4, use_flashinfer_ring=True)
     mgr = _build_v2_hybrid_with_mamba_layer(
         num_mamba_layers=2,
@@ -4503,17 +4522,16 @@ def test_v2_gdn_ring_replay_allocates_rings_instead_of_double_buffer():
     try:
         assert mgr.use_gdn_flashinfer_ring_replay
         assert not mgr.use_gdn_cached_replay_all_layer_commit
-        assert policy.old_x is None and policy.old_B is None
-        assert policy.old_dt is None and policy.old_dA_cumsum is None
+        assert policy.old_x is None and policy.old_B is None and policy.old_dt is None
         nheads, head_dim, d_state = mgr.ssm_state_shape
         layers, slots = mgr.local_num_mamba_layers, policy.cache_base.shape[0]
+        assert slots == mgr.all_ssm_states[0].shape[0]
         n_groups = mgr._state_layout.n_groups_per_rank
-        assert policy.k_ring.shape == (layers, slots, n_groups, ring_size, d_state)
-        assert policy.u_ring.shape == (layers, slots, nheads, ring_size, head_dim)
-        assert policy.g_ring.shape == (layers, slots, nheads, ring_size)
-        assert policy.g_ring.dtype == torch.float32
-        for t in (policy.cache_base, policy.k_ring, policy.u_ring, policy.g_ring):
-            assert not t.any()
+        for layer in range(layers):
+            assert policy.k_ring[layer].shape == (slots, n_groups, ring_size, d_state)
+            assert policy.u_ring[layer].shape == (slots, nheads, ring_size, head_dim)
+            assert policy.g_ring[layer].shape == (slots, nheads, ring_size)
+            assert policy.g_ring[layer].dtype == torch.float32
 
         layer_cache = mgr.mamba_layer_cache(1)
         offset = mgr.mamba_layer_offsets[1]
@@ -7260,3 +7278,701 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
 
 
 _KDA_REPLAY_FIELDS = (*_KDA_REPLAY_BUFFERS, "prev_num_accepted_tokens")
+
+
+_GDN_MANAGERS = pytest.mark.parametrize(
+    "manager_cls",
+    [Qwen35HybridCacheManager, Qwen4ExpHybridCacheManager],
+    ids=["qwen3_5", "qwen4_exp"],
+)
+_GDN_TRITON_HISTORY = ("old_x", "old_B", "old_dt")
+_GDN_RING_HISTORY = ("k_ring", "u_ring", "g_ring")
+
+
+def _build_v2_gdn_replay_manager(manager_cls=Qwen35HybridCacheManager, **kwargs):
+    """A V2 Qwen3.5 or Qwen4Exp manager with GDN replay on two layers."""
+    kwargs.setdefault("num_mamba_layers", 2)
+    return _build_v2_hybrid_with_mamba_layer(
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+        conv_state_layout="q_k_v",
+        model_manager_cls=manager_cls,
+        **kwargs,
+    )
+
+
+def _force_gdn_ring_replay(monkeypatch):
+    """Select the FlashInfer ring layout without its kernel's geometry gates."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.cache_manager._use_flashinfer_ring_replay",
+        lambda manager, replay_enabled: replay_enabled,
+    )
+
+
+def _gdn_history_names(state):
+    return _GDN_RING_HISTORY if state.use_flashinfer_ring else _GDN_TRITON_HISTORY
+
+
+def _gdn_replay_rows(mgr, replay_slot):
+    """One replay slot's (PNAT, active buffer, ring start) and clones of its per-layer history."""
+    state = mgr._speculative_state
+    history = [
+        getattr(state, name)[layer][replay_slot].clone()
+        for name in _gdn_history_names(state)
+        for layer in range(mgr.local_num_mamba_layers)
+    ]
+    bookkeeping = (
+        int(state.prev_num_accepted_tokens[replay_slot]),
+        int(state.cache_buf_idx[replay_slot]),
+        int(state.cache_base[replay_slot]) if state.use_flashinfer_ring else 0,
+    )
+    return bookkeeping, history
+
+
+def _fill_gdn_replay_slot(mgr, replay_slot, accepted, active_buffer, value):
+    state = mgr._speculative_state
+    state.prev_num_accepted_tokens[replay_slot] = accepted
+    state.cache_buf_idx[replay_slot] = active_buffer
+    if state.use_flashinfer_ring:
+        state.cache_base[replay_slot] = 5
+    for name in _gdn_history_names(state):
+        for layer in range(mgr.local_num_mamba_layers):
+            getattr(state, name)[layer][replay_slot].fill_(value)
+
+
+def _assert_gdn_replay_slot_reset(mgr, replay_slot):
+    bookkeeping, history = _gdn_replay_rows(mgr, replay_slot)
+    assert bookkeeping == (0, 0, 0)
+    assert all(torch.count_nonzero(rows) == 0 for rows in history)
+
+
+@skip_no_cuda
+@_GDN_MANAGERS
+def test_v2_gdn_replay_history_uses_private_kvcm_buffers(manager_cls):
+    """Triton GDN replay history (old_x, old_B, old_dt) and its bookkeeping live in PRIVATE buffers of the GDN layers:
+    their own group and slots, a fixed pool of one slot per IndexMapper slot, and local to the worker in disaggregated
+    serving. The double buffer's unused old_dA_cumsum is not allocated."""
+    mgr = _build_v2_gdn_replay_manager(manager_cls, max_batch_size=2)
+    try:
+        state = mgr._speculative_state
+        assert isinstance(state, GDNReplayState) and not state.use_flashinfer_ring
+        replay_group = mgr.replay_layer_group_id
+        assert replay_group is not None
+        assert replay_group != mgr.ssm_layer_group_id
+        # One slot per living cache: 2 * max_batch_size with overlap + 1 CUDA-graph padding dummy.
+        assert mgr._index_mapper_capacity == 2 * 2 + 1
+        assert mgr.kv_cache_manager_py_config.max_live_kv_caches == mgr._index_mapper_capacity
+        pools = mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        private_stats = mgr.impl.get_storage_statistics(GPU_LEVEL)[pools[replay_group]]
+        assert private_stats.total == math.ceil(
+            mgr._index_mapper_capacity / mgr.kv_cache_config.max_util_for_resume
+        )
+        replay_slots = state.prev_num_accepted_tokens.shape[0]
+        assert replay_slots == private_stats.total
+
+        first, second = mgr.mamba_pp_layers
+        history_roles = {DataRole(f"gdn_{name}") for name in _GDN_TRITON_HISTORY}
+        assert set(mgr._replay_layouts[first]) == history_roles | {DataRole("gdn_replay_meta")}
+        assert set(mgr._replay_layouts[second]) == history_roles
+        for layer_id in mgr.mamba_pp_layers:
+            local_layer = LayerId(mgr.layer_offsets[layer_id])
+            for role in mgr._replay_layouts[layer_id]:
+                assert mgr.impl.get_buffer_group_id(local_layer, role) == replay_group
+            layer_cache = mgr.mamba_layer_cache(layer_id)
+            for name in _GDN_TRITON_HISTORY:
+                assert getattr(layer_cache, name).shape[0] == replay_slots
+            assert layer_cache.old_dA_cumsum is None
+            assert layer_cache.k_ring is None and layer_cache.cache_base is None
+        # PNAT and the active buffer share one 16-byte row per slot.
+        assert state.prev_num_accepted_tokens.stride(0) == 4
+        assert state.cache_buf_idx.stride(0) == 4
+        assert mgr.use_gdn_cached_replay_all_layer_commit
+        assert not mgr.use_gdn_flashinfer_ring_replay
+        assert set(mgr._replay_layouts[first]) <= mgr.get_disagg_ignored_roles()
+        page_table = build_page_table_from_manager(mgr)
+        assert not page_table.layer_groups[replay_group].pool_views
+
+        mgr.add_dummy_requests([7], token_nums=[8], is_gen=False)
+        kv_cache = mgr.kv_cache_map[7]
+        assert mgr.get_replay_state_indices([7]) == [
+            kv_cache.get_ssm_block_base_index(replay_group)
+        ]
+        assert mgr.cuda_replay_state_indices[0].item() == mgr.get_replay_state_indices([7])[0]
+    finally:
+        mgr.shutdown()
+
+
+@_GDN_MANAGERS
+@pytest.mark.parametrize("flashinfer_ring", [False, True], ids=["triton", "ring"])
+def test_gdn_replay_cache_estimate_matches_declared_buffers(
+    monkeypatch, manager_cls, flashinfer_ring
+):
+    """The cache estimate counts the Triton history as PRIVATE bytes per living cache and the FlashInfer rings as
+    bytes of every recurrent-state slot, matching what the manager declares."""
+    from tensorrt_llm._torch.modules.fla import cache_manager as fla_cache_manager
+
+    params = SimpleNamespace(
+        num_heads=4,
+        head_dim=8,
+        state_size=8,
+        n_groups=1,
+        dtype=torch.float16,
+        mamba_ssm_cache_dtype=torch.float16,
+    )
+    monkeypatch.setattr(
+        fla_cache_manager,
+        "_get_local_mamba_cache_layout",
+        lambda *args, **kwargs: (params, 2, 1),
+    )
+    monkeypatch.setattr(
+        fla_cache_manager,
+        "_flashinfer_ring_replay_reason",
+        lambda layout, spec_config, replay_enabled: (flashinfer_ring, None),
+    )
+    if manager_cls is Qwen4ExpHybridCacheManager:
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.modules.qwen4_exp.cache_manager._get_local_mamba_cache_layout",
+            lambda *args, **kwargs: (params, 2, 1),
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.modules.qwen4_exp.cache_manager._qwen4_exp_ple_state_bytes_per_rank",
+            lambda *args, **kwargs: 0,
+        )
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    state = GDNReplayState(spec_config.tokens_per_gen_step, use_flashinfer_ring=flashinfer_ring)
+    layout = SimpleNamespace(
+        mamba_pp_layers=(0, 1),
+        ssm_state_shape=(4, 8, 8),
+        n_groups_per_rank=1,
+        conv_state_dtype=torch.float16,
+    )
+    declared = sum(
+        dtype.itemsize * math.prod(shape)
+        for layer_id in layout.mamba_pp_layers
+        for dtype, shape in state.pool_layout(layout, layer_id).values()
+    )
+    private = manager_cls._estimate_private_replay_bytes_per_slot(
+        None, mapping, spec_config=spec_config
+    )
+    coupled = manager_cls._extra_state_bytes_per_rank(None, mapping, spec_config=spec_config)
+    assert (private, coupled) == ((0, declared) if flashinfer_ring else (declared, 0))
+    # Without speculation, and on a disaggregated context server, nothing is declared.
+    assert manager_cls._estimate_private_replay_bytes_per_slot(None, mapping) == 0
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    assert (
+        manager_cls._estimate_private_replay_bytes_per_slot(
+            None, mapping, spec_config=spec_config, is_disagg=True
+        )
+        == 0
+    )
+
+
+@skip_no_cuda
+@_GDN_MANAGERS
+def test_v2_gdn_private_replay_resets_fresh_pages_of_generation_dummies(manager_cls):
+    """A PRIVATE page holds its previous owner's bytes. Requests that start in generation get their GDN replay slot
+    reset once; later steps keep their history, and the slot of a freed request is reset again for its next owner."""
+    mgr = _build_v2_gdn_replay_manager(manager_cls)
+    try:
+        state = mgr._speculative_state
+        num_replay_slots = state.prev_num_accepted_tokens.shape[0]
+        for slot in range(num_replay_slots):
+            _fill_gdn_replay_slot(mgr, slot, accepted=13, active_buffer=1, value=float("nan"))
+
+        requests = mgr.add_dummy_requests(
+            [11, 12], token_nums=[8, 8], is_gen=True, max_num_draft_tokens=3
+        )
+        replay_slots = mgr.get_replay_state_indices([11, 12])
+        assert len(set(replay_slots)) == 2
+        for slot in replay_slots:
+            _assert_gdn_replay_slot_reset(mgr, slot)
+        untouched = [slot for slot in range(num_replay_slots) if slot not in replay_slots]
+        assert all(int(state.prev_num_accepted_tokens[slot]) == 13 for slot in untouched)
+
+        _fill_gdn_replay_slot(mgr, replay_slots[0], accepted=3, active_buffer=1, value=2.0)
+        mgr._setup_state_indices(requests, num_contexts=0)
+        assert _gdn_replay_rows(mgr, replay_slots[0])[0][:2] == (3, 1)
+
+        mgr.free_resources(requests[0])
+        mgr.add_dummy_requests([11], token_nums=[8], is_gen=True, max_num_draft_tokens=3)
+        _assert_gdn_replay_slot_reset(mgr, mgr.get_replay_state_indices([11])[0])
+        assert _gdn_replay_rows(mgr, replay_slots[1])[0][:2] == (0, 0)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@_GDN_MANAGERS
+def test_v2_gdn_replay_history_is_not_committed_for_reuse(manager_cls):
+    """A finished request commits its recurrent snapshot for prefix reuse but not its GDN replay history. The PRIVATE
+    pool is empty once the request is freed, a request reusing the prefix matches only the recurrent snapshot, and its
+    replay bookkeeping starts from reset values."""
+    mgr = _build_v2_gdn_replay_manager(
+        manager_cls,
+        enable_block_reuse=True,
+        additional_snapshot_offsets_from_end=[0],
+    )
+    source = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=list(range(64)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    reader = LlmRequest(
+        request_id=2,
+        max_new_tokens=1,
+        input_tokens=list(range(65)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    try:
+        replay_group = mgr.replay_layer_group_id
+        _run_v2_hybrid_context(mgr, source, state_value=1)
+        source_slot = mgr.get_replay_state_indices([1])[0]
+        _fill_gdn_replay_slot(mgr, source_slot, accepted=5, active_buffer=1, value=7.0)
+        mgr.free_resources(source)
+
+        pools = mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        private_stats = mgr.impl.get_storage_statistics(GPU_LEVEL)[pools[replay_group]]
+        assert private_stats.free == private_stats.total
+
+        mgr.prepare_expect_snapshot_points([reader])
+        assert mgr.prepare_context(reader)
+        reader_cache = mgr.kv_cache_map[2]
+        assert reader_cache.reuse_status[mgr.ssm_layer_group_id].complete
+        assert not reader_cache.reuse_status[replay_group].complete
+        batch = ScheduledRequests()
+        batch.append_context_request(reader)
+        mgr.prepare_resources(batch)
+        assert reader.prepopulated_prompt_len == 64
+        state_index = mgr.get_state_indices([2], [False])[0]
+        for buffer in (*mgr.all_ssm_states, *mgr.all_conv_states):
+            assert torch.all(buffer[state_index] == 1)
+        _assert_gdn_replay_slot_reset(mgr, mgr.get_replay_state_indices([2])[0])
+    finally:
+        for request in (source, reader):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@_GDN_MANAGERS
+def test_v2_gdn_ring_replay_buffers_share_the_recurrent_state_slot(monkeypatch, manager_cls):
+    """FlashInfer addresses its rings by the recurrent-state index, so ring replay declares the rings, PNAT, active
+    buffer and ring start with the layer's REQUIRED policy: they join the recurrent-state group and slot, use the state
+    index, count in every state slot, bound no living caches, and are reset when a generation request first gets its
+    slot."""
+    _force_gdn_ring_replay(monkeypatch)
+    mgr = _build_v2_gdn_replay_manager(manager_cls)
+    try:
+        state = mgr._speculative_state
+        assert isinstance(state, GDNReplayState) and state.use_flashinfer_ring
+        assert mgr.use_gdn_flashinfer_ring_replay
+        assert mgr.replay_layer_group_id is None
+        assert mgr.kv_cache_manager_py_config.max_live_kv_caches is None
+        assert mgr.cuda_replay_state_indices is mgr.cuda_state_indices
+        first = mgr.mamba_pp_layers[0]
+        ring_roles = {DataRole(f"gdn_{name}") for name in _GDN_RING_HISTORY}
+        assert set(mgr._replay_layouts[first]) == ring_roles | {DataRole("gdn_replay_meta")}
+        for layer_id in mgr.mamba_pp_layers:
+            local_layer = LayerId(mgr.layer_offsets[layer_id])
+            for role in mgr._replay_layouts[layer_id]:
+                assert mgr.impl.get_buffer_group_id(local_layer, role) == mgr.ssm_layer_group_id
+        assert mgr._mamba_state_bytes_per_slot() == sum(
+            buffer.size
+            for layer_id in mgr.mamba_pp_layers
+            for buffer in mgr._get_recurrent_buffer_configs(layer_id)
+        ) + mgr._replay_bytes_per_slot(mgr._replay_layouts)
+        num_slots = mgr.all_ssm_states[0].shape[0]
+        assert state.cache_base.shape[0] == num_slots
+        assert state.cache_base.stride(0) == 4
+        n_heads, head_dim, d_state = mgr.ssm_state_shape
+        n_groups = mgr._state_layout.n_groups_per_rank
+        ring_size = FLASHINFER_REPLAY_RING_SIZE
+        layer_cache = mgr.mamba_layer_cache(first)
+        assert layer_cache.k_ring.shape == (num_slots, n_groups, ring_size, d_state)
+        assert layer_cache.u_ring.shape == (num_slots, n_heads, ring_size, head_dim)
+        assert layer_cache.g_ring.shape == (num_slots, n_heads, ring_size)
+        assert layer_cache.old_x is None
+        assert set(mgr._replay_layouts[first]) <= mgr.get_disagg_ignored_roles()
+
+        for slot in range(num_slots):
+            _fill_gdn_replay_slot(mgr, slot, accepted=13, active_buffer=1, value=float("nan"))
+        mgr.add_dummy_requests([5], token_nums=[8], is_gen=True, max_num_draft_tokens=3)
+        replay_slot = mgr.get_replay_state_indices([5])[0]
+        assert replay_slot == mgr.get_state_indices([5], [False])[0]
+        _assert_gdn_replay_slot_reset(mgr, replay_slot)
+    finally:
+        mgr.shutdown()
+
+
+_skip_no_flashinfer_ring = pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_flashinfer_cached_replay_available(),
+    reason="Requires SM90/SM100/SM103 and FlashInfer gated_delta_rule_mtp_ucache_flush",
+)
+
+
+def _v2_gdn_replay_manager_with_large_slots(manager_cls, flashinfer_ring):
+    """A real V2 GDN manager with replay at K = V = 128, 16 value and 4 key heads, on 6 layers. A recurrent-state slot
+    (3 MiB with fp32 states for the Triton history, 3 MiB of bf16 states plus the rings for FlashInfer) is larger than
+    the 2 MiB allocation grain, so the pool holds a handful of slots, fewer than the living caches allow, and runs out
+    before the attention pages do. max_util_for_resume 1.0 lets resume admit caches until the pool is full."""
+    num_gdn_layers = 6
+    return manager_cls(
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_num_heads=16,
+        mamba_n_groups=4,
+        mamba_head_dim=128,
+        mamba_num_layers=num_gdn_layers,
+        mamba_layer_mask=[True] * num_gdn_layers + [False],
+        mamba_cache_dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.bfloat16 if flashinfer_ring else torch.float32,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=1,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        layer_mask=[False] * num_gdn_layers + [True],
+        vocab_size=1024,
+        use_replay_state_update=True,
+    )
+
+
+def _gdn_verify_inputs(mgr, round_idx, layer_offset, tokens):
+    """One request's verify inputs for one GDN layer, as the mixer hands them over: q/k/v as column slices of the conv
+    output and a/b as column slices of the in_proj_ba output. They depend only on the round and the layer."""
+    n_heads, head_dim, d_state = mgr.ssm_state_shape
+    n_groups = mgr._state_layout.n_groups_per_rank
+    generator = torch.Generator(device="cuda").manual_seed(1000 * round_idx + layer_offset)
+    key_width = n_groups * d_state
+    packed = torch.randn(
+        tokens, 2 * key_width + n_heads * head_dim, generator=generator, device="cuda"
+    ).bfloat16()
+    rows = packed.view(1, tokens, -1)
+    ba = torch.randn(tokens, 2 * n_heads, generator=generator, device="cuda").bfloat16()
+    return dict(
+        q=rows[..., :key_width].view(1, tokens, n_groups, d_state),
+        k=rows[..., key_width : 2 * key_width].view(1, tokens, n_groups, d_state),
+        v=rows[..., 2 * key_width :].view(1, tokens, n_heads, head_dim),
+        b=ba[:, :n_heads].view(1, tokens, n_heads),
+        a=ba[:, n_heads:].view(1, tokens, n_heads),
+        packed=packed,
+    )
+
+
+def _gdn_verify_round(mgr, request_id, layer_weights, round_idx):
+    """One verify of the request's four tokens on every GDN layer, as the mixer runs the replay kernel. Returns the
+    outputs."""
+    state_slots = torch.tensor(
+        mgr.get_state_indices([request_id], [False]), dtype=torch.int32, device="cuda"
+    )
+    replay_slots = torch.tensor(
+        mgr.get_replay_state_indices([request_id]), dtype=torch.int32, device="cuda"
+    )
+    metadata = mgr.get_replay_state_update_metadata()
+    tokens = metadata.replay_step_width
+    outputs = []
+    for layer_offset, (A_log, dt_bias) in enumerate(layer_weights):
+        layer_cache = mgr.mamba_layer_cache(mgr.mamba_pp_layers[layer_offset])
+        inputs = _gdn_verify_inputs(mgr, round_idx, layer_offset, tokens)
+        if mgr.use_gdn_flashinfer_ring_replay:
+            rows = replay_slots.long()
+            out = flashinfer_cached_replay_update(
+                inputs["q"],
+                inputs["k"],
+                inputs["v"],
+                inputs["a"],
+                inputs["b"],
+                A_log,
+                dt_bias,
+                layer_cache.temporal,
+                state_slots,
+                layer_cache.k_ring,
+                layer_cache.u_ring,
+                layer_cache.g_ring,
+                layer_cache.prev_num_accepted_tokens[rows],
+                layer_cache.cache_base[rows],
+                history_size=metadata.replay_history_size,
+            )
+        else:
+            out = fused_recurrent_gated_delta_rule_cached_replay_update(
+                inputs["q"],
+                inputs["k"],
+                inputs["v"],
+                inputs["a"],
+                inputs["b"],
+                layer_cache.temporal,
+                state_slots,
+                layer_cache.old_x,
+                layer_cache.old_B,
+                layer_cache.old_dt,
+                None,
+                layer_cache.cache_buf_idx,
+                layer_cache.prev_num_accepted_tokens,
+                history_size=metadata.replay_history_size,
+                use_qk_l2norm_in_kernel=True,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                packed_qkv=inputs["packed"],
+                replay_indices=replay_slots,
+            )
+        outputs.append(out.clone())
+    return torch.stack(outputs)
+
+
+def _advance_gdn_replay(mgr, request_id, accepted):
+    """update_mamba_states' bookkeeping for one request: the ring start (ring replay), then PNAT and the active
+    buffer."""
+    metadata = mgr.get_replay_state_update_metadata()
+    replay_slots = torch.tensor(
+        mgr.get_replay_state_indices([request_id]), dtype=torch.int32, device="cuda"
+    )
+    if mgr.use_gdn_flashinfer_ring_replay:
+        _advance_gdn_ring_start(mgr._speculative_state.cache_base, metadata, replay_slots)
+    _advance_gdn_replay_state(
+        metadata, replay_slots, torch.tensor([accepted], dtype=torch.int32, device="cuda")
+    )
+
+
+def _run_gdn_verify_rounds(
+    manager_cls, flashinfer_ring, accepted_per_round, suspend_after=None, slot_taken=False
+):
+    """Verify rounds of one request on a V2 GDN manager, each accepting the given number of tokens. With
+    ``suspend_after``, the request is suspended after that round's acceptance and resumed, its SSM slot taken and
+    overwritten by another cache meanwhile when ``slot_taken``. Returns every round's outputs and the request's final
+    SSM states."""
+    mgr = _v2_gdn_replay_manager_with_large_slots(manager_cls, flashinfer_ring)
+    others = []
+    request = None
+    try:
+        assert mgr.use_gdn_flashinfer_ring_replay == flashinfer_ring
+        (request,) = mgr.add_dummy_requests(
+            [1], token_nums=[8], is_gen=True, max_num_draft_tokens=3
+        )
+        generator = torch.Generator(device="cuda").manual_seed(7)
+        n_heads = mgr.ssm_state_shape[0]
+        layer_weights = [
+            (
+                (torch.randn(n_heads, generator=generator, device="cuda") * 0.5).bfloat16().float(),
+                (torch.randn(n_heads, generator=generator, device="cuda") * 0.5).bfloat16().float(),
+            )
+            for _ in mgr.all_ssm_states
+        ]
+        # The state a prefill leaves; the replay history starts empty.
+        slot = mgr.get_state_indices([1], [False])[0]
+        for ssm_states in mgr.all_ssm_states:
+            ssm_states[slot] = 0.1 * torch.randn(
+                ssm_states.shape[1:], generator=generator, device="cuda"
+            )
+        _assert_gdn_replay_slot_reset(mgr, mgr.get_replay_state_indices([1])[0])
+
+        outputs = []
+        for round_idx, accepted in enumerate(accepted_per_round):
+            outputs.append(_gdn_verify_round(mgr, 1, layer_weights, round_idx))
+            _advance_gdn_replay(mgr, 1, accepted)
+            if round_idx == suspend_after:
+                slot = mgr.get_state_indices([1], [False])[0]
+                history = _gdn_replay_rows(mgr, mgr.get_replay_state_indices([1])[0])
+                mgr.suspend_request(request)
+                if slot_taken:
+                    _take_ssm_slot(mgr, slot, others)
+                    holder = others[0]
+                    holder_replay_slot = (
+                        slot
+                        if mgr.replay_layer_group_id is None
+                        else holder.get_ssm_block_base_index(mgr.replay_layer_group_id)
+                    )
+                    for ssm_states in mgr.all_ssm_states:
+                        ssm_states[slot] = torch.randn(
+                            ssm_states.shape[1:], generator=generator, device="cuda"
+                        )
+                    _fill_gdn_replay_slot(
+                        mgr, holder_replay_slot, accepted=9, active_buffer=1, value=3.0
+                    )
+                assert mgr.resume_request(request)
+                mgr._setup_state_indices([request], num_contexts=0)
+                if slot_taken:
+                    assert mgr.get_state_indices([1], [False])[0] != slot
+                # The replay pages -- PRIVATE, or the recurrent-state page that holds the rings -- follow the request
+                # with PNAT, the active buffer, the ring start and the history.
+                resumed = _gdn_replay_rows(mgr, mgr.get_replay_state_indices([1])[0])
+                assert resumed[0] == history[0]
+                assert all(torch.equal(a, b) for a, b in zip(resumed[1], history[1], strict=True))
+        slot = mgr.get_state_indices([1], [False])[0]
+        states = torch.stack([ssm_states[slot] for ssm_states in mgr.all_ssm_states])
+        torch.cuda.synchronize()
+        return outputs, states
+    finally:
+        for cache in others:
+            cache.close()
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("slot_taken", [True, False], ids=["slot_taken", "slot_kept"])
+@pytest.mark.parametrize(
+    "manager_cls, flashinfer_ring",
+    [
+        (Qwen35HybridCacheManager, False),
+        (Qwen4ExpHybridCacheManager, False),
+        (Qwen35HybridCacheManager, True),
+    ],
+    ids=["qwen3_5-triton", "qwen4_exp-triton", "qwen3_5-ring"],
+)
+def test_v2_gdn_replay_suspend_resume_matches_an_unsuspended_run(
+    monkeypatch, manager_cls, flashinfer_ring, slot_taken
+):
+    """A request is suspended with accepted tokens in its GDN replay history and resumes; every verify gives, bit for
+    bit, the outputs and leaves the states of the same request never suspended.
+
+    Triton replay keeps the history in PRIVATE pages with their own slots; FlashInfer ring replay keeps the rings and
+    their cursors in the recurrent-state page. slot_taken: while the request is suspended, new caches fill the SSM pool,
+    so the V2 runtime moves its SSM page to the host tier and gives its slot to one of them, which overwrites the slot's
+    state and its own replay history; the request resumes in another SSM slot. slot_kept: nothing else runs while it is
+    suspended."""
+    if flashinfer_ring:
+        if not is_flashinfer_cached_replay_available():
+            pytest.skip("FlashInfer ring replay needs FlashInfer and an SM90/SM100/SM103 GPU")
+        monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    elif get_sm_version() < 90:
+        pytest.skip("the cached replay kernel's tuned path needs sm_90+")
+    accepted_per_round = [2, 1, 4, 4, 3, 1, 4, 2]
+    suspend_after = 3
+    expected_outputs, expected_states = _run_gdn_verify_rounds(
+        manager_cls, flashinfer_ring, accepted_per_round
+    )
+    outputs, states = _run_gdn_verify_rounds(
+        manager_cls,
+        flashinfer_ring,
+        accepted_per_round,
+        suspend_after=suspend_after,
+        slot_taken=slot_taken,
+    )
+    for round_idx, (actual, expected) in enumerate(zip(outputs, expected_outputs, strict=True)):
+        assert torch.equal(actual, expected), f"verify round {round_idx}"
+    assert torch.equal(states, expected_states)
+
+
+@_skip_no_flashinfer_ring
+def test_v2_gdn_ring_replay_flashinfer_reads_kvcm_ring_views(monkeypatch):
+    """FlashInfer's ring replay takes the manager's rings, which are block-strided views of the recurrent-state slots,
+    and their strided cursor rows. Over steps through flushes and ring wrap-around it gives, bit for bit, the results
+    of the same rings copied into standalone contiguous tensors."""
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    mgr = _v2_gdn_replay_manager_with_large_slots(Qwen35HybridCacheManager, flashinfer_ring=True)
+    try:
+        assert mgr.use_gdn_flashinfer_ring_replay
+        requests = mgr.add_dummy_requests(
+            [1, 2, 3], token_nums=[8, 8, 8], is_gen=True, max_num_draft_tokens=3
+        )
+        state_slots = torch.tensor(
+            mgr.get_state_indices([1, 2, 3], [False] * 3), dtype=torch.int32, device="cuda"
+        )
+        assert mgr.get_replay_state_indices([1, 2, 3]) == state_slots.tolist()
+        rows = state_slots.long()
+        metadata = mgr.get_replay_state_update_metadata()
+        tokens, history_size = metadata.replay_step_width, metadata.replay_history_size
+        n_heads = mgr.ssm_state_shape[0]
+        generator = torch.Generator(device="cuda").manual_seed(11)
+        layer_offsets = (0, mgr.local_num_mamba_layers - 1)
+        managed, standalone = [], []
+        for layer_offset in layer_offsets:
+            layer_cache = mgr.mamba_layer_cache(mgr.mamba_pp_layers[layer_offset])
+            layer_cache.temporal[rows] = (
+                0.5
+                * torch.randn(layer_cache.temporal[rows].shape, generator=generator, device="cuda")
+            ).bfloat16()
+            views = {
+                "ssm_states": layer_cache.temporal,
+                "k_ring": layer_cache.k_ring,
+                "u_ring": layer_cache.u_ring,
+                "g_ring": layer_cache.g_ring,
+            }
+            for name in ("k_ring", "u_ring", "g_ring"):
+                assert not views[name].is_contiguous()
+            managed.append(views)
+            standalone.append({name: view.contiguous() for name, view in views.items()})
+        state = mgr._speculative_state
+        assert state.prev_num_accepted_tokens.stride(0) == state.cache_base.stride(0) == 4
+        standalone_meta = GDNReplayStateUpdateMetadata(
+            state.prev_num_accepted_tokens.contiguous(),
+            state.cache_buf_idx.contiguous(),
+            tokens,
+            history_size,
+        )
+        standalone_base = state.cache_base.contiguous()
+        A_log = (torch.randn(n_heads, generator=generator, device="cuda") * 0.5).bfloat16().float()
+        dt_bias = (
+            (torch.randn(n_heads, generator=generator, device="cuda") * 0.5).bfloat16().float()
+        )
+        flushes = 0
+        for step in range(12):
+            flushes += int((metadata.prev_num_accepted_tokens[rows] + tokens > history_size).sum())
+            for index, layer_offset in enumerate(layer_offsets):
+                inputs = [
+                    _gdn_verify_inputs(mgr, step, 3 * layer_offset + row, tokens)
+                    for row in range(len(requests))
+                ]
+                packed = torch.cat([x["packed"] for x in inputs])
+                key_width = 2 * mgr._state_layout.n_groups_per_rank * mgr.ssm_state_shape[2]
+                qkv = packed.view(len(requests), tokens, -1)
+                ba = torch.cat([torch.cat([x["b"], x["a"]], -1) for x in inputs])
+                outputs = []
+                for views, pnat, base in (
+                    (managed[index], metadata.prev_num_accepted_tokens, state.cache_base),
+                    (standalone[index], standalone_meta.prev_num_accepted_tokens, standalone_base),
+                ):
+                    outputs.append(
+                        flashinfer_cached_replay_update(
+                            qkv[..., : key_width // 2].view(len(requests), tokens, -1, 128),
+                            qkv[..., key_width // 2 : key_width].view(
+                                len(requests), tokens, -1, 128
+                            ),
+                            qkv[..., key_width:].view(len(requests), tokens, n_heads, 128),
+                            ba[..., n_heads:],
+                            ba[..., :n_heads],
+                            A_log,
+                            dt_bias,
+                            views["ssm_states"],
+                            state_slots,
+                            views["k_ring"],
+                            views["u_ring"],
+                            views["g_ring"],
+                            pnat[rows],
+                            base[rows],
+                            history_size=history_size,
+                        )
+                    )
+                assert torch.equal(outputs[0], outputs[1]), f"step {step} layer {layer_offset}"
+            accepted = torch.randint(
+                1,
+                tokens + 1,
+                (len(requests),),
+                generator=generator,
+                device="cuda",
+                dtype=torch.int32,
+            )
+            _advance_gdn_ring_start(state.cache_base, metadata, state_slots)
+            _advance_gdn_replay_state(metadata, state_slots, accepted)
+            _advance_gdn_ring_start(standalone_base, standalone_meta, state_slots)
+            _advance_gdn_replay_state(standalone_meta, state_slots, accepted)
+        assert flushes >= len(requests), f"only {flushes} flushes; increase the steps"
+        for views, copies in zip(managed, standalone, strict=True):
+            for name, view in views.items():
+                assert torch.equal(view[rows], copies[name][rows]), name
+    finally:
+        mgr.shutdown()

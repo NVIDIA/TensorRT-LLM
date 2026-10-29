@@ -95,14 +95,10 @@ class _Mode:
             )
             self.old_B = torch.zeros(LAYERS, SLOTS, 2, HIST, H, K, dtype=torch.bfloat16, device=DEV)
             self.old_dt = torch.zeros(LAYERS, SLOTS, 2, HV, HIST, device=DEV)
-            self.old_dA = torch.zeros(LAYERS, SLOTS, 2, HV, HIST, device=DEV)
             self.pnat = torch.zeros(SLOTS, dtype=torch.int32, device=DEV)
             self.buf = torch.zeros(SLOTS, dtype=torch.int32, device=DEV)
             bound["replay"] = M._Replay(
-                old={
-                    i: (self.old_x[i], self.old_B[i], self.old_dt[i], self.old_dA[i])
-                    for i in range(LAYERS)
-                },
+                old={i: (self.old_x[i], self.old_B[i], self.old_dt[i]) for i in range(LAYERS)},
                 cache_buf_idx=self.buf,
                 prev_num_accepted=self.pnat,
                 history=HIST,
@@ -115,6 +111,7 @@ class _Mode:
                     max_batch, REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device=DEV
                 ),
                 replay_n_writes=torch.zeros(1, dtype=torch.int32, device=DEV),
+                replay_state_indices=None,
             )
         else:
             self.int_ssm = [torch.zeros(max_batch, t, HV, V, K, device=DEV) for _ in range(LAYERS)]
@@ -136,7 +133,10 @@ class _Mode:
 
     def work(self, slots, n, t):
         """What the forward hands `_gdn_verify` as `replay`: the metadata's prepare builds
-        the work items, then `_replay_work` applies the manager's partition condition."""
+        the work items, then `_replay_work` applies the manager's partition condition. The
+        history shares the checkpoint's slots, as the metadata's replay slots alias them
+        when the manager keeps no separate replay slots."""
+        self.mm.replay_state_indices = slots
         partitioned = n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
         if partitioned:
             _build_replay_work_items_torch(
@@ -150,6 +150,7 @@ class _Mode:
             )
         replay = M._replay_work(self.core, self.mm, n)
         assert replay[2] == partitioned
+        assert torch.equal(replay[3], slots)
         return replay
 
     def verify(self, target_cls, layer, mq, a, b, slots, int_idx, n, t, replay):
@@ -344,7 +345,7 @@ def test_a_wrong_partition_drifts_off_legacy():
             mq, a, b = _rows(gen, n * t)
             want = legacy.verify(M.DecodeTarget, layer, mq, a, b, slots, int_idx, n, t, None)
             got = wrong.verify(
-                M.DecodeTarget, layer, mq, a, b, slots, int_idx, n, t, (None, None, False)
+                M.DecodeTarget, layer, mq, a, b, slots, int_idx, n, t, (None, None, False, None)
             )
             try:
                 _gate(got, want, "control")

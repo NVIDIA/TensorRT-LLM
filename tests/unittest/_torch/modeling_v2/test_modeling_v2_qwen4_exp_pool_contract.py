@@ -109,8 +109,14 @@ def test_valid_pools_pass() -> None:
                 _t(SLOTS, dtype=torch.int32),
                 _t(SLOTS, dtype=torch.int32),
                 _ssm(dtype),
+                SLOTS,
             )
+    # A manager keeps the bookkeeping in strided rows of its own replay slots, which need
+    # not match the recurrent pool's.
+    rows = _t(SLOTS + 3, 4, dtype=torch.int32)
+    M.check_replay_state(HISTORY, 3, rows[:, 0], rows[:, 1], _ssm(), SLOTS + 3)
     M.check_replay_history(G, 3, HISTORY, SLOTS, *_history())
+    M.check_replay_history(G, 3, HISTORY, SLOTS + 3, *_history(slots=SLOTS + 3))
     for rows in range(1, M._MAX_VERIFY_WIDTH + 1):
         M.check_verify_width(rows)
     M.check_shared_selection(_t(2, 8, 512, dtype=torch.int32), {3: 1}, 3, 512)
@@ -126,7 +132,6 @@ def test_bind_step_buffers_uses_manager_layer_views(replay: bool) -> None:
         state.old_x = _t(2, SLOTS, 2, HISTORY, G.num_v_heads, G.head_v_dim)
         state.old_B = _t(2, SLOTS, 2, HISTORY, G.num_k_heads, G.head_k_dim)
         state.old_dt = _t(2, SLOTS, 2, G.num_v_heads, HISTORY, dtype=torch.float32)
-        state.old_dA_cumsum = torch.empty_like(state.old_dt)
         state._state_strides = (2, 0, 1)
     else:
         state.intermediate_ssm = _t(
@@ -161,7 +166,7 @@ def test_bind_step_buffers_uses_manager_layer_views(replay: bool) -> None:
             views.extend(
                 zip(
                     replay_bound.old[layer],
-                    (state.old_x, state.old_B, state.old_dt, state.old_dA_cumsum),
+                    (state.old_x, state.old_B, state.old_dt),
                 )
             )
         else:
@@ -322,17 +327,17 @@ def test_replay_state_rejects_pool_dtype_geometry_and_bookkeeping() -> None:
     pnat = _t(SLOTS, dtype=torch.int32)
     buf = _t(SLOTS, dtype=torch.int32)
     with pytest.raises(AssertionError, match="fp32 or a bf16 checkpoint"):
-        M.check_replay_state(HISTORY, 3, pnat, buf, _ssm(torch.float16))
+        M.check_replay_state(HISTORY, 3, pnat, buf, _ssm(torch.float16), SLOTS)
     with pytest.raises(AssertionError, match="replay_history_size"):
-        M.check_replay_state(12, 3, pnat, buf, _ssm())
+        M.check_replay_state(12, 3, pnat, buf, _ssm(), SLOTS)
     for width in (1, M._MAX_VERIFY_WIDTH + 1):
         with pytest.raises(AssertionError, match="replay_step_width"):
-            M.check_replay_state(HISTORY, width, pnat, buf, _ssm())
-    # The bookkeeping is one int32 per pool slot, so it must cover the whole pool.
+            M.check_replay_state(HISTORY, width, pnat, buf, _ssm(), SLOTS)
+    # The bookkeeping is one int32 per replay slot, so it must cover every replay slot.
     with pytest.raises(AssertionError, match="prev_num_accepted_tokens"):
-        M.check_replay_state(HISTORY, 3, _t(SLOTS - 1, dtype=torch.int32), buf, _ssm())
+        M.check_replay_state(HISTORY, 3, _t(SLOTS - 1, dtype=torch.int32), buf, _ssm(), SLOTS)
     with pytest.raises(AssertionError, match="cache_buf_idx"):
-        M.check_replay_state(HISTORY, 3, pnat, buf.to(torch.int64), _ssm())
+        M.check_replay_state(HISTORY, 3, pnat, buf.to(torch.int64), _ssm(), SLOTS)
 
 
 def test_verify_width_admits_one_to_eight_rows_per_request() -> None:
@@ -354,7 +359,7 @@ def test_replay_history_rejects_missing_short_pool_and_wrong_geometry() -> None:
     old_x, old_B, old_dt = _history()
     with pytest.raises(AssertionError, match="no old_x"):
         M.check_replay_history(G, 3, HISTORY, SLOTS, None, old_B, old_dt)
-    with pytest.raises(AssertionError, match="slots for a"):
+    with pytest.raises(AssertionError, match="replay slots"):
         M.check_replay_history(G, 3, HISTORY, SLOTS, *_history(slots=SLOTS - 1))
     # The kernel addresses the history by `history_size`, so a buffer of another depth
     # would be read at the wrong offsets.
