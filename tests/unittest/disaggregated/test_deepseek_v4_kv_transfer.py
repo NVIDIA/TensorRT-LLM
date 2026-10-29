@@ -20,9 +20,13 @@ with DeepSeek-V4 cache managers. Validates all DeepseekV4AttentionType cache
 transfers across different TP/PP/DP configurations.
 """
 
+import ctypes
 import functools
+import uuid
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pytest
 import torch
 from kv_transfer_harness import (
@@ -511,6 +515,230 @@ def test_deepseek_v4_kv_transfer(
     )
 
     print("PASSED")
+
+
+def _native_transfer_manager(
+    offload: bool, dtype: DataType, tokens_per_block: int
+) -> DeepseekV4CacheManager:
+    """Build real V4 pools without enabling the guarded model-inference path."""
+    from tensorrt_llm.llmapi.llm_args import SparseKvCacheOffloadConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        GpuCacheTierConfig,
+        KVCacheManager,
+        KVCacheManagerConfig,
+    )
+
+    adapter = object.__new__(DeepseekV4CacheManager)
+    adapter._enable_kv_cache_offload = offload
+    adapter._sparse_offload_topk = 8
+    adapter._sparse_kv_offload = SparseKvCacheOffloadConfig() if offload else None
+    adapter.pp_layers = [0, 1, 2, 3]
+    adapter._compress_ratios = [1, 4, 128, 4]
+    adapter.compressed_block_sizes = [tokens_per_block // r for r in adapter._compress_ratios]
+    adapter.tokens_per_block = tokens_per_block
+    adapter.head_dim = HEAD_DIM
+    adapter.index_head_dim = INDEX_HEAD_DIM
+    adapter.dtype = DataType.FP8 if dtype == DataType.NVFP4 else dtype
+    adapter._indexer_k_dtype = "fp4"
+    adapter._use_nvfp4_compress = dtype == DataType.NVFP4
+    adapter._nvfp4_residual_dim = 64
+    adapter.use_fp8_ds_mla = False
+    adapter._swa_window_size = WINDOW_SIZE
+    adapter.max_seq_len = 4 * tokens_per_block
+    adapter.max_batch_size = 2
+    adapter.is_estimating_kv_cache = False
+    adapter.max_cuda_graph_batch_size = None
+    adapter.max_attention_window_vec = [None] * 4
+    adapter.max_draft_len = adapter._max_draft_len = 0
+    adapter.num_extra_kv_tokens = 0
+    adapter.num_kv_heads_per_layer = [1] * 4
+    config = adapter._build_cache_config(
+        KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            cache_tiers=[GpuCacheTierConfig(quota=32 << 20)],
+            layers=[],
+        )
+    )
+    adapter.impl = KVCacheManager(config)
+    return adapter
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+def test_deepseek_v4_native_sparse_host_transfer(dtype: DataType, tokens_per_block: int) -> None:
+    """NIXL writes V4 compressed KV/scales to host and all other roles to GPU.
+
+    Uses the production V4 layout builder, native KVCM allocations, and the
+    sender's registration, mapping, grouping, and submission. Raw byte checks
+    include partial pages and repeated requests reusing the same pools.
+    """
+    from cuda.bindings import runtime as cudart
+    from test_sparse_kv_transfer import _rank_info, _sender_and_meta
+
+    from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+    from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferAgent
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CudaStream
+
+    device_id = torch.cuda.current_device()
+    stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+    managers, workers, agents = [], [], []
+    suffix = uuid.uuid4().hex
+
+    def copy_bytes(dst: int, src: int, size: int, kind) -> None:
+        (error,) = cudart.cudaMemcpy(dst, src, size, kind)
+        assert int(error) == 0
+
+    try:
+        for offload, name in ((False, "ctx"), (True, "gen")):
+            manager = _native_transfer_manager(offload, dtype, tokens_per_block)
+            managers.append(manager)
+            table = KVRegionExtractorV1(manager).page_table
+            agent = BindingsNixlTransferAgent(f"{name}-{suffix}", num_threads=1)
+            agents.append(agent)
+            worker = SimpleNamespace()
+            worker._rank_info = _rank_info(name, table)
+            worker._rank_info.device_id = device_id
+            worker._agent = agent
+            worker._registered_mem = []
+            TransferWorker._register_kv_cache(worker)
+            workers.append(worker)
+        src, dst = managers
+        assert {d.type for d in workers[0]._registered_mem} == {"VRAM"}
+        assert {d.type for d in workers[1]._registered_mem} == {"VRAM", "DRAM"}
+        agents[0].load_remote_agent(agents[1].name, agents[1].get_local_agent_desc())
+
+        for request_idx, prompt_len in enumerate(
+            (tokens_per_block - 1, tokens_per_block, tokens_per_block + 1, 3 * tokens_per_block - 1)
+        ):
+            caches = []
+            transfer_active = False
+            try:
+                blocks = []
+                for manager in managers:
+                    cache = manager.impl.create_kv_cache()
+                    caches.append(cache)
+                    assert cache.resume(stream)
+                    assert cache.resize(prompt_len, prompt_len)
+                    blocks.append(
+                        [
+                            np.array(
+                                list(cache.get_aggregated_page_indices(lg, valid_only=False)),
+                                dtype=np.int64,
+                            )
+                            for lg in range(len(manager.impl.layer_grouping))
+                        ]
+                    )
+                torch.cuda.synchronize()
+                expected = []
+                host_scale_buffers = 0
+                for layer in dst.impl.init_config.layers:
+                    lg = dst.impl.get_layer_group_id(layer.layer_id)
+                    src_lg = src.impl.get_layer_group_id(layer.layer_id)
+                    src_indices = list(caches[0].get_base_page_indices(src_lg))
+                    dst_indices = list(caches[1].get_base_page_indices(lg))
+                    for buffer_idx, buffer in enumerate(layer.buffers):
+                        if buffer.role in dst.get_disagg_ignored_roles():
+                            continue
+                        src_base = src.impl.get_mem_pool_base_address(layer.layer_id, buffer.role)
+                        dst_base = dst.impl.get_mem_pool_base_address(layer.layer_id, buffer.role)
+                        src_stride = src.impl.get_page_stride(layer.layer_id, buffer.role)
+                        dst_stride = dst.impl.get_page_stride(layer.layer_id, buffer.role)
+                        src_converter = src.impl.get_page_index_converter(
+                            layer.layer_id, buffer.role
+                        )
+                        dst_converter = dst.impl.get_page_index_converter(
+                            layer.layer_id, buffer.role
+                        )
+                        assert src_converter.expansion == dst_converter.expansion == 1
+                        src_role_indices = src_converter(src_indices)
+                        dst_role_indices = dst_converter(dst_indices)
+                        host_scale_buffers += int(buffer.is_sparse and "scale" in str(buffer.role))
+                        for ordinal, (src_index, dst_index) in enumerate(
+                            zip(src_role_indices, dst_role_indices)
+                        ):
+                            if src_index < 0 or dst_index < 0:
+                                continue
+                            data = (
+                                (
+                                    np.arange(buffer.size, dtype=np.int64) * (2 * buffer_idx + 1)
+                                    + int(layer.layer_id) * 23
+                                    + ordinal * 17
+                                    + request_idx * 11
+                                )
+                                % 251
+                            ).astype(np.uint8)
+                            src_ptr = int(src_base) + int(src_index) * src_stride
+                            dst_ptr = int(dst_base) + int(dst_index) * dst_stride
+                            copy_bytes(
+                                src_ptr,
+                                data.ctypes.data,
+                                buffer.size,
+                                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                            )
+                            if buffer.is_sparse:
+                                ctypes.memset(dst_ptr, 0, buffer.size)
+                            else:
+                                zeros = np.zeros(buffer.size, dtype=np.uint8)
+                                copy_bytes(
+                                    dst_ptr,
+                                    zeros.ctypes.data,
+                                    buffer.size,
+                                    cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                                )
+                            expected.append((dst_ptr, data, buffer.is_sparse, str(buffer.role)))
+                if dtype == DataType.NVFP4:
+                    assert host_scale_buffers == 2
+                sender, meta = _sender_and_meta(
+                    workers[0]._rank_info.page_table,
+                    workers[1]._rank_info.page_table,
+                    blocks[0],
+                    blocks[1],
+                    device_id=device_id,
+                    prompt_len=prompt_len,
+                )
+                sender._agent = agents[0]
+                sender._enforce_physical_ownership = False
+                meta.peer_name = agents[1].name
+                assert {(g.src_memory_type, g.dst_memory_type) for g in meta.transfer_groups} == {
+                    ("VRAM", "VRAM"),
+                    ("VRAM", "DRAM"),
+                }
+                request = sender._make_agent_request(meta, device_id)
+                transfer_active = True
+                assert sender._submit_transfer(meta.task, 0, request) == (True, None)
+                transfer_active = False
+                assert meta.task.resources_drained
+                for address, data, on_host, role in expected:
+                    if on_host:
+                        actual = np.frombuffer(ctypes.string_at(address, data.size), dtype=np.uint8)
+                    else:
+                        actual = np.empty_like(data)
+                        copy_bytes(
+                            actual.ctypes.data,
+                            address,
+                            data.size,
+                            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                        )
+                    np.testing.assert_array_equal(actual, data, err_msg=role)
+            finally:
+                if transfer_active:
+                    # Quiesce any failed submission before releasing its pools.
+                    for agent in agents:
+                        agent.shutdown()
+                    agents.clear()
+                    workers.clear()
+                for cache in caches:
+                    cache.close()
+    finally:
+        for worker in workers:
+            for registration in reversed(worker._registered_mem):
+                worker._agent.deregister_memory(registration)
+            worker._registered_mem.clear()
+        for agent in agents:
+            agent.shutdown()
+        for manager in managers:
+            manager.impl.shutdown()
 
 
 # ---------------------------------------------------------------------------

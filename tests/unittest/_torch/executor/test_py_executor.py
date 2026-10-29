@@ -15,6 +15,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
@@ -84,6 +85,7 @@ def _forward_step_executor(
         sampler=Mock(get_cache_indirection=Mock(return_value=object())),
         execution_stream=Mock(),
         _loop_on_execution_stream=False,
+        _is_kv_manager_v2=False,
         _iter_adp_dummy_ctx_tokens=0,
         _iter_adp_dummy_gen_tokens=0,
         _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
@@ -859,6 +861,71 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
     target.release_request_state.assert_called_once_with(41)
     draft.release_request_state.assert_called_once_with(41)
     assert not executor._prefetched_request_ids
+
+
+@pytest.mark.parametrize("is_v2", [False, True])
+@pytest.mark.parametrize("forward_fails", [False, True])
+def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fails: bool) -> None:
+    batch = ScheduledRequests()
+    events = []
+    logits = object()
+
+    def forward(*args: object, **kwargs: object) -> object:
+        events.append("forward")
+        if forward_fails:
+            raise RuntimeError("forward failed")
+        return logits
+
+    caller_stream = Mock()
+    caller_stream.wait_stream.side_effect = lambda stream: events.append("join")
+    kv_cache_manager = Mock()
+
+    def update_forward_resources(
+        scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+    ) -> None:
+        wait_for_input_copy()
+        events.append("history")
+
+    kv_cache_manager.update_forward_resources.side_effect = update_forward_resources
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(route_capture=None, forward=forward),
+        resource_manager=object(),
+        kv_cache_manager=kv_cache_manager,
+        _is_kv_manager_v2=is_v2,
+        iter_counter=0,
+        sampler=Mock(),
+        execution_stream=Mock(),
+        _iter_adp_dummy_ctx_tokens=0,
+        _iter_adp_dummy_gen_tokens=0,
+        _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
+        _maybe_record_hang_diagnostic_phase=Mock(),
+        _attach_encoder_output_to_execution_stream=Mock(),
+        _mark_cross_kv_projection_consumed=Mock(),
+        _kv_connector_wait_for_save=Mock(),
+        _wait_for_model_engine_input_copy=Mock(side_effect=lambda: events.append("input_copy")),
+        _handle_errors=Mock(),
+    )
+    with (
+        patch("torch.cuda.current_stream", return_value=caller_stream),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
+    ):
+        result = PyExecutor._forward_step(executor, batch)
+    if forward_fails:
+        assert result is None
+        assert events == ["forward"]
+        executor._handle_errors.assert_called_once_with("forward failed")
+    else:
+        assert result is logits
+        assert events == ["forward", "join"] + (["input_copy", "history"] if is_v2 else [])
+        executor._handle_errors.assert_not_called()
+    if is_v2 and not forward_fails:
+        kv_cache_manager.update_forward_resources.assert_called_once_with(
+            batch, wait_for_input_copy=executor._wait_for_model_engine_input_copy
+        )
+    else:
+        kv_cache_manager.update_forward_resources.assert_not_called()
+        executor._wait_for_model_engine_input_copy.assert_not_called()
 
 
 class _InflightRequestIds:

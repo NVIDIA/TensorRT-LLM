@@ -152,11 +152,19 @@ def _make_projection_sender() -> Sender:
     )
 
     extractor = MagicMock()
+    # Write metas group fragments by the memory type of each view's physical pool, so each
+    # group's single view resolves to a device pool.
     extractor.page_table = SimpleNamespace(
         tokens_per_block=_PROJECTION_TPB,
+        pool_groups=[SimpleNamespace(pools=[SimpleNamespace(memory_type="VRAM")])],
         layer_groups=[
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
+            SimpleNamespace(
+                kind=CacheKind.PAGED,
+                sliding_window_size=_PROJECTION_PROMPT_TOKENS,
+                pool_group_idx=0,
+                pool_views=[SimpleNamespace(pool_idx=0)],
+            )
+            for _ in range(2)
         ],
     )
     # extract(region_ids, layer_group_id, pool_idx) - the caller passes the

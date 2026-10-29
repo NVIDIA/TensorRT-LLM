@@ -184,11 +184,7 @@ def sparse_layers(monkeypatch, indices):
     from dataclasses import replace
 
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-        AttentionLayerConfig,
-        BufferConfig,
-        SparseCacheConfig,
-    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
 
     build = KVCacheManagerV2._build_cache_config
 
@@ -206,9 +202,9 @@ def sparse_layers(monkeypatch, indices):
                 buffers=buffers,
                 sliding_window_size=layer.sliding_window_size,
                 num_sink_tokens=layer.num_sink_tokens,
-                sparse_cache=SparseCacheConfig(
-                    num_selected_blocks=1, max_cached_units=2, unit_tokens=self.tokens_per_block
-                ),
+                # No sparse_cache: declaring one obliges the manager to be given a
+                # sparse_kv_offload_config to reserve the arenas from, and the refusal
+                # under test is about sparse buffers, which a layer has either way.
             )
         return build(self, replace(config, layers=layers))
 
@@ -232,7 +228,8 @@ def test_a_layer_group_of_sparse_buffers_is_refused(kit, host_tier_manager, monk
     with host_tier_manager(**keywords) as mgr:
         layers = {int(layer.layer_id): layer for layer in mgr.impl.init_config.layers}
         flags = [
-            any(b.is_sparse for b in layers[int(ids[0])].buffers) for ids in mgr.impl.layer_grouping
+            any(b.is_sparse for lid in ids for b in layers[int(lid)].buffers)
+            for ids in mgr.impl.layer_grouping
         ]
         sparse = [lg for lg, flag in enumerate(flags) if flag]
         assert sparse and (0 in sparse) == (case == "first"), (

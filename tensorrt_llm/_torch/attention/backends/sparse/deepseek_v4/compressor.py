@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
+from ..offload_kernels import gather_sparse_batch_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -74,7 +75,7 @@ def resolve_kv_cache_dtype(kv_cache_dtype: Union[str, KVCacheDtype]) -> KVCacheD
 
 
 class Compressor(nn.Module):
-    """KV compressor using Triton kernels with paged memory management.
+    """KV compressor with paged state and paged or sparse-arena output.
 
     Args:
         mla_params: MLA parameters containing hidden_size and head dimensions
@@ -190,13 +191,36 @@ class Compressor(nn.Module):
             kv_type = DeepseekV4AttentionType.COMPRESSOR_KV
             score_type = DeepseekV4AttentionType.COMPRESSOR_SCORE
 
-        # Get cache buffers
-        kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx, compress_type)
-        kv_cache_scale = (
-            metadata.kv_cache_manager.get_compress_scale_buffers(self.layer_idx)
-            if not self.is_indexer and self.kv_cache_dtype == KVCacheDtype.NVFP4_BLOCKWISE
-            else None
-        )
+        # Reserve on the producer stream. The module joins this stream before
+        # fetch/attention, and scheduling joins it before advancing history.
+        sparse_state = metadata.sparse_offload_state
+        sparse_write_indices = None
+        if not self.is_indexer and self.compress_ratio == 4 and sparse_state is not None:
+            if num_contexts or metadata.num_gen_tokens_per_seq != 1 or self.footer_scale_cache:
+                raise NotImplementedError(
+                    "Sparse compressor writes require single-token decode without footer scales"
+                )
+            descriptor = sparse_state.layers[self.layer_idx]
+            writes = metadata.kv_cache_manager.prepare_sparse_compressor_write_indices(
+                sparse_state, self.layer_idx
+            )
+            # Native write rows are by Batch row; the scatter addresses requests
+            # by input position.
+            # At the slot: coinciding buffers are resolved once into one slice.
+            data_slot = sparse_state.out_slots[self.layer_idx][descriptor.data_buffer_index]
+            sparse_write_indices = gather_sparse_batch_rows(
+                writes[:, data_slot], sparse_state.batch_rows[:bsz]
+            )
+            kv_cache, kv_cache_scale = metadata.kv_cache_manager.get_sparse_compress_buffers(
+                self.layer_idx
+            )
+        else:
+            kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx, compress_type)
+            kv_cache_scale = (
+                metadata.kv_cache_manager.get_compress_scale_buffers(self.layer_idx)
+                if not self.is_indexer and self.kv_cache_dtype == KVCacheDtype.NVFP4_BLOCKWISE
+                else None
+            )
         paged_kv_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_type)
         paged_score_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, score_type)
 
@@ -205,7 +229,11 @@ class Compressor(nn.Module):
         if self.is_indexer:
             block_table = metadata.indexer_k_cache_block_offsets
         else:
-            block_table = metadata.compress_block_tables[self.compress_ratio]
+            block_table = (
+                sparse_write_indices.view(bsz, 1)
+                if sparse_write_indices is not None
+                else metadata.compress_block_tables[self.compress_ratio]
+            )
         block_table_kv_state = metadata.sliding_block_tables[local_layer_idx, kv_type.value]
         block_table_score_state = metadata.sliding_block_tables[local_layer_idx, score_type.value]
 
@@ -213,7 +241,11 @@ class Compressor(nn.Module):
         # state_tokens_per_block: for compressor kv/score state caches (used in compress kernels)
         # compress_tokens_per_block: for compressed KV cache (used in scatter)
         state_tokens_per_block = metadata.kv_cache_manager.tokens_per_block
-        compress_tokens_per_block = metadata.kv_cache_manager.compressed_block_sizes[self.layer_idx]
+        compress_tokens_per_block = (
+            1
+            if sparse_write_indices is not None
+            else metadata.kv_cache_manager.compressed_block_sizes[self.layer_idx]
+        )
 
         # Get compression metadata
         cu_new_comp_kv = metadata.cu_new_comp_kv_cuda[self.compress_ratio]
@@ -282,6 +314,11 @@ class Compressor(nn.Module):
 
         # Scatter to cache with appropriate quantization (all modes fused)
         start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
+        if sparse_write_indices is not None:
+            # One-row page addressing uses zero storage positions; RoPE IDs stay
+            # unchanged. The kernel checks num_outputs before dereferencing a page.
+            start_pos = sparse_state.scatter_start_positions[:bsz]
+            num_comp_tokens = torch.where(sparse_write_indices >= 0, num_comp_tokens, 0)
         total_tokens = kv_comp.shape[0]
 
         # Allocate optional returned postprocess buffers for indexer paths.
@@ -326,7 +363,7 @@ class Compressor(nn.Module):
             )
             return kv_comp, None
 
-        # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache write
+        # Fused RMSNorm + RoPE + Hadamard + cache write, including sparse arenas.
         torch.ops.trtllm.compressor_postprocess_scatter(
             kv_comp,
             kv_out,

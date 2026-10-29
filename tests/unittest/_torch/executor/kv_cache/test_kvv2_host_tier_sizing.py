@@ -123,6 +123,22 @@ class TestComputeAutoHostTierQuota:
             == 173 * GiB
         )
 
+    @pytest.mark.parametrize("memlock_limit", [0.0, float(1)])
+    def test_offloaded_history_without_headroom_provisions_no_tier(self, memlock_limit):
+        # Sparse KV cache offload has already pinned what the limits left, so the
+        # device quota would pin past them; the manager decides what to do
+        # without a tier instead.
+        assert (
+            _compute_auto_host_tier_quota(
+                quota=173 * GiB,
+                local_ranks=4,
+                mem_available=float(440 * GiB),
+                memlock_limit=memlock_limit,
+                pins_offloaded_history=True,
+            )
+            == 0
+        )
+
     def test_result_is_always_positive(self):
         # Exhausted node memory reading must not produce a non-positive tier.
         assert (

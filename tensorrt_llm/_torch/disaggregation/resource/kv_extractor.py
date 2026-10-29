@@ -397,10 +397,30 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
     layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.layer_grouping)
+    # Native sparse pool descriptors expose their host hot-tier allocations.
+    # Dense buffers in the same layer group still have device-backed pools.
+    sparse_buffers = {
+        (int(layer.layer_id), str(buffer.role))
+        for layer in config.layers
+        for buffer in getattr(layer, "buffers", ())
+        if getattr(buffer, "is_sparse", False)
+    }
 
     for pg_desc in pool_group_descs:
         storage_pg_idx = int(pg_desc.pool_group_index)
         storage_pg_to_list_idx[storage_pg_idx] = len(pool_groups)
+        pool_memory_types = []
+        for pool_idx in range(len(pg_desc.pools)):
+            backing = {
+                (int(buffer_id.layer_id), str(buffer_id.role)) in sparse_buffers
+                for variant in pg_desc.slot_desc.variants
+                for buffer_id in variant.coalesced_buffers[pool_idx].buffer_ids
+            }
+            if len(backing) > 1:
+                raise ValueError(
+                    f"Physical pool {storage_pg_idx}/{pool_idx} mixes host and device buffers"
+                )
+            pool_memory_types.append("DRAM" if True in backing else "VRAM")
         pool_groups.append(
             PhysicalPoolGroup(
                 pools=[
@@ -408,8 +428,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                         base_address=int(pool.base_address),
                         slot_bytes=int(pool.slot_bytes),
                         num_slots=int(pg_desc.num_slots),
+                        memory_type=pool_memory_types[pool_idx],
                     )
-                    for pool in pg_desc.pools
+                    for pool_idx, pool in enumerate(pg_desc.pools)
                 ]
             )
         )

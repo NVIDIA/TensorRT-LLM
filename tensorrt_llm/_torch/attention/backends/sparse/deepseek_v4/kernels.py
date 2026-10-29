@@ -9,12 +9,14 @@ import torch
 import triton
 import triton.language as tl
 
+from ..offload_kernels import check_sparse_offload_tensor
+
 ########################################################
 # Index gather kernel
 ########################################################
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["sparse_num_lengths"])
 def _deepseek_v4_local_to_global_kernel(
     req_id_ptr,
     block_table_swa_ptr,
@@ -58,6 +60,21 @@ def _deepseek_v4_local_to_global_kernel(
     active_request_count_ptr,
     MASK_DECODE_PADDING: tl.constexpr,
     MASK_INVALID_PAGES: tl.constexpr,
+    fetched_indices_ptr,
+    write_indices_ptr,
+    history_lengths_ptr,
+    compressed_lengths_ptr,
+    batch_rows_ptr,
+    fetch_stride0,
+    fetch_stride1,
+    write_stride,
+    history_stride,
+    length_stride,
+    batch_rows_stride,
+    MERGE_SPARSE_INDICES: tl.constexpr,
+    SPARSE_BATCH_SIZE: tl.constexpr,
+    sparse_num_lengths,
+    UNIT_TOKENS: tl.constexpr,
 ):
     """
     Triton kernel for converting local indices to global KV cache pool indices.
@@ -99,6 +116,13 @@ def _deepseek_v4_local_to_global_kernel(
     if MASK_DECODE_PADDING:
         active = tl.load(active_request_count_ptr)
         live = (token_id < active) & (req >= 0) & (req < active)
+    # Sparse offload state belongs to the request's native Batch row, which need
+    # not equal its input position; block tables and lengths follow the position.
+    row = req
+    if MERGE_SPARSE_INDICES:
+        live = live & (req < SPARSE_BATCH_SIZE) & (req < sparse_num_lengths)
+        row = tl.load(batch_rows_ptr + req * batch_rows_stride, mask=live, other=-1)
+        live = live & (row >= 0) & (row < SPARSE_BATCH_SIZE)
 
     # Load all SWA local indices for this token
     swa_ids = tl.arange(0, num_swa_indices)
@@ -136,28 +160,42 @@ def _deepseek_v4_local_to_global_kernel(
         )
         compressed_local_idx = tl.load(compressed_ptr)
 
-        # Compute global indices for all compressed positions
-        compressed_valid_mask = compressed_local_idx >= 0
-        compressed_block_ordinal = compressed_local_idx // tokens_per_block_compressed
-        compressed_token_in_block = compressed_local_idx % tokens_per_block_compressed
-        compressed_valid_block = compressed_block_ordinal < max_blocks_compressed
-        compressed_full_mask = live & compressed_valid_mask & compressed_valid_block
+        if MERGE_SPARSE_INDICES:
+            history = tl.load(history_lengths_ptr + row * history_stride, mask=live, other=0)
+            history_units = history // UNIT_TOKENS
+            length = tl.load(compressed_lengths_ptr + req * length_stride, mask=live, other=0)
+            valid = live & (compressed_local_idx >= 0) & (compressed_local_idx < length)
+            fetched = tl.load(
+                fetched_indices_ptr + row * fetch_stride0 + compressed_ids * fetch_stride1,
+                mask=valid & (compressed_local_idx < history_units),
+                other=-1,
+            )
+            write = tl.load(write_indices_ptr + row * write_stride, mask=live, other=-1)
+            compressed_global_index = tl.where(
+                valid & (compressed_local_idx == history_units), write, fetched
+            )
+        else:
+            compressed_valid_mask = compressed_local_idx >= 0
+            compressed_block_ordinal = compressed_local_idx // tokens_per_block_compressed
+            compressed_token_in_block = compressed_local_idx % tokens_per_block_compressed
+            compressed_valid_block = compressed_block_ordinal < max_blocks_compressed
+            compressed_full_mask = live & compressed_valid_mask & compressed_valid_block
 
-        compressed_bt_ptr = (
-            block_table_compressed_ptr
-            + req * bt_compressed_stride0
-            + compressed_block_ordinal * bt_compressed_stride1
-        )
-        compressed_page_index = tl.load(compressed_bt_ptr, mask=compressed_full_mask, other=0)
-        if MASK_INVALID_PAGES:
-            compressed_full_mask = compressed_full_mask & (compressed_page_index >= 0)
+            compressed_bt_ptr = (
+                block_table_compressed_ptr
+                + req * bt_compressed_stride0
+                + compressed_block_ordinal * bt_compressed_stride1
+            )
+            compressed_page_index = tl.load(compressed_bt_ptr, mask=compressed_full_mask, other=0)
+            if MASK_INVALID_PAGES:
+                compressed_full_mask = compressed_full_mask & (compressed_page_index >= 0)
 
-        compressed_global_index = (
-            compressed_buffer_offset_in_tokens
-            + compressed_page_index * tokens_per_block_compressed
-            + compressed_token_in_block
-        )
-        compressed_global_index = tl.where(compressed_full_mask, compressed_global_index, -1)
+            compressed_global_index = (
+                compressed_buffer_offset_in_tokens
+                + compressed_page_index * tokens_per_block_compressed
+                + compressed_token_in_block
+            )
+            compressed_global_index = tl.where(compressed_full_mask, compressed_global_index, -1)
 
         if SPLIT_EXTRA:
             compressed_out_ptr = (
@@ -202,6 +240,11 @@ def deepseek_v4_local_to_global_indices(
     split_extra: bool = False,
     active_request_count: torch.Tensor | None = None,
     mask_invalid_pages: bool = False,
+    compressed_fetched_indices: torch.Tensor | None = None,
+    compressed_write_indices: torch.Tensor | None = None,
+    compressed_history_lengths: torch.Tensor | None = None,
+    compressed_lengths: torch.Tensor | None = None,
+    compressed_batch_rows: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """
     Convert local token indices to global KV cache pool indices.
@@ -241,6 +284,24 @@ def deepseek_v4_local_to_global_indices(
         mask_invalid_pages: Mask negative physical page mappings in both pools
             when consuming an offload read table. Compiled out by default to
             preserve the original non-offload indexing behavior.
+        compressed_fetched_indices: CUDA int32 [B, K] physical history indices,
+            in Batch row order and original top-k column order. Supply all five
+            sparse tensors and active_request_count together for single-token
+            decode. The kernel merges history and in-flight destinations into
+            query order while preparing SWA indices; no compressed page table
+            or additional address conversion is used.
+        compressed_write_indices: CUDA int32 [B] prepared in-flight destinations,
+            by Batch row. May be a strided data-column view shared by paired
+            NVFP4 pools.
+        compressed_history_lengths: CUDA int32 [B] published history token counts,
+            by Batch row.
+        compressed_lengths: CUDA int32 [R] complete compressed-row counts by
+            request, in req_id's numbering, with Q <= R <= B. A selected unit
+            equal to history // compress_ratio and below this count uses the
+            write index. Invalid indices remain -1.
+        compressed_batch_rows: CUDA int32 [B] native Batch row of each request,
+            in req_id's numbering, or -1 for no live request. A request whose
+            row is -1 gets no indices in either pool.
 
     Returns:
         A combined index tensor, or separate SWA and compressed tensors when
@@ -257,7 +318,7 @@ def deepseek_v4_local_to_global_indices(
     num_tokens = req_id.shape[0]
     num_swa_indices = swa_local_indices.shape[1]
     if active_request_count is not None:
-        _check_sparse_offload_tensor(active_request_count, "active_request_count", 1, req_id.device)
+        check_sparse_offload_tensor(active_request_count, "active_request_count", 1, req_id.device)
         if active_request_count.shape != (1,):
             raise ValueError("active_request_count must be [1]")
 
@@ -272,7 +333,58 @@ def deepseek_v4_local_to_global_indices(
     # Compute SWA buffer offset relative to swa_pool_base_ptr in tokens
     swa_buffer_offset_in_tokens = (swa_buffer_ptr - swa_pool_base_ptr) // token_stride
 
-    if has_compressed:
+    sparse_tensors = (
+        (compressed_fetched_indices, "compressed_fetched_indices", 2),
+        (compressed_write_indices, "compressed_write_indices", 1),
+        (compressed_history_lengths, "compressed_history_lengths", 1),
+        (compressed_lengths, "compressed_lengths", 1),
+        (compressed_batch_rows, "compressed_batch_rows", 1),
+    )
+    merge_sparse_indices = any(tensor is not None for tensor, _, _ in sparse_tensors)
+    sparse_batch_size = sparse_num_lengths = 0
+    fetch_stride0 = fetch_stride1 = write_stride = history_stride = length_stride = 0
+    batch_rows_stride = 0
+    if merge_sparse_indices:
+        if (
+            not has_compressed
+            or active_request_count is None
+            or any(tensor is None for tensor, _, _ in sparse_tensors)
+        ):
+            raise ValueError(
+                "Sparse indices require a compressed layer, all mappings and an active count"
+            )
+        for tensor, name, ndim in sparse_tensors:
+            check_sparse_offload_tensor(tensor, name, ndim, req_id.device)
+        sparse_batch_size, width = compressed_fetched_indices.shape
+        sparse_num_lengths = compressed_lengths.numel()
+        if (
+            width != num_compressed_indices
+            or compressed_write_indices.shape != (sparse_batch_size,)
+            or compressed_history_lengths.shape != (sparse_batch_size,)
+            or compressed_batch_rows.shape != (sparse_batch_size,)
+            or not num_tokens <= sparse_num_lengths <= sparse_batch_size
+        ):
+            raise ValueError(
+                "Sparse mappings must cover the native Batch and configured top-k width"
+            )
+        if compressed_local_indices is None:
+            raise ValueError("Sparse index preparation requires the original top-k selection")
+        check_sparse_offload_tensor(
+            compressed_local_indices, "compressed_local_indices", 2, req_id.device
+        )
+        if compressed_local_indices.shape != (num_tokens, num_compressed_indices):
+            raise ValueError("Sparse top-k indices must be [Q, K]")
+        fetch_stride0, fetch_stride1 = compressed_fetched_indices.stride()
+        write_stride = compressed_write_indices.stride(0)
+        history_stride = compressed_history_lengths.stride(0)
+        length_stride = compressed_lengths.stride(0)
+        batch_rows_stride = compressed_batch_rows.stride(0)
+        tokens_per_block_compressed = 1
+        compressed_buffer_offset_in_tokens = 0
+        max_blocks_compressed = 0
+        block_table_compressed_c = block_table_swa
+        compressed_local_indices_c = compressed_local_indices
+    elif has_compressed:
         assert block_table_compressed is not None, (
             "block_table_compressed required when compress_ratio > 1"
         )
@@ -406,447 +518,24 @@ def deepseek_v4_local_to_global_indices(
         active_request_count_ptr=active_request_count,
         MASK_DECODE_PADDING=active_request_count is not None,
         MASK_INVALID_PAGES=mask_invalid_pages,
+        fetched_indices_ptr=compressed_fetched_indices,
+        write_indices_ptr=compressed_write_indices,
+        history_lengths_ptr=compressed_history_lengths,
+        compressed_lengths_ptr=compressed_lengths,
+        batch_rows_ptr=compressed_batch_rows,
+        fetch_stride0=fetch_stride0,
+        fetch_stride1=fetch_stride1,
+        write_stride=write_stride,
+        history_stride=history_stride,
+        length_stride=length_stride,
+        batch_rows_stride=batch_rows_stride,
+        MERGE_SPARSE_INDICES=merge_sparse_indices,
+        SPARSE_BATCH_SIZE=sparse_batch_size,
+        sparse_num_lengths=sparse_num_lengths,
+        UNIT_TOKENS=compress_ratio,
         launch_pdl=launch_with_pdl,
     )
 
     if split_extra:
         return out, out_extra
     return out
-
-
-def _check_sparse_offload_tensor(
-    tensor: torch.Tensor, name: str, ndim: int, device: torch.device
-) -> None:
-    if tensor.dtype != torch.int32 or tensor.ndim != ndim:
-        raise ValueError(f"{name} must be a {ndim}D int32 tensor")
-    if not tensor.is_cuda or tensor.device != device:
-        raise ValueError(f"{name} must be on CUDA device {device}")
-
-
-@triton.jit
-def _select_sparse_history_pages_kernel(
-    topk_ptr,
-    request_rows_ptr,
-    active_request_count_ptr,
-    compressed_lengths_ptr,
-    raw_page_table_ptr,
-    history_blocks_ptr,
-    out_ptr,
-    topk_stride0,
-    topk_stride1,
-    request_rows_stride,
-    compressed_lengths_stride,
-    raw_stride0,
-    raw_stride1,
-    history_blocks_stride,
-    out_stride0,
-    out_stride1,
-    NUM_REQUESTS: tl.constexpr,
-    MAX_BLOCKS: tl.constexpr,
-    TOPK: tl.constexpr,
-    TOKENS_PER_PAGE: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    query = tl.program_id(0)
-    active_count = tl.load(active_request_count_ptr)
-    request = tl.load(request_rows_ptr + query * request_rows_stride)
-    active = (query < active_count) & (request >= 0) & (request < active_count)
-    active = active & (request < NUM_REQUESTS)
-    length = tl.load(compressed_lengths_ptr + request * compressed_lengths_stride, active, other=0)
-    history = tl.load(history_blocks_ptr + request * history_blocks_stride, active, other=0)
-
-    k = tl.arange(0, BLOCK_K)
-    token = tl.load(topk_ptr + query * topk_stride0 + k * topk_stride1, k < TOPK, other=-1)
-    ordinal = token // TOKENS_PER_PAGE
-    valid = active & (token >= 0) & (token < length)
-    valid = valid & (ordinal < history) & (ordinal < MAX_BLOCKS)
-    page = tl.load(
-        raw_page_table_ptr + request * raw_stride0 + ordinal * raw_stride1, valid, other=-1
-    )
-    # Sort ordinals, never host slot IDs. Slot 0 is valid in either tier.
-    sorted_ordinals = tl.sort(tl.where(valid & (page >= 0), ordinal, 0x7FFFFFFF), descending=False)
-    previous = tl.gather(sorted_ordinals, tl.maximum(k - 1, 0), axis=0)
-    unique = (sorted_ordinals != 0x7FFFFFFF) & ((k == 0) | (sorted_ordinals != previous))
-    position = tl.cumsum(unique.to(tl.int32), axis=0) - 1
-    tl.store(out_ptr + request * out_stride0 + position * out_stride1, sorted_ordinals, mask=unique)
-
-
-def select_sparse_history_pages(
-    topk_indices: torch.Tensor,
-    request_rows: torch.Tensor,
-    active_request_count: torch.Tensor,
-    compressed_lengths: torch.Tensor,
-    raw_page_table: torch.Tensor,
-    history_blocks: torch.Tensor,
-    compressed_tokens_per_page: int,
-    out: torch.Tensor,
-) -> None:
-    """Select unique host-history block ordinals for single-token decode.
-
-    All tensors are CUDA int32 on one device. ``topk_indices`` is [Q, K]
-    and contains logical compressed-token indices; ``request_rows`` is [Q]
-    and maps query rows to request rows in ``raw_page_table`` ([B, M]).
-    ``active_request_count`` is [1]: only the first N query/request rows are
-    live. Their request IDs must be a permutation of [0, N), with one query
-    per request. Multi-query requests require a separate union operation.
-
-    ``compressed_lengths`` and ``history_blocks`` are [B], respectively in
-    compressed tokens and original KVCM blocks. Only ordinals below the
-    history frontier with a nonnegative raw page entry are eligible. Neither
-    resident tail pages nor padding/invalid tokens are fetched.
-
-    The caller owns ``out`` ([B, S], S >= min(K, M)) and must provide storage
-    disjoint from all inputs. Each row is sorted, compacted, and padded with
-    -1. Every output entry is rewritten, including inactive or empty rows.
-    Inputs and their token order are unchanged. No allocation, device-to-host
-    read, or synchronization is performed; all work uses the current stream.
-    """
-    device = raw_page_table.device
-    for tensor, name, ndim in (
-        (topk_indices, "topk_indices", 2),
-        (request_rows, "request_rows", 1),
-        (active_request_count, "active_request_count", 1),
-        (compressed_lengths, "compressed_lengths", 1),
-        (raw_page_table, "raw_page_table", 2),
-        (history_blocks, "history_blocks", 1),
-        (out, "out", 2),
-    ):
-        _check_sparse_offload_tensor(tensor, name, ndim, device)
-    num_requests, max_blocks = raw_page_table.shape
-    num_queries, topk = topk_indices.shape
-    if compressed_tokens_per_page <= 0:
-        raise ValueError("compressed_tokens_per_page must be positive")
-    if request_rows.shape != (num_queries,) or active_request_count.shape != (1,):
-        raise ValueError("request_rows must be [Q] and active_request_count must be [1]")
-    if compressed_lengths.shape != (num_requests,) or history_blocks.shape != (num_requests,):
-        raise ValueError("compressed_lengths and history_blocks must be [B]")
-    if out.shape[0] != num_requests or out.shape[1] < min(topk, max_blocks):
-        raise ValueError("out must be [B, S] with S >= min(K, M); selection must not be truncated")
-
-    with torch.cuda.device(device):
-        # Clear separately: query rows can be permuted and graph padding need
-        # not contain a usable request ID. The following scatter has one writer
-        # per live request under the single-token decode contract.
-        out.fill_(-1)
-        if num_queries == 0 or topk == 0 or num_requests == 0 or max_blocks == 0:
-            return
-        _select_sparse_history_pages_kernel[(num_queries,)](
-            topk_indices,
-            request_rows,
-            active_request_count,
-            compressed_lengths,
-            raw_page_table,
-            history_blocks,
-            out,
-            *topk_indices.stride(),
-            request_rows.stride(0),
-            compressed_lengths.stride(0),
-            *raw_page_table.stride(),
-            history_blocks.stride(0),
-            *out.stride(),
-            NUM_REQUESTS=num_requests,
-            MAX_BLOCKS=max_blocks,
-            TOPK=topk,
-            TOKENS_PER_PAGE=compressed_tokens_per_page,
-            BLOCK_K=triton.next_power_of_2(topk),
-        )
-
-
-@triton.jit
-def _merge_sparse_read_table_kernel(
-    fetched_ptr,
-    write_ptr,
-    history_blocks_ptr,
-    active_request_count_ptr,
-    out_ptr,
-    fetched_stride0,
-    fetched_stride1,
-    write_stride0,
-    write_stride1,
-    history_blocks_stride,
-    out_stride0,
-    out_stride1,
-    MAX_BLOCKS: tl.constexpr,
-    FETCHED_PAGE_SCALE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    request = tl.program_id(0)
-    ordinal = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    active = request < tl.load(active_request_count_ptr)
-    history = tl.load(history_blocks_ptr + request * history_blocks_stride)
-    mask = active & (ordinal < MAX_BLOCKS)
-    fetched = tl.load(
-        fetched_ptr + request * fetched_stride0 + ordinal * fetched_stride1,
-        mask & (ordinal < history),
-        other=-1,
-    )
-    resident = tl.load(
-        write_ptr + request * write_stride0 + ordinal * write_stride1,
-        mask & (ordinal >= history),
-        other=-1,
-    )
-    # The adapter must supply the agreed fetch units. Resident write pages
-    # already use the converter's physical SHARED-page convention.
-    normalized = fetched.to(tl.int64) * FETCHED_PAGE_SCALE
-    normalized = tl.where((fetched >= 0) & (normalized <= 0x7FFFFFFF), normalized, -1)
-    page = tl.where(ordinal < history, normalized, tl.where(resident >= 0, resident, -1))
-    tl.store(
-        out_ptr + request * out_stride0 + ordinal * out_stride1,
-        tl.where(active, page, -1),
-        mask=ordinal < MAX_BLOCKS,
-    )
-
-
-def merge_sparse_read_table(
-    fetched_page_table: torch.Tensor,
-    write_page_table: torch.Tensor,
-    history_blocks: torch.Tensor,
-    active_request_count: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    fetched_page_scale: int,
-) -> None:
-    """Merge fetched history and the resident tail into a separate read table.
-
-    All tensors are CUDA int32 on one device. Both input tables and ``out``
-    are [B, M]; ``history_blocks`` is [B], and ``active_request_count`` is [1].
-    ``write_page_table`` already contains physical GPU pages in the compressed
-    buffer's SHARED convention. ``fetched_page_scale`` is mandatory: pass 1 for
-    fetched physical pages, or the converter's scale for raw GPU slots with
-    the same origin. Other fetch origins must be adapted before this call.
-
-    History uses only fetched entries; the entire tail uses only the write
-    table. Negative/overflowed pages and inactive rows become -1. No missing
-    history entry falls back to a write address. The caller must validate
-    required-page coverage before enabling attention; masking is not recovery.
-
-    ``out`` must have storage disjoint from the inputs. All entries are
-    overwritten on the current stream without allocation or synchronization.
-    The writable table and the original token selections remain unchanged.
-    """
-    device = write_page_table.device
-    for tensor, name, ndim in (
-        (fetched_page_table, "fetched_page_table", 2),
-        (write_page_table, "write_page_table", 2),
-        (history_blocks, "history_blocks", 1),
-        (active_request_count, "active_request_count", 1),
-        (out, "out", 2),
-    ):
-        _check_sparse_offload_tensor(tensor, name, ndim, device)
-    num_requests, max_blocks = write_page_table.shape
-    if fetched_page_table.shape != write_page_table.shape or out.shape != write_page_table.shape:
-        raise ValueError("fetched_page_table, write_page_table, and out must all be [B, M]")
-    if history_blocks.shape != (num_requests,) or active_request_count.shape != (1,):
-        raise ValueError("history_blocks must be [B] and active_request_count must be [1]")
-    if not 0 < fetched_page_scale <= 0x7FFFFFFF:
-        raise ValueError("fetched_page_scale must be a positive int32 scale")
-    if num_requests == 0 or max_blocks == 0:
-        return
-    with torch.cuda.device(device):
-        _merge_sparse_read_table_kernel[(num_requests, triton.cdiv(max_blocks, 256))](
-            fetched_page_table,
-            write_page_table,
-            history_blocks,
-            active_request_count,
-            out,
-            *fetched_page_table.stride(),
-            *write_page_table.stride(),
-            history_blocks.stride(0),
-            *out.stride(),
-            MAX_BLOCKS=max_blocks,
-            FETCHED_PAGE_SCALE=fetched_page_scale,
-            BLOCK=256,
-        )
-
-
-@triton.jit
-def _check_sparse_read_table_kernel(
-    topk_ptr,
-    requests_ptr,
-    active_ptr,
-    lengths_ptr,
-    read_ptr,
-    valid_ptr,
-    topk_stride0,
-    topk_stride1,
-    requests_stride,
-    lengths_stride,
-    read_stride0,
-    read_stride1,
-    NUM_REQUESTS: tl.constexpr,
-    NUM_QUERIES: tl.constexpr,
-    TOPK: tl.constexpr,
-    MAX_BLOCKS: tl.constexpr,
-    TOKENS_PER_PAGE: tl.constexpr,
-    PAGE_BOUND: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    query = tl.program_id(0)
-    active = tl.load(active_ptr)
-    live = query < active
-    req = tl.load(requests_ptr + query * requests_stride)
-    request_ok = (req >= 0) & (req < active) & (req < NUM_REQUESTS)
-    length = tl.load(lengths_ptr + req * lengths_stride, mask=live & request_ok, other=0)
-    k = tl.arange(0, BLOCK_K)
-    token = tl.load(topk_ptr + query * topk_stride0 + k * topk_stride1, mask=k < TOPK, other=-1)
-    required = live & (token >= 0)
-    ordinal = token // TOKENS_PER_PAGE
-    token_ok = (token < length) & (ordinal < MAX_BLOCKS)
-    page = tl.load(
-        read_ptr + req * read_stride0 + ordinal * read_stride1,
-        mask=required & request_ok & token_ok,
-        other=-1,
-    )
-    page_ok = (page >= 0) & (page < PAGE_BOUND)
-    valid = (
-        (active >= 0)
-        & (active <= NUM_REQUESTS)
-        & (active <= NUM_QUERIES)
-        & (~live | request_ok)
-        & tl.min((~required | (token_ok & page_ok)).to(tl.int32), axis=0)
-    )
-    tl.atomic_and(valid_ptr, valid.to(tl.int32), sem="relaxed")
-
-
-def check_sparse_read_table(
-    topk_indices: torch.Tensor,
-    request_rows: torch.Tensor,
-    active_request_count: torch.Tensor,
-    compressed_lengths: torch.Tensor,
-    read_page_table: torch.Tensor,
-    compressed_tokens_per_page: int,
-    page_index_upper_bound: int,
-    out: torch.Tensor,
-) -> None:
-    """Check every live decode selection has an addressable physical KV page.
-
-    Inputs are CUDA int32: top-k [Q, K], request rows [Q], active count [1],
-    lengths [B], and read table [B, M]. The positive, exclusive page bound is
-    relative to the layer's SHARED pointer and must include KVCM scratch.
-    ``out`` is a disjoint persistent int32 [1], rewritten to 1 on success or
-    0 on invalid request/token, missing page, or out-of-bounds page. Padded
-    queries and negative token sentinels are ignored. The caller may pass it
-    to torch._assert_async before launching attention; no host read is needed.
-    """
-    device = read_page_table.device
-    for tensor, name, ndim in (
-        (topk_indices, "topk_indices", 2),
-        (request_rows, "request_rows", 1),
-        (active_request_count, "active_request_count", 1),
-        (compressed_lengths, "compressed_lengths", 1),
-        (read_page_table, "read_page_table", 2),
-        (out, "out", 1),
-    ):
-        _check_sparse_offload_tensor(tensor, name, ndim, device)
-    batch, max_blocks = read_page_table.shape
-    queries, topk = topk_indices.shape
-    if queries <= 0 or topk <= 0:
-        raise ValueError(
-            "Sparse read validation requires nonempty fixed-capacity query/top-k dimensions"
-        )
-    if request_rows.shape != (queries,) or compressed_lengths.shape != (batch,):
-        raise ValueError("request_rows must be [Q] and compressed_lengths must be [B]")
-    if active_request_count.shape != (1,) or out.shape != (1,):
-        raise ValueError("active_request_count and out must be [1]")
-    if compressed_tokens_per_page <= 0 or not 0 < page_index_upper_bound <= 0x7FFFFFFF:
-        raise ValueError("Tokens per page and physical page bound must be positive")
-    with torch.cuda.device(device):
-        out.fill_(1)
-        _check_sparse_read_table_kernel[(queries,)](
-            topk_indices,
-            request_rows,
-            active_request_count,
-            compressed_lengths,
-            read_page_table,
-            out,
-            *topk_indices.stride(),
-            request_rows.stride(0),
-            compressed_lengths.stride(0),
-            *read_page_table.stride(),
-            NUM_REQUESTS=batch,
-            NUM_QUERIES=queries,
-            TOPK=topk,
-            MAX_BLOCKS=max_blocks,
-            TOKENS_PER_PAGE=compressed_tokens_per_page,
-            PAGE_BOUND=page_index_upper_bound,
-            BLOCK_K=triton.next_power_of_2(topk),
-        )
-
-
-@triton.jit
-def _prepare_sparse_write_table_kernel(
-    raw_ptr,
-    history_ptr,
-    active_count_ptr,
-    out_ptr,
-    raw_stride0,
-    raw_stride1,
-    history_stride,
-    out_stride0,
-    out_stride1,
-    MAX_BLOCKS: tl.constexpr,
-    PAGE_SCALE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    request = tl.program_id(0)
-    ordinal = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    active = request < tl.load(active_count_ptr)
-    history = tl.load(history_ptr + request * history_stride)
-    resident = active & (ordinal >= history) & (ordinal < MAX_BLOCKS)
-    raw = tl.load(raw_ptr + request * raw_stride0 + ordinal * raw_stride1, resident, other=-1)
-    page = raw.to(tl.int64) * PAGE_SCALE
-    valid = resident & (raw >= 0) & (page <= 0x7FFFFFFF)
-    tl.store(
-        out_ptr + request * out_stride0 + ordinal * out_stride1,
-        tl.where(valid, page, -1),
-        ordinal < MAX_BLOCKS,
-    )
-
-
-def prepare_sparse_write_table(
-    raw_page_table: torch.Tensor,
-    history_blocks: torch.Tensor,
-    active_request_count: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    page_scale: int,
-) -> None:
-    """Convert only resident raw slots to SHARED pages, preserving invalids.
-
-    All tensors are CUDA int32 on one device: tables are [B, M], history
-    counts [B], and the active count [1]. ``out`` must be disjoint from inputs.
-    Host history and padded requests become -1, including host slot zero.
-    The caller supplies the resident converter scale (expansion must be 1);
-    the layer offset is already part of the compressed buffer pointer.
-    No tensor allocation or host synchronization is performed.
-    """
-    device = raw_page_table.device
-    for tensor, name, ndim in (
-        (raw_page_table, "raw_page_table", 2),
-        (history_blocks, "history_blocks", 1),
-        (active_request_count, "active_request_count", 1),
-        (out, "out", 2),
-    ):
-        _check_sparse_offload_tensor(tensor, name, ndim, device)
-    batch, max_blocks = raw_page_table.shape
-    if out.shape != raw_page_table.shape:
-        raise ValueError("raw_page_table and out must have the same [B, M] shape")
-    if history_blocks.shape != (batch,) or active_request_count.shape != (1,):
-        raise ValueError("history_blocks must be [B] and active_request_count must be [1]")
-    if not 0 < page_scale <= 0x7FFFFFFF:
-        raise ValueError("page_scale must be a positive int32 scale")
-    if batch == 0 or max_blocks == 0:
-        return
-    with torch.cuda.device(device):
-        _prepare_sparse_write_table_kernel[(batch, triton.cdiv(max_blocks, 256))](
-            raw_page_table,
-            history_blocks,
-            active_request_count,
-            out,
-            *raw_page_table.stride(),
-            history_blocks.stride(0),
-            *out.stride(),
-            MAX_BLOCKS=max_blocks,
-            PAGE_SCALE=page_scale,
-            BLOCK=256,
-        )

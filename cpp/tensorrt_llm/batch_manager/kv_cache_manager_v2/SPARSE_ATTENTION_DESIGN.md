@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Sparse attention in KVCacheManagerV2
 
 Target: the **decode instance of a disaggregated deployment**.
@@ -966,7 +971,8 @@ Declared or planned in `tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi`:
   bound, `BufferConfig.sparse_selection_unit_tokens: int | None` and
   `BufferConfig.sparse_unit_chunks: int` — construction-time, per buffer.
 - `KVCacheManager.is_sparse(layer_id, data_role) -> bool`.
-- `Batch` — membership, row order, device arrays, `resize()`, dirty-row publication.
+- `Batch` — membership, row order, device arrays, `resize()` and `publish()`, which
+  transfers the whole table; dirty-row tracking is planned, not declared.
 - `KVCacheManager.fetch_sparse_pages(batch, buffers, selected, out, stream)`.
 - `Batch.sparse_out_slots(buffers) -> list[int]` — the slice of `out` each buffer's
   indices land in, for both the fetch and the write.

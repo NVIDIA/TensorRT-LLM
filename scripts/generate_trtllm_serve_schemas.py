@@ -104,6 +104,7 @@ def _schema_for(annotation: Any, parent: dict | None = None) -> dict:
     from pydantic import TypeAdapter
 
     schema = TypeAdapter(annotation).json_schema(schema_generator=_schema_generator())
+    _apply_sparse_indexer_defaults(schema)
     if parent is not None:
         definitions = parent.setdefault("$defs", {})
         for name, definition in schema.pop("$defs", {}).items():
@@ -111,6 +112,28 @@ def _schema_for(annotation: Any, parent: dict | None = None) -> dict:
                 raise ValueError(f"Conflicting schema definition: {name}")
             definitions[name] = definition
     return schema
+
+
+def _apply_sparse_indexer_defaults(schema: dict) -> None:
+    """Describe the offload-dependent default resolved by the config validator."""
+    for definition in [schema, *schema.get("$defs", {}).values()]:
+        if definition.get("title") not in {
+            "DeepSeekSparseAttentionConfig",
+            "DeepSeekV4SparseAttentionConfig",
+        }:
+            continue
+        field = "use_cute_dsl_paged_mqa_logits"
+        resident_default = definition["properties"][field].pop("default")
+        definition.setdefault("allOf", []).append(
+            {
+                "if": {
+                    "properties": {"enable_kv_cache_offload": {"const": True}},
+                    "required": ["enable_kv_cache_offload"],
+                },
+                "then": {"properties": {field: {"default": False}}},
+                "else": {"properties": {field: {"default": resident_default}}},
+            }
+        )
 
 
 def _nullable(schema: dict) -> dict:
