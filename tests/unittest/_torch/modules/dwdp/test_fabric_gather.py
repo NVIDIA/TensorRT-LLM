@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the host side of the DWDP fabric gather (plan building and env knobs)."""
+"""CPU tests for the host side of the DWDP fabric gather (plan building, knobs, SM reserve)."""
 
 import os
 
@@ -78,26 +78,57 @@ def test_blocks_per_row_never_drops_below_one(monkeypatch):
 
 
 def test_compute_side_defaults_respect_explicit_values(monkeypatch):
-    monkeypatch.setattr(fabric_gather, "THREADS", 1024)
-    monkeypatch.setenv("TRTLLM_DWDP_GATHER_BLOCKS", "30")
-    _unset(monkeypatch, "TRTLLM_CUTEDSL_SM_RESERVE")
     monkeypatch.setenv("TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER", "static")
     monkeypatch.setenv("TLLM_ROUTING_DISABLE_COOP_LAUNCH", "0")
     fabric_gather.apply_compute_side_defaults()
-    assert os.environ["TRTLLM_CUTEDSL_SM_RESERVE"] == "30"
     assert os.environ["TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"] == "static"
     assert os.environ["TLLM_ROUTING_DISABLE_COOP_LAUNCH"] == "0"
-
-
-def test_small_blocks_do_not_reserve_sms(monkeypatch):
-    monkeypatch.setattr(fabric_gather, "THREADS", 128)
-    _unset(monkeypatch, "TRTLLM_CUTEDSL_SM_RESERVE")
     _unset(monkeypatch, "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER")
     _unset(monkeypatch, "TLLM_ROUTING_DISABLE_COOP_LAUNCH")
     fabric_gather.apply_compute_side_defaults()
-    assert os.environ["TRTLLM_CUTEDSL_SM_RESERVE"] == "0"
     assert os.environ["TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"] == "clc_dynamic"
     assert os.environ["TLLM_ROUTING_DISABLE_COOP_LAUNCH"] == "1"
+
+
+def test_resident_sms_is_the_block_count_of_a_resident_gather(monkeypatch):
+    _unset(monkeypatch, "TRTLLM_CUTEDSL_SM_RESERVE")
+    monkeypatch.setenv("TRTLLM_DWDP_GATHER_BLOCKS", "30")
+    monkeypatch.setattr(fabric_gather, "available", lambda: True)
+    monkeypatch.setattr(fabric_gather, "THREADS", 1024)
+    assert fabric_gather.resident_sms() == 30
+    # Small blocks share SMs with the compute kernels.
+    monkeypatch.setattr(fabric_gather, "THREADS", 128)
+    assert fabric_gather.resident_sms() == 0
+    # No gather, no reserve.
+    monkeypatch.setattr(fabric_gather, "THREADS", 1024)
+    monkeypatch.setattr(fabric_gather, "available", lambda: False)
+    assert fabric_gather.resident_sms() == 0
+    # An explicit count wins, with any gather configuration.
+    monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", "24")
+    assert fabric_gather.resident_sms() == 24
+
+
+def test_sm_reserve_is_set_explicitly():
+    from tensorrt_llm._torch import cute_dsl_utils
+
+    assert cute_dsl_utils.sm_reserve() == 0
+    cute_dsl_utils.set_sm_reserve(30)
+    try:
+        assert cute_dsl_utils.sm_reserve() == 30
+    finally:
+        cute_dsl_utils.set_sm_reserve(0)
+    with pytest.raises(ValueError):
+        cute_dsl_utils.set_sm_reserve(-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_sm_reserve_must_leave_an_sm():
+    from tensorrt_llm._torch import cute_dsl_utils
+
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    with pytest.raises(ValueError, match="must leave at least one"):
+        cute_dsl_utils.set_sm_reserve(sm_count)
+    assert cute_dsl_utils.sm_reserve() == 0
 
 
 @pytest.mark.parametrize(
