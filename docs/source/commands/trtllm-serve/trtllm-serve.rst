@@ -82,7 +82,7 @@ shared format. ``--reasoning_parser`` separately controls reasoning extraction;
 Multiple HTTP Frontends
 -----------------------
 
-At high concurrency a single serving process is host-bound: one asyncio event loop parses every request and writes every streamed chunk, and queuing on that loop rather than GPU time starts to dominate first-token latency. ``trtllm-serve`` therefore runs **8 HTTP frontend processes** against one executor by default (``--num_serve_frontends``, prototype). The launcher process owns the engine; the other frontends attach to it and share the serving port via ``SO_REUSEPORT``, so clients still see a single URL.
+At high concurrency a single serving process is host-bound: one asyncio event loop parses every request and writes every streamed chunk, and queuing on that loop rather than GPU time starts to dominate first-token latency. ``trtllm-serve`` therefore runs **8 HTTP frontend processes** against one executor by default (``--num_serve_frontends``, beta). The launcher process owns the engine; the other frontends attach to it and share the serving port via ``SO_REUSEPORT``, so clients still see a single URL.
 
 .. note::
 

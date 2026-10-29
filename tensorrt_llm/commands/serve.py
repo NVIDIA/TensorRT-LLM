@@ -1181,7 +1181,7 @@ def launch_visual_gen_server(
     "SO_REUSEPORT (classic IPC executor path only). Without an explicit "
     "value, --grpc and configurations that support a single frontend only "
     "use 1 and log why.",
-    status="prototype")
+    status="beta")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,

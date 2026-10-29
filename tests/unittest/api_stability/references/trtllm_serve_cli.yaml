@@ -345,7 +345,7 @@ commands:
       num_serve_frontends:
         type: int
         default: 8
-        status: prototype
+        status: beta
         required: false
         multiple: false
         is_flag: false
