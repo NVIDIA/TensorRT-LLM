@@ -522,8 +522,14 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                 def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
                 // conftest.py prefixes nodeids with --test-prefix=${stageName}; match in
                 // Groovy, not a shell grep, so a quote in a parametrized id can't break it.
+                // A unittest entry is recorded as its wrapper,
+                // "${stageName}/test_unittests.py::test_unittests_v2[unittest/...]".
+                def unfinishedNames = [
+                    "${stageName}/${bareTestName}".toString(),
+                    "${stageName}/test_unittests.py::test_unittests_v2[${bareTestName}]".toString(),
+                ]
                 def isTestUnfinished = fileExists(unfinishedTestFile) &&
-                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.contains("${stageName}/${bareTestName}".toString())
+                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.any { it in unfinishedNames }
                 if (isTestUnfinished) {
                     // Record this crash as a JUnit <testcase> like the regular-test
                     // path does. hasUnrerunFailure stays untouched here: it drives
