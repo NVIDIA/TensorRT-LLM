@@ -11,7 +11,11 @@ from unittest import mock
 import pytest
 from aiohttp import web
 
-from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
+from tensorrt_llm.llmapi.disagg_utils import (
+    MetadataServerConfig,
+    ServerRole,
+    parse_metadata_server_config_file,
+)
 from tensorrt_llm.serve import metadata_server as metadata_server_module
 from tensorrt_llm.serve.metadata_server import (
     RECORD_SIGNATURE_FIELD,
@@ -217,6 +221,48 @@ def test_config_validation():
     )
     assert cfg.port == 2379
     assert MetadataServerConfig(server_type="etcd", ca_cert="/ca.pem").user is None
+
+
+def test_config_rejects_unknown_fields():
+    with pytest.raises(ValueError, match="refersh_interval"):
+        MetadataServerConfig(server_type="etcd", refersh_interval=1.0)
+
+
+def test_config_keeps_secrets_out_of_repr_and_errors():
+    cfg = MetadataServerConfig(
+        server_type="etcd",
+        user=ETCD_USER,
+        password=ETCD_SECRET,
+        ca_cert="/ca.pem",
+        record_auth_key=RECORD_KEY,
+    )
+    assert ETCD_SECRET not in repr(cfg)
+    assert RECORD_KEY not in repr(cfg)
+    with pytest.raises(ValueError) as missing_ca_cert:
+        MetadataServerConfig(server_type="etcd", user=ETCD_USER, password=ETCD_SECRET)
+    assert ETCD_SECRET not in str(missing_ca_cert.value)
+    with pytest.raises(ValueError) as wrong_type:
+        MetadataServerConfig(server_type="etcd", record_auth_key=[RECORD_KEY])
+    assert RECORD_KEY not in str(wrong_type.value)
+
+
+def test_parse_metadata_server_config_file(tmp_path):
+    path = tmp_path / "metadata_config.yaml"
+    path.write_text(
+        "server_type: etcd\n"
+        "hostname: etcd-host\n"
+        "port: 1234\n"
+        "refresh_interval: 3.5\n"
+        f'record_auth_key: "{RECORD_KEY}"\n'
+    )
+    cfg = parse_metadata_server_config_file(str(path))
+    assert (cfg.hostname, cfg.port, cfg.refresh_interval, cfg.record_auth_key) == (
+        "etcd-host",
+        1234,
+        3.5,
+        RECORD_KEY,
+    )
+    assert parse_metadata_server_config_file(None) is None
 
 
 def test_etcd_dictionary_lists_only_the_trtllm_prefix():
