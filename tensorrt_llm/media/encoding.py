@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tensor → image/video encoding free functions."""
 
+import math
 import os
 import shutil
 import struct
@@ -141,6 +142,11 @@ class _FfmpegCliEncoder(_VideoEncoder):
             audio_output_args: list = []
             if audio is not None:
                 audio_tensor = self._validate_audio_tensor(audio)
+                # Pad only the encoding copy so -shortest preserves every video frame.
+                required_samples = math.ceil(num_frames * audio_sample_rate / frame_rate)
+                missing_samples = required_samples - audio_tensor.shape[0]
+                if missing_samples > 0:
+                    audio_tensor = torch.nn.functional.pad(audio_tensor, (0, 0, 0, missing_samples))
                 audio_np = audio_tensor.cpu().numpy()
                 tmp_audio_path = os.path.join(tmp_dir, "audio.wav")
                 self._write_wav(tmp_audio_path, audio_np, sample_rate=audio_sample_rate)

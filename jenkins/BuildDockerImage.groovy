@@ -127,66 +127,6 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                   kubernetes.io/os: linux
                   kubernetes.io/arch: ${arch}"""
 
-    if (build_wheel && arch == "arm64") {
-        // For aarch64, we need to use hostname to fix the ucxx issue when building wheels
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: In
-                                      values:
-                                        - "rl300-0008.ipp2u1.colossus"
-                                        - "rl300-0014.ipp2u1.colossus"
-                                        - "rl300-0023.ipp2u1.colossus"
-                                        - "rl300-0024.ipp2u1.colossus"
-                                        - "rl300-0030.ipp2u1.colossus"
-                                        - "rl300-0040.ipp2u1.colossus"
-                                        - "rl300-0041.ipp2u1.colossus"
-                                        - "rl300-0042.ipp2u1.colossus"
-                                        - "rl300-0043.ipp2u1.colossus"
-                                        - "rl300-0044.ipp2u1.colossus"
-                                        - "rl300-0045.ipp2u1.colossus"
-                                        - "rl300-0046.ipp2u1.colossus"
-                                        - "rl300-0047.ipp2u1.colossus"
-        """
-    } else if (arch == "arm64") {
-        // Temporarily avoid an arm64 builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: NotIn
-                                      values:
-                                        - "rl300-0021.ipp2a1.colossus"
-        """
-    }
-
-    if (arch == "amd64") {
-        // For x86_64, we block some nodes to avoid unstable network access.
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: NotIn
-                                      values:
-                                        - "sc-ipp-blossom-prod-k8w-105"
-                                        - "sc-ipp-blossom-prod-k8w-114"
-                                        - "sc-ipp-blossom-prod-k8w-115"
-                                        - "sc-ipp-blossom-prod-k8w-121"
-                                        - "sc-ipp-blossom-prod-k8w-123"
-                                        - "sc-ipp-blossom-prod-k8w-124"
-        """
-    }
-
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 

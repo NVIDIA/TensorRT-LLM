@@ -88,13 +88,16 @@ from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
 
-# Page size of a standalone drafter's separate KV pool (DFlash, standalone
-# DSpark). Deliberately not kv_cache_config.tokens_per_block: that describes
-# the target pool, and target attention backends and deployment configs set it
-# to values the drafter's block-decode kernels reject (FP4 MLA forces 128, which
-# the trtllm-gen MLA decode does not take). The drafter adopts whatever page
-# size its pool is carved with, so the pool picks one every drafter kernel
-# accepts. Matches the KvCacheConfig.tokens_per_block default.
+# Page sizes of a standalone drafter's separate KV pool (DFlash, standalone
+# DSpark). The pool keeps the target's kv_cache_config.tokens_per_block when it
+# is in _DRAFTER_KERNEL_TOKENS_PER_BLOCK, the page sizes every drafter
+# block-decode kernel accepts: trtllm-gen MLA decode takes 32 or 64, the CuTe
+# DSL MLA decode a divisor of 128 above 1, and the trtllm-gen attention of a GQA
+# drafter 16, 32 or 64. Target attention backends and deployment configs set
+# other values (FP4 MLA forces 128), and those get
+# _STANDALONE_DRAFT_TOKENS_PER_BLOCK, the KvCacheConfig.tokens_per_block
+# default. The drafter adopts whatever page size its pool is carved with.
+_DRAFTER_KERNEL_TOKENS_PER_BLOCK = frozenset((32, 64))
 _STANDALONE_DRAFT_TOKENS_PER_BLOCK = 32
 
 # Aggregated helix skips memory profiling, so its default KV fraction leaves
@@ -2275,11 +2278,13 @@ class KvCacheCreator:
     def _get_draft_tokens_per_block(self) -> int:
         """Page size of the separate one-model draft KV pool.
 
-        A standalone drafter (DFlash, standalone DSpark) gets its own page
-        size, ``_STANDALONE_DRAFT_TOKENS_PER_BLOCK``, NOT self._tokens_per_block:
-        the target's value can be one the drafter's kernels reject (FP4 MLA
-        forces 128; trtllm-gen MLA decode takes only 32 or 64). Those drafters
-        read their pool geometry from the manager, so nothing else has to agree.
+        A standalone drafter (DFlash, standalone DSpark) keeps
+        self._tokens_per_block when every drafter block-decode kernel accepts
+        it (``_DRAFTER_KERNEL_TOKENS_PER_BLOCK``), and otherwise gets its own
+        page size, ``_STANDALONE_DRAFT_TOKENS_PER_BLOCK``: the target's value
+        can be one the drafter's kernels reject (FP4 MLA forces 128;
+        trtllm-gen MLA decode takes only 32 or 64). Those drafters read their
+        pool geometry from the manager, so nothing else has to agree.
 
         Every other separate draft pool (MTP, Eagle3, ...) keeps the target's
         page size: its draft layers run through the target's attention
@@ -2290,7 +2295,8 @@ class KvCacheCreator:
         the split charges one page granularity and the pool uses another.
         """
         spec_dec_mode = self._speculative_config.spec_dec_mode
-        if spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark():
+        if ((spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()) and
+                self._tokens_per_block not in _DRAFTER_KERNEL_TOKENS_PER_BLOCK):
             return _STANDALONE_DRAFT_TOKENS_PER_BLOCK
         return self._tokens_per_block
 

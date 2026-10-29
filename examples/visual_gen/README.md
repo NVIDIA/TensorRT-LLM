@@ -16,6 +16,8 @@ for feature details.
 
 ```bash
 python quickstart_example.py
+python models/ltx23.py
+python models/ltx23_retake.py --input /path/to/retake_input.mp4
 python models/glm_image.py
 
 # With engine config (quant, parallelism, etc.)
