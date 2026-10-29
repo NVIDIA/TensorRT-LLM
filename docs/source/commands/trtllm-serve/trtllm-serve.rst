@@ -232,7 +232,9 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
    is refused unless the server is started with
    ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=<directory>``; then only regular files whose
    resolved path is inside that directory are read. This applies to
-   ``image_url``, ``video_url`` and ``audio_url`` parts.
+   ``image_url``, ``video_url`` and ``audio_url`` parts. A deployment whose
+   clients send local paths today must set the variable to the directory
+   that holds those files.
 
 .. note::
    To convert images to base64-encoded format, use the utility function
