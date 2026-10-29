@@ -7088,6 +7088,24 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
+    def _remove_kv_cache(self, request_id: int) -> None:
+        """Forget a sequence made by `_create_kv_cache`: drop it from the map,
+        close it, clear its stats exclusion and free its index slot. Calling
+        this again for the same id does nothing."""
+        kv_cache = self.kv_cache_map.pop(request_id, None)
+        if kv_cache is None:
+            self.impl.clear_stats_excluded(request_id)
+            return
+        kv_cache.discard_pending_stats()
+        if self._sharing is not None:
+            self._sharing._on_free(request_id, kv_cache)
+        kv_cache.close()
+        self.impl.clear_stats_excluded(request_id)
+        if request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request_id)
+        else:
+            self.index_mapper.remove_sequence(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
         # its saves drain, and a dead entry here would block every later
@@ -7124,19 +7142,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready.pop(request.py_request_id, None)
         self._on_allocation_stream.discard(request.py_request_id)
         self._allocation_ready.pop(request.py_request_id, None)
-        kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
-        if kv_cache is None:
-            self.impl.clear_stats_excluded(request.py_request_id)
-            return
-        kv_cache.discard_pending_stats()
-        if self._sharing is not None:
-            self._sharing._on_free(request.py_request_id, kv_cache)
-        kv_cache.close()
-        self.impl.clear_stats_excluded(request.py_request_id)
-        if request.py_request_id in self._early_freed_index_requests:
-            self._early_freed_index_requests.discard(request.py_request_id)
-        else:
-            self.index_mapper.remove_sequence(request.py_request_id)
+        self._remove_kv_cache(request.py_request_id)
 
     def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
         """Tell the lender, if one is attached, that ``kv_cache`` may have shrunk in place: blocks
