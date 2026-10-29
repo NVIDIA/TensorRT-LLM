@@ -2708,7 +2708,11 @@ def _cache_kernels():
 
         CTA ``(q, 0)`` also publishes the layer's ``lengths`` (``max(count, 1)``)
         and native ``indices``; CTA ``(0, 0)`` resets the scheduler counter and
-        derives the FP8 BMM scales.
+        derives the FP8 BMM scales. Index slots past ``lengths`` name the
+        token's own staging row for that slot instead of ``-1``: the native
+        FMHA still loads the slots of its last partial KV tile (their scores
+        are masked), and this launch zero-fills every row past the token's
+        selection, so the padding reads zeros inside the pools.
         """
 
         THREADS = 128
@@ -2887,10 +2891,7 @@ def _cache_kernels():
                     physical = Int32(q) * extra_capacity + column - 128
                     if column < 128:
                         physical = Int32(q) * 128 + column
-                    value = Int32(-1)
-                    if column < length:
-                        value = physical
-                    indices_t[q, column] = value
+                    indices_t[q, column] = physical
                 if (q == 0) & (tid == 0):
                     tensor1d(counter, Int64(1))[0] = Uint32(0)
                     if cutlass.const_expr(self.fp8):
@@ -4129,7 +4130,9 @@ def stage_selected_rows(
     ``CSA2TrtllmMetadata.global_slot_tile`` with visibility. ``scratch`` holds
     the group's ``tags``/``counts`` (and, in the mapped form, ``main_slots``
     receives the physical rows); ``compact=False`` reuses them from an
-    earlier layer of the same group in this forward.
+    earlier layer of the same group in this forward. The published
+    ``prepared_indices`` hold no ``-1``: slots past a token's selection name
+    that token's own zero-filled staging rows.
     """
     count = metadata.num_tokens
     capacity = metadata.num_sparse_topk
@@ -4191,6 +4194,7 @@ def stage_selected_rows(
             _stream(device),
         )
     extra_rows = int(metadata.extra_pool.shape[1])
+    _check(capacity <= 128 + extra_rows, "CSA2 staging rows must cover the index capacity")
     _launch(
         ("stage_dequant", fp8, device.index),
         lambda: ns.StageDequantKernel(fp8),
