@@ -581,6 +581,11 @@ zai-org/GLM-5-FP8:
     spec_dec_algo: MTP
     accuracy: 78.0
 zai-org/GLM-5.2:
+  # The non-speculative forward shares the MTP row's anchor: MTP holds the
+  # emitted distribution, so it must not move the score.
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 90
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
