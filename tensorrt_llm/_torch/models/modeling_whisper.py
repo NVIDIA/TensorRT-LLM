@@ -602,6 +602,10 @@ class WhisperInputProcessor(InputProcessor):
     # IDs are not consumed by this processor.
     supports_token_ids_input = False
 
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        return frozenset({"audio"})
+
     def __init__(self, model_path, config, tokenizer, trust_remote_code: bool = True, **kwargs):
         self.model_path = model_path
         self.config = config

@@ -94,6 +94,10 @@ class _ImageConfig:
 class _ImageInputProcessor(BaseMultimodalInputProcessor):
     """Minimal concrete processor used only for capability detection."""
 
+    @property
+    def supported_modalities(self):
+        return frozenset({"image", "video", "audio"})
+
     def __init__(self, config: _ImageConfig) -> None:
         self._config = config
 
@@ -127,6 +131,7 @@ class _AudioInputProcessor:
     """Registered processor that does not use BaseMultimodalInputProcessor."""
 
     _registered_model_type = _ImageConfig.model_type
+    supported_modalities = frozenset({"image", "video", "audio"})
 
     def __init__(self, config: _ImageConfig) -> None:
         self.config = config
@@ -643,28 +648,40 @@ async def test_audio_request_uses_one_shared_budget_without_double_charging(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("processor_kind", ["gemma4", "nemotron"])
 @pytest.mark.parametrize("audio_encoder", [False, True])
-async def test_gemma4_audio_capability_requires_checkpoint_encoder(audio_encoder, monkeypatch):
-    class GemmaConfig:
-        model_type = "gemma4"
-        audio_config = object() if audio_encoder else None
+async def test_audio_capability_follows_loaded_processor(processor_kind, audio_encoder):
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
+        NemotronHMultimodalInputProcessor,
+    )
 
-    llm = SimpleNamespace(input_processor=_ImageInputProcessor(GemmaConfig()))
-    monkeypatch.setattr(
-        MULTIMODAL_PLACEHOLDER_REGISTRY,
-        "is_valid",
-        lambda model_type, modality: modality in {"image", "audio"},
-    )
-    monkeypatch.setattr(
-        MULTIMODAL_PLACEHOLDER_REGISTRY,
-        "get_placeholder",
-        lambda model_type, modality: f"<{modality}_{{}}>",
-    )
-    capabilities = request_mapping.media_capabilities_for_model(llm)
-    assert "image" in capabilities.modalities
-    assert ("audio" in capabilities.modalities) == audio_encoder
+    if processor_kind == "gemma4":
+        processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
+        config = SimpleNamespace(
+            model_type="gemma4",
+            vision_config=object(),
+            audio_config=object() if audio_encoder else None,
+        )
+    else:
+        processor = NemotronHMultimodalInputProcessor.__new__(NemotronHMultimodalInputProcessor)
+        config = SimpleNamespace(model_type="nemotron_h_omni")
+        processor._audio_extractor = object() if audio_encoder else None
+    processor._config = config
+    llm = _ImageLlm(processor, config)
+    llm.args.reasoning_parser = None
+    llm.args.max_seq_len = 2048
+    inference = OpenEngineInferenceServicer(llm, "audio-model")
+    control = OpenEngineControlServicer(llm, "audio-model", inference)
+    info = await control.GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
+    assert ("audio" in info.extra["trtllm_supported_modalities"]) is audio_encoder
+    assert "image" in info.extra["trtllm_supported_modalities"]
+    assert {"image", "video"} <= processor.supported_modalities
+    assert ("audio" in processor.supported_modalities) is audio_encoder
     if not audio_encoder:
         request = generation_pb2.GenerateRequest(
+            request_id="unsupported-audio",
+            model="audio-model",
             prompt="transcribe",
             media=[
                 generation_pb2.MediaItem(
@@ -675,32 +692,83 @@ async def test_gemma4_audio_capability_requires_checkpoint_encoder(audio_encoder
             ],
         )
         with pytest.raises(UnsupportedFeatureError, match="audio"):
-            await request_mapping._input_from_request(request, llm, capabilities)
+            await request_mapping._input_from_request(request, llm)
+        context = FakeServicerContext()
+        with pytest.raises(AbortError):
+            async for _ in inference.Generate(request, context):
+                pass
+        assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+
+
+@pytest.mark.parametrize("audio_encoder", [False, True])
+def test_gemma4_without_vision_encoder_omits_images_and_video(audio_encoder):
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+
+    processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
+    processor._config = SimpleNamespace(
+        model_type="gemma4", vision_config=None, audio_config=object() if audio_encoder else None
+    )
+    expected = {"audio"} if audio_encoder else frozenset()
+    assert processor.supported_modalities == expected
+    assert (
+        request_mapping.media_capabilities_for_model(
+            SimpleNamespace(input_processor=processor)
+        ).modalities
+        == expected
+    )
 
 
 @pytest.mark.parametrize("config_state", ["absent", "none"])
-def test_gemma4_missing_processor_config_fails_closed(config_state, monkeypatch):
+def test_gemma4_missing_processor_config_fails_closed(config_state):
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+
     config = SimpleNamespace(model_type="gemma4", audio_config=object())
-    processor = _ImageInputProcessor(config)
-    if config_state == "absent":
-        del processor._config
-    else:
+    processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
+    if config_state == "none":
         processor._config = None
     llm = SimpleNamespace(input_processor=processor, _hf_model_config=config)
-    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda *args: True)
-    monkeypatch.setattr(
-        MULTIMODAL_PLACEHOLDER_REGISTRY,
-        "get_placeholder",
-        lambda model_type, modality: f"<{modality}_{{}}>",
+    assert processor.supported_modalities == frozenset()
+    assert request_mapping.media_capabilities_for_model(llm).modalities == frozenset()
+
+
+def test_whisper_declares_audio_without_multimodal_base():
+    from tensorrt_llm._torch.models.modeling_whisper import WhisperInputProcessor
+
+    processor = WhisperInputProcessor.__new__(WhisperInputProcessor)
+    processor.config = SimpleNamespace(model_type="whisper")
+    assert processor.supported_modalities == {"audio"}
+    llm = SimpleNamespace(input_processor=processor)
+    assert request_mapping.media_capabilities_for_model(llm).modalities == {"audio"}
+
+
+def test_multimodal_processor_defaults_to_registered_modalities(monkeypatch):
+    from tensorrt_llm.inputs.registry import MultimodalPlaceholderMetadata
+
+    class RegisteredProcessor(_ImageInputProcessor):
+        supported_modalities = BaseMultimodalInputProcessor.supported_modalities
+
+    monkeypatch.setitem(
+        MULTIMODAL_PLACEHOLDER_REGISTRY._multimodal_placeholder_by_model_type,
+        _ImageConfig.model_type,
+        MultimodalPlaceholderMetadata(placeholder_map={"image": "<image>", "audio": "<audio>"}),
     )
-    capabilities = request_mapping.media_capabilities_for_model(llm)
-    assert "image" in capabilities.modalities
-    assert "audio" not in capabilities.modalities
+    processor = RegisteredProcessor(_ImageConfig())
+    assert processor.supported_modalities == {"image", "audio"}
+    processor._config = SimpleNamespace(model_type="openengine_unknown_processor")
+    assert processor.supported_modalities == frozenset()
+
+
+def test_registered_processor_without_modality_contract_fails_closed(monkeypatch):
+    monkeypatch.delattr(_AudioInputProcessor, "supported_modalities")
+    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda *_: True)
+    llm = SimpleNamespace(input_processor=_AudioInputProcessor(_ImageConfig()))
+    assert request_mapping.media_capabilities_for_model(llm).modalities == frozenset()
 
 
 def test_default_input_processor_declares_token_ids_supported():
     processor = DefaultInputProcessor(model_path="unused", config=None, tokenizer=None)
     assert processor.supports_token_ids_input is True
+    assert processor.supported_modalities == frozenset()
 
 
 def test_decoded_media_budget_settles_peak_to_retained_bytes():
