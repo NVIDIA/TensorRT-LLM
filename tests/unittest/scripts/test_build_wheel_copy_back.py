@@ -135,8 +135,9 @@ def assert_hard_links(dst_dir: Path, src_dir: Path, linked: bool) -> None:
 def build_tree(base):
     """Build a small tree covering where the two copy paths could differ.
 
-    Nested dirs, an empty dir, an executable file, a symlink to a file, a
-    symlink to a dir, and __pycache__/*.pyc that the stage path excludes.
+    Nested dirs, an empty dir, a dir with a restrictive mode, an executable
+    file, a symlink to a file, a symlink to a dir, and __pycache__/*.pyc that
+    the stage path excludes.
     """
     base = Path(base)
     (base / "pkg/sub").mkdir(parents=True)
@@ -147,6 +148,10 @@ def build_tree(base):
     run_sh.write_bytes(b"#!/bin/sh\necho hi\n")
     run_sh.chmod(0o755)
     (base / "pkg/emptydir").mkdir()
+    private_dir = base / "pkg/private"
+    private_dir.mkdir()
+    (private_dir / "key.txt").write_bytes(b"k\n")
+    private_dir.chmod(0o700)
     (base / "pkg/link_to_init.py").symlink_to(base / "pkg/__init__.py")
     (base / "pkg/link_to_sub").symlink_to(base / "pkg/sub")
     (base / "pkg/__pycache__").mkdir()

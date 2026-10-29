@@ -751,6 +751,8 @@ def sync_tree(src: Path,
         demote_racy_mtimes()
         return
 
+    # Folders the walk creates, as (source, destination) pairs in walk order.
+    new_dirs: list[tuple[Path, Path]] = []
     for root, dirs, files in os.walk(src, followlinks=True):
         rel = Path(root).relative_to(src)
         dirs[:] = [d for d in dirs if not excluded(d)]
@@ -758,7 +760,9 @@ def sync_tree(src: Path,
         dst_root = dst / rel
         if dst_root.exists() and not dst_root.is_dir():
             dst_root.unlink()
-        dst_root.mkdir(exist_ok=True)
+        if not dst_root.is_dir():
+            dst_root.mkdir()
+            new_dirs.append((Path(root), dst_root))
         keep = set(dirs) | set(files)
         for stale in os.listdir(dst_root):
             if stale not in keep:
@@ -794,6 +798,11 @@ def sync_tree(src: Path,
             hard_link = link_or_copy_file(src_file, dst_file, hard_link)
             if not hard_link:
                 _demote_racy_mtime(dst_file, src_stat, now)
+
+    # Give each new folder its source's mode and times, as copytree does.
+    # Deepest first, so a restrictive mode cannot block its own subtree.
+    for src_dir, dst_dir in reversed(new_dirs):
+        shutil.copystat(src_dir, dst_dir)
 
 
 def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
