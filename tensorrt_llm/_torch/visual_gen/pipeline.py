@@ -129,6 +129,8 @@ class BasePipeline(nn.Module):
 
     def __init__(self, pipeline_config: "DiffusionPipelineConfig"):
         super().__init__()
+        # Registry name before variant resolution; set by AutoPipeline.
+        self.pipeline_class_name: str = "other"
         self.pipeline_config = pipeline_config
         self.config = pipeline_config.primary_pretrained_config
         self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()

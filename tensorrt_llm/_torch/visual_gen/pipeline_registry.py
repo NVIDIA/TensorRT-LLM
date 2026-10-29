@@ -199,14 +199,8 @@ class AutoPipeline:
 
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
 
-        # Preserve the allowlisted registry key separately from the resolved
-        # runtime class (a pipeline may select a specialized variant).
         pipeline = pipeline_class(config)
-        if entry.telemetry_safe:
-            try:
-                pipeline._telemetry_pipeline_class_name = class_name
-            except Exception as exc:
-                logger.debug(f"Could not attach pipeline telemetry metadata: {exc}")
+        pipeline.pipeline_class_name = class_name
         return pipeline
 
     @staticmethod

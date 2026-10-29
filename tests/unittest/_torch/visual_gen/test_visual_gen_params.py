@@ -733,41 +733,68 @@ class TestPipelineMetadataBridging:
 
         return pickle.loads(pickle.dumps(response))
 
-    def test_pipeline_telemetry_metadata_is_fail_silent(self, monkeypatch):
+    @pytest.mark.parametrize("telemetry_safe", [False, True])
+    def test_pipeline_preserves_registry_name_after_variant_resolution(
+        self, monkeypatch, telemetry_safe
+    ):
         from types import SimpleNamespace
 
+        from tensorrt_llm._torch.visual_gen.executor import _visual_gen_telemetry_metadata
+        from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
         from tensorrt_llm._torch.visual_gen.pipeline_registry import (
             PIPELINE_REGISTRY,
             AutoPipeline,
             _PipelineEntry,
         )
 
-        class _SlottedPipeline:
-            __slots__ = ()
+        for method in (
+            "_init_transformer",
+            "_install_nccl_window_tensor_scope_hooks",
+            "_setup_cuda_graphs",
+        ):
+            monkeypatch.setattr(BasePipeline, method, lambda self: None)
+        monkeypatch.delenv("TLLM_PROFILE_VISUAL_GEN_START_STOP", raising=False)
 
+        class _VariantPipeline(BasePipeline):
+            pass
+
+        class _OriginalPipeline(BasePipeline):
             @classmethod
             def resolve_variant(cls, _config):
-                return cls
+                return _VariantPipeline
 
-            def __init__(self, _config):
-                pass
-
-        monkeypatch.setitem(
-            PIPELINE_REGISTRY,
-            "SlottedPipeline",
-            _PipelineEntry(pipeline_cls=_SlottedPipeline, telemetry_safe=True),
-        )
+        for name, cls in (
+            ("OriginalPipeline", _OriginalPipeline),
+            ("VariantPipeline", _VariantPipeline),
+        ):
+            monkeypatch.setitem(
+                PIPELINE_REGISTRY,
+                name,
+                _PipelineEntry(pipeline_cls=cls, telemetry_safe=telemetry_safe),
+            )
         monkeypatch.setattr(
             AutoPipeline,
             "_detect_from_checkpoint",
-            lambda _checkpoint_dir: "SlottedPipeline",
+            lambda _checkpoint_dir: "OriginalPipeline",
         )
 
-        assert isinstance(
-            AutoPipeline.from_config(
-                SimpleNamespace(model_configs={}, vae_conv_quant_config=None), "/model"
-            ),
-            _SlottedPipeline,
+        config = SimpleNamespace(
+            primary_pretrained_config=SimpleNamespace(),
+            model_configs={},
+            vae_conv_quant_config=None,
+            mapping=SimpleNamespace(),
+            device="cpu",
+        )
+        assert BasePipeline(config).pipeline_class_name == "other"
+        pipeline = AutoPipeline.from_config(config, "/model")
+        assert isinstance(pipeline, _VariantPipeline)
+        assert pipeline.pipeline_class_name == "OriginalPipeline"
+        metadata = _visual_gen_telemetry_metadata(pipeline, SimpleNamespace(model="private"))
+        assert metadata["pipeline_class_name"] == (
+            "OriginalPipeline" if telemetry_safe else "other"
+        )
+        assert metadata["resolved_pipeline_class"] == (
+            "_VariantPipeline" if telemetry_safe else "other"
         )
 
     def test_ready_payload_pickle_roundtrip(self):
@@ -893,13 +920,14 @@ class TestPipelineMetadataBridging:
             transformer_components = ("transformer", "private_component")
 
             def __init__(self):
-                self._telemetry_pipeline_class_name = "PublicPipeline"
+                self.pipeline_class_name = "PublicPipeline"
                 self.pipeline_config = SimpleNamespace(
-                    quant_config=SimpleNamespace(quant_algo=QuantAlgo.NVFP4),
-                    dynamic_weight_quant=True,
-                    get_quant_config=lambda component: SimpleNamespace(
-                        quant_algo=(QuantAlgo.NVFP4 if component == "transformer" else None)
-                    ),
+                    model_configs={
+                        "transformer": SimpleNamespace(
+                            quant_config=SimpleNamespace(quant_algo=QuantAlgo.NVFP4),
+                            dynamic_weight_quant=True,
+                        ),
+                    },
                 )
 
         registry = {
@@ -930,7 +958,7 @@ class TestPipelineMetadataBridging:
         class _PrivatePipeline(_Pipeline):
             def __init__(self):
                 super().__init__()
-                self._telemetry_pipeline_class_name = "CustomerPipeline"
+                self.pipeline_class_name = "CustomerPipeline"
 
         registry["CustomerPipeline"] = SimpleNamespace(
             pipeline_cls=_PrivatePipeline,

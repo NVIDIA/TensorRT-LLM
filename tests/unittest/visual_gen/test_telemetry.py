@@ -42,6 +42,7 @@ def test_metadata_uses_resolved_transformer_quantization(
         for name, algorithm, is_dynamic in zip(components, algorithms, dynamic)
     }
     pipeline = SimpleNamespace(
+        pipeline_class_name="other",
         transformer_components=components,
         pipeline_config=DiffusionPipelineConfig(
             quant_config=configs["transformer"].quant_config,

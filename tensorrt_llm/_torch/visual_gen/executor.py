@@ -33,6 +33,7 @@ from tensorrt_llm.usage.visual_gen import request_shape
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
     from tensorrt_llm.visual_gen.params import VisualGenParams
 
 
@@ -69,10 +70,10 @@ def _quant_algo_name(quant_config: Any) -> str:
     return quant_algo.name if isinstance(quant_algo, QuantAlgo) else "other"
 
 
-def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[str, Any]:
+def _visual_gen_telemetry_metadata(pipeline: "BasePipeline", args: VisualGenArgs) -> Dict[str, Any]:
     """Build bounded READY metadata from the successfully loaded pipeline."""
     try:
-        pipeline_class_name = getattr(pipeline, "_telemetry_pipeline_class_name", "other")
+        pipeline_class_name = pipeline.pipeline_class_name
         entry = PIPELINE_REGISTRY.get(pipeline_class_name)
         if entry is None or not entry.telemetry_safe:
             pipeline_class_name = "other"
