@@ -184,6 +184,8 @@ l0_b200:
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/moe/test_triton_nvfp4_input_quant.py
+  - unittest/_torch/kernels/test_nvfp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py
   - unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py
