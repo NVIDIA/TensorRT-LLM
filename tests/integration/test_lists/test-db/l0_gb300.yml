@@ -6,7 +6,7 @@ l0_gb300:
 - condition:
     ranges:
       system_gpu_count:
-        gte: 4
+        gte: 1
         lte: 4
     wildcards:
       gpu:
@@ -84,12 +84,12 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
 
-# K3 kernel and wrapper checks that require one GB300 GPU.
+# K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
 - condition:
     ranges:
       system_gpu_count:
-        gte: 1
-        lte: 1
+        gte: 4
+        lte: 4
     wildcards:
       gpu:
       - '*gb110*'
@@ -100,61 +100,20 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_cluster_waits.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctm_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctm_gemv_wide.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctx_kv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_decode_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_drafter_attn.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_embed.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_fused_moe.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_head_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_attn.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_decode_attn.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_pools_past_2g.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_verify.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_attn.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_q.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_front_geometry.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_m1.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_m2.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_wide.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_route_quant.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_spec_accept.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_tcgen05_fences.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_attn_res_fwd.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_attn_res_rmsnorm_fwd.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_causal_conv1d_fwd.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_chunk_kda.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_ctm_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_ctm_gemv_long.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_ctm_gemv_swiglu.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_ctm_gemv_wide.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_decode_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_drafter_attn.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_drafter_attn_qknorm.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_embed_norm.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_head_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_kda_attn.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_kda_decode_attn.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_kda_verify.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mla_attn_vb_out.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mla_qkv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_moe.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_moe_m1.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_moe_m2.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_native.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_route_quant.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_situ_mul.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kda_decode.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kda_post_conv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kda_prefill.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_construction.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_drafter.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_drift.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_moe_routing.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_route_b_moe.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_rms_norm_gated_token_major.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_situ_and_mul.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_latent_reduce.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_markov.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mnnvl_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_front.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_push.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_sandwich.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_spec_accept_sharded.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_latent_reduce_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_moe_front_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_sandwich_plain_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_sandwich_tail_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_comm_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_allgather_split_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py

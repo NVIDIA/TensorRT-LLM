@@ -204,7 +204,7 @@ def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative)
     assert not (selected - {_CLAIMS}) & other
 
 
-def test_k3_ci_runs_once_on_the_required_gb300_topology():
+def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
     repo = Path(__file__).resolve().parents[4]
     prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl/"
     expected = {p.name for p in (repo / "tests" / prefix).glob("test_*.py")}
@@ -250,7 +250,7 @@ def test_k3_ci_runs_once_on_the_required_gb300_topology():
                 assert name not in collective_tests
                 continue
             multi = name in collective_tests
-            assert block.yaml_stem == ("l0_gb300_multi_gpus" if multi else "l0_gb300")
+            assert block.yaml_stem == ("l0_gb300" if multi else "l0_b300")
             count = 4 if multi else 1
             assert block.condition["ranges"]["system_gpu_count"] == {"gte": count, "lte": count}
             assert block.condition["terms"]["stage"] == "pre_merge"
@@ -259,5 +259,7 @@ def test_k3_ci_runs_once_on_the_required_gb300_topology():
                 for stage in stages.values()
                 if stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
             }
-            assert matched == {"GB300-4_GPUs-PyTorch-2" if multi else "GB300-PyTorch-1"}
+            assert matched == (
+                {"GB300-4_GPUs-PyTorch-1"} if multi else {"B300-PyTorch-1", "B300-PyTorch-2"}
+            )
     assert seen == expected
