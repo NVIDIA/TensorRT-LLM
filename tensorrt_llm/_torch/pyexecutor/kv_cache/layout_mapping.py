@@ -364,21 +364,18 @@ def _transferred(layout: PageLayout) -> dict[tuple[int, str], BufferDesc]:
     return {(b.layer, b.role): b for b in layout.buffers if b.transferred}
 
 
-def _reads_within(read: int | None, kept: int | None) -> bool:
-    """Whether a window of ``read`` tokens lies within one of ``kept`` tokens; None is unbounded."""
-    return kept is None or (read is not None and read <= kept)
-
-
 def check_compatible(a: PageLayout, b: PageLayout) -> None:
     """Check that two ranks' pages correspond, whichever sends.
 
     On the layers both hold, every buffer either rank transfers the other transfers too, as the
     same tensors: the same names, axes and extents over all ranks, however each splits them, and
-    elements of the same type where the tensors state one, in pages of as many sub-pages. The KV
-    data is of one element type and quantization. Pages pair one to one, so where both transfer
-    attention buffers their pages hold as many tokens; a layer group keeps what the other's reads
-    (its read window within the other's kept window), with as many sink blocks, and is of the same
-    kind.
+    elements of the same type where the tensors state one, in pages of as many sub-pages, in layer
+    groups of the same kind. The KV data is of one element type and quantization. Pages pair one to
+    one, so where both transfer attention buffers their pages hold as many tokens.
+
+    How many tokens each side keeps of a windowed group is not compared: retention margins (reuse
+    backoff, draft tokens) legitimately differ between the sides, and a transfer moves the blocks
+    both still hold. Each side's attention window apart from those margins is not in the layout.
 
     Raises:
         ValueError: Naming every difference found.
@@ -392,7 +389,6 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
     ta, tb = _transferred(a), _transferred(b)
     group_a, group_b = layer_group_of(a), layer_group_of(b)
     paged = False
-    groups_compared = set()
     for key in sorted(k for k in set(ta) | set(tb) if k[0] in layers):
         x, y = ta.get(key), tb.get(key)
         if x is None or y is None:
@@ -422,24 +418,8 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
             continue
         ga, gb = a.layer_groups[index_a], b.layer_groups[index_b]
         paged |= ga.kind == "attention" and gb.kind == "attention"
-        if (ga, gb) in groups_compared:
-            continue
-        groups_compared.add((ga, gb))
-        where = f"layer {key[0]}"
         if ga.kind != gb.kind:
-            problems.append(f"{where}: a layer group of {ga.kind} against one of {gb.kind}")
-        elif not (
-            _reads_within(ga.read_window, gb.kept_window)
-            and _reads_within(gb.read_window, ga.kept_window)
-        ):
-            problems.append(
-                f"{where}: reads {ga.read_window} of {ga.kept_window} kept tokens against "
-                f"{gb.read_window} of {gb.kept_window}"
-            )
-        if ga.num_sink_blocks != gb.num_sink_blocks:
-            problems.append(
-                f"{where}: {ga.num_sink_blocks} sink blocks against {gb.num_sink_blocks}"
-            )
+            problems.append(f"buffer {key}: a layer group of {ga.kind} against one of {gb.kind}")
     if paged and a.tokens_per_page != b.tokens_per_page:
         problems.append(f"pages of {a.tokens_per_page} tokens against {b.tokens_per_page}")
     if problems:

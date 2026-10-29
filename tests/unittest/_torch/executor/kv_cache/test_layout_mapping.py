@@ -397,7 +397,7 @@ def _with_group(page: PageLayout, **changes) -> PageLayout:
 
 def test_layouts_whose_bytes_line_up_but_mean_other_things_are_refused():
     """Bytes of the same extents hold other values under another element type, quantization,
-    window, sink count or sub-page count; such peers are refused, not paired."""
+    sub-page count or layer group kind; such peers are refused, not paired."""
     topology = Instance().ranks(0)[0]
     base = layout(topology, (0,), [("key", kv(4), "attention")])
     typed = layout(topology, (0,), [("ssm", state_heads(4), "state")])
@@ -422,15 +422,6 @@ def test_layouts_whose_bytes_line_up_but_mean_other_things_are_refused():
     with pytest.raises(ValueError, match="'ssm'\\) tensor '': elements of type bfloat16 against"):
         check_compatible(bf16, fp16)
     check_compatible(bf16, bf16)
-    windowed = _with_group(base, kept_window=64)
-    with pytest.raises(ValueError, match="reads None of None kept tokens against 64 of 64"):
-        check_compatible(base, windowed)
-    with pytest.raises(ValueError, match="reads 64 of 64 kept tokens against 32 of 32"):
-        check_compatible(windowed, _with_group(base, kept_window=32))
-    # A side reading less than the other keeps finds every token it reads.
-    check_compatible(windowed, _with_group(base, kept_window=128, read_window=64))
-    with pytest.raises(ValueError, match="1 sink blocks against 0"):
-        check_compatible(_with_group(windowed, num_sink_blocks=1), windowed)
     with pytest.raises(ValueError, match="a layer group of attention against one of state"):
         check_compatible(base, _with_group(base, kind="state"))
     expanded = dataclasses.replace(
@@ -438,6 +429,25 @@ def test_layouts_whose_bytes_line_up_but_mean_other_things_are_refused():
     )
     with pytest.raises(ValueError, match="'key'\\): 2 sub-pages against 1"):
         check_compatible(expanded, base)
+
+
+def test_layer_groups_keeping_other_windows_correspond():
+    """Retention differs legitimately between the sides: a context worker with block reuse keeps a
+    reuse-backoff token more (GPT-OSS with Eagle3 keeps 129 tokens of a 128-token window), a
+    generation worker drafting tokens keeps them too (DeepSeek-V4 DSpark keeps W + 5), and a window
+    reaching ``max_seq_len`` on one side is unbounded there. The transfer moves the blocks both
+    sides hold, so none of these is refused."""
+    topology = Instance().ranks(0)[0]
+    base = layout(topology, (0,), [("key", kv(4), "attention")])
+    pairs = [
+        (_with_group(base, kept_window=129), _with_group(base, kept_window=128)),
+        (_with_group(base, kept_window=64), _with_group(base, kept_window=69)),
+        (_with_group(base, kept_window=4096), base),
+        (_with_group(base, kept_window=64, num_sink_blocks=1), _with_group(base, kept_window=64)),
+    ]
+    for one, other in pairs:
+        check_compatible(one, other)
+        check_compatible(other, one)
 
 
 def test_state_pages_of_other_token_counts_correspond():
