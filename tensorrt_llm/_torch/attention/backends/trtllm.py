@@ -47,7 +47,6 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.manager import FmhaManager
-from .fmha.phased import FmhaParams
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, populate_helix_spec_buffers,
                       scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
@@ -111,8 +110,7 @@ class _ContextPlan:
     __slots__ = ("kv_lens", "prompt_lens", "kv_lens_cuda", "prompt_lens_cuda",
                  "num_contexts", "num_ctx_tokens", "block_offsets", "workspace",
                  "kv_cache_manager", "pool_pointers", "sig", "fmha_cls",
-                 "counter_rows", "total_num_blocks", "tokens_per_block",
-                 "max_q_len", "max_kv_len")
+                 "counter_rows", "total_num_blocks", "max_q_len", "max_kv_len")
 
 
 @functools.cache
@@ -2850,8 +2848,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         plan.counter_rows = (metadata.max_num_sequences
                              or metadata.max_num_requests)
         plan.total_num_blocks = fmha._get_total_num_blocks(metadata)
-        plan.tokens_per_block = (metadata.tokens_per_block if
-                                 metadata.tokens_per_block is not None else 64)
         plan.max_q_len = int(plan.prompt_lens[0:n].max())
         plan.max_kv_len = int(plan.kv_lens[0:n].max())
         plan.fmha_cls = type(fmha)
@@ -2931,38 +2927,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self._context_plan_counter_rows = plan.counter_rows
         if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
             metadata.workspace_reclaimable = False
-        # PhasedFmha.forward(): the whole q / output are the context part
-        num_tokens = plan.num_ctx_tokens
-        window = fwd.attention_window_size
-        params = FmhaParams(
-            attn=self,
-            meta=metadata,
-            fwd=fwd,
-            workspace=plan.workspace,
-            qkv_input=q,
-            output=fwd.output.view(num_tokens, self.num_heads,
-                                   fmha.context_out_head_size),
-            sequence_lengths=plan.kv_lens_cuda,
-            context_lengths=plan.prompt_lens_cuda,
-            input_seq_length=plan.max_q_len,
-            max_past_kv_length=plan.max_kv_len,
-            max_attention_window_size=window,
-            cyclic_attention_window_size=window,
-            num_tokens=num_tokens,
-            seq_offset=0,
-            token_offset=0,
-            tokens_per_block=plan.tokens_per_block,
-            kv_factor=fmha.kv_factor,
-            total_num_blocks=total_num_blocks,
-            batch_size=plan.num_contexts,
-            num_requests=plan.num_contexts,
-            is_cross=False,
-        )
+        params = fmha.context_params(q, None, None, metadata, fwd,
+                                     plan.workspace, total_num_blocks,
+                                     plan.max_q_len, plan.max_kv_len)
         try:
             fmha.run_context(params)
         except RuntimeError as exc:
             log_attention_failure_context(
-                type(self).__name__, self.layer_idx, metadata, window, exc)
+                type(self).__name__, self.layer_idx, metadata,
+                fwd.attention_window_size, exc)
             raise
         return True
 
