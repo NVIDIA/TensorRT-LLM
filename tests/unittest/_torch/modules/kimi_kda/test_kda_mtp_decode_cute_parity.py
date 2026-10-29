@@ -334,6 +334,7 @@ def cute_run(
         onorm_weight=data.get("onorm_weight"),
         onorm_eps=data.get("onorm_eps", 1e-5),
         fuse_output_norm=fuse_output_norm,
+        replay_state_indices=data.get("replay_state_indices"),
     )
     output_scale = None
     if quantize_output:
@@ -1319,6 +1320,239 @@ def test_commit_pending_drafts_replays_the_per_token_records():
     others = [slot for slot in range(num_slots) if slot not in slots.tolist()]
     assert torch.equal(state[others], before[others])
     assert not conv_pool[others].any()
+
+
+_REPLAY_CACHE_NAMES = ("k_cache", "g_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v")
+
+
+def _scatter_rows(tensor, rows, num_rows):
+    """A pool of ``num_rows`` zero rows holding ``tensor``'s rows at ``rows``, in ``tensor``'s
+    layout (the conv caches stay dim-contiguous)."""
+    if tensor.stride(1) == 1 and tensor.ndim == 3:
+        pool = torch.zeros(
+            num_rows, tensor.shape[2], tensor.shape[1], dtype=tensor.dtype, device=tensor.device
+        ).transpose(1, 2)
+    else:
+        pool = torch.zeros(num_rows, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device)
+    pool[rows.long()] = tensor
+    return pool
+
+
+def _separate_replay_pool(data, state_slots, replay_slots, num_state_rows, num_replay_rows):
+    """``data`` with its states moved to ``state_slots`` of a state pool and its conv and replay
+    caches to ``replay_slots`` of a separate replay pool."""
+    separate = dict(data)
+    separate["ssm_state_indices"] = state_slots
+    separate["replay_state_indices"] = replay_slots
+    separate["initial_state_cute"] = _scatter_rows(
+        data["initial_state_cute"], state_slots, num_state_rows
+    )
+    for name in _REPLAY_CACHE_NAMES:
+        separate[name] = _scatter_rows(data[name], replay_slots, num_replay_rows)
+    return separate
+
+
+def _distinct_slots(num_requests, num_state_rows, num_replay_rows, seed):
+    generator = torch.Generator().manual_seed(seed)
+    state_slots = torch.randperm(num_state_rows, generator=generator)[:num_requests]
+    replay_slots = torch.randperm(num_replay_rows, generator=generator)[:num_requests]
+    if torch.equal(state_slots, replay_slots):
+        replay_slots = replay_slots.flip(0)
+    assert not torch.equal(state_slots, replay_slots)
+    return state_slots.int().cuda(), replay_slots.int().cuda()
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["shifted", "packed"])
+@pytest.mark.parametrize("B,H,M", [(4, 6, 2), (2, 12, 7), (16, 12, 7)], ids=lambda v: str(v))
+def test_replay_slots_separate_from_state_slots(B, H, M, packed):
+    """The conv and replay caches, and on the packed path the accepted counts, live in a pool of
+    their own addressed by ``replay_state_indices``, while ``ssm_state_indices`` addresses the
+    states. The verify gives, bit for bit, the outputs, states and caches of the verify whose
+    caches share the state slots, and leaves the other rows of both pools alone. ``B=2`` runs
+    the cluster-pair form, ``B=16`` the single-CTA form."""
+    coupled, accept = _round2_inputs(B, H, M)
+    if packed:
+        coupled, _ = _pack_new_token_projection_views(coupled)
+    num_state_rows, num_replay_rows = B + 3, B + 5
+    state_slots, replay_slots = _distinct_slots(B, num_state_rows, num_replay_rows, seed=B + M)
+    separate = _separate_replay_pool(
+        coupled, state_slots, replay_slots, num_state_rows, num_replay_rows
+    )
+    if packed:
+        # The packed path reads each request's count at its replay slot.
+        pool_accepted = torch.full((num_replay_rows,), M + 9, dtype=torch.int32, device="cuda")
+        pool_accepted[replay_slots.long()] = accept.cuda()
+        separate["num_accepted_tokens"] = pool_accepted
+
+    expected = cute_run(coupled, packed_token_layout=packed)
+    actual = cute_run(separate, packed_token_layout=packed)
+
+    assert torch.equal(actual["out"], expected["out"])
+    assert torch.equal(actual["state_v_first"][state_slots.long()], expected["state_v_first"])
+    for name in _REPLAY_CACHE_NAMES:
+        assert torch.equal(actual[name][replay_slots.long()], expected[name]), name
+    other_states = torch.ones(num_state_rows, dtype=torch.bool, device="cuda")
+    other_states[state_slots.long()] = False
+    assert not actual["state_v_first"][other_states].any()
+    other_replay = torch.ones(num_replay_rows, dtype=torch.bool, device="cuda")
+    other_replay[replay_slots.long()] = False
+    for name in _REPLAY_CACHE_NAMES:
+        assert not actual[name][other_replay].any(), name
+
+
+def test_replay_slots_must_match_the_requests():
+    """One replay slot per request; without replay slots the caches must cover the state rows."""
+    data = make_conv_data(B=2, H=6, M=M, seed=19)
+    mismatched = dict(data, replay_state_indices=torch.zeros(3, dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match="one replay_state_indices entry"):
+        cute_run(mismatched)
+    short = dict(data)
+    for name in ("k_cache", "g_cache", "v_cache", "beta_cache"):
+        short[name] = data[name][:1]
+    with pytest.raises(ValueError, match="cover recurrent_state rows"):
+        cute_run(short)
+
+
+@pytest.mark.parametrize("B,H,M", [(32, 6, 2), (2, 12, 7)], ids=lambda v: str(v))
+def test_commit_pending_drafts_with_separate_replay_slots(B, H, M):
+    """The replay-only commit reads the drafts at the replay slots and commits the states at the
+    state slots, bit for bit as with caches that share the state slots."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
+        kda_mtp_commit_pending_drafts,
+    )
+
+    coupled, accept = _round2_inputs(B, H, M)
+    num_state_rows, num_replay_rows = B + 2, B + 4
+    state_slots, replay_slots = _distinct_slots(B, num_state_rows, num_replay_rows, seed=31)
+    separate = _separate_replay_pool(
+        coupled, state_slots, replay_slots, num_state_rows, num_replay_rows
+    )
+
+    def commit(data, slots, replay):
+        state = data["initial_state_cute"].clone()
+        caches = [data[name].clone() for name in _REPLAY_CACHE_NAMES]
+        kda_mtp_commit_pending_drafts(
+            state,
+            *caches[4:],
+            *caches[:4],
+            slots,
+            accept.cuda(),
+            M,
+            conv_width=data["W"],
+            replay_state_indices=replay,
+        )
+        return state
+
+    expected = commit(coupled, torch.arange(B, dtype=torch.int32, device="cuda"), None)
+    actual = commit(separate, state_slots, replay_slots)
+    assert torch.equal(actual[state_slots.long()], expected)
+
+
+def test_triton_replay_helpers_with_separate_replay_slots():
+    """The conv-window copy and store, the draft-record replay and the commit that combines them
+    read and write the conv and SSM pools at the state slots and the replay caches at the replay
+    slots, bit for bit as with replay caches that share the state slots."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
+        commit_kda_pending_drafts,
+        copy_kda_replay_conv_window,
+        replay_kda_token_records,
+        store_kda_replay_conv_window,
+    )
+
+    torch.manual_seed(23)
+    num_requests, H, K, W, num_spec = 5, 6, 128, 4, 7
+    num_state_rows, num_replay_rows = 8, 11
+    state_slots, replay_slots = _distinct_slots(
+        num_requests, num_state_rows, num_replay_rows, seed=5
+    )
+    identity = torch.arange(num_requests, dtype=torch.int32, device="cuda")
+    accepted = torch.tensor([0, 1, 3, 7, 2], dtype=torch.int32, device="cuda")
+    conv = torch.randn(num_requests, 3 * H * K, W - 1, device="cuda").bfloat16()
+    state = torch.randn(num_requests, H, K, K, device="cuda") * 0.1
+    cs = [
+        torch.randn(num_requests, W - 1 + num_spec, H * K, device="cuda").bfloat16().transpose(1, 2)
+        for _ in range(3)
+    ]
+    state_tok = torch.randn(num_requests, 3, num_spec, H, K, device="cuda") * 0.1
+
+    def coupled_and_separate():
+        coupled = {
+            "conv": conv.clone(),
+            "state": state.clone(),
+            "cs": [_scatter_rows(cache, identity, num_requests) for cache in cs],
+            "state_tok": state_tok.clone(),
+        }
+        separate = {
+            "conv": _scatter_rows(conv, state_slots, num_state_rows),
+            "state": _scatter_rows(state, state_slots, num_state_rows),
+            "cs": [_scatter_rows(cache, replay_slots, num_replay_rows) for cache in cs],
+            "state_tok": _scatter_rows(state_tok, replay_slots, num_replay_rows),
+        }
+        return coupled, separate
+
+    def check(coupled, separate):
+        assert torch.equal(separate["conv"][state_slots.long()], coupled["conv"])
+        assert torch.equal(separate["state"][state_slots.long()], coupled["state"])
+        for actual, expected in zip(separate["cs"], coupled["cs"]):
+            assert torch.equal(actual[replay_slots.long()], expected)
+
+    # copy: pool rows -> replay cache rows
+    coupled, separate = coupled_and_separate()
+    for pools in (coupled, separate):
+        for cache in pools["cs"]:
+            cache.zero_()
+    copy_kda_replay_conv_window(coupled["conv"], *coupled["cs"], identity)
+    copy_kda_replay_conv_window(separate["conv"], *separate["cs"], state_slots, replay_slots)
+    check(coupled, separate)
+
+    # store: replay cache rows -> pool rows
+    coupled, separate = coupled_and_separate()
+    for pools in (coupled, separate):
+        pools["conv"].zero_()
+    store_kda_replay_conv_window(coupled["conv"], *coupled["cs"], identity, accepted)
+    store_kda_replay_conv_window(
+        separate["conv"], *separate["cs"], state_slots, accepted, replay_slots
+    )
+    check(coupled, separate)
+
+    # draft records: replay records rows -> state rows
+    coupled, separate = coupled_and_separate()
+    replay_kda_token_records(coupled["state"], coupled["state_tok"], identity, accepted)
+    replay_kda_token_records(
+        separate["state"], separate["state_tok"], state_slots, accepted, replay_slots
+    )
+    check(coupled, separate)
+
+    # commit with the records: both of the above
+    coupled, separate = coupled_and_separate()
+    unread = torch.empty(0, device="cuda")
+    commit_kda_pending_drafts(
+        coupled["state"],
+        coupled["conv"],
+        *coupled["cs"],
+        unread,
+        unread,
+        unread,
+        unread,
+        identity,
+        accepted,
+        state_tok=coupled["state_tok"],
+    )
+    commit_kda_pending_drafts(
+        separate["state"],
+        separate["conv"],
+        *separate["cs"],
+        unread,
+        unread,
+        unread,
+        unread,
+        state_slots,
+        accepted,
+        state_tok=separate["state_tok"],
+        replay_indices=replay_slots,
+    )
+    check(coupled, separate)
+    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

@@ -31,7 +31,6 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAIntermediateState,
     KDAReplayState,
     _is_disagg_context_server,
-    bind_kda_replay_pool,
     get_kda_replay_num_spec,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -40,6 +39,10 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _host_slots_to_device
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+    ReplayLayout,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
@@ -126,26 +129,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay is not None
 
     @override
-    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
-        if self._kda_replay is not None:
-            buffers.extend(
-                self._kda_replay.pool_buffer_configs(self._state_layout, global_layer_id)
-            )
-        return buffers
-
-    @override
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        roles = super().get_disagg_ignored_roles()
-        if self._kda_replay is not None:
-            roles |= self._kda_replay.disagg_ignored_roles(self._state_layout)
-        return roles
-
-    @override
-    def _setup_model_state(self) -> None:
-        if self._kda_replay is not None:
-            bind_kda_replay_pool(self._kda_replay, self)
-        super()._setup_model_state()
+    def _get_replay_layout(self, global_layer_id: int) -> ReplayLayout:
+        if self._kda_replay is None:
+            return {}
+        return self._kda_replay.replay_layout(self._state_layout, global_layer_id)
 
     @override
     def _build_cache_config(self, config):
@@ -155,8 +142,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             and self.kv_cache_config.enable_kv_pool_rebalance
         ):
             raise ValueError(
-                "KDA replay caches are sized once from the SSM pool's slot count, "
-                "and a rebalance can grow that pool past them: set "
+                "KDA replay state binds its pool views and per-slot buffers once, "
+                "and a rebalance can resize the pools past them: set "
                 "kv_cache_config.enable_kv_pool_rebalance=False."
             )
         return super()._build_cache_config(config)
@@ -166,20 +153,24 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         replay = self._kda_replay
         request_id = request.py_request_id
         cache = self.kv_cache_map.get(request_id)
-        slot = self._request_id_to_state_index.get(request_id, -1)
-        if replay is not None and slot >= 0 and cache is not None and cache.is_active:
+        if (
+            replay is not None
+            and request_id in self._request_id_to_state_index
+            and cache is not None
+            and cache.is_active
+        ):
             if request_id in replay.acceptance_pending:
                 raise RuntimeError(
                     f"Request {request_id} is being suspended before update_resources "
-                    "recorded the acceptance of its last verify, so its pending KDA drafts are unknown"
+                    "recorded the acceptance of its last verify in its KDA replay state"
                 )
             if request_id in replay.unseeded_requests:
+                # Its replay caches have not been seeded from the transferred
+                # state. Forget its slot so a transfer completion does not seed
+                # it while suspended; it is seeded when it resumes.
                 replay.unseeded_requests.remove(request_id)
-            else:
-                with replay.on_cache_stream(self._stream):
-                    replay.commit_pending_drafts(slot)
-            del self._request_id_to_state_index[request_id]
-            replay.suspended_requests.add(request_id)
+                replay.seed_on_resume.add(request_id)
+                del self._request_id_to_state_index[request_id]
         super().suspend_request(request)
 
     @override
@@ -188,21 +179,41 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         replay = self._kda_replay
         if replay is None or self.local_num_mamba_layers == 0:
             return
-        replay.suspended_requests.difference_update(
+        replay.seed_on_resume.difference_update(
             request.py_request_id for request in requests[:num_contexts]
         )
-        slots = []
-        for request in requests[num_contexts:]:
-            if request.py_request_id in replay.suspended_requests:
-                replay.suspended_requests.remove(request.py_request_id)
-                slots.append(self._request_id_to_state_index[request.py_request_id])
-        if slots:
+        resumed = [
+            request.py_request_id
+            for request in requests[num_contexts:]
+            if request.py_request_id in replay.seed_on_resume
+        ]
+        if resumed:
+            replay.seed_on_resume.difference_update(resumed)
             with replay.on_cache_stream(self._stream):
-                replay.seed_transferred_slots(
-                    torch.tensor(
-                        slots, dtype=torch.long, device=replay.prev_num_accepted_tokens.device
-                    )
-                )
+                self._seed_kda_replay_slots(resumed)
+
+    def _seed_kda_replay_slots(self, request_ids: list[int]) -> None:
+        """Seed the replay state of requests whose recurrent state was transferred."""
+        replay = self._kda_replay
+        # Each request once, in state-slot order.
+        request_ids = sorted(
+            {
+                request_id
+                for request_id in request_ids
+                if request_id in self._request_id_to_state_index
+            },
+            key=self._request_id_to_state_index.__getitem__,
+        )
+        if not request_ids:
+            return
+        device = replay.prev_num_accepted_tokens.device
+        replay.seed_transferred_slots(
+            _host_slots_to_device(
+                [self._request_id_to_state_index[request_id] for request_id in request_ids],
+                device,
+            ),
+            _host_slots_to_device(self.get_replay_state_indices(request_ids), device),
+        )
 
     @override
     def prepare_resources(self, scheduled_batch) -> None:
@@ -231,7 +242,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @override
     def free_resources(self, request, pin_on_release: bool = False) -> None:
         if self._kda_replay is not None:
-            self._kda_replay.suspended_requests.discard(request.py_request_id)
+            self._kda_replay.seed_on_resume.discard(request.py_request_id)
             self._kda_replay.acceptance_pending.discard(request.py_request_id)
             self._kda_replay.unseeded_requests.discard(request.py_request_id)
         super().free_resources(request, pin_on_release)
@@ -245,6 +256,13 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        return KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
+
+    @classmethod
+    @override
+    def _estimate_private_replay_bytes_per_slot(
+        cls, model_config, mapping: Mapping, **kwargs
+    ) -> int:
         return KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
 
     @override
@@ -252,12 +270,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if self._kda_replay is None:
             return
         self._kda_replay.relocate_slots(old_slots, new_slots)
-        fresh_slots = [new for old, new in zip(old_slots, new_slots) if old < 0]
-        if fresh_slots:
-            slots = torch.tensor(
-                fresh_slots, dtype=torch.long, device=self.cuda_state_indices.device
-            )
-            self._kda_replay.reset_slots(slots, fresh_slots)
+        self._kda_replay.refresh_seeds([new for old, new in zip(old_slots, new_slots) if old < 0])
 
     @override
     def update_mamba_states(
@@ -309,8 +322,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if not active_requests:
             return
         device = replay.prev_num_accepted_tokens.device
-        state_indices = torch.tensor(
-            [state_index_map[request.py_request_id] for request in active_requests],
+        replay_indices = torch.tensor(
+            self.get_replay_state_indices([request.py_request_id for request in active_requests]),
             dtype=torch.int32,
             device=device,
         )
@@ -324,7 +337,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             dtype=torch.bool,
             device=device,
         )
-        replay.record_acceptance(state_indices, accepted_drafts, is_dummy_request)
+        replay.record_acceptance(replay_indices, accepted_drafts, is_dummy_request)
 
     @override
     def on_state_transfer_complete(self, request_ids: list[int]) -> None:
@@ -332,17 +345,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if replay is None or replay.prev_num_accepted_tokens is None:
             return
         replay.unseeded_requests.difference_update(request_ids)
-        slots = sorted(
-            {
-                self._request_id_to_state_index[request_id]
-                for request_id in request_ids
-                if request_id in self._request_id_to_state_index
-            }
-        )
-        if slots:
-            replay.seed_transferred_slots(
-                torch.tensor(slots, dtype=torch.long, device=replay.prev_num_accepted_tokens.device)
-            )
+        self._seed_kda_replay_slots(request_ids)
 
     def seed_kda_replay_caches_for_disagg_gen(self, request_ids: list[int]) -> None:
         """Compatibility entry point; the executor uses the generic transfer hook."""

@@ -31,6 +31,11 @@ first new (golden) token; the new spec tokens are cached for the next
 round's replay. The pool invariant is therefore "state after the last
 golden token; accepted drafts pending in the replay caches".
 
+The recurrent state rows are addressed by ``ssm_state_indices`` and the conv and
+replay caches (and, with the packed token layout, the accepted-draft counts) by
+``replay_state_indices``. The two can name different slots, so the replay caches
+may live in a pool of their own.
+
 Structure (all stage boundaries are CTA barriers):
 
 1. **Load phase.** Every warp issues its global loads up front, so the whole
@@ -298,6 +303,7 @@ def kda_decode_mtp_kernel(
     beta_cache: cute.Tensor,
     smem_qk_layout: cute.Layout,
     ssm_state_indices: cute.Tensor,
+    replay_state_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     num_accepted_tokens: cute.Tensor,
     precompute_control: cute.Tensor,
@@ -392,10 +398,12 @@ def kda_decode_mtp_kernel(
         bos = cutlass.Int32(0)
         eos = cutlass.Int32(0)
         slot = ssm_state_indices[i_n]
+        replay_slot = replay_state_indices[i_n]
     elif cutlass.const_expr(USE_REGULAR_METADATA):
         bos = i_n * (2 * NUM_SPEC + 1)
         eos = bos + (2 * NUM_SPEC + 1)
         slot = i_n
+        replay_slot = i_n
     elif cutlass.const_expr(USE_PACKED_TOKEN_LAYOUT):
         # Runtime verification packs exactly 1 + NUM_SPEC new rows per
         # request. Accepted drafts live in slot-indexed replay pools and do
@@ -403,13 +411,16 @@ def kda_decode_mtp_kernel(
         bos = cutlass.Int32(0)
         eos = cutlass.Int32(0)
         slot = ssm_state_indices[i_n]
+        replay_slot = replay_state_indices[i_n]
     else:
         bos = cu_seqlens[i_n]
         eos = cu_seqlens[i_n + 1]
         slot = ssm_state_indices[i_n]
+        replay_slot = replay_state_indices[i_n]
     # V2 state views may place many layer pages between adjacent slots. Widen
-    # the slot before indexing: slot * state stride can exceed INT32_MAX.
+    # the slots before indexing: slot * state stride can exceed INT32_MAX.
     slot = Int64(slot)
+    replay_slot = Int64(replay_slot)
     h0_idx = slot * HV + i_hv
     hk_off = i_h * K
     hv_off = i_hv * V
@@ -440,7 +451,7 @@ def kda_decode_mtp_kernel(
         commit_len = cutlass.Int32(0)
     else:
         if cutlass.const_expr(USE_PACKED_TOKEN_LAYOUT):
-            commit_len = num_accepted_tokens[slot]
+            commit_len = num_accepted_tokens[replay_slot]
         else:
             commit_len = num_accepted_tokens[i_n]
         # Only NUM_SPEC drafts can be pending from the previous round. Clamp
@@ -719,8 +730,8 @@ def kda_decode_mtp_kernel(
                     ct = tidx - QK_STAGE_TID0
                     if ct >= 0:
                         for w in cutlass.range(KERNEL_WIDTH - 1, unroll_full=True):
-                            sXQ[w * K + ct] = cutlass.Float32(cs_q[slot, hk_off + ct, w])
-                            sXK[w * K + ct] = cutlass.Float32(cs_k[slot, hk_off + ct, w])
+                            sXQ[w * K + ct] = cutlass.Float32(cs_q[replay_slot, hk_off + ct, w])
+                            sXK[w * K + ct] = cutlass.Float32(cs_k[replay_slot, hk_off + ct, w])
                     for w in cutlass.range(KERNEL_WIDTH, unroll_full=True):
                         if ct >= 0:
                             sConvW[w * K + ct] = cutlass.Float32(w_q[hk_off + ct, w])
@@ -742,7 +753,7 @@ def kda_decode_mtp_kernel(
                     cv = tidx - V_STAGE_TID0
                     if cv >= 0 and cv < V:
                         for _w in cutlass.range(KERNEL_WIDTH - 1, unroll_full=True):
-                            sXV[_w * V + cv] = cutlass.Float32(cs_v[slot, hv_off + cv, _w])
+                            sXV[_w * V + cv] = cutlass.Float32(cs_v[replay_slot, hv_off + cv, _w])
                 # Load phase: one round trip for every per-token input. Warp w
                 # stages tokens w, w + num_warps, ...; replay tokens go straight
                 # into sQ/sK/sG/sBeta/sVall, new tokens stage their raw inputs.
@@ -756,24 +767,28 @@ def kda_decode_mtp_kernel(
                                 k_idx = i * 32 + in_warp_tid
                                 # replayed drafts produce no output: their q rows are unused
                                 sQ[_t, k_idx] = cutlass.Float32(0.0)
-                                sK[_t, k_idx] = cutlass.Float32(k_cache[slot, _t, hk_off + k_idx])
-                                sG[_t, k_idx] = cutlass.Float32(g_cache[slot, _t, hk_off + k_idx])
+                                sK[_t, k_idx] = cutlass.Float32(
+                                    k_cache[replay_slot, _t, hk_off + k_idx]
+                                )
+                                sG[_t, k_idx] = cutlass.Float32(
+                                    g_cache[replay_slot, _t, hk_off + k_idx]
+                                )
                                 # the drafts' raw conv inputs feed only the new tokens' windows
                                 if cutlass.const_expr(not REPLAY_ONLY):
                                     sXQ[(_t + 3) * K + k_idx] = cutlass.Float32(
-                                        cs_q[slot, hk_off + k_idx, KERNEL_WIDTH - 1 + _t]
+                                        cs_q[replay_slot, hk_off + k_idx, KERNEL_WIDTH - 1 + _t]
                                     )
                                     sXK[(_t + 3) * K + k_idx] = cutlass.Float32(
-                                        cs_k[slot, hk_off + k_idx, KERNEL_WIDTH - 1 + _t]
+                                        cs_k[replay_slot, hk_off + k_idx, KERNEL_WIDTH - 1 + _t]
                                     )
                                     sXV[(_t + 3) * V + k_idx] = cutlass.Float32(
-                                        cs_v[slot, hv_off + k_idx, KERNEL_WIDTH - 1 + _t]
+                                        cs_v[replay_slot, hv_off + k_idx, KERNEL_WIDTH - 1 + _t]
                                     )
                                 sVall[_t * V + k_idx] = cutlass.Float32(
-                                    v_cache[slot, _t, hv_off + k_idx]
+                                    v_cache[replay_slot, _t, hv_off + k_idx]
                                 )
                             if in_warp_tid == 0:
-                                sBeta[_t] = cutlass.Float32(beta_cache[slot, _t, i_hv])
+                                sBeta[_t] = cutlass.Float32(beta_cache[replay_slot, _t, i_hv])
                         else:
                             _tok = bos + _t
                             for i in cutlass.range(vec_size, unroll_full=True):
@@ -910,24 +925,28 @@ def kda_decode_mtp_kernel(
                                             for w in cutlass.range(
                                                 KERNEL_WIDTH - 1, unroll_full=True
                                             ):
-                                                cs_q[slot, hk_off + k_idx, w] = sXQ[
+                                                cs_q[replay_slot, hk_off + k_idx, w] = sXQ[
                                                     (t + 1 + w) * K + k_idx
                                                 ].to(CONV_DTYPE)
-                                                cs_k[slot, hk_off + k_idx, w] = sXK[
+                                                cs_k[replay_slot, hk_off + k_idx, w] = sXK[
                                                     (t + 1 + w) * K + k_idx
                                                 ].to(CONV_DTYPE)
                                     else:
                                         cache_pos = j - 1
                                         for i in cutlass.range(vec_size, unroll_full=True):
                                             k_idx = i * 32 + in_warp_tid
-                                            k_cache[slot, cache_pos, hk_off + k_idx] = r_k[i].to(
-                                                K_CACHE_DTYPE
-                                            )
+                                            k_cache[replay_slot, cache_pos, hk_off + k_idx] = r_k[
+                                                i
+                                            ].to(K_CACHE_DTYPE)
                                             cs_q[
-                                                slot, hk_off + k_idx, KERNEL_WIDTH - 1 + cache_pos
+                                                replay_slot,
+                                                hk_off + k_idx,
+                                                KERNEL_WIDTH - 1 + cache_pos,
                                             ] = sXQ[(t + 3) * K + k_idx].to(CONV_DTYPE)
                                             cs_k[
-                                                slot, hk_off + k_idx, KERNEL_WIDTH - 1 + cache_pos
+                                                replay_slot,
+                                                hk_off + k_idx,
+                                                KERNEL_WIDTH - 1 + cache_pos,
                                             ] = sXK[(t + 3) * K + k_idx].to(CONV_DTYPE)
                             else:
                                 for i in cutlass.range(vec_size, unroll_full=True):
@@ -969,22 +988,26 @@ def kda_decode_mtp_kernel(
                                             for w in cutlass.range(
                                                 KERNEL_WIDTH - 1, unroll_full=True
                                             ):
-                                                cs_v[slot, hv_off + v_idx, w] = sXV[
+                                                cs_v[replay_slot, hv_off + v_idx, w] = sXV[
                                                     (t + 1 + w) * V + v_idx
                                                 ].to(CONV_DTYPE)
                                     else:
                                         cache_pos = j - 1
                                         for i in cutlass.range(vec_size, unroll_full=True):
                                             k_idx = i * 32 + in_warp_tid
-                                            g_cache[slot, cache_pos, hk_off + k_idx] = r_decay[i]
-                                            v_cache[slot, cache_pos, hv_off + k_idx] = r_bk[i].to(
-                                                V_CACHE_DTYPE
+                                            g_cache[replay_slot, cache_pos, hk_off + k_idx] = (
+                                                r_decay[i]
                                             )
+                                            v_cache[replay_slot, cache_pos, hv_off + k_idx] = r_bk[
+                                                i
+                                            ].to(V_CACHE_DTYPE)
                                             cs_v[
-                                                slot, hv_off + k_idx, KERNEL_WIDTH - 1 + cache_pos
+                                                replay_slot,
+                                                hv_off + k_idx,
+                                                KERNEL_WIDTH - 1 + cache_pos,
                                             ] = sXV[(t + 3) * V + k_idx].to(CONV_DTYPE)
                                         if in_warp_tid == 0:
-                                            beta_cache[slot, cache_pos, i_hv] = r_beta_t.to(
+                                            beta_cache[replay_slot, cache_pos, i_hv] = r_beta_t.to(
                                                 BETA_CACHE_DTYPE
                                             )
                 if cutlass.const_expr(PROFILE_STAGES):

@@ -102,6 +102,7 @@ def _copy_kda_replay_conv_window_kernel(
     k_cache_ptr,
     v_cache_ptr,
     state_indices_ptr,
+    replay_indices_ptr,
     conv_stride_slot,
     conv_stride_dim,
     conv_stride_window,
@@ -118,9 +119,12 @@ def _copy_kda_replay_conv_window_kernel(
     dim = offsets // COMMITTED
     window = offsets % COMMITTED
     slot = tl.load(state_indices_ptr + request).to(tl.int64)
+    replay_slot = tl.load(replay_indices_ptr + request).to(tl.int64)
 
     conv_offset = slot * conv_stride_slot + dim * conv_stride_dim + window * conv_stride_window
-    cache_offset = slot * cache_stride_slot + dim * cache_stride_dim + window * cache_stride_window
+    cache_offset = (
+        replay_slot * cache_stride_slot + dim * cache_stride_dim + window * cache_stride_window
+    )
     section_offset = PROJECTION_SIZE * conv_stride_dim
     tl.store(q_cache_ptr + cache_offset, tl.load(conv_ptr + conv_offset, mask=mask), mask=mask)
     tl.store(
@@ -141,27 +145,38 @@ def copy_kda_replay_conv_window(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     state_indices: torch.Tensor,
+    replay_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Copy selected packed ``W - 1`` rows into KDA replay caches.
 
     The live convolution pool is ``[slots, 3D, W - 1]``. Replay caches are
-    ``[slots, D, W - 1 + num_spec]`` with a dim-contiguous inner layout.
+    ``[replay_slots, D, W - 1 + num_spec]`` with a dim-contiguous inner layout.
+    Row ``state_indices[n]`` of the pool goes to row ``replay_indices[n]`` of
+    the caches; without ``replay_indices`` the caches share the pool's slots.
     """
     if conv_pool.ndim != 3 or conv_pool.shape[1] % 3:
         raise ValueError(f"Expected packed rank-3 KDA convolution pool, got {conv_pool.shape}")
     projection_size = conv_pool.shape[1] // 3
     committed = conv_pool.shape[2]
     caches = (q_cache, k_cache, v_cache)
-    expected_prefix = (conv_pool.shape[0], projection_size)
-    if any(cache.ndim != 3 or cache.shape[:2] != expected_prefix for cache in caches):
+    if any(cache.ndim != 3 or cache.shape[1] != projection_size for cache in caches):
         raise ValueError("KDA replay convolution caches do not match the live pool geometry")
+    if replay_indices is None:
+        if any(cache.shape[0] != conv_pool.shape[0] for cache in caches):
+            raise ValueError("KDA replay convolution caches do not match the live pool slots")
+        replay_indices = state_indices
     if any(cache.shape[2] < committed for cache in caches):
         raise ValueError("KDA replay convolution caches are shorter than the committed window")
     if any(cache.stride() != q_cache.stride() for cache in caches[1:]):
         raise ValueError("KDA replay convolution caches must share one layout")
-    if state_indices.ndim != 1 or state_indices.dtype not in (torch.int32, torch.int64):
-        raise ValueError("KDA replay state indices must be a rank-1 int32 or int64 tensor")
-    if any(tensor.device != conv_pool.device for tensor in (*caches, state_indices)):
+    for indices in (state_indices, replay_indices):
+        if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("KDA replay state indices must be a rank-1 int32 or int64 tensor")
+    if replay_indices.shape != state_indices.shape:
+        raise ValueError("Expected one replay index per state index")
+    if any(
+        tensor.device != conv_pool.device for tensor in (*caches, state_indices, replay_indices)
+    ):
         raise ValueError("KDA replay convolution tensors must be on one device")
     if state_indices.numel() == 0:
         return
@@ -178,6 +193,7 @@ def copy_kda_replay_conv_window(
             k_cache,
             v_cache,
             state_indices,
+            replay_indices,
             conv_pool.stride(0),
             conv_pool.stride(1),
             conv_pool.stride(2),
@@ -197,6 +213,7 @@ def _store_kda_replay_conv_window_kernel(
     k_cache_ptr,
     v_cache_ptr,
     state_indices_ptr,
+    replay_indices_ptr,
     num_accepted_ptr,
     conv_stride_slot,
     conv_stride_dim,
@@ -215,13 +232,16 @@ def _store_kda_replay_conv_window_kernel(
     dim = offsets // COMMITTED
     window = offsets % COMMITTED
     slot = tl.load(state_indices_ptr + request).to(tl.int64)
+    replay_slot = tl.load(replay_indices_ptr + request).to(tl.int64)
     # The window after the accepted drafts starts at their count, clamped
     # like the verify kernels clamp it.
     shift = tl.minimum(tl.maximum(tl.load(num_accepted_ptr + request), 0), NUM_SPEC)
 
     conv_offset = slot * conv_stride_slot + dim * conv_stride_dim + window * conv_stride_window
     cache_offset = (
-        slot * cache_stride_slot + dim * cache_stride_dim + (window + shift) * cache_stride_window
+        replay_slot * cache_stride_slot
+        + dim * cache_stride_dim
+        + (window + shift) * cache_stride_window
     )
     section_offset = PROJECTION_SIZE * conv_stride_dim
     tl.store(conv_ptr + conv_offset, tl.load(q_cache_ptr + cache_offset, mask=mask), mask=mask)
@@ -244,6 +264,7 @@ def store_kda_replay_conv_window(
     v_cache: torch.Tensor,
     state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    replay_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Store each selected slot's conv window after its accepted drafts in
     the live convolution pool.
@@ -252,7 +273,9 @@ def store_kda_replay_conv_window(
     ``[0, W - 1)`` and the raw inputs of the round's drafts after it, so the
     ``W - 1`` columns starting at the request's ``num_accepted_tokens`` entry
     are the window the next verify would start from. They are raw
-    convolution inputs, so storing them in a bf16 pool is exact.
+    convolution inputs, so storing them in a bf16 pool is exact. Request
+    ``n`` reads replay row ``replay_indices[n]`` (``state_indices[n]`` when
+    ``None``) and writes pool row ``state_indices[n]``.
     """
     projection_size = conv_pool.shape[1] // 3
     committed = conv_pool.shape[2]
@@ -261,8 +284,12 @@ def store_kda_replay_conv_window(
         raise ValueError("KDA replay convolution caches do not match the live pool geometry")
     if any(cache.stride() != q_cache.stride() for cache in caches[1:]):
         raise ValueError("KDA replay convolution caches must share one layout")
+    if replay_indices is None:
+        replay_indices = state_indices
     if num_accepted_tokens.shape != state_indices.shape:
         raise ValueError("Expected one accepted-draft count per state index")
+    if replay_indices.shape != state_indices.shape:
+        raise ValueError("Expected one replay index per state index")
     if state_indices.numel() == 0:
         return
 
@@ -278,6 +305,7 @@ def store_kda_replay_conv_window(
             k_cache,
             v_cache,
             state_indices,
+            replay_indices,
             num_accepted_tokens,
             conv_pool.stride(0),
             conv_pool.stride(1),
@@ -297,6 +325,7 @@ def _replay_kda_token_records_kernel(
     state_ptr,
     records_ptr,
     state_indices_ptr,
+    replay_indices_ptr,
     num_accepted_ptr,
     state_stride_slot,
     records_stride_slot,
@@ -311,12 +340,13 @@ def _replay_kda_token_records_kernel(
     rows = tl.program_id(2) * BLOCK_V + tl.arange(0, BLOCK_V)
     keys = tl.arange(0, K)
     slot = tl.load(state_indices_ptr + request).to(tl.int64)
+    replay_slot = tl.load(replay_indices_ptr + request).to(tl.int64)
     accepted = tl.minimum(tl.maximum(tl.load(num_accepted_ptr + request), 0), NUM_SPEC)
     state_ptrs = (
         state_ptr + slot * state_stride_slot + (head * V + rows[:, None]) * K + keys[None, :]
     )
     state = tl.load(state_ptrs)
-    records = records_ptr + slot * records_stride_slot
+    records = records_ptr + replay_slot * records_stride_slot
     for t in range(0, accepted):
         vn = tl.load(records + (t * H + head) * V + rows)
         beta_k = tl.load(records + NUM_SPEC * H * V + (t * H + head) * K + keys)
@@ -330,10 +360,13 @@ def replay_kda_token_records(
     state_tok: torch.Tensor,
     state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    replay_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Replay each selected slot's accepted drafts onto its pool state from
     the per-draft records the Kimi K3 verify kernels keep in ``state_tok``.
 
+    Request ``n`` updates state row ``state_indices[n]`` from records row
+    ``replay_indices[n]`` (``state_indices[n]`` when ``None``).
     A slot of ``state_tok`` (``[slots, 3, num_spec, H, K]`` fp32) holds the
     records of the last round's drafts: the row innovations ``vn``
     ``[num_spec][H][V]``, then ``beta * k`` and the decay
@@ -350,6 +383,10 @@ def replay_kda_token_records(
             f"{tuple(state_tok.shape)} for a state of "
             f"{tuple(recurrent_state.shape)}"
         )
+    if replay_indices is None:
+        replay_indices = state_indices
+    if replay_indices.shape != state_indices.shape:
+        raise ValueError("Expected one replay index per state index")
     if state_indices.numel() == 0:
         return
     block_v = 32
@@ -359,6 +396,7 @@ def replay_kda_token_records(
             recurrent_state,
             state_tok,
             state_indices,
+            replay_indices,
             num_accepted_tokens,
             recurrent_state.stride(0),
             state_tok.stride(0),
@@ -383,12 +421,15 @@ def commit_kda_pending_drafts(
     state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     state_tok: Optional[torch.Tensor] = None,
+    replay_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Commit one layer's pending accepted drafts into its live pools.
 
-    ``num_accepted_tokens[n]`` is the number of drafts of slot
-    ``state_indices[n]`` the last verify accepted, which the next verify
-    would take up first. Afterwards ``recurrent_state`` and ``conv_pool``
+    ``num_accepted_tokens[n]`` is the number of drafts of request ``n`` the
+    last verify accepted, which the next verify would take up first. Its
+    state lives in slot ``state_indices[n]`` of ``recurrent_state`` and
+    ``conv_pool``, its drafts in slot ``replay_indices[n]`` of the conv and
+    replay caches (``state_indices[n]`` when ``None``). Afterwards ``recurrent_state`` and ``conv_pool``
     hold the state and the conv window that verify would start from (the
     window bit for bit), and the caller clears the slot's count:
 
@@ -403,7 +444,9 @@ def commit_kda_pending_drafts(
     """
     num_spec = conv_q.shape[2] - conv_pool.shape[2]
     if state_tok is not None:
-        replay_kda_token_records(recurrent_state, state_tok, state_indices, num_accepted_tokens)
+        replay_kda_token_records(
+            recurrent_state, state_tok, state_indices, num_accepted_tokens, replay_indices
+        )
     else:
         assert (
             k_cache is not None
@@ -424,9 +467,10 @@ def commit_kda_pending_drafts(
             num_accepted_tokens,
             num_spec,
             conv_width=conv_pool.shape[2] + 1,
+            replay_state_indices=replay_indices,
         )
     store_kda_replay_conv_window(
-        conv_pool, conv_q, conv_k, conv_v, state_indices, num_accepted_tokens
+        conv_pool, conv_q, conv_k, conv_v, state_indices, num_accepted_tokens, replay_indices
     )
 
 

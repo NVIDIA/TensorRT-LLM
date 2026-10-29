@@ -233,7 +233,10 @@ def _rep(name, a, b):
 
 
 def _make_kvcm_replay_manager(num_heads):
-    """A V2 hybrid manager whose KVCM pools hold the KDA states and replay caches, with a host tier to offload to."""
+    """A V2 hybrid manager whose KVCM pools hold the KDA states and replay caches, with a host tier to offload to.
+
+    Its batch size leaves room for more living caches than the recurrent-state pool has slots, so newer caches can push
+    the suspended requests' recurrent states to the host tier."""
     from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
     from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
@@ -258,7 +261,7 @@ def _make_kvcm_replay_manager(num_heads):
         head_dim=K,
         tokens_per_block=32,
         max_seq_len=64,
-        max_batch_size=4,
+        max_batch_size=16,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         dtype=DataType.BF16,
         spec_config=MTPDecodingConfig(max_draft_len=M),
@@ -269,23 +272,28 @@ def _make_kvcm_replay_manager(num_heads):
 
 
 def _offload_and_resume(manager, request_ids):
-    """Suspend the requests' KV caches, push their pages to the host tier with newer caches, and resume them; returns
-    the slots they resume in."""
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import CACHE_LEVEL1, LayerId, _introspection
+    """Suspend the requests' KV caches, push their recurrent-state pages to the host tier with newer caches, and
+    resume them; returns the state slots and the replay slots they resume in."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CACHE_LEVEL1, _introspection
 
     stream = torch.cuda.current_stream().cuda_stream
     caches = [manager.kv_cache_map[rid] for rid in request_ids]
     for cache in caches:
         cache.suspend()
-    group = manager.impl.get_layer_group_id(LayerId(0))
+    group = manager.ssm_layer_group_id
     pool = next(
         pool
         for pool in manager.impl.pool_group_descs
         if any(variant.layer_group_id == group for variant in pool.slot_desc.variants)
     )
+    # Every living cache holds a replay slot, so stay within max_live_kv_caches.
+    num_pressure = pool.num_slots + len(caches)
+    max_live_kv_caches = manager.kv_cache_manager_py_config.max_live_kv_caches
+    if max_live_kv_caches is not None:
+        num_pressure = min(num_pressure, max_live_kv_caches - len(manager.kv_cache_map))
     pressure = []
     try:
-        for _ in range(pool.num_slots + len(caches)):
+        for _ in range(num_pressure):
             other = manager.impl.create_kv_cache()
             pressure.append(other)
             assert other.resume(stream)
@@ -296,11 +304,15 @@ def _offload_and_resume(manager, request_ids):
     # The suspended requests' pages must have been evicted to the host tier, or
     # the resume below would not exercise the offload path at all.
     assert max(_introspection.storage_utilization(manager.impl, CACHE_LEVEL1)) > 0
-    new_slots = []
+    new_slots, new_replay_slots = [], []
     for cache in reversed(caches):
         assert cache.resume(stream)
         new_slots.append(cache.get_ssm_block_base_index(group))
-    return torch.tensor(list(reversed(new_slots)), dtype=torch.int32, device="cuda")
+        new_replay_slots.append(cache.get_ssm_block_base_index(manager.replay_layer_group_id))
+    return (
+        torch.tensor(list(reversed(new_slots)), dtype=torch.int32, device="cuda"),
+        torch.tensor(list(reversed(new_replay_slots)), dtype=torch.int32, device="cuda"),
+    )
 
 
 @torch.no_grad()
@@ -381,6 +393,7 @@ def test_fused_vs_sequential_two_rounds(
     cache_seq = _make_seq_layer_cache(B, num_heads=num_heads)
     cache_fused = _make_fused_layer_cache(B, conv_pool_fused, num_heads=num_heads)
     fused_slots = slot_indices
+    replay_slots = slot_indices
     replay_manager = _make_kvcm_replay_manager(num_heads) if kvcm_replay else None
     if replay_manager is not None:
         request.addfinalizer(replay_manager.shutdown)
@@ -388,6 +401,11 @@ def test_fused_vs_sequential_two_rounds(
         replay_manager.add_dummy_requests(request_ids, token_nums=[32] * B, is_gen=False)
         fused_slots = torch.tensor(
             replay_manager.get_state_indices(request_ids), dtype=torch.int32, device="cuda"
+        )
+        # The replay caches live in a pool of their own, with slots of their own.
+        assert replay_manager.replay_layer_group_id is not None
+        replay_slots = torch.tensor(
+            replay_manager.get_replay_state_indices(request_ids), dtype=torch.int32, device="cuda"
         )
         cache_fused = replay_manager.mamba_layer_cache(0)
         conv_pool_fused = cache_fused.conv
@@ -414,7 +432,13 @@ def test_fused_vs_sequential_two_rounds(
     with with_multi_stream(True):
         out1_fused = rt_fused._project_output(
             rt_fused.forward_verify(
-                x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, fused_slots
+                x1,
+                T,
+                cache_fused,
+                conv_pool_fused,
+                ssm_pool_fused,
+                fused_slots,
+                replay_slot_indices=replay_slots,
             )
         )
     _assert_fused_epilogue_call(mtp_calls[-1], rt_fused, use_full_rank_gate)
@@ -424,9 +448,9 @@ def test_fused_vs_sequential_two_rounds(
     # ---- Acceptance: 0, 1, 2, 0 drafts across the 4 requests ----
     accept = torch.tensor([0, 1, 2, 0], dtype=torch.long, device="cuda")
     _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq, accept)
-    cache_fused.prev_num_accepted_tokens.index_copy_(0, fused_slots.long(), accept.to(torch.int32))
+    cache_fused.prev_num_accepted_tokens.index_copy_(0, replay_slots.long(), accept.to(torch.int32))
     if replay_manager is not None:
-        fused_slots = _offload_and_resume(replay_manager, request_ids)
+        fused_slots, replay_slots = _offload_and_resume(replay_manager, request_ids)
 
     # ---- Round 2 (fused path replays the accepted drafts) ----
     x2 = tokens()
@@ -445,6 +469,7 @@ def test_fused_vs_sequential_two_rounds(
             ssm_pool_fused,
             fused_slots,
             output=core2_fused,
+            replay_slot_indices=replay_slots,
         )
     assert result2_fused is core2_fused
     assert len(mtp_calls) == 2

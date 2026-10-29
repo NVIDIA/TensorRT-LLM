@@ -256,8 +256,17 @@ class PythonMambaCacheManager(BaseResourceManager):
             (the fused ``trtllm::kda_mtp_decode`` verify path)."""
             return self.kda_k_cache is not None
 
-        def commit_conv_window(self, slot_indices: torch.Tensor, conv_pool: torch.Tensor) -> None:
-            """Seed the KDA replay caches from the live ``W - 1`` conv pool."""
+        def commit_conv_window(
+            self,
+            slot_indices: torch.Tensor,
+            conv_pool: torch.Tensor,
+            replay_slot_indices: torch.Tensor | None = None,
+        ) -> None:
+            """Seed the KDA replay caches from the live ``W - 1`` conv pool.
+
+            The replay caches share the pool's slots, so ``replay_slot_indices``
+            name the same slots as ``slot_indices`` when given.
+            """
             from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
                 copy_kda_replay_conv_window,
             )
@@ -268,6 +277,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 self.kda_conv_k,
                 self.kda_conv_v,
                 slot_indices,
+                replay_slot_indices,
             )
 
     def __init__(
