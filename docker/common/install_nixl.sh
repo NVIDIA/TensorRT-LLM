@@ -42,7 +42,7 @@ if [[ -n "${LIBFABRIC_INSTALL_PATH}" &&
     export PKG_CONFIG_PATH="${HWLOC_INSTALL_PATH}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
 fi
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="v1.5.0"
+NIXL_VERSION="v1.5.2"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
