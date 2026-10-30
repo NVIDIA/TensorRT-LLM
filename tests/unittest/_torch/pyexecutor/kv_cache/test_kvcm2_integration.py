@@ -1901,8 +1901,8 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
         # lowers it.
         pytest.param(False, False, 8192, 8192, 8704, (9216, 8704), id="history_ahead"),
         # A mirror first seen past position 0 (a target prefix this worker did
-        # not compute): its drafter slot stores the chunk from 0, so nothing
-        # below the chunk is history and the mirror covers [0, chunk end).
+        # not compute) keeps its history and covers [0, chunk end); the DFlash
+        # drafter stores the chunk at its target position above the prefix.
         pytest.param(False, False, 8192, 0, 0, (9216, None), id="fresh_past_zero"),
         # MTP, Eagle and two-engine drafters keep the draft request view: it
         # reads position 0 with the whole prompt as its (last) chunk, and the
