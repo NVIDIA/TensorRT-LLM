@@ -1283,8 +1283,12 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
         torch.testing.assert_close(actual, reference, atol=3e-2, rtol=3e-3)
 
 
-def _forward_with_recipe(monkeypatch: pytest.MonkeyPatch, recipe) -> None:
-    """Make the shared harness send separate Q/K/V with the per-tensor recipe flags."""
+def _forward_with_recipe(monkeypatch: pytest.MonkeyPatch, recipe, vc_operands=None) -> None:
+    """Make the shared harness send separate Q/K/V with the recipe flags.
+
+    The VisualGen attention layer prepares the VC-Attention operands before the
+    attention op, so a VC recipe passes them in here.
+    """
     import backend_case
 
     from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
@@ -1296,9 +1300,32 @@ def _forward_with_recipe(monkeypatch: pytest.MonkeyPatch, recipe) -> None:
         "AttentionForwardArgs",
         functools.partial(
             AttentionForwardArgs,
-            qk_fp8_per_tensor=recipe.qk_dtype == "fp8",
-            v_fp8_per_tensor=recipe.v_dtype == "fp8",
+            qk_fp8_per_tensor=not recipe.vc_attention and recipe.qk_dtype == "fp8",
+            v_fp8_per_tensor=not recipe.vc_attention and recipe.v_dtype == "fp8",
+            vc_attention=recipe.vc_attention,
+            vc_operands=vc_operands,
         ),
+    )
+
+
+def _vc_operands(case: BackendCase, inputs: dict, recipe):
+    """Prepare the VC operands the way the VisualGen TRTLLM attention layer does."""
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention.quantization import (
+        VCAttentionPreprocessor,
+    )
+    from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import prepare_vc_operands
+
+    def bshd(x: torch.Tensor) -> torch.Tensor:
+        return x.view(case.num_seqs, -1, case.num_heads, case.head_dim)
+
+    return prepare_vc_operands(
+        bshd(inputs["q"]),
+        bshd(inputs["new_k"]),
+        bshd(inputs["new_v"]),
+        qk_fp8=recipe.qk_dtype == "fp8",
+        repair_budget=recipe.vc_repair_budget,
+        preprocessor=None if recipe.vc_repair_budget else VCAttentionPreprocessor(),
+        denoise_step=(0, 50),
     )
 
 
@@ -1316,9 +1343,24 @@ _CACHE_FREE_CASE = dict(
 
 
 @pytest.mark.parametrize("outlier", [1.0, 10.0])
-@pytest.mark.parametrize(("qk_dtype", "v_dtype"), [("bf16", "fp8"), ("fp8", "fp8")])
+@pytest.mark.parametrize(
+    ("qk_dtype", "v_dtype", "vc_attention", "vc_repair_budget"),
+    [
+        ("bf16", "fp8", False, 0.0),
+        ("fp8", "fp8", False, 0.0),
+        ("bf16", "fp8", True, 0.0),
+        ("bf16", "fp8", True, 0.01),
+        ("fp8", "fp8", True, 0.0),
+        ("fp8", "fp8", True, 0.01),
+    ],
+)
 def test_prims_ts_cache_free_fp8_recipes(
-    monkeypatch: pytest.MonkeyPatch, qk_dtype: str, v_dtype: str, outlier: float
+    monkeypatch: pytest.MonkeyPatch,
+    qk_dtype: str,
+    v_dtype: str,
+    vc_attention: bool,
+    vc_repair_budget: float,
+    outlier: float,
 ) -> None:
     """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA.
 
@@ -1329,8 +1371,12 @@ def test_prims_ts_cache_free_fp8_recipes(
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-    recipe = QuantAttentionConfig(qk_dtype=qk_dtype, v_dtype=v_dtype)
-    _forward_with_recipe(monkeypatch, recipe)
+    recipe = QuantAttentionConfig(
+        qk_dtype=qk_dtype,
+        v_dtype=v_dtype,
+        vc_attention=vc_attention,
+        vc_repair_budget=vc_repair_budget,
+    )
     plans: list[dict] = []
     runs: list[dict] = []
     plan, run = BatchPrefillTSWrapper.plan, BatchPrefillTSWrapper.run
@@ -1352,6 +1398,9 @@ def test_prims_ts_cache_free_fp8_recipes(
     inputs["q"][second] *= outlier
     inputs["new_k"][second] /= outlier
     inputs["new_v"][second] *= outlier
+    _forward_with_recipe(
+        monkeypatch, recipe, _vc_operands(case, inputs, recipe) if vc_attention else None
+    )
 
     out = run_backend(case, "TRTLLM", inputs, kv_dtype=torch.bfloat16, kv_layout="HND")
 
@@ -1376,19 +1425,30 @@ def test_prims_ts_cache_free_fp8_recipes(
     def dequant_scale(x: torch.Tensor) -> torch.Tensor:
         return (x.float().abs().amax() / 448.0).reshape(1)
 
-    # The quantize op returns BF16-rounded dequant scales.
-    torch.testing.assert_close(
-        run_kwargs["output_scale"], dequant_scale(inputs["new_v"]), rtol=1e-2, atol=0.0
-    )
-    if qk_dtype == "fp8":
-        expected = (
-            dequant_scale(inputs["q"])
-            * dequant_scale(inputs["new_k"])
-            * (math.log2(math.e) / math.sqrt(case.head_dim))
-        )
-        torch.testing.assert_close(run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0)
-    else:
+    if vc_attention:
+        # The VC operands carry the V scale and tile means (and the Q/K block scales under
+        # QK8); no per-tensor scale is folded.
+        assert run_kwargs["vc"] is not None
+        assert (run_kwargs["vc"].q_scale is not None) == (qk_dtype == "fp8")
+        assert (plan_kwargs["vc_config"].repair_tiles > 0) == (vc_repair_budget > 0)
+        assert run_kwargs["output_scale"] is None
         assert run_kwargs["scale_softmax_log2"] is None
+    else:
+        # The quantize op returns BF16-rounded dequant scales.
+        torch.testing.assert_close(
+            run_kwargs["output_scale"], dequant_scale(inputs["new_v"]), rtol=1e-2, atol=0.0
+        )
+        if qk_dtype == "fp8":
+            expected = (
+                dequant_scale(inputs["q"])
+                * dequant_scale(inputs["new_k"])
+                * (math.log2(math.e) / math.sqrt(case.head_dim))
+            )
+            torch.testing.assert_close(
+                run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0
+            )
+        else:
+            assert run_kwargs["scale_softmax_log2"] is None
     # The second sample's output is ``outlier`` times larger. Normalize it before comparing.
     sample_gain = torch.tensor([1.0, outlier], device=out.device).view(-1, 1)
     torch.testing.assert_close(
@@ -1412,6 +1472,25 @@ def test_prims_ts_recipe_requires_prims_ts_library(monkeypatch: pytest.MonkeyPat
         run_backend(
             case, "TRTLLM", generate_inputs(case, seed=0), kv_dtype=torch.bfloat16, kv_layout="HND"
         )
+
+
+def test_prims_ts_rejects_vc_attention_with_kv_cache() -> None:
+    """The VC recipe is prepared on the cache-free path only, so paged requests must not claim it."""
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+    fmha = object.__new__(PrimsTSFmha)
+    q = torch.empty(4, 128, device="cuda", dtype=torch.bfloat16)
+    supported, reason = fmha._is_supported_with_reason(
+        q,
+        None,
+        None,
+        SimpleNamespace(is_mla_enable=False),
+        SimpleNamespace(kv_cache_manager=object()),
+        SimpleNamespace(is_fused_qkv=True, vc_attention=True, sparse_runtime_params=None),
+    )
+
+    assert not supported
+    assert reason == "VC-Attention runs on cache-free context attention only."
 
 
 def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:

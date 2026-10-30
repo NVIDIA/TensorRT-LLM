@@ -112,6 +112,26 @@ class QuantAttentionConfig(StrictBaseModel):
             "the trtllm-gen kernels quantize V without it."
         ),
     )
+    vc_attention: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Run the recipe as VC-Attention on the TRTLLM backend. V is stored as E4M3 residuals "
+            "around 128-token tile means with one scale per channel; fp8 Q/K are Hadamard-rotated "
+            "with one scale per 128 tokens. Requires TLLM_FMHA_LIBS=+prims_ts."
+        ),
+    )
+    vc_repair_budget: float = Field(
+        0.0,
+        ge=0.0,
+        lt=1.0,
+        status="prototype",
+        description=(
+            "Fraction of tokens VC-Attention appends as V repair rows instead of restoring "
+            "tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the "
+            "fastest setting measured at unchanged quality. vc_attention only."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -180,6 +200,20 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (0, 0, 0)),
             },
         }
+        # VC-Attention stores V as E4M3 residuals around tile means with one scale per channel.
+        # VC-Attention-QK16 keeps Q/K in BF16, VC-Attention-QK8 quantizes the Hadamard-rotated
+        # Q/K to E4M3 with one scale per 128 tokens. The recipe fixes these block sizes, so the
+        # config names only the element formats.
+        VC_ATTENTION_RECIPES = {
+            100: {
+                ("bf16", "fp8"),
+                ("fp8", "fp8"),
+            },
+            103: {
+                ("bf16", "fp8"),
+                ("fp8", "fp8"),
+            },
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -203,30 +237,51 @@ class AttentionConfig(StrictBaseModel):
             return self
 
         q_config = self.quant_attention_config
-        recipe = (
-            q_config.qk_dtype,
-            q_config.v_dtype,
-            (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
-        )
+        block_sizes = (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size)
+        recipe = (q_config.qk_dtype, q_config.v_dtype, block_sizes)
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
-            recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(sm_version, set())
+            if q_config.vc_attention:
+                if block_sizes != (0, 0, 0):
+                    raise ValueError(
+                        "q_block_size, k_block_size and v_block_size are SageAttention options "
+                        "and do not apply to VC-Attention, which fixes its own block sizes. "
+                        f"Leave them at 0, got {block_sizes!r}."
+                    )
+                recipe = (q_config.qk_dtype, q_config.v_dtype)
+                recipes = VC_ATTENTION_RECIPES.get(sm_version, set())
+                family = "VC-Attention"
+            else:
+                recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(
+                    sm_version, set()
+                )
+                family = "SAGE and PrimTS"
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
+                    f"for backend='TRTLLM'. Supported {family} recipes on this device: "
                     f"{sorted(recipes)}."
                 )
-            if (q_config.smooth_k or q_config.smooth_v) and q_config.q_block_size == 0:
+            if (q_config.smooth_k or q_config.smooth_v) and (
+                q_config.q_block_size == 0 or q_config.vc_attention
+            ):
                 raise ValueError(
                     "smooth_k and smooth_v are SageAttention options and do not apply to the "
-                    f"per-tensor recipe {recipe!r}."
+                    f"recipe {recipe!r}."
                 )
             if q_config.smooth_v and sm_version not in (100, 103):
                 raise ValueError(
                     "smooth_v needs the PrimTS kernels, which add the V mean back to the "
                     f"attention output and run on SM100 and SM103 only; got SM{sm_version}."
                 )
+            if q_config.vc_repair_budget and not q_config.vc_attention:
+                raise ValueError(
+                    "vc_repair_budget is a VC-Attention option and requires vc_attention=True."
+                )
+        elif q_config.vc_attention or q_config.vc_repair_budget:
+            raise ValueError(
+                f"vc_attention is a TRTLLM backend option, got backend='{self.backend}'."
+            )
         elif q_config.smooth_k or q_config.smooth_v:
             raise ValueError(
                 f"smooth_k and smooth_v are SageAttention options and require backend='TRTLLM', "
@@ -299,6 +354,10 @@ class AttentionConfig(StrictBaseModel):
         # The other backends never consume quant_attention_config on that path,
         # so accepting a recipe there would silently ignore user configuration.
         # SkipSoftmax is part of the dense path itself and can compose.
+        # VC-Attention is a dense recipe of the PrimTS kernels and is not
+        # composed with any sparse algorithm.
+        if self.quant_attention_config.vc_attention:
+            raise ValueError("vc_attention does not compose with sparse_attention_config.")
         if self.backend == "TRTLLM":
             return self
         algorithm = self.sparse_attention_config.algorithm

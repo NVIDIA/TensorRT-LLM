@@ -178,6 +178,116 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    @pytest.mark.parametrize("sm_ver", [100, 103])
+    @pytest.mark.parametrize("qk_dtype", ["bf16", "fp8"])
+    def test_supported_quant_config_vc_attention(self, sm_ver, qk_dtype):
+        """VC-Attention-QK16 and VC-Attention-QK8 validate on Blackwell without block sizes."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(qk_dtype=qk_dtype, vc_attention=True),
+            )
+
+        assert attention.quant_attention_config.vc_attention
+
+    def test_vc_attention_rejects_block_sizes(self):
+        """The VC-Attention recipe fixes its block sizes, so the SageAttention fields must stay 0."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="do not apply to VC-Attention"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="fp8",
+                        q_block_size=128,
+                        k_block_size=128,
+                        v_block_size=1,
+                        vc_attention=True,
+                    ),
+                )
+
+    def test_vc_repair_budget_requires_vc_attention(self):
+        """The repair budget belongs to VC-Attention and is rejected elsewhere."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="bf16", vc_attention=True, vc_repair_budget=0.005
+                ),
+            )
+            assert attention.quant_attention_config.vc_repair_budget == 0.005
+            with pytest.raises(ValidationError, match="vc_repair_budget is a VC-Attention"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="bf16", vc_repair_budget=0.005
+                    ),
+                )
+
+    @pytest.mark.parametrize(
+        "sparse",
+        [
+            VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
+        ],
+        ids=["vsa", "skip_softmax"],
+    )
+    def test_vc_attention_rejects_sparse_attention(self, sparse):
+        """VC-Attention is a dense recipe and never composes with a sparse algorithm."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="does not compose with sparse_attention"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", vc_attention=True),
+                    sparse_attention_config=sparse,
+                )
+
+    @pytest.mark.parametrize("backend", ["CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
+    def test_vc_attention_rejected_off_trtllm(self, backend):
+        """VC-Attention and its repair budget are TRTLLM backend options."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="vc_attention is a TRTLLM backend option"):
+                AttentionConfig(
+                    backend=backend,
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", vc_attention=True),
+                )
+            with pytest.raises(ValidationError, match="vc_attention is a TRTLLM backend option"):
+                AttentionConfig(
+                    backend=backend,
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="bf16", vc_repair_budget=0.005
+                    ),
+                )
+
+    @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
+    def test_vc_attention_rejects_sage_smoothing(self, smoothing):
+        """VC-Attention smooths V on its own schedule, so the SageAttention smoothing flags are rejected."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="are SageAttention options"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="bf16", vc_attention=True, **{smoothing: True}
+                    ),
+                )
+
+    @pytest.mark.parametrize("vc_repair_budget", [-0.1, 1.0])
+    def test_vc_repair_budget_bounds(self, vc_repair_budget):
+        """The repair budget is a token fraction in [0, 1)."""
+        with pytest.raises(ValidationError, match="vc_repair_budget"):
+            QuantAttentionConfig(
+                qk_dtype="bf16", vc_attention=True, vc_repair_budget=vc_repair_budget
+            )
+
+    @pytest.mark.parametrize("sm_ver", [90, 120])
+    def test_vc_attention_rejected_off_blackwell(self, sm_ver):
+        """The VC-Attention kernels exist for SM100 and SM103 only."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            with pytest.raises(ValidationError, match="Supported VC-Attention recipes"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", vc_attention=True),
+                )
+
     @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
     @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
     def test_smoothing_rejected_without_sage_recipe(self, backend, smoothing):

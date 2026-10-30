@@ -20,7 +20,7 @@ Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
 import functools
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -30,19 +30,56 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
+if TYPE_CHECKING:
+    from ....attention.backends.prims_ts.vc_attention.quantization import (
+        VCAttentionOperands,
+        VCAttentionPreprocessor,
+    )
+
 from ....attention.backends.interface import (
     AttentionForwardArgs,
     AttentionRuntimeFeatures,
     PredefinedAttentionMask,
 )
 from ....attention.backends.sparse.params import SparseBackendForwardArgs, SparseParams
-from ....attention.backends.sparse.timestep_phase import graph_phase_for_timestep
+from ....attention.backends.sparse.timestep_phase import (
+    graph_phase_for_timestep,
+    vc_denoise_step_for_phase,
+    vc_denoise_step_for_timestep,
+)
 from ....attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ....attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from ....metadata import KVCacheParams
 from ...cache import BlockCausalKVCacheManager, ForwardPlan
 from ...cuda_graph_runner import resolved_extra_key
 from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
+
+
+def prepare_vc_operands(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    qk_fp8: bool,
+    repair_budget: float,
+    preprocessor: Optional["VCAttentionPreprocessor"],
+    denoise_step: Optional[tuple[int, int]],
+) -> "VCAttentionOperands":
+    """Quantize ``[B, S, H, D]`` bf16 Q, K and V for one VC-Attention forward.
+
+    With a repair budget the highest-residual tokens are appended as V repair
+    rows. Otherwise the layer-owned ``preprocessor`` groups the value tokens
+    and splits V into tile means and E4M3 residuals on the V-Smooth schedule
+    given by ``denoise_step``. Under QK8 ``q`` is rotated and quantized too.
+    """
+    from ....attention.backends.prims_ts.vc_attention.quantization import vc_quantize_repair
+
+    vc_q = q if qk_fp8 else None
+    if repair_budget:
+        return vc_quantize_repair(k, v, budget=repair_budget, q=vc_q)
+    if preprocessor is None:
+        raise ValueError("the tile-mean VC-Attention recipe needs a preprocessor")
+    return preprocessor.prepare(k, v, q=vc_q, denoise_step=denoise_step)
 
 
 @functools.lru_cache(maxsize=None)
@@ -298,6 +335,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - No KV cache operation
     - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
     - PrimTS per-tensor FP8 recipes (quant_attention_config with zero block sizes, requires unfused QKV)
+    - VC-Attention recipes (quant_attention_config with vc_attention, requires unfused QKV)
     - Separate-QKV forwarding for generic block-sparse attention and backends that reject fused QKV
     """
 
@@ -341,7 +379,25 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
-        if (
+        # The tile-mean VC-Attention recipe keeps its value grouping between denoising
+        # steps in a preprocessor owned by this layer.
+        self._vc_preprocessor: Optional["VCAttentionPreprocessor"] = None
+        if quant_attention_config is not None and quant_attention_config.vc_attention:
+            if sparse_params is not None:
+                raise ValueError("VC-Attention does not compose with sparse attention.")
+            if not any(fmha.supports_vc_attention for fmha in self._fmha_manager.fmha_libs):
+                raise RuntimeError(
+                    "The VC-Attention recipe needs the PrimTS FMHA library "
+                    "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
+                    "platform."
+                )
+            if not quant_attention_config.vc_repair_budget:
+                from ....attention.backends.prims_ts.vc_attention.quantization import (
+                    VCAttentionPreprocessor,
+                )
+
+                self._vc_preprocessor = VCAttentionPreprocessor()
+        elif (
             quant_attention_config is not None
             and quant_attention_config.q_block_size == 0
             and not any(fmha.supports_per_tensor_fp8 for fmha in self._fmha_manager.fmha_libs)
@@ -385,6 +441,43 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         if phase is None:
             phase = graph_phase_for_timestep(timestep, disabled_until_timestep=self.timestep_cutoff)
         return phase
+
+    @torch.compiler.disable
+    def _vc_operands(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        kv_seq_len: int,
+        timestep: object,
+    ) -> "VCAttentionOperands":
+        """Prepare the VC-Attention operands of this call from compact Q, K and V.
+
+        The V-Smooth phase belongs to the transformer call like the sparse
+        phase. Under the CUDA graph runner the host resolved phase stands in
+        for the timestep, which capture cannot read, and selects a
+        representative step of that phase. Eager calls derive the step from
+        the timestep.
+        """
+        quant_cfg = self.quant_attention_config
+        denoise_step = None
+        if self._vc_preprocessor is not None:
+            phase = resolved_extra_key("vc_smooth_phase")
+            if phase is not None:
+                denoise_step = vc_denoise_step_for_phase(phase)
+            else:
+                denoise_step = vc_denoise_step_for_timestep(timestep)
+        return prepare_vc_operands(
+            q.view(batch_size, seq_len, self.num_heads, self.head_dim),
+            k.view(batch_size, kv_seq_len, self.num_kv_heads, self.head_dim),
+            v.view(batch_size, kv_seq_len, self.num_kv_heads, self.head_dim),
+            qk_fp8=quant_cfg.qk_dtype == "fp8",
+            repair_budget=quant_cfg.vc_repair_budget,
+            preprocessor=self._vc_preprocessor,
+            denoise_step=denoise_step,
+        )
 
     def should_use_sparse(self, sparse_attn_phase: Optional[int]) -> bool:
         """Return whether this layer runs its sparse path in ``sparse_attn_phase``.
@@ -524,12 +617,19 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
-        sage_kwargs = {}
+        quantization_kwargs = {}
         if use_separate_qkv:
             q, k, v = self._compact_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
             quant_cfg = self.quant_attention_config
-            if quant_cfg is not None:
-                sage_kwargs = {
+            if quant_cfg is not None and quant_cfg.vc_attention:
+                quantization_kwargs = {
+                    "vc_attention": True,
+                    "vc_operands": self._vc_operands(
+                        q, k, v, batch_size, seq_len, kv_seq_len, timestep
+                    ),
+                }
+            elif quant_cfg is not None:
+                quantization_kwargs = {
                     "sage_attn_num_elts_per_blk_q": quant_cfg.q_block_size,
                     "sage_attn_num_elts_per_blk_k": quant_cfg.k_block_size,
                     "sage_attn_num_elts_per_blk_v": quant_cfg.v_block_size,
@@ -557,7 +657,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 timestep=timestep,
                 sparse_attn_phase=sparse_attn_phase,
                 sparse_backend_args=sparse_backend_args,
-                **sage_kwargs,
+                **quantization_kwargs,
             ),
         )
         return output.view(batch_size, seq_len, -1)
