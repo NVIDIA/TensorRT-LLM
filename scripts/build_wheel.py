@@ -679,20 +679,22 @@ def link_or_copy_file(src: Path, dst: Path, hard_link: bool = True) -> bool:
     return False
 
 
-def _install_new_file(src_file: Path, dst_file: Path, hard_link: bool,
-                      now: float) -> bool:
+def _install_file_in_new_folder(src_file: Path, dst_file: Path, hard_link: bool,
+                                now: float) -> bool:
     """Install ``src_file`` at ``dst_file`` in a folder `sync_tree` just made.
 
     Gives the same result as `link_or_copy_file`, but nothing exists at
-    ``dst_file`` yet, so it skips those checks: a hard link costs one symlink
-    check and one link request to the filesystem.
+    ``dst_file`` yet, so it skips checks related to an existing dst file.
+    The use of this function is to save file metadata queries, reducing metadata
+    server pressure and shortening build time.
 
     Returns:
         Whether ``dst_file`` is a hard link to ``src_file``.
     """
     if hard_link:
         try:
-            # os.link does not follow a symlinked src on every platform.
+            # os.link does not follow a symlinked src on every platform,
+            # so we get its real path first.
             target = (os.path.realpath(src_file)
                       if os.path.islink(src_file) else src_file)
             os.link(target, dst_file)
@@ -764,9 +766,9 @@ def sync_tree(src: Path,
 
     if hard_link:
         dst.parent.mkdir(parents=True, exist_ok=True)
+        # Hard link can only work when src and dst are on the same filesystem.
         hard_link = src.stat().st_dev == dst.parent.stat().st_dev
 
-    # A missing dst that gets hard links is filled by the walk below.
     if not dst.exists() and not hard_link:
         if not exclude and _tar_pipe_copy(src, dst):
             demote_racy_mtimes()
@@ -778,25 +780,26 @@ def sync_tree(src: Path,
         demote_racy_mtimes()
         return
 
-    # Folders the walk creates, destination to source, in walk order.
-    new_dirs: dict[Path, Path] = {}
+    # Keep track of the new dirs created and the mapping to their source paths,
+    # in the os.walk order.
+    new_dir_to_src: dict[Path, Path] = {}
+    # os.walk visits src folders depth-first, top-down:
     for root, dirs, files in os.walk(src, followlinks=True):
         rel = Path(root).relative_to(src)
         dirs[:] = [d for d in dirs if not excluded(d)]
         files = [f for f in files if not excluded(f)]
         dst_root = dst / rel
-        # Inside a folder the walk just made, nothing exists yet. Skipping the
-        # checks there saves requests to the filesystem's metadata server.
-        is_new_dir = dst_root.parent in new_dirs
+
+        is_new_dir = dst_root.parent in new_dir_to_src
         if not is_new_dir:
             if dst_root.exists() and not dst_root.is_dir():
                 dst_root.unlink()
             is_new_dir = not dst_root.is_dir()
         if is_new_dir:
             dst_root.mkdir()
-            new_dirs[dst_root] = Path(root)
+            new_dir_to_src[dst_root] = Path(root)
             for name in files:
-                hard_link = _install_new_file(
+                hard_link = _install_file_in_new_folder(
                     Path(root) / name, dst_root / name, hard_link, now)
             continue
         keep = set(dirs) | set(files)
@@ -840,8 +843,10 @@ def sync_tree(src: Path,
                 _demote_racy_mtime(dst_file, src_stat, now)
 
     # Give each new folder its source's mode and times, as copytree does.
-    # Deepest first, so a restrictive mode cannot block its own subtree.
-    for dst_dir, src_dir in reversed(new_dirs.items()):
+    # Subfolders come before their parent, so a restrictive mode cannot
+    # block its own subtree.
+    # A dict (`new_dir_to_src`) keeps keys in the order they were added.
+    for dst_dir, src_dir in reversed(new_dir_to_src.items()):
         shutil.copystat(src_dir, dst_dir)
 
 
