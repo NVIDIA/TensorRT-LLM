@@ -1303,6 +1303,11 @@ class TestPpLoopDrainWiring:
         outputs = {"logits": torch.arange(6).reshape(2, 3), "context_logits_handled": True}
         exe._forward_step = MagicMock(return_value=outputs)
         exe._sample_async = MagicMock()
+        sampling_calls = MagicMock()
+        sampling_calls.attach_mock(exe.finish_sample_event.wait, "event_wait")
+        sampling_calls.attach_mock(exe.sample_stream.wait_stream, "stream_wait")
+        sampling_calls.attach_mock(exe._sample_async, "sample")
+        sampling_calls.attach_mock(exe.finish_sample_event.record, "event_record")
         exe._handle_guided_decoder_errors = MagicMock(side_effect=StopAfterSampling)
         monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
@@ -1317,8 +1322,13 @@ class TestPpLoopDrainWiring:
         torch.testing.assert_close(sampled["logits"], outputs["logits"])
         outputs["logits"].zero_()
         torch.testing.assert_close(sampled["logits"], torch.arange(6).reshape(2, 3))
-        exe.finish_sample_event.wait.assert_called_once()
-        exe.finish_sample_event.record.assert_called_once()
+        exe.sample_stream.wait_stream.assert_called_once_with(torch.cuda.current_stream())
+        assert sampling_calls.mock_calls == [
+            call.event_wait(),
+            call.stream_wait(torch.cuda.current_stream()),
+            call.sample(*exe._sample_async.call_args.args),
+            call.event_record(),
+        ]
         exe._rebalance_kv_pools_now.assert_not_called()
 
     def test_drain_suppresses_queueing_then_rebalances_and_resumes(self, monkeypatch):
