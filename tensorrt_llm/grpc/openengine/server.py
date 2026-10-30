@@ -269,6 +269,8 @@ class OpenEngineServer:
                     or getattr(executor, "_engine_dead", False)
                 ):
                     self._fatal_engine_failure = True
+            if self._fatal_engine_failure:
+                await self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
             if self._stopping:
                 return
             ready = ready and not self._fatal_engine_failure
@@ -280,8 +282,6 @@ class OpenEngineServer:
                     if ready
                     else health_pb2.HealthCheckResponse.NOT_SERVING,
                 )
-            if self._fatal_engine_failure:
-                await self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
 
     async def _check_engine_health(self) -> bool:
         task = self._engine_health_task

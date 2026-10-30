@@ -166,25 +166,25 @@ async def test_forwarded_shutdown_rejections_do_not_fail_group():
 
 @pytest.mark.asyncio
 async def test_forwarded_shutdown_deadline_includes_peer_fanout(monkeypatch):
-    """A slow but timely peer must not exhaust the forwarding deadline."""
+    """The forwarding call must allow more time than the peer calls it awaits."""
+    async with group() as (coordinator, (first, _), failures):
+        deadlines = {}
+        connections = [first._connection, *coordinator._peers]
+        for connection in connections:
+            original_call = connection.call
 
-    class SlowCoordinator(Coordinator):
-        async def _dispatch(self, message, context):
-            if message["operation"] == "shutdown":
-                await asyncio.sleep(0.4)
-            return await super()._dispatch(message, context)
+            async def record_call(message, *, timeout, call=original_call):
+                if message.get("operation") == "shutdown":
+                    kind = "forwarded" if "expected_instance_id" in message else "peer"
+                    deadlines.setdefault(kind, []).append(timeout)
+                return await call(message, timeout=timeout)
 
-    class SlowFrontend(FrontendClient):
-        async def _dispatch(self, message, context):
-            if message.get("operation") == "shutdown":
-                await asyncio.sleep(0.8)
-            return await super()._dispatch(message, context)
-
-    async with group(SlowCoordinator, SlowFrontend) as (coordinator, (first, _), failures):
-        monkeypatch.setattr(coordination, "_RPC_TIMEOUT", 1.0)
+            monkeypatch.setattr(connection, "call", record_call)
         coordinator._request_shutdown = lambda: False
         result = await first.request("shutdown", expected_instance_id="shared-engine")
         assert result["matched"] and not result["already_stopping"]
+        assert deadlines["peer"] == [coordination._RPC_TIMEOUT] * len(coordinator._peers)
+        assert deadlines["forwarded"][0] > max(deadlines["peer"])
         assert not failures
 
 

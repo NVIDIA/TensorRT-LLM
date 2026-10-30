@@ -128,6 +128,46 @@ def test_fatal_failure_during_drain_updates_liveness() -> None:
     asyncio.run(exercise())
 
 
+def test_health_refresh_detects_fatal_failure_during_shutdown() -> None:
+    async def exercise():
+        executor = SimpleNamespace(_fatal_error=None, _engine_dead=False)
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            llm_id="test-instance",
+            tokenizer=None,
+            _check_health=lambda: True,
+            _executor=executor,
+        )
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test")
+        await server.start()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def check_health():
+            entered.set()
+            await release.wait()
+            return False
+
+        server._check_engine_health = check_health
+        refresh = asyncio.create_task(server._refresh_inference_health())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            await server.begin_shutdown()
+            executor._fatal_error = RuntimeError("engine failed")
+            release.set()
+            await refresh
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                response = await health_pb2_grpc.HealthStub(channel).Check(
+                    health_pb2.HealthCheckRequest(service="liveness"), timeout=3
+                )
+                assert response.status == health_pb2.HealthCheckResponse.NOT_SERVING
+        finally:
+            release.set()
+            await refresh
+            await server.stop(grace=0)
+
+    asyncio.run(exercise())
+
+
 def test_fatal_failure_during_start_does_not_restore_liveness() -> None:
     async def exercise():
         llm = SimpleNamespace(
