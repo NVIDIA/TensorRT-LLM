@@ -620,7 +620,6 @@ def cpu_sampler(monkeypatch):
     sampler._record_sampler_event = record_event
     sampler._async_worker_active = lambda: True
     sampler._store_scatter = None
-    sampler._store_flat = None
     sampler._slot_table_buffer = None
     sampler._store_copies_done = None
     return sampler, transfers
