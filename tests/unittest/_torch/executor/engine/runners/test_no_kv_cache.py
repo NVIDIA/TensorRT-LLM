@@ -84,7 +84,6 @@ def _prepare(
     torch.Tensor,
 ]:
     monkeypatch.setattr(no_kv_cache_module, "prefer_pinned", lambda: False)
-    monkeypatch.setattr(no_kv_cache_module, "VanillaAttentionMetadata", _AttentionMetadata)
     attn_metadata = _AttentionMetadata(sum(len(request.get_tokens(0)) for request in requests))
     scheduled_requests = SimpleNamespace(
         context_requests=requests,
