@@ -419,16 +419,28 @@ namespace common
 {
 namespace
 {
-std::mutex gNativeMemoryMutex;
-// device -> label -> usage. Labels are string literals from the allocation sites.
-std::map<int, std::map<std::string, NativeMemoryUsage>> gNativeMemory;
+struct NativeMemoryLedger
+{
+    std::mutex mutex;
+    // device -> label -> usage. Labels are string literals from the allocation sites.
+    std::map<int, std::map<std::string, NativeMemoryUsage>> usage;
+};
+
+// Never destroyed: releases are recorded from destructors that may run during static destruction, after a
+// namespace-scope map would already be gone.
+NativeMemoryLedger& nativeMemoryLedger()
+{
+    static auto* ledger = new NativeMemoryLedger();
+    return *ledger;
+}
 
 void addNativeMemory(char const* label, int device, std::int64_t count, std::int64_t bytes) noexcept
 {
     try
     {
-        std::lock_guard<std::mutex> lock(gNativeMemoryMutex);
-        auto& usage = gNativeMemory[device][label];
+        auto& ledger = nativeMemoryLedger();
+        std::lock_guard<std::mutex> lock(ledger.mutex);
+        auto& usage = ledger.usage[device][label];
         usage.count += count;
         usage.bytes += bytes;
     }
@@ -478,10 +490,11 @@ void recordNativeAllocationMeasured(char const* label, std::int64_t freeBefore) 
 
 std::vector<std::pair<std::string, NativeMemoryUsage>> getNativeMemoryUsage(int device)
 {
-    std::lock_guard<std::mutex> lock(gNativeMemoryMutex);
+    auto& ledger = nativeMemoryLedger();
+    std::lock_guard<std::mutex> lock(ledger.mutex);
     std::vector<std::pair<std::string, NativeMemoryUsage>> usage;
-    auto const it = gNativeMemory.find(device);
-    if (it != gNativeMemory.end())
+    auto const it = ledger.usage.find(device);
+    if (it != ledger.usage.end())
     {
         usage.assign(it->second.begin(), it->second.end());
     }

@@ -131,10 +131,11 @@ def render(
             _line(
                 "this process",
                 device.effective_process_used,
-                "   <- UPPER BOUND: NVML unavailable, device-wide figure",
+                "   <- UPPER BOUND: device-wide figure",
             )
         )
-        add(f"  {'other processes':<26s}{UNKNOWN}   <- unknowable without NVML")
+        add(f"  {'':<26s}  ({device.process_missing_reason})")
+        add(f"  {'other processes':<26s}{UNKNOWN}   <- unknowable without a per-process figure")
     else:
         add(_line("this process", device.process_used))
         add(_line("other processes", device.other_process))
@@ -177,13 +178,15 @@ def render(
     torch_entries = [
         e for e in frame.entries if e.placement is not Placement.NON_TORCH and e.counts_toward_total
     ]
-    derived = derived_entries(frame)
+    derived = {e.category: e for e in derived_entries(frame)}
     add("")
     add("[torch-visible, by category]")
     add(f"  {'category':<22s}{'source':<11s}{'basis':<21s}{'bytes':>14s}")
     for entry in sorted(torch_entries, key=lambda e: -(e.size_bytes or 0)):
         add(_entry_line(entry))
-    add(_entry_line(derived[0]))
+    add(_entry_line(derived[Category.UNATTRIBUTED_LIVE]))
+    if Category.SLEEP_RELEASED in derived:
+        add(_entry_line(derived[Category.SLEEP_RELEASED]))
 
     component_entries = [
         e for e in frame.entries if e.placement is Placement.NON_TORCH and e.counts_toward_total
@@ -194,7 +197,7 @@ def render(
         add("  (none registered)")
     for entry in sorted(component_entries, key=lambda e: -(e.size_bytes or 0)):
         add(_entry_line(entry))
-    add(_entry_line(derived[1]))
+    add(_entry_line(derived[Category.NONTORCH_RESIDUAL]))
 
     excluded = [e for e in frame.entries if not e.counts_toward_total]
     if excluded:

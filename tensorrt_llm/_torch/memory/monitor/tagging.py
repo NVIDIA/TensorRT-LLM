@@ -89,8 +89,9 @@ UNTAGGED = "untagged"
 _ALLOC_ACTIONS = ("alloc", "segment_alloc")
 _FREE_ACTIONS = ("free_completed", "segment_free")
 
-#: Generous enough that startup cannot wrap it; the buffer is discarded as
-#: soon as the map is frozen, so the cost is bounded and temporary.
+#: Generous enough for a typical startup; a wrap is detected and reported.
+#: The buffer is discarded as soon as the map is frozen, so the cost is
+#: bounded and temporary.
 _DEFAULT_MAX_ENTRIES = 1_000_000
 
 
@@ -222,6 +223,13 @@ def freeze_tag_map() -> TagSnapshot:
 
     owners: dict[int, str] = {}
     for device_trace in snapshot.get("device_traces") or []:
+        if len(device_trace) >= _DEFAULT_MAX_ENTRIES:
+            # The ring buffer kept only the latest events; blocks allocated
+            # before them carry no tag and are reported as unattributed.
+            logger.warning(
+                f"memory monitor: startup made more than {_DEFAULT_MAX_ENTRIES} allocation "
+                "events; the earliest are not attributed to a startup step"
+            )
         for event in device_trace:
             action = event.get("action")
             address = event.get("addr")
@@ -247,18 +255,20 @@ def freeze_tag_map() -> TagSnapshot:
 CUDA_GRAPHS = "CUDA_GRAPHS"
 
 
-def _live_blocks() -> list[tuple[int, int, bool, list]] | None:
+def _live_blocks(segments: list | None = None) -> list[tuple[int, int, bool, list]] | None:
     """Sorted ``(address, size, in_graph_pool, frames)`` of every live block, or ``None``.
 
     ``frames`` is the allocating stack when stack recording is on, else empty.
+    ``segments`` is an allocator snapshot already taken; one is taken if not.
     """
     from .pools import classify_all
 
-    try:
-        segments = torch.cuda.memory._snapshot()["segments"]
-    except Exception:  # noqa: BLE001
-        logger.debug("memory monitor: snapshot failed while reading tags")
-        return None
+    if segments is None:
+        try:
+            segments = torch.cuda.memory._snapshot()["segments"]
+        except Exception:  # noqa: BLE001
+            logger.debug("memory monitor: snapshot failed while reading tags")
+            return None
     kinds = classify_all(segment.get("segment_pool_id", (0, 0)) for segment in segments)
     blocks = []
     for segment in segments:
@@ -277,7 +287,9 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
     return live_attribution(snapshot)[0]
 
 
-def live_attribution(snapshot: TagSnapshot) -> tuple[dict[str, int], dict[str, int]]:
+def live_attribution(
+    snapshot: TagSnapshot, segments: list | None = None
+) -> tuple[dict[str, int], dict[str, int]]:
     """Live torch memory by label, and the untagged part by allocating code.
 
     Labels come from tags and claimed modules.
@@ -287,10 +299,11 @@ def live_attribution(snapshot: TagSnapshot) -> tuple[dict[str, int], dict[str, i
     when anything is live, even at zero, so a caller cannot mistake a
     partial breakdown for a complete one. Returns an empty mapping when
     neither source has anything -- not a dict of zeros, which would read as
-    a measurement.
+    a measurement. ``segments`` is an allocator snapshot the caller already
+    holds, so the tags describe the same moment as its other figures.
     """
     claims = _claimed_storages()
-    blocks = _live_blocks()
+    blocks = _live_blocks(segments)
     if blocks is None:
         return {}, {}
     in_graphs = any(graph for _, _, graph, _ in blocks)
@@ -420,24 +433,36 @@ def startup_window(rank: int | None = None):
     startup that raises part way through still publishes what it managed to
     tag and still reports, which is exactly when a breakdown is worth having.
     """
-    from . import enabled
+    from . import clear_baseline, enabled, startup
 
     if not enabled(rank):
         yield False
         return
 
+    # A process can build more than one executor; what the previous one
+    # recorded would otherwise be reported as this one's.
+    startup.clear()
+    clear_baseline()
     recording = start_tagging_window()
-    failed = False
+    failed = interrupted = False
     try:
         yield recording
-    except BaseException:
+    except Exception:
         failed = True
+        raise
+    except BaseException:
+        # Ctrl-C or exit: nobody is waiting for a memory report.
+        interrupted = True
         raise
     finally:
         snapshot = TagSnapshot(supported=False)
         try:
             if recording:
                 snapshot = freeze_tag_map()
+        except Exception as exc:  # noqa: BLE001 - must not replace startup's own error
+            logger.warning(
+                f"memory monitor: could not read startup tags ({type(exc).__name__}: {exc})"
+            )
         finally:
             if recording:
                 from .stacks import stacks_enabled, start_stack_recording
@@ -447,7 +472,8 @@ def startup_window(rank: int | None = None):
                 if not (stacks_enabled() and start_stack_recording()):
                     stop_tagging_window()
         set_frozen_map(snapshot)
-        _log_window_result(snapshot, rank, failed=failed)
+        if not interrupted:
+            _log_window_result(snapshot, rank, failed=failed)
 
 
 def _log_window_result(

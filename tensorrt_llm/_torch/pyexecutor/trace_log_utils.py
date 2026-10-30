@@ -71,13 +71,15 @@ def _maybe_log_monitor_report(tag: str) -> None:
     Imported lazily so that the monitor package is not pulled in for the
     common case where it is switched off. The import is not guarded: the
     package is part of this tree, so failing to import it is a bug to
-    surface, not an optional dependency to skip.
+    surface, not an optional dependency to skip. Building the report is
+    guarded by ``report_now``: these calls sit inside warmup, which a
+    diagnostic must not break.
     """
-    from tensorrt_llm._torch.memory.monitor import capture, render_capture
+    from tensorrt_llm._torch.memory.monitor.triggers import report_now
 
-    snapshot = capture(tag=tag)
-    if snapshot is not None:
-        logger.info("\n" + render_capture(snapshot))
+    report = report_now(tag=tag)
+    if report is not None:
+        logger.info("\n" + report)
 
 
 def log_tensor_size(tag: str, tensor: torch.Tensor, **extra) -> None:
