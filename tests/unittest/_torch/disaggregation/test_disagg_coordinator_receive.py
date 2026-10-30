@@ -204,6 +204,121 @@ def test_sync_receive_failure_under_multi_rank_adp_waits_for_the_synced_vote(syn
     assert ranks[1].effects.failed == [(_VOTE_MSG, [peer], False)]
 
 
+def _cp_dist(
+    peer_failed_ids, *, enable_attention_dp=False, tp_size=1, pp_size=1
+) -> SimpleNamespace:
+    """Dist stub for CP rank 0 of N = len(peer_failed_ids) + 1 CP ranks.
+
+    ``peer_failed_ids`` holds one id list per CP peer. ``cp_allgather`` records
+    each payload and returns it followed by those lists. Under attention DP,
+    ``world_size`` is tp x N x pp so errors wait for the synced vote, and
+    ``tp_allgather`` gathers this rank alone; otherwise ``world_size`` is 1 and
+    errors fail at once."""
+
+    def cp_allgather(ids, *, small_payload=False):
+        dist.gathered.append(list(ids))
+        return [ids, *peer_failed_ids]
+
+    cp_size = len(peer_failed_ids) + 1
+    world_size = tp_size * cp_size * pp_size if enable_attention_dp else 1
+    dist = SimpleNamespace(
+        rank=0,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        world_size=world_size,
+        gathered=[],
+    )
+    dist.cp_allgather = cp_allgather
+    dist.tp_allgather = lambda obj: [obj]
+    return dist
+
+
+def test_sync_receive_that_failed_on_a_cp_peer_fails_here_too(sync_mode) -> None:
+    """A blocking receive settles on its own rank. A request this CP rank
+    received but a CP peer failed is failed here as well, so the helix CP ranks
+    keep decoding the same batch; the rest keep their outcome."""
+    dist = _cp_dist([[2]])
+    h = CoordinatorHarness(dist=dist)
+    first, second = _gen_init(h, 1), _gen_init(h, 2)
+
+    h.coordinator.receive_gen_init([first, second])
+
+    assert dist.gathered == [[]]
+    assert first.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert second.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == [(_GEN_ERROR_MSG, [second], False)]
+
+
+def test_sync_receive_failure_here_is_shared_with_cp_peers(sync_mode) -> None:
+    dist = _cp_dist([[]])
+    h = CoordinatorHarness(dist=dist)
+    failing, received = _gen_init(h, 1), _gen_init(h, 2)
+    h.transceiver.script_sync_recv(failing, "error")
+
+    h.coordinator.receive_gen_init([failing, received])
+
+    assert dist.gathered == [[1]]
+    assert received.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert h.effects.failed == [(_GEN_ERROR_MSG, [failing], False)]
+
+
+def test_sync_receive_failed_on_a_cp_peer_under_adp_reaches_the_synced_vote(sync_mode) -> None:
+    """Under attention DP the error waits for the synced pass, whose vote spans
+    only the TP group; the CP gather already put it in error on this CP rank."""
+    dist = _cp_dist([[1]], enable_attention_dp=True)
+    h = CoordinatorHarness(dist=dist, enable_attention_dp=True)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == []
+
+    h.coordinator.handle_errors_synced()
+
+    assert h.effects.failed == [(_VOTE_MSG, [req], False)]
+
+
+@pytest.mark.parametrize(
+    "tp_size,pp_size,gathers",
+    [
+        pytest.param(2, 2, False, id="tp2_pp2_skips"),
+        pytest.param(1, 2, True, id="tp1_pp2_gathers"),
+        pytest.param(2, 1, True, id="tp2_pp1_gathers"),
+    ],
+)
+def test_sync_receive_failure_gather_under_attention_dp_follows_pp_scheduling(
+    sync_mode, tp_size, pp_size, gathers
+) -> None:
+    """Under attention DP with tp_size > 1 the PP loop schedules on each first-stage
+    rank, so the CP ranks may hold different requests and cannot share one gather;
+    it is skipped there. Every other layout gives the CP ranks the same requests."""
+    dist = _cp_dist([[1]], enable_attention_dp=True, tp_size=tp_size, pp_size=pp_size)
+    h = CoordinatorHarness(dist=dist, enable_attention_dp=True)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert dist.gathered == ([[]] if gathers else [])
+    assert req.state == (
+        LlmRequestState.DISAGG_TRANS_ERROR
+        if gathers
+        else LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    )
+
+
+def test_sync_receive_without_cp_does_not_gather(sync_mode) -> None:
+    dist = _cp_dist([])
+    dist.cp_allgather = Mock(side_effect=AssertionError("no CP peer to gather with"))
+    h = CoordinatorHarness(dist=dist)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
+
 def test_gen_only_benchmark_marks_requests_complete_without_a_transceiver_call(
     gen_only_benchmark,
 ) -> None:
@@ -518,8 +633,9 @@ def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyEx
         }
     )
     executor.sampler = SimpleNamespace(setup_sampler_step=record_batch("sampler"))
-    executor.model_engine = SimpleNamespace(enable_spec_decode=False)
+    executor.model_engine = SimpleNamespace()
     executor.draft_model_engine = None
+    executor.enable_spec_decode = False
     executor._handle_errors = Mock()
 
     finish = coordinator.try_finish_gen_receive

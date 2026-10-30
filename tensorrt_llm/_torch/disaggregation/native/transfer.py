@@ -67,7 +67,10 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 )
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    AttentionPolicy,
+    RingMapper,
+)
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
@@ -130,6 +133,9 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # Context-first receivers send REQUEST_DATA only after the context phase
+    # produced the KV cache, so a TxSession must already exist (or have ended).
+    context_first: bool = False
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -145,6 +151,7 @@ class RecvReqInfo:
                 "aux_slot": self.aux_slot,
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
+                "context_first": self.context_first,
             }
         )
 
@@ -643,6 +650,11 @@ class Sender(SenderBase):
         Called opportunistically from the listener thread when a new REQUEST_DATA
         arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
         entries that are never consumed; this sweep prevents unbounded growth.
+
+        A context-first entry that no TxSession claimed within the TTL never will
+        be (the session already ended, or the receiver names a request this rank
+        never had), so its receiver is told that the transfer failed instead of
+        waiting for data that will not arrive.
         """
         now = time.monotonic()
         with self._peer_requests_lock:
@@ -653,12 +665,32 @@ class Sender(SenderBase):
             ]
         if not stale_rids:
             return
+        orphaned_infos: list[RecvReqInfo] = []
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
                 if rid not in self._sessions and rid in self._peer_requests:
-                    self._peer_requests.pop(rid, None)
+                    req_info_map = self._peer_requests.pop(rid)
                     self._peer_requests_timestamps.pop(rid, None)
+                    orphaned_infos.extend(
+                        info for info in req_info_map.values() if info.context_first
+                    )
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
+        for info in orphaned_infos:
+            self._fail_orphaned_receiver(info)
+
+    def _fail_orphaned_receiver(self, info: RecvReqInfo) -> None:
+        """Report FAILED for a context-first REQUEST_DATA that no TxSession claimed.
+
+        This resolves the receiver's task, so its RxSession fails through the
+        normal transfer-failure path. The sweep runs on the executor and listener
+        threads, so the message goes through a worker queue.
+        """
+        logger.warning(
+            f"KV transfer request rid={info.unique_rid} from receiver "
+            f"{info.instance_name} rank {info.instance_rank} has no TxSession on this "
+            f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
+        )
+        self._send_failed_result_to_receiver(info, defer_to_worker=True)
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -1319,6 +1351,16 @@ class Sender(SenderBase):
         fall out of the same intersection without any per-case arithmetic.
         Ordinals below ``dst_start_block`` are excluded as well.
         """
+        idx = Sender._paired_ordinals(src_block_ids, dst_block_ids, dst_start_block)
+        return src_block_ids[idx], dst_block_ids[idx]
+
+    @staticmethod
+    def _paired_ordinals(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        dst_start_block: int = 0,
+    ) -> np.ndarray:
+        """Table positions where both sides hold a block (see ``_pair_ordinals``)."""
         if src_block_ids.size != dst_block_ids.size:
             raise ValueError(
                 f"positional block tables differ in length: src={src_block_ids.size} "
@@ -1327,8 +1369,28 @@ class Sender(SenderBase):
         mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
         if dst_start_block > 0:
             mask[:dst_start_block] = False
-        idx = np.flatnonzero(mask)
-        return src_block_ids[idx], dst_block_ids[idx]
+        return np.flatnonzero(mask)
+
+    @staticmethod
+    def _ring_position_ranges(
+        global_ordinals: np.ndarray,
+        tokens_per_block: int,
+        end_position: int,
+        retained_positions: int,
+    ) -> list[tuple[int, int]]:
+        """Most recent positions each ring page holds at ``end_position``.
+
+        A ring page holds only the positions of its own block, and of those
+        only the last ``retained_positions`` before ``end_position`` survive
+        in both rings.
+        """
+        first = max(0, end_position - retained_positions)
+        ranges = []
+        for ordinal in global_ordinals:
+            start = max(first, int(ordinal) * tokens_per_block)
+            end = min(end_position, (int(ordinal) + 1) * tokens_per_block)
+            ranges.append((start, max(start, end)))
+        return ranges
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1395,7 +1457,8 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
+                helix_stride = peer_ri.cp_size > 1 and self_ri.cp_size == 1
+                if helix_stride:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
@@ -1409,9 +1472,10 @@ class Sender(SenderBase):
                 # held), so pairing is a plain intersection: SWA eviction, prefix
                 # reuse, and pipelined chunk bounds are all already encoded as
                 # holes by whichever side owns that state.
-                src_block_ids, dst_block_ids = Sender._pair_ordinals(
+                paired = Sender._paired_ordinals(
                     src_block_ids, dst_block_ids, dst_start_block=dst_start_block
                 )
+                src_block_ids, dst_block_ids = src_block_ids[paired], dst_block_ids[paired]
                 if src_block_ids.size == 0:
                     continue
                 src_region = extractor.extract(src_block_ids, self_lg, self_pi)
@@ -1419,7 +1483,24 @@ class Sender(SenderBase):
 
             # Map and collect fragments (same for all layer types)
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-            region_pair = mapper.map(src_region, dst_region)
+            if isinstance(mapper, RingMapper):
+                # A ring holds positions, not a region: move the positions both
+                # rings retain at the end of this piece into each side's slots.
+                global_ordinals = (
+                    paired * peer_ri.cp_size + peer_ri.cp_rank if helix_stride else paired
+                )
+                region_pair = mapper.map_positions(
+                    src_region.memory.ptrs,
+                    dst_region.memory.ptrs,
+                    Sender._ring_position_ranges(
+                        global_ordinals,
+                        tpb,
+                        int(token_range.end),
+                        mapper.retained_positions,
+                    ),
+                )
+            else:
+                region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
             for rp in region_pairs:
                 src_frag_parts.append(rp.src.memory.ptrs)
@@ -1555,7 +1636,9 @@ class Sender(SenderBase):
         except Exception:
             if owned:
                 task.retire_unsubmitted_physical_operation(info.instance_rank)
-                self._send_failed_task_result_to_receiver(task, info)
+            # The receiver counts on one terminal result from every writer it
+            # asked; without it the request would wait out its transfer timeout.
+            self._send_failed_task_result_to_receiver(task, info)
             raise
 
     def _start_listener(self):
@@ -2754,6 +2837,7 @@ class Receiver(ReceiverBase):
             dst_start_token=None,
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
+            context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
         )
 
     @staticmethod

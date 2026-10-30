@@ -38,7 +38,12 @@ from tensorrt_llm.inputs import (
     default_multimodal_input_loader,
     prompt_inputs,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_args import (
@@ -85,16 +90,17 @@ def test_nemotron_nano_registers_native_multimodal_epd_components():
     assert NemotronHMultimodalModel.support_mm_disagg is True
 
 
-def _assert_nano_video_handoff(handoff):
+def _assert_nano_video_handoff(prompt_token_ids, params):
     """Shared assertions for the EPD video handoff: split runs stay grouped under one MM item."""
-    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
-    assert handoff.multimodal_lengths == [8]
-    assert handoff.multimodal_positions == [1]
-    assert handoff.multimodal_embedding_lengths == [4]
-    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
-    assert handoff.multimodal_run_positions == [1, 6]
-    assert handoff.multimodal_run_lengths == [4, 4]
-    assert handoff.special_token_offsets == [0, 3, 4, 7]
+    assert prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert params.multimodal_input.multimodal_lengths == [8]
+    assert params.multimodal_input.multimodal_positions == [1]
+    assert params.item_metadata.item_refs == (("video", 0),)
+    assert params.item_metadata.output_embedding_lengths == (4,)
+    assert params.multimodal_input.multimodal_item_run_cu_offsets == [0, 2]
+    assert params.multimodal_input.multimodal_run_positions == [1, 6]
+    assert params.multimodal_input.multimodal_run_lengths == [4, 4]
+    assert params.multimodal_data["special_token_offsets"] == [0, 3, 4, 7]
 
 
 @pytest.mark.parametrize(
@@ -137,19 +143,20 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
     )
 
     video = VideoData(frames=[object()], metadata={}, audio=None)
-    handoff = processor.build_disagg_prefill_multimodal_inputs(
+    prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
         {
             input_field: input_value,
             "multi_modal_data": {"video": [video]},
         },
         [{"tensor_size": (4, 16)}],
+        mm_hashes=[[1] * 8],
     )
 
     if asserts_encode_not_called:
         processor._tokenizer.encode.assert_not_called()
         processor.expand_prompt_token_ids_for_mm.assert_called_once()
         assert processor.expand_prompt_token_ids_for_mm.call_args.args[0] == [101, 98, 102]
-    _assert_nano_video_handoff(handoff)
+    _assert_nano_video_handoff(prompt_token_ids, params)
 
 
 @pytest.mark.parametrize(
@@ -297,13 +304,15 @@ def test_get_vision_encoder_cuda_graph_config():
     assert _get_vision_encoder_cuda_graph_config(mm_config) is config
 
 
-def test_get_vision_encoder_cuda_graph_config_rejects_unknown_modalities():
+def test_get_vision_encoder_cuda_graph_config_ignores_other_towers():
+    vision_config = MultimodalEncoderCudaGraphConfig(buckets=[(1280, 1)])
     mm_config = MultimodalConfig(
-        encoder_cuda_graph={"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
+        encoder_cuda_graph={
+            "vision": vision_config,
+            "audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)]),
+        }
     )
-
-    with pytest.raises(ValueError, match="Unsupported multimodal encoder CUDA graph modalities"):
-        _get_vision_encoder_cuda_graph_config(mm_config)
+    assert _get_vision_encoder_cuda_graph_config(mm_config) is vision_config
 
 
 @pytest.fixture(scope="function")
@@ -493,82 +502,6 @@ def test_nemotron_nano_v2_vl_model_sanity_check(
         print("Passed! Max difference is within tolerance")
 
 
-@pytest.mark.threadleak(enabled=False)
-def test_nemotron_nano_v2_vl_image_batch_equivalence(nano_llm_model):
-    """End-to-end equivalence check for cross-request image batching.
-
-    Two distinct image+prompt requests are sent (a) together in one
-    `generate` call so the engine batches them in a single forward step
-    (and thus a single `_encode_image_group` invocation with two
-    multimodal_params), and (b) separately in two `generate` calls. With
-    greedy decoding, the resulting token IDs must be identical and the
-    logprobs must match within bf16 tolerance. This is intended to detect
-    cross-request leakage or ordering bugs introduced by a future change
-    that batches per-modality across requests inside the vision encoder.
-    """
-    nano_llm = nano_llm_model
-    test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
-    prompts = [
-        "Describe the natural environment in the image.",
-        "Describe the object and the weather condition in the image.",
-    ]
-    media = [str(test_data_root / "seashore.png"), str(test_data_root / "inpaint.png")]
-
-    sampling_params = SamplingParams(
-        max_tokens=16,
-        temperature=0.0,
-        add_special_tokens=False,
-        return_generation_logits=True,
-    )
-
-    def _build_inputs(prompts_subset, media_subset):
-        return default_multimodal_input_loader(
-            tokenizer=nano_llm.tokenizer,
-            model_dir=MODEL_PATH,
-            model_type="NemotronH_Nano_VL_V2",
-            modality="image",
-            prompts=prompts_subset,
-            media=media_subset,
-            image_data_format="pt",
-            num_frames=8,
-            device="cpu",
-        )
-
-    # Path A: both requests in one generate call -> engine batches them.
-    batched_inputs = _build_inputs(prompts, media)
-    batched_outputs = nano_llm.generate(batched_inputs, sampling_params)
-    assert len(batched_outputs) == 2
-
-    # Path B: each request in its own generate call.
-    sep_outputs = []
-    for p, m in zip(prompts, media):
-        sep_inputs = _build_inputs([p], [m])
-        sep_outputs.append(nano_llm.generate(sep_inputs, sampling_params)[0])
-
-    for i, (b_out, s_out) in enumerate(zip(batched_outputs, sep_outputs)):
-        b_token_ids = list(b_out.outputs[0].token_ids)
-        s_token_ids = list(s_out.outputs[0].token_ids)
-        assert b_token_ids == s_token_ids, (
-            f"Request {i}: token_ids differ between batched and separate runs.\n"
-            f"  batched : {b_token_ids}\n"
-            f"  separate: {s_token_ids}"
-        )
-
-        b_logp = extract_decode_logprobs(b_out).cpu()
-        s_logp = extract_decode_logprobs(s_out).cpu()
-        max_diff = (b_logp - s_logp).abs().max().item()
-        # bf16 reductions in attention / layernorm produce small but
-        # nonzero diffs between batched-forward and per-request-forward
-        # even for the same input. Token IDs (greedy) are the stronger
-        # equivalence signal; logprobs use a looser tolerance, well
-        # below the 0.3 threshold used by the sanity test.
-        assert max_diff < 0.15, (
-            f"Request {i}: logprob diff too large ({max_diff:.4f}).\n"
-            f"  batched : {b_logp}\n"
-            f"  separate: {s_logp}"
-        )
-
-
 class _ForceTokenScript(LogitsProcessor):
     """Force greedy decoding onto `script`, leaving all other logits untouched.
 
@@ -595,28 +528,19 @@ class _ForceTokenScript(LogitsProcessor):
         self._step += 1
 
 
-@pytest.mark.threadleak(enabled=False)
-def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model: LLM) -> None:
-    """Batched and separate runs of two video requests must produce matching logits.
+def _assert_batch_equivalence(
+    nano_llm: LLM, modality: str, prompts: list[str], media: list[str]
+) -> None:
+    """Batched and separate runs of two requests must produce matching logits.
 
-    Both runs are teacher-forced onto each request's own greedy continuation, so every step
-    is computed from the same prefix. Free-running tokens are not comparable: batching shifts
-    logits by about one bf16 ULP, which flips near-tied tokens.
+    This guards against cross-request leakage or ordering bugs when the vision encoder batches
+    multimodal inputs across requests. Both runs are teacher-forced onto each request's own
+    greedy continuation, so every step is computed from the same prefix. Free-running tokens
+    are not comparable: batching shifts logits by about one bf16 ULP, which flips near-tied
+    tokens.
     """
-    nano_llm = nano_llm_model
-    test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
-    prompts = [
-        "Describe the scene in the video briefly.",
-        "Describe the natural environment in the video.",
-    ]
-    # Distinct clips so a cross-request mix-up is visible. The small clip goes second: it
-    # preprocesses quickly enough to join the first request's decode.
-    media = [
-        str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
-        str(test_data_root / "world.mp4"),
-    ]
     max_tokens = 16
-    # Batching noise is about one bf16 ULP (0.25 at these logit magnitudes); cross-request
+    # Batching noise is about one bf16 ULP (<= 0.25 at these logit magnitudes); cross-request
     # leakage moves logits by whole units.
     logit_tolerance = 1.0
 
@@ -624,7 +548,7 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model: LLM) -> Non
         tokenizer=nano_llm.tokenizer,
         model_dir=MODEL_PATH,
         model_type="NemotronH_Nano_VL_V2",
-        modality="video",
+        modality=modality,
         prompts=prompts,
         media=media,
         image_data_format="pt",
@@ -672,6 +596,38 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model: LLM) -> Non
             f"Request {i}: batched vs separate logits differ by {max_diff:.4f} at step "
             f"{int(per_step.argmax())}; per-step max: {[round(v, 4) for v in per_step.tolist()]}"
         )
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_nemotron_nano_v2_vl_image_batch_equivalence(nano_llm_model: LLM) -> None:
+    test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
+    _assert_batch_equivalence(
+        nano_llm_model,
+        "image",
+        prompts=[
+            "Describe the natural environment in the image.",
+            "Describe the object and the weather condition in the image.",
+        ],
+        media=[str(test_data_root / "seashore.png"), str(test_data_root / "inpaint.png")],
+    )
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model: LLM) -> None:
+    test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
+    # The small clip goes second so it joins the first request's decode.
+    _assert_batch_equivalence(
+        nano_llm_model,
+        "video",
+        prompts=[
+            "Describe the scene in the video briefly.",
+            "Describe the natural environment in the video.",
+        ],
+        media=[
+            str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+            str(test_data_root / "world.mp4"),
+        ],
+    )
 
 
 @pytest.mark.cpu_only
@@ -973,7 +929,8 @@ class TestEncodeAudio:
             mask[i, :vl] = 1
         return {"input_audio_features": features, "feature_attention_mask": mask}
 
-    def test_batched_matches_per_input(self):
+    @pytest.mark.parametrize("precomputed_lengths", [False, True])
+    def test_batched_matches_per_input(self, precomputed_lengths):
         """Bucket output equals N singleton `_encode_audio` calls.
 
         Compares ``encode([a1, a2])`` against ``[encode([a1])[0], encode([a2])[0]]``
@@ -989,6 +946,12 @@ class TestEncodeAudio:
         # Two inputs with different time / clip counts.
         a1 = self._make_audio_data(num_clips=2, time_len=10, valid_lens=[10, 6])
         a2 = self._make_audio_data(num_clips=1, time_len=14, valid_lens=[12])
+        if precomputed_lengths:
+            a1["audio_output_lengths"] = torch.tensor([5, 3])
+            a2["audio_output_lengths"] = torch.tensor([6])
+            model.sound_encoder.encoder._get_subsampling_output_length = mock.Mock(
+                side_effect=AssertionError("Forward must reuse host output lengths")
+            )
 
         per_input_results = [
             NemotronHMultimodalModel._encode_audio(model, [a1])[0],
@@ -997,6 +960,7 @@ class TestEncodeAudio:
         batched_results = NemotronHMultimodalModel._encode_audio(model, [a1, a2])
 
         assert len(batched_results) == 2
+        assert [counts for _, counts in batched_results] == [[5, 3], [6]]
         for (b_emb, b_counts), (s_emb, s_counts) in zip(batched_results, per_input_results):
             assert b_counts == s_counts
             assert torch.allclose(b_emb, s_emb, atol=1e-6, rtol=1e-6)
@@ -1045,7 +1009,9 @@ class TestChunkedPrefillCaching:
             multimodal_data={
                 "modality_type": modality,
                 modality: nested,
-                "multimodal_embedding_lengths": [num_tokens],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [(modality, 0)], output_embedding_lengths=[num_tokens]
+                ),
                 **extra,
             },
             multimodal_runtime=runtime,

@@ -72,9 +72,8 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
         && compType == CUBLAS_COMPUTE_32F)
     {
         // TODO: remove this after cublas fix the heuristic for Spark
-        algo_list = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 121
-            ? &cublas_lut::spark_bf16_algo_list
-            : &cublas_lut::bf16_algo_list;
+        algo_list = tensorrt_llm::common::getSMVersion() == 121 ? &cublas_lut::spark_bf16_algo_list
+                                                                : &cublas_lut::bf16_algo_list;
     }
     else if (aType == CUDA_R_8F_E4M3 && compType == CUBLAS_COMPUTE_32F)
     {

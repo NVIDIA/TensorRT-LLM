@@ -134,6 +134,7 @@ def llm_check_output(llm: LLM,
                  similar_threshold=similar_threshold,
                  finish_reasons=finish_reasons,
                  stop_reasons=stop_reasons)
+    return outputs
 
 
 default_model_name = "Qwen3/Qwen3-0.6B"
@@ -447,7 +448,10 @@ def test_generate_with_stop_words():
         model=llama_model_path,
         kv_cache_config=global_kvcache_config,
     )
-    stop_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
+    # The model continues "A B C" with space-separated letters, so the token
+    # it generates for N is the space-prefixed " N"; with BPE tokenizers
+    # (e.g. Qwen3) that differs from the token of a bare "N".
+    stop_id = llm.tokenizer.encode(" N", add_special_tokens=False)[-1]
 
     llm_check_output(llm,
                      prompts, ["D E F G H I J K L M"],
@@ -637,21 +641,29 @@ def test_generate_with_bad_words():
         kv_cache_config=global_kvcache_config,
     )
 
-    bad_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
+    # The model continues "A B C" with space-separated letters, so the tokens
+    # it generates are the space-prefixed ones (" N", " I", " J"); with BPE
+    # tokenizers (e.g. Qwen3) these differ from the tokens of bare "N" / "I J".
+    bad_id = llm.tokenizer.encode(" N", add_special_tokens=False)[-1]
 
     llm_check_output(llm,
-                     prompts, ["D E F G H I J K L M\n\nI hope this"],
+                     prompts, ["D E F G H I J K L M\nA B C D"],
                      sampling_params=SamplingParams(max_tokens=15,
                                                     bad_token_ids=[bad_id]))
 
-    llm_check_output(llm,
-                     prompts, ["D E F G H I K L M N O P Q R S"],
-                     sampling_params=SamplingParams(max_tokens=15, bad="I J"))
+    # Similarity alone also accepts the unbanned " ... I J K ..." output, so
+    # also check that the banned sequence was not generated.
+    outputs = llm_check_output(llm,
+                               prompts, ["D E F G H I K L M N O P Q R S"],
+                               sampling_params=SamplingParams(max_tokens=15,
+                                                              bad=" I J"))
+    assert " I J" not in outputs[0].outputs[0].text
 
-    llm_check_output(llm,
-                     prompts, ["D E F G H I K L M N O P Q R S"],
-                     sampling_params=SamplingParams(max_tokens=15,
-                                                    bad=["F E", "I J"]))
+    outputs = llm_check_output(llm,
+                               prompts, ["D E F G H I K L M N O P Q R S"],
+                               sampling_params=SamplingParams(
+                                   max_tokens=15, bad=[" F E", " I J"]))
+    assert " I J" not in outputs[0].outputs[0].text
 
 
 class MyLogitsProcessor(LogitsProcessor):
@@ -1448,7 +1460,18 @@ def test_startup_metrics_by_server_info() -> None:
     second_response = asyncio.run(server.get_server_info())
     third_response = asyncio.run(server.get_server_info())
 
-    assert json.loads(first_response.body) == {
+    first, second, third = (json.loads(response.body)
+                            for response in (first_response, second_response,
+                                             third_response))
+    # The render fingerprint is covered by its own tests; here it only has to be
+    # present and the same on every call.
+    fingerprints = [
+        body.pop("render_fingerprint") for body in (first, second, third)
+    ]
+    assert fingerprints[0]["digest"]
+    assert fingerprints[0] == fingerprints[1] == fingerprints[2]
+
+    assert first == {
         "disaggregated_params": {},
         "startup_metrics": {},
     }
@@ -1460,8 +1483,8 @@ def test_startup_metrics_by_server_info() -> None:
             }
         },
     }
-    assert json.loads(second_response.body) == expected_success
-    assert json.loads(third_response.body) == expected_success
+    assert second == expected_success
+    assert third == expected_success
     assert executor.calls == 2
 
 

@@ -138,7 +138,7 @@ The throughput benchmark utilizes a fixed JSON schema to specify requests. The s
 
 | Key             | Required |     Type      | Description                                     |
 | :-------------- | :------: | :-----------: | :---------------------------------------------- |
-| `task_id`       |    Y     |    String     | Unique identifier for the request.              |
+| `task_id`       |    Y     |    Integer    | Unique identifier for the request.              |
 | `prompt`        |    N*    |    String     | Input text for a generation request.            |
 | `input_ids`     |    Y*    | List[Integer] | List of token IDs that make up the request prompt. |
 | `output_tokens` |    Y     |    Integer    | Number of generated tokens for this request.    |
@@ -150,14 +150,14 @@ defined at the same time. If you specify `input_ids`, the `prompt` entry is igno
 
 Refer to the following examples of valid entries for the benchmark:
 
-- Entries with a human-readable prompt and no logits.
+- Entries with a human-readable prompt and no token IDs.
 
   ```json
   {"task_id": 1, "prompt": "Generate an infinite response to the following: This is the song that never ends, it goes on and on my friend.", "output_tokens": 1000}
   {"task_id": 2, "prompt": "Generate an infinite response to the following: Na, na, na, na", "output_tokens": 1000}
   ```
 
-- Entries which contain logits.
+- Entries which contain token IDs (`input_ids`).
 
   ```json
   {"task_id":0,"input_ids":[863,22056,25603,11943,8932,13195,3132,25032,21747,22213],"output_tokens":128}

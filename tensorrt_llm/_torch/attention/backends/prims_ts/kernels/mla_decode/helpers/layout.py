@@ -54,7 +54,7 @@ def num_softmax_scale_groups(cfg: MlaConfig) -> int:
     """Return the number of independent softmax scale groups per thread."""
     if cfg.kernel_variant == "keeps_mma_ab":
         return 1
-    return max(cfg.tile_size_q // 4, 4)
+    return max(cfg.tile_size_q // 4, 2)
 
 
 def num_s_regs_per_thread(cfg: MlaConfig) -> int:
@@ -73,6 +73,8 @@ def softmax_scratch_words(cfg: MlaConfig) -> int:
 
 def num_packed_p_regs(cfg: MlaConfig) -> int:
     """Return the number of packed P registers per softmax thread."""
+    if cfg.kernel_variant == "keeps_mma_ab":
+        return cfg.tile_size_kv // (8 if cfg.is_fp8_qkv() else 4)
     q_repeats = max(cfg.tile_size_q // 8, 1)
     return (2 if cfg.is_fp8_qkv() else 4) * q_repeats
 

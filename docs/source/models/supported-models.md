@@ -16,8 +16,7 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV41ForCausalLM`            | DeepSeek-V4.1 (text decoder)       | —                                          |
 | `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | —                                          |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
-| `ExaoneMoeForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
-| `ExaoneMoeForCausalLM`               | K-EXAONE 2.0                       | `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B`         |
+| `ExaoneMoeForCausalLM`               | K-EXAONE, K-EXAONE 2.0             | `LGAI-EXAONE/K-EXAONE-236B-A23B`, `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B` |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
 | `Gemma4ForConditionalGeneration`     | Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` |
 | `Gemma4UnifiedForConditionalGeneration` | Gemma 4 12B Unified (encoder-free) | `google/gemma-4-12B`, `google/gemma-4-12B-it`              |
@@ -83,7 +82,7 @@ statuses for the same architecture in the two matrices.
 | `Gemma4ForConditionalGeneration` | Yes                | Yes        | Yes                        | No                    | Yes             | MTP                        | Yes           | No             | Yes                      | Yes                   | Yes             |
 | `Gemma4UnifiedForConditionalGeneration` | Yes                | Yes        | Yes                        | No                    | Yes             | No                         | Yes           | No             | Yes                      | Yes                   | Yes             |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | No             | Yes                      | Yes                   | Yes             |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | EAGLE-3 (Linear)           | Yes           | No             | N/A                      | Yes                   | Yes             |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | EAGLE-3 (Linear), DSpark [^21] | Yes           | No             | N/A                      | Yes                   | Yes             |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120/SM121 and in BF16/FP8 KV cache dtype.
@@ -93,7 +92,7 @@ statuses for the same architecture in the two matrices.
 [^10]: Audio requires a checkpoint with a `sound_config` and is supported only on the full (non-disaggregated) model path, not the EPD disaggregated path.
 [^11]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](source:examples/models/core/deepseek_v4/README.md) for setup and parallelism.
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
-[^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
+[^13]: Cosmos3-Nano and Cosmos3-Super Reasoner checkpoints use `Cosmos3ForConditionalGeneration`. Cosmos3-Edge Reasoner uses `Cosmos3EdgeForConditionalGeneration` (SigLIP2 vision encoder, 4608-11520-2048 projector, dense ReLU-squared decoder, interleaved mRoPE) and is BF16. The same Cosmos 3 checkpoints also support visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
 [^14]: Requires `transformers>=5.7.0`: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (`minicpmv4_6`) and the checkpoint ships no remote code (`auto_map`) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via `MiniCPMV4_6InputProcessor`).
 [^15]: Kimi K3 is only supported on NVIDIA Blackwell GPUs (`SM100` family); see the [Kimi K3 deployment guide](../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.md). Which recipes fit is set by the attention layout rather than by the GPU count: DEP16 (`enable_attention_dp: true`) replicates the BF16 non-expert weights on every rank (114 GB) on top of the MXFP4 routed experts at 16-way expert parallelism (90 GB), needing 210 GB per rank, so it requires GB300-class per-GPU memory. TEP16 (`enable_attention_dp: false`) shards those non-expert weights instead and needs 115 GB per rank; it is validated end-to-end on GB200 (`SM100`) at 16 GPUs. On B200 (`SM100`), kernel and module support is functional and covered by CI. Note that the FP8 weight-read path (TRTLLM-14765) does not relax the DEP16 requirement: the conversion runs after the weights are already resident in BF16, so it lowers the steady-state footprint but not the load-time peak.
 [^16]: Guided decoding for `Glm4MoeForCausalLM` is currently supported only with the `xgrammar` backend; `llguidance` is not working.
@@ -101,6 +100,7 @@ statuses for the same architecture in the two matrices.
 [^18]: NGram and standalone Suffix Automaton (SA) use model-free drafting on the PyTorch backend, so they are not listed in individual entries. This does not imply universal end-to-end support: compatibility depends on each model's multi-token verification and cache-management paths and may be untested or explicitly restricted.
 [^19]: KV cache reuse for hybrid recurrent-attention models requires an explicit recurrent-state snapshot policy, such as `kv_cache_config.mamba_state_config.periodic_snapshot_interval`; the model default disables reuse when no snapshot policy is configured.
 [^20]: Supports text, image, and video inputs, MTP (including with attention data parallelism), and FP8 KV cache. Image and video inputs require `transformers==5.17.0`. Beam search is not supported. See the [GLM-5.3-Flash deployment guide](../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.md) for setup and feature-specific requirements.
+[^21]: MiniMax-M3.1-Flash ships a standalone DSpark drafter in its `dspark/` directory (architecture `DSparkMiniMaxDraftModel`). Load it with `speculative_config: {decoding_type: DSpark, speculative_model: <checkpoint>/dspark, max_draft_len: 7}` (the drafter's block size is 7 and `max_draft_len` must match it). Keep KV cache block reuse enabled (the default): with `kv_cache_config.enable_block_reuse: false`, or on a disaggregated generation server, prompts of about 131k tokens or more fail with `Draft KV cache context resize failed`.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
@@ -146,6 +146,7 @@ not used to mark a feature as supported here.
 | `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested       | Yes                   | Untested                  | L + I     |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | No             | Yes                   | Untested                  | L + I + V |
 | `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes            | Untested              | Untested                  | L + I + V |
+| `Cosmos3EdgeForConditionalGeneration` [^13] | Yes               | Yes        | Untested        | Yes           | Untested       | Untested              | Untested                  | L + I + V |
 | `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
 | `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
 | `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested       | Yes                   | No                        | L + I     |
@@ -160,6 +161,54 @@ Note:
 
 The following optimizations are available to models that implement
 `MultimodalModelMixin`.
+
+### Encoder CUDA graphs
+
+For encoders with CUDA graph support, set a maximum batch size in the model's
+modality configuration. For example, pass this YAML through `trtllm-serve --config`:
+
+```yaml
+multimodal_config:
+  encoder_cuda_graph:
+    vision:
+      max_batch_size: 8
+```
+
+The encoder adapter automatically generates capture shapes for batch sizes 1 through 8,
+within `encoder_max_num_tokens` (or `max_num_tokens` when unset). Use the optional
+per-modality `max_num_tokens` to limit capture memory and startup work. Batch size counts
+independent encoder contexts: images, video frame groups, or audio chunks as defined by
+the encoder. It does not count concurrent API requests or the scheduler's atomic items.
+Larger or unsupported shapes fall back to eager execution. Graphs remain disabled by default.
+
+Each supported tower reads its own modality entry. An audio adapter uses the same settings,
+with its own shape, mask, and output rules:
+
+```yaml
+multimodal_config:
+  encoder_cuda_graph:
+    vision:
+      max_batch_size: 8
+    audio:
+      max_batch_size: 4
+      max_num_tokens: 2048
+```
+
+The second example requires a model with graph-enabled vision and audio towers. The current
+production integrations are Qwen3-VL and related Qwen vision encoders, RADIO (`vision`), and
+GLM5-Next (`image` instead of `vision`). The shared audio adapter interface is available,
+but production audio towers still need an implementation and model validation. Requesting an
+unsupported modality fails before any graphs are captured.
+
+Advanced users can supply `buckets: [[256, 1], [512, 2]]` instead of `max_batch_size`
+and `max_num_tokens`. Each pair specifies total real encoder tokens and an exact context count.
+Automatic shapes use per-context capacities starting at 256 tokens (or the available budget
+when smaller), doubling up to each batch size's token budget. Adapters can override these
+shapes for additional alignment constraints. Padded replay is enabled by default; disabling it
+requires an exact token-count match. Encoder graphs and encoder side-stream prefetch are
+mutually exclusive.
+
+### Side streams and embeddings cache
 
 | Model Architecture | Multimodal Encoder Side Stream | Multimodal Embeddings Cache |
 | ------------------ | ------------------------------ | --------------------------- |
@@ -218,7 +267,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
-| `MiniMaxAI/MiniMax-H3` | Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio) |
+| `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
+| `MiniMaxAI/MiniMax-H3` | Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -231,15 +281,16 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
-|---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | No |
-| **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |
-| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | Text Encoder TP |
+|---|---|---|---|---|---|---|---|---|---|--|--|--|---|
+| **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **LTX-2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **LTX-2.3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
+| **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
+| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |

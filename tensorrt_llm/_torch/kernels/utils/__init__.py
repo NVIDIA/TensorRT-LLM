@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared helpers for the architecture-neutral kernels.
+"""Helper modules for kernels under tensorrt_llm/_torch/kernels.
 
-Nothing is re-exported from this file on purpose: importing one kernel must
-not drag in the others, several of which are arch-gated.
+Nothing is re-exported from this file on purpose, so that importing one
+helper module does not drag in any other.
 """

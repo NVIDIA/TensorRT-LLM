@@ -103,6 +103,7 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
     )
 
 
+@torch.compile(dynamic=True, fullgraph=True)
 def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
                                    cache_buf_idx, work_items, n_writes,
                                    replay_step_width, replay_history_size):
@@ -401,11 +402,18 @@ class Mamba2Metadata:
     def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
                                    num_contexts: int):
         self.replay_num_decodes = 0
-        if not getattr(kv_cache_manager, 'use_replay_state_update', False):
+        get_replay_metadata = getattr(kv_cache_manager,
+                                      'get_replay_state_update_metadata', None)
+        replay_metadata = get_replay_metadata(
+        ) if get_replay_metadata is not None else None
+        if replay_metadata is None:
             return
         num_decodes = batch_size - num_contexts
         self.replay_num_decodes = num_decodes
         if num_decodes == 0:
+            return
+        # FlashInfer ring replay folds in-kernel and never reads work items.
+        if getattr(kv_cache_manager, "use_gdn_flashinfer_ring_replay", False):
             return
         use_gdn_all_layer_commit = getattr(
             kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False)
@@ -418,17 +426,6 @@ class Mamba2Metadata:
             # by the partitioned replay + all-layer commit path.
             if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
                 return
-
-        if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
-            raise RuntimeError(
-                "Replay state update is enabled, but the KV cache manager "
-                "does not expose replay state update metadata.")
-
-        replay_metadata = kv_cache_manager.get_replay_state_update_metadata()
-        if replay_metadata is None:
-            raise RuntimeError(
-                "Replay state update is enabled for a decode batch, but the "
-                "KV cache manager returned no replay state update metadata.")
 
         prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
         cache_buf_idx = replay_metadata.cache_buf_idx

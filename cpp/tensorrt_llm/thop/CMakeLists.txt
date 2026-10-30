@@ -75,6 +75,14 @@ add_th_common_family(
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp)
+target_include_directories(th_common_attention
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
+
+target_sources(
+  th_common_attention
+  PRIVATE "${KIMI_K3_MODEL_CSRC}/k3AttnResOp.cpp"
+          "${KIMI_K3_MODEL_CSRC}/k3MnnvlCommOp.cpp"
+          "${KIMI_K3_MODEL_CSRC}/k3MnnvlFusionOp.cpp")
 
 add_th_common_family(
   th_common_gemm_quant
@@ -152,7 +160,10 @@ add_th_common_family(
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
-  sageQuantizeOp.cpp)
+  sageQuantizeOp.cpp
+  blockCausalLayoutOp.cpp
+  rotateRowsOp.cpp
+  scatterKvSlotsOp.cpp)
 
 add_th_common_family(
   th_common_decoding
@@ -166,6 +177,10 @@ add_th_common_family(
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
+
+# GLM bindings keep their existing family targets; source lists live with the
+# model.
+add_subdirectory(glmMoeDsa)
 
 add_library(
   th_common SHARED

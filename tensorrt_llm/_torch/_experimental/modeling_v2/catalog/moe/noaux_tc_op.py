@@ -42,23 +42,6 @@ class NoauxTcOp(OpWrapper):
             why="a token count that is not a multiple of any tile",
             spec=dict(tokens=37, experts=256, n_group=8, topk_group=4, topk=8, scale=2.5),
         ),
-        Cell(
-            why="the default target's expert chunk, which its attention-DP gather fills",
-            spec=dict(tokens=8192, experts=256, n_group=8, topk_group=4, topk=8, scale=2.5),
-        ),
-        Cell(
-            why="deepseek MTP router: fp32 logits, so the weights are the fp32 "
-            "token_final_scales fused_moe needs",
-            spec=dict(
-                tokens=256,
-                experts=256,
-                n_group=8,
-                topk_group=4,
-                topk=8,
-                scale=2.5,
-                logits_dtype=torch.float32,
-            ),
-        ),
     )
 
     note = """

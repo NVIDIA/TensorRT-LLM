@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import FinishReason
 
 pytestmark = pytest.mark.cpu_only
@@ -27,6 +28,11 @@ pytestmark = pytest.mark.cpu_only
 
 def _executor() -> PyExecutor:
     executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
+    executor._kv_connector_failed = False
+    executor._kv_connector_has_pending = False
+    executor._closed = False
+    executor._resources_released = False
     executor.kv_connector_manager = Mock(spec=KvCacheConnectorManager)
     # Set explicitly: `capacity_only` is not on the spec, so a double that
     # leaves it unset fails loudly rather than silently lifting the executor
@@ -49,6 +55,7 @@ def _executor() -> PyExecutor:
     executor.canceled_req_ids = []
     executor.waiting_queue = Mock()
     executor.dist = SimpleNamespace(rank=0)
+    executor.enable_attention_dp = False
     executor._disagg_pp_termination_handler = None
     executor._do_terminate_request = Mock()
     executor._enqueue_responses = Mock()
@@ -171,18 +178,29 @@ def test_allocation_survives_until_the_completion_poll() -> None:
     executor._do_terminate_request.assert_not_called()
 
 
-def test_load_dispatch_marks_ownership_before_worker_launch(monkeypatch) -> None:
+@pytest.mark.parametrize("park_load", [False, True])
+def test_load_dispatch_marks_ownership_before_worker_launch(
+    monkeypatch: pytest.MonkeyPatch, park_load: bool
+) -> None:
     executor = _executor()
     connector = executor.kv_connector_manager
     calls = []
-    connector.take_scheduled_requests_pending_load.side_effect = lambda batch: calls.append("park")
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [_request()]
+
+    def park(scheduled: ScheduledRequests) -> None:
+        calls.append("park")
+        if park_load:
+            scheduled.reset_context_requests([])
+
+    connector.take_scheduled_requests_pending_load.side_effect = park
     connector.handle_metadata.side_effect = lambda: calls.append("metadata")
     connector.mark_prefix_loads_dispatched.side_effect = lambda: calls.append("own")
     connector.worker = Mock()
     connector.worker.start_load_kv.side_effect = lambda stream: calls.append("start")
     monkeypatch.setattr("torch.cuda.current_stream", lambda: None)
 
-    executor._kv_connector_start_batch(SimpleNamespace())
+    assert executor._kv_connector_start_batch(batch) == (not park_load, not park_load)
 
     assert calls == ["park", "metadata", "own", "start"]
 
@@ -323,6 +341,20 @@ def test_control_drain_waits_for_detached_connector_load() -> None:
     assert executor.control_requests == [pending]
 
 
+def test_control_drain_waits_for_peer_ranks_under_attention_dp() -> None:
+    executor = _executor()
+    executor.enable_attention_dp = True
+    executor.dist = SimpleNamespace(rank=0, world_size=2, tp_allgather=lambda drained: [drained, 0])
+    executor.waiting_queue = []
+    pending = SimpleNamespace(control_requires_drain=True)
+    executor.control_requests = [pending]
+    executor.kv_connector_manager.has_pending_loads.return_value = False
+
+    executor._handle_control_request()
+
+    assert executor.control_requests == [pending]
+
+
 @pytest.mark.parametrize("control_pending", [False, True])
 def test_completion_is_broadcast_without_new_requests(control_pending: bool) -> None:
     executor = _executor()
@@ -411,7 +443,7 @@ def test_completion_envelope_reaches_every_rank_without_a_compute_batch() -> Non
                 wire["payload"] = deepcopy(value)
             return deepcopy(wire["payload"])
 
-        def broadcast_count(value, root, *, rank=rank):
+        def broadcast_count(value, root, *, rank=rank, prefer_cpu=False):
             assert root == 0
             if rank == 0:
                 wire["count"] = value

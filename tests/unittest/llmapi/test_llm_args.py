@@ -52,11 +52,9 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
                                           EncodeCudaGraphConfig,
-                                          ExecutorMemoryType,
-                                          ExtendedRuntimePerfKnobConfig,
-                                          KvCacheConfig, MambaStateConfig,
-                                          MoeConfig, MTPDecodingConfig,
-                                          MultimodalConfig,
+                                          ExecutorMemoryType, KvCacheConfig,
+                                          MambaStateConfig, MoeConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           NGramDecodingConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
@@ -1049,8 +1047,9 @@ class TestKvCacheManagerV2AutoResolution:
                          id="disagg-nixl-python"),
         ],
     )
-    def test_required_v2_resolves_on_supported_routes(self,
-                                                      cache_transceiver_config):
+    def test_required_v2_resolves_on_supported_routes(
+            self,
+            cache_transceiver_config: CacheTransceiverConfig | None) -> None:
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
@@ -1064,7 +1063,8 @@ class TestKvCacheManagerV2AutoResolution:
         pytest.param("NIXL", "CPP", id="nixl-cpp"),
         pytest.param("UCX", "PYTHON", id="ucx-python"),
     ])
-    def test_required_v2_refuses_incompatible_disagg(self, backend, runtime):
+    def test_required_v2_refuses_incompatible_disagg(self, backend: str,
+                                                     runtime: str) -> None:
         """A required V2 is refused on the demotion arm, never demoted."""
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
@@ -1412,6 +1412,43 @@ def test_swa_endpoint_rewind_manager_selection(preference: str | None,
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("disabled",
+                         ["enable_block_reuse", "use_kv_cache_manager_v2"])
+def test_KvCacheConfig_branch_snapshot_requires_reuse_and_v2(
+        disabled: str) -> None:
+    with pytest.raises(ValidationError, match=disabled):
+        KvCacheConfig.model_validate({
+            disabled: False,
+            "block_reuse_config": {
+                "enable_branch_snapshot": True
+            },
+        })
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("preference", [None, "V1", "V2"])
+def test_branch_snapshot_auto_manager_selection(preference: str | None) -> None:
+
+    class Model:
+
+        @staticmethod
+        def get_preferred_kv_cache_manager_version(
+                config: object) -> str | None:
+            return preference
+
+    args = TorchLlmArgs(
+        model="dummy",
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2="auto",
+            block_reuse_config=BlockReuseConfig(enable_branch_snapshot=True)))
+    if preference == "V2":
+        assert _resolve_kv_cache_manager_v2_auto(args, Model) is True
+    else:
+        with pytest.raises(ValueError, match="enable_branch_snapshot"):
+            _resolve_kv_cache_manager_v2_auto(args, Model)
+
+
+@pytest.mark.cpu_only
 def test_BlockReuseConfig_reports_renamed_policy_field():
     with pytest.raises(ValidationError, match="block_reuse_config\\.policy"):
         KvCacheConfig.model_validate(
@@ -1506,15 +1543,13 @@ def test_KvCacheConfig_requires_v2_for_branch_snapshots():
 def test_KvCacheConfig_keeps_branch_snapshots_under_per_conversation():
     """per_conversation zeroes the periodic interval but not this flag."""
     config = KvCacheConfig(
-        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
-        mamba_state_config=MambaStateConfig(
-            periodic_snapshot_interval=64,
-            enable_branch_snapshot=True,
-        ),
+        block_reuse_config=BlockReuseConfig(policy="per_conversation",
+                                            enable_branch_snapshot=True),
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
     )
 
     assert config.mamba_state_config.periodic_snapshot_interval == 0
-    assert config.mamba_state_config.enable_branch_snapshot is True
+    assert config.block_reuse_config.enable_branch_snapshot is True
 
 
 @pytest.mark.parametrize("interval", [0, 64])
@@ -1543,6 +1578,35 @@ def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
     assert any("mamba_state_cache_interval' is deprecated" in message
                for message in warnings_seen)
     assert "mamba_state_cache_interval" not in config.model_dump()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_block_reuse", [True, False])
+def test_KvCacheConfig_migrates_deprecated_mamba_branch_snapshot(
+        monkeypatch, enable_block_reuse: bool) -> None:
+    warnings_seen = []
+    monkeypatch.setattr(llm_args_mod.logger, "warning",
+                        lambda message: warnings_seen.append(message))
+
+    config = KvCacheConfig(
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_config=MambaStateConfig(enable_branch_snapshot=True))
+
+    # The old flag had no effect without block reuse, so it is not copied then.
+    assert config.block_reuse_config.enable_branch_snapshot is enable_block_reuse
+    assert any(
+        "mamba_state_config.enable_branch_snapshot' is deprecated" in message
+        for message in warnings_seen)
+    assert "enable_branch_snapshot" not in config.model_dump(
+    )["mamba_state_config"]
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_rejects_conflicting_branch_snapshot_flags() -> None:
+    with pytest.raises(ValidationError, match="Cannot set both"):
+        KvCacheConfig(
+            block_reuse_config=BlockReuseConfig(enable_branch_snapshot=False),
+            mamba_state_config=MambaStateConfig(enable_branch_snapshot=True))
 
 
 @pytest.mark.cpu_only
@@ -1652,6 +1716,58 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
 
 @pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
+
+    def test_automatic_buckets_need_only_max_batch_size(self):
+        config = MultimodalEncoderCudaGraphConfig(max_batch_size=8)
+        assert config.max_batch_size == 8
+        assert config.max_num_tokens is None
+        assert config.buckets is None
+
+    def test_automatic_buckets_accept_token_cap(self):
+        config = MultimodalEncoderCudaGraphConfig(max_batch_size=8,
+                                                  max_num_tokens=1024)
+        assert config.max_num_tokens == 1024
+
+    @pytest.mark.parametrize("kwargs", [
+        {
+            "max_batch_size": 0
+        },
+        {
+            "max_batch_size": -1
+        },
+        {
+            "max_batch_size": 8,
+            "max_num_tokens": 0
+        },
+        {
+            "max_num_tokens": 1024
+        },
+        {
+            "buckets": [(256, 1)],
+            "max_batch_size": 8
+        },
+        {
+            "buckets": [(256, 1)],
+            "max_num_tokens": 1024
+        },
+    ])
+    def test_rejects_invalid_automatic_config(self, kwargs):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(**kwargs)
+
+    def test_both_modalities_accept_automatic_config(self):
+        config = MultimodalConfig(
+            encoder_cuda_graph={
+                "vision": {
+                    "max_batch_size": 8
+                },
+                "audio": {
+                    "max_batch_size": 4,
+                    "max_num_tokens": 2048
+                },
+            })
+        assert config.encoder_cuda_graph["vision"].max_batch_size == 8
+        assert config.encoder_cuda_graph["audio"].max_num_tokens == 2048
 
     def test_minimal_required_fields(self):
         config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])
@@ -2767,7 +2883,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        to bound startup time and CUDA graph memory; the model-engine filter
        (invariants 2 and 3) clamps out-of-range entries to the reachable ceiling
        and never invents sizes beyond this list.
-    2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
+    2. `filter_prefill_capture_num_tokens` caps the candidate list at
        `max_batch_size * (max_seq_len - 1)` --
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
@@ -2886,10 +3002,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             )
 
     def test_prefill_filter_sorts_dedupes_and_drops_nonpositive(self):
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_prefill_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, unrecordable = _filter_prefill_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             [256, 0, -1, 128, 256],
             max_num_tokens=512,
             max_batch_size=1,
@@ -2947,11 +3063,11 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         full ceiling shape. The filter must never invent sizes the user
         did not request.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
         candidates = [512, 1024, 2048, 4096, 8192, 13914]
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             candidates,
             max_num_tokens=65536,
             max_batch_size=896,
@@ -2962,10 +3078,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
     def test_piecewise_filter_clamps_multiple_oversized_candidates(self):
         """All above-ceiling candidates collapse to one ceiling entry."""
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             [64, 120, 128, 200, 256],
             max_num_tokens=256,
             max_batch_size=1,
@@ -2983,8 +3099,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         `unrecordable` so the warning fires. ISLs in the gap still get a
         graph at the nearest recordable size.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
         candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, enable_padding=True)
@@ -2997,7 +3113,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             f"{max_capturable}. Update this test if CudaGraphConfig "
             "behavior changed.")
 
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             candidates,
             max_num_tokens=128,
             max_batch_size=1,
@@ -3017,12 +3133,12 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         `unrecordable` is empty. The ceiling (128 here) coincides with the
         largest candidate so no extra entry is appended.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
         candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, enable_padding=True)
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             candidates,
             max_num_tokens=129,
             max_batch_size=1,
@@ -3036,10 +3152,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
     def test_piecewise_filter_does_not_double_append_ceiling(self):
         """Ceiling already present in candidates -> not duplicated."""
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, _ = _filter_piecewise_capture_num_tokens(
+        kept, _ = filter_prefill_capture_num_tokens(
             [1, 64, 128],
             max_num_tokens=129,
             max_batch_size=1,
@@ -3054,10 +3170,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         ceiling itself is not appended, so the warning "exceeds reachable
         ceiling 0; raise max_seq_len" fires for the full candidate list.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+        kept, unrecordable = filter_prefill_capture_num_tokens(
             [1, 2, 4],
             max_num_tokens=8,
             max_batch_size=1,
@@ -3072,10 +3188,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         The ceiling (1016 here) is not appended; iterations above the
         largest candidate run eagerly at their true size.
         """
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            _filter_piecewise_capture_num_tokens
+        from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+            filter_prefill_capture_num_tokens
 
-        kept, _ = _filter_piecewise_capture_num_tokens(
+        kept, _ = filter_prefill_capture_num_tokens(
             [1, 2, 4, 8],
             max_num_tokens=1024,
             max_batch_size=8,
@@ -3257,21 +3373,6 @@ class TestStrictBaseModelArbitraryArgs:
             KvCacheConfig(enable_block_reuse=True,
                           non_existent_field="should_fail")
         assert "non_existent_field" in str(exc_info.value)
-
-    def test_extended_runtime_perf_knob_config_arbitrary_args(self):
-        """Test that ExtendedRuntimePerfKnobConfig rejects arbitrary arguments."""
-        # Valid arguments should work
-        config = ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                               cuda_graph_mode=False)
-        assert config.multi_block_mode == True
-        assert config.cuda_graph_mode == False
-
-        # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
-            ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                          bogus_setting="should_fail")
-        assert "bogus_setting" in str(exc_info.value)
 
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""

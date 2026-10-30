@@ -157,11 +157,6 @@ public:
     static void serialize(SchedulerConfig const& schedulerConfig, std::ostream& os);
     static size_t serializedSize(SchedulerConfig const& schedulerConfig);
 
-    // ExtendedRuntimePerfKnobConfig
-    static ExtendedRuntimePerfKnobConfig deserializeExtendedRuntimePerfKnobConfig(std::istream& is);
-    static void serialize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::ostream& os);
-    static size_t serializedSize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
-
     // PeftCacheConfig
     static PeftCacheConfig deserializePeftCacheConfig(std::istream& is);
     static void serialize(PeftCacheConfig const& peftCacheConfig, std::ostream& os);

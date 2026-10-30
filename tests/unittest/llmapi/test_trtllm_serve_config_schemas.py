@@ -19,6 +19,7 @@ import copy
 import importlib.util
 import json
 import runpy
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,9 +81,68 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 0}}}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {
+                "multimodal_config": {
+                    "encoder_cuda_graph": {"audio": {"max_batch_size": 4, "max_num_tokens": 2048}}
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_cuda_graph": {"vision": {"buckets": [[256, 1]]}}}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "multimodal_config": {
+                    "encoder_cuda_graph": {"vision": {"max_batch_size": 8, "max_num_tokens": 0}}
+                }
+            },
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "dtype": "mixed_nvfp4_fp8",
+                    "mixed_precision_first_n": 1,
+                    "mixed_precision_last_n": 65,
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "dtype": "mixed_nvfp4_bfloat16",
+                    "mixed_precision_first_n": 255,
+                    "mixed_precision_last_n": 0,
+                }
+            },
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_first_n": -1}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_last_n": -1}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_config": {}}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
@@ -106,12 +166,39 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 1}}, True),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 2}}, True),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"attention_config": {"backend": "not-a-backend"}}, False),
     ],
 )
 def test_config_validation(
     schemas: dict[str, dict], filename: str, config: dict, valid: bool
 ) -> None:
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("field", ["transfer_timeout_sec", "control_grace_sec"])
+@pytest.mark.parametrize(("value", "valid"), [(0.5, True), (0.0, False), (-1.0, False)])
+def test_connector_timeout_constraints(
+    schemas: dict[str, dict], filename: str, field: str, value: float, valid: bool
+) -> None:
+    config = {"kv_connector_config": {"connector": "lmcache", field: value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("section", ["block_reuse_config", "mamba_state_config"])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
+def test_branch_snapshot_field_types(
+    schemas: dict[str, dict], filename: str, section: str, value: bool | str, valid: bool
+) -> None:
+    config = {"kv_cache_config": {section: {"enable_branch_snapshot": value}}}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 
@@ -450,6 +537,45 @@ def test_runtime_only_fields_are_preserved(nullable: bool, union: bool) -> None:
         assert validator.is_valid({"external_hook": value}) == (nullable and value is None)
 
 
+@pytest.mark.parametrize("decoding_type", ["Eagle", "Eagle3"])
+def test_eagle_yaml_draft_length(schemas: dict[str, dict], decoding_type: str) -> None:
+    from pydantic import TypeAdapter, ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import SpeculativeConfig
+
+    config = yaml.safe_load(f"""
+speculative_config:
+  decoding_type: {decoding_type}
+  speculative_model: /path/to/draft
+  max_draft_len: 8
+""")
+    adapter = TypeAdapter(SpeculativeConfig)
+    parsed = adapter.validate_python(config["speculative_config"])
+    assert parsed.max_draft_len == 8
+    assert parsed.max_total_draft_tokens == 8
+    assert adapter.validate_json(parsed.model_dump_json()).max_draft_len == 8
+
+    validators = [
+        Draft202012Validator(schemas[generator.SERVE_SCHEMA]),
+        Draft202012Validator(schemas[generator.DISAGG_SCHEMA]),
+    ]
+    for validator in validators:
+        validator.validate(config)
+    for section in ("context_servers", "generation_servers"):
+        validators[1].validate({section: config})
+
+    for retired_value in (None, 8):
+        invalid = copy.deepcopy(config)
+        invalid["speculative_config"]["num_eagle_layers"] = retired_value
+        invalid = yaml.safe_load(yaml.safe_dump(invalid))
+        with pytest.raises(ValidationError, match="num_eagle_layers"):
+            adapter.validate_python(invalid["speculative_config"])
+        for validator in validators:
+            assert not validator.is_valid(invalid)
+        for section in ("context_servers", "generation_servers"):
+            assert not validators[1].is_valid({section: invalid})
+
+
 def test_nested_validation_alias(schemas: dict[str, dict]) -> None:
     config = {"speculative_config": {"decoding_type": "Eagle3", "speculative_model_dir": "model"}}
     Draft202012Validator(schemas[generator.SERVE_SCHEMA]).validate(config)
@@ -548,6 +674,8 @@ def test_checked_in_schemas_are_current() -> None:
 def test_check_detects_stale_files_without_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
+    for name in ("generate_serve_schema", "generate_disagg_schema", "generate_visual_gen_schema"):
+        monkeypatch.setitem(generator.write_schemas.__globals__, name, lambda: {"type": "object"})
     paths = generator.write_schemas(tmp_path)
     generator.write_schemas(tmp_path, check=True)
     if change == "missing":
@@ -555,12 +683,104 @@ def test_check_detects_stale_files_without_writing(
     elif change == "modified":
         paths[0].write_text("{}\n", encoding="utf-8")
     else:
-        from tensorrt_llm import version
-
-        monkeypatch.setattr(version, "__version__", version.__version__ + ".post1")
+        version = generator._source_version() + ".post1"
+        monkeypatch.setitem(generator.write_schemas.__globals__, "_source_version", lambda: version)
     before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
     with pytest.raises(ValueError, match="Missing or stale configuration schemas"):
         generator.write_schemas(tmp_path, check=True)
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
     generator.write_schemas(tmp_path)
     generator.write_schemas(tmp_path, check=True)
+
+
+def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> None:
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    for filename, command in generator._SCHEMA_COMMANDS.items():
+        (schema_dir / filename).write_text(
+            json.dumps(
+                {
+                    "$comment": "preserve this metadata",
+                    "$id": f"https://example.invalid/old/{filename}",
+                    "title": f"TensorRT-LLM old {command}",
+                    "sentinel": {"preserved": True},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    command = [
+        sys.executable,
+        "-S",
+        str(_REPO_ROOT / "scripts/generate_trtllm_serve_schemas.py"),
+        "--sync-version",
+        "--output-dir",
+        str(schema_dir),
+    ]
+    before_sync = {path.name: path.read_bytes() for path in schema_dir.iterdir()}
+    result = subprocess.run(command + ["--check"], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "Missing or stale configuration schemas" in result.stderr
+    assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_sync
+
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    version = generator._source_version()
+    before_check = {}
+    for filename, expected_command in generator._SCHEMA_COMMANDS.items():
+        path = schema_dir / filename
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        assert schema["$id"] == f"{generator._DOCS_URL}/{version}/_static/schemas/{filename}"
+        assert schema["title"] == f"TensorRT-LLM {version} {expected_command}"
+        assert schema["$comment"] == "preserve this metadata"
+        assert schema["sentinel"] == {"preserved": True}
+        before_check[filename] = path.read_bytes()
+
+    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True)
+    assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_check
+
+
+@pytest.mark.parametrize(("indent", "sort_keys"), [(None, True), (2, False)])
+def test_version_metadata_sync_preserves_current_file_formatting(
+    tmp_path: Path, indent: int | None, sort_keys: bool
+) -> None:
+    """Current metadata must pass checks and updates without reformatting JSON."""
+    version = generator._source_version()
+    for filename, command in generator._SCHEMA_COMMANDS.items():
+        schema = {
+            "type": "object",
+            "title": f"TensorRT-LLM {version} {command}",
+            "$id": f"{generator._DOCS_URL}/{version}/_static/schemas/{filename}",
+        }
+        (tmp_path / filename).write_text(
+            json.dumps(schema, indent=indent, sort_keys=sort_keys) + "\n", encoding="utf-8"
+        )
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    for check in (True, False):
+        generator.sync_schema_version_metadata(tmp_path, check=check)
+        assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+@pytest.mark.parametrize("change", ["missing", "malformed"])
+def test_version_metadata_sync_validates_all_files_before_writing(
+    tmp_path: Path, change: str
+) -> None:
+    """A bad final snapshot must not leave preceding snapshots modified."""
+    paths = [tmp_path / filename for filename in generator._SCHEMA_COMMANDS]
+    for path in paths:
+        path.write_text('{"type": "object", "title": "old"}\n', encoding="utf-8")
+    if change == "missing":
+        paths[-1].unlink()
+        error = ValueError
+    else:
+        paths[-1].write_text("{\n", encoding="utf-8")
+        error = json.JSONDecodeError
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    with pytest.raises(error):
+        generator.sync_schema_version_metadata(tmp_path)
+
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before

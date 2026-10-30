@@ -127,7 +127,7 @@ class TmemOResource(MlaResource):
         # Consumer aux work creates the stage-tracking variables used by the
         # correction task after it waits for O.
         self._init_tmem_state(stage_info)
-        return Int32(0), Int32(0), Int32(1)
+        return Int32(0), Int32(0), Int32(0 if self.cfg.one_insts_kv_swap else 1)
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
@@ -138,7 +138,7 @@ class TmemOResource(MlaResource):
         """Initialize O-stage index variables for a persistent work tile."""
         # Reset O stage bookkeeping for each persistent work tile.
         del stage_info
-        return Int32(0), Int32(0), Int32(1)
+        return Int32(0), Int32(0), Int32(0 if self.cfg.one_insts_kv_swap else 1)
 
     @cute.jit
     def _tail_has_prior_o(self, stage_info: StageInfo):

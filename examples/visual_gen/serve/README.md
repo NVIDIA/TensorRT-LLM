@@ -40,6 +40,8 @@ Before running these examples, ensure you have:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml
    trtllm-serve $LLM_MODEL_DIR/Wan2.2-T2V-A14B-Diffusers --visual_gen_args ./configs/wan22.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --visual_gen_args ./configs/flux1.yml
+   # flux2.yml sets ulysses_size: 2 and therefore needs 2 GPUs; every other
+   # config in ./configs/ runs on a single GPU.
    trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --visual_gen_args ./configs/flux2.yml
    trtllm-serve $LLM_MODEL_DIR/LTX-2/ --visual_gen_args ./configs/ltx2.yml
    trtllm-serve $LLM_MODEL_DIR/Qwen-Image --visual_gen_args ./configs/qwen_image.yml
@@ -51,7 +53,14 @@ Before running these examples, ensure you have:
    tail -f /tmp/serve.log
 
    ```
-   For LTX-2, you need to provide a proper text_encoder_path in `./configs/ltx2.yml`.
+   LTX-2 needs a Gemma3 text encoder. `./configs/ltx2.yml` relies on the
+   built-in default (`google/gemma-3-12b-it`); to point at a local copy, set
+   `pipeline_config.text_encoder_path` — a nested key, not a top-level one:
+
+   ```yaml
+   pipeline_config:
+     text_encoder_path: /path/to/gemma-3-12b-it
+   ```
 
 ## Examples
 
@@ -382,8 +391,9 @@ unsupported frame count fails fast; combinations that only make sense together
 auto-compute with no `video` — are still reported by the worker, as a client
 error, once the request is running.
 
-> **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
-> `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
+> **Note:** LTX-2 generates video **with audio**. Its Gemma3 text encoder defaults to
+> `google/gemma-3-12b-it`; override it with `pipeline_config.text_encoder_path` in
+> `ltx2.yml` when serving from a local copy.
 
 ## Quick Reference - curl Examples
 
