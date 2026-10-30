@@ -132,7 +132,7 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     return mock_request
 
 
-def test_request_broadcaster_collects_conversation_params_with_none():
+def test_request_broadcaster_preserves_conversation_and_logits_params():
     conversation_params = ConversationParams(conversation_id="conv")
     source_items = [
         RequestQueueItem(

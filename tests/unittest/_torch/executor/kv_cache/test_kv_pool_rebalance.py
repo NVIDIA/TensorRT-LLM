@@ -1282,7 +1282,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
 class TestPpLoopDrainWiring:
     """The three points in ``_executor_loop_pp`` that make the drain work."""
 
-    def test_loop_queues_normally_when_no_rebalance_is_pending(self, monkeypatch):
+    def test_last_pp_rank_samples_owned_logits_without_rebalance(self, monkeypatch):
         """Without a drain, the last PP rank forwards and samples owned outputs."""
 
         class StopAfterSampling(RuntimeError):
