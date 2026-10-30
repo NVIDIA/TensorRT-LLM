@@ -5290,13 +5290,13 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
             calls += streaming.parse_streaming_increment(
                 text[i:i + 4], sample_tools).calls
         calls += streaming.finish(sample_tools).calls
-        # Keep the last name and parameters sent for each call.
+        # Assemble parameter deltas as the streaming client does.
         for call in calls:
             entry = streamed.setdefault(call.tool_index, {})
             if call.name:
                 entry["name"] = call.name
             if call.parameters:
-                entry["parameters"] = call.parameters
+                entry["parameters"] = entry.get("parameters", "") + call.parameters
         assert [(entry["name"], json.loads(entry["parameters"]))
                 for _, entry in sorted(streamed.items())] == [
                     ("get_weather", {}),
