@@ -77,6 +77,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManagerConfig,
     LayerId,
     PageIndexMode,
+    ReusePolicy,
     ReuseScope,
     SsmLayerConfig,
     _introspection,
@@ -1040,6 +1041,62 @@ def test_zero_size_filter_rejects_empty_local_cache() -> None:
 
     with pytest.raises(ValueError, match="at least one non-empty local cache layer"):
         manager._remove_zero_size_buffers(config)
+
+
+def test_zero_size_filter_preserves_layer_and_buffer_reuse_policies() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.pp_layers = [0, 1, 2, 3]
+    manager.num_layers = 4
+    manager.num_local_layers = 4
+    manager.layer_offsets = {0: 0, 1: 1, 2: 2, 3: 3}
+    manager.num_kv_heads_per_layer = [2, 0, 0, 0]
+    manager.head_dim_per_layer = [64, 64, 64, 64]
+    manager.max_attention_window_vec = [None, None, None, None]
+
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=1024)],
+                reuse_policy=ReusePolicy.PRIVATE,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(1), buffers=[BufferConfig(role=Role.KEY, size=0)]
+            ),
+            SsmLayerConfig(
+                layer_id=LayerId(2),
+                buffers=[
+                    BufferConfig(role=DataRole("ssm_state"), size=256),
+                    BufferConfig(role=DataRole("conv_state"), size=0),
+                    BufferConfig(role=DataRole("old_x"), size=64, reuse_policy=ReusePolicy.PRIVATE),
+                ],
+                reuse_policy=ReusePolicy.OPTIONAL,
+            ),
+            SsmLayerConfig(
+                layer_id=LayerId(3),
+                buffers=[BufferConfig(role=DataRole("ssm_state"), size=256)],
+                reuse_policy=ReusePolicy.PRIVATE,
+            ),
+        ],
+        commit_min_snapshot=True,
+    )
+
+    filtered = manager._remove_zero_size_buffers(config)
+
+    assert manager.pp_layers == [0, 2, 3]
+    assert [layer.layer_id for layer in filtered.layers] == [0, 1, 2]
+    attention_layer, split_layer, private_layer = filtered.layers
+    assert attention_layer.reuse_policy == ReusePolicy.PRIVATE
+    assert isinstance(split_layer, SsmLayerConfig)
+    assert split_layer.reuse_policy == ReusePolicy.OPTIONAL
+    assert [(buffer.role, buffer.reuse_policy) for buffer in split_layer.buffers] == [
+        (DataRole("ssm_state"), None),
+        (DataRole("old_x"), ReusePolicy.PRIVATE),
+    ]
+    assert isinstance(private_layer, SsmLayerConfig)
+    assert private_layer.reuse_policy == ReusePolicy.PRIVATE
 
 
 @pytest.mark.parametrize("sliding_window_size", [None, 8])

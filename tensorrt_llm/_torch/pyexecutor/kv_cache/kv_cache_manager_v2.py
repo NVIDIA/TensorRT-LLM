@@ -72,7 +72,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
     GPU_LEVEL,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     AttnLifeCycle,
     Batch,
     BatchDesc,
@@ -94,6 +93,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     PoolRebalanceConfig,
+    ReusePolicy,
     ReuseScope,
     SsmLayerConfig,
     SwaScratchReuseConfig,
@@ -309,7 +309,7 @@ class KVCacheLayerSpec:
     buffer_roles: tuple[DataRole, ...]
     sliding_window_size: Optional[int] = None
     num_sink_tokens: Optional[int] = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
     def __post_init__(self) -> None:
         if self.global_layer_id < 0:
@@ -3923,7 +3923,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
                 else:
-                    layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
+                    layers.append(
+                        SsmLayerConfig(
+                            layer_id=layer_id, buffers=buffers, reuse_policy=layer.reuse_policy
+                        )
+                    )
 
         if not layers:
             raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
@@ -4061,7 +4065,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     # Native SWA includes the next query's write position.
                     sliding_window_size=self.last_n + 1,
                     num_sink_tokens=self.first_n,
-                    reuse_policy=AttentionReusePolicy.REQUIRED,
+                    reuse_policy=ReusePolicy.REQUIRED,
                 )
             )
 

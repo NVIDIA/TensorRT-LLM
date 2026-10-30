@@ -1559,18 +1559,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("SHARED", kv::PageIndexMode::SHARED)
         .value("PER_LAYER", kv::PageIndexMode::PER_LAYER);
 
-    nb::enum_<kv::AttentionReusePolicy>(m, "AttentionReusePolicy")
-        .value("REQUIRED", kv::AttentionReusePolicy::REQUIRED)
-        .value("PRIVATE", kv::AttentionReusePolicy::PRIVATE)
-        .value("OPTIONAL", kv::AttentionReusePolicy::OPTIONAL);
+    nb::enum_<kv::ReusePolicy>(m, "ReusePolicy")
+        .value("REQUIRED", kv::ReusePolicy::REQUIRED)
+        .value("PRIVATE", kv::ReusePolicy::PRIVATE)
+        .value("OPTIONAL", kv::ReusePolicy::OPTIONAL);
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int, kv::AttentionReusePolicy>(), nb::arg("window_size").none(),
-            nb::arg("num_sink_blocks"), nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
+        .def(nb::init<std::optional<int>, int, kv::ReusePolicy>(), nb::arg("window_size").none(),
+            nb::arg("num_sink_blocks"), nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
-            nb::arg("tokens_per_block"), nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
+            nb::arg("tokens_per_block"), nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
         .def_ro("reuse_policy", &kv::AttnLifeCycle::reusePolicy)
@@ -1579,7 +1579,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__eq__", &kv::AttnLifeCycle::operator==);
 
     nb::class_<kv::SsmLifeCycle>(m, "SsmLifeCycle")
-        .def(nb::init<>())
+        .def(nb::init<kv::ReusePolicy>(), nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
+        .def_ro("reuse_policy", &kv::SsmLifeCycle::reusePolicy)
         .def(
             "get_stale_range", &kv::SsmLifeCycle::getStaleRange, nb::arg("history_length"), nb::arg("tokens_per_block"))
         .def("__eq__", &kv::SsmLifeCycle::operator==);
@@ -1788,21 +1789,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "may name a layer that named nothing.") DEF_COPY(kv::SparseCacheConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int>(), nb::arg("role"), nb::arg("size"),
-            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false,
-            nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(),
+            nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
+            nb::arg("is_sparse") = false, nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1,
+            nb::arg("reuse_policy") = std::nullopt)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
         .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup)
-        .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks) DEF_COPY(kv::BufferConfig);
+        .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks)
+        .def_rw("reuse_policy", &kv::BufferConfig::reusePolicy) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
-                 kv::AttentionReusePolicy, std::optional<kv::SparseCacheConfig>>(),
+                 kv::ReusePolicy, std::optional<kv::SparseCacheConfig>>(),
             nb::arg("layer_id"), nb::arg("buffers"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED,
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED,
             nb::arg("sparse_cache") = std::nullopt)
         .def_rw("sparse_cache", &kv::AttentionLayerConfig::sparseCache)
         .def_rw("layer_id", &kv::AttentionLayerConfig::layerId)
@@ -1817,7 +1820,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("SSM", kv::LayerType::SSM);
 
     nb::class_<kv::SsmLayerConfig>(m, "SsmLayerConfig")
-        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>>(), nb::arg("layer_id"), nb::arg("buffers"))
+        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, kv::ReusePolicy>(), nb::arg("layer_id"),
+            nb::arg("buffers"), nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
+        .def_rw("reuse_policy", &kv::SsmLayerConfig::reusePolicy)
         .def_rw("layer_id", &kv::SsmLayerConfig::layerId)
         .def_rw("buffers", &kv::SsmLayerConfig::buffers) DEF_COPY(kv::SsmLayerConfig);
 
@@ -2509,7 +2514,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             {
                 for (auto const& [lc, attention] : cache.manager().lifeCycles().attentionLifeCycles())
                 {
-                    if (!attention->allowsCheckpoint()
+                    if (!kv::allowsCheckpoint(*attention)
                         || (groups && std::find(groups->begin(), groups->end(), lc.value()) == groups->end()))
                     {
                         continue;
@@ -2692,10 +2697,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "ssm_life_cycle_id",
         [](kv::KvCacheManager& manager) -> std::optional<int>
         {
-            auto id = manager.lifeCycles().ssmLifeCycleId();
-            if (id.has_value())
-                return id->value();
-            return std::nullopt;
+            auto const& ids = manager.lifeCycles().ssmLifeCycleIds();
+            if (ids.size() > 1)
+                throw std::invalid_argument("Multiple SSM lifecycles; look up the layer group by layer ID");
+            return ids.empty() ? std::nullopt : std::optional<int>{ids.front().value()};
         },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     // Returns (num_tokens, pages) where pages[i] is None for a block with no page in
@@ -3728,14 +3733,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
         .def_prop_ro(
             "layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); },
-            "Layers grouped by shared lifecycle/pool allocation. The iteration order of the "
-            "layer lists (and of the groups) is NOT an API contract and may differ across "
-            "backends/runs; do not rely on it for buffer/pool memory order -- use "
-            "pool_group_descs (PoolGroupDesc.pools[i].base_address + coalesced_buffers) instead.")
+            "Deprecated: use buffer_grouping. Partitions uniform layers by lifecycle; raises RuntimeError "
+            "if any layer spans several groups. Member order does not describe physical memory order.")
+        .def_prop_ro(
+            "buffer_grouping", [](kv::KvCacheManager const& self) { return self.bufferGrouping().raw(); },
+            "Buffer membership indexed by CacheGroupId. Each buffer appears once; member order is unspecified.")
         .def(
             "get_layer_group_id",
             [](kv::KvCacheManager const& self, kv::LayerId layerId) { return self.getLayerGroupId(layerId).value(); },
-            nb::arg("layer_id"))
+            nb::arg("layer_id"),
+            "Deprecated: use get_buffer_group_id. Returns a uniform layer's group; raises RuntimeError for a split "
+            "layer.")
+        .def(
+            "get_buffer_group_id",
+            [](kv::KvCacheManager const& self, kv::LayerId layerId, kv::DataRole const& role)
+            { return self.getBufferGroupId(layerId, role).value(); },
+            nb::arg("layer_id"), nb::arg("role"), "CacheGroupId of one buffer of the layer.")
         .def(
             "get_sparse_cache_max_units",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)

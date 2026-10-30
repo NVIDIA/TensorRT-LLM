@@ -91,6 +91,7 @@ class PageIndexMode(enum.IntEnum):
     PER_LAYER = 1
 
 LifeCycleId = NewType("LifeCycleId", int)
+CacheGroupId: TypeAlias = LifeCycleId
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
@@ -100,21 +101,21 @@ class AttnLifeCycle:
         self,
         window_size: int | None,
         num_sink_blocks: int,
-        reuse_policy: AttentionReusePolicy = ...,
+        reuse_policy: ReusePolicy = ...,
     ) -> None: ...
     @staticmethod
     def make(
         window_size: int | None,
         num_sink_tokens: int | None,
         tokens_per_block: int,
-        reuse_policy: AttentionReusePolicy = ...,
+        reuse_policy: ReusePolicy = ...,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
     @property
     def num_sink_blocks(self) -> int: ...
     @property
-    def reuse_policy(self) -> AttentionReusePolicy: ...
+    def reuse_policy(self) -> ReusePolicy: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -282,6 +283,11 @@ class DiskCacheTierConfig:
 class BufferConfig:
     """One buffer of a layer's KV cache.
 
+    ``reuse_policy`` of ``None`` uses the layer's policy. Attention and SSM
+    buffers can override the layer's policy; the buffer then belongs to the
+    layer group for its effective policy and lifecycle properties while keeping
+    its layer ID, so one layer can span several layer groups.
+
     ``is_sparse`` marks a buffer whose history is too large for device memory and is read
     through a per-request device cache rather than directly (see
     :meth:`KVCacheManager.is_sparse`).
@@ -344,6 +350,7 @@ class BufferConfig:
     ``sparse_cache.unit_tokens`` and the page being densely packed, so a padded page is not
     expressible.
     """
+    reuse_policy: ReusePolicy | None = None
 
 @dataclass(slots=True)
 class SparseCacheConfig:
@@ -402,7 +409,7 @@ class SparseCacheConfig:
     ``max_cached_units`` and ``unit_tokens``.
     """
 
-class AttentionReusePolicy(enum.IntEnum):
+class ReusePolicy(enum.IntEnum):
     REQUIRED = 0
     PRIVATE = 1
     OPTIONAL = 2
@@ -421,7 +428,7 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
     sparse_cache: SparseCacheConfig | None = None
     """The sparse fetch path for this layer's sparse buffers, if it has one.
@@ -433,8 +440,16 @@ class AttentionLayerConfig:
 
 @dataclass(slots=True)
 class SsmLayerConfig:
+    """Recurrent buffers with a layer-level default reuse policy.
+
+    A buffer's ``reuse_policy`` overrides the default for that buffer.
+    OPTIONAL state is restored only when selected on first resume at the exact
+    matched endpoint. The caller initializes or reconstructs all fresh state.
+    """
+
     layer_id: LayerId
     buffers: list[BufferConfig]
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
@@ -668,7 +683,7 @@ class ReuseGroupStatus:
     def group_id(self) -> LayerGroupId: ...
     # REQUIRED constrains the match; OPTIONAL is selected at resume; PRIVATE is never reused.
     @property
-    def policy(self) -> AttentionReusePolicy: ...
+    def policy(self) -> ReusePolicy: ...
     # Exclusive token endpoint claimed by REQUIRED groups, shared by all groups.
     @property
     def endpoint(self) -> int: ...
@@ -1856,9 +1871,16 @@ class KVCacheManager:
     def num_layers(self) -> int: ...
     @property
     def layer_ids(self) -> Iterator[LayerId]: ...
+    # Deprecated: use get_buffer_group_id. Raises RuntimeError for a split layer.
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
+    def get_buffer_group_id(self, layer_id: LayerId, role: DataRole) -> CacheGroupId: ...
+    # Deprecated: use buffer_grouping. Raises RuntimeError if any layer is split.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
+    @property
+    def buffer_grouping(self) -> Sequence[Sequence[BufferId]]:
+        """Buffer membership indexed by CacheGroupId."""
+        ...
     @property
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
