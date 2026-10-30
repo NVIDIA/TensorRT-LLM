@@ -274,6 +274,13 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     quantize_input = quantize_input_nvfp4
 
+    def _join_pending_x_ready(self) -> None:
+        """Wait for the input-ready event handed to ``run_moe_nvfp4`` (once per forward)."""
+        event = getattr(self, "_pending_x_ready_event", None)
+        if event is not None:
+            event.wait()
+            self._pending_x_ready_event = None
+
     def run_moe(self, ctx: MoERunContext, *, workspace: dict | None = None) -> torch.Tensor:
         del workspace  # the fused kernel allocates its own intermediates
         plan = require_comm_plan(self, ctx)
@@ -313,12 +320,14 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             assert moe_output.size() == (token_final_scales.size(0), self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        # Join before the fused kernel reads x, or before returning an empty batch.
+        self._pending_x_ready_event = x_ready_event
+
         # Empty micro-batches: skip autotuning (synthetic grouped-GEMM inputs
         # require at least one output row).
         if token_selected_experts.size(0) == 0:
+            self._join_pending_x_ready()
             return moe_output
-
-        self._pending_x_ready_event = x_ready_event
 
         effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
