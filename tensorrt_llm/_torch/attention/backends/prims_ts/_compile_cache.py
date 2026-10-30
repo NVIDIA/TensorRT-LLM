@@ -121,17 +121,9 @@ def probe_cached():
 
 def expected_cache_meta() -> dict:
     """The on-disk module metadata this process would write (arch, DSL version, source hash)."""
-    from flashinfer.jit.cute_dsl_core import (
-        _get_compile_arch,
-        _get_cute_dsl_version,
-        _hash_source_files,
-    )
-
-    return {
-        "arch": _get_compile_arch(),
-        "cute_dsl_version": _get_cute_dsl_version(),
-        "source_sha256": _hash_source_files(tuple(_kernel_source_files())),
-    }
+    return _make_spec(
+        "prims_ts", "metadata", lambda: None, _kernel_source_files()
+    ).expected_meta
 
 
 def _unloaded_kernel(*args, **kwargs):
@@ -146,13 +138,37 @@ def is_placeholder(compiled) -> bool:
     return compiled is _unloaded_kernel
 
 
+def cache_compiled(compile_fn):
+    """Memoize loaded kernels, bypassing the memo for probe/persist plans.
+
+    A plan may return a kernel tuple or a callable. Bypassing the whole memo
+    keeps placeholders out of either shape and probes disk even after a normal
+    plan has loaded a kernel into this process.
+    """
+    cached = functools.cache(compile_fn)
+
+    @functools.wraps(compile_fn)
+    def wrapper(*args, **kwargs):
+        if _PRECOMPILE_MODE.get() is not None:
+            return compile_fn(*args, **kwargs)
+        return cached(*args, **kwargs)
+
+    wrapper.cache_clear = cached.cache_clear
+    wrapper.cache_info = cached.cache_info
+    return wrapper
+
+
 def _make_spec(module_name: str, kernel_name: str, compile_fn, key_files):
     from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
 
-    return JitSpecCuteDsl(module_name, kernel_name, compile_fn, _hash_source_files(tuple(key_files)))
+    return JitSpecCuteDsl(
+        module_name, kernel_name, compile_fn, _hash_source_files(tuple(key_files))
+    )
 
 
-def _precompile_kernel(module_name: str, kernel_name: str, compile_fn, key_files) -> None:
+def _precompile_kernel(
+    module_name: str, kernel_name: str, compile_fn, key_files
+) -> None:
     """Compile one kernel into the on-disk cache unless it is already there.
 
     One compile per kernel per workspace: a sibling that wants the same kernel
@@ -168,7 +184,10 @@ def _precompile_kernel(module_name: str, kernel_name: str, compile_fn, key_files
     spec = _make_spec(module_name, kernel_name, compile_fn, key_files)
     if spec.is_compiled:
         return
-    lock = FileLock(get_tmpdir() / f"{spec.module_dir_name}.{spec.kernel_name}.lock", thread_local=False)
+    lock = FileLock(
+        get_tmpdir() / f"{spec.module_dir_name}.{spec.kernel_name}.lock",
+        thread_local=False,
+    )
     if _SKIP_BUSY.get():
         try:
             lock.acquire(timeout=0)
@@ -180,6 +199,8 @@ def _precompile_kernel(module_name: str, kernel_name: str, compile_fn, key_files
         if spec.is_compiled:
             return
         spec.compile_and_persist()
+        if not spec.is_compiled:
+            raise RuntimeError(f"PrimTS kernel was not persisted: {spec.name}")
     finally:
         lock.release()
 
@@ -214,8 +235,10 @@ def build_and_load_attention_kernel(
     )
 
     mode = _PRECOMPILE_MODE.get()
-    if mode is not None and os.environ.get("FLASHINFER_DISABLE_JIT"):
-        raise RuntimeError("PrimTS warm-up precompile cannot compile with FLASHINFER_DISABLE_JIT set.")
+    if mode == "persist" and os.environ.get("FLASHINFER_DISABLE_JIT"):
+        raise RuntimeError(
+            "PrimTS warm-up precompile cannot compile with FLASHINFER_DISABLE_JIT set."
+        )
     if cute_dsl_cache_disabled():
         if mode is not None:
             raise RuntimeError(
@@ -227,7 +250,9 @@ def build_and_load_attention_kernel(
     key = _compile_cache_key(spec, options, extra)
     if key is None:
         if mode is not None:
-            raise RuntimeError("PrimTS warm-up precompile cannot key this kernel for the on-disk cache.")
+            raise RuntimeError(
+                "PrimTS warm-up precompile cannot key this kernel for the on-disk cache."
+            )
         return compile_fn()
     import torch
 
@@ -237,11 +262,19 @@ def build_and_load_attention_kernel(
     major, minor = torch.cuda.get_device_capability()
     if mode == "persist":
         _precompile_kernel(
-            f"prims_ts_{family}", f"{kind}_sm{major}{minor}_{key}", compile_fn, _kernel_source_files()
+            f"prims_ts_{family}",
+            f"{kind}_sm{major}{minor}_{key}",
+            compile_fn,
+            _kernel_source_files(),
         )
         return _unloaded_kernel
     if mode == "probe":
-        _probe_kernel(f"prims_ts_{family}", f"{kind}_sm{major}{minor}_{key}", compile_fn, _kernel_source_files())
+        _probe_kernel(
+            f"prims_ts_{family}",
+            f"{kind}_sm{major}{minor}_{key}",
+            compile_fn,
+            _kernel_source_files(),
+        )
         return _unloaded_kernel
     return build_and_load_cute_dsl_kernel(
         f"prims_ts_{family}",
