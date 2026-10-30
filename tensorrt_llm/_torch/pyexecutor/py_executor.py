@@ -6917,7 +6917,7 @@ class PyExecutor:
         with self.perf_manager.record_perf_events(gpu_forward_start,
                                                   gpu_forward_end):
             self._forward_step(scheduled_batch)
-        sampler_event = torch.cuda.Event()
+        sampler_event = torch.cuda.Event(blocking=True)
         sampler_event.record()
         self._update_request_states(scheduled_batch)
         sampling_requests = scheduled_batch.context_requests_last_chunk + scheduled_batch.generation_requests

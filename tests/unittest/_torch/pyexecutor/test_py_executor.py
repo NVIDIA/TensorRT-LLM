@@ -104,6 +104,54 @@ def _run_forward_step(executor, batch, new_tensors=None):
         return PyExecutor._forward_step(executor, batch, new_tensors)
 
 
+def test_intermediate_pp_records_blocking_sampler_event_before_host_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the actual intermediate-PP producer and SamplerEvent host wait.
+
+    CUDA work is substituted here; GPU ordering/liveness validation remains
+    separate. The factory arguments catch an ordinary-event regression.
+    """
+    from tensorrt_llm._torch.pyexecutor.sampler import SampleState
+
+    operations = []
+    event = Mock()
+    event.record.side_effect = lambda: operations.append("record")
+    event.synchronize.side_effect = lambda: operations.append("host-wait")
+    factory = Mock(side_effect=lambda **kwargs: operations.append(("event", kwargs)) or event)
+    monkeypatch.setattr(torch.cuda, "Event", factory)
+    context_request, generation_request = object(), object()
+    batch = types.SimpleNamespace(context_requests_last_chunk=[context_request],
+                                  generation_requests=[generation_request])
+    start, end = object(), object()
+    perf = Mock(record_perf_events=Mock(return_value=nullcontext()))
+    executor = types.SimpleNamespace(
+        perf_manager=perf,
+        _forward_step=Mock(side_effect=lambda value: operations.append("forward")),
+        _update_request_states=Mock(side_effect=lambda value: operations.append("update")),
+        sampler=types.SimpleNamespace(SampleState=SampleState),
+        runtime_draft_len=0,
+    )
+
+    state = PyExecutor._forward_step_inter_pp(executor, batch, start, end)
+
+    factory.assert_called_once_with(blocking=True)
+    perf.record_perf_events.assert_called_once_with(start, end)
+    executor._forward_step.assert_called_once_with(batch)
+    executor._update_request_states.assert_called_once_with(batch)
+    event.record.assert_called_once_with()
+    event.synchronize.assert_not_called()
+    assert state.requests == [context_request, generation_request]
+    assert state.runtime_draft_len == 0
+    assert operations == ["forward", ("event", {"blocking": True}), "record", "update"]
+
+    # The PP loop performs this exact wrapper wait before relaying a batch;
+    # do not substitute a GPU stream wait for its host completion contract.
+    state.sampler_event.synchronize()
+    event.synchronize.assert_called_once_with()
+    assert operations[-1] == "host-wait"
+
+
 @pytest.mark.parametrize(
     ("shutdown_method", "releases_model_owned_graphs"),
     [

@@ -50,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
     _get_max_beam_width,
     _request_get_sampling_params,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import AsyncWorkerMixin
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
     RowSamplingParams,
     SamplingMode,
@@ -61,6 +62,65 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import LogprobMode, SamplingParams
+
+
+@pytest.fixture
+def host_wait_event_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    event_factory = torch.cuda.Event
+    calls: list[dict[str, Any]] = []
+
+    def create_event(*args: Any, **kwargs: Any) -> torch.cuda.Event:
+        calls.append(dict(kwargs))
+        return event_factory(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "Event", create_event)
+    return calls
+
+
+class TestSamplerHostWaitEvents:
+    def test_main_event_waits_for_device_result(
+        self, host_wait_event_calls: list[dict[str, Any]]
+    ) -> None:
+        worker = AsyncWorkerMixin()
+        worker._async_worker_init(False)
+        values = torch.arange(16, dtype=torch.float32, device="cuda").mul_(2)
+        event = worker._record_sampler_event()
+        event.synchronize()
+        torch.testing.assert_close(values.cpu(), torch.arange(16).float() * 2)
+        assert host_wait_event_calls == [{"blocking": True}]
+
+    def test_side_stream_copy_is_ready_after_sampler_wait(
+        self, host_wait_event_calls: list[dict[str, Any]]
+    ) -> None:
+        worker = AsyncWorkerMixin()
+        worker._async_worker_init(False)
+        values = torch.arange(16, dtype=torch.float32, device="cuda").add_(7)
+        with worker._make_side_stream_copier() as copier:
+            host_values = copier.stage_copy_to_host(values)
+        event = worker._record_sampler_event(side_stream_event=copier.event)
+        event.synchronize()
+        torch.testing.assert_close(host_values, torch.arange(16).float() + 7)
+        assert host_wait_event_calls == [{"blocking": True}, {"blocking": True}]
+
+    def test_async_copy_keeps_snapshot_until_future_completes(
+        self, host_wait_event_calls: list[dict[str, Any]]
+    ) -> None:
+        worker = AsyncWorkerMixin()
+        worker._async_worker_init(True)
+        worker.async_worker_start()
+        try:
+            values = torch.arange(16, dtype=torch.float32, device="cuda").add_(9)
+            host_values = worker._copy_to_host(values)
+            values.add_(100)
+            event = worker._record_sampler_event()
+            event.synchronize()
+            assert event.worker_futures
+            for future in event.worker_futures:
+                future.result(timeout=10)
+            torch.testing.assert_close(host_values, torch.arange(16).float() + 9)
+            assert host_wait_event_calls == [{"blocking": True}, {"blocking": True}]
+        finally:
+            worker.async_worker_stop()
 
 
 class TestSetupSamplerStepRequestSelection:
