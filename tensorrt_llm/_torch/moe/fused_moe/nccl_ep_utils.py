@@ -21,6 +21,7 @@ are created in ``communication/nccl_ep.py``. ``use_internal_fp8_dispatch`` gates
 the persistent FP8 scales receive buffer.
 """
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -201,20 +202,11 @@ class NcclEpContext:
         # a downgraded library, but do not probe a non-public config field.
         self.kernel_resets_recv_topk_idx = nccl_ep_supports_version("0.2")
 
-        # Capability probe for the opportunistic zero-copy dispatch path.
-        # When the Pythonic GroupConfig facade exposes `zero_copy` (i.e.,
-        # the wheel was built against a libnccl_ep.so that has the field
-        # in ncclEpGroupConfig_t), we allocate a VMM-backed,
-        # window-registered dispatch output buffer; the LL dispatch
-        # opportunistically picks zero-copy when recv_x->win_hdl is set
-        # (nvlink-only + rank-major + !fp8). The config flag itself stays
-        # AUTO/OFF -- strict zero_copy=ON requires combine inputs to be
-        # windowed too, which would force a caller-side interface change
-        # (the MLP output is caller-owned). The C-side strict-ON check
-        # remains in the library for future use.
-        self.zerocopy_enabled = not (
-            use_internal_fp8_dispatch or external_fp8 or external_nvfp4
-        ) and "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
+        # NCCL-EP selects direct access to registered windows
+        # or staging for each operation in its default opportunistic mode.
+        self.window_buffers_supported = "zero_copy" in getattr(
+            GroupConfig, "__dataclass_fields__", {}
+        )
 
         # MPI sub-communicator scoped to the EP group. Mirrors the
         # DeepEPLowLatency pattern (see deep_ep_utils.py:104): split
@@ -271,14 +263,7 @@ class NcclEpContext:
         device_id = torch.cuda.current_device()
         device = torch.device("cuda", device_id)
 
-        # Dispatch output tokens: 3D [ep_size, max_tokens_per_rank, hidden]
-        # for LL rank-major. When zerocopy is enabled the buffer must be
-        # VMM-backed (cuMemMap) so ncclCommWindowRegister's internal
-        # cuMemGetAddressRange call succeeds -- torch's caching
-        # allocator returns plain cudaMalloc memory which fails that
-        # check with CUDA_ERROR_INVALID_VALUE. Allocate via
-        # nccl.core.mem_alloc (VMM-backed) then build a zero-copy torch
-        # view over the raw pointer via the TRT-LLM CAI wrapper.
+        # LL rank-major dispatch output: [ep_size, max_tokens_per_rank, token_width].
         token_dtype = torch.float8_e4m3fn if use_internal_fp8_dispatch else torch.bfloat16
         token_width = (
             hidden_size // 2
@@ -288,14 +273,17 @@ class NcclEpContext:
             else hidden_size
         )
         token_shape = (self.ep_size, max_tokens_per_rank, token_width)
-        # The operation-scoped zero-copy path acquires a registered window
-        # from TRT-LLM's NCCL pool in NcclEP.dispatch.  Keep this ordinary
-        # tensor only as the non-window fallback/template.
+        # Receive storage belongs to this context, outside temporary tensor
+        # scopes. Unrelated pool users must never borrow a remote-write target.
         self.output_tokens_buf = torch.empty(
             *token_shape,
             dtype=token_dtype,
             device=device,
         )
+        self._dispatch_reservation = None
+        self.dispatch_window = None
+        if self.window_buffers_supported:
+            self._reserve_dispatch_tokens()
         # Received topk indices: int32 [ep_size, max_tokens_per_rank, max_top_k]
         # for the LL rank-major dispatch contract. -1 marks invalid rows.
         # Downstream consumers want 2D [max_recv, max_top_k]; flatten via view.
@@ -343,11 +331,11 @@ class NcclEpContext:
                 device=device,
             )
 
-        # Wrap each persistent buffer as a Tensor descriptor. Torch owns the
-        # storage; the descriptor only carries shape + a pointer (+ window
-        # handle on dispatch output when zerocopy is on, so libnccl_ep's
-        # opportunistic LL zero-copy path can fire).
-        self.output_tokens_nd = Tensor(self.output_tokens_buf)
+        self.output_tokens_nd = (
+            Tensor(self.output_tokens_buf, window=self.dispatch_window, window_offset=0)
+            if self.dispatch_window is not None
+            else Tensor(self.output_tokens_buf)
+        )
         self.recv_topk_idx_nd = Tensor(self.recv_topk_idx_buf)
         self.recv_topk_weights_nd = Tensor(self.recv_topk_weights_buf)
         self.recv_rank_counter_nd = Tensor(self.recv_rank_counter_buf)
@@ -382,6 +370,20 @@ class NcclEpContext:
         if self._expert_id_kind_global is not None:
             self.dispatch_layout_info._lowpp.recv_topk_idx_kind = self._expert_id_kind_global
 
+    def _reserve_dispatch_tokens(self) -> None:
+        """Reserve registered pool storage for this context's complete lifetime."""
+        self._dispatch_reservation = torch.classes.trtllm.NCCLWindowReservation(
+            self.output_tokens_buf, self.mapping.moe_ep_group
+        )
+        handle = self._dispatch_reservation.window()
+        if handle:
+            # A pool checkout can have prior unrelated users. Local stream order
+            # is insufficient before peers start writing into this destination.
+            torch.cuda.synchronize(self.output_tokens_buf.device)
+            self._ep_mpi_comm.Barrier()
+            self.output_tokens_buf = self._dispatch_reservation.tensor()
+            self.dispatch_window = SimpleNamespace(handle=handle)
+
     def get_stream(self) -> int:
         """Current CUDA stream as a raw int handle (accepted by ``nccl.ep`` APIs)."""
         return torch.cuda.current_stream().cuda_stream
@@ -394,6 +396,11 @@ class NcclEpContext:
         first (uses the comm), then ``finalize`` + ``destroy`` on the comm
         (the recommended nccl4py pattern), then ``Free`` on the MPI comm.
         """
+        if self.dispatch_window is not None:
+            # No graph may be replayed after context destruction. Drain every
+            # local stream and peer before releasing a remote-write target.
+            torch.cuda.synchronize(self.output_tokens_buf.device)
+            self._ep_mpi_comm.Barrier()
         if self.ep_group is not None:
             unregister_moe_comm_timeout_proxy(self._timeout_proxy)
             try:
@@ -402,22 +409,14 @@ class NcclEpContext:
                 logger.warning(f"NCCL EP group destroy error: {e}")
             self.ep_group = None
 
-        # Deregister windows before the comm goes away. close() is
-        # idempotent and local; the comm would auto-close any leftover
-        # windows on destroy, but explicit LIFO release matches the rest
-        # of this teardown path. Both dispatch-output and combine-input
-        # windows are registered only when zerocopy is on.
-        for attr in ("_combine_input_window",):
-            w = getattr(self, attr, None)
-            if w is not None:
-                try:
-                    w.close()
-                except _NCCL_RUNTIME_ERRORS as e:
-                    logger.warning(f"NCCL EP window close error ({attr}): {e}")
-                setattr(self, attr, None)
-
+        if self.dispatch_window is not None:
+            self.dispatch_window = None
+        if self._dispatch_reservation is not None:
+            self._dispatch_reservation.release()
+        self.dispatch_outputs = None
         self.output_tokens_nd = None
         self.output_tokens_buf = None
+        self._dispatch_reservation = None
 
         if self.comm is not None:
             try:

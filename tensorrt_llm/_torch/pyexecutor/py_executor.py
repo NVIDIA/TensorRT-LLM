@@ -2249,6 +2249,11 @@ class PyExecutor:
                         release_model_owned_graphs=True)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            for engine in (self.model_engine, self.draft_model_engine):
+                release_ep = getattr(engine, '_release_nccl_ep_communications',
+                                     None)
+                if release_ep is not None:
+                    release_ep()
         self._closed = True
         del self.model_engine
         if self.draft_model_engine is not None:
@@ -2342,6 +2347,12 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if release_model_owned_graphs:
+            for engine in (self.model_engine, self.draft_model_engine):
+                release_ep = getattr(engine, '_release_nccl_ep_communications',
+                                     None)
+                if release_ep is not None:
+                    release_ep()
         if self.kv_cache_transceiver is not None:
             self.kv_cache_transceiver.shutdown()
         if self.resource_manager is not None:
