@@ -51,14 +51,12 @@ from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
 
 # yapf: disable
 # isort: off
-from ..bindings.executor import (BatchingType as _BatchingType,
-                                 CacheTransceiverBackendType as _CacheTransceiverBackendType,
+from ..bindings.executor import (CacheTransceiverBackendType as _CacheTransceiverBackendType,
                                  CacheTransceiverConfig as _CacheTransceiverConfig,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
                                  DecodingConfig,
                                  DynamicBatchConfig as _DynamicBatchConfig,
-                                 ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
@@ -2831,11 +2829,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         "The topK value for each layer when dynamic tree is enabled. Required "
         "when use_dynamic_tree is True; ignored (with a warning) when "
         "use_dynamic_tree is False.")
-    num_eagle_layers: Optional[int] = Field(
-        default=None,
-        description=
-        "Deprecated TensorRT-only field with different semantics from draft model "
-        "layer count. Do not use on the PyTorch backend.")
     _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
@@ -2857,7 +2850,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -4297,15 +4289,6 @@ class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
     """Combined metaclass for Enum and PybindMirror.  This is crucial."""
 
 
-@PybindMirror.mirror_pybind_enum(_BatchingType)
-class BatchingType(StrEnum, metaclass=PybindMirrorEnumMeta):
-    STATIC = "STATIC"
-    INFLIGHT = "INFLIGHT"
-
-    def _to_pybind(self):
-        return getattr(_BatchingType, self.value)
-
-
 @PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
 class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     MAX_UTILIZATION = "MAX_UTILIZATION"
@@ -5515,35 +5498,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.pool_ratio values must sum to 1.0")
         return v
-
-
-@PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
-class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
-    """Configuration for extended runtime performance knobs."""
-
-    multi_block_mode: bool = Field(
-        default=True, description="Whether to use multi-block mode.")
-
-    enable_context_fmha_fp32_acc: bool = Field(
-        default=False,
-        description="Whether to enable context FMHA FP32 accumulation.")
-
-    cuda_graph_mode: bool = Field(default=False,
-                                  description="Whether to use CUDA graph mode.")
-
-    cuda_graph_cache_size: int = Field(
-        default=0,
-        description=
-        "Number of cuda graphs to be cached in the runtime. The larger the cache, the better the perf, but more GPU memory is consumed."
-    )
-
-    def _to_pybind(self):
-        res = _ExtendedRuntimePerfKnobConfig(
-            multi_block_mode=self.multi_block_mode,
-            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
-        res.cuda_graph_mode = self.cuda_graph_mode
-        res.cuda_graph_cache_size = self.cuda_graph_cache_size
-        return res
 
 
 # Legacy env-var selectors for the "DEFAULT" cache-transceiver backend,

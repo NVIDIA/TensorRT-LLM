@@ -586,6 +586,12 @@ models:
         default: null
         status: stable
         required: false
+      service_tier:
+        kind: openai
+        type: Optional[Literal['auto', 'default', 'flex', 'scale', 'priority', 'fast']]
+        default: null
+        status: stable
+        required: false
       stop:
         kind: openai
         type: Optional[Union[str, List[str]]]
@@ -669,6 +675,12 @@ models:
         type: Optional[int]
         default: 0
         status: beta
+        required: false
+      client_metadata:
+        kind: extension
+        type: Optional[Dict[str, str]]
+        default: null
+        status: prototype
         required: false
       best_of:
         kind: extension

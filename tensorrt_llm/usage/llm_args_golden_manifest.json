@@ -1900,11 +1900,6 @@
     {
       "capture_policy": "int|none",
       "kind": "value",
-      "path": "speculative_config.num_eagle_layers"
-    },
-    {
-      "capture_policy": "int|none",
-      "kind": "value",
       "path": "speculative_config.num_nextn_predict_layers"
     },
     {
