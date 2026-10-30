@@ -10,7 +10,7 @@ starts a new block."""
 
 import pytest
 import torch
-from _torch.executor.engine_test_utils import DummyModelEngine, _create_request  # noqa: E402
+from _torch.pyexecutor.engine_test_utils import DummyModelEngine, _create_request  # noqa: E402
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import (

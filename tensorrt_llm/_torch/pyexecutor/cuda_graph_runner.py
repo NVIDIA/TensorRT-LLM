@@ -252,6 +252,8 @@ class CUDAGraphRunner:
     WARMUP_STEPS = 1
     # CUDAGraphRunnerConfig.short_long_seq_len_threshold, when the config set one.
     _configured_seq_len_threshold: Optional[int] = None
+    # Default for runners built without __init__ (test stubs).
+    _adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
