@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # ============================================================================
 # PRECEDENCE: last matching pattern wins — fallback first, module rules next, governance last.
 #
@@ -382,31 +384,29 @@
 /tests/unittest/scaffolding @WeiHaocheng @dc3671
 
 # ===== MODELING_V2 =====
-# Overrides the /tensorrt_llm/_torch runtime-devs rule above for this subtree.
-# Individual handles rather than a team, like SCAFFOLDING: this is one bounded
-# experiment with named owners, not a standing domain.
-/tensorrt_llm/_torch/_experimental/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-# What every modeling_v2 family library shares (the discovery and the common/
-# macros): the modeling_v2 owners, and the kernels owners because it is CUDA and
-# links against the stock libraries.
-/cpp/tensorrt_llm/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
-/cpp/cmake/modules/modeling_v2.cmake @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
-/tests/unittest/_torch/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-/tests/integration/defs/accuracy/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-# The two catalog categories whose contracts state kernel behaviour the
-# attention and MoE owners are the authority on; co-owned rather than reassigned.
-/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq
-/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/moe @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq
-# The GlmMoeDsa (GLM-5) model and its GLM-only kernels and ops: the GLM owners
-# co-own them with each parent path's owners.
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
-/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
-/cpp/tensorrt_llm/kernels/glmMoeDsa @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
-/cpp/tensorrt_llm/thop/glmMoeDsa/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
-# A family's native code lives in its csrc/ directories: the kernels owners
-# co-own it. Last, so it applies under the family rules above; a family with its
-# own owners adds them here.
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/ @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
+# Overrides parent runtime and test fallback ownership for Modeling V2.
+/tensorrt_llm/_torch/_experimental/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
+/cpp/tensorrt_llm/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-kernels-devs
+/cpp/cmake/modules/modeling_v2.cmake @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-kernels-devs
+/tests/unittest/_torch/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
+/tests/integration/defs/accuracy/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
+# Shared attention and MoE catalogs and tests follow their domain teams.
+/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/moe @NVIDIA/trt-llm-moe-devs
+/tests/unittest/_torch/modeling_v2/attention @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/modeling_v2/moe @NVIDIA/trt-llm-moe-devs
+/jenkins/scripts/cbts/cbts/rules/modeling_v2.py @NVIDIA/trt-llm-modeling_v2-dev
+/tests/unittest/scripts/cbts/test_modeling_v2.py @NVIDIA/trt-llm-modeling_v2-dev
+/tests/unittest/scripts/cbts/test_modeling_v2_rule.py @NVIDIA/trt-llm-modeling_v2-dev
+/tests/unittest/scripts/test_build_wheel_modeling_v2.py @NVIDIA/trt-llm-modeling_v2-dev
+# Family native code is shared with kernel owners unless a family overrides it.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/ @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-kernels-devs
+# GLM-specific code and tests, including native code, belong to the GLM owners.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa @dongfengy @Tabrizian @xwang233
+/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @dongfengy @Tabrizian @xwang233
+/tests/integration/defs/accuracy/modeling_v2/test_glm_moe_dsa.py @dongfengy @Tabrizian @xwang233
+/cpp/tensorrt_llm/kernels/glmMoeDsa @dongfengy @Tabrizian @xwang233
+/cpp/tensorrt_llm/thop/glmMoeDsa/ @dongfengy @Tabrizian @xwang233
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
