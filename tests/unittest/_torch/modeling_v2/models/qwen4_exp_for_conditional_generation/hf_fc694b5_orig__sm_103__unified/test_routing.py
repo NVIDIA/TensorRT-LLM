@@ -3,9 +3,10 @@
 """Qwen3.8-Flash-Next-NVFP4 routing at two and four ranks, driven by synthetic configs on CPU.
 
 Two families route `Qwen4ExpForConditionalGeneration`: `qwen4_exp` claims one rank and
-`qwen4_exp_for_conditional_generation` claims tp4, tep4 and dep4, and dep2 (the
-disaggregated-serving engines' layout) without speculation. Each layout lands on its own
-family's target, and the layouts neither one serves fall back under `auto`.
+`qwen4_exp_for_conditional_generation` claims tp4 and tep4 with or without MTP, and the
+attention-DP layouts dep4 and dep2 (the disaggregated-serving engines' layout) without
+speculation or a breakable prefill graph. Each layout lands on its own family's target,
+and the layouts neither one serves fall back under `auto`.
 """
 
 from dataclasses import replace
@@ -61,13 +62,13 @@ _LAYOUTS = {
 # the routed experts in two 256-expert windows.
 _DEP2 = dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2, enable_attention_dp=True)
 
-_SPECS = [
-    None,
-    MTPDecodingConfig(max_draft_len=1),
-    MTPDecodingConfig(max_draft_len=3),
-    MTPDecodingConfig(max_draft_len=7),
-]
-_SPEC_IDS = ["no-spec", "mtp1", "mtp3", "mtp7"]
+# The layouts with attention TP, which serve MTP and the breakable prefill graph, and the
+# attention-DP ones, which serve neither.
+_ATTENTION_TP = ["tp4", "tep4"]
+_ATTENTION_DP = {"dep4": _LAYOUTS["dep4"], "dep2": _DEP2}
+
+# Every draft length the target runs.
+_DRAFT_LENS = list(range(1, 8))
 
 
 def _qualified(target) -> str:
@@ -161,10 +162,19 @@ def test_routing_admits_exactly_what_the_target_implements():
 # --- each layout lands on its own family's target ---------------------------------
 
 
-@pytest.mark.parametrize("spec_config", _SPECS, ids=_SPEC_IDS)
 @pytest.mark.parametrize("member", sorted(_LAYOUTS))
-def test_each_member_routes_to_the_unified_target(member, spec_config):
-    config = _model_config(spec_config, **_LAYOUTS[member])
+def test_each_member_routes_to_the_unified_target(member):
+    config = _model_config(**_LAYOUTS[member])
+    assert routing.layout(config.mapping) == member
+    for dtype in ("bfloat16", "auto"):
+        _claimed(config, kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype=dtype))
+
+
+@pytest.mark.parametrize("max_draft_len", _DRAFT_LENS)
+@pytest.mark.parametrize("member", _ATTENTION_TP)
+def test_mtp_at_every_draft_length_routes_under_attention_tp(member, max_draft_len):
+    """The tune runs MTP at tp4 and tep4 over draft lengths 1 to 7."""
+    config = _model_config(MTPDecodingConfig(max_draft_len=max_draft_len), **_LAYOUTS[member])
     assert routing.layout(config.mapping) == member
     for dtype in ("bfloat16", "auto"):
         _claimed(config, kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype=dtype))
@@ -177,13 +187,38 @@ def test_dep2_routes_to_the_unified_target(dtype):
     _claimed(config, kv_cache_config=KvCacheConfig(dtype=dtype, mamba_ssm_cache_dtype="bfloat16"))
 
 
-@pytest.mark.parametrize("spec_config", _SPECS[1:], ids=_SPEC_IDS[1:])
-def test_dep2_declines_speculation(spec_config):
-    """dep2 serves the disaggregated engines' core configuration; no draft path was
-    measured there, so neither family claims it."""
-    config = _model_config(spec_config, **_DEP2)
-    assert routing.layout(config.mapping) == "dep2"
-    _declined(config, match="dep2 .attention DP, experts EP2. without speculative decoding")
+# --- what the target does not run under attention DP ------------------------------
+
+
+@pytest.mark.parametrize("max_draft_len", [1, 3, 7])
+@pytest.mark.parametrize("member", sorted(_ATTENTION_DP))
+def test_attention_dp_declines_speculation(member, max_draft_len):
+    """The MTP draft layer's FP8 expert window is completed by the attention-TP sum, which
+    under attention DP leaves out the other ranks' partials; neither family claims it."""
+    config = _model_config(MTPDecodingConfig(max_draft_len=max_draft_len), **_ATTENTION_DP[member])
+    assert routing.layout(config.mapping) == member
+    _declined(config, match=rf"speculative decoding with attention DP \({member}\)")
+
+
+@pytest.mark.parametrize("member", sorted(_ATTENTION_DP))
+def test_attention_dp_declines_the_breakable_prefill_graph(member):
+    """The engine pads every attention-DP rank to one prefill bucket, which a rank holding
+    only generation requests cannot take; neither family claims it."""
+    config = _model_config(**_ATTENTION_DP[member])
+    _declined(
+        config,
+        match=rf"prefill_cuda_graph_backend='breakable' with attention DP \({member}\)",
+        prefill_cuda_graph_backend="breakable",
+    )
+    _claimed(config, prefill_cuda_graph_backend="disabled")
+
+
+def test_attention_dp_declines_speculation_before_the_engine_choices(monkeypatch):
+    """A draft that the legacy recurrent path also refuses is declined for attention DP:
+    that is the structural reason, and no engine choice would lift it."""
+    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(MTPDecodingConfig(max_draft_len=7), **_LAYOUTS["dep4"])
+    _declined(config, match=r"speculative decoding with attention DP \(dep4\)")
 
 
 @pytest.mark.parametrize("spec_config", [None, MTPDecodingConfig(max_draft_len=3)])
@@ -319,8 +354,9 @@ def test_a_float32_state_cache_declines():
 
 
 @pytest.mark.parametrize("backend", ["disabled", "breakable"])
-def test_no_or_the_breakable_prefill_cuda_graph_matches(backend):
-    _claimed(_model_config(**_LAYOUTS["tep4"]), prefill_cuda_graph_backend=backend)
+@pytest.mark.parametrize("member", _ATTENTION_TP)
+def test_no_or_the_breakable_prefill_cuda_graph_matches(member, backend):
+    _claimed(_model_config(**_LAYOUTS[member]), prefill_cuda_graph_backend=backend)
 
 
 def test_the_piecewise_prefill_cuda_graph_declines():

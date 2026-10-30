@@ -52,10 +52,6 @@ _LAYOUTS = {
     (2, True, 1, 2): "dep2",
 }
 
-# The layouts a `speculative_config` is admitted at: dep2 serves the core configuration
-# only.
-_SPECULATIVE_LAYOUTS = ("tp4", "tep4", "dep4")
-
 # `moe_config.backend` requests the target implements (`_TRUNK_MOE_BACKENDS` in modeling.py).
 _MOE_BACKENDS = ("AUTO", "TRTLLM")
 
@@ -182,6 +178,27 @@ def _check_engine(
         )
 
 
+def _check_attention_dp(member: str, spec_config: Optional[Any], engine: EngineChoices) -> None:
+    """Decline what the target does not run under attention DP (dep4, dep2), where each rank
+    serves its own requests and only the routed experts cross ranks.
+
+    Routing admits both at the attention-TP layouts (tp4, tep4).
+    """
+    if spec_config is not None:
+        raise NoTarget(
+            f"speculative decoding with attention DP ({member}): the target's MTP draft layer "
+            "completes its FP8 expert window with the attention-TP sum, not the attention-DP "
+            "allgather / reduce-scatter round trip, so it would drop the other ranks' expert "
+            "partials, and no draft acceptance was measured under attention DP"
+        )
+    if engine.prefill_cuda_graph_backend == "breakable":
+        raise NoTarget(
+            f"prefill_cuda_graph_backend='breakable' with attention DP ({member}): the engine "
+            "pads every rank to one prefill bucket, so a rank holding only generation requests "
+            "is handed more rows than its batch, which the target's decode step refuses"
+        )
+
+
 @routes("Qwen4ExpForConditionalGeneration")
 def route(
     model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
@@ -237,8 +254,8 @@ def route(
         and spec_config.max_total_draft_tokens == spec_config.max_draft_len
     )
 
-    # Qwen3.8-Flash-Next-NVFP4 on four GB300s (sm103) at tp4, tep4 or dep4, MTP-Eagle or
-    # no speculation; on two at dep2, without speculation.
+    # Qwen3.8-Flash-Next-NVFP4 on four GB300s (sm103) at tp4 or tep4, MTP-Eagle or no
+    # speculation, or at dep4; on two at dep2. Attention DP runs without speculation.
     member = layout(mapping)
     if (
         compute_capability == _SM
@@ -246,9 +263,11 @@ def route(
         and vshape == _VISION_SHAPE
         and member is not None
         and mtp_eagle_or_none
-        and (spec_config is None or member in _SPECULATIVE_LAYOUTS)
     ):
-        _check_engine(spec_config, kv_cache_quant_algo, engine_choices(model_config, llm_args))
+        engine = engine_choices(model_config, llm_args)
+        if mapping.enable_attention_dp:
+            _check_attention_dp(member, spec_config, engine)
+        _check_engine(spec_config, kv_cache_quant_algo, engine)
         # One line on purpose: the claims suite reads the routed targets off
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
@@ -266,8 +285,8 @@ def route(
         f"{f' max_draft_len={spec_config.max_draft_len}' if spec_config is not None else ''}, "
         f"KV cache {kv_cache_quant_algo or 'bf16'}; the unified qwen4_exp target is "
         "Qwen3.8-Flash-Next-NVFP4 on sm103 in one node: at 4 ranks tp4 (attention TP4, "
-        "experts split by intermediate), tep4 (attention TP4, experts EP4) or dep4 "
-        "(attention DP, experts EP4), with one-model MTP-Eagle (max_draft_len "
-        f"1..{_MAX_DRAFT_LEN}) or no speculative decoding; at 2 ranks dep2 (attention DP, "
-        "experts EP2) without speculative decoding"
+        "experts split by intermediate) or tep4 (attention TP4, experts EP4) with one-model "
+        f"MTP-Eagle (max_draft_len 1..{_MAX_DRAFT_LEN}) or no speculative decoding, or dep4 "
+        "(attention DP, experts EP4); at 2 ranks dep2 (attention DP, experts EP2); attention "
+        "DP without speculative decoding"
     )
