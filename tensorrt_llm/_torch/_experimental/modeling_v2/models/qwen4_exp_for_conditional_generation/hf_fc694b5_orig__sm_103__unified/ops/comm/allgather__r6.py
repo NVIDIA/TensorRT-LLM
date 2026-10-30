@@ -79,6 +79,37 @@ class Allgather(OpWrapper):
             why="qwen4 dep2 prefill: a max_num_tokens 8192-row chunk per rank",
             spec=dict(world=2, rows=8192, **_QWEN4_UNIFIED),
         ),
+        # The per-rank counts between those: dep4 captures decode graphs at
+        # 1, 2, 4, 8, 16, 24, 32 rows per rank, and an eager step pads every
+        # rank to the group's largest count, which can be any value up to 8192.
+        Cell(
+            why="qwen4 dep4 decode graph at 2 rows per rank, the smallest batch past one",
+            spec=dict(world=4, rows=2, **_QWEN4_UNIFIED),
+        ),
+        Cell(
+            why="qwen4 dep4 decode graph at 24 rows per rank, a captured batch not a power of two",
+            spec=dict(world=4, rows=24, **_QWEN4_UNIFIED),
+        ),
+        Cell(
+            why="qwen4 dep4 eager at 33 rows per rank, one past the largest captured batch",
+            spec=dict(world=4, rows=33, **_QWEN4_UNIFIED),
+        ),
+        Cell(
+            why="qwen4 dep4 eager prefill padded to 1000 rows per rank, an arbitrary group max",
+            spec=dict(world=4, rows=1000, **_QWEN4_UNIFIED),
+        ),
+        Cell(
+            why="qwen4 dep4 eager prefill padded to 4097 rows per rank, one past a power of two",
+            spec=dict(world=4, rows=4097, **_QWEN4_UNIFIED),
+        ),
+        Cell(
+            why="qwen4 dep2 decode at 24 rows per rank, a captured batch not a power of two",
+            spec=dict(world=2, rows=24, **_QWEN4_UNIFIED),
+        ),
+        Cell(
+            why="qwen4 dep2 eager prefill padded to 4097 rows per rank, one past a power of two",
+            spec=dict(world=2, rows=4097, **_QWEN4_UNIFIED),
+        ),
     )
 
     note = """
@@ -109,6 +140,15 @@ class Allgather(OpWrapper):
     (an MPI send/recv of the NCCL unique id, then ncclCommInitRank), so that
     call cannot be the first one inside a CUDA-graph capture; an engine's eager
     warm-up makes it. Read from `getComm`, not probed.
+
+    Row counts. The qwen4 cells sample the per-rank counts the attention-DP
+    round trip gathers. At world 4 they are 1, 2, 24 and 32, decode graph
+    batches, then 33, 1000, 4097 and 8192, eager steps padded to the group's
+    largest count. At world 2 they are 1, 24, 64, 4097 and 8192. Per-rank
+    message sizes run from 5 KiB to 40 MiB. The matrix's CUDA-graph checks also
+    capture and replay every batch this run captures (1, 2, 4, 8, 16, then 24
+    to 128 in steps of 8) at hidden 2560, through both symbols. A count between
+    the cells is not one.
 
     Hard limits. The uniform form passes `input.numel()` to NCCL as a size_t
     count. The ragged form sums `sizes`, and the trailing dims' product, in an

@@ -422,6 +422,9 @@ def check_certified_cells() -> None:
         assert out.shape == (rows * WORLD, *trailing), (cell.why, out.shape)
         _assert_bitwise(out, _gather_ref([rows] * WORLD, seed, dtype, trailing), cell.why)
         _barrier()
+    if RANK == 0:
+        driven = [(cell.spec["rows"], cell.spec["trailing"][-1]) for _, cell in cells]
+        print(f"[rank 0] world {WORLD}: {len(cells)} cells bitwise, (rows, hidden) {driven}")
 
 
 def check_uniform_gather() -> None:
