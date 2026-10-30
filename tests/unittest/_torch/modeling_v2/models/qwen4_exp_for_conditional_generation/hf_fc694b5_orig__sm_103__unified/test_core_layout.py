@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The unified target's core at tp4, tep4 and dep4: each rank's forward widths and its experts.
+"""The unified target's core at tp4, tep4, dep4 and dep2: each rank's forward widths and its
+experts.
 
 The core is built on the meta device from the checkpoint's text and vision config values at
-every rank of a tp4, tep4 or dep4 mapping, so nothing here touches a device. What is pinned is
+every rank of a tp4, tep4, dep4 or dep2 mapping, so nothing here touches a device. What is pinned is
 what the forward addresses: the fused attention row and the split the norm + rope reads it
 through, the Gated-DeltaNet projection's column split, the routed experts a rank holds (an
 expert window, or tp4's padded intermediate slice of every expert) and the per-expert scalars
@@ -120,14 +121,15 @@ _VISION = dict(
 # (attention DP, MoE TP, MoE EP) of the three members.
 _TEP4 = dict(enable_attention_dp=False, moe_tp_size=1, moe_ep_size=4)
 _DEP4 = dict(enable_attention_dp=True, moe_tp_size=1, moe_ep_size=4)
+_DEP2 = dict(enable_attention_dp=True, moe_tp_size=1, moe_ep_size=2)
 _TP4 = dict(enable_attention_dp=False, moe_tp_size=4, moe_ep_size=1)
 
 
-def _core(rank: int, layout: dict, spec_config=None):
-    """The core of rank `rank` of a four-rank engine at `layout`, every parameter on meta."""
+def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD):
+    """The core of rank `rank` of a `world`-rank engine at `layout`, every parameter on meta."""
     model_config = ModelConfig(
         pretrained_config=Qwen4ExpTextConfig(**_TEXT),
-        mapping=Mapping(world_size=WORLD, tp_size=WORLD, rank=rank, **layout),
+        mapping=Mapping(world_size=world, tp_size=world, rank=rank, **layout),
         quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
         moe_backend="TRTLLM",
         moe_backend_requested="TRTLLM",
@@ -297,6 +299,35 @@ def test_a_dep4_rank_runs_one_128_expert_window_for_the_group(rank) -> None:
     assert (core.local_experts, core.expert_offset) == (128, 128 * rank)
     assert core.w["l0_fc1_w"].shape[0] == 128
     assert _core(rank, _TEP4).dp_size == 1
+
+
+@pytest.mark.parametrize("rank", range(2))
+def test_a_dep2_rank_runs_every_head_and_one_256_expert_window(rank) -> None:
+    """dep2, the disaggregated-serving engines' layout, is dep4 at half the group: the same
+    single-rank attention and Gated-DeltaNet geometry, and rank `r` holds the 256-expert
+    window `[256r, 256r + 256)` over the rows both ranks gather."""
+    core, dep4 = _core(rank, _DEP2, world=2), _core(rank, _DEP4)
+    for name in (
+        "heads_q",
+        "heads_kv",
+        "kv_head_start",
+        "qkv_width",
+        "attn_in_width",
+        "attn_in_tail_heads",
+        "index_col",
+        "num_k_heads",
+        "num_v_heads",
+        "conv_dim",
+        "attn_tp_size",
+    ):
+        assert getattr(core, name) == getattr(dep4, name), name
+    assert tuple(core.in_proj_split) == tuple(dep4.in_proj_split)
+    for key in ("l3_attn_in_w", "l3_o_w", "l0_in_proj_w", "l0_router", "l0_sh_gu"):
+        assert core.w[key].shape == dep4.w[key].shape, key
+    assert (core.dp_size, core.dp_rank, core.dp_group) == (2, rank, [0, 1])
+    assert (core.local_experts, core.expert_offset) == (256, 256 * rank)
+    assert core.w["l0_fc1_w"].shape[0] == 256
+    assert core.w["l0_fc1_w"].shape[1:] == dep4.w["l0_fc1_w"].shape[1:]
 
 
 def test_attention_dp_pads_to_the_groups_largest_row_count() -> None:

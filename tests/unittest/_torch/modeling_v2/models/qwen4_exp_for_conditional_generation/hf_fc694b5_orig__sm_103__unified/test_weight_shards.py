@@ -3,7 +3,7 @@
 """The unified target's per-rank weight table, checked against the checkpoint on the CPU.
 
 From `model.safetensors.index.json` and the safetensors headers alone -- no tensor data is
-read -- at each member (tp4, tep4, dep4):
+read -- at each member (tp4, tep4, dep4; dep2, the disaggregated engines' layout, at the end):
 
 * **coverage**: at every rank, with MTP off and on, every checkpoint tensor is either read by
   the rank's table or predicted unread by `expected_unconsumed`, never both; across a member's
@@ -51,10 +51,14 @@ CHECKPOINT = "Qwen3.8-Flash-Next-NVFP4"
 #: Each member's mapping: attention TP4 with the experts split by intermediate (tp4) or by
 #: expert (tep4), and attention DP with expert parallelism (dep4).
 MEMBERS = {
-    "tp4": dict(tp_size=4, moe_tp_size=4, moe_ep_size=1, enable_attention_dp=False),
-    "tep4": dict(tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=False),
-    "dep4": dict(tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=True),
+    "tp4": dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1, enable_attention_dp=False),
+    "tep4": dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=False),
+    "dep4": dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=True),
 }
+#: Both engines of the disaggregated-serving test: attention DP over two ranks, the routed
+#: experts in two 256-expert windows. It serves without speculation.
+DEP2 = dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2, enable_attention_dp=True)
+_LAYOUTS = {**MEMBERS, "dep2": DEP2}
 RANKS = (0, 1, 2, 3)
 SHAPE_RANKS = (0, 3)
 
@@ -115,7 +119,7 @@ def configs(checkpoint):
 
 
 def _mapping(member: str, rank: int) -> Mapping:
-    return Mapping(world_size=4, rank=rank, gpus_per_node=4, pp_size=1, **MEMBERS[member])
+    return Mapping(rank=rank, gpus_per_node=4, pp_size=1, **_LAYOUTS[member])
 
 
 def _dims(configs, member: str, rank: int, mtp: bool = True, prefill_copy: bool = False):
@@ -132,7 +136,8 @@ def _dims(configs, member: str, rank: int, mtp: bool = True, prefill_copy: bool 
 
 
 def _attention_tp(member: str) -> int:
-    return 1 if MEMBERS[member]["enable_attention_dp"] else 4
+    layout = _LAYOUTS[member]
+    return 1 if layout["enable_attention_dp"] else layout["tp_size"]
 
 
 def _lm_head_rows(member: str, vocab: int) -> int:
@@ -720,3 +725,75 @@ def test_the_stored_intermediate_follows_the_engines_storage_rule(configs, membe
     align, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(d.hidden, d.expert_inter_share)
     assert d.expert_inter == -(-d.expert_inter_share // align) * align
     assert (d.expert_inter_share, d.expert_inter) == ((160, 256) if member == "tp4" else (640, 640))
+
+
+# ---------------------------------------------------------------------- dep2 --
+
+
+def test_dep2_ranks_read_the_checkpoint_in_two_256_expert_windows(stored, configs):
+    """dep2 reads what dep4 reads, except the routed experts: rank `r` reads the window
+    `[256r, 256r + 256)`, so across the two ranks every tensor is read, each expert's by one
+    rank, and the `mtp.*` subtree by none (no speculation at dep2)."""
+    everything = set(stored)
+    mtp_keys = {k for k in everything if k.startswith("mtp.")}
+    read_by = collections.Counter()
+    for rank in range(DEP2["world_size"]):
+        d = _dims(configs, "dep2", rank, mtp=False)
+        claimed = _claimed(_rank_manifest(stored, d, "dep2"))
+        unread = WT.MODEL_WEIGHTS.expected_unconsumed(d, stored.keys())
+        assert claimed <= everything and not claimed & unread, rank
+        assert claimed | unread == everything, (
+            f"rank {rank}: neither read nor predicted {sorted(everything - claimed - unread)[:8]}"
+        )
+        read_by.update(claimed)
+
+        dep4 = _dims(configs, "dep4", rank, mtp=False)
+        non_expert = {k for k in claimed if not _TRUNK_EXPERT_TENSOR.match(k)}
+        assert non_expert == {
+            k
+            for k in _claimed(_rank_manifest(stored, dep4, "dep4"))
+            if not _TRUNK_EXPERT_TENSOR.match(k)
+        }, rank
+
+        with torch.device("meta"):
+            params = WT.MODEL_WEIGHTS.declare(d)
+            dep4_params = WT.MODEL_WEIGHTS.declare(dep4)
+        # Every parameter dep4 declares, at dep4's shape, but the expert window's: 256
+        # experts where dep4 holds 128.
+        assert set(params.keys()) == set(dep4_params.keys())
+        for key in dep4_params:
+            ours, theirs = tuple(params[key].shape), tuple(dep4_params[key].shape)
+            if ours != theirs:
+                assert (ours[0], theirs[0], ours[1:]) == (256, 128, theirs[1:]), (key, ours)
+        for key, shape in _EXPERT_SHAPES["dep4"].items():
+            assert tuple(params[key].shape) == (256, *shape[1:]), (key, tuple(params[key].shape))
+        experts = [s[0] for s in WT.MODEL_WEIGHTS.manifest(d)["l0_fc2_w"]]
+        assert experts == [
+            f"model.language_model.layers.0.mlp.experts.{e}.down_proj.weight"
+            for e in range(256 * rank, 256 * (rank + 1))
+        ]
+        g = P.pool_geometry(
+            configs[0],
+            _mapping("dep2", rank),
+            tokens_per_block=32,
+            kv_cache_quant_algo=None,
+            dtype=torch.bfloat16,
+        )
+        assert (d.heads_kv, d.num_k_heads, d.num_v_heads) == (
+            g.heads_kv,
+            g.num_k_heads,
+            g.num_v_heads,
+        )
+
+    assert set(read_by) == everything - mtp_keys
+    wrong = sorted(k for k in read_by if _EXPERT_TENSOR.search(k) and read_by[k] != 1)
+    assert not wrong, f"expert tensors not read by exactly one rank: {wrong[:8]}"
+
+
+def test_dep2_load_fills_every_parameter_and_covers_the_checkpoint(stored, configs, monkeypatch):
+    """`load` end to end at dep2's last rank, without speculation, on meta tensors."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
+    model = _stub_model(configs, "dep2", 1, False)
+    WT.MODEL_WEIGHTS.load(model, _meta_checkpoint(stored))
+    assert model.lm_head.weight.shape[0] == 248320

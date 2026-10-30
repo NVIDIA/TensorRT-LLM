@@ -1,15 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The per-rank pool layout this target binds at tp4, tep4 and dep4, against the stock manager.
+"""The per-rank pool layout this target binds at tp4, tep4, dep4 and dep2, against the stock
+manager.
 
 `pool.pool_geometry` derives one rank's pool shapes from the text config and the rank's `Mapping`.
 These tests hold it to `LAYOUT` (what `core` binds at each member), then build the stock
 `Qwen4ExpHybridCacheManager` the way the engine does -- `get_kv_cache_manager_cls` and
 `_create_kv_cache_manager` over a `ModelConfig`, with the core runtime's cache configuration
 (bf16 recurrent state, block reuse off, KV cache manager V2, which the engine resolves `auto` to
-for this model) -- on rank 0 and rank 3 of each member, one GPU, and take every pool view
-through `pool.take_pools`, which checks each against the geometry. Ranks 0 and 3 hold different
-KV and GDN heads at tp4 and tep4; the shapes are the same, the heads are not.
+for this model) -- on the first and the last rank of each member, one GPU, and take every pool
+view through `pool.take_pools`, which checks each against the geometry. Ranks 0 and 3 hold
+different KV and GDN heads at tp4 and tep4; the shapes are the same, the heads are not. dep2, the
+layout of both disaggregated-serving engines, binds dep4's geometry on both of its ranks, so the
+transceiver moves pools of one layout between identical layouts.
 """
 
 import contextlib
@@ -103,11 +106,11 @@ TOKENS_PER_BLOCK = 32  # `kv_cache_config.tokens_per_block`'s default, which the
 #: Each member's mapping: attention TP4 with the experts split by intermediate (tp4) or by expert
 #: (tep4), and attention DP with expert parallelism (dep4). The expert split moves no pool.
 MEMBERS = {
-    "tp4": dict(tp_size=4, moe_tp_size=4, moe_ep_size=1, enable_attention_dp=False),
-    "tep4": dict(tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=False),
-    "dep4": dict(tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=True),
+    "tp4": dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1, enable_attention_dp=False),
+    "tep4": dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=False),
+    "dep4": dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=True),
+    "dep2": dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2, enable_attention_dp=True),
 }
-RANKS = (0, 3)
 
 #: What `core` binds on each member and rank: KV heads and the first one's global index, GDN key
 #: heads and the first, GDN value heads and the first, and the conv channels ([q | k | v]).
@@ -123,6 +126,10 @@ LAYOUT = {
     ("dep4", 0): dict(heads_kv=2, kv_head_start=0, num_k_heads=16, k_head_start=0, num_v_heads=48,
                       v_head_start=0, conv_dim=10240),
     ("dep4", 3): dict(heads_kv=2, kv_head_start=0, num_k_heads=16, k_head_start=0, num_v_heads=48,
+                      v_head_start=0, conv_dim=10240),
+    ("dep2", 0): dict(heads_kv=2, kv_head_start=0, num_k_heads=16, k_head_start=0, num_v_heads=48,
+                      v_head_start=0, conv_dim=10240),
+    ("dep2", 1): dict(heads_kv=2, kv_head_start=0, num_k_heads=16, k_head_start=0, num_v_heads=48,
                       v_head_start=0, conv_dim=10240),
 }  # fmt: skip
 
@@ -157,7 +164,7 @@ _needs_gpu = pytest.mark.skipif(
 
 
 def _mapping(member: str, rank: int) -> Mapping:
-    return Mapping(world_size=4, rank=rank, gpus_per_node=4, pp_size=1, **MEMBERS[member])
+    return Mapping(rank=rank, gpus_per_node=4, pp_size=1, **MEMBERS[member])
 
 
 def _geometry(member: str, rank: int, kv_cache_quant_algo=None) -> P.PoolGeometry:
@@ -170,8 +177,14 @@ def _geometry(member: str, rank: int, kv_cache_quant_algo=None) -> P.PoolGeometr
     )
 
 
-_MEMBER_RANKS = [(member, rank) for member in MEMBERS for rank in RANKS]
+# The first and the last rank of each member.
+_MEMBER_RANKS = [
+    (member, rank) for member, m in MEMBERS.items() for rank in (0, m["world_size"] - 1)
+]
 _MEMBER_RANK_IDS = [f"{member}-rank{rank}" for member, rank in _MEMBER_RANKS]
+# dep2 serves without speculation (routing declines a `speculative_config` there).
+_MTP_MEMBER_RANKS = [(member, rank) for member, rank in _MEMBER_RANKS if member != "dep2"]
+_MTP_MEMBER_RANK_IDS = [f"{member}-rank{rank}" for member, rank in _MTP_MEMBER_RANKS]
 
 
 @pytest.mark.parametrize("member, rank", _MEMBER_RANKS, ids=_MEMBER_RANK_IDS)
@@ -288,7 +301,7 @@ def test_the_stock_manager_serves_the_layout(member, rank, algo):
 
 
 @_needs_gpu
-@pytest.mark.parametrize("member, rank", _MEMBER_RANKS, ids=_MEMBER_RANK_IDS)
+@pytest.mark.parametrize("member, rank", _MTP_MEMBER_RANKS, ids=_MTP_MEMBER_RANK_IDS)
 def test_the_mtp_verify_buffers_hold_this_ranks_heads(monkeypatch, member, rank):
     """With MTP (three drafts, the GDN cached replay) the verify buffers -- the per-step conv
     windows and every GDN layer's replay history -- are this rank's heads. Under attention TP the

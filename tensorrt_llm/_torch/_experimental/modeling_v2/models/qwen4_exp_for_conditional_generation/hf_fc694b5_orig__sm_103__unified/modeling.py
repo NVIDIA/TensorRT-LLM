@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """ModelingV2 target: Qwen3.8-Flash-Next-NVFP4 (hf-fc694b5_orig) / sm_103 / unified.
 
-One target for the layouts `routing.py` admits at four ranks in one node: tp4 (attention
+One target for the layouts `routing.py` admits in one node: at four ranks tp4 (attention
 TP4, routed experts split by intermediate), tep4 (attention TP4, experts EP4) and dep4
-(attention DP, experts EP4). The core holds the static structure (this rank's share of the
-weights, derived operands, per-manager pool views); `PrefillTarget` (any batch with context
-rows) and `DecodeTarget` (generation only) run a step over it, passing every argument to
-every op at the call site.
+(attention DP, experts EP4); at two ranks dep2 (attention DP, experts EP2), the layout of both
+disaggregated-serving engines, which is dep4 at half the group. The core holds the static
+structure (this rank's share of the weights, derived operands, per-manager pool views);
+`PrefillTarget` (any batch with context rows) and `DecodeTarget` (generation only) run a step
+over it, passing every argument to every op at the call site.
 
 The forward is the single-rank target's general path (`qwen4_exp/...__tp1/modeling.py`),
 cut per rank. What the layout settles is settled once, at construction:
@@ -2290,7 +2291,7 @@ _MEDIA_KEYS = ("image", "video")
 class ModelingV2HfFc694b5OrigSm103Unified(
     DecoderModelForCausalLM[Qwen4ExpUnifiedModelingV2, PretrainedConfig]
 ):
-    """Qwen3.8-Flash-Next-NVFP4 at tp4, tep4 or dep4 on sm_103."""
+    """Qwen3.8-Flash-Next-NVFP4 at tp4, tep4, dep4 or dep2 on sm_103."""
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
