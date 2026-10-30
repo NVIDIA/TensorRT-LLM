@@ -1231,6 +1231,29 @@ class TestExternalDrafterKvDtype:
         assert draft_model_config.quant_config is inherited
         assert inherited.quant_mode.has_fp8_kv_cache()
 
+    def test_inherited_nvfp4_kv_algo_is_dropped_from_the_draft_cost(self, mocker):
+        """An NVFP4 target's KV algo must not reach a standalone drafter's pool.
+
+        The drafter reads a BF16 pool; an NVFP4 pool sends it to the context
+        arena that is dense in max_seq_len.
+        """
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
+        assert inherited.quant_mode.has_fp4_kv_cache()
+        c, draft_model_config, seen = self._creator(mocker, inherited)
+
+        cost = c._get_kv_size_per_token()
+
+        assert cost.slope == self.BF16_SLOPE
+        assert len(seen) == 1
+        assert not seen[0].quant_config.quant_mode.has_fp4_kv_cache()
+        assert not seen[0].quant_config.layer_quant_mode.has_fp4_kv_cache()
+        assert not c._get_draft_kv_model_config().quant_config.quant_mode.has_fp4_kv_cache()
+        assert draft_model_config.quant_config is inherited
+        assert inherited.quant_mode.has_fp4_kv_cache()
+
     def test_cost_and_allocation_paths_agree(self, mocker):
         """Both call sites must resolve the draft config through one helper."""
         from tensorrt_llm.models.modeling_utils import QuantConfig

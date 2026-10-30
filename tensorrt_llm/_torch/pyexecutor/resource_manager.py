@@ -161,6 +161,19 @@ class ResourceManagerType(enum.Enum):
     KV_CACHE_COMPRESSION_MANAGER = "KV_CACHE_COMPRESSION_MANAGER"
 
 
+def is_context_only_kv_cache(kv_cache_manager: object) -> bool:
+    """Whether a KV cache manager can serve context requests only.
+
+    A disaggregated context worker may omit generation-only cache state: the
+    KDA draft-verification buffers (``kda_context_only``) or the FP4 MLA V
+    scales and packed V (``fp4_mla_context_only_cache``). Such a worker
+    cannot run a generation row, including a warmup or padding dummy.
+    """
+    return (getattr(kv_cache_manager, "kda_context_only", False) is True
+            or getattr(kv_cache_manager, "fp4_mla_context_only_cache",
+                       False) is True)
+
+
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
 
