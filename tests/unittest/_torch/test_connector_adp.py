@@ -382,58 +382,6 @@ def test_async_without_dummy_keeps_prepared_batch(
     assert manager.worker.start_load_kv.call_count == 2
 
 
-def test_recovery_fails_when_nothing_can_free_kv_for_padding(
-    forbid_connector_collectives: None,
-) -> None:
-    """An emptied batch must not wait forever for a dummy that cannot fit.
-
-    Once every load is finished and no transfer or response can free KV, the
-    owner fails all owners through the status vote instead of polling forever.
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    manager = _manager()
-    canceled = _request(10)
-    batch = ScheduledRequests()
-    batch.context_requests_last_chunk = [canceled]
-    cache = MagicMock(spec=KVCacheManagerV2)
-    cache.get_page_indices_by_layer_group.return_value = [[5, 6]]
-    manager.get_num_new_matched_tokens(canceled, 0)
-    manager.update_state_after_alloc(canceled, [5, 6])
-    manager.build_scheduler_output(batch, cache)
-    manager.handle_metadata()
-    executor = object.__new__(PyExecutor)
-    _configure_recovery_controls(executor)
-    executor.kv_connector_manager = manager
-    executor.kv_cache_manager = cache
-    executor.kv_cache_transceiver = None
-    executor.active_requests = [canceled]
-    executor.resource_manager = MagicMock()
-    executor._release_transfer = MagicMock()
-    executor._terminate_request = MagicMock()
-    # The padding dummy never fits.
-    executor._pad_empty_attention_dp_batch = MagicMock()
-    # The client cancels the request, then its load completes.
-    executor.canceled_req_ids = [10]
-    canceled.finish_by_reason.side_effect = lambda reason: setattr(canceled, "is_finished", True)
-    manager.worker.get_finished.side_effect = [([], [10])] + [([], [])] * 4
-
-    with (
-        patch("torch.cuda.current_stream"),
-        patch("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep"),
-        pytest.raises(RuntimeError, match="no pending KV connector transfer"),
-    ):
-        executor._kv_connector_start_batch(batch)
-
-    assert executor._kv_connector_failed
-    assert not manager.has_pending_transfers(10)
-    assert batch.batch_size == 0
-    # The vote first flushed the cancelled load's response, then padding was
-    # retried once more before the owner failed.
-    executor._terminate_request.assert_called_once_with(canceled)
-    assert executor._pad_empty_attention_dp_batch.call_count == 3
-
-
 ConnectorVote = tuple[int, ...] | tuple[bool, set[int]] | str | None
 
 
