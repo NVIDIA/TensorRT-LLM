@@ -249,7 +249,7 @@ class Harness:
         slot: int = SLOT,
         memory_kind: MemoryKind = MemoryKind.HOST,
     ) -> Endpoint:
-        memory, handle = self.suite.allocate(slot * len(labels), fill, memory_kind)
+        memory, handle = self.suite.allocate_rows(slot, len(labels), fill, memory_kind)
         endpoint = Endpoint(
             self.driver,
             labels,
@@ -451,6 +451,14 @@ class DriverConformance:
         expects; a driver that really registers device memory allocates it here.
         """
         return HostBuffer(nbytes, fill), None
+
+    def allocate_rows(
+        self, slot_bytes: int, rows: int, fill: int, memory_kind: MemoryKind
+    ) -> Allocation:
+        """Memory for one endpoint of ``rows`` rows of ``slot_bytes`` each: by default
+        ``allocate`` of their total. A driver whose pools each hold one row size overrides this
+        one instead of ``allocate``, so it can carve the endpoint from the pool of that size."""
+        return self.allocate(slot_bytes * rows, fill, memory_kind)
 
     def release(self, memory: Memory) -> None:
         """Gives back memory that ``allocate`` handed out with a handle; the suite never
@@ -1055,24 +1063,32 @@ class DriverConformance:
             assert h.driver.capabilities == before
 
     def test_a_raise_after_the_operation_is_recorded_becomes_a_row_fault(self) -> None:
+        """Each declared direction is checked on a driver of its own: a driver may serve no more
+        once its store raised under it and refuse the next call, as ``put`` allows, so the second
+        direction never meets the first one's driver. A get of an unpublished key still reaches
+        the store, so a get-only driver is checked through its get alone."""
         driver = self.make_crash_after_record()
         if driver is None:
             pytest.skip("this driver cannot stage a store that raises mid-operation")
-        with self.harness(driver) as h:
-            # Each declared direction is checked on its own: a get of an unpublished key still
-            # reaches the store, so a get-only driver is checked through its get alone.
-            capabilities = h.driver.capabilities
-            if not (capabilities.put or capabilities.get):
-                pytest.skip("this driver declares neither put nor get")
-            cases = []
-            if capabilities.put:
-                writer = h.endpoint(["A"])
-                writer.fill_row(0, b"aaaaaaaa")
-                cases.append(("put", h.put, writer.rows()))
-            if capabilities.get:
-                reader = h.endpoint(["A"], fill=0x2D)
-                cases.append(("get", h.get, reader.rows()))
-            for direction, start, rows in cases:
+        capabilities = driver.capabilities
+        if not (capabilities.put or capabilities.get):
+            pytest.skip("this driver declares neither put nor get")
+        directions = [
+            d for d, declared in (("put", capabilities.put), ("get", capabilities.get)) if declared
+        ]
+        for index, direction in enumerate(directions):
+            if index:
+                driver = self.make_crash_after_record()
+                assert driver is not None, "the hook staged a driver once and then none"
+            with self.harness(driver) as h:
+                start: Callable[[Sequence[RowIO]], OpHandle]
+                if direction == "put":
+                    writer = h.endpoint(["A"])
+                    writer.fill_row(0, b"aaaaaaaa")
+                    start, rows = h.put, writer.rows()
+                else:
+                    reader = h.endpoint(["A"], fill=0x2D)
+                    start, rows = h.get, reader.rows()
                 try:
                     op = start(rows)
                 except Exception as error:  # noqa: BLE001 - the check is that nothing escapes
@@ -1468,6 +1484,73 @@ class DriverConformance:
                 h.get(writer.rows())
             assert h.driver.drain(self.timeout) is True
             assert writer.read_row(0) == b"aaaaaaaa"
+
+    def test_drain_polled_without_a_budget_turns_true_once_nothing_runs(self) -> None:
+        """The backend drains with no budget, every teardown round, and never gives the driver a
+        wait. Polled that way, ``drain`` answers False while a get runs in the store and forces
+        no end on it; once the access of that get ended and nothing runs, it turns True without
+        any call having had a budget. A suite that stages no blocked get, or none with a signal that
+        the get is in the store, checks the second half alone: without the signal, a drain may
+        find the row unstarted and cancel it, which ends its access as it should."""
+        staged = self.make_blocked_get()
+        if staged is None:
+            with self.harness() as h:
+                self._drain_without_a_budget_after_a_put(h)
+            return
+        driver, blocked_key, blocked, unblock = staged
+        if blocked is None:  # the staged driver still gets the check, and its cleanup
+            unblock()
+            with self.harness(driver) as h:
+                self._drain_without_a_budget_after_a_put(h)
+            return
+        with self.harness(driver) as h:
+            h.needs(get=True)
+            slow = h.endpoint(["S"], fill=0x2D)
+            started: dict[str, OpHandle] = {}
+            failures: list[BaseException] = []
+
+            def slow_get() -> None:
+                try:
+                    started["op"] = h.get([RowIO(blocked_key, (slow.span(0),))])
+                except BaseException as error:  # noqa: BLE001 - reported from the main thread
+                    failures.append(error)
+
+            # Off this thread: a blocking driver's get returns only once the store lets it.
+            getter = threading.Thread(target=slow_get, daemon=True)
+            getter.start()
+            try:
+                assert blocked.wait(h.timeout), "the slow get never reached the store"
+                assert h.driver.drain(0.0) is False, "drain answered True with a get in the store"
+                if "op" in started:  # the handle came back before the store answered
+                    assert not h.driver.access_ended(started["op"]), "drain forced an access end"
+            finally:
+                unblock()
+                getter.join(h.timeout)
+            assert not getter.is_alive(), "the stalled get never returned"
+            if failures:
+                raise AssertionError(f"the get raised: {failures[0]!r}") from failures[0]
+            op = started["op"]
+            h.wait_for_results(op)
+            # A store may answer the released get with something that leaves its access
+            # unprovable; the contract allows that, and drain then rightly stays False.
+            if not _access_settled(h.driver, op, h.timeout):
+                pytest.skip("the store left the released get with its access unprovable")
+            self._poll_drain_without_a_budget(h)
+
+    def _drain_without_a_budget_after_a_put(self, h: Harness) -> None:
+        """The second half of the check alone: one put, when the driver declares it, then a
+        drain polled with no budget."""
+        if h.driver.capabilities.put:
+            h.publish({"A": b"aaaaaaaa"})
+        self._poll_drain_without_a_budget(h)
+
+    def _poll_drain_without_a_budget(self, h: Harness) -> None:
+        """Polls ``drain(0.0)`` as the backend does until it answers True; fails at the timeout.
+        No call in between has a budget, so a driver that can turn True only inside a wait of
+        its own never does here."""
+        wait_until(
+            lambda: h.driver.drain(0.0) is True, "a drain with no budget to answer True", h.timeout
+        )
 
     def test_close_needs_a_true_drain_and_no_live_registrations(self) -> None:
         """For a driver whose memory was registered up front, the suite's shutdown hook does

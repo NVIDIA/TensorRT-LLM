@@ -273,6 +273,15 @@ class DrainSkipsOnChange(MemoryDriver):
             return self._quiet()
 
 
+class DrainNeedsABudget(MemoryDriver):
+    """Turns True only inside a call with a budget, however idle it is: a driver that takes the
+    budget as its one chance to wait, or one whose evidence must be newer than each call, which
+    no evidence ever is. The backend only ever calls ``drain(0.0)``."""
+
+    def drain(self, budget_s: float) -> bool:
+        return super().drain(budget_s) and budget_s > 0
+
+
 class DrainForcesAnEnd(MemoryDriver):
     """Once its budget ran out, declares the access of every operation still running ended."""
 
@@ -678,6 +687,11 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
         KeepsAcceptingWhileDraining,
         DEFAULT_CAPABILITIES,
         "test_drain_is_one_way",
+    ),
+    "drain turns true without a budget": (
+        DrainNeedsABudget,
+        DEFAULT_CAPABILITIES,
+        "test_drain_polled_without_a_budget_turns_true_once_nothing_runs",
     ),
     "close needs a true drain": (
         ClosesAnyTime,

@@ -85,6 +85,27 @@ The boundary is `store.py`; its docstrings are the specification. The rules that
    as one that opens its client with it, implements `RegistersRegionsTogether` instead:
    `register_regions(specs)` returns one handle for the batch and `unregister_regions(handle)`
    gives it back. No atomicity is promised; the failure shapes are the same as `register`'s.
+7. **The SDK's concurrency rules are the driver's to keep.** An SDK that promises no thread
+   safety is called from one thread at a time; one driver thread making every SDK call,
+   submissions and polls alike, is one way to keep that. `put` and `get` still only record and
+   queue, whatever thread runs the store's work.
+8. **Callbacks only record.** `on_change` is called outside the driver's locks, as `OnChange`
+   says. A callback the SDK itself makes from inside one of its calls should only append to a
+   list the driver works through afterwards, in the order the SDK reported; running the
+   driver's logic inside it re-enters the SDK.
+9. **Names a peer matches are computed alike on both sides.** When a remote store finds memory
+   by a name the driver chose, as a pool or region name, both sides must derive it from the same
+   logical mapping. A layout label plus an ordinal among alike regions holds only while both
+   sides register their regions in the same order; a local registration index never does.
+10. **Evidence from sampling is newer than the first `drain`, and covers the store's own
+    work.** A `drain` that rests on a sampled signal, such as an in-flight count the store
+    publishes, accepts a sample taken after the first `drain` began and after the last local
+    operation ended, and only if it shows the store doing nothing for peers through this
+    driver's memory. One sample of nothing in flight is not enough on its own: the store must
+    also have stopped taking work that would undo it, which for a store serving peers means the
+    peers submit no more. The backend polls `drain(0.0)` every teardown round; a repeated call
+    with no budget must not reset the progress made so far, so that once every piece of work
+    ended and its evidence is in, a call with no budget observes True.
 
 ### The conformance suite
 
@@ -103,6 +124,10 @@ class TestMyDriverConformance(DriverConformance):
   should implement every hook its store can honour.
 - **Pool mode**: a driver whose memory is registered up front sets `registers_on_demand =
   False`, carves endpoints out of its pool in `allocate`, and revokes the pool in `shutdown`.
+  A store whose pools each hold one row size overrides `allocate_rows(slot_bytes, rows, fill,
+  memory_kind)` instead, which tells it the row size an endpoint is laid out in.
+- **Peers**: the suite stages no remote peer, so a store that moves rows between peers brings
+  its own cross-process fault cases, such as a peer stopped or gone while it writes.
 - **Batch mode**: a driver that registers regions together sets `registers_together = True`
   on top of pool mode and implements `make_together_registration`,
   `make_failing_together_registrations` and `make_busy_together_registration`.

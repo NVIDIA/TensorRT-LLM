@@ -1441,6 +1441,65 @@ def test_every_check_has_a_broken_driver_and_each_driver_one_pairing() -> None:
     assert checks <= {name for name in dir(TestMemoryDriver) if name.startswith("test_")}
 
 
+# The suite's memory hooks.
+
+
+def test_a_suite_overriding_only_allocate_is_asked_for_the_total_as_before() -> None:
+    asked: list[tuple[int, int, MemoryKind]] = []
+
+    class Suite(TestMemoryDriverConformance):
+        def allocate(self, nbytes: int, fill: int, memory_kind: MemoryKind) -> Allocation:
+            asked.append((nbytes, fill, memory_kind))
+            return super().allocate(nbytes, fill, memory_kind)
+
+    with Suite().harness() as h:
+        h.endpoint(["A", "B"], slot=4, fill=0x2D)
+    assert asked == [(8, 0x2D, MemoryKind.HOST)]
+
+
+def test_a_suite_overriding_allocate_rows_learns_the_row_size_and_count() -> None:
+    """Two endpoints of the same total, laid out differently: the hook tells them apart, which
+    a store whose pools each hold one row size needs to pick the pool."""
+    asked: list[tuple[int, int, int, MemoryKind]] = []
+
+    class Suite(TestMemoryDriverConformance):
+        def allocate_rows(
+            self, slot_bytes: int, rows: int, fill: int, memory_kind: MemoryKind
+        ) -> Allocation:
+            asked.append((slot_bytes, rows, fill, memory_kind))
+            return super().allocate_rows(slot_bytes, rows, fill, memory_kind)
+
+    with Suite().harness() as h:
+        h.endpoint(["A", "B"], slot=4)
+        h.endpoint(["C"], slot=8)
+    assert asked == [(4, 2, 0, MemoryKind.HOST), (8, 1, 0, MemoryKind.HOST)]
+
+
+def test_the_zero_budget_drain_check_closes_a_staged_driver_that_signals_nothing() -> None:
+    """A blocked-get hook without a signal still staged a driver; the check runs its second half
+    on that driver and closes it, rather than leaving it open beside a fresh one."""
+    closed: list[MemoryDriver] = []
+    staged: list[MemoryDriver] = []
+
+    class RecordsItsClose(MemoryDriver):
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    class Suite(TestMemoryDriverConformance):
+        driver_cls = RecordsItsClose
+
+        def make_blocked_get(self) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
+            store = GatedStore(held={STAGED_KEY})
+            store.gate.clear()
+            driver = self._driver(store)
+            staged.append(driver)
+            return driver, STAGED_KEY, None, store.gate.set
+
+    Suite().test_drain_polled_without_a_budget_turns_true_once_nothing_runs()
+    assert closed == staged and len(staged) == 1
+
+
 class TestMemoryDriverOnChange:
     @pytest.mark.parametrize("stop", ["cancel", "drain"])
     def test_a_cancel_or_drain_shows_before_on_change_is_called(self, stop: str) -> None:
