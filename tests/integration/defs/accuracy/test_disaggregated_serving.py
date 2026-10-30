@@ -2275,6 +2275,79 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 max_draft_len=speculative_config["max_draft_len"])
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
+    @pytest.mark.skip_less_device(8)
+    def test_kv_cache_offload(self):
+        """The generation server keeps the MLA latent history in host memory.
+
+        Each decode step fetches the indexer-selected tokens into a GPU cache.
+        Only a decode-only worker can offload, so the context server keeps its
+        history resident. Offload takes no speculative decoding and no block
+        reuse.
+        """
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.7,
+            "enable_block_reuse": False,
+            "use_kv_cache_manager_v2": True,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+        }
+        moe_config = {"backend": "CUTEDSL"}
+        ctx_server_config = {
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": None,
+            "trust_remote_code": True,
+            "max_seq_len": 8192,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": False,
+            "enable_chunked_prefill": True,
+            "trust_remote_code": True,
+            # Each batch row holds a GPU cache for its selected history, about
+            # 180 MiB on GLM-5.2, so the batch stays small.
+            "max_batch_size": 16,
+            "max_seq_len": 8192,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "cache_transceiver_config": cache_transceiver_config,
+            "sparse_attention_config": {
+                "algorithm": "dsa",
+                "enable_kv_cache_offload": True,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=16) as llm:
+            # The DuckLLM's bare LlmArgs takes NVFP4 from the model path; the
+            # checkpoint's FP8 KV cache selects the reference entry.
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
@@ -2388,6 +2461,75 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                                       server_waiting_timeout=3600) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
+
+    # The servers take up to an hour to start, before a full GSM8K run.
+    @pytest.mark.timeout(5400)
+    @pytest.mark.skip_less_device(4)
+    def test_kv_cache_offload(self):
+        """The generation server keeps the ratio-4 compressed history in host memory.
+
+        Each decode step fetches the indexer-selected units into a GPU cache.
+        Only a decode-only worker can offload, so the context server keeps its
+        history resident. Offload takes no block reuse.
+        """
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+        }
+        # Both servers lay out the NVFP4 KV cache alike for the transfer.
+        kv_cache_config = {
+            "dtype": "nvfp4",
+            "free_gpu_memory_fraction": 0.5,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+            "max_seq_len": 4096,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+            "max_seq_len": 4096,
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                **kv_cache_config,
+                "enable_block_reuse": False,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+            "sparse_attention_config": {
+                "algorithm": "deepseek_v4",
+                "enable_kv_cache_offload": True,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      server_waiting_timeout=3600) as llm:
+            # The DuckLLM's bare LlmArgs knows no checkpoint quantization; these
+            # select the reference entry.
+            llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
 @pytest.mark.timeout(14400)
