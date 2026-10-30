@@ -3772,6 +3772,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 initial_pool_ratio = self._windowed_draft_pool_ratio(
                     layer_configs, cache_tiers[0].quota, tokens_per_block
                 )
+                if initial_pool_ratio is not None:
+                    # Allocation rounds the ratio's byte target; this floor keeps one fresh
+                    # context chunk admissible in every lifecycle.
+                    constraints.append(
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                    history_length=0,
+                                )
+                            ]
+                        )
+                    )
         else:
             # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
             # per-layer BufferConfig entries — for example a sparse index-K

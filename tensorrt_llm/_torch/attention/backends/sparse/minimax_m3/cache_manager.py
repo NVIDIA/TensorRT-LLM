@@ -29,7 +29,7 @@ Provides:
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -65,6 +65,7 @@ from .common import get_sparse_layer_ids
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
@@ -578,7 +579,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             ]
         return super()._build_cache_config(config)
 
-    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
+    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
         if self.layer_specs is not None:
             # Explicit layer specs carry K/V and scales; index-K is this manager's extra buffer.
@@ -668,7 +669,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
         return self._draft_kv_cache_view
 
-    def add_dummy_requests(self, *args, **kwargs):
+    def add_dummy_requests(self, *args: Any, **kwargs: Any) -> Optional[List[LlmRequest]]:
         """Drop the draft KV cache view before delegating.
 
         The base method mirrors dummy KV caches into a *separate* draft

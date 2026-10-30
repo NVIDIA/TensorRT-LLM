@@ -301,14 +301,14 @@ def test_window_sized_draft_pool_admits_a_full_context_chunk() -> None:
             global_layer_id=layer,
             owner=owner,
             dtype=DataType.BF16,
-            num_kv_heads=HEADS,
+            num_kv_heads=heads,
             head_dim=HEAD_DIM,
             buffer_roles=(Role.KEY, Role.VALUE),
             sliding_window_size=window,
         )
-        for layer, owner, window in (
-            (0, KVCacheLayerOwner.TARGET, None),
-            (1, KVCacheLayerOwner.DRAFT, DRAFT_WINDOW),
+        for layer, owner, heads, window in (
+            (0, KVCacheLayerOwner.TARGET, 2 * HEADS, None),
+            (1, KVCacheLayerOwner.DRAFT, HEADS, DRAFT_WINDOW),
         )
     )
     manager = KVCacheManagerV2(
@@ -320,7 +320,7 @@ def test_window_sized_draft_pool_admits_a_full_context_chunk() -> None:
         ),
         CacheType.SELF,
         num_layers=1,
-        num_kv_heads=HEADS,
+        num_kv_heads=[2 * HEADS, HEADS],
         head_dim=HEAD_DIM,
         tokens_per_block=128,
         max_seq_len=16384,
@@ -333,6 +333,8 @@ def test_window_sized_draft_pool_admits_a_full_context_chunk() -> None:
     )
     try:
         assert manager.kv_cache_manager_py_config.initial_pool_ratio is not None
+        # Different page sizes keep the draft lifecycle in its own physical pool.
+        assert int(manager.kv_cache_pool_mapping[0, 0]) != int(manager.kv_cache_pool_mapping[1, 0])
         requests = manager.add_dummy_requests([7], token_nums=[max_num_tokens])
         assert requests is not None
         manager.free_resources(requests[0])
