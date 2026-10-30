@@ -34,12 +34,28 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import register
 pytestmark = pytest.mark.cpu_only
 
 _ROOT = Path(_modeling_v2.__file__).resolve().parent
-_ARCHS = sorted(registered_routes())
 
 
-def _routing_path(arch: str) -> Path:
-    """The routing.py whose ``route`` is registered for ``arch``."""
-    return Path(sys.modules[registered_routes()[arch].__module__].__file__).resolve()
+def _routing_paths() -> list[Path]:
+    """Every routing.py with a registered ``route``, one per family.
+
+    Several families may route one architecture, so these are keyed by family
+    rather than by architecture.
+    """
+    return sorted(
+        {
+            Path(sys.modules[route.__module__].__file__).resolve()
+            for candidates in registered_routes().values()
+            for route in candidates
+        }
+    )
+
+
+_ROUTINGS = _routing_paths()
+
+
+def _family(routing: Path) -> str:
+    return routing.parent.name
 
 
 # ``route`` hands back the class itself, imported from the target directory
@@ -50,10 +66,10 @@ _TARGET_IMPORT = re.compile(
 )
 
 
-def _routed_targets(arch: str):
-    """(target directory, class name) for every target ``route`` can return."""
-    source = _routing_path(arch).read_text()
-    family_dir = _routing_path(arch).parent
+def _routed_targets(routing: Path):
+    """(target directory, class name) for every target ``routing``'s ``route`` can return."""
+    source = routing.read_text()
+    family_dir = routing.parent
     return [
         (family_dir / target, plain or wrapped)
         for target, plain, wrapped in _TARGET_IMPORT.findall(source)
@@ -63,7 +79,7 @@ def _routed_targets(arch: str):
 def test_no_routing_module_is_orphaned():
     """A routing.py that models/__init__.py does not import, or whose ``route``
     carries no ``@routes``, would never be consulted."""
-    registered = {_routing_path(arch) for arch in _ARCHS}
+    registered = set(_ROUTINGS)
     on_disk = set((_ROOT / "models").glob("*/routing.py"))
     assert on_disk == registered, (
         f"routing modules on disk with no registered route: "
@@ -71,28 +87,29 @@ def test_no_routing_module_is_orphaned():
     )
 
 
-@pytest.mark.parametrize("arch", _ARCHS)
-def test_no_target_directory_is_orphaned(arch):
+@pytest.mark.parametrize("routing", _ROUTINGS, ids=_family)
+def test_no_target_directory_is_orphaned(routing):
     """A target directory ``route`` never imports from is dead code: nothing
     else can reach it."""
-    family_dir = _routing_path(arch).parent
+    family_dir = routing.parent
     on_disk = {p.parent for p in family_dir.glob("*/modeling.py")}
-    routed = {target_dir for target_dir, _ in _routed_targets(arch)}
+    routed = {target_dir for target_dir, _ in _routed_targets(routing)}
     assert on_disk == routed, (
-        f"{arch}: target directories route() never imports: "
+        f"{_family(routing)}: target directories route() never imports: "
         f"{sorted(p.name for p in on_disk - routed)}; imports with no directory: "
         f"{sorted(p.name for p in routed - on_disk)}"
     )
 
 
-@pytest.mark.parametrize("arch", _ARCHS)
-def test_target_identity_matches_its_path(arch):
+@pytest.mark.parametrize("routing", _ROUTINGS, ids=_family)
+def test_target_identity_matches_its_path(routing):
     """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>,
     and the class name encodes the same triple."""
-    for target_dir, name in _routed_targets(arch):
+    for target_dir, name in _routed_targets(routing):
         segments = target_dir.name.split("__")
         assert len(segments) == 3, (
-            f"{arch}: {target_dir.name!r} is not a <checkpoint>__<sm>__<parallel> directory name"
+            f"{_family(routing)}: {target_dir.name!r} is not a "
+            "<checkpoint>__<sm>__<parallel> directory name"
         )
 
         def camel(segment: str) -> str:
@@ -100,7 +117,7 @@ def test_target_identity_matches_its_path(arch):
 
         for segment in segments:
             assert camel(segment).lower() in name.lower(), (
-                f"{arch}: {name} does not carry path segment {segment!r}"
+                f"{_family(routing)}: {name} does not carry path segment {segment!r}"
             )
 
 
@@ -118,8 +135,8 @@ def test_every_target_ships_both_products():
     ``tests/integration/defs/accuracy/references/``, read by the gates CI runs
     rather than by a reader.
     """
-    for arch in _ARCHS:
-        for target_dir, name in _routed_targets(arch):
+    for routing in _ROUTINGS:
+        for target_dir, name in _routed_targets(routing):
             for product in ("modeling.py", "weights.py"):
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
 
@@ -136,8 +153,8 @@ def _is_entry_module(module: str, target_dir: Path) -> bool:
 
 
 def test_targets_do_not_share_files():
-    for arch in _ARCHS:
-        for target_dir, name in _routed_targets(arch):
+    for routing in _ROUTINGS:
+        for target_dir, name in _routed_targets(routing):
             own_target = (
                 f"{_modeling_v2.__name__}.models.{target_dir.parent.name}.{target_dir.name}"
             )
@@ -201,9 +218,9 @@ def test_target_import_isolation(tmp_path, monkeypatch, source_file, statement, 
     source.parent.mkdir(parents=True)
     source.write_text(statement.format(package=_modeling_v2.__name__))
     monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
-    monkeypatch.setattr(sys.modules[__name__], "_ARCHS", ["family"])
+    monkeypatch.setattr(sys.modules[__name__], "_ROUTINGS", [tmp_path / "models/family/routing.py"])
     monkeypatch.setattr(
-        sys.modules[__name__], "_routed_targets", lambda arch: [(target_dir, "Target")]
+        sys.modules[__name__], "_routed_targets", lambda routing: [(target_dir, "Target")]
     )
     if accepted:
         test_targets_do_not_share_files()
@@ -231,9 +248,9 @@ def test_generic_call_import_scope(tmp_path, monkeypatch, module, accepted):
     (target_dir / "modeling.py").write_text(
         f"UNCERTIFIED_GENERIC_CALLS = ()\nfrom {_modeling_v2.__name__}.{module} import op\n"
     )
-    monkeypatch.setattr(sys.modules[__name__], "_ARCHS", ["family"])
+    monkeypatch.setattr(sys.modules[__name__], "_ROUTINGS", [tmp_path / "models/family/routing.py"])
     monkeypatch.setattr(
-        sys.modules[__name__], "_routed_targets", lambda arch: [(target_dir, "Target")]
+        sys.modules[__name__], "_routed_targets", lambda routing: [(target_dir, "Target")]
     )
     if accepted:
         test_uncertified_generic_calls_name_every_stock_import()
@@ -279,8 +296,8 @@ def test_uncertified_generic_calls_name_every_stock_import():
     name it imports outside the catalog, module level or function local, unless the name computes nothing; and it
     declares nothing it does not import, so the list cannot go stale as entries replace stock calls."""
     checked = 0
-    for arch in _ARCHS:
-        for target_dir, name in _routed_targets(arch):
+    for routing in _ROUTINGS:
+        for target_dir, name in _routed_targets(routing):
             tree = ast.parse((target_dir / "modeling.py").read_text())
             declared = _declared_tuple(tree, "UNCERTIFIED_GENERIC_CALLS")
             if declared is None:
@@ -407,9 +424,9 @@ def test_every_target_has_the_accuracy_gate_of_its_name():
     never run.
     """
     routed = {
-        (_routing_path(arch).parent.name, f"Test{name}")
-        for arch in _ARCHS
-        for _, name in _routed_targets(arch)
+        (_family(routing), f"Test{name}")
+        for routing in _ROUTINGS
+        for _, name in _routed_targets(routing)
     }
     gates = set()
     for path in (_TESTS_ROOT / "integration/defs/accuracy/modeling_v2").glob("test_*.py"):
@@ -488,8 +505,8 @@ _PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
 def _core_modules() -> list[Path]:
     return [
         target_dir / "modeling.py"
-        for arch in _ARCHS
-        for target_dir, _ in _routed_targets(arch)
+        for routing in _ROUTINGS
+        for target_dir, _ in _routed_targets(routing)
         if target_dir.parent.name != "kimi_k3_vl"
     ]
 

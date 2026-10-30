@@ -27,6 +27,11 @@ Two levels, on purpose:
   reason in words. Reading that one file tells you where any configuration
   lands.
 
+One architecture may be routed by several families, each claiming its own
+deployments of it. Their routes are tried in the order they registered and the
+first that does not raise ``NoTarget`` decides, so no two may claim the same
+deployment: each family's ``route`` declines what another one claims.
+
 Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
 are deliberately not routing inputs. They do not change which code runs, so a
 target claims a configuration regardless of them; ``require`` promises that the
@@ -42,7 +47,7 @@ from __future__ import annotations
 
 import enum
 import os
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Sequence, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -50,26 +55,34 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-# architectures[0] -> the ``route`` that decides where it lands, filled by ``@routes``.
-_ROUTES: Dict[str, Callable[..., type]] = {}
+# architectures[0] -> the ``route``s that decide where it lands, in the order they are
+# tried, filled by ``@routes``.
+_ROUTES: Dict[str, Tuple[Callable[..., type], ...]] = {}
 
 
 def routes(*architectures: str):
-    """Declare that the decorated ``route`` decides where these ``architectures[0]`` values land."""
+    """Declare that the decorated ``route`` decides where these ``architectures[0]`` values land.
+
+    A second family may route an architecture another family already routes; its
+    ``route`` is tried after the earlier ones (registration follows the imports in
+    ``models/__init__.py``). One routing module registering twice is a mistake.
+    """
 
     def register(route):
         for arch in architectures:
-            assert arch not in _ROUTES, (
-                f"{arch} routed by both {_ROUTES[arch].__module__} and {route.__module__}"
+            registered = _ROUTES.get(arch, ())
+            assert all(other.__module__ != route.__module__ for other in registered), (
+                f"{arch} routed twice by {route.__module__}"
             )
-            _ROUTES[arch] = route
+            _ROUTES[arch] = (*registered, route)
         return route
 
     return register
 
 
-def registered_routes() -> Dict[str, Callable[..., type]]:
-    """architectures[0] -> ``route``, for every family ``models/__init__.py`` imports."""
+def registered_routes() -> Dict[str, Tuple[Callable[..., type], ...]]:
+    """architectures[0] -> its ``route``s in the order they are tried, for every family
+    ``models/__init__.py`` imports."""
     from . import models  # noqa: F401
 
     return _ROUTES
@@ -175,13 +188,43 @@ def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
+def _family(route: Callable[..., type]) -> str:
+    """The family a ``route`` belongs to: ``<family>`` of ``models.<family>.routing``,
+    else the route's module."""
+    module = route.__module__
+    return module.rsplit(".", 2)[-2] if module.endswith(".routing") else module
+
+
+def _first_claim(
+    candidates: Sequence[Callable[..., type]],
+    config: "ModelConfig",
+    llm_args: "TorchLlmArgs",
+    compute_capability: Tuple[int, int],
+) -> type:
+    """The target of the first ``route`` that claims this deployment.
+
+    When every one declines, the ``NoTarget`` raised carries each one's reason; with
+    several routes each reason is prefixed by its family.
+    """
+    declined = []
+    for route in candidates:
+        try:
+            return route(config, llm_args, compute_capability)
+        except NoTarget as why:
+            declined.append((route, why))
+    if len(declined) == 1:
+        raise declined[0][1]
+    raise NoTarget("; ".join(f"{_family(route)}: {why}" for route, why in declined))
+
+
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
     Returns the target class, or None for the built-in implementation:
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
-    for the architecture, or when that ``route`` raises ``NoTarget``.
-    In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+    for the architecture, or when every ``route`` registered for it raises
+    ``NoTarget``. In ``require`` every one of those but ``off`` raises
+    ``ValueError`` instead.
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -193,11 +236,11 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     arch = pretrained_config.architectures[0]
 
     try:
-        route = registered_routes().get(arch)
-        if route is None:
+        candidates = registered_routes().get(arch, ())
+        if not candidates:
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
-        return route(config, llm_args, _device_compute_capability())
+        return _first_claim(candidates, config, llm_args, _device_compute_capability())
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None

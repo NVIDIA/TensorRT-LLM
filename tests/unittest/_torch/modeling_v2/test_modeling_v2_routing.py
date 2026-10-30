@@ -31,6 +31,7 @@ import torch
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch._experimental.modeling_v2 import _router_index
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     NoTarget,
     modeling_v2_resolve,
@@ -454,6 +455,87 @@ def test_an_unrouted_architecture_raises_under_require():
     config = _model_config(PretrainedConfig(architectures=["LlamaForCausalLM"]))
     with pytest.raises(ValueError, match="LlamaForCausalLM"):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+# --- several families route one architecture ------------------------------------
+
+_FAKE_ARCH = "FakeForCausalLM"
+
+
+class _TargetA:
+    """Stands in for a target class."""
+
+
+class _TargetB:
+    """Stands in for another target class."""
+
+
+def _route_from(family: str, outcome):
+    """A ``route`` of ``models.<family>.routing`` that returns ``outcome``, or raises it."""
+
+    def route(model_config, llm_args, compute_capability):
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    route.__module__ = f"{_router_index.__name__.rsplit('.', 1)[0]}.models.{family}.routing"
+    return route
+
+
+def _route_fake_arch(monkeypatch, *candidates) -> ModelConfig:
+    monkeypatch.setitem(_router_index._ROUTES, _FAKE_ARCH, candidates)
+    return _model_config(PretrainedConfig(architectures=[_FAKE_ARCH]))
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_the_first_route_that_claims_decides(monkeypatch, mode):
+    """Routes are tried in registration order; a decline passes to the next family."""
+    config = _route_fake_arch(
+        monkeypatch,
+        _route_from("family_a", NoTarget("family_a misses")),
+        _route_from("family_b", _TargetB),
+        _route_from("family_c", _TargetA),
+    )
+    assert modeling_v2_resolve(config, _llm_args(mode)) is _TargetB
+
+
+def test_every_route_declining_names_each_familys_reason(monkeypatch):
+    config = _route_fake_arch(
+        monkeypatch,
+        _route_from("family_a", NoTarget("family_a misses")),
+        _route_from("family_b", NoTarget("family_b misses")),
+    )
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="family_a: family_a misses; family_b: family_b misses$"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_one_route_declining_keeps_its_reason_as_it_is(monkeypatch):
+    config = _route_fake_arch(monkeypatch, _route_from("family_a", NoTarget("family_a misses")))
+    with pytest.raises(ValueError, match=f"no target fits '{_FAKE_ARCH}': family_a misses$"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_a_route_that_fails_otherwise_is_not_a_decline(monkeypatch):
+    """Only ``NoTarget`` passes the deployment to the next family; any other error is a
+    bug in the route and surfaces as one, under ``auto`` too."""
+    config = _route_fake_arch(
+        monkeypatch,
+        _route_from("family_a", RuntimeError("family_a is broken")),
+        _route_from("family_b", _TargetB),
+    )
+    with pytest.raises(RuntimeError, match="family_a is broken"):
+        modeling_v2_resolve(config, _llm_args("auto"))
+
+
+def test_routes_register_in_order_and_once_per_routing_module(monkeypatch):
+    monkeypatch.setattr(_router_index, "_ROUTES", {})
+    first, second = _route_from("family_a", _TargetA), _route_from("family_b", _TargetB)
+    _router_index.routes(_FAKE_ARCH)(first)
+    _router_index.routes(_FAKE_ARCH)(second)
+    assert _router_index._ROUTES[_FAKE_ARCH] == (first, second)
+    with pytest.raises(AssertionError, match="routed twice"):
+        _router_index.routes(_FAKE_ARCH)(_route_from("family_a", _TargetB))
 
 
 def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
