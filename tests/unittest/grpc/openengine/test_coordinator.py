@@ -631,6 +631,49 @@ async def test_coordinator_thread_start_failure_keeps_cleanup_bounded(
 
 
 @pytest.mark.asyncio
+async def test_coordinator_start_failure_survives_closed_loop_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_start(_coordinator: Coordinator) -> None:
+        raise ValueError("injected coordinator startup failure")
+
+    monkeypatch.setattr(Coordinator, "start", fail_start)
+    with TemporaryDirectory(prefix="oe-test-") as directory:
+        reactor = CoordinatorReactor(
+            directory, 1, "shared-engine", lambda: True, lambda reason: None
+        )
+        proceed = threading.Event()
+        set_exception = reactor._finished.set_exception
+        is_done = reactor._finished.done
+        owner_thread = threading.current_thread()
+
+        def delayed_completion(error: BaseException) -> None:
+            proceed.wait(5)
+            set_exception(error)
+
+        def completion_done() -> bool:
+            if threading.current_thread() is owner_thread and not proceed.is_set():
+                # Keep completion pending at the owner's shutdown check.
+                proceed.set()
+                return False
+            return is_done()
+
+        monkeypatch.setattr(reactor._finished, "set_exception", delayed_completion)
+        monkeypatch.setattr(reactor._finished, "done", completion_done)
+        start = asyncio.create_task(reactor.start())
+        try:
+            with pytest.raises(ValueError, match="injected coordinator startup failure"):
+                await asyncio.wait_for(asyncio.shield(start), 3)
+        finally:
+            proceed.set()
+            with suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(start), 3)
+            if reactor._thread is not None:
+                await asyncio.to_thread(reactor._thread.join, 3)
+        assert reactor._thread is not None and not reactor._thread.is_alive()
+
+
+@pytest.mark.asyncio
 async def test_coordinator_cached_health_recovers_without_reopening_a_fenced_group() -> None:
     healthy = threading.Event()
     healthy.set()

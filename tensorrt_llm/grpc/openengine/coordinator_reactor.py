@@ -201,7 +201,12 @@ class CoordinatorReactor:
         try:
             loop = await asyncio.shield(asyncio.wrap_future(self._loop_ready))
             if not self._finished.done():
-                loop.call_soon_threadsafe(self._request_stop)
+                try:
+                    loop.call_soon_threadsafe(self._request_stop)
+                except RuntimeError:
+                    # The loop exited before completion was published.
+                    if not loop.is_closed():
+                        raise
             await asyncio.shield(asyncio.wrap_future(self._finished))
         finally:
             assert self._thread is not None
