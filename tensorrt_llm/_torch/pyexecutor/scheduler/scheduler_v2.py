@@ -630,7 +630,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     if other.py_request_id in demoted_ids:
                         protected.add(other.py_request_id)
             return self._try_preempt_for_pages(
-                requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
+                requests_list,
+                protected,
+                inflight_request_ids,
+                recompute_paused,
+                preempted_ids,
+                locality_domain_id=getattr(req, "py_locality_domain_id", None),
             )
 
         # --- Phase 2: schedule deferred context / encoder requests ---
@@ -1804,6 +1809,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         inflight_request_ids: set[int],
         recompute_paused: RequestList,
         preempted_ids: set[int],
+        locality_domain_id: int | None = None,
     ) -> bool:
         """Release one started request's KV cache so another can allocate.
 
@@ -1832,6 +1838,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         for i in range(len(requests_list) - 1, -1, -1):
             victim = requests_list[i]
             if victim.py_request_id in protected_ids:
+                continue
+            # Pages are allocated per locality domain, so a victim in another
+            # domain frees nothing for this request.
+            victim_domain = getattr(victim, "py_locality_domain_id", None)
+            if (
+                isinstance(locality_domain_id, int)
+                and isinstance(victim_domain, int)
+                and victim_domain != locality_domain_id
+            ):
                 continue
             if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
                 continue

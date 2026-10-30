@@ -1743,6 +1743,7 @@ def _one_model_draft_creator(target_pool_ratio, mapping, draft_config) -> KvCach
     creator._draft_config = draft_config
     creator._speculative_config = Mock()
     creator._disable_overlap_scheduler = False
+    creator._llm_args = SimpleNamespace(enable_locality_domains=False)
     return creator
 
 

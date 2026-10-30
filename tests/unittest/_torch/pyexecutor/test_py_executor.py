@@ -3135,6 +3135,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         _should_exclude_last_generation_logits=lambda: False,
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
+        _is_kv_manager_v2=False,
     )
     seen = {}
     stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
@@ -3221,6 +3222,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         _should_exclude_last_generation_logits=lambda: False,
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
+        _is_kv_manager_v2=False,
     )
     for name in ("_get_request_admission_capacity", "_pop_from_waiting_queue"):
         setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))

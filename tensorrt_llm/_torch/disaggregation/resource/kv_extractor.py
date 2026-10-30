@@ -337,6 +337,14 @@ def _build_pool_views_for_variant(
     return pool_views
 
 
+def _mapped_ranges_of(pool) -> Optional[Tuple[Tuple[int, int], ...]]:
+    """Mapped byte ranges of a V2 pool, or None when its whole extent is backed."""
+    ranges = getattr(pool, "mapped_ranges", None)
+    if not ranges:
+        return None
+    return tuple((int(start), int(end)) for start, end in ranges)
+
+
 def _build_page_table_v2(manager) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManagerV2.
 
@@ -418,6 +426,11 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                         base_address=int(pool.base_address),
                         slot_bytes=int(pool.slot_bytes),
                         num_slots=int(pg_desc.num_slots),
+                        mapped_ranges=(
+                            _mapped_ranges_of(pool)
+                            if getattr(manager, "num_locality_domains", 1) > 1
+                            else None
+                        ),
                     )
                     for pool in pg_desc.pools
                 ]

@@ -334,6 +334,7 @@ def _create_cache_manager(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    enable_locality_domains: bool = False,
 ) -> "KVCacheManagerV2":
     """Create a KVCacheManagerV2 for the given mapping."""
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
@@ -358,6 +359,7 @@ def _create_cache_manager(
         mapping=mapping,
         dtype=DataType.FLOAT,
         vocab_size=VOCAB_SIZE,
+        enable_locality_domains=enable_locality_domains,
     )
 
 
@@ -371,6 +373,7 @@ def _create_managers_for_instance(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     cp_size: int = 1,
+    enable_locality_domains: bool = False,
 ) -> list[KVCacheManagerV2]:
     """Create cache managers for all ranks in an instance.
 
@@ -402,6 +405,7 @@ def _create_managers_for_instance(
                         max_attention_window_vec,
                         num_layers,
                         max_batch_size,
+                        enable_locality_domains,
                     )
                 )
     return managers
@@ -426,16 +430,19 @@ def _init_pool_data_v2(
         tp_rank = rank % tp
         page_table = KVRegionExtractorV1(mgr).page_table
 
-        unique_pools: Dict[int, int] = {}
+        # A localized pool leaves unmapped holes between its domains' chunks, so only
+        # the backed ranges are written.
+        unique_ranges: Dict[int, int] = {}
         for pg in page_table.pool_groups:
             for pool_desc in pg.pools:
-                key = pool_desc.base_address
                 pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
-                if key not in unique_pools or pool_bytes > unique_pools[key]:
-                    unique_pools[key] = pool_bytes
+                for start, end in pool_desc.mapped_ranges or ((0, pool_bytes),):
+                    key = pool_desc.base_address + start
+                    if key not in unique_ranges or end - start > unique_ranges[key]:
+                        unique_ranges[key] = end - start
 
         element_bytes = get_size_in_bytes(1, mgr.dtype)
-        for pool_base_ptr, pool_size in unique_pools.items():
+        for pool_base_ptr, pool_size in unique_ranges.items():
             pool_size_elements = pool_size // element_bytes
             pool_tensor = convert_to_torch_tensor(
                 TensorWrapper(pool_base_ptr, mgr.dtype, [pool_size_elements])
@@ -524,7 +531,9 @@ def _add_sequence(
     harness cannot (it transfers right after a prompt-only resize, so valid_only
     skips the page-less tail). Used to exercise the SWA + MTP transfer path.
     """
-    kv_cache = mgr._create_kv_cache(request_id, None, None)
+    kv_cache = mgr._create_kv_cache(
+        request_id, None, None, locality_domain_id=mgr.pick_locality_domain()
+    )
     if not mgr.enable_block_reuse:
         kv_cache.stop_committing()
     success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
@@ -967,6 +976,8 @@ def run_transfer_test(
     expect_cpp_bounce: bool = False,
     gen_scratch_tokens: int = 0,
     gen_cp: int = 1,
+    ctx_locality_domains: bool = False,
+    gen_locality_domains: bool = False,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2.
 
@@ -984,6 +995,10 @@ def run_transfer_test(
     incompatible with gen_scratch_tokens > 0.
     HELIX VALIDATE: the whole gen_cp path (dist-mock collectives, ledger block
     ownership, strided verify) is exercised only on GPU -- validate end to end.
+
+    ctx_locality_domains / gen_locality_domains build that side's managers with
+    locality domains; under TRT_LLM_MOCK_LOCALIZATION_SUPPORT=1 their pools are split
+    into per-domain chunks with unmapped holes on any GPU.
     """
     if request_lengths is None:
         request_lengths = REQUEST_LENGTHS
@@ -1004,6 +1019,7 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        enable_locality_domains=ctx_locality_domains,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -1015,6 +1031,7 @@ def run_transfer_test(
         num_layers,
         max_batch_size,
         cp_size=gen_cp,
+        enable_locality_domains=gen_locality_domains,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
@@ -1472,6 +1489,62 @@ def test_cache_transceiver_uneven_pp(
     )
 
     print("PASSED")
+
+
+def _pool_has_holes(manager: KVCacheManagerV2) -> bool:
+    for pg in KVRegionExtractorV1(manager).page_table.pool_groups:
+        for pool in pg.pools:
+            if pool.mapped_ranges is None:
+                continue
+            covered = sum(end - start for start, end in pool.mapped_ranges)
+            if covered < pool.slot_bytes * pool.num_slots:
+                return True
+    return False
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_tp,gen_tp", [(1, 1), (2, 1), (1, 2)], ids=["tp1_tp1", "tp2_tp1", "tp1_tp2"]
+)
+@pytest.mark.parametrize(
+    "ctx_locality_domains,gen_locality_domains",
+    [(True, True), (True, False), (False, True)],
+    ids=["ld_both", "ld_ctx", "ld_gen"],
+)
+@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
+def test_cache_transceiver_locality_domains(
+    monkeypatch, ctx_tp, gen_tp, ctx_locality_domains, gen_locality_domains, is_mla
+):
+    """Transfer between localized and non-localized KV pools.
+
+    A localized pool maps each domain's chunks at separate offsets of one VA
+    reservation, so registration and the pool fill must cover the backed ranges
+    only; the round-trip data check proves both sides addressed the same pages.
+    """
+    monkeypatch.setenv("TRT_LLM_MOCK_LOCALIZATION_SUPPORT", "1")
+    # A 72-wide head gives slot sizes whose domain chunks span several granules, which
+    # leaves an unmapped hole between the domains (power-of-two heads pack them flush).
+    monkeypatch.setitem(globals(), "HEAD_DIM", 72)
+    probe = _create_cache_manager(
+        Mapping(world_size=1, rank=0, tp_size=1), is_mla, True, enable_locality_domains=True
+    )
+    try:
+        assert probe.num_locality_domains == 2
+        assert _pool_has_holes(probe)
+    finally:
+        probe.shutdown()
+    run_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=1,
+        gen_tp=gen_tp,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=is_mla,
+        use_v2=True,
+        ctx_locality_domains=ctx_locality_domains,
+        gen_locality_domains=gen_locality_domains,
+    )
 
 
 @pytest.mark.timeout(180)

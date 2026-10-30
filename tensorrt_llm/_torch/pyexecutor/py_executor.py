@@ -7618,6 +7618,18 @@ class PyExecutor:
 
             new_requests = new_requests_cur_rank
 
+        if self._is_kv_manager_v2:
+            for req_item in new_requests:
+                if req_item.is_normal_request:
+                    request = req_item.request
+                    lora_config = getattr(request, "lora_config", None)
+                    req_item.locality_domain_id = (
+                        self.kv_cache_manager.pick_locality_domain(
+                            getattr(request, "input_token_ids", None),
+                            lora_config.task_id
+                            if lora_config is not None else None,
+                            getattr(request, "cache_salt", None)))
+
         # 7. Merge requests
         if self._kv_load_tracker.enabled and new_requests:
             self._kv_load_tracker.idle_sampled = False

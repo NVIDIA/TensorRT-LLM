@@ -29,7 +29,9 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <ranges>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -131,13 +133,58 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// SlotIdMap — maps an allocator's local slot indices onto chunks of a slot-id space shared by
+// several allocators (one per locality domain), so each hands out disjoint global ids.
+// Mirrors _storage/_core.py::_SlotIdMap.
+// ---------------------------------------------------------------------------
+class SlotIdMap
+{
+public:
+    explicit SlotIdMap(SlotCount chunkSize)
+        : mChunkSize(chunkSize)
+    {
+    }
+
+    [[nodiscard]] SlotCount chunkSize() const noexcept
+    {
+        return mChunkSize;
+    }
+
+    [[nodiscard]] std::vector<size_t> const& chunks() const noexcept
+    {
+        return mChunks;
+    }
+
+    void append(size_t chunk);
+    size_t pop();
+
+    [[nodiscard]] SlotId slotId(SlotCount localIdx) const noexcept
+    {
+        return SlotId{static_cast<SlotCount>(mChunks[slotCountToSizeT(localIdx / mChunkSize)]) * mChunkSize
+            + localIdx % mChunkSize};
+    }
+
+    // nullopt when slotId lies in a chunk this map does not own.
+    [[nodiscard]] std::optional<SlotCount> localIndex(SlotId slotId) const noexcept;
+
+private:
+    SlotCount mChunkSize;
+    std::vector<size_t> mChunks;
+    std::unordered_map<size_t, size_t> mChunkIndices;
+};
+
+// ---------------------------------------------------------------------------
 // SlotAllocator — manages a fixed-capacity array of slot ids.
 // Mirrors _storage/_core.py::SlotAllocator.
+//
+// Without a SlotIdMap the slot id is the local index. With one, capacity and shrink accounting
+// stay local while the ids handed out come from the map's chunks.
 // ---------------------------------------------------------------------------
 class SlotAllocator
 {
 public:
-    explicit SlotAllocator(SlotCount capacity);
+    explicit SlotAllocator(SlotCount capacity, SlotIdMap const* slotMap = nullptr,
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
     ~SlotAllocator();
 
     [[nodiscard]] SlotCount numFreeSlots() const noexcept;
@@ -148,11 +195,23 @@ public:
         return mCapacity;
     }
 
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainId() const noexcept
+    {
+        return mLocalityDomainId;
+    }
+
+    // Local index of a slot this allocator issued; nullopt for a foreign slot id.
+    [[nodiscard]] std::optional<SlotCount> localIndexOf(SlotId slot) const noexcept
+    {
+        return localIndex(slot);
+    }
+
     // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
     // here so no caller has to remember the lower one.
     [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
     {
-        return slot >= SlotId{0} && slot < numSlots();
+        auto const local = localIndex(slot);
+        return local.has_value() && *local >= 0 && *local < numSlots();
     }
 
     Slot allocate();
@@ -192,13 +251,25 @@ private:
     void scrubEvents();
     [[nodiscard]] bool check() const noexcept;
 
+    [[nodiscard]] std::optional<SlotCount> localIndex(SlotId slot) const noexcept
+    {
+        return mSlotMap == nullptr ? std::optional<SlotCount>{slot.value()} : mSlotMap->localIndex(slot);
+    }
+
+    [[nodiscard]] SlotId slotId(SlotCount localIdx) const noexcept
+    {
+        return mSlotMap == nullptr ? SlotId{localIdx} : mSlotMap->slotId(localIdx);
+    }
+
     SlotCount mCapacity;
     SlotCount mTargetCapacity;
     SlotCount mNumActiveSlots;
     SlotCount mNumReadyRecycledSlots;
     std::deque<Slot> mRecycledSlots;
     std::vector<Slot> mOverflowSlots;
-    DynamicBitset mOccupiedMask;
+    DynamicBitset mOccupiedMask; // indexed by local index
+    SlotIdMap const* mSlotMap;
+    std::optional<LocalityDomainId> mLocalityDomainId;
 };
 
 //! Granularity a disk pool is sized in. Disk has no allocation unit to match,
@@ -290,11 +361,17 @@ protected:
 class GpuSlotPool : public SlotPoolBase
 {
 public:
-    GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots);
+    // slotMaps: one per locality domain when the group places each domain's backing at
+    // chunk-aligned offsets of a shared slot-id space; nullptr for a single contiguous mapping.
+    GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots,
+        TypedVec<LocalityDomainId, SlotIdMap> const* slotMaps = nullptr);
 
+    // Slots backed across all locality domains.
     SlotCount numSlots() const noexcept override;
+    SlotCount numSlots(LocalityDomainId localityDomainId) const noexcept;
     void destroy() override;
     void resize(SlotCount newNumSlots) override;
+    void resize(SlotCount newNumSlots, LocalityDomainId localityDomainId);
     Address slotAddress(SlotId slot) const override;
 
     //! The VMM allocation granularity, which is what this pool's mapping grows in.
@@ -308,11 +385,23 @@ public:
         return CacheTier::GPU_MEM;
     }
 
+    [[nodiscard]] int numLocalityDomains() const noexcept
+    {
+        return mVirtMem.numLocalityDomains();
+    }
+
+    // Merged mapped byte ranges relative to the pool base.
+    [[nodiscard]] std::vector<std::pair<size_t, size_t>> mappedRanges() const
+    {
+        return mVirtMem.mappedRanges();
+    }
+
     static size_t computeNumPhysMem(size_t slotSize, SlotCount numSlots, size_t physMemSize) noexcept;
     static SlotCount computeNumSlots(size_t slotSize, size_t numPhysMem, size_t physMemSize) noexcept;
 
 private:
     VirtMem mVirtMem;
+    TypedVec<LocalityDomainId, SlotIdMap> const* mSlotMaps;
 };
 
 // ---------------------------------------------------------------------------
@@ -428,21 +517,26 @@ public:
         return mPools.size();
     }
 
-    SlotCount numSlots() const noexcept;
-
-    SlotCount numFreeSlots() const noexcept
+    int numLocalityDomains() const noexcept
     {
-        return mSlotAllocator.numFreeSlots();
+        return mSlotAllocators.size().value();
     }
 
-    SlotAllocator& slotAllocator() noexcept
+    SlotCount numSlots(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept;
+
+    SlotCount numFreeSlots(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept
     {
-        return mSlotAllocator;
+        return mSlotAllocators[localityDomainId]->numFreeSlots();
     }
 
-    SlotAllocator const& slotAllocator() const noexcept
+    SlotAllocator& slotAllocator(LocalityDomainId localityDomainId = LocalityDomainId{0}) noexcept
     {
-        return mSlotAllocator;
+        return *mSlotAllocators[localityDomainId];
+    }
+
+    SlotAllocator const& slotAllocator(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept
+    {
+        return *mSlotAllocators[localityDomainId];
     }
 
     //! Allocate, then block until the slots handed back are backed.
@@ -451,11 +545,34 @@ public:
     //! point every later use of a slot passes through. Nothing downstream -- not
     //! slotAddress(), not a device mapping read from it -- waits again. A pool with no
     //! fill to wait on answers at once.
-    Slot allocate();
-    std::vector<Slot> allocateMultiple(SlotCount numSlots);
+    Slot allocate(LocalityDomainId localityDomainId = LocalityDomainId{0});
+    std::vector<Slot> allocateMultiple(SlotCount numSlots, LocalityDomainId localityDomainId = LocalityDomainId{0});
+    // Returns the slot to the allocator of the domain that issued it.
     void release(Slot slot);
     void destroy();
-    void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt);
+
+    // Locality domain whose memory backs a slot id this group issued; nullopt when not localized.
+    [[nodiscard]] virtual std::optional<LocalityDomainId> localityDomainOf(SlotId /*slot*/) const noexcept
+    {
+        return std::nullopt;
+    }
+
+    virtual void resizePools(
+        std::optional<SlotCount> newNumSlots = std::nullopt, LocalityDomainId localityDomainId = LocalityDomainId{0});
+
+    // Usable global slot ranges [begin, end), merged and sorted, excluding unmapped holes.
+    virtual std::vector<std::pair<SlotCount, SlotCount>> slotRanges() const;
+
+    // One past the highest usable slot id; equals numSlots() for a contiguous group.
+    SlotCount slotIndexUpperBound() const
+    {
+        SlotCount upperBound = 0;
+        for (auto const& [begin, end] : slotRanges())
+        {
+            upperBound = std::max(upperBound, end);
+        }
+        return upperBound;
+    }
 
     // Addresses for all pools at a given slot id.
     TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
@@ -525,33 +642,43 @@ public:
     //! budgets and rounded to different grains -- so every caller measuring them names the
     //! one it means. roundedNumBytes(cacheTier()) is what this group's own tier pays for;
     //! roundedNumBytes(HOST_MEM) on a GPU-tier group is what it holds in host pages besides.
-    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const
+    [[nodiscard]] virtual size_t roundedNumBytes(CacheTier medium) const
     {
         return roundedBytesWith(numSlots(), medium);
     }
 
 protected:
     // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
-    [[nodiscard]] SlotCount getNumSlotsFromPools() const noexcept;
+    [[nodiscard]] virtual SlotCount getNumSlotsFromPools(
+        LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept;
 
     //! Block until every pool backs the range ending just past `slot`.
     void _waitSlotUsable(SlotId slot) const;
 
-    SlotAllocator mSlotAllocator;
+    TypedVec<LocalityDomainId, std::unique_ptr<SlotAllocator>> mSlotAllocators;
     TypedVec<PoolIndex, std::unique_ptr<SlotPoolBase>> mPools;
     bool mDestroyed = false;
 };
 
+// Slots per locality-domain chunk: the smallest slot count that starts on a physical-page boundary in every pool
+// of the group.
+[[nodiscard]] size_t localityDomainChunkSlots(TypedVec<PoolIndex, size_t> const& slotSizeList, size_t physMemSize);
+
 // ---------------------------------------------------------------------------
 // GpuPoolGroup / HostPoolGroup / DiskPoolGroup
 // ---------------------------------------------------------------------------
+
+// With several locality domains the pools share one slot-id space: ids are handed out in chunks
+// whose byte extent is physically aligned in every pool, each chunk backed by one domain's memory.
 class GpuPoolGroup : public PoolGroupBase
 {
 public:
+    //! `numSlots` is the initial slot count per locality domain.
+    //!
     //! `sparsity`, when given, marks the pools to allocate from host memory instead of
     //! device memory. They hold a sparse buffer's pages: ordinary hot pages that are read
     //! through the sparse GPU cache rather than directly, so they are device-mapped but do
-    //! not consume the tier's device budget.
+    //! not consume the tier's device budget. Sparse pools need a single locality domain.
     //!
     //! The group still reports GPU_MEM. Migration never reads the hot side's tier -- the
     //! codec path keeps only the cold side's -- and host memory is device-accessible, so a
@@ -564,14 +691,61 @@ public:
     //! reserves; a pool never reserves less than its initial slots. Unset reserves for the
     //! most slots device memory could buy, which exceeds the address space once a sparse
     //! slot is several hundred times the group's device bytes per slot.
-    GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+    GpuPoolGroup(TypedVec<LocalityDomainId, SlotCount> const& numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
         PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {},
         HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
+    // The allocators hold pointers into mSlotMaps, so release them before the maps go away.
+    ~GpuPoolGroup() override;
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
         return CacheTier::GPU_MEM;
     }
+
+    void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt,
+        LocalityDomainId localityDomainId = LocalityDomainId{0}) override;
+    std::vector<std::pair<SlotCount, SlotCount>> slotRanges() const override;
+    // Each domain's backing is rounded up on its own, so the sum must be too or a quota
+    // round trip through totalQuota() loses slots.
+    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const override;
+
+    [[nodiscard]] std::vector<std::pair<size_t, size_t>> mappedRanges(PoolIndex poolIdx) const
+    {
+        auto const& pool = *mPools.at(poolIdx);
+        // A sparse pool is host memory committed contiguously from its base.
+        if (pool.medium() != CacheTier::GPU_MEM)
+        {
+            size_t const bytes = pool.numBytes();
+            return bytes == 0 ? std::vector<std::pair<size_t, size_t>>{}
+                              : std::vector<std::pair<size_t, size_t>>{{size_t{0}, bytes}};
+        }
+        return static_cast<GpuSlotPool const&>(pool).mappedRanges();
+    }
+
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainOf(SlotId slot) const noexcept override
+    {
+        if (mSlotMaps.empty())
+        {
+            return std::nullopt;
+        }
+        int8_t const owner = mChunkOwner[slotCountToSizeT(slot.value() / mChunkSize)];
+        return owner < 0 ? std::nullopt : std::optional<LocalityDomainId>{LocalityDomainId{owner}};
+    }
+
+protected:
+    SlotCount getNumSlotsFromPools(LocalityDomainId localityDomainId = LocalityDomainId{0}) const noexcept override;
+
+private:
+    // Grow or shrink a domain's chunk list to cover numSlots.
+    void resizeSlotMap(SlotCount numSlots, LocalityDomainId localityDomainId);
+
+    TypedVec<LocalityDomainId, SlotIdMap> mSlotMaps; // empty with one locality domain
+    SlotCount mChunkSize{0};
+    size_t mMaxChunks{0};
+    size_t mNumChunks{0};
+    std::priority_queue<size_t, std::vector<size_t>, std::greater<>> mFreeChunks;
+    // Owning locality domain of each chunk of the slot-id space, kept in step with mSlotMaps.
+    std::vector<int8_t> mChunkOwner;
 };
 
 //! Host pools are committed progressively on a background thread, so a slot may
@@ -654,10 +828,17 @@ public:
         return mPoolGroups.size();
     }
 
-    std::vector<Slot> allocateMultiple(PoolGroupIndex pgIdx, SlotCount numSlots);
+    std::vector<Slot> allocateMultiple(
+        PoolGroupIndex pgIdx, SlotCount numSlots, LocalityDomainId localityDomainId = LocalityDomainId{0});
     void release(PoolGroupIndex pgIdx, Slot slot);
-    SlotCount numFreeSlots(PoolGroupIndex pgIdx) const;
+    SlotCount numFreeSlots(PoolGroupIndex pgIdx, LocalityDomainId localityDomainId = LocalityDomainId{0}) const;
     TypedVec<PoolIndex, Address> slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const;
+
+    // 1 unless this is a localized GPU level.
+    virtual int numLocalityDomains() const noexcept
+    {
+        return 1;
+    }
 
     // Additional accessors used by StorageManager and KvCacheManager.
     virtual void destroy()
@@ -671,9 +852,19 @@ public:
         return mPoolGroups.at(pgIdx)->numPools();
     }
 
-    SlotCount numSlots(PoolGroupIndex pgIdx) const
+    SlotCount numSlots(PoolGroupIndex pgIdx, LocalityDomainId localityDomainId = LocalityDomainId{0}) const
     {
-        return mPoolGroups.at(pgIdx)->numSlots();
+        return mPoolGroups.at(pgIdx)->numSlots(localityDomainId);
+    }
+
+    SlotCount slotIndexUpperBound(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->slotIndexUpperBound();
+    }
+
+    std::vector<std::pair<SlotCount, SlotCount>> slotRanges(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->slotRanges();
     }
 
     TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const
@@ -687,6 +878,11 @@ public:
     }
 
     PoolGroupBase& poolGroup(PoolGroupIndex pgIdx)
+    {
+        return *mPoolGroups.at(pgIdx);
+    }
+
+    PoolGroupBase const& poolGroup(PoolGroupIndex pgIdx) const
     {
         return *mPoolGroups.at(pgIdx);
     }
@@ -745,13 +941,13 @@ public:
         return getUniformAttribute(withMedium, grainOf);
     }
 
-    // Returns numSlots() per pool group.
-    TypedVec<PoolGroupIndex, SlotCount> slotCountList() const
+    // Returns numSlots(localityDomainId) per pool group.
+    TypedVec<PoolGroupIndex, SlotCount> slotCountList(LocalityDomainId localityDomainId = LocalityDomainId{0}) const
     {
         TypedVec<PoolGroupIndex, SlotCount> ret;
         ret.reserve(mPoolGroups.size());
         for (auto const& pg : mPoolGroups)
-            ret.push_back(pg->numSlots());
+            ret.push_back(pg->numSlots(localityDomainId));
         return ret;
     }
 
@@ -913,6 +1109,16 @@ public:
     CacheTier cacheTier() const noexcept override
     {
         return CacheTier::GPU_MEM;
+    }
+
+    int numLocalityDomains() const noexcept override
+    {
+        return mPhysMemAllocator.numLocalityDomains();
+    }
+
+    std::vector<std::pair<size_t, size_t>> mappedRanges(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+    {
+        return static_cast<GpuPoolGroup const&>(*mPoolGroups.at(pgIdx)).mappedRanges(poolIdx);
     }
 
 private:

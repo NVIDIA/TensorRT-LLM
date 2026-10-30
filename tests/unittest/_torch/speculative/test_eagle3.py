@@ -80,7 +80,9 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     metadata = _Metadata()
 
     @contextmanager
-    def draft_context(attn_metadata, manager):
+    def draft_context(attn_metadata,
+                      manager,
+                      enable_draft_locality_domain_forkjoin=False):
         assert attn_metadata is metadata
         assert manager is draft_manager
         events.append("switch")
