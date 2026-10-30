@@ -1779,18 +1779,47 @@ class NVFP4LinearMethod(LinearMethodBase):
         # LayerNorm for QKV and Gate/Up projection layers when possible. we can see the tensor only for o_proj and down_proj
         module.pre_quant_scale = None
 
+        # SVDQuant low-rank residual (ModelOpt ``NVFP4_SVD``): the exported
+        # weight is W - B @ A, and the layer output is
+        # ``nvfp4_gemm(x_s) + (x_s @ A^T) @ B^T`` with ``x_s`` the input after
+        # ``pre_quant_scale``. Set by the load paths when the checkpoint has them.
+        module.svdquant_lora_a = None
+        module.svdquant_lora_b = None
+
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
         else:
             module.register_parameter("bias", None)
 
-    def _input_prepare(self, module: Linear, input: torch.Tensor):
+    def _svdquant_residual(self, module: Linear, input: torch.Tensor):
+        """Return ``(input_for_gemm, residual)`` for a layer with SVDQuant tensors.
+
+        Applies ``pre_quant_scale`` once and feeds the scaled input to both the
+        low-rank branch and the FP4 GEMM, as ModelOpt's SVDQuantLinear does.
+        """
+        if isinstance(input, (tuple, Fp4QuantizedTensor)):
+            raise RuntimeError(
+                "Received pre-quantized FP4 input for a layer with an SVDQuant "
+                "low-rank residual, which needs the high-precision input. This "
+                "indicates FP4 output was not disabled in the previous layer.")
+        if module.pre_quant_scale is not None:
+            assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
+            input = input * module.pre_quant_scale
+        residual = F.linear(F.linear(input, module.svdquant_lora_a),
+                            module.svdquant_lora_b)
+        return input, residual
+
+    def _input_prepare(self,
+                       module: Linear,
+                       input: torch.Tensor,
+                       pre_quant_scaled: bool = False):
         """Quantize input tensor to FP4 format.
 
         Args:
             module: Linear module with quantization parameters
             input: Input tensor (may be pre-quantized Fp4QuantizedTensor, tuple, or regular tensor)
+            pre_quant_scaled: ``pre_quant_scale`` was already applied to ``input``
 
         Returns:
             Tuple of (act_fp4, act_sf, alpha) - quantized activation, per-block scales, and alpha
@@ -1822,7 +1851,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             return input[0], input[1], module.alpha
         else:
             # Input is a regular tensor - apply pre_quant_scale if it exists (for NVFP4_AWQ)
-            if module.pre_quant_scale is not None:
+            if module.pre_quant_scale is not None and not pre_quant_scaled:
                 assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
                 input = input * module.pre_quant_scale
 
@@ -1867,7 +1896,11 @@ class NVFP4LinearMethod(LinearMethodBase):
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
 
-        act_fp4, act_sf, alpha = self._input_prepare(module, input)
+        lora_residual = None
+        if module.svdquant_lora_a is not None:
+            input, lora_residual = self._svdquant_residual(module, input)
+        act_fp4, act_sf, alpha = self._input_prepare(
+            module, input, pre_quant_scaled=lora_residual is not None)
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
@@ -1903,6 +1936,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
 
+        if lora_residual is not None:
+            output = output + lora_residual
+
         if original_shape is not None:
             output = output.reshape(*original_shape[:-1], output.shape[-1])
 
@@ -1913,6 +1949,10 @@ class NVFP4LinearMethod(LinearMethodBase):
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
                                tp_group: List[int]):
+        if module.svdquant_lora_a is not None:
+            raise NotImplementedError(
+                "SVDQuant low-rank residual is not supported with the fused "
+                "NVFP4 GEMM + all-reduce path.")
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
         output = torch.ops.trtllm.nvfp4_gemm_allreduce(act_fp4, module.weight,
                                                        act_sf,
@@ -2084,24 +2124,75 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Load scales (vanilla = no shard_keys)
         self.load_weight_scales(module, weights, shard_keys=None)
 
-        # Load pre_quant_scale if it exists (for NVFP4_AWQ)
-        if "pre_quant_scale" in weights[0]:
-            device = module.weight.device
-            # scale_span is flipped because flip_tp=True
-            act_scale_span = 1 if module.tp_mode == TensorParallelMode.ROW else 16
-            pre_quant_scale = module.load_shard(
-                weights[0]["pre_quant_scale"],
-                # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
-                flip_tp=True,
-                device=device,
-                scale_span=act_scale_span,
+        self._load_pre_quant_scale(module, weights)
+        self._load_svdquant_lora(module, weights)
+
+    def _load_pre_quant_scale(self, module: Linear,
+                              weights: List[Dict]) -> None:
+        """Load ``pre_quant_scale`` (NVFP4_AWQ, SVDQuant) if the checkpoint has it.
+
+        Fused shards share one input, and ModelOpt exports the same tensor for
+        each of them, so the first shard's tensor is used.
+        """
+        if "pre_quant_scale" not in weights[0]:
+            return
+        device = module.weight.device
+        # scale_span is flipped because flip_tp=True
+        act_scale_span = 1 if module.tp_mode == TensorParallelMode.ROW else 16
+        pre_quant_scale = module.load_shard(
+            weights[0]["pre_quant_scale"],
+            # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
+            flip_tp=True,
+            device=device,
+            scale_span=act_scale_span,
+        )
+
+        module.pre_quant_scale = Parameter(
+            torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
+            requires_grad=False).to(device=device)
+
+        copy_weight(module.pre_quant_scale, pre_quant_scale)
+
+    def _load_svdquant_lora(self, module: Linear, weights: List[Dict]) -> None:
+        """Load the SVDQuant low-rank residual if the checkpoint has it.
+
+        Each shard ``i`` of a fused Linear carries ``A_i`` ``[r, K]`` and
+        ``B_i`` ``[N_i, r]`` over the shared input, so the fused residual is
+        ``A = cat(A_i)`` and ``B = block_diag(B_i)``; ``(x @ A^T) @ B^T`` then
+        lines up with the fused output rows in shard order.
+        """
+        has_a = ["svdquant_lora_a" in w for w in weights]
+        has_b = ["svdquant_lora_b" in w for w in weights]
+        if not any(has_a) and not any(has_b):
+            return
+        if not (all(has_a) and all(has_b)):
+            raise ValueError(
+                "svdquant_lora_a and svdquant_lora_b must be present for every "
+                "fused shard or for none of them.")
+        if module.tp_size > 1:
+            raise NotImplementedError(
+                "SVDQuant low-rank residual is not sharded for tensor parallelism."
             )
-
-            module.pre_quant_scale = Parameter(
-                torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
-                requires_grad=False).to(device=device)
-
-            copy_weight(module.pre_quant_scale, pre_quant_scale)
+        device = module.weight.device
+        lora_a = torch.cat([
+            w["svdquant_lora_a"][...].to(device=device, dtype=module.dtype)
+            for w in weights
+        ],
+                           dim=0)
+        lora_b = torch.block_diag(*[
+            w["svdquant_lora_b"][...].to(device=device, dtype=module.dtype)
+            for w in weights
+        ])
+        if lora_a.shape[1] != module.in_features or lora_b.shape[
+                0] != module.out_features:
+            raise ValueError(
+                f"SVDQuant residual shapes A{tuple(lora_a.shape)} / "
+                f"B{tuple(lora_b.shape)} do not match in_features="
+                f"{module.in_features}, out_features={module.out_features}.")
+        module.svdquant_lora_a = Parameter(lora_a.contiguous(),
+                                           requires_grad=False)
+        module.svdquant_lora_b = Parameter(lora_b.contiguous(),
+                                           requires_grad=False)
 
     def load_weights_fused_qkv_linear(
             self,
@@ -2128,6 +2219,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         self.load_weight_scales(module,
                                 weights[:3],
                                 shard_keys=weight_mode.shard_keys)
+
+        self._load_pre_quant_scale(module, weights[:3])
+        self._load_svdquant_lora(module, weights[:3])
 
         k_scale, v_scale = self.load_kv_scales(weights)
         if k_scale:
@@ -2184,7 +2278,6 @@ class NVFP4LinearMethod(LinearMethodBase):
             elm_packing=elm_packing)
 
         weight_mode = module.weights_loading_config.weight_mode
-        device = torch.device("cuda")
 
         for shard_key, weight in zip(('gate', 'up'), (gate_weight, up_weight)):
             if weight is not None:
@@ -2197,23 +2290,8 @@ class NVFP4LinearMethod(LinearMethodBase):
                                 weights[:2],
                                 shard_keys=weight_mode.shard_keys)
 
-        # Load pre_quant_scale if it exists (for NVFP4_AWQ)
-        # NOTE: pre_quant_scale is the same for gate and up since modelopt checks which layer shared the same input
-        if "pre_quant_scale" in weights[0]:
-            act_scale_span = 1 if module.tp_mode == TensorParallelMode.ROW else 16
-            pre_quant_scale = module.load_shard(
-                weights[0]["pre_quant_scale"],
-                # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
-                flip_tp=True,
-                device=module.weight.device,
-                scale_span=act_scale_span,
-            )
-
-            module.pre_quant_scale = Parameter(
-                torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
-                requires_grad=False).to(device=device)
-
-            copy_weight(module.pre_quant_scale, pre_quant_scale)
+        self._load_pre_quant_scale(module, weights[:2])
+        self._load_svdquant_lora(module, weights[:2])
 
     def process_weights_after_loading_fused_gate_up_linear(
             self, module: Linear):
