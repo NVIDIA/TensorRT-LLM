@@ -27,13 +27,13 @@ from tensorrt_llm.bench.benchmark import (collect_explicit_cli_keys,
                                           generate_json_report,
                                           get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.general import (generate_warmup_dataset,
+                                                        resolve_end_id)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.commands._telemetry import TelemetryCommand
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
-from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
@@ -302,9 +302,8 @@ def latency_command(
         llm = get_llm(runtime_config, kwargs)
         startup_metrics = llm.startup_metrics
 
-        ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
-        eos_id = tokenizer.eos_token_id if not ignore_eos else -1
-        pad_id = tokenizer.pad_token_id if not ignore_eos else -1
+        eos_id = resolve_end_id(llm.args, tokenizer.eos_token_id)
+        pad_id = tokenizer.pad_token_id if eos_id != -1 else -1
 
         sampler_args = {
             "end_id": eos_id,

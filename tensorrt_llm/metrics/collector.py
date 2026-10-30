@@ -35,6 +35,30 @@ from .enums import MetricNames
 MAX_SPEC_DECODE_POSITION_LABELS = 16
 
 
+def speculative_config_info(args: "BaseLlmArgs") -> Optional[Dict[str, str]]:
+    """Summarize the speculative-decoding config of ``args`` as string labels.
+
+    Returns None when speculative decoding is not configured. The summary is
+    shared by the Prometheus config-info gauge and the ``/v1/models`` metadata
+    that benchmark clients read to choose their EOS handling.
+    """
+    spec_config_obj = getattr(args, "speculative_config", None) or getattr(
+        args, "decoding_config", None)
+    if spec_config_obj is None:
+        return None
+    speculative_config = {"spec_enabled": "true"}
+    decoding_type = getattr(spec_config_obj, "decoding_type", None)
+    if decoding_type is not None:
+        speculative_config["spec_method"] = str(decoding_type)
+    max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
+    if max_draft_len is not None:
+        speculative_config["spec_num_tokens"] = str(max_draft_len)
+    draft_model = getattr(spec_config_obj, "speculative_model", None)
+    if draft_model is not None:
+        speculative_config["spec_draft_model"] = str(draft_model)
+    return speculative_config
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
 class MetricsCollector:
     """Collects and logs metrics from TensorRT-LLM engine stats to Prometheus.
@@ -627,21 +651,7 @@ class MetricsCollector:
         if ep_size is not None and ep_size > 0:
             parallel_config["expert_parallel_size"] = str(ep_size)
 
-        # Speculative decoding config
-        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
-            args, "decoding_config", None)
-        speculative_config = None
-        if spec_config_obj is not None:
-            speculative_config = {"spec_enabled": "true"}
-            decoding_type = getattr(spec_config_obj, "decoding_type", None)
-            if decoding_type is not None:
-                speculative_config["spec_method"] = str(decoding_type)
-            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
-            if max_draft_len is not None:
-                speculative_config["spec_num_tokens"] = str(max_draft_len)
-            draft_model = getattr(spec_config_obj, "speculative_model", None)
-            if draft_model is not None:
-                speculative_config["spec_draft_model"] = str(draft_model)
+        speculative_config = speculative_config_info(args)
 
         # KV cache config
         kv_cache_config_obj = getattr(args, "kv_cache_config", None)

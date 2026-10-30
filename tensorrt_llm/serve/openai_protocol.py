@@ -240,6 +240,8 @@ class ModelCard(OpenAIBaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "tensorrt_llm"
+    # TensorRT-LLM extension: ``{"speculative_config": <labels or None>}``.
+    metadata: Optional[Dict[str, Optional[Dict[str, str]]]] = None
 
 
 class ModelList(OpenAIBaseModel):
