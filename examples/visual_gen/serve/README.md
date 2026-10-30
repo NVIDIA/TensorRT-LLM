@@ -423,7 +423,7 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F "guidance_scale=5.0"
 ```
 
-### Omni inputs: text, image, video, and audio (MiniMax H3 Ref2VA)
+### Omni inputs: text, image, video, and audio
 
 A single request can combine `prompt`, `image_reference`, `video_reference`, and
 `audio_reference`. This contract applies to any model that declares the relevant
@@ -433,14 +433,9 @@ rejected. Both `/v1/videos` and `/v1/videos/sync` accept JSON reference objects
 for multiple files. Uploads and JSON reference objects/lists can also be mixed
 under the same field, preserving their order within that modality.
 
-For MiniMax H3, start the server with the converted H3 checkpoint and
-`--visual_gen_args examples/visual_gen/configs/minimax-h3-ref2va-bf16-1gpu.yaml`
-to select Ref2VA (the checkpoint must include `transformer_ref/`). Video and audio
-references require PyAV (`av`) in the serving runtime. Audio sample-rate conversion
-also requires a `torchaudio` version compatible with the installed PyTorch.
-Alternatively, use FFmpeg to resample both audio references and video soundtracks
-to H3's 32 kHz input rate before uploading. MP4 output requires FFmpeg as described
-in the prerequisites above. Then submit:
+Start the server with a model and configuration that support the requested
+combination of inputs. Follow that model's setup instructions for media-decoding
+dependencies, supported formats, and sample rates. For example:
 
 ```bash
 curl -X POST "http://localhost:8000/v1/videos" \
@@ -448,16 +443,11 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F 'image_reference=@./subject.png' \
   -F 'image_reference=@./style.png' \
   -F 'video_reference=@./motion.mp4' \
-  -F 'audio_reference=@./sound.wav' \
-  -F 'extra_params={"reference_order":["image:0","video:0","audio:0","image:1"]}'
+  -F 'audio_reference=@./sound.wav'
 ```
 
-H3's optional `reference_order` selects cross-modality order using zero-based
-indices within each field. Without it, H3 consumes images, then videos, then
-audio. It must list every supplied reference exactly once. Ref2VA accepts up to
-9 images, 3 videos, and 3 audio references, with at most 12 references total;
-audio-only conditioning is not supported. Other models define their own limits
-and model-specific options in `extra_params`.
+Reference roles, count limits, and cross-modality ordering are defined by the
+loaded model. Pass any supported model-specific options through `extra_params`.
 
 ### Video-to-Video (Multipart with File Upload, Cosmos3)
 ```bash
