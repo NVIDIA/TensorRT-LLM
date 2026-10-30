@@ -18,8 +18,10 @@
 #pragma once
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceMessage.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/HostWorkerPool.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -42,14 +44,15 @@ struct BounceChunk
     // on the ACK critical path) by orders of magnitude. The per-desc arrays above stay as-is for the
     // gather (src layout is independent of dst).
     std::vector<BounceScatterRun> scatterRuns;
-    std::uint64_t totalBytes{0};  // sum of desc sizes (payload only, excludes padding)
-    std::uint64_t packedBytes{0}; // region extent to RDMA-write: last bounceOffset + its size
-    std::uint32_t dstDeviceId{0}; // receiver device id (uniform across the entire request)
+    std::uint64_t totalBytes{0};   // sum of desc sizes (payload only, excludes padding)
+    std::uint64_t packedBytes{0};  // region extent to RDMA-write: last bounceOffset + its size
+    std::uint32_t dstDeviceId{0};  // receiver device id (uniform across the entire request)
+    std::uint32_t maxDescBytes{0}; // largest entry of `sizes` (descs counted after src/dst-contiguous merging)
 };
 
 /// Pure bin-packing of a TransferRequest's (src,dst) descriptor pairs into chunks that each
-/// fit in one bounce region (<= maxChunkSizeBytes). No CUDA / NIXL / threads — trivially
-/// unit-testable.
+/// fit in one bounce region (<= maxChunkSizeBytes). No CUDA / NIXL, and threads only through an
+/// optional caller-provided HostWorkerPool — trivially unit-testable.
 ///
 /// Source descriptors must all use one device id, and destination descriptors must all use one
 /// device id. Mixed-device requests are unsupported.
@@ -57,15 +60,20 @@ struct BounceChunk
 /// Packing rules (a chunk is flushed when either holds):
 ///   - adding the next desc would exceed `maxChunkSizeBytes`,
 ///   - the chunk already holds `maxDescsPerChunk` descs.
+/// Each descriptor segment starts a fresh chunk, so a segment boundary may add one partially filled chunk.
 class BounceTransferPlan
 {
 public:
     /// @param maxChunkSizeBytes Per-chunk byte cap (one transfer writes at most this many bytes).
     /// @param maxDescsPerChunk Upper bound on descriptors per chunk (bounds scatter-plan size).
+    /// @param segments Number of contiguous descriptor segments planned independently (capped at the
+    /// descriptor count; production uses bulkSegmentCount).
+    /// @param pool Plans the segments in parallel when non-null. The plan depends only on `segments`.
     /// Throws (TLLM_CHECK) on src/dst count, length, or device-id mismatch, or when a single desc is
-    /// larger than maxChunkSizeBytes.
+    /// larger than maxChunkSizeBytes, reporting the lowest offending index.
     [[nodiscard]] static BounceTransferPlan build(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
-        std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk);
+        std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk, std::size_t segments = 1,
+        HostWorkerPool* pool = nullptr);
 
     [[nodiscard]] std::vector<BounceChunk> const& chunks() const noexcept
     {

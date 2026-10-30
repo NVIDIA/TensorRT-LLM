@@ -130,6 +130,29 @@ namespace tensorrt_llm::executor::kv_cache::bounce
     return parsed * mult;
 }
 
+/// Whether a bounce agent should run its NIXL UCX backend with split_batch_size=1, which posts every write
+/// to one of NIXL's dedicated worker threads. Otherwise bounce's one-descriptor chunk writes run on the
+/// shared UCX worker, which the progress thread arms; arming queues a host callback on the cuda_ipc copy
+/// stream and serializes the queued chunk copies (about half the NVLink bandwidth). A user-set
+/// split_batch_size wins.
+[[nodiscard]] inline bool bounceWantsSplitBatchSizeOne(bool bounceRequested, std::string const& backend,
+    bool useProgThread, bool userSetSplitBatchSize, std::optional<std::string> const& resolvedNumThreads)
+{
+    if (!bounceRequested || backend != "UCX" || !useProgThread || userSetSplitBatchSize
+        || !resolvedNumThreads.has_value())
+    {
+        return false;
+    }
+    auto const threads = parseU64Value(*resolvedNumThreads);
+    return threads.has_value() && *threads > 0;
+}
+
+// Split large copy runs into pieces of this size when building the batched-copy plan arrays. The
+// copy kernel assigns ONE thread block per plan entry, so a plan of a few huge coalesced runs would
+// use only a few SMs; splitting restores the grid-level parallelism the pre-coalescing per-desc plan
+// had, without giving up the small wire messages.
+inline constexpr std::uint32_t kCopySplitBytes = 64U << 10;
+
 /// POD config for the bounce v2 pipeline. There is no `enabled` field: the on/off switch is
 /// CacheTransceiverConfig's agent_bounce_buffer_enable + kv_cache_bounce_size_mb (which the Python
 /// frontend folds into the agent's arena size in MiB: 0 = off, >0 = arena size), and at runtime
@@ -163,6 +186,12 @@ struct BounceConfig
     // means no minimum.
     std::size_t minDescriptorCount{1024};                   // min_descriptor_count
     std::size_t maxAverageDescriptorSizeBytes{16ULL << 10}; // max_average_descriptor_size
+
+    [[nodiscard]] bool outboundRoutingDisabled() const noexcept
+    {
+        return maxAverageDescriptorSizeBytes == 0;
+    }
+
     int requestTimeoutMs{30000}; // request_timeout_ms; must be > 0 — the whole failure model
                                  // (abandoned-flow resolution, receiver lease, quarantine) hangs off
                                  // this timer, so applyParam rejects 0 (negatives already fail the
@@ -402,5 +431,12 @@ struct BounceConfig
         return base;
     }
 };
+
+/// Descriptor cap per chunk: the transfer plan packs at most this many descs per chunk, and every exec
+/// context's plan arrays are sized for it.
+[[nodiscard]] inline std::size_t maxDescsPerChunk(BounceConfig const& cfg) noexcept
+{
+    return std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
+}
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce
