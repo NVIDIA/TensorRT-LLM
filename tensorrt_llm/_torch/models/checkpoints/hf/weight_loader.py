@@ -857,9 +857,11 @@ class HfWeightLoader(BaseWeightLoader):
         setup_error = None
         try:
             plan = build_local_plan(file_sizes, local_rank, local_size)
-            session = RankStripedReadAheadSession(active_communicator,
-                                                  node_communicator,
-                                                  plan).start()
+            session = RankStripedReadAheadSession(
+                active_communicator,
+                node_communicator,
+                plan,
+                checkpoint_bytes=checkpoint_bytes).start()
         except Exception as error:
             setup_error = error
         coordinated_setup_error = coordinate_error(active_communicator,
@@ -1126,6 +1128,23 @@ class HfWeightLoader(BaseWeightLoader):
         # Each rank loads files with indices local_rank, local_rank + local_mpi_size, local_rank + 2*local_mpi_size, etc.
         if local_communicator is None:
             rank, size = local_mpi_rank(), local_mpi_size()
+            if mpi_disabled():
+                # Under Ray orchestration MPI is disabled: local_mpi_size()
+                # falls back to 1 while local_mpi_rank() falls back to
+                # torch.cuda.current_device(), so the stride partition below
+                # degenerates to "every file from index <rank> onward" and
+                # each rank re-reads nearly the whole checkpoint. A plain
+                # single-process MPI run also has size 1 but one rank per
+                # node, so it keeps prefetching every file.
+                # Stride by the node's GPU
+                # count instead: the node's ranks then partition the file list
+                # and their union still covers every file, which is all
+                # prefetch exists for (the page cache is node-shared). A rank
+                # that is genuinely alone on its node merely prefetches a
+                # subset; the rest is read at mmap fault time with no
+                # correctness impact.
+                size = max(1, torch.cuda.device_count())
+                rank = rank % size
         else:
             rank = local_communicator.Get_rank()
             size = local_communicator.Get_size()

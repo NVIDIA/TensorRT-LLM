@@ -27,7 +27,7 @@ after model weight loading and BEFORE any inference forward pass.  It:
    local weights into fabric memory and freeing the originals.  Handles
    are exchanged via the DWDP MPI communicator.
 5. Constructs a WeightBuffer with composite VA layout (zero-copy local
-   + page-pool-backed remote double buffer).
+   + page-pool-backed remote prefetch slots).
 6. Fills page-alignment edge bytes at MNNVL region boundaries.
 7. Creates a DWDPWeightManager for runtime P2P prefetch scheduling.
 8. Patches each MoE backend so it sees all ``num_experts`` (ep_size=1) and
@@ -42,7 +42,7 @@ no-op (returns the existing manager stored on the model).
 from __future__ import annotations
 
 import traceback
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -93,7 +93,9 @@ def setup_dwdp(
     layer_indices: List[int],
     num_experts_per_worker: int,
     num_prefetch_experts: int,
+    num_prefetch_slots: int,
     contention_opt: bool = False,
+    repeated_layer_indices: Sequence[int] = (),
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -124,6 +126,12 @@ def setup_dwdp(
             redundancy: adjacent ranks' ranges overlap by
             ``num_experts_per_worker - num_prefetch_experts`` experts and
             ``lookup_owner`` resolves the lowest-rank owner.
+        num_prefetch_slots: Number of prefetch buffer slots, each holding the
+            remote experts of one MoE layer (``DwdpConfig.num_prefetch_slots``).
+        contention_opt: Copy-engine prefetch as one interleaved
+            ``cudaMemcpyBatchAsync`` per layer (``DwdpConfig.contention_opt``).
+        repeated_layer_indices: Layers of ``layer_indices`` that run several
+            times in a row within a forward pass (``DwdpManager.add_repeated_layer``).
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
@@ -235,11 +243,14 @@ def setup_dwdp(
             local_end=local_end,
             dwdp_size=mapping.dwdp_size,
             device_id=device_id,
+            num_slots=num_prefetch_slots,
         )
     except BaseException:
         _release_during_rollback(transport, "transport")
         raise
-    logger.info("[DWDP Setup] Weight buffer created successfully.")
+    logger.info(
+        f"[DWDP Setup] Weight buffer created successfully ({num_prefetch_slots} prefetch slots)."
+    )
 
     # 6. Fill edge bytes
     logger.info("[DWDP Setup] Filling page-alignment edge bytes...")
@@ -270,6 +281,7 @@ def setup_dwdp(
             dwdp_rank=mapping.dwdp_rank,
             dwdp_size=mapping.dwdp_size,
             contention_opt=contention_opt,
+            repeated_layer_indices=repeated_layer_indices,
         )
     except BaseException:
         _release_during_rollback(weight_buffer, "weight buffer")

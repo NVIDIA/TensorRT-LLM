@@ -537,7 +537,9 @@ class Fp4MlaV2CacheLayoutPolicy:
                     self._bf16_mla_manager_layer_ids[0], Role.KEY
                 ).scale
             )
-        self.kv_offset = torch.zeros_like(self.index_scales)
+        self.kv_offset = torch.zeros(
+            num_pools, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
         self._index_scale_ints = self.index_scales.tolist()
         # FP4 MLA builds one page table per lifecycle pool (each pool holds a
         # single layer kind) and rejects enable_swa_scratch_reuse, so the base
@@ -553,6 +555,8 @@ class Fp4MlaV2CacheLayoutPolicy:
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+
+        self._prepare_page_table_materializer(index_mapper_capacity)
 
     def _validate_fp4_mla_layer_groups(self) -> None:
         cache_groups = {

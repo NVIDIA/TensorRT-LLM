@@ -40,7 +40,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LogprobMode, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import SlotSamplingParams
@@ -62,8 +62,8 @@ class _Request:
     is_dummy: bool = False
     py_beam_width: int = 1
     is_context_init_state: bool = False
-    return_log_probs: bool = False
     py_return_log_probs: bool = False
+    py_logprobs_mode: LogprobMode = LogprobMode.RAW
     py_min_length: int = 0
     py_stop_words_list: Any = None
     py_bad_words: Any = None

@@ -556,32 +556,23 @@ class LowMGemmDispatcher:
         ):
             best_runner = cublas_runner
             best_tactic = -1
-        # Fetch or lazily create a per-(module, M-bucket, N) output buffer so
-        # the kernel always writes to a stable device address compatible with
-        # TRT-LLM's model-level CUDA-graph replay.  Allocation is guarded
-        # against happening inside a live CUDA-graph capture window.
-        #
-        # The module name (set by prepare()) is included in the key to prevent
-        # two Linear modules that share the same output shape — e.g. gate_proj
-        # and up_proj in a SwiGLU MLP, or Q/K/V projections with equal head
-        # dimensions — from aliasing each other's output buffer.
+        # Cache output storage outside capture, keyed by module to prevent
+        # same-shaped projections from sharing a destination. During capture,
+        # each invocation needs its own output: a module may run repeatedly
+        # while callers retain earlier results (for example, draft logits).
         m = int(input_2d.shape[0])
         n = int(weight.shape[0])
         m_bucket = next((b for b in _M_TUNING_BUCKETS if b >= m), _M_TUNING_BUCKETS[-1])
         module_key = getattr(module, "_low_m_gemm_name", str(id(module)))
         buf_key = (module_key, m_bucket, n)
-        if buf_key not in self._output_buffers:
-            if torch.cuda.is_current_stream_capturing():
-                # Allocation inside a CUDA-graph capture corrupts the graph.
-                # Use a per-call tensor so the capture can complete; the next
-                # non-capturing call will populate the cache.
-                out_buf = torch.empty((m, n), dtype=input_2d.dtype, device=input_2d.device)
-            else:
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
+            out_buf = torch.empty((m, n), dtype=input_2d.dtype, device=input_2d.device)
+        else:
+            if buf_key not in self._output_buffers:
                 self._output_buffers[buf_key] = torch.empty(
                     (m_bucket, n), dtype=torch.bfloat16, device=input_2d.device
                 )
-                out_buf = self._output_buffers[buf_key][:m, :]
-        else:
             out_buf = self._output_buffers[buf_key][:m, :]
         out = best_runner([input_2d, weight_t], tactic=best_tactic, bias=bias_d, out=out_buf)
         out_view = out.view(*input_tensor.shape[:-1], weight.shape[0])
@@ -591,7 +582,7 @@ class LowMGemmDispatcher:
         # torch.stack() — receive an independent copy rather than a view that the
         # next call silently overwrites.  Inside a capture window out_buf is already
         # a fresh per-call allocation, so no clone is needed there.
-        if not torch.cuda.is_current_stream_capturing():
+        if not is_capturing:
             return out_view.clone()
         return out_view
 

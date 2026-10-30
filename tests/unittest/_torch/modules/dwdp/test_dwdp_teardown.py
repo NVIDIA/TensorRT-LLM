@@ -22,6 +22,8 @@ import torch.nn as nn
 from tensorrt_llm._torch.modules.dwdp.setup import teardown_dwdp
 from tensorrt_llm._torch.modules.dwdp.weight_manager import DWDPWeightManager
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_weight_manager_release_is_ordered_and_idempotent():
     manager = DWDPWeightManager.__new__(DWDPWeightManager)
@@ -30,6 +32,7 @@ def test_weight_manager_release_is_ordered_and_idempotent():
     manager._peer_views = {}
     manager._transport = MagicMock()
     manager._batched_copy_plans = {}
+    manager._gather_plans = {3: None}
     order = []
     manager._weight_buffer.release.side_effect = lambda: order.append("weight_buffer")
     manager._transport.release.side_effect = lambda: order.append("transport")
@@ -43,6 +46,7 @@ def test_weight_manager_release_is_ordered_and_idempotent():
         manager.release()
 
     assert order == ["synchronize", "weight_buffer", "transport"]
+    assert manager._gather_plans == {}
     assert synchronize.call_args_list == [call(0)]
     manager._weight_buffer.release.assert_called_once_with()
     transport.release.assert_called_once_with()
@@ -63,6 +67,7 @@ def test_weight_manager_release_frees_transport_when_the_buffer_raises():
     manager._peer_views = {}
     manager._transport = MagicMock()
     manager._batched_copy_plans = {}
+    manager._gather_plans = {}
     manager._weight_buffer.release.side_effect = RuntimeError("buffer release failed")
 
     with patch("tensorrt_llm._torch.modules.dwdp.weight_manager.torch.cuda.synchronize"):

@@ -28,7 +28,7 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 |---|---|---|---|---|
 | `TRTLLM` | `int8` | `fp8` | `(2, 16, 1)` | SageAttention (INT8 QK) for Hopper |
 | `TRTLLM` | `int8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (INT8 QK) for Blackwell |
-| `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)` | SageAttention (FP8 QK) for Blackwell |
+| `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (FP8 QK) for Blackwell |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | PrimTS QK16PV8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | PrimTS FP8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `CUDNN` | `fp8` | `fp8` | `(0, 0, 0)` | cuDNN FP8 |
@@ -66,6 +66,8 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | `q_block_size` | int ≥ 0 | `0` | Q tokens per SageAttention quantization block. `0` outside SageAttention. |
 | `k_block_size` | int ≥ 0 | `0` | K tokens per SageAttention quantization block. `0` outside SageAttention. |
 | `v_block_size` | int ≥ 0 | `0` | V block size on the hidden dimension. `0` = one tensor-wide V scale; `1` = one scale per channel. Keep `0` if `v_dtype` defines its own scaling format (e.g., `mxfp8` or `nvfp4`) |
+| `smooth_k` | bool | `False` | SageAttention only. Subtract the per-channel K mean before quantizing K. |
+| `smooth_v` | bool | `False` | SageAttention only. Subtract the per-channel V mean before quantizing V and add it back to the output. Applied where attention runs on the PrimTS kernels; see [SageAttention in the `TRTLLM` backend](#sageattention-in-the-trtllm-backend). |
 
 Routing (`tensorrt_llm/_torch/visual_gen/attention/backends/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
 
@@ -118,6 +120,7 @@ attention_config:
 - On H100/H200/H800/H20, only one recipe with fixed `qk_dtype: "int8"` is supported.
 - On B200/GB200, it is recommended to use the `qk_dtype: "int8"` recipes.
 - On B300/GB300, use `qk_dtype: "fp8"` and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200.
+- `smooth_v` needs a kernel that adds the V mean back to the output. The PrimTS kernels behind VSA and SOL do; with `smooth_v`, dense attention calls (dense layers and timesteps, or a dense model) also run on PrimTS where their shape allows. The trtllm-gen kernels quantize V without the mean and log a warning once. PrimTS runs on B200/GB200 and B300/GB300 only, so H100/H200/H800/H20 reject `smooth_v`.
 
 **Configuration.**
 

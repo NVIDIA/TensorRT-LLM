@@ -4,8 +4,9 @@
 
 MoE LoRA is supported only on the Cutlass backend with unquantized fp16/bf16 or
 per-tensor FP8 (qdq) base weights. Resolution owns that contract at select time:
-``supports_moe_lora`` filters backends, and ``CutlassFusedMoE.can_implement``
-rejects unsupported base-weight quants when ``moe_lora_enabled`` is set.
+``supports_moe_lora`` filters backends, and each CUTLASS leaf's ``can_implement``
+(``check_moe_lora``) rejects unsupported base-weight quants when
+``moe_lora_enabled`` is set.
 
 `check_moe_lora_supported` remains as a standalone assertion for unit tests and
 any caller that wants an explicit ValueError without going through resolution.

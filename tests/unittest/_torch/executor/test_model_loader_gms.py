@@ -94,6 +94,7 @@ def _pool_scope(events):
 def _make_loader(monkeypatch, *, events, spec_config=None):
     llm_args = SimpleNamespace(
         load_format=LoadFormat.GMS,
+        lm_head_output_dtype="auto",
         gms_config=SimpleNamespace(socket_path="/tmp/gms.sock", mode="auto", tag="weights"),
     )
     loader = ModelLoader(
@@ -366,6 +367,35 @@ def test_gms_ro_materializes_between_alias_setup_and_cache_state(monkeypatch):
     assert "post_load_weights" not in events
     checkpoint_loader.load_weights.assert_not_called()
     backend.materialize_module.assert_called_once()
+
+
+def test_gms_ro_does_not_retransform_materialized_slice_weights(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    backend = _build_gms_backend(is_rw=False, events=events)
+    _install_gms_backend(monkeypatch, backend)
+
+    class _AlreadyTransformedProjection(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._weights_transformed = False
+            self.cache_rebuilt = False
+
+        def cache_derived_state(self):
+            if not self._weights_transformed:
+                raise AssertionError("GMS read-only weights must not be transformed again")
+            self.cache_rebuilt = True
+
+    model = model_loader_mod.AutoModelForCausalLM.from_config.return_value
+    model.projection = _AlreadyTransformedProjection()
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+
+    loaded_model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    assert loaded_model is model
+    assert model.projection.cache_rebuilt
+    assert model.projection._weights_transformed
 
 
 def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):

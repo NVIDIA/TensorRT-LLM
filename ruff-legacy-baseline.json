@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2091,
-    "total_files": 222
+    "total_violations": 2089,
+    "total_files": 221
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -225,9 +225,6 @@
   },
   "tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py": {
     "F821": 2
-  },
-  "tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py": {
-    "E741": 2
   },
   "tensorrt_llm/_torch/moe/fused_moe/fused_moe_triton.py": {
     "F821": 1

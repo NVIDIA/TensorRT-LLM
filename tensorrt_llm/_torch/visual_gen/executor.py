@@ -28,6 +28,7 @@ from tensorrt_llm._torch.visual_gen.batching import (
 )
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
@@ -837,6 +838,7 @@ def run_diffusion_worker(
         device_id = _local_rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
         if torch.cuda.is_available():
             torch.cuda.set_device(device_id)
+            check_cuda_architecture_supported(device_id)
             try:
                 configure_cpu_affinity(device_id)
             except Exception as e:
