@@ -739,7 +739,7 @@ struct Result
     std::optional<std::vector<VecLogProbs>> logProbs;
 
     /// @brief The reason why the model stopped generating tokens for each beam in this request. Size [beamSize].
-    /// Currently only supported when beamSize is 1 and when using BatchingType::kINFLIGHT.
+    /// Currently only supported when beamSize is 1 and when using in-flight batching.
     std::vector<FinishReason> finishReasons;
 
     /// @brief The params of the context phase.
@@ -990,46 +990,6 @@ private:
     /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
     /// be allocated.
     uint64_t mMaxGpuTotalBytes;
-};
-
-/// @brief Configuration class for the runtime perf knobs
-class ExtendedRuntimePerfKnobConfig
-{
-public:
-    explicit ExtendedRuntimePerfKnobConfig(bool multiBlockMode = true, bool enableContextFMHAFP32Acc = false,
-        bool cudaGraphMode = false, SizeType32 cudaGraphCacheSize = 0);
-
-    bool operator==(ExtendedRuntimePerfKnobConfig const& other) const
-    {
-        return mMultiBlockMode == other.mMultiBlockMode && mEnableContextFMHAFP32Acc == other.mEnableContextFMHAFP32Acc
-            && mCudaGraphMode == other.mCudaGraphMode && mCudaGraphCacheSize == other.mCudaGraphCacheSize;
-    }
-
-    [[nodiscard]] bool getMultiBlockMode() const;
-    [[nodiscard]] bool getEnableContextFMHAFP32Acc() const;
-    [[nodiscard]] bool getCudaGraphMode() const;
-    [[nodiscard]] SizeType32 getCudaGraphCacheSize() const;
-
-    void setMultiBlockMode(bool multiBlockMode);
-    void setEnableContextFMHAFP32Acc(bool enableContextFMHAFP32Acc);
-    void setCudaGraphMode(bool cudaGraphMode);
-    void setCudaGraphCacheSize(SizeType32 cacheSize);
-
-private:
-    friend class Serialization;
-
-    /// @brief Control if multi block mode should be enabled or not.
-    bool mMultiBlockMode;
-
-    /// @brief If enable FMHA runner FP32 accumulation.
-    bool mEnableContextFMHAFP32Acc;
-
-    /// @brief Control if enable cuda graph.
-    bool mCudaGraphMode;
-
-    /// @brief Number of cuda graphs to be cached in the runtime.
-    /// The larger the cache, the better the perf, but more GPU memory is consumed.
-    SizeType32 mCudaGraphCacheSize;
 };
 
 /// @brief config for PeftCacheManager

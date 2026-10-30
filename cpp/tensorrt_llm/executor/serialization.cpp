@@ -1189,34 +1189,6 @@ size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTranscei
     return totalSize;
 }
 
-// ExtendedRuntimePerfKnobConfig
-ExtendedRuntimePerfKnobConfig Serialization::deserializeExtendedRuntimePerfKnobConfig(std::istream& is)
-{
-    auto multiBlockMode = su::deserialize<bool>(is);
-    auto enableContextFMHAFP32Acc = su::deserialize<bool>(is);
-    auto cudaGraphMode = su::deserialize<bool>(is);
-    auto cudaGraphCacheSize = su::deserialize<SizeType32>(is);
-    return ExtendedRuntimePerfKnobConfig{multiBlockMode, enableContextFMHAFP32Acc, cudaGraphMode, cudaGraphCacheSize};
-}
-
-void Serialization::serialize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::ostream& os)
-{
-    su::serialize(extendedRuntimePerfKnobConfig.getMultiBlockMode(), os);
-    su::serialize(extendedRuntimePerfKnobConfig.getEnableContextFMHAFP32Acc(), os);
-    su::serialize(extendedRuntimePerfKnobConfig.getCudaGraphMode(), os);
-    su::serialize(extendedRuntimePerfKnobConfig.getCudaGraphCacheSize(), os);
-}
-
-size_t Serialization::serializedSize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(extendedRuntimePerfKnobConfig.getMultiBlockMode());
-    totalSize += su::serializedSize(extendedRuntimePerfKnobConfig.getEnableContextFMHAFP32Acc());
-    totalSize += su::serializedSize(extendedRuntimePerfKnobConfig.getCudaGraphMode());
-    totalSize += su::serializedSize(extendedRuntimePerfKnobConfig.getCudaGraphCacheSize());
-    return totalSize;
-}
-
 // PeftCacheConfig
 PeftCacheConfig Serialization::deserializePeftCacheConfig(std::istream& is)
 {

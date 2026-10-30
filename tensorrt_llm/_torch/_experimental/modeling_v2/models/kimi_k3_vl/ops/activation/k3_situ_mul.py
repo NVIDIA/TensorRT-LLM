@@ -11,7 +11,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 class K3SituMul(OpWrapper):
     """Return `SituAndMul(beta, linear_beta)(gu)`, gate half first, in one k3_situ_mul call."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"{name} caps at M={m}: TP16 dense MLP row-count independence",

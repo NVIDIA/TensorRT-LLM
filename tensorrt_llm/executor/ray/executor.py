@@ -37,6 +37,7 @@ from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.executor.ray.utils import unwrap_ray_errors
 from tensorrt_llm.logger import logger
 
+from ...llmapi._load_balance_env import uses_collective_shutdown
 from ...llmapi.utils import logger_debug
 from ..executor import GenerationExecutor
 from ..postproc_worker import PostprocWorkerConfig
@@ -364,17 +365,22 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
         # Then, shutdown the workers
         if hasattr(self, 'workers') and self.workers is not None:
-            try:
-                shutdown_refs = [
-                    worker.shutdown.remote() for worker in self.workers
-                ]
-                # Add timeout to prevent indefinite hanging
-                ray.get(shutdown_refs, timeout=30.0)
-            except ray.exceptions.GetTimeoutError:
-                logger.warning(
-                    "Timeout waiting for workers to shutdown after 30 seconds")
-            except Exception as e:
-                logger.warning(f"Error shutting down: {e}")
+            if uses_collective_shutdown(
+                    getattr(self, "worker_kwargs", {}).get("llm_args")):
+                self._shutdown_workers_collectively()
+            else:
+                try:
+                    shutdown_refs = [
+                        worker.shutdown.remote() for worker in self.workers
+                    ]
+                    # Add timeout to prevent indefinite hanging
+                    ray.get(shutdown_refs, timeout=30.0)
+                except ray.exceptions.GetTimeoutError:
+                    logger.warning(
+                        "Timeout waiting for workers to shutdown after 30 seconds"
+                    )
+                except Exception as e:
+                    logger.warning(f"Error shutting down: {e}")
 
             # The engines are already stopped by the shutdown RPC above, so
             # kill the actor processes explicitly instead of relying on
@@ -411,6 +417,52 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         if self.has_start_local_cluser and ray.is_initialized():
             logger.debug("Shutting down Ray cluster")
             ray.shutdown()
+
+    def _shutdown_workers_collectively(self):
+        """Shut down workers that must release EP resources collectively.
+
+        Raises if a live worker failed, keeping the actors and placement group
+        for an explicit retry. A dead actor can never join the collective
+        release, so it falls through to forced teardown instead.
+        """
+        shutdown_refs = getattr(self, "_pending_shutdown_refs", None)
+        if shutdown_refs is None:
+            shutdown_refs = [
+                worker.shutdown.remote() for worker in self.workers
+            ]
+            self._pending_shutdown_refs = shutdown_refs
+
+        # Converge every rank before deciding whether actor teardown is safe.
+        # Keep timed-out refs for the next explicit shutdown() call: issuing a
+        # second collective shutdown while the first is still running can
+        # deadlock the rank set.
+        shutdown_errors = []
+        timed_out = False
+        actor_died = False
+        deadline = time.monotonic() + 30.0
+        for rank, shutdown_ref in enumerate(shutdown_refs):
+            try:
+                ray.get(shutdown_ref,
+                        timeout=max(0.0, deadline - time.monotonic()))
+            except ray.exceptions.GetTimeoutError as error:
+                timed_out = True
+                shutdown_errors.append((rank, error))
+            except ray.exceptions.RayActorError as error:
+                actor_died = True
+                shutdown_errors.append((rank, error))
+            except Exception as error:
+                shutdown_errors.append((rank, error))
+
+        if not timed_out or actor_died:
+            self._pending_shutdown_refs = None
+        for rank, error in shutdown_errors:
+            logger.warning(f"Ray worker {rank} shutdown failed: {error}")
+        if shutdown_errors and not actor_died:
+            # Preserve the actors and placement group. RayGPUWorker resets its
+            # own shutdown guard on failure, so a later explicit call can retry
+            # after all pending refs have converged.
+            self._shutdown_event.clear()
+            raise shutdown_errors[0][1]
 
     def _wait_for_cluster_resource_release(self, timeout: float = 30.0) -> None:
         """Block until Ray returns the workers' resources to the cluster.

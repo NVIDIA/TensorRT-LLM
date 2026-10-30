@@ -671,15 +671,20 @@ def test_sharded_block_logits_run_the_markov_kernel():
     vocab_slice = slice(RANK_IN_TP * SHARD, (RANK_IN_TP + 1) * SHARD)
 
     worker._k3_sharded_block_logits = True
-    assert worker._apply_dspark_markov_bias(drafter, logits, first, case.spec) is corrected
+    assert worker._apply_dspark_markov_bias(drafter, logits, first) is corrected
     assert len(chained) == 1 and chained[0][0] is logits and chained[0][1] is first
     assert chained[0][2] == vocab_slice
     assert not worker._k3_sharded_block_logits and not drafter.chain_calls
 
-    # The flag is spent: the next chain is the unfused one.
-    worker._apply_dspark_markov_bias(drafter, logits, first, case.spec)
+    # The flag is spent: the next chain is DSparkWorker's, through the Markov TP exchange.
+    exchange = SimpleNamespace(tp_size=TP)
+    worker._markov_tp_exchange = exchange
+    drafter.apply_markov_chain_logits = lambda logits, first, tp_exchange=None: (
+        drafter.chain_calls.append((logits, first, tp_exchange)) or logits
+    )
+    worker._apply_dspark_markov_bias(drafter, logits, first)
     assert len(chained) == 1 and len(drafter.chain_calls) == 1
-    assert drafter.chain_calls[0][2] == vocab_slice
+    assert drafter.chain_calls[0][0] is logits and drafter.chain_calls[0][2] is exchange
 
 
 def test_dspark_acceptance_is_kept_only_under_k3_decode(monkeypatch):
