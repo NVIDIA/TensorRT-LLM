@@ -164,6 +164,7 @@ class PrimsTSFmha(PhasedFmha):
     supports_per_tensor_fp8 = True
 
     SUPPORTED_SMS = frozenset({100, 103, 107})
+    SUPPORTED_MLA_SMS = frozenset({100, 103})
     SUPPORTED_PAGE_SIZES = {16, 32, 64, 128}
     SUPPORTED_CONTEXT_HEAD_DIMS = {128, 256}
     SUPPORTED_DECODE_HEAD_DIMS = {64, 128, 256}
@@ -202,8 +203,8 @@ class PrimsTSFmha(PhasedFmha):
                 f"PrimTS FMHA is unavailable: requires SM100, SM103, or SM107, got SM{sm}."
             )
             return False
-        if sm == 107 and attn.is_mla_enable:
-            logger.debug("PrimTS MLA FMHA is unavailable on SM107.")
+        if attn.is_mla_enable and sm not in cls.SUPPORTED_MLA_SMS:
+            logger.debug(f"PrimTS MLA FMHA is unavailable on SM{sm}.")
             return False
         try:
             cutlass = import_module("cutlass")
