@@ -120,6 +120,15 @@ deepseek-ai/DeepSeek-V4-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 95.11
+  # MXFP4 routed experts served as NVFP4_PLUS (E2M1 activations with UE5M3
+  # block scales) on the CuteDSL MoE; the rest of the model is unchanged, so
+  # quant_algo still reports FP8_BLOCK_SCALES. test_nvfp4_plus measures 95.45
+  # on 4x Rubin (SM107) at TP=4/EP=4 with attention DP, and test_auto_dtype
+  # (MXFP4 W4A8 on the TRTLLM MoE) 95.75 on the same node, so the reference
+  # stays level with the FP8_BLOCK_SCALES row above.
+  - quant_algo: FP8_BLOCK_SCALES
+    extra_acc_spec: moe_quant_algo=NVFP4_PLUS
+    accuracy: 95.11
   # DeepSeek-V4-Flash-nvfp4-DSpark: the same weights plus the DSpark drafter
   # for target layers 40-42, with the routed experts cast MXFP4 -> NVFP4.
   # MIXED_PRECISION is what the checkpoint's hf_quant_config declares (NVFP4

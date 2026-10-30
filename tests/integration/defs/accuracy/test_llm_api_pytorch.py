@@ -2223,6 +2223,31 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_no_rubin
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_plus(self, monkeypatch):
+        # Serves the MXFP4 routed experts as NVFP4_PLUS on the CuteDSL MoE:
+        # the E8M0 weight scales convert exactly to UE5M3, and activations are
+        # quantized to E2M1 with a UE5M3 scale per 32 elements. env_overrides
+        # sets the override in this process and on every worker rank;
+        # monkeypatch removes it from this process once the test ends.
+        env = {"OVERRIDE_QUANT_ALGO": "NVFP4_PLUS"}
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        with LLM(self.MODEL_PATH,
+                 env_overrides=env,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 moe_config=MoeConfig(backend="CUTEDSL"),
+                 enable_attention_dp=True,
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="moe_quant_algo=NVFP4_PLUS")
+
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_tep_mtp_separate_draft_kv_cache(self):
         # TEP (attention_dp=False) + one-model MTP exercises the separate draft
