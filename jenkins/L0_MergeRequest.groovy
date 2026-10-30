@@ -1880,7 +1880,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
-        "tests/integration/test_lists/test-db/l0_verl.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/moe/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",

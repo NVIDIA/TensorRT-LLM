@@ -3,6 +3,7 @@
 """The Kimi K3 targets' construction checks, host-side: each target requires its own parallel layout, and
 ``tp16_moetp16ep1`` also an explicit expert split and no speculative decoding."""
 
+import inspect
 import types
 
 import pytest
@@ -11,9 +12,17 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     modeling as route_a,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    spec_worker as spec_a,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
     modeling as route_b,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
+    spec_worker as spec_b,
+)
+from tensorrt_llm._torch.models import modeling_kimi_linear as shared
+from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -62,6 +71,46 @@ def test_each_target_requires_its_layout(target, parallel, split, other):
         target._check_construction(_config(*other))
     with pytest.raises(AssertionError, match="enable_attention_dp false"):
         target._check_construction(_config(*split, attention_dp=True))
+
+
+@pytest.mark.parametrize("target", [route_a, route_b], ids=["tp16_moetp4ep4", "tp16_moetp16ep1"])
+def test_expert_ckpt_spec_meets_the_shared_loader_contract(target):
+    spec = target._k3_expert_ckpt_spec(QuantAlgo.W4A8_MXFP4_MXFP8)
+    assert set(shared._K3ExpertCkptSpec._fields) <= set(spec._fields)
+    assert tuple(spec.optional_suffixes) == ()
+
+    loaded = {}
+    backend = types.SimpleNamespace(
+        quant_method=types.SimpleNamespace(
+            load_packed_mxfp4_expert=lambda backend, **kwargs: loaded.update(kwargs)
+        )
+    )
+    spec.loader(backend, "experts", 3, 0, lambda key: key, lambda key: None)
+    assert loaded["global_expert_id"] == 3
+    assert loaded["w1_weight"] == "experts.3.w1.weight_packed"
+
+
+@pytest.mark.parametrize("target", [spec_a, spec_b], ids=["tp16_moetp4ep4", "tp16_moetp16ep1"])
+def test_dspark_markov_bias_meets_the_shared_worker_contract(target, monkeypatch):
+    worker_cls = target.KimiK3DSparkWorker
+    assert inspect.signature(worker_cls._apply_dspark_markov_bias) == inspect.signature(
+        DSparkWorker._apply_dspark_markov_bias
+    )
+    calls = []
+    monkeypatch.setattr(
+        DSparkWorker,
+        "_apply_dspark_markov_bias",
+        lambda self, *args: calls.append(args) or "shared",
+    )
+    worker = worker_cls.__new__(worker_cls)
+    worker._k3_sharded_block_logits = False
+    draft_model = types.SimpleNamespace(has_markov_head=True, markov_w2=torch.empty(8, 2))
+    logits = torch.zeros(1, 2, 8)
+    prev = torch.zeros(1, dtype=torch.long)
+    assert worker._refine_block_logits(draft_model, logits, {"first_prev_tokens": prev}, None) == (
+        "shared"
+    )
+    assert calls == [(draft_model, logits, prev)]
 
 
 def test_tp16_moetp16ep1_requires_the_split_set_explicitly():

@@ -55,6 +55,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import (
     GenAdmissionConfig,
     GenAdmissionWaitingQueue,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankKvCacheStats
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
 from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.conversation_params import ConversationParams
@@ -275,6 +276,147 @@ class TestRankState:
 
         assert state.iter_stats == payload
         assert state.iter_stats is not payload
+
+    @pytest.mark.parametrize("include_kv_cache_load", [False, True])
+    @pytest.mark.parametrize("cache_presence", [(True, False), (False, True), (True, True)])
+    def test_kv_snapshot_roundtrip_preserves_tail(
+        self, include_kv_cache_load: bool, cache_presence: tuple[bool, bool]
+    ) -> None:
+        """Preserve snapshots, optional load telemetry and all routing tail fields."""
+        primary = RankKvCacheStats(100, 80, 20, 16, 40, 30, 7, 5, 0.375)
+        # A measured all-zero cache is different from an absent snapshot.
+        cross = RankKvCacheStats(0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+        payload = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_gen_requests=5,
+            kv_used_blocks=22 if include_kv_cache_load else -1,
+            kv_total_blocks=200 if include_kv_cache_load else -1,
+            kv_load_timestamp_ns=123 if include_kv_cache_load else 0,
+            kv_cache_stats=primary if cache_presence[0] else None,
+            cross_kv_cache_stats=cross if cache_presence[1] else None,
+        )
+        state = RankState(
+            rank=1,
+            num_active_requests=7,
+            num_active_tokens=321,
+            num_retiring_requests=2,
+            iter_stats=payload,
+            num_context_requests=3,
+            num_generation_requests=4,
+            num_connector_transfers=6,
+            connector_poll_failed=True,
+        )
+
+        assert RankIterStatsPayload.deserialize(payload.serialize(include_kv_cache_load)) == payload
+        assert RankState.deserialize(state.serialize(include_kv_cache_load)) == state
+
+    def test_kv_snapshot_wire_schema_is_stable(self) -> None:
+        """Pin field order and the complete versioned frame independently of roundtrips."""
+        assert RankKvCacheStats._fields == (
+            "max_num_blocks",
+            "free_num_blocks",
+            "used_num_blocks",
+            "tokens_per_block",
+            "alloc_total_blocks",
+            "alloc_new_blocks",
+            "reused_blocks",
+            "missed_blocks",
+            "cache_hit_rate",
+        )
+        state = RankState(
+            rank=1,
+            num_active_requests=7,
+            num_active_tokens=321,
+            num_retiring_requests=2,
+            iter_stats=RankIterStatsPayload(
+                has_iter_stats=1,
+                iter_stats_iter=9,
+                num_context_requests=2,
+                num_ctx_tokens=33,
+                num_ctx_kv_tokens=44,
+                num_gen_requests=5,
+                num_gen_kv_tokens=66,
+                num_paused_requests=7,
+                num_paused_kv_tokens=88,
+                kv_used_blocks=22,
+                kv_total_blocks=200,
+                kv_load_timestamp_ns=123,
+                kv_cache_stats=RankKvCacheStats(100, 80, 20, 16, 40, 30, 7, 5, 0.375),
+                cross_kv_cache_stats=RankKvCacheStats(60, 45, 15, 32, 25, 18, 4, 3, 0.25),
+            ),
+            num_context_requests=3,
+            num_generation_requests=4,
+            num_connector_transfers=6,
+            connector_poll_failed=True,
+        )
+        expected = [
+            1,
+            7,
+            321,
+            2,  # Rank state prefix.
+            -1,
+            1,
+            1,
+            1,  # Version and load/primary/cross presence flags.
+            1,
+            9,
+            2,
+            33,
+            44,
+            5,
+            66,
+            7,
+            88,  # Iteration scalars.
+            22,
+            200,
+            123,  # Routing load telemetry.
+            100,
+            80,
+            20,
+            16,
+            40,
+            30,
+            7,
+            5,
+            0.375,  # Primary KV snapshot.
+            60,
+            45,
+            15,
+            32,
+            25,
+            18,
+            4,
+            3,
+            0.25,  # Cross KV snapshot.
+            3,
+            4,
+            6,
+            1,  # Scheduling and connector tail.
+        ]
+
+        assert state.serialize(include_kv_cache_load=True) == expected
+        assert RankState.deserialize(expected) == state
+
+    def test_kv_snapshot_invalid_framing_is_rejected(self) -> None:
+        """Reject incomplete snapshots instead of consuming routing fields as KV values."""
+        state = RankState(
+            rank=0,
+            iter_stats=RankIterStatsPayload(
+                has_iter_stats=1,
+                iter_stats_iter=9,
+                kv_cache_stats=RankKvCacheStats(10, 8, 2, 16, 3, 2, 1, 1, 0.5),
+            ),
+        )
+        wire = state.serialize()
+        for invalid in (wire[:-1], [*wire, 0]):
+            with pytest.raises(ValueError, match="four trailing fields"):
+                RankState.deserialize(invalid)
+        wire[5] = 2  # The routing-load presence flag must be 0 or 1.
+        with pytest.raises(ValueError, match="header"):
+            RankState.deserialize(wire)
+        with pytest.raises(ValueError, match="requires"):
+            RankIterStatsPayload.deserialize(state.iter_stats.serialize()[:-1])
 
 
 class TestDefaultADPRouter:
