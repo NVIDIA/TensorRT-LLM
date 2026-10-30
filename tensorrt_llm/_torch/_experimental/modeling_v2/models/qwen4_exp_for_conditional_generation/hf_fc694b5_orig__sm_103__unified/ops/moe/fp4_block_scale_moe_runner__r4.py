@@ -101,8 +101,11 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     answers for `[local_expert_offset, local_expert_offset + local_num_experts)`
     and contributes zero for every other id, so an expert-parallel split is N
     calls whose outputs sum -- which is what the deepseek default target does
-    under moe_ep, one call per rank over its window; qwen4_exp makes one call
-    over its whole expert stack.
+    under moe_ep, one call per rank over its window. The qwen4_exp tp1 target
+    makes one call over its whole expert stack; the qwen4 unified target makes
+    one call per rank over a 128-expert window of the 512 at tep4 and dep4, a
+    256-expert window at dep2, and over all 512 experts at tp4, where each
+    rank's 160-wide slice of the intermediate is zero-padded to 256.
 
     With `do_finalize=True` the result is a one-element list holding the
     combined `[T, H]` bf16 rows, or an empty tensor when `output` was given.
@@ -155,8 +158,45 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     the linear (unswizzled) e4m3 block-scale layout, one scale per 16 elements
     of each row.
 
-    At 512 experts only the whole stack is certified: no expert-parallel window
-    of it, `do_finalize=False` or a caller-supplied `output` was measured there.
+    At 512 experts (H 2560, top-10) the whole stack at I 640, the qwen4
+    unified target's 128- and 256-expert windows of it at I 640, and the whole
+    stack at I 256 holding a 160-wide intermediate zero-padded are certified;
+    the unified target's cells (its test's `TARGET_CELLS`) were driven on
+    sm_103 only, the one architecture that target runs on, at 1 to 8192 rows:
+    at most 9.22 bf16 ulp per element against the row scale and 0.72 ulp
+    relative RMS, inside the test's 16 / 2 gate. The windows sum back to the
+    512-expert result (4.03 / 0.86), a row routing nothing into a window comes
+    back bitwise zero, and a warm autotuner cache leaves every layout's result
+    bitwise unchanged. `do_finalize=False` and a caller-supplied `output` were
+    not measured at 512 experts, nor were windows of the padded I 256 stack
+    (tp4 does not split experts).
+
+    The tp4 padding: rows [160, 256) of the up and gate halves and columns
+    [160, 256) of the down projection are zero codes with zero block scales,
+    each half padded on its own *before* the `[up | gate]` concatenation and
+    the row interleave. The padded layer then computes the 160-wide one: the
+    pad's FC1 output is zero, its requantized blocks are zero, and FC2 reads
+    zero weights there. A 160-wide layer does not fit the layout this entry
+    contracts -- 2 * 160 = 320 FC1 rows are not a multiple of the 128x4 scale
+    swizzle's 128, and 160 / 16 = 10 FC2 scale columns not a multiple of its 4
+    -- so an unpadded call is not certified (and was not measured). Padding
+    after the concatenation
+    moves gate rows into the up half: no error, ~290 bf16 ulp RMS. Naming
+    `intermediate_size=160` beside the padded operands is rejected loudly (no
+    trtllm-gen config for the N = 320 FC1 GEMM).
+
+    The weights' expert dimension is not checked by the op: only the scales'
+    and the three scalars' dim 0 are compared with `local_num_experts`. A
+    window call handed the full stack's `gemm1_weights` or `gemm2_weights`
+    with the window's scales reads the stack's first `local_num_experts`
+    experts for the window's ids, with no error -- measured ~360 bf16 ulp RMS
+    off at a 128-expert window of the 512. `is_valid` refuses it.
+
+    The op is a Python `torch.library.custom_op` (`trtllm::fp4_block_scale_moe_runner`
+    in `_torch/custom_ops/trtllm_gen_custom_ops.py`) over the compiled-in C++
+    class `torch.classes.trtllm.FP4BlockScaleMoERunner`
+    (`cpp/tensorrt_llm/thop/moe/trtllmGen/fp4BlockScaleMoe.cpp`), which launches
+    trtllm-gen's precompiled cubins: nothing is JIT-compiled.
 
     `tune_max_num_tokens` is an autotuner bucket hint and was measured inert;
     it is not a token count. `T` is `hidden_states.shape[0]`, and 8192 is the
@@ -329,7 +369,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
     ) -> None:
-        """The two ways this op takes an input and answers it wrongly.
+        """The three ways this op takes an input and answers it wrongly.
 
         Everything else a caller can get wrong here the op rejects loudly: a
         mismatched `intermediate_size`, a `top_k` outside `(0, num_experts)`, a
@@ -376,6 +416,18 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             "hidden size (gemm1_weights.shape[-1] * 2) must be a multiple of 256; "
             "the prepared block-scale layout is silently misread otherwise"
         )
+
+        # The op checks the scales' and scalars' expert dimension against
+        # local_num_experts but not the weights'. A window call handed the
+        # whole stack's weights reads its first local_num_experts experts for
+        # the window's ids. Measured at a 128-expert window of 512: no error,
+        # ~360 bf16 ulp RMS.
+        for name, tensor in (("gemm1_weights", gemm1_weights), ("gemm2_weights", gemm2_weights)):
+            assert tensor.shape[0] == local_num_experts, (
+                f"{name} holds {tensor.shape[0]} experts but local_num_experts is "
+                f"{local_num_experts}; pass the window's own weights -- the op reads "
+                "the first local_num_experts of a larger stack without complaint"
+            )
 
 
 fp4_block_scale_moe_runner = Fp4BlockScaleMoeRunner()
