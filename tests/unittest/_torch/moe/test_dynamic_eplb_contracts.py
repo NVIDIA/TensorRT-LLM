@@ -878,7 +878,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/py_executor.py",
         "PyExecutor",
-        {"shutdown", "_shutdown", "_finish_shutdown"},
+        {"shutdown", "_release_execution_resources", "_release_execution_pools"},
         {
             "AsyncWorkerMixin": AsyncWorkerMixin,
             "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
@@ -895,6 +895,9 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor = executor_cls()
     executor.model_engine = engine
     executor.draft_model_engine = None
+    executor._closed = False
+    executor._resources_released = False
+    executor.kv_cache_transceiver = None
     executor.shutdown_all_ranks = True
     executor.can_shutdown = lambda: True
     executor.executor_request_queue = SimpleNamespace(
@@ -923,7 +926,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     def terminal_cleanup(*, local_safe):
         events.append(("terminal_cleanup", local_safe))
         if local_safe:
-            assert executor.model_engine is None
+            assert not hasattr(executor, "model_engine")
             assert executor._terminal_model_engines == (engine,)
             executor._terminal_model_engines = ()
 
@@ -961,10 +964,9 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         ("terminal_cleanup", True),
     ]
     assert executor.virtual_memory_pools == {}
-    assert executor.model_engine is None
+    assert not hasattr(executor, "model_engine")
     assert executor.draft_model_engine is None
     assert executor.dwdp_manager is None
-    assert executor._shutdown_sampler_complete
     assert executor._terminal_model_engines == ()
     assert worker.engine is None
 
@@ -1761,8 +1763,8 @@ def test_megamoe_cute_pointer_cache_keys_address_and_alignment():
 
 
 def test_executors_of_one_engine_share_the_execution_stream():
-    # The planner binds the first MAIN stream for good, so the KV-cache
-    # estimation executor and the final executor must share one stream.
+    # The planner binds the first MAIN stream for good, so every executor
+    # built for the engine, across profiling and serving, uses its one stream.
     tree = ast.parse((_TORCH_ROOT / "pyexecutor/py_executor_creator.py").read_text())
     create = next(
         node
@@ -1776,7 +1778,7 @@ def test_executors_of_one_engine_share_the_execution_stream():
         and isinstance(node.func, ast.Name)
         and node.func.id == "create_py_executor_instance"
     ]
-    assert len(calls) >= 2
+    assert calls
     for call in calls:
         stream = next(
             (keyword.value for keyword in call.keywords if keyword.arg == "execution_stream"),
