@@ -832,3 +832,6 @@ visual_gen/test_minimax_h3_sleep.py::test_minimax_h3_sleep_preserves_video_and_a
 
 # Tiny local Wan/FLUX checkpoints; one CUDA GPU, no pretrained model download.
 unittest/_torch/visual_gen/test_sleep_non_h3.py
+
+# First 100 questions only; one four-GB300 node, never full GSM8K.
+accuracy/test_nvfp4_serving_gsm8k.py::test_gsm8k_first100 TIMEOUT (45)

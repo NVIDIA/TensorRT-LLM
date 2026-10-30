@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam checkpoint layout / sm_103 / tp4: rank-local real weights and representative blocks.
+"""Beam BF16 checkpoint-layout component / sm_103 / tp4: rank-local real weights and blocks.
 
-A component, not a routed target. There is no ``routing.py`` and no ``ForCausalLM``: a
-caller on each of four ranks constructs this class with the checkpoint's configuration and
-its rank's ``Mapping`` (attention TP4, MoE TP4/EP1, PP1), loads a caller-supplied checkpoint
-directory into the rank's slices, and runs representative computations. It does not run a
-full-depth forward, prefill/decode loop or sampler.
+Owned by the routed NVFP4 target (this directory): the NVFP4 component (``component``) builds
+on it and the full model (``model``) on that. Constructed on its own it is a component, not a
+target: a caller on each of four ranks constructs this class with the checkpoint's
+configuration and its rank's ``Mapping`` (attention TP4, MoE TP4/EP1, PP1), loads a
+caller-supplied checkpoint directory into the rank's slices, and runs representative
+computations. It does not run a full-depth forward, prefill/decode loop or sampler.
 
-Storage is rank-local and final: each logical tensor's slice (``layout``) lives in its own
+Storage is rank-local and final: each logical tensor's slice (``layout_bf16``) lives in its own
 parameter, except that each sparse layer keeps its 256 experts' slices in three contiguous
 banks. Loading streams bounded tiles straight into that storage (``loader``) and is a
 transaction: the component is usable only after every rank loaded every selected tensor.
@@ -21,10 +22,10 @@ boundary, on the TRT-LLM NCCL all-reduce or all-gather::
     attention      local q/k/v/gate, q/k norms, RoPE or NoPE scale, TRTLLM attention on the
                    rank's kv heads, output gate, local o_proj partial, one all-reduce
     dense FFN      local gate/up, fp32 SwiGLU, local down partial, one all-reduce
-    MoE            replicated fp32 router (global expert ids), all-rank agreement on the
-                   router input, ids and weights, rank-local expert slices combined in
-                   ascending global expert order (bf16 routes, fp32 sum, x2.5, bf16), one
-                   all-reduce
+    MoE            replicated fp32 router (global expert ids), in diagnostic mode an
+                   all-rank agreement on the router input, ids and weights, rank-local
+                   expert slices combined in ascending global expert order (bf16 routes,
+                   fp32 sum, x2.5, bf16), one all-reduce
     head           final norm, local vocabulary logits, one all-gather along the
                    vocabulary in rank order, fp32 softcap once
 
@@ -43,6 +44,14 @@ from typing import Any, Mapping, Optional, Sequence
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    MODELING_V2_VALIDATE_ENV,
+    step_contract_enabled,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.beam_logit_softcap import (
+    beam_logit_softcap,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import swiglu_fp32
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
     beam_neox_rope,
 )
@@ -56,11 +65,18 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (
+    beam_grouped_topk_router,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.beam_rmsnorm_fp32 import (
+    beam_rmsnorm_fp32,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
     beam_depth_residual,
+    depth_scales,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import AllReduce, allgather
@@ -68,15 +84,8 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
-from .. import _attention
-from ..dense_block_bf16__sm_103__tp1.block import depth_scales
-from ..moe_dispatch_combine_bf16__sm_103__tp1 import dispatch_combine
-from ..moe_expert_bf16__sm_103__tp1.ops.activation.swiglu_fp32 import swiglu_fp32
-from ..moe_router_bf16__sm_103__tp1.ops.moe.beam_grouped_topk_router import beam_grouped_topk_router
-from ..small_model_prefill_bf16__sm_103__tp1.ops.activation.beam_logit_softcap import (
-    beam_logit_softcap,
-)
-from .layout import (
+from . import _attention, dispatch_combine
+from .layout_bf16 import (
     EMBED,
     FINAL_NORM,
     HEAD,
@@ -88,8 +97,7 @@ from .layout import (
     ownership_ledger,
     tensor_specs,
 )
-from .loader import CheckpointFormatError, SafetensorsCatalog, TileReader, read_slice_into
-from .ops.norm.beam_rmsnorm_fp32 import beam_rmsnorm_fp32
+from .loader_bf16 import CheckpointFormatError, SafetensorsCatalog, TileReader, read_slice_into
 
 _SM = (10, 3)
 ROUTER_EPS = 1e-20
@@ -211,6 +219,30 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.usable = False
         self.load_record: Optional[dict] = None
         self._init_kv_cache_mode()
+        self._init_diagnostics()
+
+    # ------------------------------------------------------------------ diagnostics
+
+    def _init_diagnostics(self) -> None:
+        """Diagnostic validation mode: ``step_contract_enabled()``, read once per instance.
+
+        On, each MoE layer also proves the four ranks routed identical bytes (an all-gather of
+        host digests) and callers re-check per-call facts their own validation already fixed.
+        Off (the default), none of that host work or diagnostic collective runs. Every rank
+        must run in the same mode, since the agreement is a collective; ``load`` checks that
+        before the component can run.
+        """
+        self.diagnostics = step_contract_enabled()
+
+    def _check_diagnostics_agree(self) -> None:
+        """Raise on every rank unless all four ranks run the same diagnostic mode (collective)."""
+        flag = torch.tensor([1.0 if self.diagnostics else 0.0], device=self.device)
+        on = int(self._allreduce(flag).item())
+        if on not in (0, WORLD_SIZE):
+            raise LoadError(
+                f"rank {self.rank}: diagnostic validation is on for {on} of {WORLD_SIZE} ranks; "
+                f"set {MODELING_V2_VALIDATE_ENV} alike on every rank"
+            )
 
     # ------------------------------------------------------------------ KV cache mode
 
@@ -316,6 +348,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         and leaves the component unusable. Returns the load record (coverage, source
         digests, bytes read).
         """
+        self._check_diagnostics_agree()
         error: Optional[BaseException] = None
         catalog = None
         try:
@@ -411,7 +444,11 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         return self._allreduce(tensor)
 
     def _digests_agree(self, tensors: Sequence[torch.Tensor]) -> list:
-        """Raise unless every rank holds byte-identical ``tensors``; return this rank's digests."""
+        """Raise unless every rank holds byte-identical ``tensors``; return this rank's digests.
+
+        Diagnostic (``self.diagnostics``): host hashing of device copies and one all-gather,
+        called on every rank alike or on none.
+        """
         digests = []
         for t in tensors:
             h = hashlib.sha256(f"{t.dtype}{list(t.shape)}".encode())
@@ -453,27 +490,31 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         *,
         generation_rows: int = 1,
         extra_kv_tokens: int = 0,
+        call_checked: bool = False,
     ) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> attention output after the one o_proj all-reduce.
 
         ``md`` is one prepared step of one or more requests (``_attention.check_batch_metadata``
         with ``generation_rows`` rows per generation request and ``extra_kv_tokens`` reserved
         KV slots) whose new tokens are the T rows, contexts first; ``positions`` are their
-        absolute positions.
+        absolute positions. ``call_checked`` states that the caller validated this call's
+        metadata and its cache manager's every layer already (a full-depth call does so once);
+        the per-layer re-check then runs only in diagnostic mode.
         """
         self._check_usable(layer)
         _check_hidden(h, self.hidden, self.device, self.max_tokens)
         T = h.shape[0]
-        _attention.check_batch_metadata(
-            md,
-            T,
-            layer_idx=layer,
-            num_kv_heads=self.local_kv_heads,
-            head_dim=self.head_dim,
-            generation_rows=generation_rows,
-            extra_kv_tokens=extra_kv_tokens,
-            kv_cache_dtype=self.kv_cache_dtype,
-        )
+        if not call_checked or self.diagnostics:
+            _attention.check_batch_metadata(
+                md,
+                T,
+                layer_idx=layer,
+                num_kv_heads=self.local_kv_heads,
+                head_dim=self.head_dim,
+                generation_rows=generation_rows,
+                extra_kv_tokens=extra_kv_tokens,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
         step = _attention.step_args(md, layer)
         heads, kv_heads, d = self.local_heads, self.local_kv_heads, self.head_dim
         q = cublas_mm(h, self._layer(layer, "self_attn.q_proj.weight").t())
@@ -596,12 +637,13 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     def moe(self, layer: int, h: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> MoE output after the one all-reduce.
 
-        Before any expert runs, every rank's router input bytes, ordered expert ids and
-        FP32 weights must be identical (one all-gather of their digests).
+        In diagnostic mode, before any expert runs, every rank's router input bytes, ordered
+        expert ids and FP32 weights must be identical (one all-gather of their digests, also
+        recorded in ``capture``).
         """
         routing = self.route(layer, h)
         ids, weights = routing["ids"], routing["weights"]
-        digests = self._digests_agree((h, ids, weights))
+        digests = self._digests_agree((h, ids, weights)) if self.diagnostics else None
         gate_bank, up_bank, down_bank = (self._bank(layer, w) for w in ("gate", "up", "down"))
         calls = []
 
@@ -644,7 +686,8 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                     "mlp_out": out,
                 },
             )
-            capture["moe.agreement_sha256"] = digests
+            if digests is not None:
+                capture["moe.agreement_sha256"] = digests
         return out
 
     @torch.no_grad()
@@ -658,13 +701,15 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         *,
         generation_rows: int = 1,
         extra_kv_tokens: int = 0,
+        call_checked: bool = False,
     ) -> torch.Tensor:
         """One decoder block of logical layer ``layer`` on ``x`` ``[T, hidden]``, one engine step.
 
         The input norm runs the source model's torch op order (``beam_rmsnorm_fp32``), so the
         q/k/v/gate projections read the source's normalized bytes for the same block input.
-        The other norms use the flashinfer kernel. ``generation_rows`` and ``extra_kv_tokens``
-        are the step's speculative shape (see ``attention``).
+        The other norms use the flashinfer kernel. ``generation_rows``, ``extra_kv_tokens``
+        and ``call_checked`` are the step's speculative shape and validation state (see
+        ``attention``).
         """
         self._check_usable(layer)
         p = f"model.layers.{layer}."
@@ -677,6 +722,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             capture,
             generation_rows=generation_rows,
             extra_kv_tokens=extra_kv_tokens,
+            call_checked=call_checked,
         )
         pa = flashinfer_rmsnorm(a, self.tensor(p + "post_attention_layernorm.weight"), self.eps)
         x1 = beam_depth_residual(pa, x, *depth_scales(layer, is_attention=True))

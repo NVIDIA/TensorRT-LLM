@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_bf16__sm_103__tp4.ops.norm.beam_rmsnorm_fp32 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.beam_rmsnorm_fp32 import (  # noqa: E501
     beam_rmsnorm_fp32 as op,
 )
 

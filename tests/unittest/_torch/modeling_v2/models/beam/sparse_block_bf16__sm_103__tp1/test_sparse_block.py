@@ -59,6 +59,9 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import (  # noqa: E501
+    swiglu_fp32,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
     beam_neox_rope,
 )
@@ -69,6 +72,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_dispatch_combine import (  # noqa: E501
+    beam_dispatch_combine_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (  # noqa: E501
+    beam_grouped_topk_router,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
@@ -77,15 +86,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_r
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_bf16__sm_103__tp1.moe import (
     BeamMoeBf16Sm103Tp1,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_dispatch_combine_bf16__sm_103__tp1.ops.moe.beam_dispatch_combine import (  # noqa: E501
-    beam_dispatch_combine_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_expert_bf16__sm_103__tp1.ops.activation.swiglu_fp32 import (  # noqa: E501
-    swiglu_fp32,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_router_bf16__sm_103__tp1.ops.moe.beam_grouped_topk_router import (  # noqa: E501
-    beam_grouped_topk_router,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.sparse_block_bf16__sm_103__tp1 import (  # noqa: E501
     block as block_module,

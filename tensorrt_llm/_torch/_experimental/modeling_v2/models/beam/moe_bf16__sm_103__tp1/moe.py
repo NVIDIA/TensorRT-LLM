@@ -36,7 +36,7 @@ from typing import Mapping
 import torch
 from torch import nn
 
-from ..moe_dispatch_combine_bf16__sm_103__tp1 import dispatch_combine
+from ..full_model_nvfp4__sm_103__tp4 import dispatch_combine
 from ..moe_expert_bf16__sm_103__tp1.expert import WEIGHT_SHAPES as EXPERT_WEIGHT_SHAPES
 from ..moe_expert_bf16__sm_103__tp1.expert import BeamMoeExpertBf16Sm103Tp1
 from ..moe_router_bf16__sm_103__tp1.router import BeamMoeRouterBf16Sm103Tp1

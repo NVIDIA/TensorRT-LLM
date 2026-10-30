@@ -28,6 +28,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -505,6 +506,52 @@ def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -
     return int(max_ctx) + max(int(block_size), int(max_draft_len) + 1)
 
 
+def dflash_block_kv_lookahead(spec_config) -> int:
+    """Draft-pool positions a DFlash-family drafter writes past a step's draft-token reserve.
+
+    For a generation step a draft KV cache manager grows the request to ``history +
+    num_extra_kv_tokens + 1 + reserve`` positions, ``reserve`` covering ``max_draft_len``
+    draft tokens. The drafter then stores its noise block's K/V at ``[ctx_after, ctx_after +
+    block)`` with ``ctx_after = history + accepted + 1``, so with every proposal accepted the
+    widest block (``max_draft_len + 1`` rows) ends ``block - num_extra_kv_tokens`` positions
+    past that reserve. A draft pool the drafter writes into must reserve them too: a row
+    beyond the request's allocation goes through a block-table entry the manager never
+    allocated, which ``_refresh_ctx_block_tables`` decodes to pool page 0 -- a live page of
+    some request. Zero for every other speculative mode.
+    """
+    if spec_config is None:
+        return 0
+    mode = spec_config.spec_dec_mode
+    if not (mode.is_dflash() or mode.is_dspark()):
+        return 0
+    from .utils import get_num_extra_kv_tokens
+
+    return max(spec_config.max_draft_len + 1 - get_num_extra_kv_tokens(spec_config), 0)
+
+
+def check_draft_pool_reserve(spec_config, block_width: int, draft_kv_cache_manager) -> None:
+    """Raise unless ``draft_kv_cache_manager`` reserves the drafter's block at full acceptance.
+
+    The manager's per-step reserve ``_kv_reserve_draft_tokens`` (positions past a request's
+    history, its extra KV tokens and the pending token) must hold ``max_draft_len`` accepted
+    proposals plus the ``block_width``-row noise block, less the extra KV tokens it already
+    keeps (``dflash_block_kv_lookahead``).
+    """
+    from .utils import get_num_extra_kv_tokens
+
+    extra = get_num_extra_kv_tokens(spec_config)
+    needed = spec_config.max_draft_len + int(block_width) - extra
+    reserve = getattr(draft_kv_cache_manager, "_kv_reserve_draft_tokens", None)
+    if reserve is None or int(reserve) < needed:
+        raise RuntimeError(
+            f"DFlash: the draft KV cache manager {type(draft_kv_cache_manager).__name__} "
+            f"reserves {reserve} positions per generation step past a request's history; the "
+            f"drafter's noise block needs {needed} ({spec_config.max_draft_len} accepted "
+            f"proposals and a {block_width}-row block, less {extra} extra KV tokens). A shorter "
+            "reserve writes the block through block-table entries the manager never allocated."
+        )
+
+
 def dflash_allocated_ctx_limit(
     block_counts: torch.Tensor, page_size: int, block_size: int
 ) -> torch.Tensor:
@@ -607,21 +654,46 @@ class DFlashSpecMetadata(SpecMetadata):
 
             # A disagg generation worker receives prompt KV instead of
             # prefilling, so _store_prefill_context -- the only other assigner --
-            # never runs and every request would land on the dummy slot.
+            # never runs and every request would land on the dummy slot. A
+            # request whose draft context arrived with it (import_disagg_context)
+            # resumes from the imported cursor; any other starts at its first
+            # position when the draft layers share the target's cache (their
+            # pages arrived with the target's), else empty.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
-            for rid in self.request_ids[num_contexts:]:
+            assigned = {}
+            for request_idx, rid in enumerate(self.request_ids[num_contexts:], num_contexts):
                 if (
                     rid != ATTENTION_DP_DUMMY_REQUEST_ID
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    if worker._assign_slot(rid) is None:
+                    imported = worker._pending_disagg_imports.pop(rid, None)
+                    slot = worker._assign_slot(rid, updates=assigned)
+                    if slot is None:
+                        if imported is not None:
+                            raise RuntimeError(
+                                f"DFlash: no free drafter slot for generation request {rid}, "
+                                "whose transferred draft context needs one"
+                            )
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
                         logger.warning(
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
+                    elif imported is not None:
+                        draft_ctx_len, next_position = imported
+                        assigned[slot] = draft_ctx_len
+                        worker._req_ctx_pos[rid] = next_position
+                    elif worker._ctx_unified_cache:
+                        # New requests have no in-flight predecessor. Subsequent
+                        # accepted tokens advance the device length during replay.
+                        token_offset = sum(self.seq_lens[:request_idx])
+                        assigned[slot] = min(
+                            int(self.host_position_ids[token_offset]), worker._max_ctx
+                        )
+            if assigned:
+                worker._write_ctx_len(assigned)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
@@ -752,6 +824,9 @@ class DFlashWorker(SpecWorkerBase):
         # the table width on the default backend -- dflash_allocated_ctx_limit.
         self._ctx_block_counts = None
         self._ctx_pool_idx = 0
+        self._ctx_layer_ids = None
+        self._ctx_unified_cache = False
+        self._ctx_block_offset = 0
         self._ctx_block_divisor = 1  # encoded offset -> raw pool block index
         self._ctx_kv_indptr = None
         self._ctx_kv_last_page_len = None
@@ -774,6 +849,9 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque()  # available slot indices
         self._dummy_slot = None  # for cudagraph padding or warmup dummy requests
         self._graph_dummy_id_floor = 1 << 62
+        # Draft-context cursors received with a disaggregated request's KV
+        # (import_disagg_context), bound to a slot at the request's first step.
+        self._pending_disagg_imports: dict[int, tuple[int, int]] = {}
 
         # Opt-in acceptance-statistics recorder (None unless
         # TLLM_DFLASH_ACCEPT_STATS_DIR is set; see accept_stats.py). Only
@@ -941,7 +1019,18 @@ class DFlashWorker(SpecWorkerBase):
                     "manager's pool, and there is no draft KV cache manager"
                 )
             return None
-        layers = [draft_kv_cache_manager.get_buffers(i, kv_layout="HND") for i in range(L)]
+        draft_layer_ids = tuple(getattr(draft_kv_cache_manager, "draft_layer_ids", ()))
+        layer_ids = draft_layer_ids if draft_layer_ids else tuple(range(L))
+        if len(layer_ids) != L:
+            logger.warning(
+                f"DFlash: KV cache manager exposes {len(layer_ids)} draft layers "
+                f"but the drafter has {L}; using the private ctx arena."
+            )
+            return None
+        self._ctx_layer_ids = layer_ids
+        layers = [
+            draft_kv_cache_manager.get_buffers(layer_id, kv_layout="HND") for layer_id in layer_ids
+        ]
         base = layers[0]
         # kv_factor 1 is the MLA drafter's SELFKONLY pool: one latent, no V.
         expected = (kv_factor, nkv, base.size(-2), hd)
@@ -979,10 +1068,40 @@ class DFlashWorker(SpecWorkerBase):
         """
         mgr = draft_kv_cache_manager
         pool_mapping = mgr.kv_cache_pool_mapping
-        layer_offset = mgr.layer_offsets[0]
+        first_layer_id = self._ctx_layer_ids[0] if self._ctx_layer_ids is not None else 0
+        layer_offset = mgr.layer_offsets[first_layer_id]
         self._ctx_pool_idx = int(pool_mapping[layer_offset, 0])
+        per_layer_tables = bool(getattr(mgr, "_use_per_layer_page_tables", False))
         num_pool_layers = int((pool_mapping[:, 0] == self._ctx_pool_idx).sum())
-        if num_pool_layers != L:
+        self._ctx_block_offset = 0
+        if isinstance(mgr, KVCacheManagerV2):
+            converter = mgr.impl.get_page_index_converter(layer_offset, Role.KEY)
+            layer_group_id = mgr.layer_to_pool_mapping_dict[layer_offset]
+            if mgr.enable_swa_scratch_reuse:
+                raise NotImplementedError(
+                    "DFlash managed context does not support SWA scratch pages"
+                )
+            for layer_id in self._ctx_layer_ids:
+                local_id = mgr.layer_offsets[layer_id]
+                if (
+                    mgr.layer_to_pool_mapping_dict[local_id] != layer_group_id
+                    or mgr.get_layer_page_index_scale(layer_id) != converter.scale
+                ):
+                    if self._ctx_unified_cache:
+                        raise NotImplementedError(
+                            "DFlash's shared context block table requires draft layers "
+                            "with the same lifecycle and page-index scale"
+                        )
+                    logger.warning(
+                        "DFlash: draft KV layers have different lifecycles or page-index "
+                        "scales; using the private ctx arena."
+                    )
+                    return False
+            if per_layer_tables:
+                # Attention tables address the physical pool origin, whereas
+                # get_buffers() starts at this layer's own K buffer.
+                self._ctx_block_offset = int(converter.layer_offset)
+        elif num_pool_layers != L:
             logger.warning(
                 f"DFlash: draft KV pool {self._ctx_pool_idx} spans {num_pool_layers} layers but "
                 f"the drafter has {L}; using the private ctx arena."
@@ -991,12 +1110,23 @@ class DFlashWorker(SpecWorkerBase):
         # V1 slices a page-major pool, so stride(0) spans every layer; V2 wraps
         # the layer base in a dense view over interleaved pages, so stride(0) is
         # one layer slot. Guessing wrong is silent: acceptance quietly drops.
-        layer_block_elems = mgr.kv_factor * nkv * page_size * hd
+        manager_kv_factor = (
+            mgr.get_layer_kv_factor(first_layer_id)
+            if hasattr(mgr, "get_layer_kv_factor")
+            else mgr.kv_factor
+        )
+        if manager_kv_factor != getattr(self, "_ctx_kv_factor", manager_kv_factor):
+            logger.warning(
+                "DFlash: draft KV layer factor does not match the drafter; "
+                "using the private ctx arena."
+            )
+            return False
+        layer_block_elems = manager_kv_factor * nkv * page_size * hd
         stride0 = pool[0].stride(0)
         if stride0 == layer_block_elems:
-            self._ctx_block_divisor = mgr.kv_factor
+            self._ctx_block_divisor = manager_kv_factor
         elif stride0 == num_pool_layers * layer_block_elems:
-            self._ctx_block_divisor = num_pool_layers * mgr.kv_factor
+            self._ctx_block_divisor = num_pool_layers * manager_kv_factor
         else:
             logger.warning(
                 f"DFlash: draft KV pool layer stride {stride0} matches neither V1's "
@@ -1029,20 +1159,27 @@ class DFlashWorker(SpecWorkerBase):
         """
         if self._ctx_block_tables is None or num_seqs <= 0:
             return False
-        src = getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
+        offsets_name = (
+            "kv_cache_block_offsets" if self._ctx_unified_cache else "draft_kv_cache_block_offsets"
+        )
+        src = getattr(attn_metadata, offsets_name, None)
         if src is None:
             # The table is bound but unfillable. Leaving it at zeros would send
             # every request's every layer to pool block 0 -- silently.
             raise RuntimeError(
                 "DFlash: bound to the draft KV pool but "
                 f"{type(attn_metadata).__name__} carries no "
-                "draft_kv_cache_block_offsets this iteration."
+                f"{offsets_name} this iteration."
             )
         # Field 0 of the K/V pair: both name the same block for a kv_factor=2
         # pool, and the drafter addresses blocks, not planes.
         # clone(): .to() is a no-op for an int64 source, and the in-place ops
         # below would then edit attn_metadata's own tensor.
         encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
+        if self._ctx_block_offset:
+            # Per-layer attention tables address the physical pool origin; the
+            # drafter's views start at its first layer's K buffer.
+            encoded.sub_(self._ctx_block_offset)
         # Before the clamp erases the placeholders. Informative only on the
         # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
         self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
@@ -1054,12 +1191,18 @@ class DFlashWorker(SpecWorkerBase):
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
     ):
         self._validate_draft_attention_backend(draft_model)
-        # Only TrtllmAttentionMetadata builds draft_kv_cache_block_offsets.
-        # Without it the table stays all-zero and every request would read and
-        # write pool block 0 -- silently, at acceptance 1.0.
-        if draft_kv_cache_manager is not None and not hasattr(
-            attn_metadata, "draft_kv_cache_block_offsets"
-        ):
+        self._ctx_unified_cache = (
+            draft_kv_cache_manager is not None
+            and draft_kv_cache_manager is getattr(attn_metadata, "kv_cache_manager", None)
+        )
+        offsets_name = (
+            "kv_cache_block_offsets" if self._ctx_unified_cache else "draft_kv_cache_block_offsets"
+        )
+        if draft_kv_cache_manager is not None and not hasattr(attn_metadata, offsets_name):
+            if self._ctx_unified_cache:
+                raise NotImplementedError(
+                    f"DFlash unified KV requires {offsets_name} in attention metadata"
+                )
             logger.warning(
                 f"DFlash: {type(attn_metadata).__name__} carries no draft KV block offsets; "
                 "using the private ctx arena."
@@ -1178,6 +1321,7 @@ class DFlashWorker(SpecWorkerBase):
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
         kv_factor = getattr(draft_model, "_kv_factor", 2)
+        self._ctx_kv_factor = kv_factor
         capacity = self._max_ctx + self._compute_block_size
         # Published before any drafter table is built, so a drafter may read it
         # instead of its config cap. _max_ctx is attn_metadata.max_seq_len, which
@@ -1246,6 +1390,8 @@ class DFlashWorker(SpecWorkerBase):
                     )
                 pool = None
             if pool is None:
+                if self._ctx_unified_cache:
+                    raise ValueError("DFlash could not bind the unified manager's draft KV layers")
                 # Per-slot reservation is an arena-only notion; the pool path
                 # takes its pages from the manager one iteration at a time.
                 self._ctx_pages_per_slot = (capacity + page_size - 1) // page_size
@@ -1271,12 +1417,16 @@ class DFlashWorker(SpecWorkerBase):
             else:
                 # Nothing reserved: pages come from the manager's per-request
                 # block table one iteration at a time, so the footprint follows
-                # the sequences served rather than max_batch x max_seq_len.
+                # the sequences served rather than max_batch x max_seq_len. Each
+                # step's allocation must therefore cover the noise block too.
+                check_draft_pool_reserve(
+                    self.spec_config, self._compute_block_size, draft_kv_cache_manager
+                )
                 self._ctx_kv_buf = pool
                 # Only a manager that publishes and matches its own blocks can
                 # hand back a reused prefix's drafter K/V; the private arena and
                 # an unpaired draft pool both start every request at 0.
-                self._ctx_reuse_addressable = bool(
+                self._ctx_reuse_addressable = self._ctx_unified_cache or bool(
                     getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False)
                 )
             self._ctx_kv_last_page_len = torch.full(
@@ -1360,6 +1510,41 @@ class DFlashWorker(SpecWorkerBase):
             self._req_to_slot[req_id] = slot
             clear(slot)
         return self._req_to_slot[req_id]
+
+    def export_disagg_context(self, request_id: int) -> Optional[dict]:
+        """The draft-context cursor a finished context request leaves for disaggregated decode.
+
+        The context K/V themselves are the pages of the draft layers the target's KV cache
+        manager owns, which the cache transceiver moves with the target's. What makes them
+        readable is this cursor: the
+        slot-local length stored for the request and the target position the next store
+        starts at. None when the request stored no context here (no free slot, an
+        overflowing prompt, or a step that did not draft), which the receiver must reject.
+        Valid until the next ``prepare`` recycles the request's slot.
+        """
+        if not self._ctx_buf_inited:
+            return None
+        slot = self._req_to_slot.get(request_id)
+        if slot is None:
+            return None
+        ctx_len = int(self._ctx_len_host[slot])
+        return {
+            "draft_ctx_len": ctx_len,
+            "next_position": int(self._req_ctx_pos.get(request_id, ctx_len)),
+        }
+
+    def import_disagg_context(self, request_id: int, draft_ctx_len: int, next_position: int):
+        """Queue a received draft-context cursor for ``request_id``.
+
+        Its slot is bound at the request's first generation step (``prepare``), after the
+        draft pages it describes have arrived in this engine's KV cache manager; that binding
+        replaces the position-based seed a shared cache gives a request without a cursor.
+        """
+        self._pending_disagg_imports[request_id] = (int(draft_ctx_len), int(next_position))
+
+    def release_request_state(self, request_id: int) -> None:
+        """Drop an import that was never bound (a request released before its first step)."""
+        self._pending_disagg_imports.pop(request_id, None)
 
     def _ctx_activation_dtype(self) -> torch.dtype:
         """Dtype the drafter computes context K/V in before they are stored.
@@ -1716,10 +1901,18 @@ class DFlashWorker(SpecWorkerBase):
 
         # Lazy init buffers and attach worker reference for prepare()
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+        previous_ctx_len = self._ctx_len
         self._lazy_init_ctx_buffers(
             draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
         )
         spec_metadata._dflash_worker = self
+        if (
+            self._ctx_unified_cache
+            and self._ctx_len is not previous_ctx_len
+            and spec_metadata.request_ids
+        ):
+            # New buffers clear request slots; seed them before generation.
+            spec_metadata.prepare()
         # Before any store: prefill and decode both address pages through it.
         # Returning False here means an empty batch -- the missing-offsets case
         # raises inside, with the metadata type in the message.
@@ -2207,7 +2400,7 @@ class DFlashWorker(SpecWorkerBase):
                     projected_rows = projected_to_store.reshape(num_gens, K_plus_1, -1)
                     lilicorr_anchor = last_accepted_hidden(projected_rows, gen_num_accepted)
                 gen_num_accepted_long = gen_num_accepted.long()
-                col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
+                col_idx = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
                 if self._ctx_block_tables is not None:
                     # Bound by what the manager handed THIS request: the masked

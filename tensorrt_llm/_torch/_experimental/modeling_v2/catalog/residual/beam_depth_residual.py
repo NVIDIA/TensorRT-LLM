@@ -18,6 +18,19 @@ _FEED_FORWARD_ADD = (1.0 / math.sqrt(3.0), math.sqrt(2.0) / math.sqrt(3.0))
 _BLOCK3_ATTENTION_ADD = (1.0 / math.sqrt(8.0), math.sqrt(7.0) / math.sqrt(8.0))
 _BLOCK3_FEED_FORWARD_ADD = (1.0 / math.sqrt(9.0), math.sqrt(8.0) / math.sqrt(9.0))
 
+
+def depth_scales(layer_idx: int, is_attention: bool) -> tuple[float, float]:
+    """(branch, residual) scales of a block's attention or feed-forward residual add.
+
+    The n-th add of the residual stream scales the branch by 1 / sqrt(n) and the stream
+    by sqrt(n - 1) / sqrt(n); block i's attention add is the 2(i + 1)-th, its
+    feed-forward add the next one.
+    """
+    num_adds = 2 * (layer_idx + 1) + (0 if is_attention else 1)
+    denom = math.sqrt(num_adds)
+    return 1.0 / denom, math.sqrt(num_adds - 1) / denom
+
+
 _HIDDEN = dict(hidden=5120, dtype=torch.bfloat16)
 
 

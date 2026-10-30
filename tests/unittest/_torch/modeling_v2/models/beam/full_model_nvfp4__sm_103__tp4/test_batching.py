@@ -13,11 +13,14 @@ model files.
 from __future__ import annotations
 
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    _attention,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (  # noqa: E501
     BeamFullModelNvfp4Sm103Tp4,
 )
@@ -130,6 +133,141 @@ def test_unheld_layer_is_rejected():
             _attention.check_batch_metadata(
                 md, 62, layer_idx=3, num_kv_heads=KV_HEADS, head_dim=HEAD_DIM
             )
+
+
+REQUESTS = list(CONTEXTS) + list(GENERATIONS)
+NUM_TOKENS = sum(n for _, n in REQUESTS)
+
+
+def _call_state(diagnostics, manager_checks):
+    """The per-call state of the full model that ``check_call`` reads (no weights)."""
+    return SimpleNamespace(
+        max_tokens=8192,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        local_kv_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        kv_cache_dtype=DataType.BF16,
+        diagnostics=diagnostics,
+        _checked_manager=None,
+        check_cache_manager=manager_checks.append,
+    )
+
+
+def _call_inputs():
+    ids = torch.zeros(NUM_TOKENS, dtype=torch.int64, device="cuda")
+    positions = torch.cat([torch.arange(p, p + n) for p, n in REQUESTS]).cuda()
+    return ids, positions
+
+
+check_call = BeamFullModelNvfp4Sm103Tp4.check_call
+
+
+@pytest.mark.parametrize("diagnostics", [False, True], ids=["off", "on"])
+def test_call_returns_spans_and_compares_positions_in_diagnostic_mode_only(diagnostics):
+    with prepared_step(CONTEXTS, GENERATIONS) as md:
+        state = _call_state(diagnostics, [])
+        ids, positions = _call_inputs()
+        flat, flat_positions, spans = check_call(state, ids.view(1, -1), positions, md)
+        assert spans == REQUESTS
+        assert torch.equal(flat, ids) and torch.equal(flat_positions, positions)
+        shifted = positions + 1
+        if diagnostics:
+            with pytest.raises(ValueError, match="positions must be exactly"):
+                check_call(state, ids, shifted, md)
+        else:
+            _, flat_positions, spans = check_call(state, ids, shifted, md)
+            assert spans == REQUESTS and torch.equal(flat_positions, shifted)
+
+
+@pytest.mark.parametrize("diagnostics", [False, True], ids=["off", "on"])
+@pytest.mark.parametrize(
+    "fault,match",
+    [
+        ("ids_dtype", "torch.int64"),
+        ("ids_shape", r"\[T\] or \[1, T\]"),
+        ("rows", "do not fill"),
+        ("positions_float", "integer tensor"),
+        ("positions_count", "integer tensor"),
+        ("positions_device", "integer tensor"),
+        ("generation_rows", "exactly 2 tokens"),
+        ("extra_kv_tokens", "extra KV tokens"),
+        ("no_manager", "needs a KV cache manager"),
+    ],
+)
+def test_call_rejects_malformed_required_inputs_in_every_mode(diagnostics, fault, match):
+    with prepared_step(CONTEXTS, GENERATIONS) as md:
+        state = _call_state(diagnostics, [])
+        ids, positions = _call_inputs()
+        kwargs = {}
+        if fault == "ids_dtype":
+            ids = ids.to(torch.int32)
+        elif fault == "ids_shape":
+            ids = ids.view(2, -1)
+        elif fault == "rows":
+            ids, positions = ids[:-1], positions[:-1]
+        elif fault == "positions_float":
+            positions = positions.float()
+        elif fault == "positions_count":
+            positions = positions[:-1]
+        elif fault == "positions_device":
+            positions = positions.cpu()
+        elif fault == "generation_rows":
+            kwargs["generation_rows"] = 2
+        elif fault == "extra_kv_tokens":
+            kwargs["extra_kv_tokens"] = 6
+        else:
+            md.kv_cache_manager = None
+        with pytest.raises(ValueError, match=match):
+            check_call(state, ids, positions, md, **kwargs)
+
+
+def test_cache_manager_geometry_is_checked_once_per_manager():
+    checks = []
+    with prepared_step(CONTEXTS, GENERATIONS) as md:
+        state = _call_state(False, checks)
+        ids, positions = _call_inputs()
+        for _ in range(3):
+            check_call(state, ids, positions, md)
+        assert checks == [md.kv_cache_manager]
+    with prepared_step(CONTEXTS, GENERATIONS) as md:
+        check_call(state, ids, positions, md)
+        assert len(checks) == 2 and checks[-1] is md.kv_cache_manager
+
+
+def test_rejected_cache_manager_is_checked_again():
+    def reject(manager):
+        raise ValueError("the KV cache manager must hold logical layers 0..51")
+
+    with prepared_step(CONTEXTS, GENERATIONS) as md:
+        state = _call_state(False, [])
+        state.check_cache_manager = reject
+        ids, positions = _call_inputs()
+        for _ in range(2):
+            with pytest.raises(ValueError, match="must hold logical layers"):
+                check_call(state, ids, positions, md)
+        assert state._checked_manager is None
+
+
+@pytest.mark.parametrize("diagnostics", [False, True], ids=["off", "on"])
+def test_gather_id_values_are_compared_in_diagnostic_mode_only(diagnostics):
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    state = SimpleNamespace(
+        device=torch.device("cuda", torch.cuda.current_device()), diagnostics=diagnostics
+    )
+    rows = [3, 4, 5]
+    check = BeamFullModelNvfp4Sm103Tp4._check_gather_ids
+    check(state, torch.tensor(rows, device="cuda"), rows)
+    with pytest.raises(ValueError, match="gathers logits rows"):
+        check(state, torch.tensor(rows[:2], device="cuda"), rows)
+    with pytest.raises(ValueError, match="gathers logits rows"):
+        check(state, torch.tensor(rows), rows)
+    wrong = torch.tensor([3, 4, 6], device="cuda")
+    if diagnostics:
+        with pytest.raises(ValueError, match="need the rows"):
+            check(state, wrong, rows)
+    else:
+        check(state, wrong, rows)
 
 
 @pytest.mark.parametrize(

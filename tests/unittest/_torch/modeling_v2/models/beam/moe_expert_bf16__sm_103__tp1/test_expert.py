@@ -29,14 +29,14 @@ import pytest
 import torch
 from torch.overrides import TorchFunctionMode, resolve_name
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import (  # noqa: E501
+    SwigluFp32,
+    swiglu_fp32,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import CublasMm, cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_expert_bf16__sm_103__tp1.expert import (  # noqa: E501
     WEIGHT_SHAPES,
     BeamMoeExpertBf16Sm103Tp1,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_expert_bf16__sm_103__tp1.ops.activation.swiglu_fp32 import (  # noqa: E501
-    SwigluFp32,
-    swiglu_fp32,
 )
 
 __extra_import_path__ = [".", "../../.."]

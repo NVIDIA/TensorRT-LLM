@@ -26,7 +26,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .ops.moe.beam_grouped_topk_router import beam_grouped_topk_router
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (
+    beam_grouped_topk_router,
+)
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.

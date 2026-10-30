@@ -28,11 +28,13 @@ import struct
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_bf16__sm_103__tp4 import (  # noqa: E501
-    layout,
-    loader,
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+    layout_bf16 as layout,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_bf16__sm_103__tp4.layout import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+    loader_bf16 as loader,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.layout_bf16 import (  # noqa: E501
     BF16,
     F32,
     FP8,
@@ -449,7 +451,7 @@ def _sm103() -> bool:
 
 @pytest.mark.skipif(not _sm103(), reason="the component is built for sm_103")
 def test_mapping_rejections_and_weight_state_guard() -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_bf16__sm_103__tp4.model import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.component_bf16 import (  # noqa: E501
         BeamCheckpointLayoutBf16Sm103Tp4,
     )
     from tensorrt_llm.mapping import Mapping
