@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.8-Flash-Next-NVFP4 routing at four ranks, driven by synthetic configs on CPU.
+"""Qwen3.8-Flash-Next-NVFP4 routing at two and four ranks, driven by synthetic configs on CPU.
 
 Two families route `Qwen4ExpForConditionalGeneration`: `qwen4_exp` claims one rank and
-`qwen4_exp_for_conditional_generation` claims tp4, tep4 and dep4. Each layout lands on
-its own family's target, and the layouts neither one serves fall back under `auto`.
+`qwen4_exp_for_conditional_generation` claims tp4, tep4 and dep4, and dep2 (the
+disaggregated-serving engines' layout) without speculation. Each layout lands on its own
+family's target, and the layouts neither one serves fall back under `auto`.
 """
 
 from dataclasses import replace
@@ -48,13 +49,17 @@ _TP1_TARGET = (
     "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1"
 )
 
-# The three layouts, as the LLM API's parallel arguments build them. tp4 leaves the
+# The four-rank layouts, as the LLM API's parallel arguments build them. tp4 leaves the
 # expert split to Mapping's default, which is the TP size.
 _LAYOUTS = {
     "tp4": dict(world_size=4, tp_size=4),
     "tep4": dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4),
     "dep4": dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4, enable_attention_dp=True),
 }
+
+# The two-rank layout both engines of the disaggregated-serving test run: attention DP,
+# the routed experts in two 256-expert windows.
+_DEP2 = dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2, enable_attention_dp=True)
 
 _SPECS = [
     None,
@@ -165,6 +170,22 @@ def test_each_member_routes_to_the_unified_target(member, spec_config):
         _claimed(config, kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype=dtype))
 
 
+@pytest.mark.parametrize("dtype", ["fp8", "nvfp4", "auto"])
+def test_dep2_routes_to_the_unified_target(dtype):
+    config = _model_config(**_DEP2)
+    assert routing.layout(config.mapping) == "dep2"
+    _claimed(config, kv_cache_config=KvCacheConfig(dtype=dtype, mamba_ssm_cache_dtype="bfloat16"))
+
+
+@pytest.mark.parametrize("spec_config", _SPECS[1:], ids=_SPEC_IDS[1:])
+def test_dep2_declines_speculation(spec_config):
+    """dep2 serves the disaggregated engines' core configuration; no draft path was
+    measured there, so neither family claims it."""
+    config = _model_config(spec_config, **_DEP2)
+    assert routing.layout(config.mapping) == "dep2"
+    _declined(config, match="dep2 .attention DP, experts EP2. without speculative decoding")
+
+
 @pytest.mark.parametrize("spec_config", [None, MTPDecodingConfig(max_draft_len=3)])
 def test_the_one_rank_deployment_still_routes_to_tp1(spec_config):
     config = _model_config(spec_config)
@@ -177,14 +198,15 @@ def test_the_one_rank_deployment_still_routes_to_tp1(spec_config):
     [
         dict(world_size=2, tp_size=2),
         dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2),
-        dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2, enable_attention_dp=True),
+        dict(_DEP2, moe_tp_size=2, moe_ep_size=1),
+        dict(_DEP2, enable_lm_head_tp_in_adp=True),
         dict(world_size=8, tp_size=8),
         dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8),
         dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8, enable_attention_dp=True),
     ],
-    ids=["tp2", "tep2", "dep2", "tp8", "tep8", "dep8"],
+    ids=["tp2", "tep2", "dep2-moetp2", "dep2-lm-head-tp", "tp8", "tep8", "dep8"],
 )
-def test_two_or_eight_ranks_decline_in_both_families(mapping_kwargs):
+def test_other_two_or_eight_rank_layouts_decline_in_both_families(mapping_kwargs):
     """Neither family claims it, and ``require`` names each family's reason."""
     config = _model_config(**mapping_kwargs)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
