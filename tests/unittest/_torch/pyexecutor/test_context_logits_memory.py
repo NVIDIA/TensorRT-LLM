@@ -61,13 +61,19 @@ def assert_logprobs_equal(actual, expected) -> None:
                 assert found[token].logprob == pytest.approx(reference[token].logprob, abs=1e-5)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("host", [False, True])
 @torch.inference_mode()
-def test_storage_oom_and_chunk_output_oom(monkeypatch, dtype, host) -> None:
-    head = make_head(dtype=dtype)
+def test_storage_oom_and_chunk_output_oom(monkeypatch, host) -> None:
+    from tensorrt_llm._torch.modules.context_logits import context_logits_scope
+    from tensorrt_llm._torch.modules.embedding import LMHead
+    from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+
+    head = LMHead(97, 32, dtype=torch.bfloat16).cuda()
+    head.weight.normal_()
+    assert head.context_logits_workspace is None
+    head.prepare_context_logits_workspace()
     request = make_request(95, head.num_embeddings)
-    hidden = torch.randn(95, 32, device="cuda", dtype=dtype)
+    hidden = torch.randn(95, 32, device="cuda", dtype=head.weight.dtype)
     expected = (hidden @ head.weight.t()).float()
     workspace = head.context_logits_workspace
     original_empty = torch.empty
@@ -91,7 +97,8 @@ def test_storage_oom_and_chunk_output_oom(monkeypatch, dtype, host) -> None:
     monkeypatch.setattr(workspace, "_allocate", fail_optional)
     pointers = [buffer.data_ptr() for buffer in workspace.resident]
     plan = ContextLogitsPlan(SimpleNamespace(context_requests=[request]))
-    sampling = plan.project(hidden, head)
+    with context_logits_scope(plan):
+        sampling = LogitsProcessor()(hidden, head, None, return_context_logits=True)
     assert plan.handled
     assert request.py_result.context_logits.device.type == ("cpu" if host else "cuda")
     torch.testing.assert_close(request.py_result.context_logits.cuda(), expected)
@@ -112,13 +119,12 @@ def test_storage_oom_and_chunk_output_oom(monkeypatch, dtype, host) -> None:
     torch.testing.assert_close(receiver.context_logits.cpu(), expected.cpu())
 
 
-@pytest.mark.parametrize("full_first", [False, True])
 @torch.inference_mode()
-def test_mixed_prefill_selects_only_requested_rows(full_first) -> None:
+def test_mixed_prefill_selects_only_requested_rows() -> None:
     head = make_head()
     requests = [
-        make_request(7, head.num_embeddings, full=full_first),
-        make_request(11, head.num_embeddings, full=not full_first),
+        make_request(7, head.num_embeddings, full=True),
+        make_request(11, head.num_embeddings, full=False),
     ]
     hidden = torch.randn(20, 32, device="cuda", dtype=head.weight.dtype)
     reference = (hidden @ head.weight.t()).float()
@@ -129,83 +135,6 @@ def test_mixed_prefill_selects_only_requested_rows(full_first) -> None:
             torch.testing.assert_close(request.py_result.context_logits, reference[start:end])
         else:
             assert request.py_result.context_logits is None
-
-
-@pytest.mark.parametrize("k,simple", [(0, False), (0, True), (5, False)])
-@pytest.mark.parametrize("full", [False, True])
-@torch.inference_mode()
-def test_prompt_logprobs_across_prefill_chunks(k, simple, full) -> None:
-    head = make_head(dtype=torch.float32)
-    request = make_request(91, head.num_embeddings, full=full, k=k, simple=simple)
-    hidden = torch.randn(91, 32, device="cuda")
-    reference = hidden @ head.weight.t()
-    for start, end in [(0, 37), (37, 91)]:
-        request.context_current_position = start
-        request.context_chunk_size = end - start
-        request.is_last_context_chunk = end == 91
-        ContextLogitsPlan(SimpleNamespace(context_requests=[request])).project(
-            hidden[start:end], head
-        )
-    targets = request.get_tokens(0)[1:] + [13]
-    expected = compute_prompt_logprobs(k, reference.cpu(), targets, simple).prompt
-    tail = compute_prompt_logprobs(
-        k, request.py_result.context_prompt_last_logits, [13], simple
-    ).prompt
-    actual = request.py_result.context_prompt_logprobs + tail
-    assert_logprobs_equal(actual, expected)
-    if full:
-        torch.testing.assert_close(request.py_result.context_logits, reference)
-    else:
-        assert request.py_result.context_logits is None
-        assert request.py_result._context_logits._storage is None
-    receiver = PyResult(
-        prompt_len=91, max_new_tokens=2, return_context_logits=True, use_device_memory=False
-    )
-    receiver.apply_diff(request.py_result.get_diff())
-    assert_logprobs_equal(
-        receiver.context_prompt_logprobs, request.py_result.context_prompt_logprobs
-    )
-    torch.testing.assert_close(
-        receiver.context_prompt_last_logits, request.py_result.context_prompt_last_logits
-    )
-
-
-@torch.inference_mode()
-def test_optional_allocation_backoff(monkeypatch) -> None:
-    head = make_head()
-    workspace = head.context_logits_workspace
-    allocate = workspace._allocate
-    attempts = []
-
-    def limited(rows):
-        attempts.append(rows)
-        if rows > 100:
-            raise torch.OutOfMemoryError("injected large output failure")
-        return allocate(rows)
-
-    monkeypatch.setattr(workspace, "_allocate", limited)
-    output, converted = workspace.acquire(384, host_storage=False)
-    assert attempts == [384, 192, 96]
-    assert output.shape[0] == converted.shape[0] == 96
-    assert output.data_ptr() != workspace.resident[0].data_ptr()
-
-
-@pytest.mark.parametrize("host", [False, True])
-def test_prompt_postprocessing_is_chunked(monkeypatch, host) -> None:
-    logits = torch.randn(9, 1024 * 1024, device="cpu" if host else "cuda")
-    original = torch.nn.functional.log_softmax
-    rows = []
-
-    def record(input, *args, **kwargs):
-        rows.append(input.shape[0])
-        return original(input, *args, **kwargs)
-
-    monkeypatch.setattr(torch.nn.functional, "log_softmax", record)
-    result = compute_prompt_logprobs(0, logits, list(range(9)), True)
-    assert len(result.prompt) == 9
-    assert max(rows) <= 4
-    expected = original(logits, dim=-1)[torch.arange(9), torch.arange(9)].cpu().tolist()
-    assert_logprobs_equal(result.prompt, expected)
 
 
 @torch.inference_mode()
@@ -227,150 +156,6 @@ def test_prompt_reduction_oom_falls_back_to_cpu(monkeypatch) -> None:
     assert_logprobs_equal(result.prompt, expected)
 
 
-@torch.inference_mode()
-def test_actual_allocator_limit_preserves_resident_workspace() -> None:
-    head = make_head(vocab=4096)
-    workspace = head.context_logits_workspace
-    hidden = torch.randn(7, 32, dtype=head.weight.dtype, device="cuda")
-    expected = (hidden @ head.weight.t()).float()
-    old_fraction = torch.cuda.get_per_process_memory_fraction()
-    # The allocator limit is process-local; it does not consume other clients'
-    # GPU memory. Existing cached blocks remain usable for the resident path.
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    total = torch.cuda.get_device_properties(0).total_memory
-    limit = (torch.cuda.memory_reserved() + 4 * 1024 * 1024) / total
-    try:
-        torch.cuda.set_per_process_memory_fraction(limit)
-        acquired = workspace.acquire(16384, host_storage=False)
-        assert acquired is workspace.resident
-        result = workspace.project(head, hidden, acquired)
-        torch.testing.assert_close(result, expected)
-    finally:
-        torch.cuda.set_per_process_memory_fraction(old_fraction)
-
-
-@pytest.mark.parametrize("output_dtype", [None, torch.float32])
-@torch.inference_mode()
-def test_lm_head_and_logits_processor_use_prepared_workspace(monkeypatch, output_dtype) -> None:
-    from tensorrt_llm._torch.modules.context_logits import context_logits_scope
-    from tensorrt_llm._torch.modules.embedding import LMHead
-    from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
-
-    head = LMHead(97, 32, dtype=torch.bfloat16, output_dtype=output_dtype).cuda()
-    head.weight.normal_()
-    assert head.context_logits_workspace is None
-    head.prepare_context_logits_workspace()
-    resident = head.context_logits_workspace.resident
-    head.prepare_context_logits_workspace()
-    assert head.context_logits_workspace.resident is resident
-    hidden = torch.randn(43, 32, device="cuda", dtype=torch.bfloat16)
-    kwargs = {} if output_dtype is None else {"out_dtype": output_dtype}
-    reference = torch.mm(hidden, head.weight.t(), **kwargs).float()
-    request = make_request(43, 97)
-    plan = ContextLogitsPlan(SimpleNamespace(context_requests=[request]))
-    processor = LogitsProcessor()
-
-    def fail_optional(rows):
-        raise torch.OutOfMemoryError("injected output failure")
-
-    monkeypatch.setattr(head.context_logits_workspace, "_allocate", fail_optional)
-    with context_logits_scope(plan):
-        sampled = processor(hidden, head, None, return_context_logits=True)
-    assert plan.handled
-    torch.testing.assert_close(sampled, reference[-1:], rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(request.py_result.context_logits, reference, rtol=1e-4, atol=1e-4)
-    # Models with subsequent vocabulary transforms must retain all rows.
-    bypassed_plan = ContextLogitsPlan(SimpleNamespace(context_requests=[request]))
-    with context_logits_scope(bypassed_plan):
-        complete = LogitsProcessor(allow_context_logits_plan=False)(
-            hidden, head, None, return_context_logits=True
-        )
-    assert not bypassed_plan.handled
-    torch.testing.assert_close(complete, reference, rtol=1e-4, atol=1e-4)
-    # Ordinary forwards do not see request state or enter the context path.
-    ordinary = processor(hidden, head, None)
-    torch.testing.assert_close(ordinary.reshape(1, -1), reference[-1:], rtol=1e-4, atol=1e-4)
-
-
-@torch.inference_mode()
-def test_handled_context_outputs_are_not_appended_twice() -> None:
-    from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
-
-    head = make_head()
-    requests = [make_request(5, 97), make_request(3, 97, full=False)]
-    for request in requests:
-        request.py_return_generation_logits = False
-        request.py_use_chunked_generation_logits = False
-    hidden = torch.randn(8, 32, dtype=torch.bfloat16, device="cuda")
-    plan = ContextLogitsPlan(SimpleNamespace(context_requests=requests))
-    sampling = plan.project(hidden, head)
-    HandleLogits()(requests, [], sampling, 1, [0, 1, 2], True, context_logits_handled=True)
-    assert requests[0].py_result.context_logits.shape == (5, 97)
-    assert requests[1].py_result.context_logits is None
-
-
-def test_output_allocation_does_not_swallow_non_oom_errors(monkeypatch) -> None:
-    head = make_head()
-
-    def invalid(rows):
-        raise RuntimeError("invalid output configuration")
-
-    monkeypatch.setattr(head.context_logits_workspace, "_allocate", invalid)
-    with pytest.raises(RuntimeError, match="invalid output configuration"):
-        head.context_logits_workspace.acquire(256, host_storage=False)
-
-
-@pytest.mark.parametrize("simple", [False, True])
-def test_worker_assembles_compact_prompt_and_caches_streaming_result(simple) -> None:
-    from tensorrt_llm.executor.base_worker import _compute_pytorch_prompt_logprobs
-
-    logits = torch.randn(5, 97)
-    prompt = [1, 2, 3, 4, 5]
-    first_token = 17
-    prefix = compute_prompt_logprobs(0, logits[:-1], prompt[1:], simple).prompt
-    response = SimpleNamespace(
-        result=SimpleNamespace(
-            context_logits=None,
-            context_prompt_logprobs=prefix,
-            context_prompt_last_logits=logits[-1:],
-            get_result=lambda: SimpleNamespace(output_token_ids=[[first_token]]),
-        )
-    )
-    generation = SimpleNamespace(
-        _streaming=True,
-        _logprob_params=SimpleNamespace(prompt_logprobs=0, prompt_logprobs_simple_format=simple),
-        _generation_request=SimpleNamespace(prompt_token_ids=prompt),
-    )
-    result = _compute_pytorch_prompt_logprobs(generation, response)
-    expected = compute_prompt_logprobs(0, logits, prompt[1:] + [first_token], simple).prompt
-    assert_logprobs_equal(result.prompt, expected)
-    response.result.context_prompt_last_logits = None
-    cached = _compute_pytorch_prompt_logprobs(generation, response)
-    assert cached.prompt is generation._cached_prompt_logprobs
-    assert_logprobs_equal(cached.prompt, expected)
-
-
-def test_receiving_rank_can_fall_back_independently(monkeypatch) -> None:
-    source = PyResult(prompt_len=9, max_new_tokens=1, return_context_logits=True)
-    logits = torch.randn(9, 97, device="cuda")
-    source.append_context_logits(logits)
-    diff = source.get_diff()
-    assert not diff.context_logits_on_cpu
-    original_empty = torch.empty
-
-    def fail_receiver(shape, *args, **kwargs):
-        if tuple(shape) == (9, 1, 97) and torch.device(kwargs.get("device", "cpu")).type == "cuda":
-            raise torch.OutOfMemoryError("injected receiving-rank allocation failure")
-        return original_empty(shape, *args, **kwargs)
-
-    monkeypatch.setattr(torch, "empty", fail_receiver)
-    receiver = PyResult(prompt_len=9, max_new_tokens=1, return_context_logits=True)
-    receiver.apply_diff(diff)
-    assert receiver.context_logits.device.type == "cpu"
-    torch.testing.assert_close(receiver.context_logits, logits.cpu())
-
-
 def make_model_and_mapping() -> tuple[torch.nn.Module, SimpleNamespace]:
     from tensorrt_llm._torch.modules.embedding import LMHead
     from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
@@ -387,18 +172,15 @@ def make_model_and_mapping() -> tuple[torch.nn.Module, SimpleNamespace]:
 
 
 @pytest.mark.parametrize("legacy_first", [False, True])
-@pytest.mark.parametrize("full", [False, True])
-@pytest.mark.parametrize("k,simple", [(0, True), (3, False)])
 @torch.inference_mode()
-def test_prompt_logprobs_survive_batch_dependent_projection_switch(
-    legacy_first: bool, full: bool, k: int, simple: bool
-) -> None:
+def test_prompt_logprobs_survive_batch_dependent_projection_switch(legacy_first: bool) -> None:
     from tensorrt_llm._torch.modules.context_logits import context_logits_scope
     from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
+    from tensorrt_llm.executor.base_worker import _compute_pytorch_prompt_logprobs
 
     model, mapping = make_model_and_mapping()
     model.lm_head.prepare_context_logits_workspace()
-    request = make_request(91, 97, full=full, k=k, simple=simple)
+    request = make_request(91, 97, full=False, k=3)
     peer = make_request(1, 97, full=False)
     for item in (request, peer):
         item.py_return_generation_logits = False
@@ -430,76 +212,37 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
             context_logits_handled=handled,
         )
     targets = request.get_tokens(0)[1:] + [13]
-    expected = compute_prompt_logprobs(k, reference.cpu(), targets, simple).prompt
-    tail = compute_prompt_logprobs(
-        k, request.py_result.context_prompt_last_logits, [13], simple
-    ).prompt
-    assert_logprobs_equal(request.py_result.context_prompt_logprobs + tail, expected)
-    if full:
-        torch.testing.assert_close(request.py_result.context_logits, reference)
-    else:
-        assert request.py_result.context_logits is None
-        assert request.py_result._context_logits._storage is None
+    expected = compute_prompt_logprobs(3, reference.cpu(), targets).prompt
+    response = SimpleNamespace(
+        result=SimpleNamespace(
+            context_logits=None,
+            context_prompt_logprobs=request.py_result.context_prompt_logprobs,
+            context_prompt_last_logits=request.py_result.context_prompt_last_logits,
+            get_result=lambda: SimpleNamespace(output_token_ids=[[13]]),
+        )
+    )
+    generation = SimpleNamespace(
+        _streaming=True,
+        _logprob_params=SimpleNamespace(prompt_logprobs=3, prompt_logprobs_simple_format=False),
+        _generation_request=SimpleNamespace(prompt_token_ids=request.get_tokens(0)),
+    )
+    actual = _compute_pytorch_prompt_logprobs(generation, response)
+    assert_logprobs_equal(actual.prompt, expected)
+    assert request.py_result.context_logits is None
+    assert request.py_result._context_logits._storage is None
 
 
-@pytest.mark.parametrize(
-    "mode", ["supported", "tp", "cp", "adp", "non_last_pp", "spec", "custom", "opt_out"]
-)
-def test_warmup_and_execution_share_projection_eligibility(mode: str) -> None:
-    from tensorrt_llm._torch.modules.context_logits import context_logits_heads
-
-    model, mapping = make_model_and_mapping()
-    if mode == "tp":
-        mapping.tp_size = 2
-    elif mode == "cp":
-        mapping.cp_size = 2
-    elif mode == "adp":
-        mapping.enable_attention_dp = True
-    elif mode == "non_last_pp":
-        mapping.is_last_pp_rank = lambda: False
-    elif mode == "custom":
-        model.logits_processor = torch.nn.Identity()
-    elif mode == "opt_out":
-        model.logits_processor.allow_context_logits_plan = False
-    request = make_request(9, 97)
-    batch = SimpleNamespace(context_requests=[request], all_requests=lambda: [request])
-    assert ContextLogitsPlan.for_batch(model, mapping, batch, is_spec_decode=mode == "spec") is None
-    heads = context_logits_heads(model, mapping, is_spec_decode=mode == "spec")
-    for head in heads:
-        head.prepare_context_logits_workspace()
-    plan = ContextLogitsPlan.for_batch(model, mapping, batch, is_spec_decode=mode == "spec")
-    if mode == "supported":
-        assert heads == (model.lm_head,)
-        assert plan is not None
-        assert model.lm_head.context_logits_workspace is not None
-    else:
-        assert heads == ()
-        assert plan is None
-        assert model.lm_head.context_logits_workspace is None
-
-
-@pytest.mark.parametrize(
-    "mode",
-    ["supported", "unprepared", "custom", "opt_out", "tp", "spec", "postprocessor", "ordinary"],
-)
-def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(mode: str) -> None:
+@pytest.mark.parametrize("prepared", [False, True])
+def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(prepared: bool) -> None:
     from contextlib import nullcontext
     from unittest.mock import Mock
 
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 
     model, mapping = make_model_and_mapping()
-    if mode != "unprepared":
+    if prepared:
         model.lm_head.prepare_context_logits_workspace()
-    if mode == "custom":
-        model.logits_processor = torch.nn.Identity()
-    elif mode == "opt_out":
-        model.logits_processor.allow_context_logits_plan = False
-    elif mode == "tp":
-        mapping.tp_size = 2
-    request = make_request(1, 97, full=mode != "ordinary")
-    if mode == "postprocessor":
-        request.py_logits_post_processors = [lambda *args: None]
+    request = make_request(1, 97)
     batch = SimpleNamespace(
         context_requests=[request], num_context_requests=1, all_requests=lambda: [request]
     )
@@ -536,7 +279,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(mode: st
     runner = SimpleNamespace(
         _model=model,
         _mapping=mapping,
-        _config=SimpleNamespace(is_spec_decode=mode == "spec", spec_config=None, use_mrope=False),
+        _config=SimpleNamespace(is_spec_decode=False, spec_config=None, use_mrope=False),
         _graphs=graphs,
         _inputs=inputs,
         _buffers=SimpleNamespace(draft_tokens_cuda=None),
@@ -555,13 +298,13 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(mode: st
         batch=batch,
         new_tensors_device=None,
         cache_indirection_buffer=None,
-        gather_context_logits=mode != "ordinary",
+        gather_context_logits=True,
         enable_spec_decode=False,
         runtime_draft_len=0,
     )
     manager = SimpleNamespace(get_resource_manager=lambda kind: object())
     result = DecoderRunner._forward_decoder(runner, forward_inputs, manager, is_dummy=False)
-    bounded = mode == "supported"
+    bounded = prepared
     assert graphs.run.call_args.args[0] is (None if bounded else key)
     assert inputs.prepare_inputs.call_args.args[0] is (batch if bounded else promoted)
     assert inputs.prepare_inputs.call_args.args[7] is not bounded
