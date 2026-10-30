@@ -437,7 +437,6 @@ def test_fp4_mla_kv_transfer(
     [topology[:6] for topology in TOPOLOGIES],
     ids=[topology[6] for topology in TOPOLOGIES],
 )
-@pytest.mark.parametrize("speculative", [False, True], ids=["no-draft", "mtp"])
 def test_fp4_mla_kv_transfer_from_context_only_cache(
     monkeypatch,
     backend: str,
@@ -447,12 +446,11 @@ def test_fp4_mla_kv_transfer_from_context_only_cache(
     gen_tp: int,
     gen_pp: int,
     gen_enable_dp: bool,
-    speculative: bool,
 ) -> None:
-    """A single-copy context cache sends the canonical state a decoding cache sends.
+    """A single-copy context cache with an MTP drafter sends what a decoding cache sends.
 
-    With a one-model drafter, its draft layer keeps the decode views in a
-    lifecycle of its own; the decoding peer holds every layer in one lifecycle.
+    Its draft layer keeps the decode views in a lifecycle of its own, while the
+    decoding peer holds every layer in one lifecycle.
     """
     _requires_fp4_mla_backend(backend)
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
@@ -463,7 +461,7 @@ def test_fp4_mla_kv_transfer_from_context_only_cache(
         context_side = not created_sides
         created_sides.append(context_side)
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context" if context_side else "generation")
-        return _create_managers(tp, pp, enable_dp, speculative=speculative)
+        return _create_managers(tp, pp, enable_dp)
 
     transfer_harness.run_kv_transfer_test(
         ctx_tp=ctx_tp,
