@@ -878,7 +878,7 @@ class AutoTunerProfilingCache:
                 # entry reuses the previous tactic.
                 logger.warning_once(
                     f"[AutoTuner] Could not deserialize tactic: {value['tactic']} for cache key {key_str}; skipping entry.",
-                    key=value["tactic"])
+                    key=("autotuner_deserialize_tactic", repr(value["tactic"])))
                 continue
 
             runner_id = value["runner_id"]
