@@ -6,10 +6,16 @@ A copy of the tp1 target's test for `ops/attention/qsa_prefill_compress`, pointe
 
 The paged state is real: an index-key pool of random raw keys, a position
 plane holding `(t, h, w)` for every allocated position, and the engine's
-`[slots, width]` table -- more slots than requests, each live row's pages drawn
-from a seeded permutation of the pool, `-1` past its allocation, rows past the
-batch holding a previous step's plausible page ids. The cos|sin table is built
-the way the target builds it at load.
+`[slots, width]` table -- at least as many slots as requests, each live row's
+pages drawn from a seeded permutation of the pool, `-1` past its allocation,
+rows past the batch holding a previous step's plausible page ids. The cos|sin
+table is built the way the target builds it at load, `max_position_embeddings`
+rows tall.
+
+The `coalesced` cells hold this target's pool: one rank's measured page count,
+the 12 sparse layers' index pages sharing each slot as KV cache manager V2 lays
+them out at bf16, the other 11 layers' planes holding a sentinel that must
+survive. Those pools are drawn on the device.
 
 A padding row at logical position -1 is deliberately absent: it is an illegal
 memory access that poisons the process for every test after it.
@@ -42,24 +48,30 @@ def _compare(out: torch.Tensor, ref: torch.Tensor, flips: int = 0) -> None:
     kernel takes `tl.rsqrt`, the hardware approximation, where the reference takes torch's,
     and the two differ by an fp32 ulp, which moves the bf16 rounding of an element whose fp32
     value sits on a rounding boundary. One element of its 8192 anchor elements is one bf16
-    step off.
+    step off. The 8192-row tep4 prefill cell has five of 262016, each an exact bf16 tie in
+    the reference's fp32 value; the nearest wrong variant measured there (sequential bf16
+    pooling) moves 94580.
     """
     assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
-    if flips == 0:
-        torch.testing.assert_close(out.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
+    # Only the differing elements are widened: a pool-sized int32 copy would not fit beside
+    # the target's pool.
+    a, b = out.view(torch.int16), ref.view(torch.int16)
+    differs = a != b
+    count = int(differs.sum())
+    if count == 0:
         return
-    distance = (out.view(torch.int16).int() - ref.view(torch.int16).int()).abs()
-    assert int(distance.max()) <= 1 and int((distance != 0).sum()) <= flips, (
-        f"{int((distance != 0).sum())} elements differ, by up to {int(distance.max())} bf16 "
-        f"steps; at most {flips} may differ by one"
+    distance = int((a[differs].int() - b[differs].int()).abs().max())
+    assert distance <= 1 and count <= flips, (
+        f"{count} elements differ, by up to {distance} bf16 steps; at most {flips} may differ by one"
     )
 
 
 DEV = "cuda"
 ROTARY_DIM = 64
 THETA = 1.0e7
-MAX_POSITIONS = 16384
+#: The target's table height: the checkpoint's `max_position_embeddings`.
+MAX_POSITIONS = 262144
 SENTINEL = 0x3C3C
 
 
@@ -83,7 +95,17 @@ def _build(spec, seed: int):
 
     table = torch.randint(0, pages, (slots, width), generator=gen, dtype=torch.int32)
     order = torch.randperm(pages, generator=gen).to(torch.int32)
-    index_cache = torch.randn(pages, tpb, 1, head_dim, generator=gen).to(torch.bfloat16)
+    if spec.get("top_page"):
+        # Request 0's last page is the pool's last, so its anchors address the top of the pool.
+        last = (segments[0][0] + segments[0][1] - 1) // tpb
+        where = int((order == pages - 1).nonzero())
+        order[[where, last]] = order[[last, where]]
+    coalesced = spec["layout"] == "coalesced"
+    index_cache = (
+        None  # drawn on the device below
+        if coalesced
+        else torch.randn(pages, tpb, 1, head_dim, generator=gen).to(torch.bfloat16)
+    )
     position_cache = torch.zeros(pages, tpb, 3, dtype=torch.int32)
     used = 0
     for r, (start, n) in enumerate(segments):
@@ -94,14 +116,30 @@ def _build(spec, seed: int):
         p = torch.arange(cols * tpb).view(cols, tpb)
         coords = (p, (3 * p + 5 * r) % 500, (5 * p + 11 * r) % 500)
         position_cache[table[r, :cols].long()] = torch.stack(coords, dim=-1).to(torch.int32)
-    assert used <= pages and len(segments) < slots, "pool or table too small for the batch"
+    assert used <= pages and len(segments) <= slots, "pool or table too small for the batch"
     k_norm_weight = (torch.randn(head_dim, generator=gen) * 0.1).to(torch.bfloat16)
 
     logical = torch.tensor(positions, dtype=spec["logical_dtype"])
     request = torch.tensor(requests, dtype=spec["request_dtype"])
-    table, index_cache, position_cache = table.to(DEV), index_cache.to(DEV), position_cache.to(DEV)
+    table, position_cache = table.to(DEV), position_cache.to(DEV)
 
     extras = {}
+    if coalesced:
+        # `roles` layers' index pages per slot; this layer's is `ordinal`, the rest a sentinel.
+        roles, ordinal = spec["roles"], spec["ordinal"]
+        pool = torch.empty(pages, roles, tpb, 1, head_dim, dtype=torch.bfloat16, device=DEV)
+        pool.view(torch.int16).fill_(SENTINEL)
+        index_cache = pool[:, ordinal]
+        device_gen = torch.Generator(device=DEV).manual_seed(seed)
+        index_cache.copy_(
+            torch.randn(
+                pages, tpb, 1, head_dim, generator=device_gen, device=DEV, dtype=torch.bfloat16
+            )
+        )
+        assert index_cache.stride() == (roles * tpb * head_dim, head_dim, head_dim, 1)
+        extras["other_layers"] = (pool, ordinal)
+    else:
+        index_cache = index_cache.to(DEV)
     if spec["layout"] == "shared_page":
         # An NVFP4 pool's page: `roles` index pages, then the position page. The other
         # index roles hold a sentinel and must survive, as must the position page.
@@ -121,7 +159,7 @@ def _build(spec, seed: int):
         extras["neighbour"] = (others, others.clone())
         extras["position_page"] = (position_cache, position_cache.clone())
     else:
-        assert spec["layout"] == "plain", spec["layout"]
+        assert spec["layout"] in ("plain", "coalesced"), spec["layout"]
 
     args = dict(
         logical_positions=logical.to(DEV),
@@ -146,6 +184,15 @@ def _anchors(args) -> int:
     return int(torch.unique(keyed[(logical + 1) % args["compress_ratio"] == 0]).numel())
 
 
+def _top_anchor_page(args) -> int:
+    """The highest page an anchor row writes."""
+    logical = args["logical_positions"].long()
+    anchored = (logical + 1) % args["compress_ratio"] == 0
+    request = args["request_indices"].long()[anchored]
+    pages = args["block_table"].long()[request, logical[anchored] // args["tokens_per_block"]]
+    return int(pages.max())
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
@@ -163,6 +210,17 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     if "position_page" in extras:
         view, saved = extras["position_page"]
         assert torch.equal(view, saved), "wrote into the position page"
+    if "other_layers" in extras:
+        pool, ordinal = extras["other_layers"]
+        for other in range(pool.shape[1]):
+            if other != ordinal:
+                plane = pool[:, other].view(torch.int16)
+                assert bool((plane == SENTINEL).all()), f"wrote into layer ordinal {other}'s plane"
+    if cell.spec.get("top_page"):
+        # The pool's last page is written, at an element offset past int32 from the base.
+        top = _top_anchor_page(args)
+        assert top == cell.spec["pages"] - 1, top
+        assert top * out.stride(0) >= 2**31, top * out.stride(0)
 
 
 def _scene(seed: int, **overrides):
@@ -176,11 +234,21 @@ _MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 re
 _MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots", "rounding_flips")}
 
 
-def test_cuda_graph_capture_and_replay() -> None:
+#: The 128-request decode over this target's tep4 pool, at its cell's seed.
+_DECODE_128 = next(c for c in op.CELLS if c.why.startswith("tep4 decode: 128 requests"))
+
+
+@pytest.mark.parametrize("batch", ["mtp7_32", "tep4_decode_128"])
+def test_cuda_graph_capture_and_replay(batch) -> None:
     """The launch grid is fixed by the row count, so it captures and replays: 32 MTP7
-    verify blocks, the decode target's captured batch."""
-    batch = _MTP7_BATCH
-    args = _scene(seed=16, **batch)
+    verify blocks, and 128 decode rows over this target's coalesced tep4 pool, the
+    decode target's captured batches."""
+    if batch == "mtp7_32":
+        args, flips = _scene(seed=16, **_MTP7_BATCH), _MTP7_BATCH["rounding_flips"]
+    else:
+        spec = _DECODE_128.spec
+        args = _build(spec, seed=zlib.crc32(_DECODE_128.why.encode()))[0]
+        flips = spec.get("rounding_flips", 0)
     cache = args["index_cache"]
     before = cache.clone()
     ref = op.reference(**args)
@@ -200,7 +268,7 @@ def test_cuda_graph_capture_and_replay() -> None:
         cache.copy_(before)
         graph.replay()
         torch.cuda.synchronize()
-        _compare(cache, ref, batch["rounding_flips"])
+        _compare(cache, ref, flips)
 
 
 def _strided(tensor: torch.Tensor, dim: int) -> torch.Tensor:
