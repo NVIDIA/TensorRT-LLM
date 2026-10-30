@@ -22,11 +22,12 @@ capture.
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import Dict
 
 import torch
+
+from tensorrt_llm._utils import get_env_flag
 
 MAX_TOKENS = 8
 
@@ -42,7 +43,7 @@ def _arg(t: torch.Tensor):
 
 
 def _use_pdl() -> bool:
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    return get_env_flag("TRTLLM_ENABLE_PDL", True)
 
 
 def supports(x: torch.Tensor, weight: torch.Tensor) -> bool:

@@ -56,7 +56,7 @@ from transformers.utils.chat_template_utils import render_jinja_template
 
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
-from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm._utils import AdjustedSteadyClock, get_env_flag
 from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
@@ -116,7 +116,7 @@ REASONING_EFFORT = {
 # prompt handed to the model. Off by default: it prints whole
 # conversations, so it is a debugging aid rather than something to leave
 # enabled on a shared server.
-ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
+ENABLE_RESPONSES_DEBUG_MSG = get_env_flag("TRTLLM_RESPONSES_DEBUG", False)
 
 # The parameter a freeform custom tool is described with; see
 # _get_chat_completion_function_tools and _tool_call_output_item.

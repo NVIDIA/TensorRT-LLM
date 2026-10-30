@@ -29,7 +29,7 @@ from tensorrt_llm._torch.pyexecutor.trace_log_utils import log_mem_snapshot
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import get_draft_kv_cache_manager
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
-from tensorrt_llm._utils import global_mpi_rank
+from tensorrt_llm._utils import get_env_flag, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
@@ -526,7 +526,7 @@ class DecoderWarmup:
     def _freeze_eager_workspace_floor(self) -> EagerWorkspaceReclaimer | None:
         if not self._eager_workspace_reclaimable:
             return None
-        if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
+        if not get_env_flag("TRTLLM_RECLAIM_WORKSPACE", True):
             return None
         metadata = self._metadata.attn_metadata
         if (
@@ -1246,7 +1246,7 @@ class DecoderWarmup:
         the autotuner is enabled so op-level (M,N,K) caches also get primed
         for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
         """
-        if os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") != "1":
+        if not get_env_flag("TLLM_MAMBA_MULTISEQ_WARMUP", True):
             return
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER

@@ -50,6 +50,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
+from tensorrt_llm._utils import get_env_flag
+
 logger = logging.get_logger(__name__)
 
 __all__ = [
@@ -474,7 +476,7 @@ _DECODER_BOUNDED_REPLAY_ENV = "TRTLLM_V41_DECODER_BOUNDED_REPLAY"
 
 def encoder_replay_enabled() -> bool:
     """Allow independent Encoder state eviction and bounded recovery on a miss."""
-    enabled = os.environ.get("TRTLLM_V41_ENCODER_REPLAY", "0") not in ("0", "", "false", "False")
+    enabled = get_env_flag("TRTLLM_V41_ENCODER_REPLAY", False)
     if enabled and not decoder_bounded_replay_enabled():
         raise ValueError("TRTLLM_V41_ENCODER_REPLAY requires TRTLLM_V41_DECODER_BOUNDED_REPLAY=1")
     return enabled
@@ -490,7 +492,7 @@ def decoder_bounded_replay_enabled() -> bool:
     scratch reuse; explicit user settings take precedence. Unsupported topologies
     and scratch reuse retain full prefill. Full-context consumers retain all rows.
     """
-    return os.environ.get(_DECODER_BOUNDED_REPLAY_ENV, "1") not in ("0", "", "false", "False")
+    return get_env_flag(_DECODER_BOUNDED_REPLAY_ENV, True)
 
 
 def disagg_context_decoder_skipping_enabled(bounded_replay_on_generation: bool) -> bool:

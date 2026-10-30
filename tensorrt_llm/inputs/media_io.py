@@ -46,6 +46,7 @@ from blake3 import blake3
 from packaging.version import Version
 from PIL import Image
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.inputs.multimodal_data import AudioData, MediaModality, VideoData
 from tensorrt_llm.logger import logger
 
@@ -193,7 +194,7 @@ _ALLOW_PRIVATE_URLS_ENV = "TRTLLM_MEDIA_ALLOW_PRIVATE_URLS"
 
 
 def _allow_private_urls() -> bool:
-    if os.environ.get(_ALLOW_PRIVATE_URLS_ENV, "0") != "1":
+    if not get_env_flag(_ALLOW_PRIVATE_URLS_ENV, False):
         return False
     logger.warning_once(
         f"{_ALLOW_PRIVATE_URLS_ENV}=1: media URLs resolving to private/loopback "
@@ -493,7 +494,7 @@ def extract_audio_from_video(
     Raises:
         ValueError: If the video has no audio stream or the data is corrupt.
     """
-    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
+    if not get_env_flag("TRTLLM_ENABLE_PYAV", False):
         raise RuntimeError(
             "PyAV is required for audio extraction from video. "
             "Set the environment variable TRTLLM_ENABLE_PYAV=1 to enable it."

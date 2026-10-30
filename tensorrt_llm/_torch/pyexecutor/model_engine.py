@@ -17,7 +17,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import mpi_disabled, release_gc
+from tensorrt_llm._utils import get_env_flag, mpi_disabled, release_gc
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, create_input_processor
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
@@ -117,7 +117,7 @@ def _configure_deep_gemm_pdl() -> None:
 
     from tensorrt_llm import deep_gemm
 
-    deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+    deep_gemm.set_pdl(get_env_flag("TRTLLM_ENABLE_PDL", True))
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 

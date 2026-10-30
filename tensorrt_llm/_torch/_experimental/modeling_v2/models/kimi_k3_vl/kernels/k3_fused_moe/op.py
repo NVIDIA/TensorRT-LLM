@@ -44,6 +44,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import get_env_flag
+
 HIDDEN_SIZE = 3584
 NUM_EXPERTS = 896
 TOP_K = 16
@@ -352,7 +354,7 @@ class K3MoeState(_K3MoeScratch):
         num_ctas: Optional[int] = None,
     ):
         if use_pdl is None:
-            use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+            use_pdl = get_env_flag("TRTLLM_ENABLE_PDL", True)
         super().__init__(device, i_tp, num_local, MAX_TOKENS, use_pdl, head_flags, num_ctas)
 
 

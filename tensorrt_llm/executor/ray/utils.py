@@ -18,6 +18,8 @@ import tempfile
 from contextlib import contextmanager
 from typing import Callable, Optional
 
+from tensorrt_llm._utils import get_env_flag
+
 try:
     import ray
 except ImportError:
@@ -25,7 +27,7 @@ except ImportError:
 
 
 def _configure_deep_gemm_cache(rank: int, gpu: int) -> None:
-    if os.environ.get("TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS", "1") == "0":
+    if not get_env_flag("TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS", True):
         return
 
     cache_dir = os.environ.get("TRTLLM_CACHE_DIR")

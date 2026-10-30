@@ -13,12 +13,11 @@ methods are restored and the buffers are freed, leaving no pinned-memory
 footprint behind. Default off: without the env var the scope is a no-op.
 """
 
-import os
 import threading
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_env_flag, prefer_pinned
 from tensorrt_llm.logger import logger
 
 _lock = threading.RLock()
@@ -29,7 +28,7 @@ _orig_copy = None
 
 
 def _enabled() -> bool:
-    return os.environ.get("TRTLLM_PINNED_WEIGHT_STAGING", "0") == "1" and prefer_pinned()
+    return get_env_flag("TRTLLM_PINNED_WEIGHT_STAGING", False) and prefer_pinned()
 
 
 def _pinned_clone(src: torch.Tensor) -> torch.Tensor:

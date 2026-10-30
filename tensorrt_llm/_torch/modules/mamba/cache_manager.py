@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -27,7 +26,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import get_env_flag, get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -466,7 +465,7 @@ def select_mamba2_state(
             "using legacy MTP path for stochastic rounding support"
         )
         use_replay = False
-    if os.environ.get("TRTLLM_USE_MAMBA_REPLAY", "1") == "0":
+    if not get_env_flag("TRTLLM_USE_MAMBA_REPLAY", True):
         logger.info("Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
         use_replay = False
     else:

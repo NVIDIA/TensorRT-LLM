@@ -52,6 +52,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tensorrt_llm._utils import get_env_flag
+
 if TYPE_CHECKING:
     from logging import Logger
 
@@ -410,7 +412,7 @@ class GpuKeepalive:
         Construction touches no CUDA state; the device side is set up at the
         first :meth:`tick`, where any failure disables the keepalive.
         """
-        if os.environ.get(KEEPALIVE_ENV_VAR_NAME, "0") != "1":
+        if not get_env_flag(KEEPALIVE_ENV_VAR_NAME, False):
             return None
         try:
             return cls(device)

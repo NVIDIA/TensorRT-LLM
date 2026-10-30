@@ -3,7 +3,6 @@
 
 import inspect
 import math
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -13,7 +12,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
-from tensorrt_llm._utils import is_sm_120f
+from tensorrt_llm._utils import get_env_flag, is_sm_120f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -533,7 +532,7 @@ class Glm4DecoderLayer(DecoderLayer):
         self.is_p2p_supported = can_access_peer(mapping)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get("TRTLLM_GLM_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not get_env_flag("TRTLLM_GLM_EAGER_FUSION_DISABLED", False)
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode

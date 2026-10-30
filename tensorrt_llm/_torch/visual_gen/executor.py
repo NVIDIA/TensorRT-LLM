@@ -20,6 +20,7 @@ import zmq
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -340,11 +341,7 @@ def _cuda_memory_logging_enabled() -> bool:
     config surface clean, mirroring the nsys trace knob
     ``TLLM_PROFILE_VISUAL_GEN_START_STOP``.
     """
-    return os.environ.get("TLLM_VISUAL_GEN_LOG_CUDA_MEMORY", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    return get_env_flag("TLLM_VISUAL_GEN_LOG_CUDA_MEMORY", False)
 
 
 @dataclass

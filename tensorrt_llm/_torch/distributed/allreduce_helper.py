@@ -19,6 +19,7 @@ from typing import List, Tuple
 import torch
 
 from tensorrt_llm._ipc_utils import IpcMemory, can_access_peer
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.bindings.internal.runtime import (
     lamport_initialize,
     max_workspace_size_lowprecision,
@@ -28,9 +29,8 @@ from tensorrt_llm.mapping import Mapping
 
 
 def force_all_reduce_deterministic():
-    return (
-        os.getenv("FORCE_DETERMINISTIC", "0") == "1"
-        or os.getenv("FORCE_ALL_REDUCE_DETERMINISTIC", "0") == "1"
+    return get_env_flag("FORCE_DETERMINISTIC", False) or get_env_flag(
+        "FORCE_ALL_REDUCE_DETERMINISTIC", False
     )
 
 

@@ -18,7 +18,6 @@ cache-slot indexing, and speculative-verification state handling directly.
 from __future__ import annotations
 
 import math
-import os
 import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -26,6 +25,8 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 import torch
 from fla.modules import ShortConvolution
 from torch import nn
+
+from tensorrt_llm._utils import get_env_flag
 
 from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
@@ -46,7 +47,7 @@ from ._kda_kernels import KDAKernelDispatch, fused_kda_post_conv
 if TYPE_CHECKING:
     from ..mamba.mamba2_metadata import Mamba2Metadata
 
-_KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
+_KDA_INDEXED_STATE_POOL_ENABLED = get_env_flag("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", True)
 # Heuristic ported from SGLang's Blackwell cutoff:
 # https://github.com/sgl-project/sglang/blob/e84bbf68efb683c9e2eef4168c5198042544599d/python/sglang/srt/models/kimi_k3.py#L946-L954
 # It has not been tuned for TensorRT-LLM; benchmark and retune it for TRT-LLM's
@@ -301,7 +302,7 @@ class KimiKDALinearAttention(nn.Module):
         kernel_shape_ok = self.head_k_dim == 128 and self.head_dim == 128
         self._dispatch = KDAKernelDispatch(
             use_optimized_prefill=(
-                os.getenv("TLLM_KDA_ENABLE_OPT_PREFILL", "1") == "1"
+                get_env_flag("TLLM_KDA_ENABLE_OPT_PREFILL", True)
                 and kernel_shape_ok
                 and self.conv_size == 4
                 and self.gate_lower_bound is not None

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -13,7 +12,7 @@ from tensorrt_llm._torch.attention.backends.interface import MLAParams, Position
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_env_flag, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 
@@ -131,7 +130,7 @@ class DeepseekV4Indexer(Indexer):
         return q
 
     def _is_fused_project_mxfp4_enabled(self, input_dtype: torch.dtype) -> bool:
-        if os.environ.get("TRTLLM_DISABLE_DSA_FUSED_INDEXER_Q", "0") == "1":
+        if get_env_flag("TRTLLM_DISABLE_DSA_FUSED_INDEXER_Q", False):
             return False
         return (
             self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE

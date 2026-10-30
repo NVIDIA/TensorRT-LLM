@@ -24,7 +24,6 @@ All resources are lazily initialized on first use for each device.
 """
 
 import ctypes
-import os
 import threading
 from contextlib import contextmanager
 from functools import lru_cache
@@ -35,7 +34,7 @@ from torch.cuda.memory import CUDAPluggableAllocator
 
 import tensorrt_llm as trtllm
 import tensorrt_llm.bindings.internal.runtime as _tbr
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 
 __all__ = [
     "get_locality_domain_stream",
@@ -231,7 +230,7 @@ def is_locality_domain_enabled() -> bool:
     """
     Check if LOCALITY_DOMAIN localization is enabled on this system.
     """
-    if os.getenv("DISABLE_LOCALITY_DOMAINS", "0") == "1":
+    if get_env_flag("DISABLE_LOCALITY_DOMAINS", False):
         return False
     if not torch.cuda.is_available():
         return False

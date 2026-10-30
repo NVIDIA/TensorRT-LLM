@@ -66,8 +66,6 @@ executing the module; options it leaves out take their defaults.
 
 from __future__ import annotations
 
-import os
-
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
@@ -75,6 +73,8 @@ import cutlass.experimental.cuda as cuda
 from cutlass import dsl_user_op
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.cuda.tensor_map import TensorMapDataType
+
+from tensorrt_llm._utils import get_env_flag
 
 _CFG = globals().get("K3_CONFIG") or {}
 
@@ -110,7 +110,7 @@ assert SCHED in ("dynamic", "hybrid", "static"), SCHED
 DYN_ALL = SCHED != "static"  # tiles (all, or all but the first) come through the claim ring
 HYBRID = SCHED == "hybrid"
 PRECLAIM_T = 1 if HYBRID else 0  # the tile whose claim is issued in the prologue
-USE_PDL = bool(int(_cfg("pdl", 0 if os.environ.get("TRTLLM_ENABLE_PDL") == "0" else 1)))
+USE_PDL = bool(int(_cfg("pdl", 0 if not get_env_flag("TRTLLM_ENABLE_PDL", True) else 1)))
 # PDL trigger: right after griddepcontrol.wait (0), so the next kernel's CTAs take SMs as this
 # kernel's CTAs exit and may stream their weights while its last tasks run; or at CTA exit (1).
 LATE_TRIGGER = bool(int(_cfg("late_trigger", 0)))

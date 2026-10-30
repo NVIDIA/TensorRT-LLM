@@ -4,7 +4,6 @@
 
 import json
 import math
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +11,7 @@ from typing import TYPE_CHECKING, Sequence
 
 import torch
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.modelopt_config import (
     is_modelopt_quant_config,
@@ -135,7 +135,7 @@ def _load_modelopt_nvfp4_scales(
 ) -> dict[int, _LayerScales]:
     """Load optional ModelOpt NVFP4 K/V global scales by model layer."""
 
-    if checkpoint_path is None or os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") != "1":
+    if checkpoint_path is None or not get_env_flag("TRTLLM_LOAD_KV_SCALES", True):
         return {}
 
     checkpoint_dir = Path(checkpoint_path)

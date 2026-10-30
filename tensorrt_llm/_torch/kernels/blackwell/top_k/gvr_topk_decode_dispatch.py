@@ -61,6 +61,7 @@ import os
 
 import torch
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 from .gvr_topk_decode_direct import DKCMAX, direct_topk
@@ -99,7 +100,7 @@ def _env_threshold(name):
 def _env_flag(name):
     t = _ENV.get(name)
     if t is None:
-        t = os.environ.get(name, "").strip() not in ("", "0")
+        t = get_env_flag(name, False)
         _ENV[name] = t
     return t
 

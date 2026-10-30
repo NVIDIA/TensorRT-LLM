@@ -15,7 +15,6 @@
 
 import functools
 import math
-import os
 import weakref
 from contextlib import nullcontext
 from typing import Dict, Optional, cast
@@ -24,7 +23,7 @@ import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
+from tensorrt_llm._utils import get_env_flag, get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
@@ -2120,7 +2119,7 @@ class MLA(nn.Module):
         """Resolve the static half of the context-phase fused FP8-Q gate (see
         `_use_fused_q_fp8_context`). Called once from `create_weights()`."""
         ok = (
-            os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") != "1"
+            not get_env_flag("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", False)
             # Independent of use_cute_dsl_bf16_bmm (off by default outside PP):
             # this path is a memory-traffic win, not a GEMM-kernel preference.
             and IS_CUTLASS_DSL_AVAILABLE

@@ -43,9 +43,10 @@ from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
     coordinate_error, effective_available_host_memory, memory_admission)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
-from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
-                                 local_mpi_comm, local_mpi_rank, local_mpi_size,
-                                 mpi_comm, mpi_disabled)
+from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, get_env_flag,
+                                 local_mpi_barrier, local_mpi_comm,
+                                 local_mpi_rank, local_mpi_size, mpi_comm,
+                                 mpi_disabled)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -188,8 +189,7 @@ class HfWeightLoader(BaseWeightLoader):
 
     @staticmethod
     def _is_weight_cache_enabled() -> bool:
-        return os.environ.get(_WEIGHT_CACHE_ENV,
-                              "0").lower() in ("1", "true", "yes", "on")
+        return get_env_flag(_WEIGHT_CACHE_ENV, False)
 
     @staticmethod
     def _weight_cache_max_entries() -> int:

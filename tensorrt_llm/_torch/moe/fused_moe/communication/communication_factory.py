@@ -26,6 +26,7 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 from ..moe_comm_timeout_guard import get_moe_comm_timeout_budgets
@@ -295,7 +296,7 @@ class CommunicationFactory:
             logger.debug(f"NcclEP not available: {nccl_ep_unavailable_reason}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
+        if get_env_flag("TRTLLM_CAN_USE_DEEP_EP", True) and act_dtype == torch.bfloat16:
             try:
                 strategy = DeepEP(
                     mapping,

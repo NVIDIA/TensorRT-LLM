@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -24,7 +23,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import AuxStreamType
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_env_flag, get_sm_version, is_sm_100f
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
@@ -158,9 +157,9 @@ def initialize_sparse_attn(self) -> None:
     sm_version = _get_validated_sm_version()
     if sm_version == 90:
         self._dsv4_flash_mla = DeepSeekV4FlashMLA(self.mqa, self.mqa.compress_ratio)
-    self._disable_dsv4_epilogue_fusion = os.environ.get(
-        "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION", ""
-    ).strip().lower() in ("1", "true", "on")
+    self._disable_dsv4_epilogue_fusion = get_env_flag(
+        "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION", False
+    )
     self.dsv4_overlap_start_event = torch.cuda.Event()
     self.dsv4_compressor_start_event = torch.cuda.Event()
     self.dsv4_compressor_event = torch.cuda.Event()
@@ -583,7 +582,7 @@ def _is_fused_q_fp8_quant_enabled(
     # The fused path leaves a placeholder bf16 q_buf, so consumers read the FP8
     # buffer and `_fused_q_pe`: context takes the prefix rows, generation the
     # suffix. A mixed batch launches once per phase over those disjoint ranges.
-    if os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") == "1":
+    if get_env_flag("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", False):
         return False
     if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
         return False
@@ -607,7 +606,7 @@ def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
     batches therefore take the unfused path, and the context-side handling below
     and in the thop op is not exercised yet.
     """
-    if os.environ.get("TRTLLM_DISABLE_DSV4_Q_B_GEMM_NORM_ROPE_FUSION", "0") == "1":
+    if get_env_flag("TRTLLM_DISABLE_DSV4_Q_B_GEMM_NORM_ROPE_FUSION", False):
         return False
     num_contexts = attn_metadata.num_contexts
     num_generations = attn_metadata.num_generations
@@ -1264,7 +1263,7 @@ def forward_sparse_attn(
     # TRTLLM_MLA_EXTRA_OVERLAP overlaps the compressor and ratio-4 indexer with
     # Q projection on dedicated streams.
     _v4_extra_overlap = (
-        os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "1") == "1"
+        get_env_flag("TRTLLM_MLA_EXTRA_OVERLAP", True)
         and self.compressor is not None
         and self.aux_stream is not None
     )
@@ -1367,7 +1366,7 @@ def forward_sparse_attn(
     # construction rather than by assertion.
     _use_q_b_cute = (
         self.has_dsv4_indexer
-        and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
+        and get_env_flag("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", True)
         and self.q_b_proj.bias is None
         and self.q_b_proj.weight.dtype == torch.bfloat16
         and getattr(self.q_b_proj, "_locality_domain_weight_shards", None) is None

@@ -14,12 +14,10 @@
 # limitations under the License.
 """``trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8``."""
 
-import os
-
 import torch
 
 from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_env_flag, is_sm_100f
 
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
 from ..impl_identity import register_moe_impl
@@ -62,7 +60,7 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         below mirror its ``TORCH_CHECK``s so a miss declines quietly instead of
         raising, which keeps every other model and shape on the unfused path.
         """
-        if os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1" or isinstance(
+        if get_env_flag("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", False) or isinstance(
             x, MxFp8QuantizedTensor
         ):
             return None

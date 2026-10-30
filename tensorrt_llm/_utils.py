@@ -510,7 +510,7 @@ def torch_comm():
 
 def mpi_disabled() -> bool:
     """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
-    return os.environ.get("TLLM_DISABLE_MPI") == "1"
+    return get_env_flag("TLLM_DISABLE_MPI", False)
 
 
 def mpi_rank():
@@ -970,8 +970,8 @@ def nvtx_range_debug(msg: str,
                         that is both a context manager and an identity
                         decorator; it is safe for concurrent and nested use.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or \
+            get_env_flag("TLLM_NVTX_DEBUG", False):
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
         return _NULL_RANGE
@@ -984,8 +984,8 @@ def nvtx_mark_debug(msg: str,
     """
     Creates an NVTX marker for debugging purposes.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or \
+            get_env_flag("TLLM_NVTX_DEBUG", False):
         nvtx_mark(msg, color=color, domain=domain, category=category)
 
 
@@ -1330,6 +1330,29 @@ def confidential_compute_enabled() -> bool:
     """Return whether confidential compute restrictions are enabled."""
     cc_enabled, _ = get_cc_and_nvle_status()
     return cc_enabled
+
+
+_ENV_FLAG_TRUE_VALUES = frozenset(("1", "true", "yes", "on"))
+_ENV_FLAG_FALSE_VALUES = frozenset(("0", "false", "no", "off"))
+
+
+def get_env_flag(name: str, default: Optional[bool] = None) -> Optional[bool]:
+    """Read a boolean switch from the environment.
+
+    Unset or blank returns ``default``. ``1``/``true``/``yes``/``on`` return
+    True and ``0``/``false``/``no``/``off`` return False (case-insensitive,
+    surrounding whitespace ignored). Any other value raises ``ValueError``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in _ENV_FLAG_TRUE_VALUES:
+        return True
+    if value in _ENV_FLAG_FALSE_VALUES:
+        return False
+    raise ValueError(f"{name}={raw!r} is not one of 1/true/yes/on or "
+                     "0/false/no/off")
 
 
 @lru_cache(maxsize=None)

@@ -106,7 +106,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_env_flag, get_sm_version, is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
@@ -145,9 +145,7 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
-_K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
-    os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
-)
+_K3_DISABLE_MIN_LATENCY_LATENT_PROJ = get_env_flag("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", False)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -349,13 +347,13 @@ for it.
 Deriving this from checkpoint metadata is not possible today: neither published
 drafter's config records which capture convention it was distilled against."""
 
-_AUX_ATTN_RES_STREAM_ENABLED = os.environ.get(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, "1") == "1"
+_AUX_ATTN_RES_STREAM_ENABLED = get_env_flag(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, True)
 
 KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
 """Set to ``0`` to disable the in-tree fused Torch op
 ``trtllm::attn_res_fwd`` (Blackwell only). Default: fused with fallback."""
 
-_FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
+_FUSED_ATTN_RES_ENABLED = get_env_flag(KIMI_K3_FUSED_ATTN_RES_ENV, True)
 
 
 KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"

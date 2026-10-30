@@ -30,7 +30,6 @@
 
 import copy
 import math
-import os
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
@@ -44,7 +43,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
+from tensorrt_llm._utils import (get_env_flag, get_sm_version, is_sm_100f,
+                                 is_sm_120f)
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -1360,8 +1360,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not get_env_flag(
+            "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", False)
         self.enable_fusion &= not self.enable_attention_dp
 
         quant_config = self._get_decoder_layer_quant_config(

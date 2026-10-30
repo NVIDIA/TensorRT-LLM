@@ -3,13 +3,12 @@
 """Triton kernels for QSA sparse attention."""
 
 import math
-import os
 
 import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 from tensorrt_llm.logger import logger
 
 _INTEGER_DTYPES = (torch.int32, torch.int64)
@@ -31,7 +30,7 @@ def _require_same_cuda_device(name: str, *tensors: torch.Tensor) -> None:
 def _qsa_pdl_enabled(rows: int) -> bool:
     # PDL helps the two- and four-row speculative target graphs. Larger IFB
     # batches already expose enough split-K parallelism to hide the merge.
-    return rows <= 4 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
+    return rows <= 4 and get_env_flag("TRTLLM_ENABLE_PDL", True) and get_sm_version() >= 90
 
 
 @triton.jit

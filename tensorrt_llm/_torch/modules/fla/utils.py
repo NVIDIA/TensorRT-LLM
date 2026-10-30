@@ -16,10 +16,12 @@ import torch
 import triton
 from packaging import version
 
+from tensorrt_llm._utils import get_env_flag
+
 logger = logging.getLogger(__name__)
 
-COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
-FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
+COMPILER_MODE = get_env_flag("FLA_COMPILER_MODE", False)
+FLA_CI_ENV = get_env_flag("FLA_CI_ENV", False)
 
 
 @lru_cache(maxsize=1)
@@ -300,7 +302,7 @@ is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_n
     0)
 is_nvidia_hopper = is_nvidia and ("NVIDIA H" in torch.cuda.get_device_name(0)
                                   or torch.cuda.get_device_capability()[0] >= 9)
-use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
+use_cuda_graph = is_nvidia and get_env_flag("FLA_USE_CUDA_GRAPH", False)
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8

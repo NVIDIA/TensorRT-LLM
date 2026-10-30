@@ -52,7 +52,7 @@ from transformers import (
 from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import prefer_pinned
+from ..._utils import get_env_flag, prefer_pinned
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -90,7 +90,7 @@ from .modeling_utils import (
 
 logger = logging.getLogger(__name__)
 
-DISAGG = os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
+DISAGG = get_env_flag("TLLM_MULTIMODAL_DISAGGREGATED", False)
 
 
 def _has_meta_tensors(module: nn.Module) -> bool:

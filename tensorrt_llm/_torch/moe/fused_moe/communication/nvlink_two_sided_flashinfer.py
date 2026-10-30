@@ -22,12 +22,12 @@ NVLINK Two-Sided supports post-quant dispatch for all quantization modes.
 """
 
 import functools
-import os
 from typing import List, Optional, Tuple
 
 import pynvml
 import torch
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -104,9 +104,7 @@ class NVLinkTwoSidedFlashinfer(Communication):
         self.alltoall_result_do_sum = alltoall_result_do_sum
 
         # Read from environment variable, same as wideEP
-        self.enable_postquant_alltoall = (
-            os.environ.get("TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1") == "1"
-        )
+        self.enable_postquant_alltoall = get_env_flag("TRTLLM_MOE_POST_QUANT_ALLTOALLV", True)
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-coded to support -1 only.
         # CutlassFusedMoE kernels support any invalid value.

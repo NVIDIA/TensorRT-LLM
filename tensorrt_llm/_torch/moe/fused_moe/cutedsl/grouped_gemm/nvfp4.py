@@ -14,11 +14,9 @@
 # limitations under the License.
 """``TrtllmCutedslGroupedGemmNvfp4Impl``: ``trtllm.cutedsl.grouped_gemm.nvfp4``."""
 
-import os
-
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 
 from .....autotuner import AutoTuner
 from .....cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
@@ -46,7 +44,7 @@ from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
 
 # Kill switch for TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async.
-ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
+ASYNC_INPUT_QUANT = get_env_flag("TLLM_MOE_ASYNC_INPUT_QUANT", True)
 # Largest batch quantize_input_async moves to the aux stream. Only
 # latency-bound decode batches gain from the overlap; on a prefill batch the
 # cross-stream record_stream of its large input and output keeps the caching
@@ -105,8 +103,8 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     def _init_format_state(self) -> None:
         # Opt-out for adapter-free DeepEP metadata; see
         # can_use_deep_ep_direct_metadata.
-        self.disable_deep_ep_direct_metadata = (
-            os.environ.get(_DISABLE_DIRECT_DEEP_EP_METADATA_ENV, "0") == "1"
+        self.disable_deep_ep_direct_metadata = get_env_flag(
+            _DISABLE_DIRECT_DEEP_EP_METADATA_ENV, False
         )
         # Async input quantization (see quantize_input_async /
         # _join_pending_x_ready).

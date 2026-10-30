@@ -28,6 +28,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import (
+    get_env_flag,
     get_sm_version,
     is_sm_100f,
     is_sm_120f,
@@ -864,7 +865,7 @@ class Indexer(nn.Module):
             # core kernel) and requires bf16<->fp32 casts around it; the model-dtype
             # path runs a single native GEMM with no casts. The default stays fp32
             # because the indexer top-k selection is precision sensitive.
-            self._indexer_bf16 = os.environ.get("TRTLLM_DSA_INDEXER_BF16", "0") == "1"
+            self._indexer_bf16 = get_env_flag("TRTLLM_DSA_INDEXER_BF16", False)
             _wk_wp_dtype = dtype if self._indexer_bf16 else torch.float32
             self.wk = Linear(
                 self.hidden_size,
