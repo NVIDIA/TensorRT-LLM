@@ -1343,10 +1343,9 @@ def _check_forced_chunk_context_limit(
         raise ValueError(
             f"max_num_tokens ({max_num_tokens}) must be at least the "
             f"FORCE_CHUNK context chunk unit ({chunk_unit_size}). Increase "
-            "max_num_tokens. For a hybrid linear-attention model with "
-            "kv_cache_config.enable_block_reuse, FORCE_CHUNK is selected for the "
-            "model and the unit is kv_cache_config.tokens_per_block, which can be "
-            "decreased instead. Otherwise FORCE_CHUNK comes from "
+            "max_num_tokens. FORCE_CHUNK is selected for a hybrid linear-attention "
+            "model with kv_cache_config.enable_block_reuse, with the KV cache block "
+            "size as the unit; otherwise it comes from "
             "scheduler_config.context_chunking_policy."
         )
 
