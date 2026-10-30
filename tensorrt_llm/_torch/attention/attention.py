@@ -95,6 +95,8 @@ def attn_custom_op_inplace(
     mrope_position_deltas: Optional[torch.Tensor],
     attention_window_size: Optional[int],
     attention_mask_data: Optional[torch.Tensor],
+    variable_window_token_starts: Optional[torch.Tensor],
+    variable_window_token_ends: Optional[torch.Tensor],
     attention_sinks: Optional[torch.Tensor],
     relative_attention_bias: Optional[torch.Tensor],
     relative_attention_max_distance: int,
@@ -121,6 +123,8 @@ def attn_custom_op_inplace(
         mrope_position_deltas,
         attention_window_size,
         attention_mask_data,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
         output=output,
         output_sf=output_sf,
         attention_sinks=attention_sinks,
@@ -930,6 +934,8 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ):
         num_tokens = attn_metadata.num_tokens
 
@@ -964,6 +970,8 @@ class Attention(nn.Module):
                     mrope_position_deltas=mrope_position_deltas,
                     attention_window_size=attention_window_size,
                     attention_mask_data=attention_mask_data,
+                    variable_window_token_starts=variable_window_token_starts,
+                    variable_window_token_ends=variable_window_token_ends,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
                     relative_attention_bias=relative_attention_bias,
@@ -1014,6 +1022,8 @@ class Attention(nn.Module):
                     mrope_position_deltas=mrope_position_deltas,
                     attention_window_size=attention_window_size,
                     attention_mask_data=attention_mask_data,
+                    variable_window_token_starts=variable_window_token_starts,
+                    variable_window_token_ends=variable_window_token_ends,
                     output=output[:num_tokens, :]
                     if output is not None else None,
                     output_sf=output_sf,
@@ -1044,6 +1054,8 @@ class Attention(nn.Module):
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
         output_gate: Optional[torch.Tensor] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if self.sparse_attn_hooks is not None:
@@ -1062,6 +1074,8 @@ class Attention(nn.Module):
                 relative_attention_max_distance,
                 has_lora,
                 output_gate,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
                 **kwargs,
             )
             if sparse_output is not None:
@@ -1096,6 +1110,8 @@ class Attention(nn.Module):
                 mrope_position_deltas,
                 attention_window_size,
                 attention_mask_data,
+                variable_window_token_starts,
+                variable_window_token_ends,
                 attention_sinks,
                 relative_attention_bias,
                 relative_attention_max_distance,
@@ -1114,6 +1130,8 @@ class Attention(nn.Module):
                 mrope_position_deltas,
                 attention_window_size,
                 attention_mask_data,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
@@ -1140,6 +1158,8 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -1209,6 +1229,8 @@ class Attention(nn.Module):
             relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
             output_gate=gate,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
             **kwargs,
         )
 

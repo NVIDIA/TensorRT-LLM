@@ -65,6 +65,7 @@ class FallbackFmha(Fmha):
 
     supports_skip_correction = True
     supports_workspace_reclamation = True
+    supports_variable_window = True
 
     # Head sizes whose fused context FMHA kernel is proven absent for at
     # least one KV cache dtype, per SM version. This is a blocklist of
@@ -365,6 +366,8 @@ class FallbackFmha(Fmha):
             mask_type=forward_args.mask_type,
             attention_input_type=int(forward_args.attention_input_type),
             attention_window_size=forward_args.attention_window_size,
+            variable_window_token_starts=forward_args.variable_window_token_starts,
+            variable_window_token_ends=forward_args.variable_window_token_ends,
             chunked_prefill_buffer_batch_size=forward_args.chunked_prefill_buffer_batch_size,
             mrope_rotary_cos_sin=forward_args.mrope_rotary_cos_sin,
             mrope_position_deltas=forward_args.mrope_position_deltas,

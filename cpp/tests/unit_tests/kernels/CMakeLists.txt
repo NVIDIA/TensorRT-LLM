@@ -228,6 +228,21 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;attention-mask;gpu")
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_tllm_gtest(
+  fmhaDispatcherTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDispatcherTest.cpp
+  LINK_LIBRARIES
+  kernels_src
+  context_attention_src
+  trtllm_gen_fmha
+  ${CUDA_DRV_LIB}
+  tllm::common_environment
+  tllm::common_logging
+  LABELS
+  "unit;kernel;host")
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest

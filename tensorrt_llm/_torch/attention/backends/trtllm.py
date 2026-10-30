@@ -2195,6 +2195,29 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_mla_enable,
         )
 
+    def _is_variable_window_kernel_available(
+        self,
+        *,
+        dtype: torch.dtype,
+        output_dtype: torch.dtype,
+        metadata: TrtllmAttentionMetadata,
+    ) -> bool:
+        return torch.ops.trtllm.attention_supports_variable_window(
+            dtype,
+            output_dtype,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            metadata.tokens_per_block,
+            self.quant_mode,
+            metadata.max_num_requests,
+            metadata.max_context_length,
+            metadata.max_seq_len,
+            self.attention_chunk_size,
+            metadata.kv_cache_manager is not None,
+            metadata.use_paged_context_fmha,
+        )
+
     def create_output(self, q, *, is_quantize_output: bool,
                       metadata: TrtllmAttentionMetadata,
                       attention_mask: AttentionMask, is_gen_only: bool,
@@ -2275,6 +2298,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        has_variable_window_starts = (forward_args.variable_window_token_starts
+                                      is not None)
+        has_variable_window_ends = forward_args.variable_window_token_ends is not None
+        if has_variable_window_starts != has_variable_window_ends:
+            raise ValueError(
+                "variable_window_token_starts and variable_window_token_ends "
+                "must be provided together")
+        if (has_variable_window_starts and forward_args.attention_input_type
+                == AttentionInputType.generation_only):
+            raise ValueError(
+                "variable-window bounds are supported only for context attention"
+            )
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
