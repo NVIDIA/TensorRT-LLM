@@ -99,6 +99,8 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kernel_smooth_quant
   tllm::kernel_int8_gemm
+  TEST_PREFIX
+  "SmoothQuant."
   LABELS
   "unit;kernels;smooth-quant;gpu")
 add_tllm_gtest(
@@ -110,6 +112,8 @@ add_tllm_gtest(
   LINK_LIBRARIES
   tllm::kernel_weight_only
   tllm::kernel_weight_only_gemm
+  TEST_PREFIX
+  "WeightOnly."
   LABELS
   "unit;kernels;weight-only;gpu")
 add_tllm_gtest(
