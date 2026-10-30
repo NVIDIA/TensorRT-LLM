@@ -882,20 +882,63 @@ def test_retained_compressed_row_mask_drops_pages_the_twin_released():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_retained_compressed_row_mask_matches_reference():
+    """Many requests with uneven row counts: the in-kernel request search matches searchsorted."""
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
+        _retained_compressed_row_mask,
+    )
+
+    torch.manual_seed(0)
+    batch, rows_per_page, width = 37, 4, 8
+    new_rows = torch.randint(0, 6, (batch,), dtype=torch.int32)
+    cu = torch.cat([torch.zeros(1, dtype=torch.int32), new_rows.cumsum(0).int()])
+    total = int(cu[-1])
+    num_comp = (new_rows - torch.randint(0, 2, (batch,), dtype=torch.int32)).clamp(min=0)
+    start_pos = torch.randint(0, 40, (batch,), dtype=torch.int32)
+    compressed_mask = torch.rand(total) > 0.2
+    table = torch.randint(-1, 9, (batch, width), dtype=torch.int32)
+    mask = _retained_compressed_row_mask(
+        table.cuda(),
+        rows_per_page,
+        num_comp.cuda(),
+        cu.cuda(),
+        start_pos.cuda(),
+        compressed_mask.cuda(),
+        batch,
+        total,
+    ).cpu()
+    expected = []
+    for row in range(total):
+        req = int(torch.searchsorted(cu[1:], row, right=True))
+        local = row - int(cu[req])
+        block = (int(start_pos[req]) + local) // rows_per_page
+        page = int(table[req, block]) if block < width else -1
+        expected.append(bool(compressed_mask[row]) and local < int(num_comp[req]) and page >= 0)
+    assert mask.tolist() == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("shared_rows", [False, True])
 def test_overlay_retained_rows_copies_held_rows(shared_rows):
-    """The overlay replaces exactly the scratch rows whose token the twin holds."""
+    """The overlay replaces exactly the scratch rows whose token the twin holds.
+
+    Two calls in a row: the context overlay's row records from the first call must not leak
+    into the second, which releases pages the first one held.
+    """
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
         overlay_retained_rows,
     )
 
     torch.manual_seed(0)
+    # topk spans three overlay tiles, the last one partial.
     tokens_per_block, width, queries, topk = 4, 656, 5, 150
-    # Twin pool of 6 pages; two requests hold pages for blocks 0 and 3 / block 1 only.
     pool = torch.randint(
         0, 255, (6, 1, tokens_per_block, 1, width), dtype=torch.uint8, device="cuda"
     )
-    table = torch.tensor([[2, -1, -1, 5], [-1, 0, -1, -1]], dtype=torch.int32, device="cuda")
+    tables = [
+        torch.tensor([[2, -1, -1, 5], [-1, 0, -1, -1]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[-1, -1, -1, 5], [-1, -1, 3, -1]], dtype=torch.int32, device="cuda"),
+    ]
     requests = torch.tensor([0, 0, 1, 1, 0], dtype=torch.int32, device="cuda")
     topk_indices = torch.randint(-1, 16, (queries, topk), dtype=torch.int32, device="cuda")
     if shared_rows:
@@ -905,27 +948,28 @@ def test_overlay_retained_rows_copies_held_rows(shared_rows):
     else:
         compact = torch.arange(queries * topk, dtype=torch.int32, device="cuda").view(queries, topk)
         rows = queries * topk
-    scratch = torch.zeros(rows, width, dtype=torch.uint8, device="cuda")
     owner = SimpleNamespace(layer_idx=0, kv_scale_orig_quant=None)
     manager = SimpleNamespace(
         layer_offsets={0: 0},
         high_layers={0: 1},
         _get_mixed_precision_buffers=lambda *args: pool,
     )
-    meta = SimpleNamespace(retained_block_table=table, kv_cache_manager=manager)
-    overlay_retained_rows(owner, meta, topk_indices, requests, compact, scratch, shared_rows)
-
-    expected = torch.zeros_like(scratch)
     flat = pool.view(-1, width)
-    for q in range(queries):
-        for k in range(topk):
-            pos, row = int(topk_indices[q, k]), int(compact[q, k])
-            if pos < 0 or row < 0:
-                continue
-            page = int(table[int(requests[q]), pos // tokens_per_block])
-            if page >= 0:
-                expected[row] = flat[page * tokens_per_block + pos % tokens_per_block]
-    assert torch.equal(scratch, expected)
+    for table in tables:
+        scratch = torch.zeros(rows, width, dtype=torch.uint8, device="cuda")
+        meta = SimpleNamespace(retained_block_table=table, kv_cache_manager=manager)
+        overlay_retained_rows(owner, meta, topk_indices, requests, compact, scratch, shared_rows)
+
+        expected = torch.zeros_like(scratch)
+        for q in range(queries):
+            for k in range(topk):
+                pos, row = int(topk_indices[q, k]), int(compact[q, k])
+                if pos < 0 or row < 0:
+                    continue
+                page = int(table[int(requests[q]), pos // tokens_per_block])
+                if page >= 0:
+                    expected[row] = flat[page * tokens_per_block + pos % tokens_per_block]
+        assert torch.equal(scratch, expected)
 
 
 @pytest.mark.cpu_only
