@@ -71,8 +71,13 @@ def _specs(draft_window: Optional[int] = DRAFT_WINDOW) -> tuple[KVCacheLayerSpec
     return tuple(target + draft)
 
 
-def _manager(layer_specs: Optional[tuple[KVCacheLayerSpec, ...]]) -> MiniMaxM3KVCacheManagerV2:
-    """A hybrid NVFP4 MSA manager, with or without explicit draft layer specs."""
+def _manager(
+    layer_specs: Optional[tuple[KVCacheLayerSpec, ...]],
+    dtype: DataType = DataType.NVFP4,
+    implementation: str = "msa",
+    is_disagg: bool = False,
+) -> MiniMaxM3KVCacheManagerV2:
+    """A MiniMax-M3 manager (hybrid NVFP4 MSA by default), with or without draft layer specs."""
     return MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=64 << 20,
@@ -89,12 +94,14 @@ def _manager(layer_specs: Optional[tuple[KVCacheLayerSpec, ...]]) -> MiniMaxM3KV
         max_batch_size=2,
         max_num_tokens=256,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
-        dtype=DataType.NVFP4,
+        dtype=dtype,
         vocab_size=16,
         sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-            implementation="msa", indexer_kv_dtype="fp8"
+            implementation=implementation,
+            indexer_kv_dtype="fp8" if implementation == "msa" else "bf16",
         ),
         layer_specs=layer_specs,
+        is_disagg=is_disagg,
     )
 
 
@@ -185,11 +192,10 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
-@pytest.mark.parametrize("draft_window", [DRAFT_WINDOW, None])
-def test_page_indices_follow_the_layer_owner(draft_window: Optional[int]) -> None:
-    """Target layers get raw slot ids and draft layers base view rows, even in one lifecycle."""
+def test_page_indices_follow_the_layer_owner() -> None:
+    """Target layers get raw slot ids and draft layers base view rows."""
     torch.cuda.init()
-    manager = _manager(_specs(draft_window))
+    manager = _manager(_specs())
     try:
         (request,) = manager.add_dummy_requests([7], token_nums=[200])
         for layer in manager.pp_layers:
@@ -219,9 +225,31 @@ def test_nvfp4_draft_layers_are_rejected() -> None:
         _manager((*specs[:NUM_TARGET], nvfp4_draft, *specs[NUM_TARGET + 1 :]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_draft_layers_need_their_own_lifecycle() -> None:
+    """Unwindowed draft layers would share the target's lifecycle and pool offsets."""
+    torch.cuda.init()
+    with pytest.raises(ValueError, match="only in their own lifecycle"):
+        _manager(_specs(draft_window=None))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_disagg_draft_layers_need_the_hnd_layout() -> None:
+    """A Triton FP8 cache transfers token-major K/V, but drafters write head-major K/V."""
+    specs = tuple(
+        replace(spec, dtype=DataType.FP8, buffer_roles=(Role.KEY, Role.VALUE))
+        if spec.owner is KVCacheLayerOwner.TARGET
+        else spec
+        for spec in _specs()
+    )
+    with pytest.raises(ValueError, match="only with the HND K/V layout"):
+        _manager(specs, dtype=DataType.FP8, implementation="triton", is_disagg=True)
+
+
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("pp_size", [1, 2])
 @pytest.mark.parametrize("is_disagg", [False, True])
-def test_window_sized_draft_ratio(is_disagg: bool) -> None:
+def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
     """A windowed draft lifecycle gets its windows plus one chunk, not a bytes-per-token share."""
 
     def _configs(specs: tuple[KVCacheLayerSpec, ...], target_sinks: Optional[int] = None) -> list:
@@ -239,13 +267,15 @@ def test_window_sized_draft_ratio(is_disagg: bool) -> None:
     manager.layer_specs = _specs()[NUM_TARGET - 1 :]
     manager.max_batch_size = 2
     manager.max_num_tokens = 256
-    manager.mapping = Mapping()
+    manager.mapping = Mapping(world_size=pp_size, rank=0, pp_size=pp_size)
     manager.is_disagg = is_disagg
     manager._generation_kv_capacity_headroom = 1
     configs = _configs(manager.layer_specs)
     draft_bytes_per_token = 2 * HEADS * HEAD_DIM * 2 * NUM_DRAFT
-    # Four admissible sequences hold three pages of window each, plus one 256-token chunk.
-    draft_bytes = (4 * 3 * 128 + 256) * draft_bytes_per_token
+    # Admissible sequences (batch x PP stages, doubled for the overlap scheduler's retiring
+    # request unless an aggregated PP pipeline) hold three pages of window each, plus one chunk.
+    num_sequences = 2 * pp_size * (2 if is_disagg or pp_size == 1 else 1)
+    draft_bytes = (num_sequences * 3 * 128 + 256) * draft_bytes_per_token
     assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128) == pytest.approx(
         [1 - draft_bytes / (1 << 30), draft_bytes / (1 << 30)]
     )

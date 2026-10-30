@@ -416,6 +416,18 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         ):
             # Block scales here belong to the MSA sparse target layers only.
             raise ValueError(f"{type(self).__name__} does not host NVFP4 draft layers.")
+        hosts_draft_layers = layer_specs is not None and any(
+            spec.owner is KVCacheLayerOwner.DRAFT for spec in layer_specs
+        )
+        if (
+            hosts_draft_layers
+            and kwargs.get("is_disagg")
+            and self._main_kv_mapper_kind != MapperKind.HND
+        ):
+            # Drafters write head-major K/V, but transfer reads every K/V buffer with the main mapper.
+            raise ValueError(
+                f"{type(self).__name__} transfers draft layers only with the HND K/V layout."
+            )
         if layer_specs is not None and kwargs.get("dtype") == DataType.NVFP4:
             # The hybrid layout of _build_cache_config as specs: FP8 on the dense target layers.
             kwargs["layer_specs"] = tuple(
@@ -427,6 +439,18 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 for spec in layer_specs
             )
         super().__init__(*args, **kwargs)
+
+        if hosts_draft_layers:
+            groups = self.layer_to_pool_mapping_dict
+            target_groups = {groups[self.layer_offsets[layer]] for layer in self.target_layer_ids}
+            if any(
+                groups[self.layer_offsets[layer]] in target_groups for layer in self.draft_layer_ids
+            ):
+                # Coalesced with target buffers, draft layers would get target-relative pool offsets.
+                self.shutdown()
+                raise ValueError(
+                    f"{type(self).__name__} hosts draft layers only in their own lifecycle."
+                )
 
         if self.dtype == DataType.NVFP4:
             dense_target_layers = [
