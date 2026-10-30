@@ -5896,9 +5896,9 @@ class PyExecutor:
                         self._adp_loop_head_exchange())
                 else:
                     flush_transfer_errors = self.disagg.handle_errors_synced()
-                if flush_transfer_errors and (
-                        not self.gather_all_responses
-                        or self.dist.tp_size == self.dist.world_size):
+                if flush_transfer_errors and (not self.gather_all_responses
+                                              or self.dist.tp_size
+                                              == self.dist.world_size):
                     # Error cleanup can remove the last live request. Publish
                     # its response before the next fetch can block on an idle
                     # queue. A TP-uniform vote cannot trigger a wider-world
