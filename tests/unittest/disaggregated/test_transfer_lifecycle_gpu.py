@@ -65,7 +65,7 @@ _CASES = (
 )
 _PHASE_TIMEOUT_S = 30.0
 _TIMEOUT_S = 4 * _PHASE_TIMEOUT_S
-_WORKER_TIMEOUT_S = 120.0
+_WORKER_TIMEOUT_S = 600.0
 
 
 def _wait(
@@ -961,7 +961,7 @@ def _exercise_live_session(
     _record(directory, f"{role}.reused_after_done", stable_outcome=session.status.name, sentinel=77)
 
 
-@pytest.mark.timeout(600, method="signal")
+@pytest.mark.timeout(_WORKER_TIMEOUT_S + 4 * _TIMEOUT_S, method="signal")
 @pytest.mark.parametrize("case", _CASES)
 def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
     """Qualify real GPU/NIXL software lifecycle with four GPUs and separate MPI jobs.

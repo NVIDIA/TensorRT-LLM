@@ -100,6 +100,14 @@ class InputProcessor(Protocol):
         - Register the inherited class to the model class using @register_input_processor(...)
     """
 
+    supports_token_ids_input: bool = True
+    """Whether pre-tokenized prompts are accepted; encoder-driven processors may opt out."""
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        """Media accepted by this processor instance; text-only by default."""
+        return frozenset()
+
     model_path: any
     config: any
     tokenizer: any
@@ -155,6 +163,15 @@ class BaseMultimodalInputProcessor(ABC):
     If the flag is False, the pipeline detokenizes the text prompt first and then
     processes the multimodal inputs.
     """
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        """Registered modalities, narrowed by checkpoint-specific overrides."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return frozenset()
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_modalities(
+            resolve_top_level_model_type(config))
 
     # Whether multimodal soft-token runs need bidirectional attention spanning
     # the full block. When True, the chunked-prefill scheduler must keep each
@@ -895,6 +912,13 @@ class MultimodalPlaceholderRegistry:
             raise ValueError(f"Model type '{model_type}' is not registered")
         del self._multimodal_placeholder_by_model_type[model_type]
 
+    def get_registered_modalities(self, model_type: str) -> frozenset[str]:
+        """Return registered media types, or an empty set for an unknown model."""
+        self._ensure_provider_imported(model_type)
+        metadata = self._multimodal_placeholder_by_model_type.get(model_type)
+        return frozenset(
+            metadata.placeholder_map) if metadata is not None else frozenset()
+
     def is_valid(self, model_type: str, modality: str) -> bool:
         self._ensure_provider_imported(model_type)
         return model_type in self._multimodal_placeholder_by_model_type and \
@@ -1083,8 +1107,10 @@ def create_input_processor(
     Args:
         model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
         tokenizer: Tokenizer instance.
-        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
-            config loading; any other value skips HF config loading. Default is "HF".
+        checkpoint_format: Checkpoint format identifier. "HF" and "MX" use Hugging
+            Face-style config loading, because MX loads Hugging Face-format
+            checkpoints; "mistral" and "mistral_large_3" use the native Mistral
+            config; any other value skips HF config loading. Default is "HF".
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
         enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
@@ -1103,7 +1129,7 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format == "HF":
+    if checkpoint_format in ("HF", "MX"):
         try:
             model_config = ModelConfig.from_pretrained(
                 model_path_or_dir, trust_remote_code=trust_remote_code)
@@ -1310,8 +1336,9 @@ def create_input_processor_with_hash(
         positions, and masks on top.
 
         Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
-        When a UUID is provided for a multimodal item, it will be used as the
-        cache identifier and returned in KV cache events instead of the content hash.
+        When a UUID is provided for a multimodal item, it contributes to the
+        derived cache digest and is preserved as the external identity in KV
+        cache events.
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']

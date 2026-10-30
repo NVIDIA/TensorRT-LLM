@@ -54,8 +54,8 @@ from tensorrt_llm.llmapi.llm_args import (
     MultimodalConfig,
     TorchLlmArgs,
 )
-from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1266,7 +1266,7 @@ def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
     )
     layers = [
         windowed,
-        replace(windowed, global_layer_id=1, reuse_policy=AttentionReusePolicy.PRIVATE),
+        replace(windowed, global_layer_id=1, reuse_policy=ReusePolicy.PRIVATE),
         replace(windowed, global_layer_id=2, num_sink_tokens=None),
         replace(windowed, global_layer_id=3, sliding_window_size=None, num_sink_tokens=None),
     ]
@@ -1626,7 +1626,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     ):
         creator = KvCacheCreator(
             model_engine=model_engine,
-            mapping=Mock(cp_config={}),
+            mapping=Mapping(),
             net_max_seq_len=max_seq_len,
             kv_connector_manager=None,
             max_num_tokens=256,
@@ -1693,7 +1693,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
     py_executor.warmup_scope.assert_called_once_with()
     py_executor.start_worker.assert_called_once()
-    py_executor.shutdown_for_kv_cache_estimation.assert_called_once()
+    py_executor.release_resources.assert_called_once()
     py_executor.shutdown.assert_not_called()
     assert kv_cache_config.max_tokens == user_max_tokens
     assert kv_cache_config.pool_ratio == pool_ratio
@@ -1805,10 +1805,9 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
     assert kv_cache_config.avg_seq_len == 2055
 
 
-def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
+def _one_model_draft_creator(target_pool_ratio, mapping, draft_config) -> KvCacheCreator:
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = Mock(max_cuda_graph_batch_size=4)
-    target_pool_ratio = [0.32, 0.68]
     creator._kv_cache_config = KvCacheConfig(
         pool_ratio=target_pool_ratio,
         max_attention_window=None,
@@ -1823,10 +1822,15 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator._execution_stream = None
     creator._is_disagg = False
     creator._cache_transceiver_config = None
-    creator._mapping = Mock()
+    creator._mapping = mapping
+    creator._draft_config = draft_config
     creator._speculative_config = Mock()
     creator._disable_overlap_scheduler = False
+    return creator
 
+
+def _create_one_model_draft_manager(creator: KvCacheCreator, **kwargs) -> Mock:
+    """Run the draft-manager factory with the heavy pieces patched out."""
     effective_draft_config = Mock()
     effective_draft_config.pretrained_config.torch_dtype = "bfloat16"
     effective_draft_config.sparse_attention_config = None
@@ -1858,18 +1862,43 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
             return_value=Mock(),
         ) as create_manager,
     ):
-        codec_provider = object()
-        creator._create_one_model_draft_kv_cache_manager(
-            creator._max_seq_len,
-            estimating_kv_cache=True,
-            cold_page_codec_provider=codec_provider,
-        )
+        creator._create_one_model_draft_kv_cache_manager(creator._max_seq_len, **kwargs)
+    return create_manager
+
+
+def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
+    target_pool_ratio = [0.32, 0.68]
+    creator = _one_model_draft_creator(target_pool_ratio, Mock(), None)
+    codec_provider = object()
+    create_manager = _create_one_model_draft_manager(
+        creator, estimating_kv_cache=True, cold_page_codec_provider=codec_provider
+    )
 
     draft_config = create_manager.call_args.kwargs["kv_cache_config"]
     assert draft_config.pool_ratio == [1.0]
     assert create_manager.call_args.kwargs["max_cuda_graph_batch_size"] == 4
     assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio
+
+
+def test_one_model_draft_kv_uses_the_drafter_mapping_under_helix() -> None:
+    # Helix + attention DP (Kimi K3 helix_a2a): the drafter is built head-TP on a
+    # mapping without attention DP, so its KV heads must be sharded the same way,
+    # not by the executor's attention-DP repurposed mapping.
+    helix_adp = Mapping(
+        world_size=4,
+        rank=1,
+        tp_size=1,
+        cp_size=4,
+        cp_config={"cp_type": CpType.HELIX},
+        enable_attention_dp=True,
+    )
+    drafter_mapping = helix_adp.repurpose_helix_cp_to_tp()
+    drafter_mapping.enable_attention_dp = False
+    creator = _one_model_draft_creator([1.0], helix_adp, SimpleNamespace(mapping=drafter_mapping))
+    create_manager = _create_one_model_draft_manager(creator)
+
+    assert create_manager.call_args.kwargs["mapping"] is drafter_mapping
 
 
 # ---------------------------------------------------------------------------
@@ -2213,3 +2242,40 @@ def test_unified_layout_uses_model_provided_geometry(attention_dp: bool) -> None
         ModelKVCacheLayerSpec(head_dim=512, num_kv_heads=4, num_q_heads=16),
     )
     assert creator._dflash_kv_layout(model_config, torch.bfloat16) is None
+
+
+def test_profiling_failure_releases_resources_and_restores_response_state():
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = SimpleNamespace(cp_config={})
+    creator._kv_cache_config = SimpleNamespace(free_gpu_memory_fraction=0.9)
+    creator._skip_est = False
+    creator._dummy_reqs = []
+    creator._encode_dummy_inputs = Mock(return_value=None)
+    executor = Mock()
+    warmup_scope = MagicMock()
+    warmup_scope.__exit__.return_value = False
+    executor.warmup_scope.return_value = warmup_scope
+    executor.dist.mapping.rank = 0
+    executor.dist.broadcast.side_effect = lambda value, root: value
+    executor.enable_iter_perf_stats = True
+    executor.await_responses.side_effect = RuntimeError("profiling request failed")
+    kv_manager = Mock()
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
+    executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+
+    with (
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
+        pytest.raises(RuntimeError, match="profiling request failed"),
+    ):
+        creator.configure_kv_cache_capacity(executor)
+
+    executor.release_resources.assert_called_once_with()
+    executor.shutdown.assert_not_called()
+    executor.warmup_scope.assert_called_once_with()
+    warmup_scope.__enter__.assert_called_once()
+    warmup_scope.__exit__.assert_called_once()
+    assert executor.enable_iter_perf_stats is True
+    assert executor.set_gather_responses.call_args.args == (False,)

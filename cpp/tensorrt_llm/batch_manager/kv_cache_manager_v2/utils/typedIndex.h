@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include <array>
 #include <cstddef>
 #include <functional>
 #include <initializer_list>
@@ -167,6 +168,45 @@ constexpr T operator-(StrongIndex<T, Tag, LhsDefaultValue> lhs, StrongIndex<T, T
     return static_cast<T>(lhs.value() - rhs.value());
 }
 
+namespace detail
+{
+//! A StrongIndex is its value and nothing else: one member, no padding, no vtable. Code that
+//! stages indices in a buffer a kernel reads, or hands them to a copy that moves bytes, rests
+//! on this; checked here so none of it has to say so again.
+//!
+//! Spelled in the native types rather than the fixed-width aliases: int64_t names one of
+//! long and long long, so those would leave the other unchecked. Every type is_integral
+//! admits is here, which is wider than the arithmetic ones -- char is a third type beside
+//! its signed and unsigned spellings, and bool and the character types are integral too.
+template <typename T>
+using IndexLayoutProbe = StrongIndex<T, struct IndexLayoutProbeTag>;
+
+#define KVCM2_CHECK_INDEX_LAYOUT(T)                                                                                    \
+    static_assert(sizeof(IndexLayoutProbe<T>) == sizeof(T));                                                           \
+    static_assert(alignof(IndexLayoutProbe<T>) == alignof(T));                                                         \
+    static_assert(std::is_trivially_copyable_v<IndexLayoutProbe<T>>);                                                  \
+    static_assert(std::is_standard_layout_v<IndexLayoutProbe<T>>)
+
+KVCM2_CHECK_INDEX_LAYOUT(bool);
+KVCM2_CHECK_INDEX_LAYOUT(char);
+KVCM2_CHECK_INDEX_LAYOUT(signed char);
+KVCM2_CHECK_INDEX_LAYOUT(short);
+KVCM2_CHECK_INDEX_LAYOUT(int);
+KVCM2_CHECK_INDEX_LAYOUT(long);
+KVCM2_CHECK_INDEX_LAYOUT(long long);
+KVCM2_CHECK_INDEX_LAYOUT(unsigned char);
+KVCM2_CHECK_INDEX_LAYOUT(unsigned short);
+KVCM2_CHECK_INDEX_LAYOUT(unsigned int);
+KVCM2_CHECK_INDEX_LAYOUT(unsigned long);
+KVCM2_CHECK_INDEX_LAYOUT(unsigned long long);
+KVCM2_CHECK_INDEX_LAYOUT(wchar_t);
+KVCM2_CHECK_INDEX_LAYOUT(char8_t);
+KVCM2_CHECK_INDEX_LAYOUT(char16_t);
+KVCM2_CHECK_INDEX_LAYOUT(char32_t);
+
+#undef KVCM2_CHECK_INDEX_LAYOUT
+} // namespace detail
+
 template <typename T, typename Tag, T DefaultValue>
 [[nodiscard]] std::size_t toSizeT(StrongIndex<T, Tag, DefaultValue> index) noexcept
 {
@@ -186,6 +226,11 @@ public:
     using ContainerType = std::vector<T>;
     using iterator = typename ContainerType::iterator;
     using const_iterator = typename ContainerType::const_iterator;
+    //! The container's own reference types rather than `T&`/`T const&`, so that
+    //! TypedVec<Index, bool> works: std::vector<bool> hands out a proxy, not a `bool&`.
+    //! For every other T these are exactly `T&` and `T const&`.
+    using reference = typename ContainerType::reference;
+    using const_reference = typename ContainerType::const_reference;
 
     TypedVec() = default;
 
@@ -209,22 +254,22 @@ public:
     {
     }
 
-    [[nodiscard]] T& operator[](Index index) noexcept
+    [[nodiscard]] reference operator[](Index index) noexcept
     {
         return mData[toSizeT(index)];
     }
 
-    [[nodiscard]] T const& operator[](Index index) const noexcept
+    [[nodiscard]] const_reference operator[](Index index) const noexcept
     {
         return mData[toSizeT(index)];
     }
 
-    [[nodiscard]] T& at(Index index)
+    [[nodiscard]] reference at(Index index)
     {
         return mData.at(toSizeT(index));
     }
 
-    [[nodiscard]] T const& at(Index index) const
+    [[nodiscard]] const_reference at(Index index) const
     {
         return mData.at(toSizeT(index));
     }
@@ -275,7 +320,7 @@ public:
     }
 
     template <typename... Args>
-    T& emplace_back(Args&&... args)
+    reference emplace_back(Args&&... args)
     {
         return mData.emplace_back(std::forward<Args>(args)...);
     }
@@ -285,22 +330,22 @@ public:
         mData.pop_back();
     }
 
-    [[nodiscard]] T& front()
+    [[nodiscard]] reference front()
     {
         return mData.front();
     }
 
-    [[nodiscard]] T const& front() const
+    [[nodiscard]] const_reference front() const
     {
         return mData.front();
     }
 
-    [[nodiscard]] T& back()
+    [[nodiscard]] reference back()
     {
         return mData.back();
     }
 
-    [[nodiscard]] T const& back() const
+    [[nodiscard]] const_reference back() const
     {
         return mData.back();
     }
@@ -357,6 +402,92 @@ public:
 
 private:
     ContainerType mData;
+};
+
+//! Index of an EnumMap: a StrongIndex as elsewhere, or a plain enum whose enumerators run
+//! from zero. Both name a position; neither is an integer a caller can pass by accident.
+template <typename Index>
+[[nodiscard]] constexpr std::size_t toMapSlot(Index index) noexcept
+{
+    if constexpr (std::is_enum_v<Index>)
+    {
+        return static_cast<std::size_t>(index);
+    }
+    else
+    {
+        return toSizeT(index);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EnumMap -- one value per enumerator, in an array rather than an allocation.
+//
+// For a set whose size is known when the type is written: the slots are fixed, so a lookup
+// is a load at a constant displacement where the value it replaces was arithmetic over
+// members the compiler cannot fold. TypedVec is the one to reach for when the count is a
+// runtime answer.
+// ---------------------------------------------------------------------------
+template <typename Index, typename T, std::size_t Count>
+class EnumMap
+{
+public:
+    using IndexType = Index;
+    using ValueType = T;
+
+    constexpr EnumMap() = default;
+
+    constexpr explicit EnumMap(std::array<T, Count> const& values)
+        : mData(values)
+    {
+    }
+
+    [[nodiscard]] constexpr T& operator[](Index index) noexcept
+    {
+        return mData[toMapSlot(index)];
+    }
+
+    [[nodiscard]] constexpr T const& operator[](Index index) const noexcept
+    {
+        return mData[toMapSlot(index)];
+    }
+
+    [[nodiscard]] constexpr T& at(Index index)
+    {
+        return mData.at(toMapSlot(index));
+    }
+
+    [[nodiscard]] constexpr T const& at(Index index) const
+    {
+        return mData.at(toMapSlot(index));
+    }
+
+    [[nodiscard]] static constexpr std::size_t size() noexcept
+    {
+        return Count;
+    }
+
+    [[nodiscard]] constexpr typename std::array<T, Count>::iterator begin() noexcept
+    {
+        return mData.begin();
+    }
+
+    [[nodiscard]] constexpr typename std::array<T, Count>::iterator end() noexcept
+    {
+        return mData.end();
+    }
+
+    [[nodiscard]] constexpr typename std::array<T, Count>::const_iterator begin() const noexcept
+    {
+        return mData.begin();
+    }
+
+    [[nodiscard]] constexpr typename std::array<T, Count>::const_iterator end() const noexcept
+    {
+        return mData.end();
+    }
+
+private:
+    std::array<T, Count> mData{};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

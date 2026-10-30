@@ -135,7 +135,7 @@ def test_dspark_checkpoint_width_reaches_shared_cache_cost_and_construction(
     creator._per_manager_cache_cost(RecordingManager, layout, include_request_cost=True)
     create_manager = Mock(return_value=SimpleNamespace(max_seq_len=4096))
     monkeypatch.setattr(_util, "_create_kv_cache_manager", create_manager)
-    creator._create_kv_cache_manager(creator._model_engine)
+    creator._create_kv_cache_manager()
 
     runtime_specs = create_manager.call_args.kwargs["layer_specs"]
     for call in (

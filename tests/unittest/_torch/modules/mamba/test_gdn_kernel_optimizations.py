@@ -17,10 +17,16 @@ decode QKV packing, the dense in_proj row permutation, and the multi-row
 gated RMSNorm."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn.functional as F
+from transformers import Qwen3NextConfig
+
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+from tensorrt_llm._torch.utils import torch_compiling
 
 skip_no_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -562,6 +568,49 @@ def test_recurrent_state_reset_supports_gdn_pool_views():
         torch.testing.assert_close(state_pool[state_idx], state_pool_before[state_idx])
 
 
+@skip_no_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens,num_heads,head_dim", [(1, 2, 4), (5, 3, 8)])
+def test_gdn_eager_forward_supplies_output_buffer(
+    dtype: torch.dtype, num_tokens: int, num_heads: int, head_dim: int
+) -> None:
+    config = Qwen3NextConfig(
+        architectures=["Qwen3NextForCausalLM"],
+        hidden_size=16,
+        linear_num_key_heads=1,
+        linear_num_value_heads=num_heads,
+        linear_key_head_dim=head_dim,
+        linear_value_head_dim=head_dim,
+        linear_conv_kernel_dim=4,
+        torch_dtype=dtype,
+    )
+    layer = Qwen3NextGatedDeltaNet(
+        ModelConfig(pretrained_config=config), aux_stream=None, layer_idx=0
+    )
+    mixed_qkv = torch.empty(num_tokens, layer.conv_dim_per_tp, dtype=dtype, device="cuda")
+    layer._compute_tokenwise_inputs = Mock(return_value=(mixed_qkv, None, None, None))
+    # This test checks the wrapper's output-buffer allocation and forwarding.
+    # Existing mixed-decode tests cover the core's numerical and state behavior, so the core can be
+    # mocked without repeating those kernel checks here.
+    layer.forward_core = Mock()
+    layer._postprocess_gdn_output = Mock()
+
+    with torch_compiling(False):
+        layer.forward(
+            hidden_states=torch.empty(num_tokens, config.hidden_size, dtype=dtype, device="cuda"),
+            attn_metadata=None,
+            mamba_metadata=None,
+        )
+
+    layer.forward_core.assert_called_once()
+    # Check that we pass one buffer to the core call.
+    output = layer.forward_core.call_args.kwargs.get("output")
+    assert output is not None
+    assert output.shape == (1, num_tokens, num_heads, head_dim)
+    assert output.dtype == mixed_qkv.dtype
+    assert output.device == mixed_qkv.device
+
+
 def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
     """The compile boundary consumes split inputs and mutates its output."""
     import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
@@ -608,7 +657,6 @@ def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
 
 def test_gdn_attaches_only_static_fp8_scale():
     from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod
-    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
     from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
 
     layer = Qwen3NextGatedDeltaNet.__new__(Qwen3NextGatedDeltaNet)

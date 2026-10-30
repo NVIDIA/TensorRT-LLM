@@ -29,6 +29,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_kv_balanced_admission"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.enable_kv_cache_aware_routing"
     },
     {
@@ -309,6 +314,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.num_prefetch_experts"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_slots"
     },
     {
       "capture_policy": "bool",
@@ -1839,11 +1849,6 @@
       "capture_policy": "literal|none",
       "kind": "categorical",
       "path": "speculative_config.moe_backend"
-    },
-    {
-      "capture_policy": "int|none",
-      "kind": "value",
-      "path": "speculative_config.num_eagle_layers"
     },
     {
       "capture_policy": "int|none",

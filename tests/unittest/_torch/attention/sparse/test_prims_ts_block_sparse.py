@@ -36,6 +36,7 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseRuntimeParams,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention.kernels.sage_quant import SageQuantized
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -122,6 +123,8 @@ def _proxy_reference(
 
 
 class _Attention:
+    out_head_size = TrtllmAttention.out_head_size
+
     def __init__(self) -> None:
         self.sparse_params = None
         self.num_heads = 2

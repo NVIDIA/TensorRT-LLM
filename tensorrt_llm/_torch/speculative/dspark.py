@@ -236,9 +236,9 @@ class DSparkSpecMetadata(SpecMetadata):
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
-                    worker._ctx_len[slot] = 0
-                    worker._valid_len[slot] = 0
-                    worker._position_initialized[slot] = False
+                    worker._ctx_len[slot].zero_()
+                    worker._valid_len[slot].zero_()
+                    worker._position_initialized[slot].zero_()
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
             # Assign a persistent rolling-window slot to every real generation
@@ -249,8 +249,8 @@ class DSparkSpecMetadata(SpecMetadata):
             # without this, all concurrent gen requests fall through to the shared
             # scratch row below and corrupt each other's draft window at batch
             # size > 1 (GitHub #16767). Context-prefix entries are left to
-            # ``_seed_context_windows``. CUDA-graph capture dummies and real
-            # generation requests acquire a persistent slot only once; prepare()
+            # ``_seed_context_windows``. Real generation requests acquire a
+            # persistent slot only once; prepare()
             # runs before every replay, so it must never reset a live slot.
             # ADP-idle (id 0) and high-ID CUDA-graph padding dummies use scratch.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
@@ -271,9 +271,9 @@ class DSparkSpecMetadata(SpecMetadata):
             # unconditional advance would leave its ABSOLUTE position climbing
             # across graph shapes and iterations until it indexes past the RoPE
             # table. A real slot is bounded instead by its request's lifetime.
-            worker._ctx_len[scratch] = 0
-            worker._valid_len[scratch] = 0
-            worker._position_initialized[scratch] = False
+            worker._ctx_len[scratch].zero_()
+            worker._valid_len[scratch].zero_()
+            worker._position_initialized[scratch].zero_()
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
@@ -562,8 +562,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._scratch_slot = max_batch
             num_rows = max_batch + 1
 
-            # CUDA-graph padding requests carry ids in
-            # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
+            # Both CUDA-graph padding variants, each with K+1 runtime widths,
+            # use ``[CUDA_GRAPH_DUMMY_REQUEST_ID - 2*(K+1) + 1,
+            # CUDA_GRAPH_DUMMY_REQUEST_ID]``, where K is the physical draft cap,
             # while real request ids start at ``max_batch_size`` and grow, so a simple
             # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
             # (0) these dummies must route to the scratch row (see ``prepare()``) and
@@ -571,7 +572,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
             from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 
-            self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+            self._graph_dummy_id_floor = (
+                CUDA_GRAPH_DUMMY_REQUEST_ID - 2 * (self.max_draft_len + 1) + 1
+            )
 
             self._kv_windows = torch.zeros(
                 (num_rows, num_stages, self._win, head_dim),
@@ -700,9 +703,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         """Get (or refresh) the slot for a request; reset clears its window."""
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
-            self._ctx_len[old] = 0
-            self._valid_len[old] = 0
-            self._position_initialized[old] = False
+            self._ctx_len[old].zero_()
+            self._valid_len[old].zero_()
+            self._position_initialized[old].zero_()
             self._kv_windows[old].zero_()
             self._free_slots.append(old)
         if req_id not in self._req_to_slot:
@@ -713,9 +716,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
-            self._ctx_len[slot] = 0
-            self._valid_len[slot] = 0
-            self._position_initialized[slot] = False
+            self._ctx_len[slot].zero_()
+            self._valid_len[slot].zero_()
+            self._position_initialized[slot].zero_()
             self._kv_windows[slot].zero_()
             if self._confidence_logits is not None:
                 # A recycled slot still holds the previous occupant's scores;

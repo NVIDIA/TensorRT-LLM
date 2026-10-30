@@ -4,6 +4,8 @@
 """Translate an OpenEngine GenerateRequest into TensorRT-LLM request inputs."""
 
 import asyncio
+import importlib
+import threading
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -13,7 +15,14 @@ from urllib.parse import urlparse
 import grpc
 
 from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.inputs.media_io import ImageMediaIO, MediaFetchError
+from tensorrt_llm.inputs.media_io import (
+    AudioMediaIO,
+    ImageMediaIO,
+    MediaFetchError,
+    VideoMediaIO,
+    _decoded_video_bytes,
+)
+from tensorrt_llm.inputs.multimodal_data import AudioData
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
@@ -25,11 +34,12 @@ from .errors import MediaUnavailableError, UnsupportedFeatureError
 # output index and a scan of every generated token, so an unbounded list lets a
 # single request tax the event loop for the whole stream.
 _MAX_STOP_CONDITIONS = 64
-# Bound per-request decode work and retained image data.
+# Bound per-request decode work and retained decoded media.
 _MAX_MEDIA_ITEMS = 64
 _MAX_CONCURRENT_MEDIA_LOADS = 8
-# Checked after each decode; concurrency bounds peak overshoot. Encoded inputs
-# have separate gRPC and remote-loader caps.
+# Images are charged after decoding. Video decoders reserve retained bytes and
+# counted peak buffers separately before allocating frames.
+# Encoded inputs have separate gRPC and remote-loader caps.
 _MAX_TOTAL_DECODED_MEDIA_BYTES = 512 * 1024 * 1024
 _CONVERSATION_ID_EXTRA_KEY = "conversation_id"
 _DETOKENIZE_EXTRA_KEY = "detokenize"
@@ -39,12 +49,123 @@ _MediaLoader = Callable[[generation_pb2.MediaItem, int], Awaitable[Any]]
 _MediaValidator = Callable[[generation_pb2.MediaItem, int], None]
 
 
+class _DecodedMediaReservation:
+    def __init__(self, budget: "_DecodedMediaBudget", peak_bytes: int, retained_bytes: int) -> None:
+        self._budget = budget
+        self._peak_bytes = peak_bytes
+        self._retained_bytes = retained_bytes
+        self._active = True
+
+    def check_cancelled(self) -> None:
+        with self._budget._condition:
+            if self._budget._cancelled:
+                raise ValueError("decoded media loading was cancelled")
+
+    def shrink(self, retained_bytes: int) -> None:
+        if not self._active or not 0 <= retained_bytes <= self._retained_bytes:
+            raise ValueError("invalid decoded-media reservation shrink")
+        self._budget._shrink(self._peak_bytes, self._retained_bytes, retained_bytes)
+        self._peak_bytes = self._retained_bytes = retained_bytes
+
+    def commit(self, retained_bytes: int) -> None:
+        if not self._active:
+            raise RuntimeError("decoded-media reservation is no longer active")
+        try:
+            self._budget._settle(self._peak_bytes, self._retained_bytes, retained_bytes)
+        finally:
+            self._active = False
+
+    def release(self) -> None:
+        if self._active:
+            self._budget._settle(self._peak_bytes, self._retained_bytes, 0)
+            self._active = False
+
+
+class _DecodedMediaBudget:
+    """Thread-safe shared budget for all decoded media in one request."""
+
+    def __init__(self, limit: int, peak_limit: int | None = None) -> None:
+        self._limit = limit
+        # Conversion buffers have a separate allowance from retained output.
+        self._peak_limit = peak_limit if peak_limit is not None else 2 * limit
+        self._retained = 0
+        self._reserved_retained = 0
+        self._used = 0
+        self._condition = threading.Condition()
+        self._cancelled = False
+
+    def _limit_error(self) -> ValueError:
+        return ValueError(f"decoded media exceeds the per-request limit of {self._limit} bytes")
+
+    def charge(self, retained_bytes: int) -> None:
+        if retained_bytes < 0:
+            raise ValueError("decoded media size cannot be negative")
+        with self._condition:
+            if self._retained + self._reserved_retained + retained_bytes > self._limit:
+                raise self._limit_error()
+            self._retained += retained_bytes
+            self._used += retained_bytes
+
+    def reserve(self, peak_bytes: int, retained_bytes: int) -> _DecodedMediaReservation:
+        if not 0 <= retained_bytes <= peak_bytes:
+            raise ValueError("decoded media sizes must satisfy 0 <= retained <= peak")
+        with self._condition:
+            while True:
+                if self._cancelled:
+                    raise ValueError("decoded media loading was cancelled")
+                if self._retained + self._reserved_retained + retained_bytes > self._limit:
+                    raise self._limit_error()
+                if self._retained + peak_bytes > self._peak_limit:
+                    raise ValueError(
+                        f"decoded media exceeds the peak buffer limit of {self._peak_limit} bytes"
+                    )
+                if self._used + peak_bytes <= self._peak_limit:
+                    break
+                self._condition.wait()
+            self._used += peak_bytes
+            self._reserved_retained += retained_bytes
+        return _DecodedMediaReservation(self, peak_bytes, retained_bytes)
+
+    def _shrink(self, peak_bytes: int, reserved_retained: int, retained_bytes: int) -> None:
+        with self._condition:
+            self._used -= peak_bytes - retained_bytes
+            self._reserved_retained -= reserved_retained - retained_bytes
+            self._condition.notify_all()
+
+    def _settle(self, peak_bytes: int, reserved_retained: int, retained_bytes: int) -> None:
+        with self._condition:
+            self._used -= peak_bytes
+            self._reserved_retained -= reserved_retained
+            try:
+                if retained_bytes < 0:
+                    raise ValueError("decoded media size cannot be negative")
+                if self._retained + self._reserved_retained + retained_bytes > self._limit:
+                    raise self._limit_error()
+                if self._used + retained_bytes > self._peak_limit:
+                    raise self._limit_error()
+                self._used += retained_bytes
+                self._retained += retained_bytes
+            finally:
+                self._condition.notify_all()
+
+    def cancel(self) -> None:
+        with self._condition:
+            self._cancelled = True
+            self._condition.notify_all()
+
+
+def _always_available() -> bool:
+    return True
+
+
 @dataclass(frozen=True)
 class _MediaHandler:
     name: str
     validate: _MediaValidator
-    loader_factory: Callable[[Any], _MediaLoader]
+    loader_factory: Callable[[Any, _DecodedMediaBudget], _MediaLoader]
     decoded_bytes: Callable[[Any], int]
+    runtime_available: Callable[[], bool] = _always_available
+    reserves_decoded_bytes: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +182,12 @@ def conversation_affinity_enabled(llm: Any) -> bool:
     return getattr(args, "enable_attention_dp", False) is True and (
         getattr(config, "kv_cache_routing_conversation_affinity", False) is True
     )
+
+
+def token_ids_input_supported(llm: Any) -> bool:
+    """Whether the loaded input processor consumes pre-tokenized prompts."""
+    input_processor = getattr(llm, "input_processor", None)
+    return getattr(input_processor, "supports_token_ids_input", True) is not False
 
 
 def _top_n_candidates(selection: Any, name: str) -> int:
@@ -276,26 +403,35 @@ def _metadata_from_context(
 
 
 def _base_input_from_request(
-    request: generation_pb2.GenerateRequest,
+    request: generation_pb2.GenerateRequest, llm: Any
 ) -> str | dict[str, list[int]]:
     input_kind = request.WhichOneof("input")
     if input_kind == "prompt":
         return request.prompt
     if input_kind == "token_ids":
+        if not token_ids_input_supported(llm):
+            raise UnsupportedFeatureError(
+                "token-ID input is not supported by the loaded model; send a text prompt"
+            )
         return {"prompt_token_ids": request.token_ids.ids[:]}
     raise ValueError("exactly one of prompt or token_ids must be set")
 
 
-def _image_io_for_model(llm: Any) -> ImageMediaIO:
+def _media_io_for_model(
+    llm: Any,
+    modality: str,
+    media_io_type: type[Any],
+    runtime_kwargs: dict[str, Any] | None = None,
+) -> Any:
     input_processor = getattr(llm, "input_processor", None)
     defaults = None
     if isinstance(input_processor, BaseMultimodalInputProcessor):
         preferences = input_processor.get_preferred_media_io_kwargs() or {}
-        defaults = preferences.get("image")
-    return ImageMediaIO.create(defaults, None)
+        defaults = preferences.get(modality)
+    return media_io_type.create(defaults, runtime_kwargs)
 
 
-def _validate_image_item(item: generation_pb2.MediaItem, index: int) -> None:
+def _validate_media_item(item: generation_pb2.MediaItem, index: int, modality: str) -> None:
     source = item.WhichOneof("source")
     if source is None:
         raise ValueError(f"media[{index}] must set exactly one source")
@@ -320,28 +456,42 @@ def _validate_image_item(item: generation_pb2.MediaItem, index: int) -> None:
         media_type, _, encoding = data_spec.partition(";")
         if encoding != "base64":
             raise ValueError(f"media[{index}].data_uri must use base64 encoding")
-        if media_type and not media_type.lower().startswith("image/"):
-            raise ValueError(f"media[{index}].data_uri must declare an image type")
+        if media_type and not media_type.lower().startswith(f"{modality}/"):
+            raise ValueError(f"media[{index}].data_uri must declare an {modality} type")
     elif source == "raw_bytes":
-        if item.mime_type and not item.mime_type.lower().startswith("image/"):
-            raise ValueError(f"media[{index}].mime_type must be an image type for raw image bytes")
+        if item.mime_type and not item.mime_type.lower().startswith(f"{modality}/"):
+            raise ValueError(
+                f"media[{index}].mime_type must start with {modality}/ for raw {modality} bytes"
+            )
     else:
         raise ValueError(f"media[{index}] has an unknown source '{source}'")
 
 
-async def _load_image_item(
-    item: generation_pb2.MediaItem, image_io: ImageMediaIO, index: int
+def _validate_image_item(item: generation_pb2.MediaItem, index: int) -> None:
+    _validate_media_item(item, index, "image")
+
+
+def _validate_audio_item(item: generation_pb2.MediaItem, index: int) -> None:
+    _validate_media_item(item, index, "audio")
+
+
+def _validate_video_item(item: generation_pb2.MediaItem, index: int) -> None:
+    _validate_media_item(item, index, "video")
+
+
+async def _load_media_item(
+    item: generation_pb2.MediaItem, media_io: Any, index: int, modality: str
 ) -> Any:
     source = item.WhichOneof("source")
     if source == "raw_bytes":
         try:
-            return await image_io.async_load_bytes(bytes(item.raw_bytes))
+            return await media_io.async_load_bytes(bytes(item.raw_bytes))
         except Exception as error:
             raise ValueError(f"media[{index}].raw_bytes could not be decoded: {error}") from error
 
     value = item.url if source == "url" else item.data_uri
     try:
-        return await image_io.async_load(value)
+        return await media_io.async_load(value)
     except MediaFetchError as error:
         raise MediaUnavailableError(
             f"media[{index}].{source} is temporarily unavailable: {error}"
@@ -350,11 +500,36 @@ async def _load_image_item(
         raise ValueError(f"media[{index}].{source} could not be loaded: {error}") from error
 
 
-def _image_loader_factory(llm: Any) -> _MediaLoader:
-    image_io = _image_io_for_model(llm)
+def _image_loader_factory(llm: Any, _budget: _DecodedMediaBudget) -> _MediaLoader:
+    image_io = _media_io_for_model(llm, "image", ImageMediaIO)
 
     async def load(item: generation_pb2.MediaItem, index: int) -> Any:
-        return await _load_image_item(item, image_io, index)
+        return await _load_media_item(item, image_io, index, "image")
+
+    return load
+
+
+def _video_loader_factory(llm: Any, budget: _DecodedMediaBudget) -> _MediaLoader:
+    video_io = _media_io_for_model(
+        llm,
+        "video",
+        VideoMediaIO,
+        {"decoded_memory_reserver": budget.reserve},
+    )
+
+    async def load(item: generation_pb2.MediaItem, index: int) -> Any:
+        return await _load_media_item(item, video_io, index, "video")
+
+    return load
+
+
+def _audio_loader_factory(llm: Any, budget: _DecodedMediaBudget) -> _MediaLoader:
+    audio_io = _media_io_for_model(
+        llm, "audio", AudioMediaIO, {"decoded_memory_reserver": budget.reserve}
+    )
+
+    async def load(item: generation_pb2.MediaItem, index: int) -> Any:
+        return await _load_media_item(item, audio_io, index, "audio")
 
     return load
 
@@ -373,15 +548,58 @@ def _decoded_image_bytes(image: Any) -> int:
     raise TypeError(f"unsupported decoded image type: {type(image).__name__}")
 
 
+def _decoded_audio_data_bytes(audio: AudioData) -> int:
+    import numpy as np
+    import torch
+
+    if isinstance(audio.samples, torch.Tensor):
+        return audio.samples.numel() * audio.samples.element_size()
+    if isinstance(audio.samples, np.ndarray):
+        return audio.samples.nbytes
+    raise TypeError(f"unsupported decoded audio type: {type(audio.samples).__name__}")
+
+
+def _decoded_audio_bytes(audio: Any) -> int:
+    if not isinstance(audio, tuple) or len(audio) != 2:
+        raise TypeError(f"unsupported decoded audio type: {type(audio).__name__}")
+    return _decoded_audio_data_bytes(AudioData(samples=audio[0], sample_rate=audio[1]))
+
+
+def _video_runtime_available() -> bool:
+    try:
+        importlib.import_module("cv2")
+    except (ImportError, OSError):
+        return False
+    return True
+
+
 _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
     generation_pb2.MODALITY_IMAGE: _MediaHandler(
         "image", _validate_image_item, _image_loader_factory, _decoded_image_bytes
+    ),
+    generation_pb2.MODALITY_VIDEO: _MediaHandler(
+        "video",
+        _validate_video_item,
+        _video_loader_factory,
+        _decoded_video_bytes,
+        _video_runtime_available,
+        reserves_decoded_bytes=True,
+    ),
+    generation_pb2.MODALITY_AUDIO: _MediaHandler(
+        "audio",
+        _validate_audio_item,
+        _audio_loader_factory,
+        _decoded_audio_bytes,
+        reserves_decoded_bytes=True,
     ),
 }
 
 
 def media_capabilities_for_model(llm: Any) -> MediaCapabilities:
-    return resolve_media_capabilities(llm, {handler.name for handler in _MEDIA_HANDLERS.values()})
+    return resolve_media_capabilities(
+        llm,
+        {handler.name for handler in _MEDIA_HANDLERS.values() if handler.runtime_available()},
+    )
 
 
 def _modality_name(modality: int) -> str:
@@ -397,7 +615,7 @@ def _prepare_input_from_request(
     media_capabilities: MediaCapabilities | None = None,
 ) -> _PreparedInput:
     """Validate request media without starting any fetch or decode work."""
-    inputs = _base_input_from_request(request)
+    inputs = _base_input_from_request(request, llm)
     if not request.media:
         return _PreparedInput(inputs, (), None)
 
@@ -463,6 +681,8 @@ def _validate_media_placeholders(prepared: _PreparedInput, llm: Any) -> None:
     if not prepared.media or prepared.capabilities is None:
         return
     processor = llm.input_processor
+    if not isinstance(processor, BaseMultimodalInputProcessor):
+        return
     if not processor.requires_input_placeholders(tokenized=not isinstance(prepared.inputs, str)):
         return
     tokenizer = llm.tokenizer
@@ -515,25 +735,20 @@ async def _load_prepared_input(prepared: _PreparedInput, llm: Any) -> str | dict
     if capabilities is None:
         raise RuntimeError("media input plan is missing capabilities")
 
+    budget = _DecodedMediaBudget(_MAX_TOTAL_DECODED_MEDIA_BYTES)
     loaders: dict[str, _MediaLoader] = {}
     for _, handler in prepared.media:
         if handler.name not in loaders:
-            loaders[handler.name] = handler.loader_factory(llm)
+            loaders[handler.name] = handler.loader_factory(llm, budget)
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEDIA_LOADS)
-    decoded_bytes = 0
 
     async def load_bounded(
         item: generation_pb2.MediaItem, index: int, handler: _MediaHandler
     ) -> Any:
-        nonlocal decoded_bytes
         async with semaphore:
             decoded = await loaders[handler.name](item, index)
-            decoded_bytes += handler.decoded_bytes(decoded)
-            if decoded_bytes > _MAX_TOTAL_DECODED_MEDIA_BYTES:
-                raise ValueError(
-                    "decoded media exceeds the per-request limit of "
-                    f"{_MAX_TOTAL_DECODED_MEDIA_BYTES} bytes"
-                )
+            if not handler.reserves_decoded_bytes:
+                budget.charge(handler.decoded_bytes(decoded))
             return decoded
 
     tasks = [
@@ -544,6 +759,7 @@ async def _load_prepared_input(prepared: _PreparedInput, llm: Any) -> str | dict
         decoded_media = await asyncio.gather(*tasks)
     except (Exception, asyncio.CancelledError):
         # gather leaves siblings running after the first failure.
+        budget.cancel()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -587,4 +803,5 @@ async def _input_from_request(
 __all__ = [
     "conversation_params_from_request",
     "sampling_params_from_request",
+    "token_ids_input_supported",
 ]
