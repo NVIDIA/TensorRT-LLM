@@ -2351,7 +2351,7 @@ class KvCacheCreator:
 
     def _kv_cache_manager_hosts_draft_layers(self) -> bool:
         """Whether the target's specialized manager accepts explicit draft layer specs."""
-        manager_cls = self._kv_cache_manager_cls
+        manager_cls = getattr(self, "_kv_cache_manager_cls", None)
         return (isinstance(manager_cls, type)
                 and issubclass(manager_cls, KVCacheManagerV2)
                 and manager_cls.hosts_unified_draft_layers)
