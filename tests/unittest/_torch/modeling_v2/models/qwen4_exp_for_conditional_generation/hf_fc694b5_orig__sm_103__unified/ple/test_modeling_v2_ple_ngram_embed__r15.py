@@ -31,6 +31,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditio
     CKPT_SCALE,
     CKPT_TABLE_ROWS,
     ENGINE_SLOTS,
+    TEP4_SLOTS,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ple.ple_ngram_embed__r15 import (  # noqa: E501
     ple_ngram_embed as op,
@@ -84,9 +85,10 @@ def _host_mapped(src: torch.Tensor) -> torch.Tensor:
 
 
 def _scattered(n: int, pool_slots: int, g) -> list:
-    """`n` distinct slots over the whole pool, both ends included."""
+    """`n` distinct slots over the whole pool, both ends included; a lone
+    sequence takes the last slot, the farthest row of the pool."""
     middle = (torch.randperm(pool_slots - 2, generator=g) + 1).tolist()
-    slots = ([0, pool_slots - 1] + middle)[:n]
+    slots = ([pool_slots - 1, 0] + middle)[:n]
     assert len(set(slots)) == n and max(slots) < pool_slots
     return slots
 
@@ -189,8 +191,22 @@ def test_guard_refuses_short_query_start_loc() -> None:
         op(*args)
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    args = _build(dict(lengths=(1,) * 16, pool_slots=ENGINE_SLOTS, eos_density=0.1), seed=11)
+#: Captured decode shapes: tp1's, and this target's 128-request decode and MTP7
+#: verify (the packed-row form's two launches) at a tep4 rank's pool.
+GRAPH_SPECS = (
+    dict(lengths=(1,) * 16, pool_slots=ENGINE_SLOTS, eos_density=0.1),
+    dict(lengths=(1,) * 128, pool_slots=TEP4_SLOTS, table="host", eos_density=0.1),
+    dict(lengths=(8,) * 128, pool_slots=TEP4_SLOTS, table="host", eos_density=0.1),
+)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    GRAPH_SPECS,
+    ids=[f"{len(s['lengths'])}x{s['lengths'][0]}@{s['pool_slots']}" for s in GRAPH_SPECS],
+)
+def test_cuda_graph_capture_and_replay(spec) -> None:
+    args = _build(spec, seed=11)
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup):
@@ -199,7 +215,7 @@ def test_cuda_graph_capture_and_replay() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_out = op(*args)
-    fresh = _build(dict(lengths=(1,) * 16, pool_slots=ENGINE_SLOTS, eos_density=0.1), seed=12)
+    fresh = _build(spec, seed=12)
     args[0].copy_(fresh[0])
     pool_before = args[1].clone()
     want, want_pool = op.reference(*args)
