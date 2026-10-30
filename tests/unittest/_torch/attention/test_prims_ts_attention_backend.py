@@ -33,8 +33,14 @@ from backend_case import (
 from utils.util import getSMVersion
 
 pytestmark = pytest.mark.skipif(
+    getSMVersion() not in (100, 103, 107),
+    reason="PrimsTS attention kernels require SM100, SM103, or SM107",
+)
+
+
+_REQUIRES_BLACKWELL_MLA = pytest.mark.skipif(
     getSMVersion() not in (100, 103),
-    reason="PrimsTS attention kernels require SM100 or SM103",
+    reason="MLA PrimsTS integration requires SM100 or SM103",
 )
 
 
@@ -108,16 +114,18 @@ _DEEPSEEK_V3_LITE_MLA = {
         ),
     ],
 )
-@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["bf16-kv", "fp8-kv"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["native-kv", "fp8-kv"])
 def test_prims_ts_qwen2_gqa(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
     phase_args: dict,
     kv_dtype: str | None,
+    dtype: str,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
     case = BackendCase(
-        **_QWEN2_7B,
+        **{**_QWEN2_7B, "dtype": dtype},
         **phase_args,
         kv_dtype=kv_dtype,
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
@@ -377,6 +385,7 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_deepseek_v3_lite_mla_generation(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
@@ -395,6 +404,7 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
 
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_fp8_mla_preprocessing(
     monkeypatch: pytest.MonkeyPatch, num_heads: int, use_kv_cache_manager_v2: bool
 ) -> None:
@@ -461,6 +471,7 @@ def test_prims_ts_fp8_mla_preprocessing(
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("batch_size", [2, 65])
 @pytest.mark.parametrize("max_seq_len", [64, 128], ids=["short-kv", "regular-kv"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_fp8_mla_scales_and_graph_replay(
     monkeypatch: pytest.MonkeyPatch, num_heads: int, batch_size: int, max_seq_len: int
 ) -> None:
@@ -876,6 +887,7 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
 
 
 @pytest.mark.parametrize("max_seq_len", [64, 1024], ids=["short-kv", "regular-kv"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchMLADecodePagedTSWrapper,

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TRT-LLM FMHA adapter for the vendored PrimTS Blackwell kernels."""
+"""TRT-LLM FMHA adapter for the vendored PrimTS kernels."""
 
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ if TYPE_CHECKING:
 
 
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
+_MIN_RUBIN_CUTLASS_DSL_VERSION = Version("4.8.0")
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
 
@@ -157,7 +158,7 @@ def get_attention_feature_unsupported_reason(
 
 
 class PrimsTSFmha(PhasedFmha):
-    """Blackwell task-scheduled paged context and decode FMHA library.
+    """Task-scheduled paged context and decode FMHA library.
 
     Standard FP8 KV cache uses fused preprocessing to quantize Q with the
     shared Q/K/V scale. Kernels consume FP8 Q/K/V and write the model's FP16
@@ -166,7 +167,7 @@ class PrimsTSFmha(PhasedFmha):
 
     supports_per_tensor_fp8 = True
 
-    SUPPORTED_SMS = frozenset({100, 103})
+    SUPPORTED_SMS = frozenset({100, 103, 107})
     SUPPORTED_PAGE_SIZES = {16, 32, 64, 128}
     SUPPORTED_CONTEXT_HEAD_DIMS = {128, 256}
     SUPPORTED_DECODE_HEAD_DIMS = {64, 128, 256}
@@ -201,17 +202,25 @@ class PrimsTSFmha(PhasedFmha):
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         sm = get_sm_version()
         if sm not in cls.SUPPORTED_SMS:
-            logger.debug(f"PrimTS FMHA is unavailable: requires SM100 or SM103, got SM{sm}.")
+            logger.debug(
+                f"PrimTS FMHA is unavailable: requires SM100, SM103, or SM107, got SM{sm}."
+            )
             return False
+        if sm == 107 and attn.is_mla_enable:
+            logger.debug("PrimTS MLA FMHA is unavailable on SM107.")
+            return False
+        min_dsl_version = _MIN_RUBIN_CUTLASS_DSL_VERSION if sm == 107 else _MIN_CUTLASS_DSL_VERSION
         try:
             installed_version = Version(version("nvidia-cutlass-dsl"))
         except (PackageNotFoundError, InvalidVersion):
-            logger.debug("PrimTS FMHA is unavailable: nvidia-cutlass-dsl>=4.7 is required.")
+            logger.debug(
+                f"PrimTS FMHA is unavailable: nvidia-cutlass-dsl>={min_dsl_version} is required."
+            )
             return False
-        if installed_version < _MIN_CUTLASS_DSL_VERSION:
+        if installed_version < min_dsl_version:
             logger.debug(
                 "PrimTS FMHA is unavailable: "
-                f"nvidia-cutlass-dsl>={_MIN_CUTLASS_DSL_VERSION} is required, "
+                f"nvidia-cutlass-dsl>={min_dsl_version} is required, "
                 f"got {installed_version}."
             )
             return False

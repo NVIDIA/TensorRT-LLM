@@ -722,15 +722,19 @@ def test_unsupported_matrix_falls_through(case: dict, expected_reason: str) -> N
 
 
 @pytest.mark.parametrize(
-    ("sm", "cutlass_version", "compiler_version", "expected"),
+    ("sm", "cutlass_version", "compiler_version", "is_mla", "expected"),
     [
-        (100, "4.7.0", "13.3", True),
-        (103, "4.7.0", "13.3", True),
-        (100, "4.7.0", "13.4", True),
-        (100, "4.7.0", "13.2", False),
-        (107, "4.7.0", "13.3", False),
-        (120, "4.7.0", "13.3", False),
-        (100, "4.6.2", "13.3", False),
+        (100, "4.7.0", "13.3", False, True),
+        (103, "4.7.0", "13.3", False, True),
+        (100, "4.7.0", "13.4", False, True),
+        (100, "4.7.0", "13.2", False, False),
+        (107, "4.7.0", "13.3", False, False),
+        (107, "4.8.0", "13.3", False, True),
+        (107, "4.8.0", "13.2", False, False),
+        (107, "4.8.0", "13.3", True, False),
+        (100, "4.7.0", "13.3", True, True),
+        (120, "4.7.0", "13.3", False, False),
+        (100, "4.6.2", "13.3", False, False),
     ],
 )
 def test_static_availability_gate(
@@ -738,6 +742,7 @@ def test_static_availability_gate(
     sm: int,
     cutlass_version: str,
     compiler_version: str,
+    is_mla: bool,
     expected: bool,
 ) -> None:
     target_version = Mock(
@@ -756,8 +761,10 @@ def test_static_availability_gate(
     monkeypatch.setattr(prims_ts_module, "import_module", import_cutlass_module)
     monkeypatch.setattr(PrimsTSFmha, "_missing_fused_nanobind_ops", staticmethod(lambda: []))
 
-    assert PrimsTSFmha.is_available(_Attention()) is expected
-    if sm in (100, 103) and Version(cutlass_version) >= Version("4.7.0"):
+    assert PrimsTSFmha.is_available(_Attention(is_mla=is_mla)) is expected
+    if (sm in (100, 103) and Version(cutlass_version) >= Version("4.7.0")) or (
+        sm == 107 and not is_mla and Version(cutlass_version) >= Version("4.8.0")
+    ):
         target_version.assert_called_once_with(min_version="13.3")
     else:
         target_version.assert_not_called()
