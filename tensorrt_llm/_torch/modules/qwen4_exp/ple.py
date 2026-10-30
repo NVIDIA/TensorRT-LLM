@@ -930,7 +930,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             torch.zeros_like(lookup_ids),
         )
         partial = F.embedding(local_ids, self.ngram_embedding.weight)
-        partial.masked_fill_(~owned.unsqueeze(-1), 0)
+        # FP8 rows stay quantized until _finish_embedding_lookup, and FP8 has no
+        # masked_fill_ kernel. An all-zero byte is +0.0 in both FP8 formats, so
+        # clearing the raw bytes matches masking after dequantization.
+        if partial.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            partial.view(torch.uint8).masked_fill_(~owned.unsqueeze(-1), 0)
+        else:
+            partial.masked_fill_(~owned.unsqueeze(-1), 0)
         return self._finish_embedding_lookup(
             partial,
             semantic_tokens,

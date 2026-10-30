@@ -6016,11 +6016,13 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             enable_block_reuse: bool = False,
             sparse_attention_config: Optional[QSASparseAttentionConfig] = None,
             acceptance_length_key: Optional[str] = None,
-            kv_cache_dtype: str = "auto") -> None:
+            kv_cache_dtype: str = "auto",
+            ple_host_offload: bool = True) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
-        monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
+        monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD",
+                           "1" if ple_host_offload else "0")
 
         # A case opts into the acceptance-length guard by naming its own entry
         # in references/acceptance_length.yaml.
@@ -6116,29 +6118,32 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(70000)
-    @pytest.mark.skip_less_host_memory(131072)
-    def test_nvfp4_adp4_mtp3_trtllm_ple_offload(self,
-                                                monkeypatch: pytest.MonkeyPatch,
-                                                mocker) -> None:
-        """NVFP4 on four GPUs with attention DP, MTP3 and PLE offload.
+    def test_nvfp4_adp4_mtp3_trtllm(self, monkeypatch: pytest.MonkeyPatch,
+                                    mocker) -> None:
+        """NVFP4 on four GPUs with attention DP, MTP3 and the PLE table on GPU.
 
         Blackwell-only, so the GVR Top-K prerequisites hold. This is the case
         that keeps both indexer options under accuracy guard: the heuristic
         Top-K, and the draft loop reusing one selection.
+
+        The checkpoint stores the PLE n-gram table as scaled FP8. Under
+        attention DP each rank owns a row slice of it and masks the rows it
+        does not own before the reduce-scatter, while the rows are still FP8.
         """
-        self._run_evals(
-            f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
-            tensor_parallel_size=4,
-            moe_backend="TRTLLM",
-            max_draft_len=3,
-            expected_quant_algo=QuantAlgo.MIXED_PRECISION,
-            monkeypatch=monkeypatch,
-            mocker=mocker,
-            moe_expert_parallel_size=4,
-            enable_attention_dp=True,
-            sparse_attention_config=QSASparseAttentionConfig(
-                enable_heuristic_topk=True, index_share_for_mtp_iteration=True),
-            acceptance_length_key="test_nvfp4_adp4_mtp3_trtllm_ple_offload")
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True,
+                        sparse_attention_config=QSASparseAttentionConfig(
+                            enable_heuristic_topk=True,
+                            index_share_for_mtp_iteration=True),
+                        acceptance_length_key="test_nvfp4_adp4_mtp3_trtllm",
+                        ple_host_offload=False)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)

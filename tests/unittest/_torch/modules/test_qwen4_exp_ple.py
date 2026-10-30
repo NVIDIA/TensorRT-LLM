@@ -765,3 +765,73 @@ def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> 
     )
 
     torch.testing.assert_close(output, full_weight[local_ids])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FP8 masking is checked on CUDA")
+def test_ple_attention_dp_row_shard_masks_fp8_table(monkeypatch) -> None:
+    from tensorrt_llm._torch.modules.qwen4_exp import ple as qwen4_exp_ple
+
+    config = _make_config()
+    mapping = SimpleNamespace(tp_size=2, tp_rank=0, cp_size=1, enable_attention_dp=True)
+    module = Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim=32,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+    )
+    module.configure_fp8_weight_storage(torch.tensor(0.5), torch.float8_e4m3fn)
+    module = module.cuda()
+    # Small integers are exact in e4m3, so the dequantized rows are exact too.
+    full_weight = (
+        torch.arange(
+            module.padded_vocab_size * module.head_dim_per_ngram,
+            dtype=torch.float32,
+            device="cuda",
+        ).remainder(15)
+        - 7
+    ).reshape(module.padded_vocab_size, module.head_dim_per_ngram)
+    with torch.no_grad():
+        module.ngram_embedding.weight.copy_(
+            full_weight[module.vocab_start_index : module.vocab_end_index].to(torch.float8_e4m3fn)
+        )
+
+    local_ids = torch.tensor(
+        [
+            [1, module.vocab_end_index + 1] * (NGRAM_HEADS // 2),
+            [module.vocab_end_index - 1, module.padded_vocab_size - 1] * (NGRAM_HEADS // 2),
+        ],
+        dtype=torch.long,
+        device="cuda",
+    )
+    remote_ids = torch.tensor(
+        [[module.vocab_end_index + 3, 7] * (NGRAM_HEADS // 2)],
+        dtype=torch.long,
+        device="cuda",
+    )
+    gathered_ids = torch.cat((local_ids, torch.zeros_like(local_ids[:1]), remote_ids))
+    owned = gathered_ids < module.vocab_end_index
+    expected_partial = torch.zeros(
+        (*gathered_ids.shape, module.head_dim_per_ngram),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected_partial[owned] = (full_weight[gathered_ids[owned]] * 0.5).to(torch.bfloat16)
+
+    def fake_allgather(input_ids, actual_mapping, dim, sizes):
+        return gathered_ids
+
+    def fake_reducescatter(partial, actual_mapping, dim, sizes):
+        assert partial.dtype == torch.bfloat16
+        torch.testing.assert_close(partial, expected_partial, rtol=0, atol=0)
+        return partial[:3]
+
+    monkeypatch.setattr(qwen4_exp_ple, "allgather", fake_allgather)
+    monkeypatch.setattr(qwen4_exp_ple, "reducescatter", fake_reducescatter)
+
+    output = module.embed(
+        local_ids,
+        physical_tokens=3,
+        all_rank_num_tokens=[3, 1],
+    )
+
+    torch.testing.assert_close(output, expected_partial[:2], rtol=0, atol=0)
