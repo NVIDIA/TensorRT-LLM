@@ -49,7 +49,7 @@ them before changing `batch.*`, `sparseCache.*` or the index conversion.
 - Prefer composition when it expresses ownership or containment. Use
   inheritance only for a real IS-A relationship or required virtual dispatch,
   such as `CommittedPage : Page` and `EventManager : EventSink`.
-- Preserve strongly typed indices. `LayerGroupId` is a public lifecycle
+- Preserve strongly typed indices. `CacheGroupId` (and legacy `LayerGroupId`) is a public lifecycle
   semantic, `PoolGroupIndex` is a storage-layout index, `BlockOrdinal` is a
   sequence position, and `SlotId`/page indices address storage. Do not convert
   or compare them implicitly.
@@ -93,9 +93,41 @@ must eventually be `close()`d. Its normal flow is:
    for later requests; `stopCommitting()` finalizes this process.
 5. Suspend or close the request, returning pages to holding/eviction ownership.
 
-`LifeCycleRegistry` maps model layers to lifecycle groups. Attention lifecycles
+`LifeCycleRegistry` maps layer buffers to lifecycle groups. Attention lifecycles
 may have sliding-window and sink-token rules; SSM lifecycles represent a
-recurrent-state checkpoint. A pool-group index is a storage-layout index and is
+recurrent-state checkpoint. Both layer configs expose `reusePolicy`: `REQUIRED`
+constrains the prefix match, `OPTIONAL` offers state at the required endpoint for
+explicit selection on first resume, and `PRIVATE` never publishes reusable pages.
+A buffer may override its layer's default through `BufferConfig::reusePolicy`.
+This applies to attention and SSM buffers, so one model layer may span several
+lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
+(`get_buffer_group_id` and `buffer_grouping` in Python) for exact membership.
+These APIs return or index by `CacheGroupId`, a public alias of `LifeCycleId`.
+`LayerGroupId` remains a lifecycle alias for legacy APIs.
+The legacy `getLayerGroupId(layerId)` and `layerGrouping()` are deprecated in
+documentation only: uniform layers retain their results, while a split layer
+fails a `TLLM_CHECK_WITH_INFO` (for the queried layer or the entire partition,
+respectively), exposed as `RuntimeError` in Python. No deprecation warnings are emitted.
+
+Page conversion reads `BufferAttr::scratchPagesPerBlock`, counting only the
+layer's buffers in that coalesced slot. Scratch capacity uses the maximum exact
+layer share across pools within each lifecycle. Layer counts are temporary
+layout calculations, not persistent `(layer, lifecycle)` attributes.
+
+Execution backends that share a page or state index across coupled buffers must
+validate that they use the same policy; independent policies require independent
+index tables. In particular, the default attention view couples K/V and scales,
+and Mamba kernels couple recurrent, convolution, PLE, and replay state. Native
+KVCM supports independent policies for callers that provide those indices.
+The sparse fetch path configured by `sparseCache` still uses one group per layer;
+its setup uses the checked layer lookup and rejects split layers.
+
+SSM lifecycles are deduplicated by policy, so a manager can have up to three SSM
+groups; iterate `ssmLifeCycleIds()` for working state and use
+`requiredSsmLifeCycleId()` only for prefix pruning.
+Optional SSM checkpoints require an exact endpoint match, including partial
+blocks. Fresh or unselected recurrent state must be initialized or reconstructed
+by the caller before inference. A pool-group index is a storage-layout index and is
 not interchangeable with a layer ID or lifecycle ID.
 
 Sparsity is a property of a pool, not of a lifecycle: a layer's buffers may be

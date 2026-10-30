@@ -585,9 +585,9 @@ def _attention_case(*, tokens_per_block=128, fetched_page_scale=1, fp8=False):
 
 
 def _consume(case, backend):
-    backend._prepare_sparse_forward_args(case.metadata, case.args)
+    forward_args = backend._prepare_sparse_forward_args(case.metadata, case.args)
     return prepare_sparse_runtime_params(
-        backend, case.pool[:4], None, None, case.metadata, case.args
+        backend, case.pool[:4], None, None, case.metadata, forward_args
     )
 
 
