@@ -195,7 +195,7 @@ class PeerRegistrar:
             peer_ri.page_table,
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
-        self._validate_view_head_geometry(peer_ri)
+        self.validate_view_head_geometry(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -211,8 +211,8 @@ class PeerRegistrar:
 
         return True
 
-    def _validate_view_head_geometry(self, peer_ri: RankInfo) -> None:
-        """Check that every matched head-sharded view pair can be resharded.
+    def validate_view_head_geometry(self, peer_ri: RankInfo) -> None:
+        """Validate pool pairing and head geometry without registering the peer.
 
         Views carry their own KV-head count. A view without one (tables from
         older builders) falls back to the rank-wide count, which describes it

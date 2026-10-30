@@ -4220,20 +4220,19 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return frozenset()
 
-    def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole):
-        """Keep target and draft layers in separate transfer views.
+    def get_disagg_pool_view_partition(
+        self, layer_id: LayerId, role: DataRole
+    ) -> tuple[str, int] | None:
+        """Keep different owners and KV-head counts in separate transfer views.
 
-        Target and draft layers may share a physical pool, but each model has
-        its own head geometry, so the transfer layout must keep them apart
-        whatever the storage coalescing does. Managers without draft-owned
-        layers need no partition.
+        Layers may share a physical pool when their buffers have equal byte
+        sizes, even if their head counts differ within the same model.
         """
         layer_specs = getattr(self, "layer_specs", None)
-        if layer_specs is None or not any(
-            layer.owner is KVCacheLayerOwner.DRAFT for layer in layer_specs
-        ):
+        if layer_specs is None:
             return None
-        return layer_specs[int(layer_id)].owner.value
+        layer = layer_specs[int(layer_id)]
+        return layer.owner.value, layer.num_kv_heads
 
     def get_layer_cache_spec(self, global_layer_id: int) -> KVCacheLayerSpec:
         """Return an explicitly supplied rank-local layer specification."""

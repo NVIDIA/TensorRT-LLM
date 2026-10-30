@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import numpy as np
 import pytest
 
@@ -537,6 +540,163 @@ def test_per_view_missing_heads_rejects_incompatible_legacy_geometry():
     reg = _make_peer_registrar(self_ri)
     with pytest.raises(ValueError, match="both peers must publish per-view KV-head counts"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def _make_receiver_for_view_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    registrar: PeerRegistrar,
+    sender_infos: dict[str, RankInfo],
+    enforce_physical_ownership: bool,
+) -> tuple:
+    import tensorrt_llm._torch.disaggregation.native.transfer as transfer_module
+
+    messengers = {}
+
+    def make_messenger(*, mode: str, endpoint: str | None = None) -> Mock:
+        messenger = Mock()
+        messenger.endpoint = endpoint or "tcp://receiver"
+        if endpoint in sender_infos:
+            messenger.receive.return_value = [sender_infos[endpoint].to_bytes()]
+        messengers[endpoint] = messenger
+        return messenger
+
+    messenger_factory = Mock(side_effect=make_messenger)
+    monkeypatch.setattr(transfer_module, "ZMQMessenger", messenger_factory)
+    receiver = transfer_module.Receiver(
+        registrar,
+        Mock(),
+        bounce=Mock(),
+        enforce_physical_ownership=enforce_physical_ownership,
+    )
+    receiver._build_recv_req_info = Mock()
+    receiver._request_sender_data = Mock()
+    return receiver, messengers, messenger_factory
+
+
+@pytest.mark.parametrize("enforce_physical_ownership", [False, True])
+@pytest.mark.parametrize(
+    ("mismatch", "diagnostic"),
+    [
+        ("legacy_heads", "both peers must publish per-view KV-head counts"),
+        ("pool_roles", "has no peer view with the same roles"),
+    ],
+)
+def test_receiver_rejects_view_mismatch_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    enforce_physical_ownership: bool,
+    mismatch: str,
+    diagnostic: str,
+) -> None:
+    from tensorrt_llm._torch.disaggregation.base import TokenRange
+    from tensorrt_llm._torch.disaggregation.native.extent import Chunk
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        KVRecvTask,
+        MessageType,
+        PeerIncompatibleError,
+        TaskStatus,
+    )
+
+    local_ri, bad_ri, good_ri = [
+        make_rankinfo(
+            instance_name=name,
+            tp_size=1,
+            tokens_per_block=2,
+            dims_per_head=2,
+            page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+        )
+        for name in ("receiver", "bad-sender", "good-sender")
+    ]
+    bad_view = bad_ri.page_table.layer_groups[0].pool_views[1]
+    if mismatch == "legacy_heads":
+        bad_view.num_kv_heads = None
+    else:
+        bad_view.pool_role = frozenset({"other_kv"})
+    bad_ri.sender_endpoints = ["tcp://bad-sender"]
+    good_ri.sender_endpoints = ["tcp://good-sender"]
+    bad_endpoint = "tcp://bad-info"
+    good_endpoint = "tcp://good-info"
+    registrar = _make_peer_registrar(local_ri)
+    receiver, messengers, messenger_factory = _make_receiver_for_view_validation(
+        monkeypatch,
+        registrar,
+        {bad_endpoint: bad_ri, good_endpoint: good_ri},
+        enforce_physical_ownership,
+    )
+    chunk = Chunk(
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=0),
+        is_last=True,
+    )
+
+    try:
+        for rid in (1, 2):
+            params = SimpleNamespace(ctx_info_endpoint=bad_endpoint, ctx_dp_rank=0)
+            task = KVRecvTask(rid, chunk, slice_id=0, params=params, aux_slot=None)
+            if enforce_physical_ownership:
+                task.begin_publication()
+
+            receiver.dispatch_task(task)
+
+            assert task.status == TaskStatus.ERROR
+            assert task.is_done
+            assert isinstance(task._exception, PeerIncompatibleError)
+            assert diagnostic in str(task._exception)
+            if enforce_physical_ownership:
+                assert task.resources_drained
+
+        assert bad_endpoint in receiver._incompatible_peers
+        assert bad_endpoint not in receiver._sender_ep_instance_map
+        assert receiver._dealers == {}
+        assert messenger_factory.call_count == 2  # Receiver listener and one info lookup.
+        receiver._request_sender_data.assert_not_called()
+        receiver._bounce.reserve.assert_not_called()
+        messengers[bad_endpoint].send.assert_called_once_with([MessageType.REQUEST_INSTANCE_INFO])
+        messengers[bad_endpoint].receive.assert_called_once_with()
+        messengers[bad_endpoint].stop.assert_called_once_with()
+        with pytest.raises(KeyError):
+            registrar.get_peer_rank_info(bad_ri.instance_name, bad_ri.instance_rank)
+
+        # The same receiver can still register a different, compatible sender.
+        good_params = SimpleNamespace(ctx_info_endpoint=good_endpoint, ctx_dp_rank=0)
+        sender_info = receiver._get_sender_info(good_params)
+        assert sender_info.instance_name == good_ri.instance_name
+        assert registrar.get_pool_mapping(sender_info) == {(0, 0): (0, 0), (0, 1): (0, 1)}
+        messengers["tcp://good-sender"].send.assert_called_once_with(
+            [MessageType.REGISTER_RANK_INFO, local_ri.to_bytes()]
+        )
+        assert receiver._get_sender_info(good_params) is sender_info
+        assert messenger_factory.call_count == 4  # One more info lookup and one sender dealer.
+        messengers[good_endpoint].receive.assert_called_once_with()
+        with pytest.raises(KeyError):
+            registrar.get_peer_rank_info(good_ri.instance_name, good_ri.instance_rank)
+    finally:
+        receiver.shutdown()
+
+
+def test_view_validation_allows_nonoverlapping_pp_stage() -> None:
+    local_page_table = _make_per_view_page_table([2, 1], MapperKind.INDEXED)
+    local_page_table.layer_groups[0].local_layers = [LocalLayer(0, 2), LocalLayer(1, 3)]
+    local_ri = make_rankinfo(
+        tp_size=1,
+        pp_size=2,
+        pp_rank=1,
+        instance_rank=1,
+        page_table=local_page_table,
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        pp_size=2,
+        page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+    )
+    registrar = _make_peer_registrar(local_ri)
+
+    registrar.validate_view_head_geometry(peer_ri)
+
+    assert registrar.get_pool_mapping(peer_ri) == {}
+    with pytest.raises(KeyError):
+        registrar.get_peer_rank_info(peer_ri.instance_name, peer_ri.instance_rank)
 
 
 @pytest.mark.parametrize(

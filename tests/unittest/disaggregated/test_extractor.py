@@ -360,31 +360,48 @@ def test_v2_builder_stamps_homogeneous_pool_kinds():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("mixed_owners", [False, True])
-def test_v2_builder_partitions_coalesced_views_by_owner(mixed_owners):
+@pytest.mark.parametrize(
+    "owners, head_counts, expected_num_views",
+    [
+        pytest.param(("target", "target"), (2, 2), 1, id="target-uniform-heads"),
+        pytest.param(("target", "target"), (2, 1), 2, id="target-mixed-heads"),
+        pytest.param(("target", "draft"), (2, 2), 2, id="mixed-owners-uniform-heads"),
+        pytest.param(("target", "draft"), (2, 1), 2, id="mixed-owners-mixed-heads"),
+        pytest.param(("draft", "draft"), (2, 1), 2, id="draft-mixed-heads"),
+    ],
+)
+def test_v2_builder_partitions_coalesced_views_by_owner_and_heads(
+    owners: tuple[str, str], head_counts: tuple[int, int], expected_num_views: int
+) -> None:
     from types import SimpleNamespace
 
+    # FP16 (2 heads, dim 64) and (1 head, dim 128) share a 4096-byte K/V
+    # buffer size at 16 tokens per block.
+    buffer_size = 4096
     attrs = {
         (layer, role): SimpleNamespace(
-            life_cycle_id=0, pool_index=0, offset=(2 * layer + role_index) * 128, size=128
+            life_cycle_id=0,
+            pool_index=0,
+            offset=(2 * layer + role_index) * buffer_size,
+            size=buffer_size,
         )
         for layer in range(2)
         for role_index, role in enumerate((Role.KEY, Role.VALUE))
     }
-    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
-    manager.num_kv_heads_per_layer = [2, 1] if mixed_owners else [2, 2]
+    manager = _make_fake_v2_manager(
+        attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(4 * buffer_size,)
+    )
+    manager.num_kv_heads_per_layer = list(head_counts)
     manager.layer_specs = tuple(
         KVCacheLayerSpec(
             global_layer_id=layer,
-            owner=KVCacheLayerOwner.DRAFT
-            if mixed_owners and layer == 1
-            else KVCacheLayerOwner.TARGET,
+            owner=KVCacheLayerOwner(owners[layer]),
             dtype=DataType.HALF,
             num_kv_heads=heads,
-            head_dim=4 // heads,
+            head_dim=128 // heads,
             buffer_roles=(Role.KEY, Role.VALUE),
         )
-        for layer, heads in enumerate(manager.num_kv_heads_per_layer)
+        for layer, heads in enumerate(head_counts)
     )
     manager.get_disagg_pool_view_partition = (
         KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
@@ -392,13 +409,16 @@ def test_v2_builder_partitions_coalesced_views_by_owner(mixed_owners):
 
     views = build_page_table_from_manager(manager).layer_groups[0].pool_views
 
-    if mixed_owners:
-        assert [view.num_kv_heads for view in views] == [2, 1]
+    assert len(views) == expected_num_views
+    if expected_num_views == 2:
+        assert [view.num_kv_heads for view in views] == list(head_counts)
         assert [get_unique_layers(view) for view in views] == [{0}, {1}]
         assert [view.pool_idx for view in views] == [0, 0]
-        assert [view.buffer_entries["offset"].tolist() for view in views] == [[0, 128], [256, 384]]
+        assert [view.buffer_entries["offset"].tolist() for view in views] == [
+            [0, buffer_size],
+            [2 * buffer_size, 3 * buffer_size],
+        ]
     else:
-        assert len(views) == 1
         assert views[0].num_kv_heads == 2
         assert get_unique_layers(views[0]) == {0, 1}
 

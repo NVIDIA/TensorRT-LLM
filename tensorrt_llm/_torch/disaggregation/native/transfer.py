@@ -2861,8 +2861,10 @@ class Receiver(ReceiverBase):
         # Any duplicated head, rank-wide or in a single view pair, leaves some
         # writers without a share (sender side) or doubles one (receiver side).
         view_factors = getattr(overlap, "view_duplicate_head_factors", {}).values()
-        if overlap.duplicate_head_factor != 1 or any(
-            factor != 1 for pair in view_factors for factor in pair
+        if (
+            overlap.duplicate_head_factor != 1
+            or overlap.peer_duplicate_head_factor != 1
+            or any(factor != 1 for pair in view_factors for factor in pair)
         ):
             return False
         if overlap.overlap_pp_size > 1:
@@ -3114,6 +3116,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                self._registrar.validate_view_head_geometry(sender_info)
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "

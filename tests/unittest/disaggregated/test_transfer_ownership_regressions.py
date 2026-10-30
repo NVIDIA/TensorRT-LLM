@@ -694,6 +694,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     overlap = SimpleNamespace(
         ranks=[0, 1],
         duplicate_head_factor=1,
+        peer_duplicate_head_factor=1,
         overlap_pp_size=1,
     )
     receiver._registrar = SimpleNamespace(
