@@ -221,7 +221,10 @@ class GuidedDecoder:
 
         self.requests: Optional[GuidedRequests] = None
         # (request_id, error_msg) of disagg gen requests whose grammar matcher
-        # failed to initialize; reported by the next build.
+        # failed to initialize; reported by the next build. Every
+        # init_disagg_gen_requests call must be followed by a build on the
+        # same batch before the next init: init resets this list, so an init
+        # that ran twice (a retry, a second microbatch) would drop failures.
         self.init_failed_requests: List[Tuple[int, str]] = []
 
         self.stream = torch.cuda.Stream()
