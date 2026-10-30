@@ -516,7 +516,7 @@ rule and how to force gating back on.
 
 Use this for pre-merge stages whose goal is to catch functional regressions on paths that only had post-merge coverage before. It preserves the data-continuity benefit of running in pre-merge (baselines still update from PR data points) without the flakiness cost of gating on the noisier disagg perf numbers.
 
-**No stage currently sets this flag.** Pre-merge perf-sanity is single-node `ctx_only` only, and every `ctx_only` case gates on perf; the multi-node disagg cases that used it are post-merge only. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
+**No stage currently sets this flag**, and no perf-sanity stage currently runs in pre-merge. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
 
 Detection is by substring match on `os.environ["stageName"]` inside `test_perf_sanity.py`; no changes to `perf_regression_utils.py`.
 
