@@ -1775,16 +1775,22 @@ def test_normalization_metadata_survives_processor_output(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.float64])
 @pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("worker_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("scalar_statistics", [False, True])
 @pytest.mark.parametrize("do_rescale,do_normalize", [(True, True), (True, False), (False, True)])
-def test_normalization_enabled_operations(dtype, default_dtype, do_rescale, do_normalize):
+def test_normalization_enabled_operations(
+    dtype, default_dtype, worker_dtype, scalar_statistics, do_rescale, do_normalize
+):
+    import pickle
+
     from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
     processor = Qwen2VLImageProcessor(
         do_rescale=do_rescale,
         do_normalize=do_normalize,
         rescale_factor=1 / 127 if do_rescale else None,
-        image_mean=[0.2, 0.4, 0.6] if do_normalize else None,
-        image_std=[0.1, 0.3, 0.7] if do_normalize else None,
+        image_mean=(0.2 if scalar_statistics else [0.2, 0.4, 0.6]) if do_normalize else None,
+        image_std=(0.1 if scalar_statistics else [0.1, 0.3, 0.7]) if do_normalize else None,
     )
     values = np.tile(np.arange(256, dtype=np.uint8).reshape(1, 256, 1), (2, 1, 3))
     pixels = torch.from_numpy(values).permute(2, 0, 1).contiguous()
@@ -1794,15 +1800,22 @@ def test_normalization_enabled_operations(dtype, default_dtype, do_rescale, do_n
         spec = vision_normalization_from_processor([values], processor, dtype)
         assert isinstance(spec, VisionNormalization)
         assert spec.rescale_factor == (processor.rescale_factor if do_rescale else None)
-        assert spec.image_mean == (tuple(processor.image_mean) if do_normalize else None)
+        assert spec.image_mean == (
+            ((processor.image_mean,) * 3 if scalar_statistics else tuple(processor.image_mean))
+            if do_normalize
+            else None
+        )
+        assert spec.lookup_table is not None
         expected = processor.rescale_and_normalize(
             pixels,
             do_rescale=do_rescale,
             rescale_factor=processor.rescale_factor,
             do_normalize=do_normalize,
-            image_mean=tuple(processor.image_mean) if do_normalize else None,
-            image_std=tuple(processor.image_std) if do_normalize else None,
+            image_mean=processor.image_mean,
+            image_std=processor.image_std,
         ).to(dtype)
+        spec = pickle.loads(pickle.dumps(spec))
+        torch.set_default_dtype(worker_dtype)
         assert torch.equal(
             normalize_vision_pixels(pixels.reshape(3, -1), spec), expected.reshape(3, -1)
         )
@@ -1905,12 +1918,22 @@ def test_normalization_matches_cpu_processor(
 @pytest.mark.parametrize("sample", ["all_values", "real_image"])
 @pytest.mark.parametrize("modality", ["image", "video"])
 @pytest.mark.parametrize("custom_constants", [False, True])
+@pytest.mark.parametrize("producer_dtype", [torch.float32, torch.float64])
 def test_normalization_matches_gpu_processor(
-    dtype: torch.dtype, sample: str, modality: str, custom_constants: bool
+    dtype: torch.dtype,
+    sample: str,
+    modality: str,
+    custom_constants: bool,
+    producer_dtype: torch.dtype,
 ) -> None:
-    raw, expected, spec = _normalization_processor_outputs(
-        sample, modality, dtype, custom_constants
-    )
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(producer_dtype)
+        raw, expected, spec = _normalization_processor_outputs(
+            sample, modality, dtype, custom_constants
+        )
+    finally:
+        torch.set_default_dtype(previous_dtype)
     with torch.device("cuda"):
         actual = normalize_vision_pixels(raw.cuda().view(-1, 3, raw.shape[-1] // 3), spec).view(
             raw.shape
@@ -1984,8 +2007,12 @@ def test_normalization_does_not_compile_after_startup(
 
 
 def _normalization_transport_spec():
-    return modeling_multimodal_utils.VisionNormalization(
-        1 / 255, (0.25, 0.5, 0.75), (0.5,) * 3, torch.bfloat16
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    return vision_normalization_from_processor(
+        [Image.new("RGB", (16, 16))],
+        Qwen2VLImageProcessor(image_mean=[0.25, 0.5, 0.75], image_std=[0.5] * 3),
+        torch.bfloat16,
     )
 
 
@@ -2006,18 +2033,19 @@ def test_normalization_transport_item_selection(declared: bool, modality: str) -
         if modality == "image"
         else ("pixel_values_videos", "video_grid_thw")
     )
-    pixels = torch.arange(12, dtype=torch.uint8).view(4, 3)
-    # Four items also matches the tuple's field count: it must remain shared.
+    count = len(spec)
+    pixels = torch.arange(count * 3, dtype=torch.uint8).view(count, 3)
+    # Matching the tuple's field count must not turn shared metadata into item data.
     param = MultimodalParams(
         multimodal_data={
             modality: {
                 pixel_key: pixels,
-                grid_key: torch.ones(4, 3, dtype=torch.int64),
+                grid_key: torch.ones(count, 3, dtype=torch.int64),
                 "vision_normalization": spec,
             },
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [(modality, i) for i in range(4)],
-                output_embedding_lengths=[1] * 4,
+                [(modality, i) for i in range(count)],
+                output_embedding_lengths=[1] * count,
                 input_partitions={
                     modality: {
                         pixel_key: MultimodalItemPartition(),
@@ -2079,7 +2107,8 @@ def _normalization_transport_process(connection, payload) -> None:
 
 
 @pytest.mark.cpu_only
-def test_normalization_transport_shared_handles_and_process() -> None:
+@pytest.mark.parametrize("producer_dtype", [torch.float32, torch.float64])
+def test_normalization_transport_shared_handles_and_process(producer_dtype) -> None:
     import multiprocessing
     import pickle
 
@@ -2087,7 +2116,12 @@ def test_normalization_transport_shared_handles_and_process() -> None:
     from tensorrt_llm.executor.request import GenerationRequest
     from tensorrt_llm.sampling_params import SamplingParams
 
-    spec = _normalization_transport_spec()
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(producer_dtype)
+        spec = _normalization_transport_spec()
+    finally:
+        torch.set_default_dtype(previous_dtype)
     pixels = torch.arange(12, dtype=torch.uint8)
     params = MultimodalParams(
         multimodal_data={"image": {"pixel_values": pixels, "vision_normalization": spec}}
