@@ -1617,6 +1617,7 @@ def test_normalization_startup_follows_encoder_dtype(
         assert pixels.dtype == torch.uint8
         assert pixels.is_contiguous()
         assert spec.out_dtype == dtype
+        assert spec.compute_dtype is None
     assert model.attn_metadata.max_num_tokens == 16
 
 
@@ -1805,7 +1806,7 @@ def test_normalization_enabled_operations(
             if do_normalize
             else None
         )
-        assert spec.lookup_table is not None
+        assert spec.compute_dtype == default_dtype
         expected = processor.rescale_and_normalize(
             pixels,
             do_rescale=do_rescale,
@@ -2120,6 +2121,7 @@ def test_normalization_transport_shared_handles_and_process(producer_dtype) -> N
     try:
         torch.set_default_dtype(producer_dtype)
         spec = _normalization_transport_spec()
+        assert spec.compute_dtype == producer_dtype
     finally:
         torch.set_default_dtype(previous_dtype)
     pixels = torch.arange(12, dtype=torch.uint8)

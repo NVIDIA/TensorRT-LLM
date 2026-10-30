@@ -44,14 +44,14 @@ class VisionNormalization(NamedTuple):
     image_mean: tuple[float, ...] | None
     image_std: tuple[float, ...] | None
     out_dtype: torch.dtype
-    lookup_table: bytes | None = None
+    compute_dtype: torch.dtype | None = None
 
 
 def vision_normalization_from_processor(
         frames: list[Any], processor: Any,
         out_dtype: torch.dtype) -> VisionNormalization | None:
     """Describe elementwise normalization for RGB PIL or uint8 HWC frames."""
-    # The table must use the same elementwise backend as the processor.
+    # Workers reconstruct the table, so the processor must use the shared backend.
     uses_shared_backend = all(
         getattr(getattr(processor, name, None), "__func__", None) is getattr(
             TorchvisionBackend, name)
@@ -66,7 +66,7 @@ def vision_normalization_from_processor(
          and frame.ndim == 3 and frame.shape[-1] == 3) for frame in frames)
     if not rgb_frames:
         return None
-    normalization = VisionNormalization(
+    return VisionNormalization(
         rescale_factor=processor.rescale_factor
         if processor.do_rescale else None,
         image_mean=((processor.image_mean, ) * 3 if np.isscalar(
@@ -76,11 +76,8 @@ def vision_normalization_from_processor(
             processor.image_std) else tuple(processor.image_std))
         if processor.do_normalize else None,
         out_dtype=out_dtype,
+        compute_dtype=torch.get_default_dtype(),
     )
-    table = _vision_normalization_table(normalization, torch.device("cpu"), 3,
-                                        torch.get_default_dtype())
-    return normalization._replace(
-        lookup_table=table.view(torch.uint8).numpy().tobytes())
 
 
 @functools.lru_cache(maxsize=32)
@@ -88,21 +85,23 @@ def _vision_normalization_table(
     normalization: VisionNormalization,
     device: torch.device,
     channels: int,
-    default_dtype: torch.dtype | None,
+    default_dtype: torch.dtype,
 ) -> torch.Tensor:
-    if normalization.lookup_table is not None:
-        return torch.frombuffer(bytearray(normalization.lookup_table),
-                                dtype=normalization.out_dtype).reshape(
-                                    channels, 256).to(device=device)
-    values = torch.arange(256, dtype=torch.int32,
-                          device="cpu").to(torch.uint8).expand(channels, 1, -1)
+    values = torch.arange(256, dtype=default_dtype,
+                          device="cpu").expand(channels, 1, -1)
+    image_mean, image_std = normalization.image_mean, normalization.image_std
+    if normalization.rescale_factor is not None and image_mean is not None:
+        image_mean = torch.tensor(image_mean, dtype=default_dtype,
+                                  device="cpu").unbind()
+        image_std = torch.tensor(image_std, dtype=default_dtype,
+                                 device="cpu").unbind()
     values = TorchvisionBackend().rescale_and_normalize(
         values,
         do_rescale=normalization.rescale_factor is not None,
         rescale_factor=normalization.rescale_factor,
         do_normalize=normalization.image_mean is not None,
-        image_mean=normalization.image_mean,
-        image_std=normalization.image_std,
+        image_mean=image_mean,
+        image_std=image_std,
     )
     return values.to(dtype=normalization.out_dtype,
                      device=device).reshape(channels, 256).contiguous()
@@ -137,10 +136,10 @@ def normalize_vision_pixels(
     channels, channel_stride = pixel_values.shape[-2:]
     if not channels or not channel_stride:
         return pixel_values.to(normalization.out_dtype)
-    # Transport producer-built values without repeating normalization arithmetic.
+    # Match the producer's intermediate precision when rebuilding the table.
     table = _vision_normalization_table(
-        normalization, pixel_values.device, channels, None if
-        normalization.lookup_table is not None else torch.get_default_dtype())
+        normalization, pixel_values.device, channels,
+        normalization.compute_dtype or torch.get_default_dtype())
     if not pixel_values.is_cuda:
         offsets = torch.arange(pixel_values.numel(), device=pixel_values.device)
         channel = (offsets // channel_stride) % channels
