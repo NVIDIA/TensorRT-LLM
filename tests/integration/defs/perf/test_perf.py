@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from ..conftest import get_device_count, llm_models_root, trt_environment
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
-from .pytorch_model_config import get_model_yaml_config
+from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
@@ -130,6 +130,8 @@ SPEC_DEC_REAL_DATASET_MODELS = {
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
+    "gpt_oss_120b_eagle3": "cnn_dailymail",
+    "qwen3.6_35b_a3b_fp4_mtp": "cnn_dailymail",
 }
 
 # All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
@@ -469,6 +471,8 @@ class PerfTestConfig:
         pp_size: int = 1,
         num_gpus: int = 1,
         moe_backend: str | None = None,
+        prefix_len: int = 0,
+        cfg_presets: str | None = None,
     ):
         # The model name.
         self.model_name = model_name
@@ -519,6 +523,10 @@ class PerfTestConfig:
         # Number of GPUs.
         self.num_gpus = num_gpus
         self.moe_backend = moe_backend
+        # Shared random prefix length (serve only), added in front of every prompt.
+        self.prefix_len = prefix_len
+        # "+"-joined names from PERF_CONFIG_PRESETS in pytorch_model_config.py.
+        self.cfg_presets = cfg_presets
 
     def to_string(self,
                   custom_server_name: str = None,
@@ -632,6 +640,12 @@ class PerfTestConfig:
         if self.moe_backend is not None:
             entries.append(f"moe:{self.moe_backend}")
 
+        if self.prefix_len > 0:
+            entries.append(f"prefix:{self.prefix_len}")
+
+        if self.cfg_presets is not None:
+            entries.append(f"cfg:{self.cfg_presets}")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -739,6 +753,14 @@ class PerfTestConfig:
         if labels and labels[0].startswith("moe:"):
             self.moe_backend = labels.pop(0).removeprefix("moe:")
 
+        self.prefix_len = 0
+        if labels and labels[0].startswith("prefix:"):
+            self.prefix_len = int(labels.pop(0).removeprefix("prefix:"))
+
+        self.cfg_presets = None
+        if labels and labels[0].startswith("cfg:"):
+            self.cfg_presets = labels.pop(0).removeprefix("cfg:")
+
         assert len(
             labels
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
@@ -778,6 +800,22 @@ class PerfTestConfig:
         assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
         VALID_KV_CACHE_DTYPES = ["auto", "fp8"]
         assert self.kv_cache_dtype in VALID_KV_CACHE_DTYPES, f"Invalid kv_cache_dtype {self.kv_cache_dtype}!"
+
+        if self.prefix_len > 0:
+            assert self.runtime == "serve", \
+                "prefix (shared random prompt prefix) requires the serve runtime!"
+            assert self.model_name not in SPEC_DEC_REAL_DATASET_MODELS \
+                and self.model_name not in SERVE_IMAGE_MODELS, \
+                "prefix applies only to the random text dataset!"
+
+        if self.cfg_presets is not None:
+            unknown_presets = [
+                name for name in self.cfg_presets.split("+")
+                if name not in PERF_CONFIG_PRESETS
+            ]
+            assert not unknown_presets, (
+                f"Unknown cfg preset(s) {unknown_presets}; "
+                f"known presets: {sorted(PERF_CONFIG_PRESETS)}")
 
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
@@ -931,7 +969,7 @@ class PerfTestConfig:
             return None
 
         sequence_lengths = {
-            input_len + output_len
+            self.prefix_len + input_len + output_len
             for input_len, output_len in zip(
                 self.input_lens, self.output_lens, strict=True)
         }
@@ -1455,6 +1493,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 "--random-range-ratio",
                 "0.0",
             ]
+            if self._config.prefix_len > 0:
+                client_cmd += [
+                    "--random-prefix-len",
+                    str(self._config.prefix_len)
+                ]
         if self._config.concurrency != -1:
             client_cmd += ["--max-concurrency", str(self._config.concurrency)]
         if self._config.streaming == "streaming":
