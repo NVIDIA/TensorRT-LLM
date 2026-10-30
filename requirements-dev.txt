@@ -35,6 +35,7 @@ mako
 oyaml
 parameterized
 pre-commit
+virtualenv>=20.29.1,<22.0
 pybind11
 pybind11-stubgen
 # 8.4+ needed for `pytest.RaisesExc` support in `pytest.mark.xfail`.

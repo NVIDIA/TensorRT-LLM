@@ -115,8 +115,21 @@ def install(profile: str, root: Path, python: str, bin_dir: Path) -> None:
 
     destination = root / profile
     executable = destination / "bin" / "python"
+    create_command = [
+        sys.executable,
+        "-I",
+        "-m",
+        "virtualenv",
+        "--python",
+        python,
+        "--no-download",
+        "--no-periodic-update",
+        "--app-data",
+        str(root / ".virtualenv"),
+        str(destination),
+    ]
     if not executable.exists():
-        subprocess.check_call([python, "-I", "-m", "venv", str(destination)], env=env)
+        subprocess.check_call(create_command, env=env)
     installed_version = json.loads(
         subprocess.check_output(
             [
@@ -136,6 +149,24 @@ def install(profile: str, root: Path, python: str, bin_dir: Path) -> None:
     config = (destination / "pyvenv.cfg").read_text()
     if "include-system-site-packages = false" not in config.lower():
         raise RuntimeError(f"{destination} must not inherit inference site-packages")
+    pip_available = subprocess.run(
+        [
+            str(executable),
+            "-I",
+            "-c",
+            "import importlib.util,sys; sys.exit(importlib.util.find_spec('pip') is None)",
+        ],
+        env=env,
+        check=False,
+    )
+    if pip_available.returncode:
+        # Seed pip in an interrupted environment without requiring system ensurepip.
+        subprocess.check_call(create_command, env=env)
+        if (
+            "include-system-site-packages = false"
+            not in (destination / "pyvenv.cfg").read_text().lower()
+        ):
+            raise RuntimeError(f"{destination} must not inherit inference site-packages")
     requirements = list(REQUIREMENTS[profile])
     if profile == "agentx" and os.environ.get("AGENTX_AIPERF_REF"):
         requirements[0] = f"aiperf @ {os.environ['AGENTX_AIPERF_REF']}"

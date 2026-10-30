@@ -484,7 +484,17 @@ independently of this check.
 
 #### Installing the client
 
-Install the benchmark client separately with Python 3.11, 3.12, or 3.13:
+Install the benchmark client separately with Python 3.11, 3.12, or 3.13.
+The setup interpreter needs `virtualenv>=20.29.1,<22.0`, supplied by
+`requirements-dev.txt`, to create pip-enabled environments even when the OS
+does not provide `ensurepip`. For a standalone client setup, install that
+utility explicitly:
+
+```bash
+python3.12 -m pip install 'virtualenv>=20.29.1,<22.0'
+```
+
+Then install the client:
 
 ```bash
 export TRTLLM_BENCHMARK_ENV_ROOT="$PWD/.benchmark-tools"

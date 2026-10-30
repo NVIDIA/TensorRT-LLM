@@ -60,6 +60,25 @@ def make_environment(destination: Path) -> Path:
     return package
 
 
+def make_pip_environment(destination: Path) -> None:
+    """Create a pip-enabled fixture using bundled seed wheels."""
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "virtualenv",
+            "--python",
+            sys.executable,
+            "--no-download",
+            "--no-periodic-update",
+            "--app-data",
+            str(destination.parent / ".virtualenv"),
+            str(destination),
+        ]
+    )
+
+
 def test_launcher_ignores_inference_package_path(
     installer: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supported_python: str
 ) -> None:
@@ -161,7 +180,7 @@ def test_pip_destination_overrides_cannot_change_runtime(
     write_wheel(wheels, "aiperf", "0.8.0", marker="unchanged runtime client")
     write_wheel(wheels, "aiperf", "0.13.0", marker="isolated client")
     runtime = tmp_path / "inference"
-    venv.EnvBuilder(with_pip=True).create(runtime)
+    make_pip_environment(runtime)
     runtime_python = str(runtime / "bin/python")
     monkeypatch.setenv("PIP_NO_INDEX", "1")
     monkeypatch.setenv("PIP_FIND_LINKS", str(wheels))
@@ -287,7 +306,7 @@ def test_reused_environment_upgrades_transitive_dependencies(
     monkeypatch.setenv("PIP_FIND_LINKS", str(wheels))
     monkeypatch.setitem(installer.REQUIREMENTS, "stock", ["aiperf==0.13.0"])
     destination = tmp_path / "stock"
-    venv.EnvBuilder(with_pip=True).create(destination)
+    make_pip_environment(destination)
     python = str(destination / "bin/python")
     env = installer.clean_environment()
     subprocess.check_call(
@@ -329,7 +348,7 @@ def test_same_version_source_change_updates_client_metadata(
     monkeypatch.setenv("PIP_FIND_LINKS", str(wheels))
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     destination = tmp_path / "stock"
-    venv.EnvBuilder(with_pip=True).create(destination)
+    make_pip_environment(destination)
     python = str(destination / "bin/python")
     env = installer.clean_environment()
     subprocess.check_call([python, "-I", "-m", "pip", "install", "aiperf==0.13.0"], env=env)
