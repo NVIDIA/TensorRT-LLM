@@ -16,8 +16,10 @@
  */
 
 #include "kv_cache_manager_v2/kvCacheManager.h"
+#include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -28,8 +30,9 @@
 #include <chrono>
 #include <cmath>
 #include <map>
-#include <numeric>
+#include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -46,12 +49,13 @@ static double nowSeconds()
 // PageIndexConverter
 // ---------------------------------------------------------------------------
 
-std::vector<int> PageIndexConverter::operator()(
-    std::vector<int> const& baseIndices, std::optional<PageIndexMode> indexMode, ScratchDesc const* scratch) const
+std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndices,
+    std::optional<PageIndexMode> indexMode, HalfOpenRange<BlockOrdinal> scratchRange,
+    Span<int const> scratchSlots) const
 {
     if (!indexMode.has_value())
     {
-        if (scratch)
+        if (!scratchRange.empty())
         {
             throw std::invalid_argument("index_mode must be provided when scratch is active");
         }
@@ -67,15 +71,26 @@ std::vector<int> PageIndexConverter::operator()(
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{static_cast<int>(baseIndices.size())}; ++ordinal)
     {
         int index;
-        if (scratch && scratch->range.contains(ordinal))
+        if (scratchRange.contains(ordinal))
         {
-            // Scratch block: slot IDs come from ScratchDesc, not base_indices.
-            int blockPos = ordinal - scratch->range.beg;
+            // Scratch block: its slot comes from the request's own scratch slots, not from
+            // base_indices.
+            int blockPos = ordinal - scratchRange.beg;
             int totalOffset = blockPos * scratchPages;
+            bool const crossesSlots = scale % scratchPages != 0;
+            if (crossesSlots)
+            {
+                // Unequal layer shares can put a block across two slots. Pack
+                // the layer's consecutive roles before resolving the slot ID,
+                // so a trailing role cannot wrap over an earlier block's data.
+                totalOffset += appliedLayerOffset % scratchPages;
+            }
             int slotIdx = totalOffset / scale;
-            int slotId = scratch->slotIds[static_cast<size_t>(slotIdx)];
+            TLLM_CHECK_DEBUG_WITH_INFO(slotIdx < scratchSlots.size(), "Scratch slot %d past the %d the range describes",
+                slotIdx, scratchSlots.size());
+            int slotId = scratchSlots[slotIdx];
             int offset = totalOffset % scale;
-            index = slotId * scale + (offset + appliedLayerOffset) % scale;
+            index = slotId * scale + (crossesSlots ? offset : (offset + appliedLayerOffset) % scale);
         }
         else if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value())
         {
@@ -95,7 +110,7 @@ std::vector<int> PageIndexConverter::operator()(
 
 std::vector<int> PageIndexConverter::operator()(int baseIndex) const
 {
-    return operator()(std::vector<int>{baseIndex}, std::nullopt, nullptr);
+    return operator()(std::vector<int>{baseIndex});
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +142,13 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
         mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority);
 
+    _computeSparseCacheShape();
+
+    // The storage above has a device context up, which this needs.
+    CUdevice device{};
+    cuCheck(cuCtxGetDevice(&device));
+    mSmCount = sparseCopyMultiprocessors(device);
+
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();
     _resetIterationPeakNumBlocks();
@@ -137,6 +159,252 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 KvCacheManager::~KvCacheManager()
 {
     KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
+}
+
+void KvCacheManager::_computeSparseCacheShape()
+{
+    LifeCycleId const numLc = mStorage->numLifeCycles();
+    mSparseCacheShape = TypedVec<LifeCycleId, SparseCacheShape>(numLc, SparseCacheShape{});
+    mSelectionSlot.clear();
+    mSparseLayerSelection = TypedVec<LifeCycleId, std::vector<int32_t>>(numLc);
+
+    // Selection ids are the caller's, so they are dense only by luck; these give each one
+    // a slot in its life cycle's metadata, and catch an id used across two of them.
+    std::unordered_map<int, LifeCycleId> selectionLifeCycle;
+    std::map<LifeCycleId, std::map<int, int>> slotsOf;
+
+    for (auto const& layer : mConfig.layers)
+    {
+        auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
+        if (attn == nullptr)
+        {
+            continue;
+        }
+        if (!attn->sparseCache.has_value())
+        {
+            continue;
+        }
+        LifeCycleId const lcId = getLayerGroupId(attn->layerId);
+        auto const& cache = *attn->sparseCache;
+        int const unitsPerPage = cache.unitsPerPage(mConfig.tokensPerBlock);
+
+        // Layers of one life cycle must currently declare the same sparse_cache. The arena
+        // is per life cycle and its metadata is one stride: a selection's rows are found at
+        // `residentOrdinal + slot * entriesPerSelection`, so a single entry count serves
+        // them all, and cellsPerBuffer follows from maxCachedUnits and unitsPerPage alike.
+        // See SPARSE_ATTENTION_DESIGN.md.
+        auto& shape = mSparseCacheShape[lcId];
+        if (shape.layers > 0)
+        {
+            TLLM_CHECK_WITH_INFO(shape.maxUnits == cache.maxCachedUnits && shape.selection == cache.numSelectedBlocks
+                    && shape.unitsPerPage == unitsPerPage,
+                "Layers sharing a life cycle must declare the same sparse_cache; they share one arena");
+        }
+        shape.maxUnits = cache.maxCachedUnits;
+        shape.selection = cache.numSelectedBlocks;
+        shape.unitsPerPage = unitsPerPage;
+
+        bool layerCounted = false;
+        for (auto const& buf : attn->buffers)
+        {
+            // A zero-size buffer has no layout and never reaches storage, so the plan below
+            // has no entry for it. Counting it here would size this metadata for a buffer
+            // nothing writes.
+            if (!buf.isSparse || buf.size == 0)
+            {
+                continue;
+            }
+            ++shape.buffers;
+            if (!layerCounted)
+            {
+                ++shape.layers;
+                layerCounted = true;
+            }
+        }
+        if (!layerCounted)
+        {
+            continue;
+        }
+
+        // A selection is a life cycle's, because the metadata it indexes is. Layers that
+        // name one from either side of a life cycle boundary are naming two things.
+        int const selectionId = cache.effectiveSelectionId(attn->layerId);
+        auto const [owner, firstHere] = selectionLifeCycle.try_emplace(selectionId, lcId);
+        TLLM_CHECK_WITH_INFO(firstHere || owner->second == lcId,
+            "Layers sharing a selection_id must share a life cycle; selection %d spans two", selectionId);
+
+        auto& slots = slotsOf[lcId];
+        auto const [slot, fresh] = slots.try_emplace(selectionId, static_cast<int>(slots.size()));
+        mSelectionSlot[attn->layerId] = slot->second;
+        // Indexed by the layer's dense row, which is what the arena and the write-back's
+        // grid address it by; _sparseBufferPlan numbers it from this same walk.
+        mSparseLayerSelection[lcId].push_back(static_cast<int32_t>(slot->second));
+        if (fresh)
+        {
+            ++shape.groups;
+        }
+    }
+}
+
+int KvCacheManager::_selectionSlotOf(LayerId layerId) const
+{
+    auto const it = mSelectionSlot.find(layerId);
+    TLLM_CHECK_WITH_INFO(it != mSelectionSlot.end(), "This layer carries no sparse selection");
+    return it->second;
+}
+
+std::vector<int32_t> const& KvCacheManager::_sparseLayerSelection(LifeCycleId lifeCycle) const
+{
+    return mSparseLayerSelection[lifeCycle];
+}
+
+int KvCacheManager::_selectionLayerCount(LifeCycleId lifeCycle, int slot) const
+{
+    auto const& selections = mSparseLayerSelection[lifeCycle];
+    return static_cast<int>(std::count(selections.begin(), selections.end(), slot));
+}
+
+int KvCacheManager::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const noexcept
+{
+    int const maxUnits = sparseCacheMaxUnits(lifeCycle);
+    if (maxUnits <= 0)
+    {
+        return 0;
+    }
+    return divUp(maxUnits, sparseCacheUnitsPerPage(lifeCycle));
+}
+
+int KvCacheManager::_sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept
+{
+    int const cells = _sparseCacheSubSlotsPerBuffer(lifeCycle) * sparseCacheUnitsPerPage(lifeCycle);
+    if (cells <= 0)
+    {
+        return 0;
+    }
+    // A step advances capacity one token past history, and one token straddles at most one
+    // unit boundary, so at most one unit is ever in flight. That is the whole of the
+    // headroom: everything else the reservation holds is available to the selection.
+    return 1;
+}
+
+std::vector<SparseBufferPlan> KvCacheManager::_sparseBufferPlan(LifeCycleId lifeCycle) const
+{
+    // Layers outermost, as _computeSparseCacheShape walks them.
+    std::vector<SparseBufferPlan> plan;
+    std::optional<LayerId> previousLayer;
+    int32_t layerRow = -1;
+    for (auto const& layer : mConfig.layers)
+    {
+        auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
+        if (attn == nullptr || !attn->sparseCache.has_value() || getLayerGroupId(attn->layerId) != lifeCycle)
+        {
+            continue;
+        }
+        auto const firstOfLayer = plan.size();
+        for (auto const& buf : attn->buffers)
+        {
+            // A sparse buffer in a layer with no sparse_cache has storage and locking but
+            // no fetch path, so it contributes no cells and no layout.
+            // Zero-size as in _computeSparseCacheShape: no layout to derive, and
+            // sparseLayout() rejects one rather than inventing it.
+            if (!buf.isSparse || buf.size == 0 || !attn->sparseCache.has_value())
+            {
+                continue;
+            }
+            if (!previousLayer.has_value() || attn->layerId != *previousLayer)
+            {
+                previousLayer = attn->layerId;
+                ++layerRow;
+            }
+            auto const attr = _bufferAttr(attn->layerId, buf.role);
+            plan.push_back(SparseBufferPlan{BufferId{attn->layerId, buf.role}, attr.poolIndex, attr.size,
+                static_cast<uint32_t>(attr.offset),
+                buf.sparseLayout(attn->sparseCache->unitsPerPage(mConfig.tokensPerBlock)), layerRow, 0});
+        }
+        // Group a layer's buffers by pool so a (layer, pool) run is consecutive too; the copy
+        // addresses one pool per launch. Stable, so declaration order survives within a pool.
+        std::stable_sort(plan.begin() + static_cast<ptrdiff_t>(firstOfLayer), plan.end(),
+            [](SparseBufferPlan const& a, SparseBufferPlan const& b) { return a.poolIndex < b.poolIndex; });
+    }
+
+    std::map<PoolIndex, int32_t> nextSlot;
+    for (auto& entry : plan)
+    {
+        entry.slotInPool = nextSlot[entry.poolIndex]++;
+    }
+    return plan;
+}
+
+std::vector<BufferId> KvCacheManager::_sparseBufferIds(LifeCycleId lifeCycle) const
+{
+    std::vector<BufferId> ids;
+    for (auto const& entry : _sparseBufferPlan(lifeCycle))
+    {
+        ids.push_back(entry.id);
+    }
+    return ids;
+}
+
+std::vector<IndexTableSpec> KvCacheManager::sparseIndexTableSpecs() const
+{
+    std::vector<IndexTableSpec> specs;
+    for (LifeCycleId lcId{0}; lcId < mStorage->numLifeCycles(); ++lcId)
+    {
+        auto const plan = _sparseBufferPlan(lcId);
+        for (size_t begin = 0; begin < plan.size();)
+        {
+            size_t end = begin;
+            while (end < plan.size() && plan[end].poolIndex == plan[begin].poolIndex
+                && plan[end].layerRow == plan[begin].layerRow)
+            {
+                ++end;
+            }
+            IndexTableSpec spec;
+            for (size_t i = begin; i < end; ++i)
+            {
+                spec.buffers.push_back(plan[i].id);
+            }
+            specs.push_back(std::move(spec));
+            begin = end;
+        }
+    }
+    return specs;
+}
+
+KvCacheManager::SparseLayerSpan KvCacheManager::_sparseLayerSpan(
+    std::vector<BufferId> const& buffers, char const* api) const
+{
+    TLLM_CHECK_WITH_INFO(!buffers.empty(), std::string(api) + ": no buffers");
+
+    LayerId const layerId = buffers.front().layerId;
+    for (auto const& id : buffers)
+    {
+        TLLM_CHECK_WITH_INFO(id.layerId == layerId, std::string(api) + ": every buffer must belong to one layer");
+    }
+
+    SparseLayerSpan span;
+    span.lifeCycle = getLayerGroupId(layerId);
+    auto const all = _sparseBufferIds(span.lifeCycle);
+    // Buffers are grouped by layer, so this layer's are a contiguous run.
+    auto const first
+        = std::find_if(all.begin(), all.end(), [layerId](BufferId const& id) { return id.layerId == layerId; });
+    auto const last = std::find_if(first, all.end(), [layerId](BufferId const& id) { return id.layerId != layerId; });
+    TLLM_CHECK_WITH_INFO(std::equal(first, last, buffers.begin(), buffers.end()),
+        std::string(api) + ": buffers must be exactly this layer's sparse buffers, in the cache's order");
+
+    span.bufferBase = static_cast<int32_t>(std::distance(all.begin(), first));
+    span.numBuffers = static_cast<int32_t>(std::distance(first, last));
+    // The metadata row is the layer's index among those carrying a cache, which is the
+    // number of distinct layers before it in the same walk.
+    for (auto it = all.begin(); it != first; ++it)
+    {
+        if (it == all.begin() || it->layerId != std::prev(it)->layerId)
+        {
+            ++span.layerInGroup;
+        }
+    }
+    span.selectionSlot = _selectionSlotOf(layerId);
+    return span;
 }
 
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
@@ -298,6 +566,23 @@ MemAddress KvCacheManager::getMemPoolBaseAddress(
     return addr;
 }
 
+bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
+{
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    auto const pgIdx = mStorage->getPoolGroupIndex(kHotLevel, attr.lifeCycleId);
+    return mStorage->poolMedium(kHotLevel, pgIdx, attr.poolIndex) == CacheTier::HOST_MEM;
+}
+
+size_t KvCacheManager::getNumBytes(CacheLevel level, CacheTier medium) const
+{
+    return mStorage->getNumBytes(level, medium);
+}
+
+std::optional<CacheTier> KvCacheManager::sparseBackingMedium() const
+{
+    return mStorage->sparseBackingMedium();
+}
+
 int KvCacheManager::getPageStride(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
@@ -323,29 +608,90 @@ int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
     return mStorage->mSlotToPageIndices.at(attr.lifeCycleId).at(attr.poolIndex);
 }
 
-bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
-{
-    auto const& attr = mStorage->getBufferAttr(layerId, role);
-    auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[attr.lifeCycleId]);
-    return attn && attn->isSparse;
-}
-
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
-    auto const& layerAttr = mStorage->getLayerAttr(layerId);
     int scale = mStorage->mSlotToPageIndices.at(attr.lifeCycleId).at(attr.poolIndex);
     int offset = exactDiv(static_cast<int>(attr.offset), static_cast<int>(attr.size));
-    int scratchPages = layerAttr.slotUtil.at(attr.poolIndex);
-    return PageIndexConverter{scale, attr.expansion, offset, scratchPages};
+    return PageIndexConverter{scale, attr.expansion, offset, attr.scratchPagesPerBlock};
 }
 
-std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode) const
+int KvCacheManager::_scratchSlotsFor(
+    LifeCycleId lcId, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens) const
+{
+    auto const blocks = _maxScratchBlocks(lcId, maxBlocksPerSeq, maxTotalInputTokens);
+    if (blocks <= 0)
+    {
+        return 0;
+    }
+    // The same fraction KvCache::_takeExcessScratchSlots converts with, so what a request
+    // takes and what the batch stages for it cannot disagree. It is the widest ratio any
+    // of the life cycle's (layer, pool) pairs reaches, and a narrower one would leave the
+    // widest layer's slots past the end of the row.
+    return mStorage->slotUtilFracMax(lcId).ceilMul(blocks);
+}
+
+int KvCacheManager::maxScratchSlots(int maxBlocksPerSeq) const
+{
+    int result = 0;
+    for (LifeCycleId lcId{0}; lcId < numLifeCycles(); ++lcId)
+    {
+        result = std::max(result, _scratchSlotsFor(lcId, maxBlocksPerSeq));
+    }
+    return result;
+}
+
+int KvCacheManager::_maxScratchBlocks(
+    LifeCycleId lcId, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens) const
+{
+    if (!mConfig.enableSwaScratchReuse() || maxBlocksPerSeq <= 0)
+    {
+        return 0;
+    }
+    auto const* attn = std::get_if<AttnLifeCycle>(&lifeCycles().getLifeCycle(lcId));
+    if (attn == nullptr || !attn->windowSize.has_value())
+    {
+        return 0;
+    }
+    auto const tpb = tokensPerBlock();
+    auto const rewind = mConfig.swaScratchReuse->maxRewindLen;
+
+    // Capacity-limited: a request whose history is empty and whose capacity fills the page
+    // table. Deferred to getStaleRange rather than restated, since which blocks are stale
+    // turns on the sink count and on the in-flight token the window always keeps.
+    auto const capacity = static_cast<int64_t>(maxBlocksPerSeq) * tpb;
+    auto const stale = attn->getStaleRange(static_cast<int>(std::max<int64_t>(0, capacity - rewind)), tpb);
+    auto bound = static_cast<int64_t>(stale.end.value() - stale.beg.value());
+
+    if (maxTotalInputTokens.has_value())
+    {
+        // The subtraction is in tokens, before the division: converting to blocks first and
+        // subtracting after would lose the alignment this is exact at. The bound is tight --
+        // the count is largest when the stale end falls on a block boundary, which is the
+        // case this quotient gives.
+        auto const reach = static_cast<int64_t>(*maxTotalInputTokens) - *attn->windowSize - rewind + 1;
+        bound = std::min(bound, reach / tpb);
+    }
+    return static_cast<int>(std::max<int64_t>(0, bound));
+}
+
+std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const
 {
     switch (mode)
     {
     case PageIndexMode::PER_LAYER: return true;
-    case PageIndexMode::SHARED: return mConfig.enableSwaScratchReuse() ? std::optional<bool>(std::nullopt) : true;
+    case PageIndexMode::SHARED:
+    {
+        if (!mConfig.enableSwaScratchReuse())
+        {
+            return true;
+        }
+        // A life cycle with no sliding window yields an empty scratch range whatever the
+        // watermarks, so no request can ever hold scratch slots for it.
+        auto const* attn = std::get_if<AttnLifeCycle>(&lifeCycles().getLifeCycle(lcId));
+        bool const mayHoldScratch = attn != nullptr && attn->windowSize.has_value();
+        return mayHoldScratch ? std::optional<bool>(std::nullopt) : true;
+    }
     }
     return std::nullopt;
 }
@@ -461,16 +807,46 @@ std::vector<LayerId> KvCacheManager::layerIds() const
 
 LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 {
-    return mStorage->layerToLifeCycleIds().at(layerId);
+    auto const& lifeCycles = mStorage->layerToLifeCycleIds().at(layerId);
+    TLLM_CHECK_WITH_INFO(lifeCycles.size() == 1,
+        "Layer %d has buffers in %zu layer groups because its buffers use different reuse policies; "
+        "look up its layer group per buffer with get_buffer_group_id(layer_id, role) / getBufferGroupId(layerId, role)",
+        layerId, lifeCycles.size());
+    return lifeCycles.front();
+}
+
+CacheGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
+{
+    return mStorage->getBufferAttr(layerId, role).lifeCycleId;
 }
 
 TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() const
 {
     LifeCycleId numLc = mLifeCycles.size();
     TypedVec<LayerGroupId, std::vector<LayerId>> result(numLc);
-    for (auto const& [lid, lc] : mStorage->layerToLifeCycleIds())
+    for (auto const& [lid, lifeCycles] : mStorage->layerToLifeCycleIds())
     {
-        result.at(lc).push_back(lid);
+        result.at(getLayerGroupId(lid)).push_back(lid);
+    }
+    return result;
+}
+
+TypedVec<CacheGroupId, std::vector<BufferId>> KvCacheManager::bufferGrouping() const
+{
+    TypedVec<CacheGroupId, std::vector<BufferId>> result(mLifeCycles.size());
+    std::unordered_map<LayerId, std::vector<BufferId>> buffersByLayer;
+    for (auto const& buffer : allBufferIds())
+    {
+        buffersByLayer[buffer.layerId].push_back(buffer);
+    }
+    // Keep layer order consistent with layerGrouping() for consumers that pair
+    // group membership with a declared list of global model layer IDs.
+    for (auto const& [layer, lifeCycles] : mStorage->layerToLifeCycleIds())
+    {
+        for (auto const& buffer : buffersByLayer.at(layer))
+        {
+            result.at(getBufferGroupId(buffer.layerId, buffer.role)).push_back(buffer);
+        }
     }
     return result;
 }
@@ -504,7 +880,8 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 size_t KvCacheManager::getQuota(CacheLevel level) const
 {
     auto const apiLock = lockShared();
-    return mStorage->mLevels.at(level).storage->totalQuota();
+    auto const& storage = *mStorage->mLevels.at(level).storage;
+    return storage.roundedNumBytes(storage.cacheTier());
 }
 
 // ---- Statistics ----------------------------------------------------------

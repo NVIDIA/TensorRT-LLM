@@ -302,7 +302,7 @@ class MappedHostRegion
 {
 public:
     explicit MappedHostRegion(std::size_t payloadBytes)
-        : mMemory(roundUp(kGuardBytes + payloadBytes + kGuardBytes, HostMem::kAlignment))
+        : mMemory(roundUp(kGuardBytes + payloadBytes + kGuardBytes, HostMem::sizeGranularity()))
         , mPayloadBytes(payloadBytes)
     {
         TLLM_CHECK_WITH_INFO(kGuardBytes + payloadBytes + kGuardBytes <= mMemory.size(),

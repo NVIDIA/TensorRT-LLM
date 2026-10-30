@@ -11,25 +11,6 @@ l0_gb300_multi_gpus_perf_sanity:
       linux_distribution_name: ubuntu*
       cpu: aarch64
     terms:
-      stage: pre_merge
-      backend: pytorch
-  tests:
-  # ctx_only tests (disagg config)
-  # deepseek-v4-pro-fp4 8k1k
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (45)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] TIMEOUT (65)
-
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 4
-        lte: 4
-    wildcards:
-      gpu:
-      - '*gb300*'
-      linux_distribution_name: ubuntu*
-      cpu: aarch64
-    terms:
       stage: post_merge
       backend: pytorch
   tests:
@@ -39,13 +20,31 @@ l0_gb300_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm-5-fp4_8k1k_con512_ctx1_dep2_gen1_dep32_eplb0_mtp3_ccb-NIXL] TIMEOUT (50)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL] TIMEOUT (65)
   # deepseek-v4-pro-fp4 8k1k
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (45)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] TIMEOUT (45)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] TIMEOUT (65)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] TIMEOUT (125)
+  # glm-5.3-flash-fp8 8k1k con16
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm53-flash-fp8_8k1k_con16_ctx1_tep4_gen1_tep4_eplb0_mtp3_ccb-NIXL] TIMEOUT (30)
+  # minimax-m3-fp4 150k prompts, TP2 ctx worker
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (40)
   # deepseek-v4.1-flash-fp4 8k1k dspark (aggregated)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_deepseek_v41_flash_nvfp4_grace_blackwell-v41_flash_nvfp4_tep4_dspark5_8k1k] TIMEOUT (30)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_deepseek_v41_flash_nvfp4_grace_blackwell-v41_flash_nvfp4_dep4_dspark5_8k1k] TIMEOUT (35)
+  # deepseek-v4.1-flash 8k1k (aggregated)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v41_flash_grace_blackwell-v41_flash_tep4_8k1k] TIMEOUT (30)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v41_flash_grace_blackwell-v41_flash_dep4_8k1k] TIMEOUT (30)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v41_flash_grace_blackwell-v41_flash_tep4_dspark_8k1k] TIMEOUT (30)
   # glm-5.3-flash-fp8 tp4 mtp3 8k1k (aggregated)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_tp4_mtp3_8k1k] TIMEOUT (30)
+  # glm-5.3-flash-fp8 attention dp4 mtp3 fp8 kv 8k1k and long prompt (aggregated)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_dep4_mtp3_fp8kv_8k1k] TIMEOUT (30)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_tp4_mtp3_isl13312_osl33] TIMEOUT (30)
+  # glm-5.3-flash-nvfp4 tp4 mtp3 8k1k (aggregated)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_nvfp4_grace_blackwell-glm53_flash_nvfp4_tp4_mtp3_8k1k] TIMEOUT (30)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_nvfp4_grace_blackwell-glm53_flash_nvfp4_tp4_mtp3_isl13312_osl33] TIMEOUT (35)
+  # qwen3.8-flash-next-nvfp4 modeling_v2 tp1 mtp3 8k1k (aggregated, 1 GPU)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_qwen3_8_flash_next_fp4_grace_blackwell-qwen3_8_flash_next_fp4_mv2_tp1_mtp3_8k1k] TIMEOUT (35)
   # nemotron-ultra-v3-fp4 8k64k (ctx_only)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL] TIMEOUT (30)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_8k64k_con9832_ctx1_dep4_gen8_dep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (60)
@@ -60,3 +59,8 @@ l0_gb300_multi_gpus_perf_sanity:
   # nemotron-ultra-v3-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL] TIMEOUT (40)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL] TIMEOUT (40)
+  # glm-5.3-flash-fp8 8k1k con16
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_glm53-flash-fp8_8k1k_con16_ctx1_tep4_gen1_tep4_eplb0_mtp3_ccb-NIXL] TIMEOUT (30)
+  # minimax-m3-fp4 eagle3 150k1k con1 and con64, TP4 gen worker
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (35)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con64_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (45)

@@ -51,14 +51,12 @@ from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
 
 # yapf: disable
 # isort: off
-from ..bindings.executor import (BatchingType as _BatchingType,
-                                 CacheTransceiverBackendType as _CacheTransceiverBackendType,
+from ..bindings.executor import (CacheTransceiverBackendType as _CacheTransceiverBackendType,
                                  CacheTransceiverConfig as _CacheTransceiverConfig,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
                                  DecodingConfig,
                                  DynamicBatchConfig as _DynamicBatchConfig,
-                                 ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
@@ -2015,6 +2013,20 @@ class AttentionDpConfig(StrictBaseModel):
     batching_wait_iters: int = Field(
         default=10,
         description="The number of iterations to wait for batching.")
+    enable_kv_balanced_admission: bool = Field(
+        default=False,
+        description=
+        "Admit generation-only requests by per-rank KV load. When True and "
+        "the first 32 queued requests are all generation-only requests "
+        "without an attention_dp_rank, the attention DP router chooses which "
+        "of them to admit and which rank takes each, keeping the largest "
+        "per-rank request count and KV token count low, instead of admitting "
+        "them in queue order. Request priorities are respected, and a request "
+        "passed over in 64 admitting rounds is admitted next. Useful on "
+        "disaggregated generation workers. Has no effect with "
+        "kv_cache_routing_conversation_affinity, or with "
+        "enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+        status="prototype")
     enable_kv_cache_aware_routing: bool = Field(
         default=False,
         description="Enable internal KV cache-aware routing for attention DP. "
@@ -2730,6 +2742,23 @@ class KvCacheConnectorConfig(StrictBaseModel):
         "set, trtllm-serve provisions the pool during bringup instead of "
         "requiring MOONCAKE_CONFIG_PATH from an external script.")
 
+    transfer_timeout_sec: float = Field(
+        default=600.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Deadline in seconds for an outstanding ADP KV connector "
+        "transfer. Checked at polling gates; cannot interrupt blocking callbacks. "
+        "Expiration fails all ADP owners and requires process restart. Unused without attention DP."
+    )
+    control_grace_sec: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Grace period in seconds for pending ADP KV connector "
+        "transfers after cancellation or shutdown. Can only shorten the "
+        "existing transfer deadline. Expiration fails all ADP owners and requires process restart. "
+        "Unused without attention DP.")
+
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
         from tensorrt_llm._torch.pyexecutor.connectors.registry import (
@@ -2800,11 +2829,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         "The topK value for each layer when dynamic tree is enabled. Required "
         "when use_dynamic_tree is True; ignored (with a warning) when "
         "use_dynamic_tree is False.")
-    num_eagle_layers: Optional[int] = Field(
-        default=None,
-        description=
-        "Deprecated TensorRT-only field with different semantics from draft model "
-        "layer count. Do not use on the PyTorch backend.")
     _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
@@ -2826,7 +2850,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -4248,15 +4271,6 @@ class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
     """Combined metaclass for Enum and PybindMirror.  This is crucial."""
 
 
-@PybindMirror.mirror_pybind_enum(_BatchingType)
-class BatchingType(StrEnum, metaclass=PybindMirrorEnumMeta):
-    STATIC = "STATIC"
-    INFLIGHT = "INFLIGHT"
-
-    def _to_pybind(self):
-        return getattr(_BatchingType, self.value)
-
-
 @PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
 class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     MAX_UTILIZATION = "MAX_UTILIZATION"
@@ -5429,35 +5443,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         return v
 
 
-@PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
-class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
-    """Configuration for extended runtime performance knobs."""
-
-    multi_block_mode: bool = Field(
-        default=True, description="Whether to use multi-block mode.")
-
-    enable_context_fmha_fp32_acc: bool = Field(
-        default=False,
-        description="Whether to enable context FMHA FP32 accumulation.")
-
-    cuda_graph_mode: bool = Field(default=False,
-                                  description="Whether to use CUDA graph mode.")
-
-    cuda_graph_cache_size: int = Field(
-        default=0,
-        description=
-        "Number of cuda graphs to be cached in the runtime. The larger the cache, the better the perf, but more GPU memory is consumed."
-    )
-
-    def _to_pybind(self):
-        res = _ExtendedRuntimePerfKnobConfig(
-            multi_block_mode=self.multi_block_mode,
-            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
-        res.cuda_graph_mode = self.cuda_graph_mode
-        res.cuda_graph_cache_size = self.cuda_graph_cache_size
-        return res
-
-
 # Legacy env-var selectors for the "DEFAULT" cache-transceiver backend,
 # ordered by priority. Single source of truth shared with
 # _torch/disaggregation/kv_cache_transceiver.py.
@@ -5687,7 +5672,7 @@ class DwdpConfig(StrictBaseModel):
     Each worker holds a subset of experts locally and asynchronously prefetches
     the remaining experts from peer workers via CUDA VMM + MNNVL fabric
     handles (composite virtual-address layout with zero-copy local mapping and
-    double-buffered P2P remote regions), enabling fully asynchronous execution
+    P2P remote prefetch slots), enabling fully asynchronous execution
     across ranks without synchronization barriers.
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
@@ -5709,6 +5694,14 @@ class DwdpConfig(StrictBaseModel):
         "Enable limited-contention prefetch optimization. Uses batched "
         "memcpy with round-robin slice ordering across peers and a 2 MiB "
         "slice granularity to reduce NVLink contention.")
+    num_prefetch_slots: int = Field(
+        default=2,
+        ge=2,
+        description=
+        "The number of expert prefetch buffer slots. Each slot holds the "
+        "remote experts of one MoE layer; more slots let the prefetch run "
+        "further ahead of the MoE compute, at the cost of device memory that "
+        "is then not available to the KV cache.")
 
 
 class BaseLlmArgs(StrictBaseModel):

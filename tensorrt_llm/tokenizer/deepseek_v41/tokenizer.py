@@ -43,7 +43,8 @@ differences, each verified against the checkpoint by
 5. **Tool names are namespace-qualified** (``namespace::name``), and a namespace
    description is prepended to the tool description.
 6. **There is no ``developer`` role**, and assistant reasoning is read only from
-   ``reasoning_content`` (V4 also accepted ``reasoning``).
+   ``reasoning_content`` (V4 also accepted ``reasoning``). ``apply_chat_template``
+   renders a developer message as a system message.
 
 Renders text and image placeholders; the multimodal input pipeline decodes images
 and inserts their placeholders.
@@ -89,6 +90,16 @@ REASONING_EFFORT_TEMPLATE = (
 )
 REASONING_EFFORT_MAPPINGS = {"low": 50, "high": 75, "max": 100}
 DEFAULT_REASONING_EFFORT = "high"
+# OpenAI's reasoning levels, placed on the same budget: the levels the checkpoint
+# names keep their budgets, and the others fall between them in order.
+OPENAI_REASONING_EFFORTS = {
+    "minimal": 25,
+    "low": 50,
+    "medium": 62,
+    "high": 75,
+    "xhigh": 87,
+    "max": 100,
+}
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -612,13 +623,26 @@ class DeepseekV41Tokenizer(TransformersTokenizer):
         thinking_mode = "thinking" if thinking else "chat"
         # Unlike V4, any value the checkpoint accepts is passed through: the
         # budget is numeric, so clamping to {"max", "high"} would silently
-        # discard a caller's "low" or explicit integer.
+        # discard a caller's "low" or explicit integer. OpenAI's level names
+        # are translated to the budget; anything else is left to the renderer.
         reasoning_effort = kwargs.get("reasoning_effort")
+        if isinstance(reasoning_effort, str) and reasoning_effort in OPENAI_REASONING_EFFORTS:
+            reasoning_effort = OPENAI_REASONING_EFFORTS[reasoning_effort]
 
         conversation = kwargs.get("conversation", messages)
-        messages = list(conversation)
+        # V4.1 has no developer role; a developer message is a system message.
+        messages = [
+            {**message, "role": "system"} if message.get("role") == "developer" else message
+            for message in conversation
+        ]
         if tools:
-            messages.insert(0, {"role": "system", "tools": tools})
+            # The checkpoint's encoder renders tools from the system message that
+            # leads the conversation, after its content: one system block, not a
+            # tools-only block ahead of the caller's system prompt.
+            if messages and messages[0].get("role") == "system" and not messages[0].get("tools"):
+                messages[0] = {**messages[0], "tools": tools}
+            else:
+                messages.insert(0, {"role": "system", "tools": tools})
 
         rendered = encode_messages(
             messages=messages,

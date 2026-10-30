@@ -32,6 +32,9 @@ If a CI run fails `sanity_perf_check.py`, it will upload a patch file as an arti
 
 This patch will only update the metrics that had a difference which was over the accepted threshold. The patch will also remove/add metrics according to the removed or added tests.
 
+## Warmup pass
+Before measuring, `test_perf.py` warms up with one un-measured wave of the benchmark's own traffic (its concurrency, or `min(reqs, maxbs)` without one), so JIT kernels for the real prefill shapes compile outside the measured window: `bench` cases raise `trtllm-bench --warmup` to that wave, and `serve` cases send it with other prompts before each client. `TRTLLM_PERF_WARMUP_PASS=0` turns it off.
+
 ## Running locally
 Given a `target_perf_csv_path` you can compare it to another perf csv file.
 First make sure you install the dependencies:

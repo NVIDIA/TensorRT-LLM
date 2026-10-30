@@ -3161,6 +3161,53 @@ def test_deepseek_streaming_keeps_markdown_fences(
     assert parser_cls().detect_and_parse(text, sample_tools).normal_text == text
 
 
+def _dsml_tool_call(tag_prefix: str, block_name: str, name: str,
+                    string_arguments: dict[str, str]) -> str:
+    """A tool call as the DSML encoders render it: each string value verbatim."""
+    parameters = "\n".join(
+        f'<{tag_prefix}parameter name="{key}" string="true">{value}'
+        f"</{tag_prefix}parameter>" for key, value in string_arguments.items())
+    return (f"<{tag_prefix}{block_name}>\n"
+            f'<{tag_prefix}invoke name="{name}">\n{parameters}\n'
+            f"</{tag_prefix}invoke>\n</{tag_prefix}{block_name}>")
+
+
+@pytest.mark.parametrize("parser_cls,tag_prefix,block_name", [
+    (DeepSeekV32Parser, "｜DSML｜", "function_calls"),
+    (DeepSeekV4Parser, "｜DSML｜", "tool_calls"),
+    (DeepSeekV41Parser, "｜DSML｜ ", "calls"),
+])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_dsml_string_parameter_values_are_kept_as_written(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tag_prefix: str, block_name: str,
+        streaming: bool) -> None:
+    """A string value's leading and trailing whitespace is part of the value.
+
+    An edit's ``old_string`` must match the file including its indentation,
+    and a written file keeps its last newline.
+    """
+    arguments = {
+        "location": "    indented line\n    second line",
+        "unit": "file content\n",
+    }
+    text = _dsml_tool_call(tag_prefix, block_name, "get_weather", arguments)
+
+    parser = parser_cls()
+    if streaming:
+        results = [
+            parser.parse_streaming_increment(text[i:i + 7], sample_tools)
+            for i in range(0, len(text), 7)
+        ]
+        calls = [call for result in results for call in result.calls]
+    else:
+        calls = parser.detect_and_parse(text, sample_tools).calls
+
+    assert [call.name for call in calls if call.name] == ["get_weather"]
+    assert json.loads("".join(call.parameters or ""
+                              for call in calls)) == arguments
+
+
 @pytest.mark.parametrize(
     "parser_cls, tool_call_text",
     [
@@ -6823,6 +6870,73 @@ class TestConfigureParserSpecialTokenDecoding:
         assert sampling_params.skip_special_tokens is False
         assert sampling_params.spaces_between_special_tokens is True
 
+    @pytest.mark.parametrize(
+        "reasoning_parser, tool_parser, with_tools, skip, spaces",
+        [
+            ("kimi_k3", "kimi_k3", True, False, False),
+            ("kimi_k3", None, False, False, False),
+            (None, "deepseek_v32", True, False, True),
+            (None, "deepseek_v32", False, True, True),
+            (None, None, True, True, True),
+        ],
+    )
+    def test_the_responses_route_applies_it(self, monkeypatch, reasoning_parser,
+                                            tool_parser, with_tools, skip,
+                                            spaces) -> None:
+        """/v1/responses detokenizes for the parsers as chat completions does.
+
+        Without it Kimi-K3's tags arrive with their special tokens dropped or
+        spaced apart, and its tool calls reach the client as message text.
+        """
+        import asyncio
+        from types import SimpleNamespace
+
+        import tensorrt_llm.serve.openai_server as server_module
+        from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        async def fake_preprocess(**kwargs):
+            return [1, 2, 3], SamplingParams()
+
+        monkeypatch.setattr(server_module, "responses_api_request_preprocess",
+                            fake_preprocess)
+        submitted = []
+
+        def generate_async(*, sampling_params, **kwargs):
+            submitted.append(sampling_params)
+            raise RuntimeError("stop after submission")
+
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        server.enable_store = False
+        server.use_harmony = False
+        server.tokenizer = None
+        server.model_config = None
+        server.processor = None
+        server.multimodal_server_config = None
+        server.chat_template = None
+        server.tool_parser = tool_parser
+        server.metrics_collector = None
+        server.conversation_store = None
+        server.generator = SimpleNamespace(args=SimpleNamespace(
+            reasoning_parser=reasoning_parser, num_postprocess_workers=0),
+                                           generate_async=generate_async)
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        tools = [{
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {
+                "type": "object"
+            }
+        }] if with_tools else None
+        request = ResponsesRequest(model="test-model", input="hi", tools=tools)
+
+        asyncio.run(server.openai_responses(request, raw_request))
+
+        (sampling_params, ) = submitted
+        assert sampling_params.skip_special_tokens is skip
+        assert sampling_params.spaces_between_special_tokens is spaces
+
 
 # ============================================================================
 # Forced tool call: argument truncation — TRTLLM-12758
@@ -7554,3 +7668,167 @@ def test_parse_base_json_reports_the_name_as_emitted(sample_tools):
 
     assert [(c.name, c.tool_index)
             for c in calls] == [("functions.get_weather", -1)]
+
+
+# ============================================================================
+# DeepSeek DSML layout: the newlines inside a tool-call block are not content
+# ============================================================================
+
+_DSML_FORMATS = [
+    (DeepSeekV32Parser, "function_calls", "invoke", "parameter"),
+    (DeepSeekV4Parser, "tool_calls", "invoke", "parameter"),
+    (DeepSeekV41Parser, " calls", " invoke", " parameter"),
+]
+
+
+def _dsml_block(calls_tag: str, invoke_tag: str, parameter_tag: str) -> str:
+    """Two calls laid out as the checkpoint encoders write them: one per line."""
+    dsml = "｜DSML｜"
+
+    def invoke(name: str, key: str, value: str) -> str:
+        return (f'<{dsml}{invoke_tag} name="{name}">\n'
+                f'<{dsml}{parameter_tag} name="{key}" string="true">{value}'
+                f"</{dsml}{parameter_tag}>\n"
+                f"</{dsml}{invoke_tag}>")
+
+    return (f"<{dsml}{calls_tag}>\n" +
+            invoke("get_weather", "location", "NYC") + "\n" +
+            invoke("search_web", "query", "AI") + "\n" +
+            f"</{dsml}{calls_tag}>")
+
+
+def _stream(parser,
+            text: str,
+            chunk_size: int,
+            tools: list[ChatCompletionToolsParam],
+            *,
+            finish: bool = True):
+    results = [
+        parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+        for i in range(0, len(text), chunk_size)
+    ]
+    if finish:
+        results.append(parser.finish(tools))
+    content = "".join(result.normal_text for result in results)
+    calls = [call for result in results for call in result.calls]
+    return content, calls
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 10_000])
+def test_dsml_newlines_between_calls_are_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The newline after each invoke is the block's layout, however it is chunked.
+
+    Streamed as text, it became content after every tool call: over Anthropic
+    Messages, a whitespace-only text block followed each tool_use, and a client
+    that drops such blocks sent back a turn that no longer matched what was
+    served.
+    """
+    text = "Let me check.\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Let me check."
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+    arguments = [
+        json.loads(call.parameters) for call in calls
+        if not call.name and call.parameters
+    ]
+    assert arguments == [{"location": "NYC"}, {"query": "AI"}]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [5, 10_000])
+def test_dsml_text_after_the_block_is_still_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Only the layout inside the block is dropped; text after it is kept.
+
+    In one increment, the closing tag and the text after it follow the last
+    invoke; that text must come out of that increment.
+    """
+    text = _dsml_block(calls_tag, invoke_tag, parameter_tag) + " Done."
+
+    parser = parser_cls()
+    content, calls = _stream(parser,
+                             text,
+                             chunk_size,
+                             sample_tools,
+                             finish=False)
+
+    assert content == " Done."
+    finish_result = parser.finish(sample_tools)
+    assert finish_result.normal_text == ""
+    assert finish_result.calls == []
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 10_000])
+def test_dsml_blank_line_before_the_block_is_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The encoders write a blank line between the content and the block.
+
+    The content keeps its own whitespace; only that blank line is dropped, on
+    both paths.
+    """
+    content_in = "  Indented first line.\nLast line.\n"
+    text = content_in + "\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == content_in
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content_in
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_trailing_blank_lines_without_a_block_are_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Newlines held back in case a block follows come out when none does."""
+    text = "Done.\n\n"
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == text
+    assert calls == []
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """A stream cut short inside the block ends with its content.
+
+    The non-streaming path reads the same text the same way.
+    """
+    block = _dsml_block(calls_tag, invoke_tag, parameter_tag)
+    text = "Checking.\n\n" + block[:block.index("</｜DSML｜")]
+
+    content, _ = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Checking."
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content
