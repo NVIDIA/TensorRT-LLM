@@ -2770,7 +2770,8 @@ class AllReduceRunner(TunableRunner):
 
     def unique_id(
         self
-    ) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool, bool, Tuple[int, ...]]:
+    ) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool, bool, Tuple[int,
+                                                                         ...]]:
         return (
             self.tp_size,
             # Keep Python cache entries aligned with the native tactic cache:
