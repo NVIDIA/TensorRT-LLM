@@ -702,13 +702,15 @@ def sync_tree(src: Path,
     the source's current content, so it is skipped. Once the source is
     replaced by a new file, the inodes differ and the file is linked again.
     After one failed link, the rest of the tree is copied. Pass
-    ``hard_link=False`` when files in dst are edited in place after the sync.
+    ``hard_link=False`` when files in dst are edited in place after the sync;
+    hard links left in dst by an earlier sync are then replaced by copies.
     """
     import fnmatch
 
     src = Path(src).resolve()
     dst = Path(dst)
     now = time.time()
+    copy_only = not hard_link
 
     def excluded(name: str) -> bool:
         return any(fnmatch.fnmatch(name, pat) for pat in exclude)
@@ -778,13 +780,15 @@ def sync_tree(src: Path,
             try:
                 src_stat = src_file.stat()
                 dst_stat = dst_file.stat()
-                if os.path.samestat(src_stat, dst_stat):
+                same_inode = os.path.samestat(src_stat, dst_stat)
+                if same_inode and not copy_only:
                     continue
                 # Trust the match only once the source mtime has aged past the
                 # race window; a just-written source can be rewritten again
                 # without the mtime moving, which would strand a stale copy.
                 # With hard links, a matching copy is replaced by a link.
-                if (not hard_link and src_stat.st_size == dst_stat.st_size
+                if (not hard_link and not same_inode
+                        and src_stat.st_size == dst_stat.st_size
                         and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3
                         and src_stat.st_mtime <= now - _MTIME_RACE_WINDOW):
                     continue

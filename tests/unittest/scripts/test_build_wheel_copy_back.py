@@ -313,9 +313,10 @@ def test_same_src_dst_is_noop(sync_tree, tmp_path):
 def test_copy_over_hard_link_keeps_source(build_wheel_module, tmp_path):
     """A copy installed over an earlier hard link must not change its source.
 
-    Files that patchelf edits after install are installed as copies. If dst
-    still is a hard link from an earlier install, writing the copy into it
-    would also rewrite the build output that shares its inode.
+    Files that patchelf edits after install are installed as copies, by
+    link_or_copy_file or by sync_tree. If dst still is a hard link from an
+    earlier install, writing into it would also rewrite the build output that
+    shares its inode.
     """
     link_or_copy_file = build_wheel_module.link_or_copy_file
     build_output = tmp_path / "libwrapper.so"
@@ -329,8 +330,19 @@ def test_copy_over_hard_link_keeps_source(build_wheel_module, tmp_path):
     assert os.path.samefile(installed, build_output)
 
     assert not link_or_copy_file(build_output, lib_dir, hard_link=False)
+    assert installed.read_bytes() == b"built\n"
     installed.write_bytes(b"patched\n")  # an in-place edit, as patchelf does
     assert build_output.read_bytes() == b"built\n"
+
+    # A folder synced with hard links, then synced again as copies
+    src, dst = tmp_path / "build", tmp_path / "pkg"
+    src.mkdir()
+    (src / "lib.so").write_bytes(b"built\n")
+    build_wheel_module.sync_tree(src, dst, hard_link=True)
+    assert os.path.samefile(dst / "lib.so", src / "lib.so")
+    build_wheel_module.sync_tree(src, dst, hard_link=False)
+    (dst / "lib.so").write_bytes(b"patched\n")
+    assert (src / "lib.so").read_bytes() == b"built\n"
 
 
 @pytest.mark.parametrize(
