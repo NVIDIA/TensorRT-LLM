@@ -333,6 +333,11 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
+  # Muse Spark Open: the decoder's GPU module tests and the tower load; the
+  # remaining Muse files are cpu_only and run in l0_cpu.
+  - unittest/_torch/modeling/test_modeling_musespark_open.py
+  - unittest/_torch/modeling/test_musespark_open_moe_tp.py
+  - unittest/_torch/modeling/test_musespark_open_tower_load.py
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
