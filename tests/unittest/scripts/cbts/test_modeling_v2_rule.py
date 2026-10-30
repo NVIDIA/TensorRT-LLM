@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Block, Stage, YAMLIndex
+from cbts.blocks import Block, Stage, YAMLIndex, block_matches_stage, parse_stages_from_groovy
 from cbts.rules.base import PRInputs
 from cbts.rules.modeling_v2 import ModelingV2Rule, _is_mv2_claim, _kept_entries
 
@@ -158,8 +160,106 @@ def test_scope(rule):
     assert _COMM in _selected(result)  # unreadable family falls back to all modeling_v2
 
 
-@pytest.mark.parametrize("relative", ["csrc/kernel.cu", "ops/_native.py", "routing.py"])
-def test_stock_linked_k3_uses_baseline_selection(rule, relative):
+@pytest.mark.parametrize("relative", ["csrc/kernel.cu", "fake_ops.py", "routing.py"])
+def test_k3_uses_modeling_v2_selection(rule, relative):
     path = f"{_PY}/models/kimi_k3_vl/{relative}"
-    assert not _is_mv2_claim(path)
-    assert _apply(rule, path) is None
+    assert _is_mv2_claim(path)
+    assert _apply(rule, path).scope == "modelingv2only"
+
+
+@pytest.mark.parametrize("relative", ["csrc/k3MnnvlAllreduce.cu", "target/modeling.py"])
+def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative):
+    family = rule._src_root / "models/kimi_k3_vl"
+    (family / "target").mkdir(parents=True)
+    (family / "target/modeling.py").touch()
+    (family / "routing.py").write_text("from .target.modeling import KimiK3\n")
+    prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl"
+    kernel_tests = {
+        f"{prefix}/test_k3_mnnvl_comm.py",
+        f"{prefix}/test_k3_sandwich.py",
+    }
+    matrix = f"{prefix}/test_modeling_v2_mnnvl_allgather_split_op_matrix.py"
+    norm = f"{prefix}/test_modeling_v2_attn_res_rmsnorm_fwd.py"
+    native = f"{prefix}/test_modeling_v2_k3_native.py"
+    host = f"{prefix}/test_modeling_v2_kimi_k3_decode_step.py"
+    accuracy = "accuracy/modeling_v2/test_kimi_k3_vl.py::TestKimiK3::test_gsm8k"
+    # The broad single-GPU entry excludes the flat family directory; its
+    # single-GPU tests and collective tests have separate stage entries.
+    rule.yaml_index.blocks[0].tests.remove(_UNIT)
+    rule.yaml_index.blocks[0].tests.extend([f"{_UNIT} --ignore={prefix}", native, accuracy])
+    rule.yaml_index.blocks[1].tests.extend([*sorted(kernel_tests), matrix])
+    rule.yaml_index.blocks[2].tests.append(norm)
+    rule.yaml_index.blocks[3].tests.append(host)
+    result = _apply(rule, f"{_PY}/models/kimi_k3_vl/{relative}")
+    selected = kernel_tests | {matrix, norm, native, host, accuracy, _CLAIMS}
+    assert _selected(result) == selected
+    assert result.affected_stages == {
+        "B300-PyTorch-1",
+        "B200-PyTorch-1",
+        "GB300-4_GPUs-PyTorch-1",
+        "CPU-Generic-x86-1",
+    }
+    assert result.scope == "modelingv2only"
+    other = _selected(_apply(rule, f"{_PY}/models/gpt_oss/csrc/kernel.cu"))
+    assert not (selected - {_CLAIMS}) & other
+
+
+def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
+    repo = Path(__file__).resolve().parents[4]
+    prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl/"
+    expected = {p.name for p in (repo / "tests" / prefix).glob("test_*.py")}
+    collective_tests = {
+        "test_k3_latent_reduce.py",
+        "test_k3_markov.py",
+        "test_k3_mnnvl_comm.py",
+        "test_k3_moe_front.py",
+        "test_k3_moe_push.py",
+        "test_k3_sandwich.py",
+        "test_k3_spec_accept_sharded.py",
+        "test_modeling_v2_k3_latent_reduce_op_matrix.py",
+        "test_modeling_v2_k3_moe_front_op_matrix.py",
+        "test_modeling_v2_k3_sandwich_oproj_op_matrix.py",
+        "test_modeling_v2_k3_sandwich_plain_op_matrix.py",
+        "test_modeling_v2_k3_sandwich_tail_op_matrix.py",
+        "test_modeling_v2_kimi_k3_decode_comm_op_matrix.py",
+        "test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py",
+        "test_modeling_v2_mnnvl_allgather_split_op_matrix.py",
+        "test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py",
+        "test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py",
+    }
+    index = YAMLIndex.load(repo / "tests/integration/test_lists/test-db")
+    stages = parse_stages_from_groovy(repo / "jenkins/L0_Test.groovy")
+    seen = set()
+    for block in index.blocks:
+        for entry in block.tests:
+            target = entry.split()[0].split("::")[0]
+            if not target.startswith(prefix):
+                # Broad directory entries must exclude this family outside its
+                # dedicated stages, or the GPU coverage would be duplicated.
+                if prefix.startswith(target.rstrip("/") + "/"):
+                    assert any(
+                        prefix.rstrip("/") == arg.removeprefix("--ignore=").rstrip("/")
+                        for arg in entry.split()
+                        if arg.startswith("--ignore=")
+                    ), (block.yaml_stem, entry)
+                continue
+            name = target.removeprefix(prefix)
+            assert name not in seen, (block.yaml_stem, name)
+            seen.add(name)
+            if block.yaml_stem == "l0_cpu":
+                assert name not in collective_tests
+                continue
+            multi = name in collective_tests
+            assert block.yaml_stem == ("l0_gb300" if multi else "l0_b300")
+            count = 4 if multi else 1
+            assert block.condition["ranges"]["system_gpu_count"] == {"gte": count, "lte": count}
+            assert block.condition["terms"]["stage"] == "pre_merge"
+            matched = {
+                stage.name
+                for stage in stages.values()
+                if stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
+            }
+            assert matched == (
+                {"GB300-4_GPUs-PyTorch-1"} if multi else {"B300-PyTorch-1", "B300-PyTorch-2"}
+            )
+    assert seen == expected
