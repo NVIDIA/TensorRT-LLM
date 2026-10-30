@@ -24,7 +24,8 @@
 # type-stub installation. Without bindings, keeps the same diagnostics and
 # disables automatic stub installation.
 # The check is advisory: write the result to mypy_final_report.txt and return
-# success to the caller even when mypy or baseline comparison fails.
+# success to the caller even when mypy or baseline comparison fails. Print the
+# final filtered report to stdout when the check finishes.
 # Checks changed product Python files by default; explicit paths can be passed
 # by pre-commit or on the command line. Pass --full-project to scan all product
 # Python files. Pass --update-baseline with --full-project to replace the saved
@@ -84,6 +85,7 @@ cleanup_stub_dir() {
         rm -rf "$MYPY_CONFIG_DIR" || true
     fi
     printf '\n# Check status: %s\n' "$check_status"
+    cat "$REPORT_FILE" >&3 || true
     printf 'mypy report: %s (check status: %s)\n' "$REPORT_FILE" "$check_status" >&3 || true
     trap - EXIT
     exit 0
