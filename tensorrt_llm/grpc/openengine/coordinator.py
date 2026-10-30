@@ -10,7 +10,9 @@ The Unix sockets live in the launcher's mode-0700 temporary directory.
 
 import asyncio
 import json
+import threading
 import uuid
+from _thread import RLock
 from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
@@ -65,8 +67,11 @@ def _address(directory: str, name: str) -> str:
     return f"unix:{Path(directory) / name}"
 
 
-def _server(address: str, handler: Callable) -> grpc.aio.Server:
-    server = grpc.aio.server(options=_OPTIONS)
+def _server(
+    address: str, handler: Callable, server: grpc.aio.Server | None = None
+) -> grpc.aio.Server:
+    if server is None:
+        server = grpc.aio.server(options=_OPTIONS)
     server.add_generic_rpc_handlers(
         (
             grpc.method_handlers_generic_handler(
@@ -108,6 +113,7 @@ class Coordinator:
         instance_id: str,
         healthy: Callable[[], bool],
         fail: Callable[[str], None],
+        admission_lock: RLock | None = None,
     ) -> None:
         self.instance_id = instance_id
         self.ready = False
@@ -115,17 +121,30 @@ class Coordinator:
         self._heartbeats: list[float | None] = [None] * count
         self._healthy = healthy
         self._fail = fail
+        self._admission_lock = admission_lock if admission_lock is not None else threading.RLock()
         self._requests: dict[str, tuple[str, int]] = {}
-        self._peers = [_Connection(_address(directory, f"frontend-{i}")) for i in range(count)]
-        self._server = _server(_address(directory, "coordinator"), self._dispatch)
+        self._directory = directory
+        self._peers: list[_Connection] = []
+        self._server: grpc.aio.Server | None = None
 
     async def start(self) -> None:
-        await self._server.start()
+        try:
+            self._server = grpc.aio.server(options=_OPTIONS)
+            for frontend in range(len(self._heartbeats)):
+                self._peers.append(_Connection(_address(self._directory, f"frontend-{frontend}")))
+            _server(_address(self._directory, "coordinator"), self._dispatch, self._server)
+            await self._server.start()
+        except BaseException:
+            await self.close()
+            raise
 
     async def close(self) -> None:
         self.ready = False
-        await self._server.stop(0)
-        await asyncio.gather(*(peer.close() for peer in self._peers))
+        try:
+            if self._server is not None:
+                await self._server.stop(0)
+        finally:
+            await asyncio.gather(*(peer.close() for peer in self._peers))
 
     def _group_ready(self) -> bool:
         if not self.ready or self.stopping:
@@ -187,15 +206,18 @@ class Coordinator:
                 self._fail(f"OpenEngine frontend {message['frontend']} is stopping")
             return {}
         if operation == "reserve":
-            if not self._group_ready():
-                return {"ready": False, "reserved": False}
-            request_id = message["request_id"]
-            owner = (message["token"], message["frontend"])
-            current = self._requests.get(request_id)
-            if current is not None and current != owner:
-                return {"reserved": False}
-            self._requests[request_id] = owner
-            return {"reserved": True}
+            # Terminal owner failure and reservation commit share one ordering.
+            # This section performs no asynchronous work or engine operations.
+            with self._admission_lock:
+                if not self._group_ready():
+                    return {"ready": False, "reserved": False}
+                request_id = message["request_id"]
+                owner = (message["token"], message["frontend"])
+                current = self._requests.get(request_id)
+                if current is not None and current != owner:
+                    return {"reserved": False}
+                self._requests[request_id] = owner
+                return {"reserved": True}
         if operation == "release":
             request_id = message["request_id"]
             if self._requests.get(request_id) == (message["token"], message["frontend"]):

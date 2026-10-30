@@ -4,7 +4,8 @@
 """Exercise request ownership over real private gRPC sockets."""
 
 import asyncio
-from contextlib import asynccontextmanager, suppress
+import threading
+from contextlib import asynccontextmanager, contextmanager, suppress
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ from tensorrt_llm.grpc.openengine.coordinator import (  # noqa: E402
     DuplicateRequestError,
     FrontendClient,
 )
+from tensorrt_llm.grpc.openengine.coordinator_reactor import CoordinatorReactor  # noqa: E402
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
@@ -43,19 +45,24 @@ class Handle:
 
 
 @asynccontextmanager
-async def group(coordinator_type=Coordinator, client_type=FrontendClient):
+async def group(coordinator_type=Coordinator, client_type=FrontendClient, healthy=lambda: True):
     # Short paths avoid the AF_UNIX pathname limit under pytest's tmp_path.
     with TemporaryDirectory(prefix="oe-test-") as directory:
         failures = []
-        coordinator = coordinator_type(directory, 2, "shared-engine", lambda: True, failures.append)
+        coordinator = coordinator_type(directory, 2, "shared-engine", healthy, failures.append)
         clients = [client_type(directory, i, failures.append) for i in range(2)]
         await coordinator.start()
         for client in clients:
             await client.start()
-        coordinator.ready = True
+        if isinstance(coordinator, CoordinatorReactor):
+            await coordinator.set_ready()
+        else:
+            coordinator.ready = True
         try:
             yield coordinator, clients, failures
         finally:
+            if isinstance(coordinator, CoordinatorReactor):
+                await coordinator.stop_admission()
             for client in clients:
                 await client.close()
             await coordinator.close()
@@ -542,3 +549,172 @@ async def test_frontend_withdraw_stops_group_admission():
         with pytest.raises(CoordinationError):
             await second.reserve("new-work")
         await reservation.release()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_receiver_progresses_while_owner_loop_is_paused() -> None:
+    """Private ownership must progress independently of the inference loop."""
+    with TemporaryDirectory(prefix="oe-test-") as directory:
+        failures = []
+        errors = []
+        client_ready = threading.Event()
+        begin_reserve = threading.Event()
+        reply_received = threading.Event()
+        release_owner = threading.Event()
+        reactor = CoordinatorReactor(directory, 1, "shared-engine", lambda: True, failures.append)
+
+        async def exercise_frontend() -> None:
+            client = FrontendClient(directory, 0, failures.append)
+            try:
+                await client.start()
+                client_ready.set()
+                await asyncio.to_thread(begin_reserve.wait)
+                reservation = await client.reserve("independent-frontend")
+                reply_received.set()
+                release_owner.set()
+                await reservation.release()
+            finally:
+                await client.close()
+
+        def run_frontend() -> None:
+            try:
+                asyncio.run(exercise_frontend())
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                client_ready.set()
+                release_owner.set()
+
+        frontend = None
+        try:
+            await reactor.start()
+            frontend = threading.Thread(target=run_frontend, name="test-openengine-frontend")
+            frontend.start()
+            assert await asyncio.to_thread(client_ready.wait, 5)
+            assert not errors
+            await reactor.set_ready()
+            begin_reserve.set()
+            # Deliberately hold the owner loop; only the receiver and independent
+            # frontend can deliver the reply that releases it.
+            assert (
+                release_owner.wait(3) and reply_received.is_set()
+            ), f"Private control waited for the inference owner loop: {errors}"
+        finally:
+            begin_reserve.set()
+            release_owner.set()
+            try:
+                if frontend is not None:
+                    await asyncio.to_thread(frontend.join, 10)
+            finally:
+                await reactor.close()
+        assert frontend is not None and not frontend.is_alive()
+        assert not errors
+        assert not failures
+
+
+@pytest.mark.asyncio
+async def test_coordinator_thread_start_failure_keeps_cleanup_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_coordinator_start(_thread: threading.Thread) -> None:
+        raise RuntimeError("injected coordinator thread start failure")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_coordinator_start)
+    with TemporaryDirectory(prefix="oe-test-") as directory:
+        reactor = CoordinatorReactor(
+            directory, 1, "shared-engine", lambda: True, lambda reason: None
+        )
+        with pytest.raises(RuntimeError, match="injected coordinator thread start failure"):
+            await asyncio.wait_for(reactor.start(), 3)
+        await asyncio.wait_for(reactor.stop_admission(), 3)
+        await asyncio.wait_for(reactor.close(), 3)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_cached_health_recovers_without_reopening_a_fenced_group() -> None:
+    healthy = threading.Event()
+    healthy.set()
+    async with group(coordinator_type=CoordinatorReactor, healthy=healthy.is_set) as (
+        reactor,
+        (client, _),
+        failures,
+    ):
+        assert (await client.request("status"))["ready"]
+        healthy.clear()
+        assert not (await client.request("status"))["ready"]
+        assert not failures
+        healthy.set()
+        assert (await client.request("status"))["ready"]
+
+        reactor.report_owner_failure("terminal owner failure")
+        with pytest.raises(CoordinationError, match="fenced"):
+            await reactor.set_ready()
+        healthy.set()
+        status = await client.request("status")
+        assert not status["ready"] and status["stopping"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_failure_first", [True, False])
+async def test_terminal_owner_failure_is_ordered_with_reservation_commit(
+    owner_failure_first: bool,
+) -> None:
+    """A published terminal failure cannot race with a new ownership commit."""
+    async with group(coordinator_type=CoordinatorReactor) as (reactor, (client, _), _):
+        coordinator = reactor._coordinator
+        assert coordinator is not None
+        admission_lock = coordinator._admission_lock
+        entered, proceed = threading.Event(), threading.Event()
+        publishing, published = threading.Event(), threading.Event()
+
+        @contextmanager
+        def paused_admission():
+            if owner_failure_first:
+                entered.set()
+                assert proceed.wait(3)
+            with admission_lock:
+                if not owner_failure_first:
+                    entered.set()
+                    assert proceed.wait(3)
+                yield
+
+        def publish_failure() -> None:
+            publishing.set()
+            reactor.report_owner_failure("terminal owner failure")
+            published.set()
+
+        coordinator._admission_lock = paused_admission()
+        publisher = None
+        reserve = asyncio.create_task(
+            client.request("reserve", request_id="racing", token="generation", frontend=0)
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            if owner_failure_first:
+                # The receiver is paused before acquiring the lock. Publication
+                # returns before it resumes, and its queued fence cannot run yet.
+                publish_failure()
+                assert published.is_set()
+            else:
+                # The receiver already owns the lock. Publication must wait for
+                # this reservation to commit, without either thread deadlocking.
+                publisher = threading.Thread(target=publish_failure)
+                publisher.start()
+                assert await asyncio.to_thread(publishing.wait, 3)
+                assert not await asyncio.to_thread(published.wait, 0.1)
+            proceed.set()
+            reply = await asyncio.wait_for(reserve, 3)
+        finally:
+            proceed.set()
+            if publisher is not None:
+                await asyncio.to_thread(publisher.join, 3)
+                assert not publisher.is_alive()
+            coordinator._admission_lock = admission_lock
+            await asyncio.gather(reserve, return_exceptions=True)
+
+        assert published.is_set()
+        assert reply["reserved"] is not owner_failure_first
+        assert await client.request(
+            "reserve", request_id="after-failure", token="late", frontend=0
+        ) == {"ready": False, "reserved": False}
+        assert (await client.request("status"))["count"] == int(not owner_failure_first)
