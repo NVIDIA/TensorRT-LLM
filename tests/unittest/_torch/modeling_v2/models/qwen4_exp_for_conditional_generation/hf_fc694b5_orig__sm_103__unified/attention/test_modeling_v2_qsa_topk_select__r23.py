@@ -97,12 +97,19 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     _compare(out, op.reference(*args))
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    """Captured, then replayed against new scores and a new causal bound: the 256 rows a
-    verify step of 32 requests carries at max_draft_len 7."""
-    rows = 256
-    gen = torch.Generator(device=DEV).manual_seed(8)
-    cols = 2048
+#: (rows, score columns, replay window): tp1's 256-row verify step, then the unified
+#: target's decode batches 1 and 128 and its 1024-row MTP7 verify step at the
+#: 262144-token envelope's 65536 columns. Every capture runs full windows (the
+#: histogram path); the replays move the bound, 128 rows down to the budget's
+#: copy-through shortcut.
+GRAPH_CASES = ((256, 2048, 1500), (1, 65536, 65535), (128, 65536, 511), (1024, 65536, 30000))
+
+
+@pytest.mark.parametrize("rows, cols, replay_end", GRAPH_CASES)
+def test_cuda_graph_capture_and_replay(rows: int, cols: int, replay_end: int) -> None:
+    """Captured, then replayed against new scores and a new causal bound through the
+    captured addresses."""
+    gen = torch.Generator(device=DEV).manual_seed(8 + rows)
     logits = _logits("relu", rows, cols, gen)
     row_starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
     row_ends = torch.full((rows,), cols, dtype=torch.int32, device=DEV)
@@ -120,7 +127,7 @@ def test_cuda_graph_capture_and_replay() -> None:
         op(logits, row_starts, row_ends, indices, BLOCK_TOPK)
 
     logits.copy_(_logits("relu", rows, cols, gen))
-    row_ends.fill_(1500)
+    row_ends.fill_(replay_end)
     indices.fill_(SENTINEL)
     graph.replay()
     torch.cuda.synchronize()

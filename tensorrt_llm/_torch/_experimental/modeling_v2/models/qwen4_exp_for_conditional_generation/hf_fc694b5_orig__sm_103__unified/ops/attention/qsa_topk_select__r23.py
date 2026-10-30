@@ -17,6 +17,26 @@ _BLOCK_TOPK = 512
 #: Score-row width the target hands over: a 260-page block table at 32 tokens
 #: per block, compressed 4:1.
 _SCORE_COLUMNS = 260 * 32 // 4
+#: The unified target's widest score row: the tune envelope's `max_seq_len`
+#: 262144 is an 8192-page block table at 32 tokens per block, compressed 4:1.
+#: Core's 9216 (288 pages, 2304 columns) and MTP's 16384 (512 pages, 4096
+#: columns) are narrower; the kernel picks its path by each row's window, so
+#: the windows below span theirs.
+_ENVELOPE_SEQ_LEN = 262144
+_ENVELOPE_COLUMNS = _ENVELOPE_SEQ_LEN // 4
+#: 128 decode requests: the window edges first -- empty (position 2), one
+#: block, 511 / 512 / 513 blocks around the budget (512 is the kernel's
+#: copy-through shortcut, 513 its first histogram row), core's and MTP's widest
+#: rows, the envelope's less one column -- then 120 spread to the envelope.
+_DECODE_POSITIONS = (2, 3, 2046, 2047, 2051, 9215, 16383, _ENVELOPE_SEQ_LEN - 2) + tuple(
+    4096 + (_ENVELOPE_SEQ_LEN - 1 - 4096) * i // 119 for i in range(120)
+)
+#: 128 verify requests at max_draft_len 7, 8 consecutive positions each: one
+#: from position 0, two straddling the budget, core's and MTP's last rows, the
+#: envelope's last (a full 65536-column window), then 122 spread between.
+_VERIFY_STARTS = (0, 2040, 2044, 9208, 16376, _ENVELOPE_SEQ_LEN - 8) + tuple(
+    4096 + (_ENVELOPE_SEQ_LEN - 16 - 4096) * i // 121 for i in range(122)
+)
 #: Rows from which a contiguous launch runs the CuTe DSL sibling: the CUDA op
 #: serves rows at or past 12288 with its radix variant, which is the slower of
 #: the two (16384 rows: 310 vs 135 us at k=512 over 2592 columns, GB300);
@@ -110,6 +130,52 @@ class QsaTopkSelect(OpWrapper):
                 tail="nan",
             ),
         ),
+        # The unified target (tp4 / tep4 / dep4): the selection is per row and
+        # replicated across ranks, so the member changes only the row count.
+        Cell(
+            why="decode: one row at the 262144-token envelope, a 65535-block window, NaN tail",
+            spec=dict(
+                rows=1,
+                cols=_ENVELOPE_COLUMNS,
+                index_topk=_BLOCK_TOPK,
+                windows=("positions", (_ENVELOPE_SEQ_LEN - 2,)),
+                logits="relu",
+                tail="nan",
+            ),
+        ),
+        Cell(
+            why="decode batch 128: windows empty, 511 / 512 / 513 blocks and up to the envelope",
+            spec=dict(
+                rows=128,
+                cols=_ENVELOPE_COLUMNS,
+                index_topk=_BLOCK_TOPK,
+                windows=("positions", _DECODE_POSITIONS),
+                logits="relu",
+                tail="nan",
+            ),
+        ),
+        Cell(
+            why="verify MTP7 at 128 requests: 1024 rows, windows up to the envelope's 65536",
+            spec=dict(
+                rows=1024,
+                cols=_ENVELOPE_COLUMNS,
+                index_topk=_BLOCK_TOPK,
+                windows=("positions", tuple(s + j for s in _VERIFY_STARTS for j in range(8))),
+                logits="relu",
+                tail="nan",
+            ),
+        ),
+        Cell(
+            why="context chunk: max_num_tokens 8192 rows ending a 262144-token prompt",
+            spec=dict(
+                rows=8192,
+                cols=_ENVELOPE_COLUMNS,
+                index_topk=_BLOCK_TOPK,
+                windows=("chunk", _ENVELOPE_SEQ_LEN - 8192),
+                logits="relu",
+                tail="nan",
+            ),
+        ),
     )
 
     note = """
@@ -144,13 +210,41 @@ class QsaTopkSelect(OpWrapper):
     first captured decode JIT-compiles nothing. `torch.ops.trtllm.indexer_topk_decode` is the request-grouped
     sibling; QSA does not use it.
 
-    CUDA graphs: captured at `[256, 2048]` (32 requests at max_draft_len 7),
-    `k=512`, and replayed against new logits and a new `row_ends` through the
-    captured addresses. Bitwise comparison of two
-    replays is not a valid check (order is unspecified).
+    The CUDA op picks its path per row by the window's length, never by the
+    row width: a window of at most `index_topk` copies offsets 0..len-1
+    through (unsorted, no histogram); a longer one runs the histogram passes
+    over the fp32 bits into a 2048-item final buffer. The width enters only as
+    the row stride, and a row that does not start 16-byte aligned is read with
+    a scalar head and tail. So the unified target's cells, at the 262144-token
+    envelope's 65536-column rows, take windows from empty through 1, 511, 512,
+    513, core's 2304 (`max_seq_len` 9216) and MTP's 4096 (16384) to 65535 and
+    65536 -- rows 1, 128 (decode), 1024 (MTP7 verify at 128 requests) and 8192
+    (a `max_num_tokens` context chunk). All four run the compiled-in CUDA op
+    (below 12288 rows); the JIT-compiled CuTe DSL sibling runs at the 16384-row
+    cell, on sm_103 in the same test file. Attention DP and TP do not change the
+    op's shape, only its row count. Measured on GB300, warm, CUDA events:
+    1 x 65536 26.6 us, 128 x 65536 26.8 us, 1024 x 65536 70.4 us, 8192 x 65536
+    885.4 us.
 
-    Hard limits: not probed. `indices` is addressed as `row * index_topk +
-    slot`; the largest certified extent is 16384 x 512.
+    A tied class far wider than the final buffer -- this checkpoint's relu
+    scores leave rows with fewer positive blocks than the budget -- was probed
+    (not a cell): 0, 1, 100, 511, 512, 513 and 3000 positive scores in a
+    65536-column window, the rest exactly 0, at 1, 128 and 1024 rows. Every row
+    returned 512 distinct in-window offsets whose values are the window's top
+    512.
+
+    CUDA graphs: captured at `[256, 2048]` (32 requests at max_draft_len 7) and
+    at 1, 128 and 1024 rows of 65536 columns, `k=512`, each over full windows,
+    and replayed against new logits and a new `row_ends` through the captured
+    addresses (the 128-row replay at 511 blocks, the copy-through path).
+    Bitwise comparison of two replays is not a valid check (order is
+    unspecified).
+
+    Hard limits: `indices` is addressed as `row * index_topk + slot` and the
+    logits row as `row * stride(0)`, both in 64-bit; `num_columns` and
+    `stride(0)` pass through int32, so a row past 2^31 - 1 elements is out of
+    reach (the envelope's is 65536). The largest certified extents are logits
+    8192 x 65536 (2^29 elements) and `indices` 16384 x 512.
     """
 
     def __call__(
