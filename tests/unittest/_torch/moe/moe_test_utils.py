@@ -678,12 +678,12 @@ def should_skip_cutedsl(
                 f"128-aligned. fp4_utils asserts M % 128 == 0."
             )
 
-    # NVFP4_PLUS gathers each token's UE5M3 scale row in 8-byte copies, so
-    # can_implement declines a hidden_size that is not a multiple of 256.
-    if quant_algo == QuantAlgo.NVFP4_PLUS and model_config.hidden_size % 256 != 0:
+    # NVFP4_PLUS gathers each token's UE5M3 scale row in 16-byte copies, so
+    # can_implement declines a hidden_size that is not a multiple of 512.
+    if quant_algo == QuantAlgo.NVFP4_PLUS and model_config.hidden_size % 512 != 0:
         return (
             f"{backend_name} NVFP4_PLUS: hidden_size={model_config.hidden_size} "
-            "is not a multiple of 256."
+            "is not a multiple of 512."
         )
 
     return None

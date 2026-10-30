@@ -42,14 +42,13 @@ from ..runners import CuteDslFusedMoENvfp4Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
 
-# The UE5M3 scales of a token's hidden vector are packed four to an int32,
-# and the FC1 kernel gathers them 8 bytes at a time, so a token's scale row
-# must be a whole number of 8-byte copies.
-_HIDDEN_SIZE_ALIGNMENT = 8 * NVFP4_PLUS_SF_VEC_SIZE
+# The FC1 kernel gathers a token's UE5M3 scales 16 bytes (two K tiles) at a
+# time, so a token's scale row must be a whole number of 16-byte copies.
+_HIDDEN_SIZE_ALIGNMENT = 16 * NVFP4_PLUS_SF_VEC_SIZE
 
 
 def _hidden_size_alignment_rejection(p: MoEProblem) -> MoEEligibility | None:
-    """Reject a hidden size whose UE5M3 scale row is not 8-byte aligned."""
+    """Reject a hidden size whose UE5M3 scale row is not 16-byte aligned."""
     if p.hidden_size is None or p.hidden_size % _HIDDEN_SIZE_ALIGNMENT == 0:
         return None
     return MoEEligibility.no(
