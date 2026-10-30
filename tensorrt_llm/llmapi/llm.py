@@ -995,7 +995,7 @@ class BaseLLM:
                 # BaseWorker resolves embedding handles to local tensor views.
                 multimodal_data = multimodal_params.multimodal_data
                 if disaggregated_params.mrope_position_ids_handle is not None:
-                    # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
+                    # NOTE: `ModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None
                     mrope_config = {}
                     mrope_config[
@@ -1017,7 +1017,7 @@ class BaseLLM:
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
-                # PyTorchModelEngine assumes both are present when using mrope.
+                # ModelEngine assumes both are present when using mrope.
                 if disaggregated_params.mrope_position_deltas_handle is None:
                     raise RuntimeError(
                         "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
@@ -2035,7 +2035,7 @@ class _TorchLLM(BaseLLM):
     def _reject_token_encoder_config_without_buckets(self) -> None:
         """Reject a bucket-less token-encoder config before weights load.
 
-        `PyTorchModelEngine.__init__` asks the instantiated model and keeps the
+        `ModelEngine.__init__` asks the instantiated model and keeps the
         last word; this asks the class its architecture resolves to. It defers
         wherever that class might not be the one the engine builds, so it can
         only reject earlier, never differently. A model that installs

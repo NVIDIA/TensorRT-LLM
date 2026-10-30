@@ -67,6 +67,7 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
     convert_anthropic_count_tokens_request, convert_anthropic_request,
@@ -92,6 +93,12 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
+from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
+                                               AttachedFrontendWatchdog,
+                                               LauncherForwarder,
+                                               MultiFrontendServing,
+                                               SharedClockOffset,
+                                               follow_clock_offset)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,
@@ -123,12 +130,14 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
                                        render_conversation)
-from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
+from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
+                                                ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
                                                 ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
-from tensorrt_llm.serve.responses_utils import guard_responses_stream
+from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
+                                                keep_responses_stream_alive)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -599,7 +608,8 @@ class OpenAIServer(_VideoRoutesMixin):
             enable_rl_control_endpoints: bool = False,
             rl_control_api_key: Optional[str] = None,
             enable_runtime_control_endpoints: bool = False,
-            runtime_control_api_key: Optional[str] = None):
+            runtime_control_api_key: Optional[str] = None,
+            multi_frontend_serving: Optional[MultiFrontendServing] = None):
         if enable_rl_control_endpoints:
             logger.warning(
                 "RL control endpoints are deprecated; use generic runtime "
@@ -643,7 +653,11 @@ class OpenAIServer(_VideoRoutesMixin):
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
         self.tool_parser = tool_parser
-        self.metadata_server = create_metadata_server(metadata_server_cfg)
+        # Attached frontends serve the launcher's port: only it registers.
+        self._registers_server = (multi_frontend_serving is None
+                                  or multi_frontend_serving.is_launcher)
+        self.metadata_server = (create_metadata_server(metadata_server_cfg)
+                                if self._registers_server else None)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
         # Seed media-IO decode defaults from the model's input processor, then
@@ -706,12 +720,13 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model = model
         self.metrics_collector = None
         args = getattr(self.generator, "args", None)
-        self._expose_perf_metrics = bool(
-            args and getattr(args, "return_perf_metrics", False))
         perf_metrics_output_dir = (getattr(args, "perf_metrics_output_dir",
                                            None) if args else None)
-        self._collect_perf_metrics = (self._expose_perf_metrics
-                                      or perf_metrics_output_dir is not None)
+        perf_metrics = resolve_perf_metrics_config(
+            getattr(args, "return_perf_metrics", False),
+            perf_metrics_output_dir)
+        self._expose_perf_metrics = perf_metrics.expose_response_metrics
+        self._collect_perf_metrics = perf_metrics.collect_request_metrics
         # Per-request spec-decode acceptance stats. Deliberately independent of
         # return_perf_metrics: coupling them would mean asking for acceptance
         # numbers silently mounts the Prometheus endpoint too.
@@ -727,6 +742,23 @@ class OpenAIServer(_VideoRoutesMixin):
         ) if server_role is not None else "server"
         self._perf_metrics_writer = PerfMetricsJsonlWriter(
             perf_metrics_output_dir, server_kind)
+        # Multi-frontend serving: see serve/multi_frontend.py.
+        self._multi_frontend = multi_frontend_serving
+        self._launcher_forwarder: Optional[LauncherForwarder] = None
+        self._launcher_watchdog_task: Optional[asyncio.Task] = None
+        if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
+            self._launcher_forwarder = LauncherForwarder(
+                multi_frontend_serving.launcher_uds)
+        self._shared_clock_offset: Optional[SharedClockOffset] = (
+            SharedClockOffset(
+                os.path.dirname(multi_frontend_serving.launcher_uds))
+            if multi_frontend_serving is not None else None)
+        self._clock_offset_task: Optional[asyncio.Task] = None
+        # Requests finishing on attached frontends never wake the launcher's
+        # collector, so it also polls.
+        self._iteration_stats_poll_interval: Optional[float] = (
+            1.0 if multi_frontend_serving is not None
+            and multi_frontend_serving.is_launcher else None)
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
         # Bounded snapshot of iteration stats for the GET /metrics handler.
@@ -757,27 +789,7 @@ class OpenAIServer(_VideoRoutesMixin):
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             await self._perf_metrics_writer.start()
-            if self.metadata_server is not None:
-                metadata = {
-                    "model": self.model,
-                    "version": VERSION,
-                    "timestamp": datetime.now().isoformat(),
-                    "server_role": server_role.name,
-                    "url": self.binding_addr
-                }
-                # TODO: add more metadata
-                # Register with ETCD using the existing key format
-                self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
-                                         metadata)
-                logger.info(f"trtllm/{self.generator.llm_id} is registered")
-
-            if self.disagg_cluster_config:
-                self.disagg_cluster_storage = create_cluster_storage_client(
-                    self.disagg_cluster_config.cluster_uri,
-                    self.disagg_cluster_config.cluster_name)
-                self.disagg_cluster_worker = DisaggClusterWorker(
-                    self.server_role, self.host, self.port,
-                    self.disagg_cluster_config, self.disagg_cluster_storage)
+            self._register_server()
 
             # VisualGen has no args
             if not self._is_visual_gen:
@@ -794,7 +806,20 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 # Start background iteration stats collector if metrics are enabled
                 # The PyTorch backend args include `enable_iter_perf_stats`.
-                if self.metrics_collector and getattr(
+                # Attached frontends leave the engine queue to the launcher.
+                if self._launcher_forwarder is not None:
+                    self._launcher_watchdog_task = asyncio.create_task(
+                        AttachedFrontendWatchdog(
+                            self._launcher_forwarder,
+                            self._multi_frontend.launcher_pid,
+                            self._on_launcher_lost).run())
+                    self._clock_offset_task = asyncio.create_task(
+                        follow_clock_offset(self._shared_clock_offset,
+                                            self._apply_shared_clock_offset))
+                    logger.info(
+                        "Attached frontend: forwarding launcher-owned routes "
+                        f"to {self._multi_frontend.launcher_uds}")
+                elif self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
                     # The background loop becomes the sole consumer of the
                     # engine stats queue; /metrics reads from a tee buffer
@@ -827,6 +852,15 @@ class OpenAIServer(_VideoRoutesMixin):
             yield
 
             await self._perf_metrics_writer.close()
+            for task in (self._launcher_watchdog_task, self._clock_offset_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            if self._launcher_forwarder is not None:
+                await self._launcher_forwarder.close()
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
@@ -840,11 +874,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     pass
                 logger.info("Stopped background iteration stats collector task")
 
-            if self.metadata_server is not None:
-                self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
-                logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
-            if self.disagg_cluster_worker:
-                await self.disagg_cluster_worker.deregister_worker()
+            await self._deregister_server()
             if self.resource_governor is not None:
                 self.resource_governor.close()
             self.generator.shutdown()
@@ -875,6 +905,7 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_embedding_batcher()
             self.register_embedding_routes()
         else:
+            self._register_launcher_forwarding_routes()
             self.register_routes()
 
         if self._collect_perf_metrics:
@@ -984,29 +1015,12 @@ class OpenAIServer(_VideoRoutesMixin):
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
-            args = self.generator.args
-            pmc = getattr(args, "prometheus_metrics_config", None)
-            self.metrics_collector = MetricsCollector(
-                {
-                    "model_name": self.model,
-                    "engine_type": args.backend or "unknown"
-                },
-                e2e_request_latency_buckets=(pmc.e2e_request_latency_buckets
-                                             if pmc else None),
-                time_to_first_token_buckets=(pmc.time_to_first_token_buckets
-                                             if pmc else None),
-                time_per_output_token_buckets=(pmc.time_per_output_token_buckets
-                                               if pmc else None),
-                request_queue_time_buckets=(pmc.request_queue_time_buckets
-                                            if pmc else None),
-                request_prefill_time_buckets=(pmc.request_prefill_time_buckets
-                                              if pmc else None),
-                request_decode_time_buckets=(pmc.request_decode_time_buckets
-                                             if pmc else None),
-                request_inference_time_buckets=(
-                    pmc.request_inference_time_buckets if pmc else None),
-            )
-            self._log_config_info_metrics()
+            self.metrics_collector = MetricsCollector.from_args(
+                self.generator.args, self.model)
+            # One config-info series per server, not per frontend process.
+            if self._launcher_forwarder is None:
+                self.metrics_collector.log_config_from_args(
+                    self.generator.args, self.model)
 
     @staticmethod
     def _ensure_post_processor_hook_supported(
@@ -1060,95 +1074,6 @@ class OpenAIServer(_VideoRoutesMixin):
             return cache_transceiver_config.get("backend") is not None
         return (cache_transceiver_config is not None and getattr(
             cache_transceiver_config, "backend", None) is not None)
-
-    def _log_config_info_metrics(self) -> None:
-        """Extract configuration from generator args and log as Prometheus info gauges."""
-        args = self.generator.args
-
-        # Model config
-        model_config = {
-            "model": str(args.model),
-            "served_model_name": self.model,
-            "dtype": str(args.dtype),
-        }
-        quant_config = getattr(args, "quant_config", None)
-        if quant_config is not None:
-            quant_algo = getattr(quant_config, "quant_algo", None)
-            model_config["quantization"] = str(
-                quant_algo) if quant_algo else "none"
-        else:
-            model_config["quantization"] = "none"
-        max_seq_len = getattr(args, "max_seq_len", None)
-        if max_seq_len is not None:
-            model_config["max_model_len"] = str(max_seq_len)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                model_config["gpu_type"] = torch.cuda.get_device_name(0)
-        except (ImportError, RuntimeError) as e:
-            logger.debug("Could not detect GPU type for config metrics: %s", e)
-
-        # Parallel config — prefer parallel_config from generator args
-        # for accurate values including cp_size and world_size.
-        par_cfg = getattr(args, "parallel_config", None)
-        if par_cfg is not None:
-            tp_size = getattr(par_cfg, "tp_size", 1) or 1
-            pp_size = getattr(par_cfg, "pp_size", 1) or 1
-            cp_size = getattr(par_cfg, "cp_size", 1) or 1
-            world_size = getattr(par_cfg, "world_size",
-                                 tp_size * pp_size * cp_size)
-        else:
-            tp_size = getattr(args, "tensor_parallel_size", 1) or 1
-            pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
-            cp_size = 1
-            world_size = tp_size * pp_size * cp_size
-        parallel_config = {
-            "tensor_parallel_size": str(tp_size),
-            "pipeline_parallel_size": str(pp_size),
-            "context_parallel_size": str(cp_size),
-            "gpu_count": str(world_size),
-        }
-        ep_size = getattr(par_cfg, "moe_ep_size", None) if par_cfg else \
-            getattr(args, "moe_expert_parallel_size", None)
-        if ep_size is not None and ep_size > 0:
-            parallel_config["expert_parallel_size"] = str(ep_size)
-
-        # Speculative decoding config
-        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
-            args, "decoding_config", None)
-        speculative_config = None
-        if spec_config_obj is not None:
-            speculative_config = {"spec_enabled": "true"}
-            decoding_type = getattr(spec_config_obj, "decoding_type", None)
-            if decoding_type is not None:
-                speculative_config["spec_method"] = str(decoding_type)
-            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
-            if max_draft_len is not None:
-                speculative_config["spec_num_tokens"] = str(max_draft_len)
-            draft_model = getattr(spec_config_obj, "speculative_model", None)
-            if draft_model is not None:
-                speculative_config["spec_draft_model"] = str(draft_model)
-
-        # KV cache config
-        kv_cache_config_obj = getattr(args, "kv_cache_config", None)
-        kv_cache_config = None
-        if kv_cache_config_obj is not None:
-            kv_cache_config = {}
-            for field in ("page_size", "enable_block_reuse",
-                          "enable_partial_reuse", "free_gpu_memory_fraction"):
-                val = getattr(kv_cache_config_obj, field, None)
-                if val is not None:
-                    kv_cache_config[field] = str(val)
-            kv_dtype = getattr(kv_cache_config_obj, "dtype", None)
-            if kv_dtype is not None:
-                kv_cache_config["cache_dtype"] = str(kv_dtype)
-
-        self.metrics_collector.log_config_info(
-            model_config=model_config,
-            parallel_config=parallel_config,
-            speculative_config=speculative_config,
-            kv_cache_config=kv_cache_config if kv_cache_config else None,
-        )
 
     @staticmethod
     def _attach_multimodal_data(
@@ -1733,6 +1658,67 @@ class OpenAIServer(_VideoRoutesMixin):
             base64.b64encode(state).decode("utf-8")
         })
 
+    def _register_launcher_forwarding_routes(self) -> None:
+        """Attached frontends: forward launcher-owned routes (before register_routes())."""
+        if self._launcher_forwarder is None:
+            return
+        for method, path in FORWARDED_ROUTES:
+            self.app.add_api_route(path,
+                                   self._launcher_forwarder.forward,
+                                   methods=[method],
+                                   include_in_schema=False)
+
+    def _register_server(self) -> None:
+        """Register with the metadata server and/or disagg cluster (launcher only)."""
+        if not self._registers_server:
+            return
+        if self.metadata_server is not None:
+            metadata = {
+                "model": self.model,
+                "version": VERSION,
+                "timestamp": datetime.now().isoformat(),
+                "server_role": self.server_role.name,
+                "url": self.binding_addr
+            }
+            # TODO: add more metadata
+            # Register with ETCD using the existing key format
+            self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
+                                     metadata)
+            logger.info(f"trtllm/{self.generator.llm_id} is registered")
+
+        if self.disagg_cluster_config:
+            self.disagg_cluster_storage = create_cluster_storage_client(
+                self.disagg_cluster_config.cluster_uri,
+                self.disagg_cluster_config.cluster_name)
+            self.disagg_cluster_worker = DisaggClusterWorker(
+                self.server_role, self.host, self.port,
+                self.disagg_cluster_config, self.disagg_cluster_storage)
+
+    async def _deregister_server(self) -> None:
+        if self.metadata_server is not None:
+            self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
+            logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
+        if self.disagg_cluster_worker:
+            await self.disagg_cluster_worker.deregister_worker()
+
+    def _apply_shared_clock_offset(self, offset: float) -> None:
+        self._adjusted_steady_clock.set_reference_offset(offset)
+        logger.info(f"Following the launcher's steady clock offset between "
+                    f"local and disagg server: {offset} second")
+
+    def _on_launcher_lost(self, error: BaseException) -> None:
+        """Watchdog callback: fail requests with EngineDeadError, then shut down.
+
+        Mirrors the fatal-error branch of ``health``.
+        """
+        executor = self.generator._executor
+        if executor is None:  # the LLM already shut down
+            return
+        executor._set_fatal_error(error)  # keeps only the first error
+        if not executor.doing_shutdown:
+            _record_generator_termination(self.generator)
+            signal.raise_signal(signal.SIGINT)
+
     async def health(self) -> Response:
         if self._check_health():
             return Response(status_code=200)
@@ -1907,6 +1893,15 @@ class OpenAIServer(_VideoRoutesMixin):
         logger.info(
             f"The steady clock offset between local and disagg server: {offset} second"
         )
+        # Multi-frontend launcher: every frontend stamps perf metrics with it.
+        if self._shared_clock_offset is not None:
+            try:
+                self._shared_clock_offset.publish(offset)
+            except OSError as e:
+                logger.error(
+                    f"Failed to share the steady clock offset with the "
+                    f"attached frontends: {e}")
+                return Response(status_code=500, content=str(e))
         return Response(status_code=200)
 
     async def get_steady_clock_offset(self) -> JSONResponse:
@@ -1954,7 +1949,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     res.metrics_dict)
             # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
             # Wake up the stats collector to drain iteration stats
-            if getattr(self.generator.args, "enable_iter_perf_stats", True):
+            # The collector only runs with enable_iter_perf_stats.
+            if self._iteration_stats_collector_task is not None:
                 self._iteration_stats_wakeup_event.set()
 
     async def _create_chat_response(
@@ -2005,22 +2001,32 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             logger.info("Iteration stats collector loop started")
             while True:
-                # Wait for signal that requests have completed and stats may be available
-                await self._iteration_stats_wakeup_event.wait()
+                # Wait for signal that requests have completed and stats may
+                # be available (a multi-frontend launcher also polls).
+                woken_by_timer = False
+                try:
+                    await asyncio.wait_for(
+                        self._iteration_stats_wakeup_event.wait(),
+                        timeout=self._iteration_stats_poll_interval)
+                except asyncio.TimeoutError:
+                    woken_by_timer = True
 
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
                 try:
-                    async for llm_stat in self.generator.get_stats_async(
-                            timeout=0.5):
-                        self.metrics_collector.log_iteration_stats(llm_stat)
-                        # Tee into the /metrics snapshot buffer so the HTTP
-                        # handler can serve without competing for the engine
-                        # queue (nvbug 6102381).
-                        if self._iteration_stats_buffer is not None:
-                            self._iteration_stats_buffer.append(llm_stat)
+                    if woken_by_timer:
+                        # Idle poll: a non-blocking read on the metrics
+                        # thread, idle while this loop owns the queue.
+                        for llm_stat in await asyncio.get_running_loop(
+                        ).run_in_executor(self._metrics_stats_executor,
+                                          self.generator.get_stats, 0):
+                            self._record_iteration_stat(llm_stat)
+                    else:
+                        async for llm_stat in self.generator.get_stats_async(
+                                timeout=0.5):
+                            self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -2054,6 +2060,13 @@ class OpenAIServer(_VideoRoutesMixin):
         postproc_args.return_spec_decode_stats = True
         postproc_args.spec_decode_num_spec_tokens = getattr(
             self, "_spec_decode_num_spec_tokens", None)
+
+    def _record_iteration_stat(self, llm_stat: dict) -> None:
+        self.metrics_collector.log_iteration_stats(llm_stat)
+        # Tee into the /metrics snapshot buffer so the HTTP handler can serve
+        # without competing for the engine queue (nvbug 6102381).
+        if self._iteration_stats_buffer is not None:
+            self._iteration_stats_buffer.append(llm_stat)
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
@@ -3519,11 +3532,14 @@ class OpenAIServer(_VideoRoutesMixin):
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             if request.stream:
-                return StreamingResponse(content=guard_responses_stream(
-                    create_streaming_generator(promise, postproc_params),
-                    streaming_processor.get_stream_failed_events,
-                ),
-                                         media_type="text/event-stream")
+                return ClosingStreamingResponse(
+                    content=keep_responses_stream_alive(
+                        guard_responses_stream(
+                            create_streaming_generator(promise,
+                                                       postproc_params),
+                            streaming_processor.get_stream_failed_events,
+                        )),
+                    media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
                 # Context-only: the orchestrator may ask for the prompt as a

@@ -180,6 +180,9 @@ def _executor(monkeypatch, pp_size: int) -> PyExecutor:
     monkeypatch.setenv(MPI_PROGRESS_POLL_MS_ENV_VAR_NAME, "0")
     monkeypatch.delenv(PP_MPI_PROGRESS_INTERVAL_US_ENV_VAR_NAME, raising=False)
     executor = object.__new__(PyExecutor)
+    executor._closed = False
+    executor._resources_released = False
+    executor.kv_cache_transceiver = None
     executor.dist = SimpleNamespace(rank=0, world_size=1, pp_size=pp_size)
     executor.worker_lock = threading.Lock()
     executor.worker_started = False
@@ -196,6 +199,8 @@ def _executor(monkeypatch, pp_size: int) -> PyExecutor:
     executor.hang_detector = Mock()
     executor.hang_detector.detected.return_value = False
     executor.kv_connector_manager = None
+    executor.enable_attention_dp = False
+    executor._kv_connector_failed = False
     executor._shutdown_sleep_wakeup_listeners = Mock()
     executor.model_engine = None
     executor.draft_model_engine = None

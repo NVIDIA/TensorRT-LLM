@@ -2879,6 +2879,13 @@ def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFi
                (needsSanity && key =~ /PackageSanityCheck/) ||
                (needsPerfSanity && key =~ /PerfSanity/)
     }
+    // Preserve baseline auto-triggered stages when coverage replaces the selected stage set.
+    if (cbts.scope == "coverage") {
+        def autoTriggerTags = testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []
+        filtered += parallelJobsFiltered.findAll { key, _ ->
+            autoTriggerTags.any { key.contains(it) }
+        }
+    }
     if (affectedSet.isEmpty()) {
         if (filtered.isEmpty()) {
             echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
@@ -4018,12 +4025,15 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     imagePullPolicy: Always
         """
     }
-    // Temporarily avoid an arm64 CPU builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-    def blockedNodeAffinity = targetCloud == "kubernetes-cpu" && arch == "arm64" ? '''
-                              - key: "kubernetes.io/hostname"
+    // CPU test pods mount the model scratch from 10.117.145.14, which can't be accessed from ipp6/ipp9 DC.
+    // Pods placed there stay in ContainerCreating. Build stage pods do not mount the model scratch,
+    // so they can still use these nodes.
+    def scratchUnreachableNodeAffinity = type == "cpu" ? '''
+                              - key: "region"
                                 operator: NotIn
                                 values:
-                                - "rl300-0021.ipp2a1.colossus"''' : ""
+                                - "ipp6"
+                                - "ipp9"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -4046,8 +4056,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
 
-    // RTXPro6000D, RTX5080 and GH200 use the Austin model scratch.
-    if (type.contains("6000d") || type.contains("rtx-5080") || type == "gh200") {
+    // RTXPro6000D and RTX5080 use the Austin model scratch.
+    if (type.contains("6000d") || type.contains("rtx-5080")) {
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
@@ -4077,7 +4087,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                                 - "qa_only"
-${blockedNodeAffinity}
+${scratchUnreachableNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -4386,12 +4396,8 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     } else if (stageName.contains("-Generic-")) {
         // Generic stages select tests by marker expression rather than backend ownership.
         makoArgs += ["backend=generic"]
-    } else if (stageName.contains("-Verl-")) {
-        // If stageName contains "-Verl-", add "backend=verl" to makoArgs
-        // At this point, only tests with backend=verl or unspecified backend will be run
-        makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", or "-Verl-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", or "-FMHA-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -5929,7 +5935,9 @@ def runLLMBuild(
     }
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
-        buildArgs += " -a '90-real;100-real;103-real;120-real'"
+        buildArgs += " -a '90;100;103;107;120;121'"
+    } else {
+        buildArgs += " -a '80;86;89;90;100;103;107;120'"
     }
     def platNameArg = plat_name ? " --plat-name ${plat_name}" : ""
 
@@ -6479,7 +6487,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // may break the mapping functionality.
 
     x86TestConfigs = [
-        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-x86-2": ["cpu", "l0_cpu", 2, 2],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
@@ -6597,12 +6606,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // M3 CTX TP2/EP2 -> GEN TP4/EP1 C++ NIXL bounce accuracy (6 GPUs).
         "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
         "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        // Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and
-        // pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the
-        // numpy>=2.0.0 TensorRT-LLM asks for, so the install downgrades numpy out from under
-        // the interpreter. Importing tensorrt_llm then fails and every test in the stage goes
-        // with it, which makes the whole stage noise rather than signal.
-        // "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
         "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
@@ -6648,7 +6651,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-arm-2": ["cpu", "l0_cpu", 2, 2],
         "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
@@ -6672,15 +6676,15 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
-        // PerfSanity pre-merge tests. GB300 x4 capacity is the binding constraint, so
-        // pre-merge gating is one stage on one node: the two DeepSeek-V4-Pro ctx_only cases.
-        "GB300-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 1, 4, 1, true, false],
         // PerfSanity post-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 4, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 4, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 4, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 4, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 6, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 7, 7, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -6798,7 +6802,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
-        4,
+        6,
         8,
         2
     )
@@ -6807,7 +6811,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16",
-        1,
+        2,
         16,
         4
     )
@@ -6820,12 +6824,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         32,
         8
     )
-    // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
+    // Nemotron-Ultra-V3 8k64k con1 and GLM-5.3-Flash FP8 8k1k con16: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-        1,
+        2,
         8,
         2
     )
@@ -7111,8 +7115,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             // Must match what requirements.txt resolves to from the public index: the
                             // wheel under test is linked against that libtorch, and a mismatch fails
                             // the import with an undefined c10 symbol instead of a version error.
-                            // Use internal mirror instead of https://download.pytorch.org/whl/cu132 for better network stability.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
+                            // The internal mirror proxies https://download.pytorch.org/whl/cu132.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cuda-thirteen-two-remote/simple")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or

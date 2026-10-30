@@ -238,6 +238,16 @@ void initBindings(nb::module_& m)
                 }
                 return hashes;
             })
+        .def_prop_ro("multimodal_uuids",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<std::optional<std::string>>> uuids = std::nullopt;
+                if (self.getMultimodalUuids())
+                {
+                    uuids = *self.getMultimodalUuids().value();
+                }
+                return uuids;
+            })
         .def_prop_ro("multimodal_positions",
             [](GenLlmReq& self)
             {
@@ -412,9 +422,13 @@ void initBindings(nb::module_& m)
             nb::arg("cache_salt") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
+        .def(nb::init<tb::LlmRequest const&, tb::LlmRequest::RequestIdType>(), nb::arg("parent_request"),
+            nb::arg("child_id"))
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
             nb::arg("max_draft_len"), nb::arg("enable_kv_cache_reuse") = false)
         .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
+        .def("_register_child_request", &tb::LlmRequest::registerChildRequest, nb::arg("child"))
+        .def_prop_ro("_native_child_requests", &GenLlmReq::getChildRequests)
         .def("create_result", &tb::LlmRequest::createResult)
         .def("create_serialized_result",
             [](tb::LlmRequest& self)

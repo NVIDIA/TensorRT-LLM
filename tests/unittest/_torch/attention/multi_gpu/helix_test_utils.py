@@ -22,6 +22,7 @@ from mpi4py.futures import MPIPoolExecutor
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
@@ -292,6 +293,17 @@ def run_single_rank(func, *args, **kwargs):
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
 
 
+def run_in_nccl_window_tensor_scope(rank, func, *args, **kwargs):
+    """Call ``func(rank, ...)`` inside an NCCL window-tensor scope.
+
+    The NCCL collectives may return NCCL-window tensors, whose leases must end in
+    a tensor scope (the model engine opens one around every forward). The scope
+    only becomes active with a CUDA tensor among its inputs.
+    """
+    with discard_nccl_window_tensor_outputs(torch.empty(1, device="cuda")):
+        return func(rank, *args, **kwargs)
+
+
 def parse_comms_medium(comms_medium: str):
     """Return ``(use_nccl_for_alltoall, fifo_version)`` for *comms_medium*."""
     if comms_medium == "nccl":
@@ -320,6 +332,7 @@ def run_helix_test(
             *zip(
                 *[
                     (
+                        run_in_nccl_window_tensor_scope,
                         full_test_func,
                         world_size,
                         scenario,

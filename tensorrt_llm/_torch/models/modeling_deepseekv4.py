@@ -47,7 +47,7 @@ from transformers import PretrainedConfig
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1436,7 +1436,7 @@ class DeepseekV4Linear(Linear):
         layer_idx: Optional[int] | None = None,
     ):
         num_tokens = input.shape[0]
-        if not self.has_any_quant and 1 <= num_tokens <= 16 and get_sm_version() not in [120, 121]:
+        if not self.has_any_quant and 1 <= num_tokens <= 16 and not is_sm_120f():
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(input, self.weight.t(), bias, None)
         else:
             output = super().apply_linear(input, bias, lora_params, layer_idx)
@@ -1801,7 +1801,7 @@ class DeepseekV4MoE(nn.Module):
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
         # TODO: Move this model-agonostic part to MoE
-        if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() == 120:
+        if self.use_dp and self.mapping.tp_size > 1 and is_sm_120f():
             use_dp_padding = True
             hidden_states = torch.nn.functional.pad(
                 hidden_states, (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0])

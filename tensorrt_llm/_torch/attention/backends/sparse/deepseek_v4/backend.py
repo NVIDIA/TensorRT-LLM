@@ -205,7 +205,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         self,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
-    ) -> None:
+    ) -> AttentionForwardArgs:
         attention_input_type = forward_args.attention_input_type
         if attention_input_type == AttentionInputType.context_only:
             start_idx = 0
@@ -217,7 +217,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             start_idx = 0
             end_idx = metadata.num_tokens
 
-        sparse_args = forward_args.sparse_runtime_params
+        sparse_args = replace(forward_args.sparse_runtime_params)
         sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]
@@ -230,6 +230,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             self.sparse_attention_config.window_size
             + metadata.max_compressed_indices[self.compress_ratio]
         )
+        return replace(forward_args, sparse_runtime_params=sparse_args)
 
     def forward(
         self,
@@ -246,7 +247,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if forward_args.attention_sinks is None:
                 forward_args = replace(forward_args, attention_sinks=attn_sink.data)
 
-        self._prepare_sparse_forward_args(metadata, forward_args)
+        forward_args = self._prepare_sparse_forward_args(metadata, forward_args)
         return super().forward(q, k, v, metadata, forward_args=forward_args)
 
     def _unit_scale(self, like: torch.Tensor) -> torch.Tensor:
