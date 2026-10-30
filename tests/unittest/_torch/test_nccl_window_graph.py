@@ -387,7 +387,7 @@ def test_nested_graph_capture_restores_previous_owner(monkeypatch):
 def tensor_scope_events(monkeypatch):
     events = []
 
-    def collect_tensors(value, tensors):
+    def collect_tensors(value, tensors, *, include_dataclasses=True):
         if value is not None:
             tensors.extend(value)
 
@@ -964,3 +964,167 @@ def test_decoder_warmup_scope_uses_device_buffer_for_host_only_batch(
                 ScheduledRequests(), None, enable_spec_decode=False, runtime_draft_len=0
             )
     assert events == ["begin", "forward", "end"]
+
+
+@pytest.mark.parametrize("wrapper_kind", ["fp4", "mxfp8"])
+@pytest.mark.parametrize("positional", [False, True])
+def test_eager_scope_adopts_direct_containers_and_quantized_tensors(
+    monkeypatch: pytest.MonkeyPatch, wrapper_kind: str, positional: bool
+) -> None:
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
+
+    @dataclass
+    class Metadata:
+        seq_lens: torch.Tensor
+
+    class Layer(torch.nn.Module):
+        def forward(
+            self,
+            hidden: torch.Tensor,
+            residual: dict,
+            quantized: Fp4QuantizedTensor | MxFp8QuantizedTensor,
+            metadata: Metadata,
+        ) -> dict:
+            return {"hidden": hidden, "quantized": quantized}
+
+    with FakeTensorMode():
+        hidden, residual, packed, scale, unquantized, seq_lens = (
+            torch.empty(2, device="cuda") for _ in range(6)
+        )
+    if wrapper_kind == "fp4":
+        quantized = Fp4QuantizedTensor(packed, scale, unquantized_hidden_states=unquantized)
+        wrapper_tensors = [packed, scale, unquantized]
+    else:
+        quantized = MxFp8QuantizedTensor(packed, scale)
+        wrapper_tensors = [packed, scale]
+    calls = []
+
+    def begin(inputs: list[torch.Tensor]) -> int:
+        calls.append(("begin", tuple(id(tensor) for tensor in inputs)))
+        return 0
+
+    def end(
+        inputs: list[torch.Tensor], outputs: list[torch.Tensor], failed: bool, entry_depth: int
+    ) -> None:
+        calls.append(("end", tuple(id(tensor) for tensor in outputs), failed, entry_depth))
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    layer = Layer()
+    handles = nccl_window_tensor_scope.install_module_nccl_window_tensor_scopes([layer])
+    inputs = dict(
+        hidden=hidden,
+        residual={"values": (residual, torch.ones(2))},
+        quantized=quantized,
+        metadata=Metadata(seq_lens),
+    )
+    try:
+        output = layer(*inputs.values()) if positional else layer(**inputs)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert output["hidden"] is hidden and output["quantized"] is quantized
+    assert calls == [
+        ("begin", tuple(id(tensor) for tensor in [hidden, residual, *wrapper_tensors])),
+        ("end", tuple(id(tensor) for tensor in [hidden, *wrapper_tensors]), False, 0),
+    ]
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_nested_module_inputs_keep_metadata_in_enclosing_scope(
+    monkeypatch: pytest.MonkeyPatch, positional: bool
+) -> None:
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
+
+    class RequestIds(list):
+        visits = 0
+
+        def __iter__(self) -> Iterator:
+            self.visits += 1
+            return super().__iter__()
+
+    @dataclass
+    class Metadata:
+        seq_lens: torch.Tensor
+        request_ids: RequestIds
+
+    @dataclass
+    class Produced:
+        hidden: torch.Tensor
+        quantized: tuple[Fp4QuantizedTensor, MxFp8QuantizedTensor]
+        metadata: Metadata
+        values: torch.Tensor
+
+    visits_at_forward = []
+
+    class Layer(torch.nn.Module):
+        def forward(self, payload: dict, values: torch.Tensor) -> Produced:
+            branch = payload["branch"]
+            hidden, fp4 = branch[0]["activations"]
+            mxfp8 = branch[1][0]
+            metadata = branch[0]["metadata"]
+            visits_at_forward.append(metadata.request_ids.visits)
+            return Produced(hidden + 1, (fp4, mxfp8), metadata, values + 1)
+
+    with FakeTensorMode():
+        hidden, residual, packed, scale, unquantized, fp8, fp8_scale, seq_lens = (
+            torch.empty(2, device="cuda") for _ in range(8)
+        )
+    fp4 = Fp4QuantizedTensor(packed, scale, unquantized_hidden_states=unquantized)
+    mxfp8 = MxFp8QuantizedTensor(fp8, fp8_scale)
+    metadata = Metadata(seq_lens, RequestIds(range(7)))
+    branch = [
+        {"activations": (hidden, fp4), "metadata": metadata},
+        (mxfp8, residual, metadata),
+    ]
+    payload = {"branch": branch, "container_alias": branch, "wrapper_alias": fp4}
+    payload["cycle"] = [payload]
+    # Tensor aliases retain the generic collector's multiplicity; container
+    # and wrapper aliases are visited once, and cycles terminate.
+    payload["tensor_alias"] = hidden
+    calls = []
+    active = []
+
+    def begin(inputs: list[torch.Tensor]) -> int:
+        identities = tuple(id(tensor) for tensor in inputs)
+        depth = len(active)
+        active.append(identities)
+        calls.append(("begin", identities, depth))
+        return depth
+
+    def end(
+        inputs: list[torch.Tensor], outputs: list[torch.Tensor], failed: bool, entry_depth: int
+    ) -> None:
+        assert len(active) == entry_depth + 1
+        assert active.pop() == tuple(id(tensor) for tensor in inputs)
+        calls.append(("end", tuple(id(tensor) for tensor in outputs), failed, entry_depth))
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    layer = Layer()
+    handles = nccl_window_tensor_scope.install_module_nccl_window_tensor_scopes([layer])
+    values = torch.tensor([1, 4])
+    try:
+        with nccl_window_tensor_scope.nccl_window_tensor_scope(payload) as outer:
+            output = layer(payload, values) if positional else layer(payload=payload, values=values)
+            outer.escape(output)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert not active
+    torch.testing.assert_close(output.values, torch.tensor([2, 5]))
+    assert visits_at_forward == [1], (
+        "A module must not traverse metadata inside activation containers"
+    )
+    assert metadata.request_ids.visits == 3  # Outer adoption and both output escapes.
+    direct = [hidden, packed, scale, unquantized, fp8, fp8_scale, residual, hidden]
+    outer_inputs = [hidden, packed, scale, unquantized, seq_lens, fp8, fp8_scale, residual, hidden]
+    escaped = [output.hidden, packed, scale, unquantized, fp8, fp8_scale, seq_lens]
+    assert calls == [
+        ("begin", tuple(map(id, outer_inputs)), 0),
+        ("begin", tuple(map(id, direct)), 1),
+        ("end", tuple(map(id, escaped)), False, 1),
+        ("end", tuple(map(id, escaped)), False, 0),
+    ]
