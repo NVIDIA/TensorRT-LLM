@@ -1493,8 +1493,28 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     f"CUDA Core backend requires M <= "
                     f"{CudaCoreNVFP4Runner.MAX_M_DIMENSION}, but got M={m}. "
                     "Please add other backends to allowed_backends.")
-            backend = ("cutlass" if "cutlass" in fallback_backends else
-                       fallback_backends[0])
+            if "cutlass" in fallback_backends:
+                backend = "cutlass"
+            else:
+                # Skip backends that cannot run here (e.g. CuteDSL off
+                # SM100/103/107) and take the first allowed one, in
+                # allowed_backends order, that has valid tactics.
+                runnable = {
+                    b
+                    for b, _ in NVFP4GemmUnifiedRunner(self.output_buffer_kind,
+                                                       self.output_dtype,
+                                                       fallback_backends,
+                                                       group=self.group).
+                    get_valid_tactics(inputs, profile=None)
+                }
+                backend = next((b for b in fallback_backends if b in runnable),
+                               None)
+                if backend is None:
+                    raise ValueError(
+                        f"CUDA Core backend requires M <= "
+                        f"{CudaCoreNVFP4Runner.MAX_M_DIMENSION}, but got "
+                        f"M={m}, and none of {fallback_backends} supports "
+                        "this shape on this device.")
             sub_tactic = -1
 
         if backend == "cuda_core":

@@ -978,6 +978,40 @@ def test_nvfp4_gemm_cuda_core_tactic_falls_back_above_limit(m):
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
 
 
+@pytest.mark.skipif(
+    get_sm_version() < 100,
+    reason="CUDA Core backend requires SM >= 100 (Blackwell or newer)",
+)
+def test_nvfp4_gemm_cuda_core_fallback_skips_unavailable_backend(monkeypatch):
+    """Without cutlass, M > 16 falls back to the first backend that can run.
+
+    CuteDSL is made unavailable (as on SM120/121), so it must be skipped in
+    favor of the later cuBLASLt entry instead of raising.
+    """
+    from tensorrt_llm._torch.cublaslt_utils import IS_CUBLASLT_AVAILABLE
+    if not IS_CUBLASLT_AVAILABLE:
+        pytest.skip("cuBLASLt is not available")
+
+    def no_cutedsl(self, *, required=False):
+        if required:
+            raise ValueError("CuteDSL backend is not available.")
+        return None
+
+    monkeypatch.setattr(NVFP4GemmUnifiedRunner, "_get_cutedsl_runner",
+                        no_cutedsl)
+    m = CudaCoreNVFP4Runner.MAX_M_DIMENSION + 1
+    inputs = list(_make_nvfp4_inputs_for_bias_test(m, 1024, 1024))
+    runner = NVFP4GemmUnifiedRunner(0, torch.bfloat16,
+                                    ["cuda_core", "cutedsl", "cublaslt"])
+    with torch.inference_mode():
+        output = runner(inputs=inputs, tactic=("cuda_core", 0))
+        output_ref = torch.ops.trtllm.nvfp4_gemm(*inputs,
+                                                 torch.bfloat16,
+                                                 allowed_backends="cublaslt")
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
+
+
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE
                     or get_sm_version() not in (100, 103, 107),
                     reason="Requires SM100/SM103/SM107 CuTe DSL")
