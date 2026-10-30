@@ -987,7 +987,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
     This runner is available on:
     - SM >= 100 (Blackwell)
-    - M <= 8 (small batch size limitation from kernel template)
+    - M <= 16 (small batch size limitation from kernel template)
     """
 
     # Shared tuning config (no tactics needed, single implementation)
@@ -996,7 +996,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
     # Minimum supported architecture: SM100 (Blackwell)
     MIN_SM_VERSION = 100
     # Maximum M dimension (from cudaCoreGemmTemplateMaxM in C++ kernel)
-    MAX_M_DIMENSION = 8
+    MAX_M_DIMENSION = 16
 
     def __init__(self,
                  output_buffer_kind: int,
@@ -1482,6 +1482,44 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                 tactic = (self.allowed_backends[0], -1)
 
         backend, sub_tactic = tactic
+        m = inputs[0].shape[0]
+        if (backend == "cuda_core" and m > CudaCoreNVFP4Runner.MAX_M_DIMENSION):
+            # Tuning buckets round M down to a power of two, so a cuda_core
+            # tactic tuned for M=16 is also selected for 16 < M < 32. The
+            # kernel only handles M <= MAX_M_DIMENSION, so use another
+            # allowed backend for larger M.
+            fallback_backends = [
+                b for b in self.allowed_backends if b != "cuda_core"
+            ]
+            if not fallback_backends:
+                raise ValueError(
+                    f"CUDA Core backend requires M <= "
+                    f"{CudaCoreNVFP4Runner.MAX_M_DIMENSION}, but got M={m}. "
+                    "Please add other backends to allowed_backends.")
+            if "cutlass" in fallback_backends:
+                backend = "cutlass"
+            else:
+                # Skip backends that cannot run here (e.g. CuteDSL off
+                # SM100/103/107) and take the first allowed one, in
+                # allowed_backends order, that has valid tactics.
+                runnable = {
+                    b
+                    for b, _ in NVFP4GemmUnifiedRunner(self.output_buffer_kind,
+                                                       self.output_dtype,
+                                                       fallback_backends,
+                                                       group=self.group).
+                    get_valid_tactics(inputs, profile=None)
+                }
+                backend = next((b for b in fallback_backends if b in runnable),
+                               None)
+                if backend is None:
+                    raise ValueError(
+                        f"CUDA Core backend requires M <= "
+                        f"{CudaCoreNVFP4Runner.MAX_M_DIMENSION}, but got "
+                        f"M={m}, and none of {fallback_backends} supports "
+                        "this shape on this device.")
+            sub_tactic = -1
+
         if backend == "cuda_core":
             return CudaCoreNVFP4Runner(self.output_buffer_kind,
                                        self.output_dtype,
@@ -1532,7 +1570,7 @@ def nvfp4_gemm(
     - CUTLASS: Predefined CUTLASS configurations with auto-tuning
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell/Rubin persistent kernels (when available and inputs are valid)
-    - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
+    - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 16)
     - Marlin: Ada/Hopper W4A16 NVFP4 implementation (requires SM 89-99)
 
     The AutoTuner profiles all available backends during the first run and caches
