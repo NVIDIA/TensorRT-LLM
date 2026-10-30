@@ -596,9 +596,9 @@ async def test_coordinator_receiver_progresses_while_owner_loop_is_paused() -> N
             begin_reserve.set()
             # Deliberately hold the owner loop; only the receiver and independent
             # frontend can deliver the reply that releases it.
-            assert (
-                release_owner.wait(3) and reply_received.is_set()
-            ), f"Private control waited for the inference owner loop: {errors}"
+            assert release_owner.wait(3) and reply_received.is_set(), (
+                f"Private control waited for the inference owner loop: {errors}"
+            )
         finally:
             begin_reserve.set()
             release_owner.set()
