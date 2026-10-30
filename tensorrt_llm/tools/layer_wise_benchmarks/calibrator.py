@@ -5,6 +5,7 @@ import base64
 import functools
 import json
 import zlib
+from collections.abc import Mapping
 from enum import Enum
 from typing import Optional
 
@@ -48,17 +49,14 @@ def _layer_list(obj):
     """
     for attr in _LAYER_LIST_ATTRS:
         layers = getattr(obj, attr, None)
-        if layers is None or not hasattr(layers, "__getitem__"):
+        if layers is None or isinstance(layers, Mapping) or not hasattr(layers, "__getitem__"):
             continue
         try:
             if len(layers) == 0:
                 continue
             first = layers[0]
         except (TypeError, KeyError, IndexError):
-            # Not an integer-indexed sequence. A dict named `h` passes both the
-            # __getitem__ and len() checks and then raises KeyError on [0], so
-            # catching TypeError alone would let one attribute abort the search
-            # for the others.
+            # A sized, indexable object may still reject integer indexing.
             continue
         if callable(getattr(first, "forward", None)):
             return layers
@@ -83,22 +81,23 @@ def _decoder_layers(model):
     search of the module tree, for the reason given in `_layer_list`.
     """
     seen = []
-    obj = model
-    # +1: the budget counts UNWRAPS, and the object reached by the last one has
-    # to be examined or it is not an unwrap at all. Plain `range(depth)` looked
-    # at the root and three levels while the name promised four.
-    for _ in range(_MAX_UNWRAP_DEPTH + 1):
+    pending = [(model, 0, frozenset())]
+    while pending:
+        obj, depth, ancestors = pending.pop()
+        if id(obj) in ancestors:
+            continue
         layers = _layer_list(obj)
         if layers is not None:
             return layers
         seen.append(type(obj).__name__)
-        for attr in _INNER_MODEL_ATTRS:
+        if depth == _MAX_UNWRAP_DEPTH:
+            continue
+        ancestors = ancestors | {id(obj)}
+        # Reverse the push order so the first wrapper name is searched first.
+        for attr in reversed(_INNER_MODEL_ATTRS):
             inner = getattr(obj, attr, None)
-            if inner is not None and inner is not obj:
-                obj = inner
-                break
-        else:
-            break
+            if inner is not None:
+                pending.append((inner, depth + 1, ancestors))
     raise NoDecoderLayers(
         "%s keeps its decoder layers under none of %s, at or below %s. Add the "
         "name here once you have read the model definition -- guessing which "

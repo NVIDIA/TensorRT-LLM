@@ -14,9 +14,12 @@ cannot be used here: _init_replay_mode() decodes every record and moves the slot
 to CUDA.
 """
 
+from collections import UserDict
+from collections.abc import Mapping
 from typing import Iterable
 
 import pytest
+import torch
 
 from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import (
     Calibrator,
@@ -263,6 +266,12 @@ def test_decoder_layers_under_each_known_name(attr: str) -> None:
     assert _decoder_layers(_Holder(model=_Holder(**{attr: layers}))) is layers
 
 
+def test_decoder_layers_accepts_a_module_list() -> None:
+    """A PyTorch ModuleList remains a supported layer container."""
+    layers = torch.nn.ModuleList([torch.nn.Identity()])
+    assert _decoder_layers(_Holder(layers=layers)) is layers
+
+
 def test_decoder_layers_of_a_vl_wrapper_without_an_inner_model() -> None:
     """A wrapper that holds its stack directly, with no inner `.model`."""
     layers = [_Layer(), _Layer(), _Layer()]
@@ -288,6 +297,30 @@ def test_decoder_layers_descends_into_language_model() -> None:
     assert _decoder_layers(_Holder(language_model=_Holder(model=_Holder(layers=layers)))) is layers
 
 
+@pytest.mark.parametrize("wrapper", ["llm", "language_model"])
+def test_decoder_layers_searches_past_an_empty_model_branch(wrapper: str) -> None:
+    """An empty higher-priority branch must not hide another decoder stack."""
+    layers = [_Layer(), _Layer()]
+    model = _Holder(model=_Holder(), **{wrapper: _Holder(layers=layers)})
+    assert _decoder_layers(model) is layers
+
+
+def test_decoder_layers_preserves_wrapper_priority() -> None:
+    """Prefer the model subtree before trying sibling wrapper names."""
+    preferred = [_Layer()]
+    other = [_Layer()]
+    model = _Holder(model=_Holder(model=_Holder(layers=preferred)), llm=_Holder(layers=other))
+    assert _decoder_layers(model) is preferred
+
+
+def test_decoder_layers_searches_past_a_cyclic_model_branch() -> None:
+    """A cycle in one wrapper branch must not hide another decoder stack."""
+    layers = [_Layer()]
+    model = _Holder(llm=_Holder(layers=layers))
+    model.model = _Holder(model=model)
+    assert _decoder_layers(model) is layers
+
+
 def test_decoder_layers_stops_on_a_self_referential_wrapper() -> None:
     """A wrapper whose `model` is itself must not spin."""
     holder = _Holder()
@@ -308,9 +341,18 @@ def test_decoder_layers_skips_a_mapping_named_h() -> None:
     assert _decoder_layers(_Holder(model=holder)) is layers
 
 
-def test_decoder_layers_raises_when_only_a_mapping_is_present() -> None:
+@pytest.mark.parametrize("mapping_type", [dict, UserDict])
+def test_decoder_layers_skips_an_integer_keyed_mapping(mapping_type: type[Mapping]) -> None:
+    """An integer-keyed mapping must not hide a later layer-list candidate."""
+    layers = [_Layer()]
+    model = _Holder(layers=mapping_type({0: _Layer()}), blocks=layers)
+    assert _decoder_layers(model) is layers
+
+
+@pytest.mark.parametrize("mapping", [{"attn": 1}, {0: _Layer()}, UserDict({0: _Layer()})])
+def test_decoder_layers_raises_when_only_a_mapping_is_present(mapping: Mapping) -> None:
     with pytest.raises(NoDecoderLayers):
-        _decoder_layers(_Holder(model=_Holder(h={"attn": 1})))
+        _decoder_layers(_Holder(model=_Holder(h=mapping)))
 
 
 def _wrapped_chain(unwraps: int, layers) -> _Holder:
@@ -330,6 +372,14 @@ def test_decoder_layers_searches_the_whole_budget(unwraps: int) -> None:
     """
     layers = [_Layer()]
     assert _decoder_layers(_wrapped_chain(unwraps, layers)) is layers
+
+
+def test_decoder_layers_retries_a_shared_branch_with_its_own_depth_budget() -> None:
+    """A shorter sibling path can reach layers beyond the first path's budget."""
+    layers = [_Layer()]
+    shared = _wrapped_chain(3, layers)
+    model = _Holder(model=_Holder(model=shared), llm=shared)
+    assert _decoder_layers(model) is layers
 
 
 def test_decoder_layers_stops_one_level_past_the_budget() -> None:
