@@ -253,6 +253,13 @@ class PrimsTSSparseMlaFmha(Fmha):
             metadata.kv_cache_manager, "swa_pool_ptr"
         ):
             return "a DeepSeek-V4 KV cache manager is required."
+        if (
+            int(attn.compress_ratio) == 4
+            and getattr(metadata, "sparse_offload_state", None) is not None
+        ):
+            # The kernel gathers compressed rows from the manager's compress pool, but
+            # offloaded rows sit in the sparse cache arena that the aux pool pointer names.
+            return "sparse KV cache offload keeps the compressed rows in the sparse cache arena."
         if metadata.beam_width != 1:
             return "beam search is not supported."
         if getattr(metadata, "token_positions_cuda", None) is None:

@@ -30,8 +30,8 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        RuntimeMemoryStatus, SADecodingConfig, SAEnhancerConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
                        SkipSoftmaxAttentionConfig, SleepConfig,
-                       TorchCompileConfig, TorchLlmArgs,
-                       TriAttentionKvCacheCompressionConfig,
+                       SparseKvCacheOffloadConfig, TorchCompileConfig,
+                       TorchLlmArgs, TriAttentionKvCacheCompressionConfig,
                        UserProvidedDecodingConfig)
 from .llm_utils import KvCacheRetentionConfig, QuantAlgo, QuantConfig
 from .mm_encoder import MultimodalEncoder
@@ -99,6 +99,7 @@ __all__ = [
     'DeepSeekSparseAttentionConfig',
     'DeepSeekV4SparseAttentionConfig',
     'MiniMaxM3SparseAttentionConfig',
+    'SparseKvCacheOffloadConfig',
     'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
     'ColdPageQuantizationCompressionConfig',

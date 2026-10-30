@@ -3397,19 +3397,21 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self._maybe_record_hang_diagnostic_phase(
-                        "preparing_resources", scheduled_batch)
-                    self.resource_manager.prepare_resources(scheduled_batch)
-
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
+                    # Sort before preparing resources: a resource manager can
+                    # assign per-request rows in this order.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
                         key=lambda req: int(req.py_batch_idx is not None),
                     )
+
+                    self._maybe_record_hang_diagnostic_phase(
+                        "preparing_resources", scheduled_batch)
+                    self.resource_manager.prepare_resources(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
@@ -6334,6 +6336,18 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
+                    # made in model_engine.py::_forward_step. This is only important
+                    # for disaggregated serving. For non-disaggregated serving,
+                    # the generation requests always have batch_idx.
+                    # Sort before preparing resources: a resource manager can
+                    # assign per-request rows in this order.
+                    scheduled_batch.generation_requests = sorted(  # stable sort
+                        scheduled_batch.generation_requests,
+                        key=lambda req: int(req.py_batch_idx is not None),
+                    )
+
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
@@ -6362,17 +6376,6 @@ class PyExecutor:
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
-
-                    # The generation requests that do not have batch_idx
-                    # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
-
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
@@ -9033,6 +9036,11 @@ class PyExecutor:
             # before downstream operations use the outputs.
             if not self._loop_on_execution_stream:
                 torch.cuda.current_stream().wait_stream(self.execution_stream)
+
+            if self._is_kv_manager_v2:
+                self.kv_cache_manager.update_forward_resources(
+                    scheduled_requests,
+                    wait_for_input_copy=self._wait_for_model_engine_input_copy)
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:

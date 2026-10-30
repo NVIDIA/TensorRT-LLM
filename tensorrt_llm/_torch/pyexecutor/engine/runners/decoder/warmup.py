@@ -21,6 +21,7 @@ from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
@@ -341,6 +342,20 @@ class DecoderWarmup:
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
+    def _generation_warmup_shapes(
+        self, warmup_requests_configs: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """Keeps the warmup shapes whose tokens all belong to generation requests.
+
+        Each shape is ``(num_tokens, num_gen_requests)``. Order is preserved.
+        """
+        tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
+        return [
+            (num_tokens, num_gen_requests)
+            for num_tokens, num_gen_requests in warmup_requests_configs
+            if num_tokens == num_gen_requests * tokens_per_gen_request
+        ]
+
     def _warmup_scheduled(
         self, resource_manager: ResourceManager, kv_cache_manager
     ) -> EagerWorkspaceReclaimer | None:
@@ -387,6 +402,10 @@ class DecoderWarmup:
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager)
         )
+        # A decode-only worker never runs a context batch, so every phase below
+        # warms up pure-generation shapes only. The flag comes from the
+        # configuration, so every rank takes the same branch.
+        decode_only = is_decode_only(self.sparse_attention_config)
 
         log_mem_snapshot("warmup/before_warmup")
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
@@ -402,16 +421,21 @@ class DecoderWarmup:
                 ),
                 self._torch_compile_bypass(),
             ):
-                self._run_attention_warmup(resource_manager, can_run_general_warmup)
+                self._run_attention_warmup(
+                    resource_manager, can_run_general_warmup and not decode_only
+                )
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
             with self._warmup_timer.phase(
                 "general", metrics=self._metrics, metric_name="general_warmup_seconds"
             ):
-                warmup_requests_configs = self._agreement.agree_shapes(
-                    self._get_full_general_warmup_requests(resource_manager)
-                )
+                warmup_requests_configs = self._get_full_general_warmup_requests(resource_manager)
+                if decode_only:
+                    warmup_requests_configs = self._generation_warmup_shapes(
+                        warmup_requests_configs
+                    )
+                warmup_requests_configs = self._agreement.agree_shapes(warmup_requests_configs)
                 # Currently graph has not been captured, disable cuda graph for this warmup.
                 with self._graphs.no_cuda_graph():
                     self._general_warmup(resource_manager, warmup_requests_configs)
@@ -444,7 +468,7 @@ class DecoderWarmup:
                 ),
                 self._torch_compile_bypass(),
             ):
-                self._run_autotuner_warmup(resource_manager)
+                self._run_autotuner_warmup(resource_manager, generation_only=decode_only)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
             # for Mamba hybrid models. Runs regardless of enable_autotuner,
@@ -501,6 +525,10 @@ class DecoderWarmup:
                 self._torch_compile_bypass(),
             ):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(resource_manager)
+                if decode_only:
+                    warmup_requests_configs = self._generation_warmup_shapes(
+                        warmup_requests_configs
+                    )
                 self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 

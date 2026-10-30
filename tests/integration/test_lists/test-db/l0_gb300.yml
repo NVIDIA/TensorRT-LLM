@@ -43,6 +43,7 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
+  - unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestSparseResolve::test_colliding_selections_preserve_slots_and_eviction
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).

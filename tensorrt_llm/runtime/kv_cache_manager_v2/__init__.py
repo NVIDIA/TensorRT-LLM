@@ -164,7 +164,6 @@ ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 Batch = _cpp.Batch
 IndexTableSpec = _cpp.IndexTableSpec
-ScratchDesc = _cpp.ScratchDesc
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
 SsmLayerConfig = _cpp.SsmLayerConfig
@@ -273,7 +272,6 @@ __all__ = [
     "Priority",
     "ReuseGroupStatus",
     "ReuseScope",
-    "ScratchDesc",
     "Batch",
     "IndexTableSpec",
     "KVCacheIterationStatsDelta",

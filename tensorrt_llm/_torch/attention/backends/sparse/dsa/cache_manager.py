@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import math
 import os
+from collections import Counter
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -13,16 +15,36 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    convert_to_torch_tensor,
+    get_size_in_bytes,
+    get_sm_version,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttentionLayerConfig,
+    BufferConfig,
+    DataRole,
+    PageIndexMode,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
+from ..offload import (
+    SPARSE_OFFLOAD_STATE_COPIES,
+    SparseOffloadCacheMixin,
+    SparseOffloadLayerDescriptor,
+)
 from .params import DSAParams
+
+# A DSA selection names single tokens of the MLA latent.
+DSA_SPARSE_UNIT_TOKENS = 1
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -95,6 +117,44 @@ def _get_indexer_k_cache_size_per_token(
     return num_attention_layers * bytes_per_layer
 
 
+def _get_full_indexer_cache_size_per_token(
+    model_config: ModelConfig,
+    mapping: Mapping,
+    num_layers: Optional[int] = None,
+) -> int:
+    """Estimate the indexer K-cache cost of the local full-indexer layers.
+
+    Shared-indexer layers own no indexer row. With ``num_layers`` every one of
+    those layers is costed as a full-indexer layer.
+    """
+    sparse_attention_config = model_config.sparse_attention_config
+    config = model_config.pretrained_config
+    sparse_params = sparse_attention_config.to_sparse_params(pretrained_config=config)
+    if not isinstance(sparse_params, DSAParams):
+        raise ValueError("DSA cache requires DSA sparse parameters")
+    if num_layers is not None:
+        num_indexer_layers = max(num_layers, 1)
+    else:
+        local_layer_ids = mapping.pp_layers(model_config.get_num_attention_layers())
+        num_indexer_layers = sum(
+            1
+            for layer_id in local_layer_ids
+            if getattr(
+                sparse_attention_config.to_sparse_params(
+                    pretrained_config=config, layer_idx=layer_id
+                ),
+                "is_full_indexer_layer",
+                True,
+            )
+        )
+    # Indexer K cache: physically allocated as raw UINT8, so it is NOT scaled by
+    # the KV cache dtype (unlike the latent). Under FP4 the indexer stores two
+    # E2M1 codes per byte; the scale bytes are unchanged.
+    return num_indexer_layers * _get_indexer_k_cache_bytes_per_token(
+        sparse_params.index_head_dim, 128, sparse_params.indexer_k_dtype == "fp4"
+    )
+
+
 def derive_indexer_k_cache_layer_mask(
     sparse_attention_config: "SparseAttentionConfig",
     pretrained_config,
@@ -153,6 +213,10 @@ class DSACacheManager(KVCacheManager):
         )
         if not isinstance(sparse_params, DSAParams):
             raise ValueError("DSA cache requires DSA sparse parameters")
+        if sparse_attention_config.get_kv_cache_offload_config() is not None:
+            raise ValueError(
+                "DSA KV cache offload requires kv_cache_config.use_kv_cache_manager_v2=True."
+            )
         self.quant_block_size = 128
         self.index_head_dim = sparse_params.index_head_dim
         # V1 pool geometry is fixed by the legacy C++ manager. Residual
@@ -279,14 +343,6 @@ class DSACacheManager(KVCacheManager):
         )
         if not isinstance(sparse_params, DSAParams):
             raise ValueError("DSA cache requires DSA sparse parameters")
-        index_head_dim = sparse_params.index_head_dim
-        quant_block_size = 128
-        # Under FP4 the indexer stores two E2M1 codes per byte, so the
-        # per-token data footprint halves (132 B -> 68 B at index_head_dim=128);
-        # the scale bytes are unchanged (4 per token, one int32 holding four
-        # UE8M0 exponents at quant_block_size=32 after packing).
-        use_fp4 = sparse_params.indexer_k_dtype == "fp4"
-        indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
 
         # Get latent KV-cache bytes. NVFP4 stores two values per data byte
         # plus one E4M3 block scale for every 16 values.
@@ -313,32 +369,9 @@ class DSACacheManager(KVCacheManager):
             )
             mem_per_token = num_attention_layers * head_dim * bytes_per_element
 
-        if num_layers is not None:
-            num_indexer_layers = max(num_layers, 1)
-        else:
-            local_layer_ids = mapping.pp_layers(model_config.get_num_attention_layers())
-            num_indexer_layers = sum(
-                1
-                for layer_id in local_layer_ids
-                if getattr(
-                    sparse_attention_config.to_sparse_params(
-                        pretrained_config=config, layer_idx=layer_id
-                    ),
-                    "is_full_indexer_layer",
-                    True,
-                )
-            )
-
-        # Indexer K cache: physically allocated as raw UINT8 in
-        # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
-        # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
-        # the latent above). The data-portion byte count already reflects fp8 vs
-        # fp4 via indexer_data_dim.
-        indexer_bytes_per_token = num_indexer_layers * (
-            indexer_data_dim + index_head_dim // quant_block_size * 4
+        return mem_per_token + _get_full_indexer_cache_size_per_token(
+            model_config, mapping, num_layers
         )
-        mem_per_token += indexer_bytes_per_token
-        return mem_per_token
 
     def get_cache_bytes_per_token(self):
         """Compute actual cache bytes per token from instance configuration."""
@@ -387,8 +420,15 @@ class DSACacheManager(KVCacheManager):
         return cache_size_bytes_per_token
 
 
-class DSACacheManagerV2(KVCacheManagerV2):
-    """KVCacheManagerV2-backed cache manager with a DSA indexer K-cache."""
+class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
+    """KVCacheManagerV2-backed cache manager with a DSA indexer K-cache.
+
+    With KV cache offload, every layer's MLA latent (``KEY``, with its
+    ``KEY_BLOCK_SCALE`` under NVFP4) keeps its history in host memory and is
+    read through a per-request GPU cache of single-token units; the indexer
+    K-cache (``INDEX_KEY``) stays on the GPU. Full-indexer and shared-indexer
+    layers differ only in where their selection comes from.
+    """
 
     def __init__(
         self,
@@ -453,6 +493,12 @@ class DSACacheManagerV2(KVCacheManagerV2):
         self.use_fp8_ds_mla, head_dim = _resolve_fp8_ds_mla_head_dim(
             kv_cache_config, tokens_per_block, head_dim, dtype
         )
+        sparse_kv_offload_config = sparse_attention_config.get_kv_cache_offload_config()
+        self._init_sparse_offload(
+            enabled=sparse_kv_offload_config is not None, topk=sparse_params.index_topk
+        )
+        if sparse_kv_offload_config is not None:
+            self._check_dsa_offload_support(dtype)
 
         from tensorrt_llm._torch.speculative import get_num_spec_layers
 
@@ -462,6 +508,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
         self._indexer_k_cache_layer_mask = derive_indexer_k_cache_layer_mask(
             sparse_attention_config, pretrained_config, total_num_layers
         )
+        self._selection_leader_cache: dict[int, int | None] | None = None
 
         super().__init__(
             kv_cache_config,
@@ -479,10 +526,25 @@ class DSACacheManagerV2(KVCacheManagerV2):
             max_num_tokens=max_num_tokens,
             model_config=model_config,
             max_beam_width=max_beam_width,
+            sparse_kv_offload_config=sparse_kv_offload_config,
             **kwargs,
         )
         if self.num_local_layers == 0:
             raise ValueError("DSA requires at least one local attention layer")
+        self._sparse_offload_descriptors: dict[int, SparseOffloadLayerDescriptor] = {}
+        self._sparse_latent_write_pools: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._sparse_latent_nvfp4_arenas: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        if self._enable_kv_cache_offload:
+            self._sparse_offload_descriptors = self.get_sparse_offload_descriptors()
+            self._initialize_sparse_arena_padding(self._sparse_offload_descriptors)
+            self._sparse_latent_write_pools = {
+                layer: self._latent_arena_pool_tensors(descriptor)
+                for layer, descriptor in self._sparse_offload_descriptors.items()
+            }
+            if self.dtype == DataType.NVFP4:
+                self._sparse_latent_nvfp4_arenas = self._latent_nvfp4_arena_views(
+                    self._sparse_offload_descriptors
+                )
         primary_converters = [
             self.impl.get_page_index_converter(local_layer_idx, Role.KEY)
             for local_layer_idx in range(self.num_local_layers)
@@ -605,6 +667,11 @@ class DSACacheManagerV2(KVCacheManagerV2):
         """Return the uniform MLA K pool in the V1-compatible layout."""
         if self._unique_primary_pool is not None:
             return self._unique_primary_pool
+        if self._enable_kv_cache_offload:
+            raise RuntimeError(
+                "With KV cache offload the MLA latent's pages are host memory; attention "
+                "reads it through the sparse cache arena"
+            )
         if self.num_local_layers == 0:
             raise ValueError("DSA requires at least one local attention layer")
         if self.kv_factor != 1:
@@ -671,12 +738,230 @@ class DSACacheManagerV2(KVCacheManagerV2):
             elif data_role == Role.ALL:
                 cache_bytes += self.mla_kv_cache_residual_dim // 2
                 cache_bytes += self.mla_kv_cache_residual_dim // 16
+        if data_role == Role.ALL and self._sparse_kv_offload is not None:
+            # Role.ALL is what the device estimators count; the latent's pages
+            # are host memory.
+            for role in self._sparse_latent_roles():
+                cache_bytes -= self.get_layer_bytes_per_token(local_layer_idx, role)
         if (
             data_role == Role.ALL
             and self._indexer_k_cache_layer_mask[self.pp_layers[local_layer_idx]]
         ):
             cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
         return cache_bytes
+
+    def _check_dsa_offload_support(self, dtype: DataType) -> None:
+        """Refuse offload on the paths that have no arena read or write yet."""
+        if self.use_fp8_ds_mla:
+            raise NotImplementedError(
+                "DSA KV cache offload does not support kv_cache_config.dtype='fp8_ds_mla'."
+            )
+        if dtype not in (DataType.FP8, DataType.BF16, DataType.NVFP4):
+            raise NotImplementedError(
+                f"DSA KV cache offload supports an FP8, BF16 or NVFP4 MLA latent, got {dtype}."
+            )
+        if get_sm_version() < 100:
+            raise NotImplementedError(
+                "DSA KV cache offload reads the latent through the trtllm-gen sparse MLA "
+                f"kernels, which need SM100 or newer; this GPU is SM{get_sm_version()}."
+            )
+        if self._sparse_offload_topk is None or self._sparse_offload_topk <= 0:
+            raise ValueError("DSA KV cache offload requires a positive index_topk")
+
+    def _sparse_latent_roles(self) -> Tuple[DataRole, ...]:
+        """The latent buffers offload keeps in host memory: data, and NVFP4 block scales."""
+        if self.dtype == DataType.NVFP4:
+            return (Role.KEY, Role.KEY_BLOCK_SCALE)
+        return (Role.KEY,)
+
+    def _selection_leaders(self) -> dict[int, int | None]:
+        """Per model layer, the model layer whose indexer selects for it.
+
+        A group is a run of local layers starting at one that owns an indexer;
+        the layers after it reuse its top-k, so the whole run is handed one
+        selection and shares one resident set in the cache. ``None`` where the
+        run holds a single layer, which is every layer of a model with no
+        indexer sharing -- a layer that selects for itself never shares.
+
+        Keyed and valued by model layer, because the local numbering is compacted
+        after the cache config is built and this answer has to be the same on both
+        sides of that. Computed once for the same reason.
+        """
+        if self._selection_leader_cache is None:
+            leader_of: dict[int, int | None] = {}
+            leader = self.pp_layers[0]
+            for local, layer in enumerate(self.pp_layers):
+                # The first layer leads whether or not the mask says it owns an
+                # indexer: a run has to start somewhere, and
+                # derive_indexer_k_cache_layer_mask already forces layer 0 to be full.
+                if self._indexer_k_cache_layer_mask[layer] or local == 0:
+                    leader = layer
+                leader_of[layer] = leader
+            members = Counter(leader_of.values())
+            self._selection_leader_cache = {
+                layer: leader if members[leader] > 1 else None
+                for layer, leader in leader_of.items()
+            }
+        return self._selection_leader_cache
+
+    def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """With offload, give every layer's MLA latent host-backed history and a GPU cache."""
+        if self._sparse_kv_offload is None:
+            return config
+        # Named by the leading local layer, so the layers of one indexer resolve once
+        # between them. An unshared layer names nothing and keeps a row to itself.
+        leaders = self._selection_leaders()
+
+        def selection_id(local_layer_idx: int) -> int | None:
+            leader = leaders[self.pp_layers[local_layer_idx]]
+            # Negated so the id cannot land in the runtime's layer-id space, where an
+            # unset id reads as the layer's own and a leading model layer's number may
+            # well be some other layer's local one. The id only has to be equal within
+            # a group and distinct between them; it is not a layer reference.
+            return None if leader is None else -(leader + 1)
+
+        def cache_for(local_layer_idx: int):
+            return sparse_cache_config(
+                num_selected_units=self._sparse_offload_topk,
+                unit_tokens=DSA_SPARSE_UNIT_TOKENS,
+                tokens_per_block=self.tokens_per_block,
+                gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
+                selection_id=selection_id(local_layer_idx),
+            )
+
+        sparse_roles = self._sparse_latent_roles()
+        layers = []
+        for layer in config.layers:
+            if not isinstance(layer, AttentionLayerConfig):
+                layers.append(layer)
+                continue
+            # A sparse buffer's size is still a whole page; the layer's sparse_cache
+            # divides it into one-token units of the single-head latent.
+            buffers = [
+                BufferConfig(role=buffer.role, size=buffer.size, is_sparse=True)
+                if buffer.role in sparse_roles
+                else buffer
+                for buffer in layer.buffers
+            ]
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=layer.layer_id,
+                    buffers=buffers,
+                    sliding_window_size=layer.sliding_window_size,
+                    num_sink_tokens=layer.num_sink_tokens,
+                    sparse_cache=cache_for(int(layer.layer_id)),
+                )
+            )
+        return replace(config, layers=layers)
+
+    def get_sparse_offload_descriptors(self) -> dict[int, SparseOffloadLayerDescriptor]:
+        """Describe each local layer's MLA latent arena, by global layer index."""
+        if not self._enable_kv_cache_offload:
+            raise ValueError("Sparse offload metadata requires an offload-enabled cache manager")
+        layout = self._sparse_arena_layout()
+        leaders = self._selection_leaders()
+        return {
+            layer: self._build_sparse_offload_descriptor(
+                layout,
+                self.layer_offsets[layer],
+                Role.KEY,
+                unit_tokens=DSA_SPARSE_UNIT_TOKENS,
+                scale_role=Role.KEY_BLOCK_SCALE if self.dtype == DataType.NVFP4 else None,
+                selection_owner=leaders[layer],
+                name=f"Layer {layer}",
+            )
+            for layer in self.pp_layers
+        }
+
+    def _latent_arena_pool_tensors(
+        self, descriptor: SparseOffloadLayerDescriptor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return a one-pool view of a layer's latent arena for the MLA cache writer.
+
+        The writer addresses its cache through host pool pointers [pool, 2] and a
+        layer-to-pool mapping [layer, 2]. Pool 0 starts at the arena base, so a
+        one-token page whose block offset is the write row lands in that row.
+        NVFP4 pointers are [pool, 2, 2], data then block scales; the scales'
+        arena pairs its rows with the data's, so the same row addresses both.
+        """
+        data_base = descriptor.arena_base_addresses[descriptor.data_buffer_index]
+        if descriptor.scale_buffer_index is None:
+            pointers = [[data_base, 0]]
+        else:
+            scale_base = descriptor.arena_base_addresses[descriptor.scale_buffer_index]
+            pointers = [[[data_base, scale_base], [0, 0]]]
+        pool_pointers = torch.tensor(pointers, dtype=torch.int64, device="cpu")
+        pool_mapping = torch.zeros((1, 2), dtype=torch.int32, device="cpu")
+        return pool_pointers, pool_mapping
+
+    def get_sparse_latent_write_pool(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the host pool pointers and mapping that address a layer's latent arena."""
+        return self._sparse_latent_write_pools[layer_idx]
+
+    def _latent_nvfp4_arena_views(
+        self, descriptors: dict[int, SparseOffloadLayerDescriptor]
+    ) -> dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+        """View each layer's NVFP4 latent arenas as the rows the NVFP4 gather reads.
+
+        Data views are packed bytes [rows, 1, data bytes] and scale views E4M3
+        [rows, 1, scale bytes], where a row is one token's unit and an arena row
+        index addresses it. All layers' buffers of one pool share its region,
+        and so its view.
+        """
+        views: dict[int, torch.Tensor] = {}
+
+        def view(
+            descriptor: SparseOffloadLayerDescriptor,
+            index: int,
+            dtype: torch.dtype,
+            row_bytes: int,
+        ) -> torch.Tensor:
+            base = descriptor.arena_base_addresses[index]
+            if base not in views:
+                rows = descriptor.arena_row_counts[index]
+                views[base] = convert_to_torch_tensor(
+                    TensorWrapper(base, dtype, (rows, 1, row_bytes))
+                )
+            return views[base]
+
+        arenas = {}
+        for layer, descriptor in descriptors.items():
+            local_layer_idx = self.layer_offsets[layer]
+            arenas[layer] = (
+                view(
+                    descriptor,
+                    descriptor.data_buffer_index,
+                    torch.uint8,
+                    self.get_layer_bytes_per_token(local_layer_idx, Role.KEY),
+                ),
+                view(
+                    descriptor,
+                    descriptor.scale_buffer_index,
+                    torch.float8_e4m3fn,
+                    self.get_layer_bytes_per_token(local_layer_idx, Role.KEY_BLOCK_SCALE),
+                ),
+            )
+        return arenas
+
+    def get_sparse_latent_nvfp4_arenas(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return a layer's NVFP4 latent data and block-scale arena views, indexed by arena row."""
+        return self._sparse_latent_nvfp4_arenas[layer_idx]
+
+    def _sparse_offload_nvfp4_head_dim(self) -> Optional[int]:
+        return self.head_dim if self.dtype == DataType.NVFP4 else None
+
+    def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfigPy) -> int:
+        """Count the offload state and the latent writer's one-token page table.
+
+        Per Batch row, the page table holds a K and a V offset and the write slots
+        one entry, since an offloading step has one query token per request.
+        Both metadata copies hold them.
+        """
+        scratch = super().get_sparse_offload_scratch_bytes(config)
+        if scratch:
+            writer_entries = 3 * self.max_batch_size
+            scratch += SPARSE_OFFLOAD_STATE_COPIES * writer_entries * torch.int32.itemsize
+        return scratch
 
     def get_cache_bytes_per_token(self) -> int:
         return sum(
@@ -691,6 +976,14 @@ class DSACacheManagerV2(KVCacheManagerV2):
         num_layers: Optional[int] = None,
         **kwargs,
     ):
+        sparse_attention_config = model_config.sparse_attention_config
+        if (
+            sparse_attention_config is not None
+            and sparse_attention_config.get_kv_cache_offload_config() is not None
+        ):
+            # The latent's history lives in host memory; only the indexer K-cache
+            # takes device bytes per token.
+            return _get_full_indexer_cache_size_per_token(model_config, mapping, num_layers)
         cache_bytes = DSACacheManager.get_cache_size_per_token(
             model_config, mapping, num_layers=num_layers, **kwargs
         )

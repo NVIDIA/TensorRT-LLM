@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from enum import Enum
 
 import torch
@@ -36,6 +37,10 @@ class TopK(nn.Module):
     request metadata and retain a stable address across CUDA Graph replays.
     Native CUDA scratch is supplied by the caller so its lifetime follows the
     caller's eager or CUDA-graph metadata.
+
+    ``FORCE_DETERMINISTIC=1`` or ``FORCE_TOPK_KERNEL_DETERMINISTIC=1`` selects
+    the PyTorch implementation for repeatable indices, including their ordering
+    and selection among tied scores.
     """
 
     def __init__(
@@ -51,6 +56,13 @@ class TopK(nn.Module):
     ) -> None:
         super().__init__()
         self.top_k = top_k
+        if (
+            os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+            or os.getenv("FORCE_TOPK_KERNEL_DETERMINISTIC", "0") == "1"
+        ):
+            # Native selection uses atomic appends, including for ties at the
+            # cutoff. Fix both the selected set and its order for repeatability.
+            prefill_implementation = decode_implementation = TopKImplementation.TORCH
         self.prefill_implementation = TopKImplementation(
             prefill_implementation or TopKImplementation.CUDA_RADIX
         )

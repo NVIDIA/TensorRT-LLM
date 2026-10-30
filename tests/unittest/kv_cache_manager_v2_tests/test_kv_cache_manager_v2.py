@@ -1647,7 +1647,7 @@ class TestSparseCacheReservation(unittest.TestCase):
 
 
 class TestSparseResolve(unittest.TestCase):
-    """The sparse resolve kernel: probe index, victim choice and recency rebuild."""
+    """The sparse resolve kernel: probe index, victim choice and the ages it leaves."""
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -1662,7 +1662,7 @@ class TestSparseResolve(unittest.TestCase):
         selected: list[int],
         *,
         num_layers: int = 1,
-        lru: list[int] | None = None,
+        ages: list[int] | None = None,
         history_units: int = 1 << 20,
         capacity_units: int | None = None,
         max_in_flight_units: int = 0,
@@ -1671,13 +1671,11 @@ class TestSparseResolve(unittest.TestCase):
     ):
         entries = len(resident) // (num_layers * num_rows)
         width = len(selected) // (num_layers * num_rows)
-        if lru is None:
-            lru = list(range(entries)) * num_layers * num_rows
         history = [history_units] * num_rows
         capacity = [history_units if capacity_units is None else capacity_units] * num_rows
         return _introspection.sparse_resolve(
             resident,
-            lru,
+            ages or [],
             num_layers,
             entries,
             selected,
@@ -1710,29 +1708,33 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.out_slot[1:], [-1, -1])
 
     def test_hits_outrank_units_fetched_this_step(self):
+        """Both entries are used this step, and the history flag is what separates them."""
         # Entry 0 holds unit 10 and is selected; unit 99 is new.
         resident = [10] + self._free(7)
         result = self._resolve(resident, [10, 99])
         fetched = result.out_slot[1]
-        self.assertEqual(result.lru_order[0], 0, "the hit should be most recently used")
-        self.assertEqual(result.lru_order[1], fetched, "the fetch ranks below the hit")
+        self.assertEqual(result.entry_age[0], 0)
+        self.assertEqual(result.entry_hit[0], 1, "the entry already held its unit")
+        self.assertEqual(result.entry_age[fetched], 0)
+        self.assertEqual(result.entry_hit[fetched], 0, "the unit was fetched into the entry")
 
-    def test_victims_come_from_the_lru_tail(self):
-        # A full cache, with entry 2 placed last in recency so it is the victim.
+    def test_victims_are_the_stalest_entries(self):
+        # A full cache, with entry 2 the oldest so it is the victim.
         resident = [10, 11, 12, 13]
-        lru = [0, 1, 3, 2]
-        result = self._resolve(resident, [99], lru=lru)
+        result = self._resolve(resident, [99], ages=[1, 1, 9, 1])
         self.assertEqual(result.miss_count, [1])
         self.assertEqual(result.out_slot, [2])
         self.assertEqual(result.resident_ordinal[2], 99)
-        # The units that were not selected keep their data.
+        # The units that were not selected keep their data, and age by nothing: the step
+        # clock only advances between resolves.
         self.assertEqual([result.resident_ordinal[i] for i in (0, 1, 3)], [10, 11, 13])
+        self.assertEqual([result.entry_age[i] for i in (0, 1, 3)], [1, 1, 1])
 
     def test_in_flight_entries_are_never_evicted(self):
         # Unit 12 is at or above the watermark, so it holds the only copy of its data.
         resident = [10, 11, 12, 13]
-        lru = [0, 1, 3, 2]  # entry 2 (unit 12) is least recently used
-        result = self._resolve(resident, [99], lru=lru, history_units=12)
+        ages = [1, 1, 9, 1]  # entry 2 (unit 12) is the oldest
+        result = self._resolve(resident, [99], ages=ages, history_units=12)
         self.assertEqual(result.resident_ordinal[2], 12, "an in-flight unit must survive")
         self.assertEqual(result.resident_ordinal[result.out_slot[0]], 99)
 
@@ -1840,35 +1842,20 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.out_slot[0], 0)
         self.assertEqual(result.resident_ordinal[2 + result.out_slot[2]], 42)
 
-    def test_large_caches_preserve_victims_and_recency_order(self):
-        """Hits, fetched victims, and untouched entries retain their relative order."""
-        import cuda.bindings.runtime as cudart
-
-        # The 8192-entry case needs 147552 bytes of dynamic shared memory per resolve block,
-        # on top of what the kernel declares statically.
-        err, device = cudart.cudaGetDevice()
-        self.assertEqual(int(err), int(cudart.cudaError_t.cudaSuccess))
-        err, shared_optin = cudart.cudaDeviceGetAttribute(
-            cudart.cudaDeviceAttr.cudaDevAttrMaxSharedMemoryPerBlockOptin, device
-        )
-        self.assertEqual(int(err), int(cudart.cudaError_t.cudaSuccess))
-        if shared_optin < 160 << 10:
-            self.skipTest(
-                f"needs 160 KiB of shared memory per block; this device allows {shared_optin}"
-            )
+    def test_large_caches_evict_the_free_entries_then_the_stalest(self):
+        """Free entries go first, then the oldest, and every other entry is left alone."""
         for entries in (31, 32, 33, 255, 256, 257, 2048, 4096, 4224, 8192):
             with self.subTest(entries=entries):
                 rng = random.Random(entries)
                 history = 100000
                 in_flight = 4
+                count = min(entries // 4, 512)
+                num_free = min(entries // 8, count // 2)
                 resident = list(range(entries - in_flight)) + list(
                     range(history, history + in_flight)
                 )
-                resident[: entries // 8] = self._free(entries // 8)
+                resident[:num_free] = self._free(num_free)
                 rng.shuffle(resident)
-                lru = list(range(entries))
-                rng.shuffle(lru)
-                count = min(entries // 4, 512)
                 hits = rng.sample(
                     [ordinal for ordinal in resident if 0 <= ordinal < history], count
                 )
@@ -1880,18 +1867,22 @@ class TestSparseResolve(unittest.TestCase):
                     for slot, ordinal in enumerate(resident)
                     if ordinal in hits or history <= ordinal < history + in_flight
                 }
-                eligible = [slot for slot in lru if slot not in hit_slots]
-                victims = set(eligible[-count:])
-                expected_lru = (
-                    [slot for slot in lru if slot in hit_slots]
-                    + [slot for slot in lru if slot in victims]
-                    + [slot for slot in lru if slot not in hit_slots | victims]
-                )
+                free_slots = {slot for slot, ordinal in enumerate(resident) if ordinal < 0}
+                # Two ages, far enough apart that the cache has to take the older group
+                # whole before it reaches anything else.
+                eligible = [
+                    slot
+                    for slot in range(entries)
+                    if slot not in hit_slots and slot not in free_slots
+                ]
+                stale = set(rng.sample(eligible, count - num_free))
+                ages = [9 if slot in stale else 1 for slot in range(entries)]
+                victims = free_slots | stale
                 try:
                     result = self._resolve(
                         resident,
                         selected,
-                        lru=lru,
+                        ages=ages,
                         history_units=history,
                         capacity_units=history + in_flight,
                         max_in_flight_units=in_flight,
@@ -1901,7 +1892,6 @@ class TestSparseResolve(unittest.TestCase):
                         raise unittest.SkipTest(str(error)) from error
                     raise
                 self.assertEqual(result.miss_count, [count])
-                self.assertEqual(result.lru_order, expected_lru)
                 fetched_slots = set()
                 for ordinal, slot in zip(selected, result.out_slot):
                     if ordinal < 0:
@@ -1914,40 +1904,42 @@ class TestSparseResolve(unittest.TestCase):
                 for slot, ordinal in enumerate(resident):
                     if slot not in victims:
                         self.assertEqual(result.resident_ordinal[slot], ordinal)
+                # Every entry the step used is now the youngest there is, and the flag
+                # separates the ones that were already holding their unit.
+                for slot in range(entries):
+                    if slot in victims:
+                        self.assertEqual((result.entry_age[slot], result.entry_hit[slot]), (0, 0))
+                    elif slot in hit_slots - free_slots:
+                        self.assertEqual((result.entry_age[slot], result.entry_hit[slot]), (0, 1))
+                    else:
+                        self.assertEqual(result.entry_age[slot], ages[slot])
                 self.assertEqual(
                     result.in_flight_slot,
                     [resident.index(history + i) for i in range(in_flight)],
                 )
 
-    def test_colliding_selections_preserve_slots_and_recency(self) -> None:
-        """Sparse ordinals and padding preserve the same eviction and stable-order contract."""
+    def test_colliding_selections_preserve_slots_and_eviction(self) -> None:
+        """Sparse ordinals and padding preserve the same eviction contract."""
         for entries in (63, 257, 2080):
             with self.subTest(entries=entries):
-                history = 1 << 28
-                resident = [i * 2048 for i in range(entries - 2)] + [history, history + 1]
-                lru = list(range(entries))
-                random.Random(entries).shuffle(lru)
+                history = 200000
+                resident = [i * 64 for i in range(entries - 2)] + [history, history + 1]
                 count = min(entries // 4, 32)
                 hits = resident[:count]
-                misses = [(entries + i) * 2048 for i in range(count)]
+                misses = [(entries + i) * 64 for i in range(count)]
                 selected = [-1, *misses, -1, *reversed(hits), -1]
                 hit_slots = set(range(count)) | {entries - 2, entries - 1}
-                eligible = [slot for slot in lru if slot not in hit_slots]
-                victims = set(eligible[-count:])
-                expected_lru = (
-                    [slot for slot in lru if slot in hit_slots]
-                    + [slot for slot in lru if slot in victims]
-                    + [slot for slot in lru if slot not in hit_slots | victims]
-                )
+                eligible = [slot for slot in range(entries) if slot not in hit_slots]
+                victims = set(random.Random(entries).sample(eligible, count))
+                ages = [9 if slot in victims else 1 for slot in range(entries)]
                 result = self._resolve(
                     resident,
                     selected,
-                    lru=lru,
+                    ages=ages,
                     history_units=history,
                     capacity_units=history + 2,
                     max_in_flight_units=4,
                 )
-                self.assertEqual(result.lru_order, expected_lru)
                 self.assertEqual(result.miss_count, [count])
                 self.assertEqual(result.miss_total, [count])
                 self.assertEqual(result.in_flight_slot, [entries - 2, entries - 1, -1, -1])
@@ -4496,11 +4488,11 @@ class TestSparseWriteIndices(unittest.TestCase):
         that treated its entry as an ordinary miss would copy stale bytes over what the model
         wrote. Removing that guard fails this.
 
-        It does not cover the separate `pinned` term in the victim test. Every in-flight
+        It does not cover the separate held-entry term in the victim test. Every in-flight
         ordinal is probed in the resolve's required prefix, so its entry is always classified
-        hit or fetched and never `kClassUntouched` -- which the victim test already excludes.
-        Dropping `pinned` leaves every test here passing, so it appears to be redundant with
-        that classification rather than load-bearing.
+        as matched and never as evictable -- which the victim test already excludes. Dropping
+        the held term leaves every test here passing, so it appears to be redundant with that
+        classification rather than load-bearing.
         """
         ctypes, cudart, torch = self._deps()
         manager = self._manager()

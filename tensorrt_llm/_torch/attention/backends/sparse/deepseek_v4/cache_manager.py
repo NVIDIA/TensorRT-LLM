@@ -15,8 +15,8 @@
 
 from collections import defaultdict
 from dataclasses import replace
-from math import gcd
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from math import ceil, gcd
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -24,13 +24,13 @@ from tensorrt_llm._torch.pyexecutor import llm_request
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _GUARD_PAGE_REQUEST_ID,
     _RESERVED_REQUEST_IDS,
-    CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
     _fill_kv_pages,
+    _get_generation_kv_capacity,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -44,30 +44,24 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeC
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
-    BufferId,
-    CudaStream,
     DataRole,
+    HalfOpenRange,
     KVCacheDesc,
     LayerId,
     PageIndexMode,
-    ScratchDesc,
+    SparseCacheConfig,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
+from ..offload import SparseOffloadCacheMixin, SparseOffloadLayerDescriptor, SparseOffloadState
 from .compressor import KVCacheDtype, get_nvfp4_compress_residual_dim
-from .kernels import (
-    check_sparse_read_table,
-    merge_sparse_read_table,
-    prepare_sparse_write_table,
-    select_sparse_history_pages,
-)
-from .offload import SparseOffloadLayerDescriptor, SparseOffloadState
 from .params import (
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
@@ -76,9 +70,6 @@ from .params import (
     compress_ratio_has_attention,
     is_overlap_compressor,
 )
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
 KV_CACHE_COPY_ALIGNMENT = 16
@@ -177,10 +168,24 @@ def _estimate_non_sliding_attn_size_per_token(
     use_fp8_ds_mla: bool = False,
     has_nvfp4_compress: bool = False,
     nvfp4_residual_dim: int | None = None,
-) -> int:
+    offload_sparse_history: bool = False,
+) -> float:
+    """Return the GPU bytes per token of compressed-layer history.
+
+    With ``offload_sparse_history``, size a worker that offloads ratio-4
+    history: leave out the offloaded rows and count the rest at their exact
+    bytes per token instead of rounding each down to whole bytes.
+    """
     total_bytes = 0
     for compress_ratio in compress_ratios:
         for attn_type in DEEPSEEK_V4_NON_SLIDING_ATTENTION:
+            if (
+                offload_sparse_history
+                and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
+                and attn_type == DeepseekV4AttentionType.COMPRESS
+            ):
+                # Offloaded history lives in host memory.
+                continue
             if compress_ratio_has_attention(compress_ratio, attn_type):
                 total_bytes += _get_attn_bytes_per_token(
                     head_dim,
@@ -192,6 +197,7 @@ def _estimate_non_sliding_attn_size_per_token(
                     use_fp8_ds_mla=use_fp8_ds_mla,
                     has_nvfp4_compress=has_nvfp4_compress,
                     nvfp4_residual_dim=nvfp4_residual_dim,
+                    exact=offload_sparse_history,
                 )
     return total_bytes
 
@@ -208,7 +214,15 @@ def _estimate_swa_cache_size(
     scratch: bool,
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
+    generation_capacity_headroom: int | None = None,
 ) -> Tuple[int, int]:
+    """Return the sliding-window bytes per token and per request.
+
+    By default a window costs one page per ``tokens_per_block`` tokens of
+    window. With ``generation_capacity_headroom``, the tokens a generation step
+    reserves above history, it costs the most pages its live interval touches
+    at any page offset, which is what the cache manager holds.
+    """
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
     size_per_request = 0
@@ -226,9 +240,15 @@ def _estimate_swa_cache_size(
                 window_size = state_factor * compress_ratio
             if window_size <= 0:
                 continue
-            window_tokens = (
-                (int(window_size) + tokens_per_block - 1) // tokens_per_block
-            ) * tokens_per_block
+            if generation_capacity_headroom is None:
+                window_pages = ceil_div(int(window_size), tokens_per_block)
+            else:
+                # The live interval spans window + headroom - 1 tokens.
+                window_pages = (
+                    ceil_div(int(window_size) + generation_capacity_headroom - 2, tokens_per_block)
+                    + 1
+                )
+            window_tokens = window_pages * tokens_per_block
             token_bytes = _get_attn_bytes_per_token(
                 head_dim,
                 index_head_dim,
@@ -262,7 +282,13 @@ def _get_attn_bytes_per_token(
     use_fp8_ds_mla: bool = False,
     has_nvfp4_compress: bool = False,
     nvfp4_residual_dim: int | None = None,
-) -> int:
+    exact: bool = False,
+) -> float:
+    """Return the bytes one token adds to a buffer.
+
+    A compressed row covers ``compress_ratio`` tokens, so its bytes are divided
+    among them: rounded down to whole bytes, or exactly when ``exact`` is set.
+    """
     token_bytes = get_token_bytes(
         head_dim,
         index_head_dim,
@@ -275,8 +301,18 @@ def _get_attn_bytes_per_token(
         nvfp4_residual_dim=nvfp4_residual_dim,
     )
     if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
+        if exact:
+            return token_bytes / compress_ratio
         token_bytes //= compress_ratio
     return token_bytes
+
+
+def _scratch_entry(kv_cache, pool_id) -> tuple[HalfOpenRange, list[int]] | None:
+    """The scratch range and the slots serving it, or None when none of the blocks do."""
+    scratch_range = kv_cache.get_swa_scratch_range(pool_id)
+    if not scratch_range:
+        return None
+    return scratch_range, kv_cache.get_scratch_slots(pool_id)
 
 
 def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
@@ -286,7 +322,7 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
         return PageIndexMode.SHARED
 
 
-class DeepseekV4CacheManager(KVCacheManagerV2):
+class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
     _supports_reuse_match_backoff = False
 
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
@@ -339,13 +375,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 "for DeepseekV4CacheManager"
             )
 
-        self._enable_kv_cache_offload = sparse_attn_config.enable_kv_cache_offload
-        if self._enable_kv_cache_offload:
-            # The attention adapter is connected; enable only after validating
-            # the real runtime's transfer, addressing, and scratch contracts.
-            raise NotImplementedError(
-                "DeepSeek-V4 KV cache offload requires the KVCM v2 sparse runtime "
-                "and validated fetch addressing, scratch lifetime, and transfer ordering."
+        self._init_sparse_offload(
+            enabled=sparse_attn_config.enable_kv_cache_offload,
+            topk=sparse_attn_config.index_topk,
+        )
+        sparse_kv_offload_config = sparse_attn_config.get_kv_cache_offload_config()
+        if sparse_kv_offload_config is not None:
+            self._check_sparse_kv_offload_config(
+                sparse_kv_offload_config,
+                kv_cache_config,
+                mapping,
+                spec_config=kwargs.get("spec_config"),
             )
 
         # DeepSeek-V4 specific attributes initialization
@@ -422,6 +462,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             mapping=mapping,
             dtype=cache_dtype,
             max_num_tokens=max_num_tokens,
+            sparse_kv_offload_config=sparse_kv_offload_config,
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
@@ -430,6 +471,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # to be in the same pool and have the same scale.
         self._assert_layer_pool_scale()
         self._assert_nvfp4_compress_pool_layout()
+        self._sparse_arena_buffers: dict[int, tuple[torch.Tensor, torch.Tensor | None]] = {}
+        if self._enable_kv_cache_offload:
+            descriptors = self.get_sparse_offload_descriptors()
+            self._initialize_sparse_arena_buffers(descriptors)
+            self._initialize_sparse_arena_padding(descriptors)
 
         # For DeepSeek-V4 Attention, the base pointer for SWA pool
         # Use first PP layer instead of hardcoded 0 for pipeline parallelism.
@@ -487,6 +533,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return
         for layer_idx in self.pp_layers:
             compress_ratio = self._compress_ratios[layer_idx]
+            if self._enable_kv_cache_offload and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
+                # Arena geometry is validated when building the sparse descriptors;
+                # the host page converters do not address the arena.
+                continue
             if not compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS):
                 continue
             layer_id = self._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS]
@@ -544,6 +594,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         Returns:
             The buffer tensor (shape: [num_blocks, tokens_per_block, attn_dim])
             For blockwise FP8 layers, shape is [num_blocks, tokens_per_block, attn_dim + scale_size]
+            Sparse COMPRESS storage is device-mapped host memory and keeps the ordinary
+            page shape, [num_blocks, compressed_block_size, dim_per_token]: a sparse
+            buffer's size is its whole page, which the cache divides into selection units.
+            GPU arena views are returned by get_sparse_compress_buffers().
         """
         layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
         data_role = attn_type.role
@@ -604,7 +658,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
     def get_compress_scale_buffers(self, layer_idx: int) -> torch.Tensor:
-        """Return E4M3 per-16 scales for an NVFP4 COMPRESS layer."""
+        """Return E4M3 per-16 scales from the NVFP4 COMPRESS storage pool.
+
+        Sparse storage is device-mapped host memory, indexed one compressed row
+        at a time. GPU arena scales are returned by get_sparse_compress_buffers().
+        """
         if not self._use_nvfp4_compress:
             raise RuntimeError("COMPRESS block scales exist only for NVFP4 KV cache.")
         layer_id = self._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS]
@@ -614,9 +672,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         page_index_upper_bound = self.impl.get_page_index_upper_bound(
             layer_id, COMPRESS_BLOCK_SCALE_ROLE
         )
+        block_size = self.compressed_block_sizes[layer_idx]
         shape = (
             page_index_upper_bound,
-            self.compressed_block_sizes[layer_idx],
+            block_size,
             (self.head_dim + self.nvfp4_residual_dim) // NVFP4_VECTOR_SIZE,
         )
         return convert_to_torch_tensor(TensorWrapper(addr, DataType.FP8, shape))
@@ -942,8 +1001,15 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return converter(
             base_indices,
             page_index_mode,
-            kv_cache.get_scratch_desc(pool_id),
+            kv_cache.get_swa_scratch_range(pool_id) or None,
+            kv_cache.get_scratch_slots(pool_id),
         )
+
+    def _get_window_page_headroom(self) -> int | None:
+        """Headroom for counting the pages a window holds with offload, else None."""
+        if not self._enable_kv_cache_offload:
+            return None
+        return self._generation_kv_capacity_headroom
 
     def _get_extra_quota_padding(self) -> int:
         """Ensure each attention type has minimal space when max_tokens is small."""
@@ -961,6 +1027,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
             nvfp4_residual_dim=self.nvfp4_residual_dim,
+            offload_sparse_history=self._enable_kv_cache_offload,
         )
         (
             context_swa_size_per_token,
@@ -976,6 +1043,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         (
             generation_swa_size_per_token,
@@ -991,6 +1059,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         max_context_tokens = (
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
@@ -1018,6 +1087,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
             nvfp4_residual_dim=self.nvfp4_residual_dim,
+            offload_sparse_history=self._enable_kv_cache_offload,
         )
         context_swa_size_per_token, _ = _estimate_swa_cache_size(
             self.head_dim,
@@ -1030,6 +1100,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         (
             generation_swa_size_per_token,
@@ -1045,6 +1116,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         padding = self._get_extra_quota_padding()
         size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
@@ -1091,13 +1163,50 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 if padding_pages:
                     nvfp4_padding_pages[grouped_layers[-1]] = padding_pages
 
+        def _make_buffer_config(
+            layer_idx: int,
+            role: DataRole,
+            page_bytes: int,
+            *,
+            is_sparse: bool,
+        ) -> BufferConfig:
+            if not is_sparse:
+                return BufferConfig(role=role, size=page_bytes)
+            if self.use_fp8_ds_mla:
+                raise NotImplementedError(
+                    "Sparse fp8_ds_mla compressed KV requires a selection layout with "
+                    "separate data and footer-scale regions"
+                )
+            # `size` is the whole page, as for any other buffer; the layer's sparse_cache
+            # says how many selection units it divides into. num_kv_heads is 1 here, so a
+            # unit is one contiguous range and the default sparse_unit_chunks of 1 is right.
+            return BufferConfig(role=role, size=page_bytes, is_sparse=True)
+
+        def _sparse_cache_config() -> SparseCacheConfig:
+            topk = self._sparse_offload_topk
+            if topk is None or topk <= 0:
+                raise ValueError("Sparse compressed KV requires a positive index_topk")
+            # A selection names compressed rows of four original tokens each.
+            return sparse_cache_config(
+                num_selected_units=topk,
+                unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
+                tokens_per_block=self.tokens_per_block,
+                gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
+            )
+
         def _add_layer(
             layer_idx: int,
             attention_types: List[DeepseekV4AttentionType],
             sliding_window_size: int | None,
             *,
-            is_sparse: bool = False,
+            sparse_roles: frozenset[DeepseekV4AttentionType] = frozenset(),
         ) -> None:
+            # Sparsity is per buffer, so one layer may hold the compressed KV the cache
+            # fetches through beside the indexer that selects over it -- they are one
+            # attention computation and belong together.
+            def _is_sparse(attn_type: DeepseekV4AttentionType) -> bool:
+                return attn_type in sparse_roles
+
             layer_id = LayerId(len(layers))
             for attn_type in attention_types:
                 layer_attn_to_layer_id[layer_idx, attn_type] = layer_id
@@ -1108,12 +1217,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             buffers = []
             for attn_type in attention_types:
                 size = self._get_attn_bytes_per_block(attn_type, layer_idx)
-                if is_sparse:
-                    buffer = BufferConfig(role=attn_type.role, size=size, is_sparse=True)
-                else:
-                    # The current runtime does not yet accept the sparse keyword.
-                    buffer = BufferConfig(role=attn_type.role, size=size)
-                buffers.append(buffer)
+                buffers.append(
+                    _make_buffer_config(
+                        layer_idx, attn_type.role, size, is_sparse=_is_sparse(attn_type)
+                    )
+                )
             if self._use_nvfp4_compress and DeepseekV4AttentionType.COMPRESS in attention_types:
                 scale_page_size = (
                     self.compressed_block_sizes[layer_idx]
@@ -1121,9 +1229,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     // NVFP4_VECTOR_SIZE
                 )
                 buffers.append(
-                    BufferConfig(
-                        role=COMPRESS_BLOCK_SCALE_ROLE,
-                        size=scale_page_size,
+                    _make_buffer_config(
+                        layer_idx,
+                        COMPRESS_BLOCK_SCALE_ROLE,
+                        scale_page_size,
+                        is_sparse=_is_sparse(DeepseekV4AttentionType.COMPRESS),
                     )
                 )
                 # Reuse snapshots copy complete coalesced slots in 16-byte
@@ -1139,13 +1249,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     )
                     buffers.extend(
                         [
-                            BufferConfig(
-                                role=data_padding_role,
-                                size=data_page_size,
+                            _make_buffer_config(
+                                layer_idx,
+                                data_padding_role,
+                                data_page_size,
+                                is_sparse=_is_sparse(DeepseekV4AttentionType.COMPRESS),
                             ),
-                            BufferConfig(
-                                role=scale_padding_role,
-                                size=scale_page_size,
+                            _make_buffer_config(
+                                layer_idx,
+                                scale_padding_role,
+                                scale_page_size,
+                                is_sparse=_is_sparse(DeepseekV4AttentionType.COMPRESS),
                             ),
                         ]
                     )
@@ -1155,6 +1269,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 buffers=buffers,
                 sliding_window_size=sliding_window_size,
                 num_sink_tokens=None,
+                sparse_cache=_sparse_cache_config() if sparse_roles else None,
             )
             layers.append(layer_config)
 
@@ -1173,18 +1288,21 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     [DeepseekV4AttentionType.SWA],
                     self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
                 )
-                if self._enable_kv_cache_offload:
-                    _add_layer(layer, [DeepseekV4AttentionType.COMPRESS], None, is_sparse=True)
-                    _add_layer(layer, [DeepseekV4AttentionType.INDEXER_COMPRESS], None)
-                else:
-                    _add_layer(
-                        layer,
-                        [
-                            DeepseekV4AttentionType.COMPRESS,
-                            DeepseekV4AttentionType.INDEXER_COMPRESS,
-                        ],
-                        None,
-                    )
+                # One layer either way. Only the compressed KV is fetched through the
+                # sparse cache; the indexer that selects over it stays device-resident.
+                _add_layer(
+                    layer,
+                    [
+                        DeepseekV4AttentionType.COMPRESS,
+                        DeepseekV4AttentionType.INDEXER_COMPRESS,
+                    ],
+                    None,
+                    sparse_roles=(
+                        frozenset({DeepseekV4AttentionType.COMPRESS})
+                        if self._enable_kv_cache_offload
+                        else frozenset()
+                    ),
+                )
                 _add_layer(
                     layer,
                     [
@@ -1389,15 +1507,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """Get the average cache bytes per token for DeepSeek-V4."""
         has_fp8_kv_cache = self.dtype == DataType.FP8
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        return _estimate_non_sliding_attn_size_per_token(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-            has_nvfp4_compress=self._use_nvfp4_compress,
-            nvfp4_residual_dim=self.nvfp4_residual_dim,
+        return ceil(
+            _estimate_non_sliding_attn_size_per_token(
+                self.head_dim,
+                self.index_head_dim,
+                compress_ratios,
+                has_fp8_kv_cache,
+                indexer_k_dtype=self._indexer_k_dtype,
+                use_fp8_ds_mla=self.use_fp8_ds_mla,
+                has_nvfp4_compress=self._use_nvfp4_compress,
+                nvfp4_residual_dim=self.nvfp4_residual_dim,
+                offload_sparse_history=self._enable_kv_cache_offload,
+            )
         )
 
     def get_max_resource_count(self) -> int:
@@ -1444,6 +1565,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
             nvfp4_residual_dim=self.nvfp4_residual_dim,
+            offload_sparse_history=self._enable_kv_cache_offload,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             self.head_dim,
@@ -1456,10 +1578,23 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         return int(
             total_tokens * (non_sliding_attn_size_per_token + swa_size_per_token)
             + swa_size_per_request
+        )
+
+    def get_request_device_bytes(self, num_tokens: int) -> int:
+        """Return the device pool bytes one decoding request of ``num_tokens`` tokens holds."""
+        return self._get_cache_bytes_for_tokens(num_tokens, context=False)
+
+    def _sparse_offload_nvfp4_head_dim(self) -> int | None:
+        return self.head_dim if self._use_nvfp4_compress else None
+
+    def _has_sparse_offload_layers(self) -> bool:
+        return self._enable_kv_cache_offload and any(
+            self._compress_ratios[layer] == DEEPSEEK_V4_SPARSE_RATIO for layer in self.pp_layers
         )
 
     def get_needed_resource_to_completion(self, request: llm_request.LlmRequest) -> int:
@@ -1508,7 +1643,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
     def _copy_scratch_metadata_to_device(
         self,
-        scratch_descs_by_pool: list[list[ScratchDesc | None]],
+        scratch_descs_by_pool: list[list[tuple[HalfOpenRange, list[int]] | None]],
         num_contexts: int,
         host_begs_staging: torch.Tensor,
         host_ends_staging: torch.Tensor,
@@ -1525,17 +1660,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         host_slots.zero_()
 
         for pool_idx, scratch_descs in enumerate(scratch_descs_by_pool):
-            for context_idx, desc in enumerate(scratch_descs):
-                if desc is None:
+            for context_idx, entry in enumerate(scratch_descs):
+                if entry is None:
                     continue
-                slot_ids = desc.slot_ids
+                scratch_range, slot_ids = entry
                 if len(slot_ids) > self._max_scratch_slots:
                     raise RuntimeError(
                         f"Scratch slot count {len(slot_ids)} exceeds staging capacity "
                         f"{self._max_scratch_slots}"
                     )
-                host_begs[pool_idx, context_idx] = int(desc.range.beg)
-                host_ends[pool_idx, context_idx] = int(desc.range.end)
+                host_begs[pool_idx, context_idx] = int(scratch_range.beg)
+                host_ends[pool_idx, context_idx] = int(scratch_range.end)
                 for slot_idx, slot_id in enumerate(slot_ids):
                     host_slots[pool_idx, context_idx, slot_idx] = int(slot_id)
 
@@ -1564,7 +1699,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if self.enable_swa_scratch_reuse and num_contexts > 0:
             scratch_descs_by_pool = [
                 [
-                    self.kv_cache_map[req].get_scratch_desc(pool_id)
+                    _scratch_entry(self.kv_cache_map[req], pool_id)
                     for req in request_ids[:num_contexts]
                 ]
                 for pool_id in range(self.num_pools)
@@ -1653,82 +1788,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             non_blocking=True,
         )
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        if self._enable_kv_cache_offload and any(
-            not (request.is_first_context_chunk and request.is_last_context_chunk)
-            for request in scheduled_batch.context_requests
-        ):
-            # Attention metadata's prompt_lens contains the current chunk's
-            # length, so only the scheduled request can identify a first chunk
-            # that does not complete its prompt. Reject before model writes.
-            raise NotImplementedError("Sparse offload does not support chunked prefill")
-        super().prepare_resources(scheduled_batch)
-
-    def _validate_sparse_history_policy(self) -> None:
-        """Check fixed history policies during attention metadata initialization."""
-        if (
-            self.enable_block_reuse
-            or self.kv_compression_manages_history
-            or self._has_cp_helix
-            or self.is_draft
-        ):
-            raise NotImplementedError(
-                "Sparse offload requires block reuse, KV compression, CP Helix, and draft caches disabled"
-            )
-
-    def _order_sparse_history_update(self, requests: Iterable[llm_request.LlmRequest]) -> None:
-        """Order demotion after all model producers and attention readers.
-
-        The non-overlap executor orders its calling stream after model forward.
-        Join it onto the cache stream before resize may demote/recycle pages.
-        prepare_sparse_offload() supplies the reverse dependency for the next
-        forward. No host/device synchronization or per-layer history mutation
-        is needed. Other executor schedules remain behind the inference guard.
-        """
-        if not self._enable_kv_cache_offload:
-            return
-        active = False
-        for request in requests:
-            cache = self.kv_cache_map.get(request.py_request_id)
-            if cache is None or not cache.is_active:
-                continue
-            if cache.cuda_stream != self._stream.cuda_stream:
-                raise RuntimeError("Sparse history updates require the manager's cache stream")
-            active = True
-        if active:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Sparse history updates must run outside CUDA graph capture")
-            self._stream.wait_stream(torch.cuda.current_stream(self._stream.device))
-
-    def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        self._order_sparse_history_update(scheduled_batch.context_requests)
-        super().update_context_resources(scheduled_batch)
-
-    def update_resources(
-        self,
-        scheduled_batch: ScheduledRequests,
-        attn_metadata: "AttentionMetadata | None" = None,
-        kv_cache_dtype_byte_size: float | None = None,
-    ) -> None:
-        self._order_sparse_history_update(scheduled_batch.generation_requests)
-        # The base computes max_beam_num_tokens - 1, excluding the sampled
-        # output token whose KV has not been produced yet. Never increment here.
-        super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
-
     def get_sparse_offload_descriptors(self) -> dict[int, SparseOffloadLayerDescriptor]:
-        """Validate the ratio-4 shared write-table contract using runtime IDs.
-
-        Called once when constructing each metadata instance. Different layer
-        offsets are allowed in SHARED mode, where the buffer pointer supplies
-        the offset. Different groups/scales require per-layer write tables and
-        are not supported by the current ratio-shared compressor interface.
-        """
+        """Describe each local ratio-4 layer's complete sparse fetch buffer set."""
         if not self._enable_kv_cache_offload:
             raise ValueError("Sparse offload metadata requires an offload-enabled cache manager")
-        if self._use_nvfp4_compress or self.use_fp8_ds_mla:
-            raise NotImplementedError(
-                "Sparse offload metadata supports BF16/per-tensor FP8 KV only"
-            )
         local_layers = [
             layer
             for layer in self.pp_layers
@@ -1736,230 +1799,93 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         ]
         if not local_layers:
             return {}
-        if not callable(getattr(self.impl, "is_sparse", None)) or not callable(
-            getattr(self.impl, "copy_base_page_indices_to_device", None)
-        ):
-            raise NotImplementedError("KVCM v2 sparse page-table APIs are not implemented")
-
-        descriptors = {}
-        shared_layout = None
-        for layer in local_layers:
-            layer_id = self._layer_attn_to_layer_id[layer, DeepseekV4AttentionType.COMPRESS]
-            role = DeepseekV4AttentionType.COMPRESS.role
-            if not self.impl.is_sparse(layer_id, role):
-                raise ValueError(f"Layer {layer}'s COMPRESS buffer must be sparse")
-            converter = self.impl.get_page_index_converter(layer_id, role)
-            if converter.expansion != 1 or not 0 < converter.scale <= 0x7FFFFFFF:
-                raise NotImplementedError(
-                    "Sparse offload requires expansion 1 and a positive int32 scale"
-                )
-            group_id = self.impl.get_layer_group_id(layer_id)
-            layout = (
-                group_id,
-                int(converter.scale),
-                # SHARED includes this buffer's offset. PER_LAYER exposes
-                # the common pool origin, even when the layer offsets differ.
-                self.impl.get_mem_pool_base_address(layer_id, role, PageIndexMode.PER_LAYER),
+        if self.use_fp8_ds_mla:
+            raise NotImplementedError(
+                "Sparse fp8_ds_mla compressed KV requires a selection layout with "
+                "separate data and footer-scale regions"
             )
-            if shared_layout is not None and layout != shared_layout:
-                raise NotImplementedError(
-                    "Ratio-4 sparse layers must share a layer group, page scale, and GPU pool"
-                )
-            shared_layout = layout
-            page_bound = int(self.impl.get_page_index_upper_bound(layer_id, role))
-            if not 0 < page_bound <= 0x7FFFFFFF:
-                raise ValueError("Sparse GPU pool must have a positive int32 physical-page bound")
-            descriptors[layer] = SparseOffloadLayerDescriptor(
-                buffer_id=BufferId(layer_id, role),
-                group_id=group_id,
-                page_scale=int(converter.scale),
-                page_index_upper_bound=page_bound,
+        layout = self._sparse_arena_layout()
+        return {
+            layer: self._build_sparse_offload_descriptor(
+                layout,
+                self._layer_attn_to_layer_id[layer, DeepseekV4AttentionType.COMPRESS],
+                DeepseekV4AttentionType.COMPRESS.role,
+                # A selection names compressed rows of four original tokens each.
+                unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
+                scale_role=COMPRESS_BLOCK_SCALE_ROLE if self._use_nvfp4_compress else None,
+                name=f"Layer {layer}",
             )
+            for layer in local_layers
+        }
 
-        sparse_groups = {descriptor.group_id for descriptor in descriptors.values()}
-        for (layer, attn_type), layer_id in self._layer_attn_to_layer_id.items():
-            if layer in descriptors and attn_type == DeepseekV4AttentionType.COMPRESS:
-                continue
-            if self.impl.get_layer_group_id(layer_id) in sparse_groups:
-                raise ValueError(
-                    "Sparse COMPRESS must have a separate lifecycle from ordinary cache buffers"
-                )
-        return descriptors
-
-    @nvtx_range_debug("dsv4_prepare_sparse_offload")
-    def prepare_sparse_offload(
-        self,
-        state: SparseOffloadState,
-        request_ids: list[int],
-        write_page_table: torch.Tensor,
-        *,
-        beam_width: int,
+    def _initialize_sparse_arena_buffers(
+        self, layers: dict[int, SparseOffloadLayerDescriptor]
     ) -> None:
-        """Upload the current mixed-tier mapping and history frontier in request order.
+        """Cache tensor views over KVCM-owned arena regions before graph capture.
 
-        The caller must keep request locks stable through the forward. Uploads
-        and write-table conversion use the current stream, ordered after the
-        manager's stream. This host preparation is outside graph capture;
-        subsequent replay consumes the persistent device buffers in place.
-        Only trailing CUDA-graph dummy requests are padding. Real requests
-        must be unique, with one beam, and retain their supplied order.
+        Each view is [pool_rows, 1, row_elements], so an arena index is also a
+        one-row page index. Pool rows cover all leases and buffers, including
+        padding roles. Layers sharing a region reuse the same tensor storage.
+        KVCM must keep the allocation alive while these views or graphs use it.
         """
-        state.prepared = False
-        if not self._enable_kv_cache_offload or beam_width != 1:
-            raise ValueError("Sparse offload preparation requires offload enabled and beam width 1")
-        batch = state.history_blocks.numel()
-        if len(request_ids) > batch:
-            raise ValueError("Request batch exceeds sparse offload metadata capacity")
-        if (
-            write_page_table.shape != (batch, self.max_blocks_per_seq)
-            or write_page_table.dtype != torch.int32
-            or write_page_table.device != state.history_blocks.device
-        ):
-            raise ValueError(
-                "Sparse write table must match the metadata's CUDA int32 [B, M] layout"
-            )
-        active_count = len(request_ids)
-        if CUDA_GRAPH_DUMMY_REQUEST_ID in request_ids:
-            active_count = request_ids.index(CUDA_GRAPH_DUMMY_REQUEST_ID)
-            if any(req != CUDA_GRAPH_DUMMY_REQUEST_ID for req in request_ids[active_count:]):
-                raise ValueError("CUDA-graph dummy requests must form a trailing suffix")
-        live_ids = request_ids[:active_count]
-        if len(set(live_ids)) != active_count:
-            raise ValueError("Sparse offload requires unique live request IDs")
-        caches = [self.kv_cache_map[request_id] for request_id in live_ids]
-        histories = []
-        for cache in caches:
-            if cache.beam_width != 1:
-                raise ValueError("Sparse offload supports one beam per request")
-            history = cache.history_length
-            if not 0 <= history <= cache.capacity:
-                raise ValueError("Invalid KVCM history frontier")
-            if cache.num_blocks > self.max_blocks_per_seq:
-                raise ValueError("Request allocation exceeds sparse offload page-table capacity")
-            histories.append(history // self.tokens_per_block)
-
-        with torch.cuda.device(state.history_blocks.device):
+        if not layers:
+            return
+        with torch.cuda.device(self._stream.device):
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "Sparse offload page tables must be prepared outside graph capture"
-                )
-            stream = torch.cuda.current_stream()
-            stream.wait_stream(self._stream)
-            # A queued H2D copy borrows the pinned host staging. Wait only for
-            # that upload before reusing its storage, never for the whole GPU.
-            if state.history_upload_pending:
-                state.history_upload_done.synchronize()
-            state.history_blocks_host.zero_()
-            state.history_blocks_host[:active_count].copy_(
-                torch.tensor(histories, dtype=torch.int32, device="cpu")
-            )
-            state.history_blocks.copy_(state.history_blocks_host, non_blocking=True)
-            state.history_upload_done.record(stream)
-            state.history_upload_pending = True
-            state.active_request_count.fill_(active_count)
-            state.selected_history_pages.fill_(BAD_PAGE_INDEX)
-            state.fetched_page_table.fill_(BAD_PAGE_INDEX)
-            state.compress_read_table.fill_(BAD_PAGE_INDEX)
-
-            for group_id, raw_table in state.base_page_tables.items():
-                raw_table.fill_(BAD_PAGE_INDEX)
-                if active_count:
-                    self.impl.copy_base_page_indices_to_device(
-                        kv_caches=caches,
-                        layer_group_id=group_id,
-                        out=raw_table[:active_count],
-                        stream=CudaStream(stream.cuda_stream),
+                raise RuntimeError("Sparse arena views must be initialized before graph capture")
+            pool_views: dict[int, torch.Tensor] = {}
+            for layer, descriptor in layers.items():
+                specs = [
+                    (
+                        descriptor.data_buffer_index,
+                        DataType.UINT8 if self._use_nvfp4_compress else self.dtype,
+                        (self.head_dim + self.nvfp4_residual_dim) // 2
+                        if self._use_nvfp4_compress
+                        else self.head_dim,
                     )
+                ]
+                if descriptor.scale_buffer_index is not None:
+                    specs.append(
+                        (
+                            descriptor.scale_buffer_index,
+                            DataType.FP8,
+                            (self.head_dim + self.nvfp4_residual_dim) // NVFP4_VECTOR_SIZE,
+                        )
+                    )
+                views = []
+                for index, dtype, row_elements in specs:
+                    base = descriptor.arena_base_addresses[index]
+                    if base not in pool_views:
+                        pool_views[base] = convert_to_torch_tensor(
+                            TensorWrapper(
+                                base, dtype, (descriptor.arena_row_counts[index], 1, row_elements)
+                            )
+                        )
+                    views.append(pool_views[base])
+                self._sparse_arena_buffers[layer] = (views[0], views[1] if len(views) > 1 else None)
 
-            # Descriptor validation guarantees one compatible ratio-4 table.
-            descriptor = next(iter(state.layers.values()))
-            prepare_sparse_write_table(
-                state.base_page_tables[descriptor.group_id],
-                state.history_blocks,
-                state.active_request_count,
-                write_page_table,
-                page_scale=descriptor.page_scale,
-            )
-        state.prepared = True
+    def get_sparse_compress_buffers(
+        self, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return cached data/scales arena views indexed by prepared or fetched rows."""
+        return self._sparse_arena_buffers[layer_idx]
 
-    @nvtx_range_debug("dsv4_fetch_sparse_read_table")
-    def fetch_sparse_read_table(
-        self,
-        state: SparseOffloadState,
-        layer_idx: int,
-        topk_indices: torch.Tensor,
-        request_rows: torch.Tensor,
-        compressed_lengths: torch.Tensor,
-        write_page_table: torch.Tensor,
+    def prepare_sparse_compressor_write_indices(
+        self, state: SparseOffloadState, layer_idx: int
     ) -> torch.Tensor:
-        """Stage one layer's selected history and return its physical read table.
+        """Reserve this layer's pinned destinations on the compressor's stream.
 
-        The caller has joined indexer/compressor producers on the consuming
-        stream. Selection, KVCM fetch, merge, index conversion, and attention
-        must remain ordered on that stream, including during graph replay.
-        The shared workspace and KVCM scratch cannot be reused by another
-        layer/forward until attention has consumed them. No host tensor reads
-        or active-count branches are allowed here.
+        Return int32[B, F] in Batch and descriptor buffer order. The caller
+        must join Batch publication before this call, and join the compressor
+        stream before fetch/attention or a history update. No KV is fetched here.
+        Padding roles were initialized during manager construction. The fused
+        compressor uses the data column as a one-row page table for data and
+        NVFP4 scales, whose matching geometry is checked during descriptor construction
+        and, once per layer outside graph capture, by ``prepare_sparse_write_indices``
+        against the indices native returns. Each buffer still uses its own arena base
+        and byte stride.
         """
-        if not self._enable_kv_cache_offload or not state.prepared or state.is_prefill:
-            raise RuntimeError("Sparse fetch requires prepared decode metadata")
-        descriptor = state.layers[layer_idx]
-        fetched_page_scale = descriptor.fetched_page_scale
-        if fetched_page_scale is None:
-            raise NotImplementedError("KVCM sparse fetch output page units are not bound")
-        if not 0 < fetched_page_scale <= 0x7FFFFFFF:
-            raise ValueError("Sparse fetch page scale must be a positive int32")
-        if not callable(getattr(self.impl, "fetch_sparse_pages", None)):
-            raise NotImplementedError("KVCM v2 fetch_sparse_pages is not implemented")
-
-        with torch.cuda.device(state.history_blocks.device):
-            raw_table = state.base_page_tables[descriptor.group_id]
-            select_sparse_history_pages(
-                topk_indices,
-                request_rows,
-                state.active_request_count,
-                compressed_lengths,
-                raw_table,
-                state.history_blocks,
-                self.tokens_per_block // DEEPSEEK_V4_SPARSE_RATIO,
-                state.selected_history_pages,
-            )
-            # Fetch even when all selections are -1. KVCM must overwrite the
-            # entire output, so a replay cannot reuse the previous layer's map.
-            self.impl.fetch_sparse_pages(
-                buffers=[descriptor.buffer_id],
-                page_table=raw_table,
-                selected=state.selected_history_pages,
-                num_blocks=state.history_blocks,
-                out=state.fetched_page_table,
-                stream=CudaStream(torch.cuda.current_stream().cuda_stream),
-            )
-            merge_sparse_read_table(
-                state.fetched_page_table,
-                write_page_table,
-                state.history_blocks,
-                state.active_request_count,
-                state.compress_read_table,
-                fetched_page_scale=fetched_page_scale,
-            )
-            check_sparse_read_table(
-                topk_indices,
-                request_rows,
-                state.active_request_count,
-                compressed_lengths,
-                state.compress_read_table,
-                self.tokens_per_block // DEEPSEEK_V4_SPARSE_RATIO,
-                descriptor.page_index_upper_bound,
-                state.read_table_valid,
-            )
-            if state.debug_assert:
-                # KVCM must return every required page. Keep the assertion opt-in
-                # because a failed device assertion poisons the CUDA context.
-                torch._assert_async(
-                    state.read_table_valid,
-                    "Sparse offload: invalid top-k request/token or missing/out-of-bounds KV page",
-                )
-        return state.compress_read_table
+        return self.prepare_sparse_write_indices(state, layer_idx)
 
     @nvtx_range_debug("dsv4_copy_batch_compress_block_tables")
     def copy_batch_compress_block_tables(
@@ -1973,7 +1899,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     ) -> None:
         """Build the COMPRESS block table for one compression ratio and copy it to the destination."""
         if self._enable_kv_cache_offload and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
-            raise RuntimeError("Use prepare_sparse_offload() for the mixed-tier ratio-4 table")
+            raise RuntimeError("Sparse COMPRESS requires per-buffer arena indices")
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         staging = self._host_compress_block_tables_staging[compress_ratio]
@@ -2036,6 +1962,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             kv_cache_config is not None
             and getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
         )
+        offload = model_config.sparse_attention_config.enable_kv_cache_offload
         non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
             head_dim,
             index_head_dim,
@@ -2044,7 +1971,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=indexer_k_dtype,
             use_fp8_ds_mla=use_fp8_ds_mla,
             has_nvfp4_compress=has_nvfp4_compress,
+            offload_sparse_history=offload,
         )
+        generation_capacity_headroom = None
+        if offload:
+            _, generation_capacity_headroom = _get_generation_kv_capacity(
+                kwargs.get("spec_config"), is_draft=kwargs.get("is_draft", False)
+            )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             head_dim,
             index_head_dim,
@@ -2056,10 +1989,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=indexer_k_dtype,
             use_fp8_ds_mla=use_fp8_ds_mla,
+            generation_capacity_headroom=generation_capacity_headroom,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
         return (
-            non_sliding_attn_size_per_token + swa_size_per_token,
+            ceil(non_sliding_attn_size_per_token + swa_size_per_token),
             swa_size_per_request * max_batch_size,
         )
 
@@ -2125,12 +2059,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             f">1 attn buffer)"
         )
 
-    @torch.inference_mode()
-    def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
-        some_checks_unavailable = False
-        has_invalid_values = torch.tensor(
-            [False], dtype=torch.bool, device=torch.cuda.current_device()
-        )
+    def _iter_cache_cleanup_buffers(self) -> Iterable[tuple[torch.Tensor, int | None]]:
+        """Yield device storage and arena views with their optional storage guard-page index.
+
+        Host-backed sparse history is left out. Nothing reads a row of it before
+        a transfer or a write-back fills it, and walking it would cross PCIe for
+        every page of the host budget.
+        """
         buffers_handled = set()
 
         # Handle each attention buffer from start to end to traverse the whole
@@ -2147,19 +2082,38 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             for buffer_key, buffer in buffers:
                 if buffer_key in buffers_handled:
                     continue
-                if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
-                    some_checks_unavailable = True
-                if fill_with_zero:
-                    buffer.zero_()
-                    # Warmup scrubs the cache with fill_with_zero before inference;
-                    # restore this buffer's guard-page sentinel so the startup
-                    # warning does not claim a guard that was just wiped (mirrors
-                    # the base check_invalid_values_in_kv_cache). The guard key is
-                    # this buffer's (layer_id, role) identity == buffer_key.
-                    guard_page = self._guard_page_by_layer.get(buffer_key)
-                    if guard_page is not None and self._guard_page_value is not None:
-                        _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
                 buffers_handled.add(buffer_key)
+                if self._enable_kv_cache_offload and self.impl.is_sparse(*buffer_key):
+                    continue
+                yield buffer, self._guard_page_by_layer.get(buffer_key)
+
+        # Arena views span complete GPU pools and can be shared by several layers.
+        # Their physical row indices are independent of the host storage guard pages.
+        arenas_handled = set()
+        for arenas in self._sparse_arena_buffers.values():
+            for arena in arenas:
+                if arena is None or arena.data_ptr() in arenas_handled:
+                    continue
+                arenas_handled.add(arena.data_ptr())
+                yield arena, None
+
+    @torch.inference_mode()
+    def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
+        if self._enable_kv_cache_offload:
+            # Finish cache-stream writeback, which reads the arenas, before
+            # scanning or clearing them.
+            torch.cuda.current_stream(self._stream.device).wait_stream(self._stream)
+        some_checks_unavailable = False
+        has_invalid_values = torch.tensor(
+            [False], dtype=torch.bool, device=torch.cuda.current_device()
+        )
+        for buffer, guard_page in self._iter_cache_cleanup_buffers():
+            if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+                some_checks_unavailable = True
+            if fill_with_zero:
+                buffer.zero_()
+                if guard_page is not None and self._guard_page_value is not None:
+                    _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
         torch.cuda.synchronize()
 
         if some_checks_unavailable:

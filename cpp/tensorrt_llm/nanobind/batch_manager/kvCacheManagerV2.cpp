@@ -69,18 +69,6 @@ namespace tensorrt_llm::nanobind::batch_manager
 namespace
 {
 
-//! A scratch range paired with the slots covering it.
-//!
-//! KvCache reports the two separately, through getSwaScratchRange() and getScratchSlots().
-//! This pairs them for Python consumers that still expect one object, and exists only so
-//! this change stands alone; remove it, and the get_scratch_desc() binding, once the full
-//! sparse attention support lands and those consumers read the two accessors directly.
-struct ScratchDescCompat
-{
-    kv::HalfOpenRange<kv::BlockOrdinal> range;
-    std::vector<int> slotIds;
-};
-
 // Exposed via introspection sub-module for tests.
 class TestPaddingColdPageCodec final : public kv::IKvCacheColdPageCodec
 {
@@ -1477,17 +1465,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__contains__", [](BlockRange const& self, int item) { return self.contains(kv::BlockOrdinal{item}); },
             nb::arg("item"));
 
-    // A scratch range and its slots as one object, which is how KvCache used to report
-    // them. Kept for consumers that still read `.range` and `.slot_ids`; the manager
-    // itself reports the two separately through get_swa_scratch_range() and
-    // get_scratch_slots(). Remove this class and get_scratch_desc() once the full sparse
-    // attention support lands and those consumers move to the two accessors -- they exist
-    // only so this change stands alone.
-    nb::class_<ScratchDescCompat>(m, "ScratchDesc")
-        .def_ro("range", &ScratchDescCompat::range)
-        .def_ro("slot_ids", &ScratchDescCompat::slotIds)
-        .def("__bool__", [](ScratchDescCompat const& self) { return static_cast<bool>(self.range); });
-
     nb::enum_<kv::PageIndexMode>(m, "PageIndexMode")
         .value("SHARED", kv::PageIndexMode::SHARED)
         .value("PER_LAYER", kv::PageIndexMode::PER_LAYER);
@@ -1949,15 +1926,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
             "resume",
-            // `is_decoding` is accepted and ignored: resuming no longer distinguishes a
-            // decoding request, since what that selected -- sparse history offload -- is the
-            // sparse fetch path's now. Drop the parameter once the full sparse attention
-            // support is merged and its callers stop passing it; it is here only so this
-            // change stands alone.
-            [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding,
-                std::optional<std::vector<int>> groups)
+            [](kv::KvCache& self, nb::object stream, std::optional<std::vector<int>> groups)
             {
-                (void) isDecoding;
                 std::optional<CUstream> optStream;
                 if (!stream.is_none())
                     optStream = reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
@@ -1973,8 +1943,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release rel;
                 return self.resume(optStream, std::move(selected));
             },
-            nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
-            nb::arg("optional_reuse_groups") = nb::none())
+            nb::arg("cuda_stream") = nb::none(), nb::arg("optional_reuse_groups") = nb::none())
         .def(
             "get_page_priorities",
             [](kv::KvCache const& self, int layerGroupId, int beamIndex)
@@ -2074,22 +2043,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>(),
             "Page indices of this life cycle's scratch slots, in slot order.")
-        .def(
-            "get_scratch_desc",
-            [](kv::KvCache const& self, int layerGroupId) -> std::optional<ScratchDescCompat>
-            {
-                auto const lgId = kv::LayerGroupId{layerGroupId};
-                auto const range = self.getSwaScratchRange(lgId);
-                if (!range)
-                {
-                    return std::nullopt;
-                }
-                auto const slots = self.getScratchSlots(lgId);
-                return ScratchDescCompat{range, std::vector<int>(slots.begin(), slots.end())};
-            },
-            nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>(),
-            "get_swa_scratch_range() and get_scratch_slots() as one object, or None when this life "
-            "cycle serves nothing from scratch. Remove with the ScratchDesc class.")
         .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
         .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
             [](kv::KvCache& self, bool enable)
@@ -2110,23 +2063,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("mode"), nb::arg("layer_group_id"), "Per life cycle, which is where the scratch slots live.")
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
-        // Admission into decode, which the manager no longer marks: beyond setting a flag,
-        // this offloaded sparse history, and the sparse fetch path owns that now. A cache
-        // with no sparse life cycle had nothing to offload, so always admitting is what it
-        // already did. Remove once the full sparse attention support is merged and its
-        // callers drop this; it exists only so this change stands alone.
-        .def(
-            "enter_decode",
-            [](kv::KvCache const& self)
-            {
-                if (!self.isActive())
-                {
-                    throw kv::LogicError("Decode admission requires an active request");
-                }
-                return true;
-            },
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Admit this request into decode. Always true for an active request.")
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro(
             "batch_row",
@@ -2532,20 +2468,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("batch"));
     mIntrospection.def(
         "sparse_resolve",
-        [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
+        [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& entryAge, int numLayers,
             int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
             std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
             std::vector<int32_t> const& inactiveRows)
         {
-            auto r = kv::KvCacheIntrospection::sparseResolve(residentOrdinal, lruOrder, numLayers, entriesPerLayer,
+            auto r = kv::KvCacheIntrospection::sparseResolve(residentOrdinal, entryAge, numLayers, entriesPerLayer,
                 selected, selectionWidth, historyUnits, capacityUnits, maxInFlightUnits, inactiveRows);
             // No gil_scoped_release call guard: the tuple below is built from the lambda body,
             // which the guard would have left running without the GIL.
-            return std::make_tuple(std::move(r.residentOrdinal), std::move(r.lruOrder), std::move(r.outSlot),
-                std::move(r.missRow), std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missTotal),
-                std::move(r.missCount), std::move(r.inFlightSlot));
+            return std::make_tuple(std::move(r.residentOrdinal), std::move(r.entryAge), std::move(r.entryHit),
+                std::move(r.outSlot), std::move(r.missRow), std::move(r.missOrdinal), std::move(r.missSlot),
+                std::move(r.missTotal), std::move(r.missCount), std::move(r.inFlightSlot));
         },
-        nb::arg("resident_ordinal"), nb::arg("lru_order"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
+        nb::arg("resident_ordinal"), nb::arg("entry_age"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
         nb::arg("max_in_flight_units"), nb::arg("inactive_rows"));
     mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),
@@ -3723,28 +3659,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("scratch_pages_per_block", &kv::PageIndexConverter::scratchPagesPerBlock)
         .def(
             "__call__",
-            // `scratch_range` also takes the ScratchDesc that get_scratch_desc() returns, which
-            // carries its slots with it; see ScratchDescCompat.
             [](kv::PageIndexConverter const& self, std::vector<int> const& baseIndices,
-                std::optional<kv::PageIndexMode> indexMode, nb::object scratch,
+                std::optional<kv::PageIndexMode> indexMode,
+                std::optional<kv::HalfOpenRange<kv::BlockOrdinal>> scratchRange,
                 std::vector<int> const& scratchSlots) -> std::vector<int>
             {
-                kv::HalfOpenRange<kv::BlockOrdinal> range{};
-                std::vector<int> const* slots = &scratchSlots;
-                if (nb::isinstance<ScratchDescCompat>(scratch))
-                {
-                    TLLM_CHECK_WITH_INFO(
-                        scratchSlots.empty(), "scratch_slots must be empty when scratch_range is a ScratchDesc");
-                    auto const& desc = nb::cast<ScratchDescCompat const&>(scratch);
-                    range = desc.range;
-                    slots = &desc.slotIds;
-                }
-                else if (!scratch.is_none())
-                {
-                    range = nb::cast<kv::HalfOpenRange<kv::BlockOrdinal>>(scratch);
-                }
-                return self(
-                    baseIndices, indexMode, range, kv::Span<int const>{slots->data(), static_cast<int>(slots->size())});
+                return self(baseIndices, indexMode, scratchRange.value_or(kv::HalfOpenRange<kv::BlockOrdinal>{}),
+                    kv::Span<int const>{scratchSlots.data(), static_cast<int>(scratchSlots.size())});
             },
             nb::arg("base_indices"), nb::arg("index_mode") = nb::none(), nb::arg("scratch_range") = nb::none(),
             nb::arg("scratch_slots") = std::vector<int>{});

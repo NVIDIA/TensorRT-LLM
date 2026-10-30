@@ -181,7 +181,7 @@ void KvCacheManager::_computeSparseCacheShape()
 
         // Layers of one life cycle must currently declare the same sparse_cache. The arena
         // is per life cycle and its metadata is one stride: a selection's rows are found at
-        // `residentOrdinal + slot * entriesPerSelection`, so a single entry count serves
+        // `entry + slot * entriesPerSelection`, so a single entry count serves
         // them all, and cellsPerBuffer follows from maxCachedUnits and unitsPerPage alike.
         // See SPARSE_ATTENTION_DESIGN.md.
         auto& shape = mSparseCacheShape[lcId];

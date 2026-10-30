@@ -51,6 +51,14 @@ from .quantization import (
 )
 
 
+def _scratch_entry(cache, pool_id):
+    """The scratch range and the slots serving it, or None when none of the blocks do."""
+    scratch_range = cache.get_swa_scratch_range(pool_id)
+    if not scratch_range:
+        return None
+    return scratch_range, cache.get_scratch_slots(pool_id)
+
+
 def _validate_context_swa_layer_limit(limit: int | None, num_layers: int) -> None:
     if limit is not None and (type(limit) is not int or not 0 < limit < num_layers):
         raise ValueError("CSA2 context SWA layer limit must be an integer inside the model")
@@ -792,7 +800,8 @@ class CSA2CacheManager(KVCacheManagerV2):
         return converter(
             cache.get_base_page_indices(pool_id).tolist(),
             role.index_mode,
-            cache.get_scratch_desc(pool_id),
+            cache.get_swa_scratch_range(pool_id) or None,
+            cache.get_scratch_slots(pool_id),
         )
 
     def compute_batch_page_tables(self, request_ids, num_contexts) -> None:
@@ -856,17 +865,17 @@ class CSA2CacheManager(KVCacheManagerV2):
         if not holders:
             return None
         descs = [
-            (index, row, desc)
+            (index, row, entry)
             for row, cache in holders
             for index, pool in enumerate(self._scratch_pools.tolist())
-            if (desc := cache.get_scratch_desc(pool))
+            if (entry := _scratch_entry(cache, pool))
         ]
         ranges = np.zeros((len(self._scratch_pools), len(request_ids), 2), dtype=np.int32)
-        width = max((len(desc.slot_ids) for _, _, desc in descs), default=1)
+        width = max((len(slot_ids) for _, _, (_, slot_ids) in descs), default=1)
         slots = np.zeros((len(self._scratch_pools), len(request_ids), width), dtype=np.int32)
-        for index, row, desc in descs:
-            ranges[index, row] = (desc.range.beg, desc.range.end)
-            slots[index, row, : len(desc.slot_ids)] = desc.slot_ids
+        for index, row, (scratch_range, slot_ids) in descs:
+            ranges[index, row] = (scratch_range.beg, scratch_range.end)
+            slots[index, row, : len(slot_ids)] = slot_ids
         return ranges, slots
 
     def batch_page_table(self, spec, width: int) -> torch.Tensor:
