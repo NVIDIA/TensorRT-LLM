@@ -1328,19 +1328,20 @@ def _to_chunking_policy(policy: Any) -> ChunkingPolicy:
 
 
 def _check_forced_chunk_context_limit(
-    policy: Any, chunk_unit_size: int, max_context_length: Optional[int]
+    policy: Any, chunk_unit_size: int, max_num_tokens: Optional[int]
 ) -> None:
-    """Reject a context-length limit below one FORCE_CHUNK unit.
+    """Reject a ``max_num_tokens`` below one FORCE_CHUNK unit.
 
-    The micro-batch schedulers reject such a limit on every context request
-    (see ``_chunk_forced`` and ``microBatchScheduler.cpp``), so the
-    configuration is rejected when the scheduler is created instead.
+    ``max_num_tokens`` is the schedulers' context-length limit. They reject such
+    a limit on every context request (see ``_chunk_forced`` and
+    ``microBatchScheduler.cpp``), so the configuration is rejected when the
+    scheduler is created instead.
     """
-    if _to_chunking_policy(policy) != ChunkingPolicy.FORCE_CHUNK or max_context_length is None:
+    if _to_chunking_policy(policy) != ChunkingPolicy.FORCE_CHUNK or max_num_tokens is None:
         return
-    if max_context_length < chunk_unit_size:
+    if max_num_tokens < chunk_unit_size:
         raise ValueError(
-            f"max_num_tokens ({max_context_length}) must be at least the "
+            f"max_num_tokens ({max_num_tokens}) must be at least the "
             f"FORCE_CHUNK context chunk unit ({chunk_unit_size}, which is "
             "kv_cache_config.tokens_per_block for hybrid linear-attention "
             "models with KV cache block reuse). Increase max_num_tokens, "
@@ -1384,9 +1385,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         self.max_context_length = max_num_tokens
         if ctx_chunk_config is not None:
             _check_forced_chunk_context_limit(
-                ctx_chunk_config.chunking_policy,
-                ctx_chunk_config.chunk_unit_size,
-                self.max_context_length,
+                ctx_chunk_config.chunking_policy, ctx_chunk_config.chunk_unit_size, max_num_tokens
             )
         # Match C++ MicroBatchScheduler defaults (see algorithms.cpp line 68-70)
         self.no_schedule_until_state = no_schedule_until_state
