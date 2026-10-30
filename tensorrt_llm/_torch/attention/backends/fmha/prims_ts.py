@@ -19,11 +19,9 @@ from __future__ import annotations
 
 import math
 from importlib import import_module
-from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from packaging.version import InvalidVersion, Version
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -57,8 +55,6 @@ if TYPE_CHECKING:
     )
 
 
-_MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
-_MIN_RUBIN_CUTLASS_DSL_VERSION = Version("4.8.0")
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
 
@@ -208,21 +204,6 @@ class PrimsTSFmha(PhasedFmha):
             return False
         if sm == 107 and attn.is_mla_enable:
             logger.debug("PrimTS MLA FMHA is unavailable on SM107.")
-            return False
-        min_dsl_version = _MIN_RUBIN_CUTLASS_DSL_VERSION if sm == 107 else _MIN_CUTLASS_DSL_VERSION
-        try:
-            installed_version = Version(version("nvidia-cutlass-dsl"))
-        except (PackageNotFoundError, InvalidVersion):
-            logger.debug(
-                f"PrimTS FMHA is unavailable: nvidia-cutlass-dsl>={min_dsl_version} is required."
-            )
-            return False
-        if installed_version < min_dsl_version:
-            logger.debug(
-                "PrimTS FMHA is unavailable: "
-                f"nvidia-cutlass-dsl>={min_dsl_version} is required, "
-                f"got {installed_version}."
-            )
             return False
         try:
             cutlass = import_module("cutlass")
@@ -1438,10 +1419,8 @@ class PrimsTSFmha(PhasedFmha):
             (k_cache, v_cache),
             seq_lens,
             block_tables=fixed_block_tables,
-            bmm1_scale=self._get_bmm1_scale(attn),
-            bmm2_scale=1.0,
-            bmm1_scale_device=bmm1_scale.reshape(-1)[:1] if use_fp8 else None,
-            bmm2_scale_device=bmm2_scale.reshape(-1)[:1] if use_fp8 else None,
+            bmm1_scale=bmm1_scale.reshape(-1)[:1] if use_fp8 else self._get_bmm1_scale(attn),
+            bmm2_scale=bmm2_scale.reshape(-1)[:1] if use_fp8 else 1.0,
             out=output,
             validate=False,
         )

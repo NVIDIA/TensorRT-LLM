@@ -1580,8 +1580,8 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
             lengths,
             table,
             out=output,
-            bmm1_scale_device=bmm1,
-            bmm2_scale_device=bmm2,
+            bmm1_scale=bmm1,
+            bmm2_scale=bmm2,
             validate=False,
         )
 
@@ -1630,7 +1630,18 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
             output.float(), bf16_host_output.float(), atol=0.0005, rtol=0.008
         )
 
-    run()
+    if mode == "gmem_reduction":
+        wrapper._plan_state.workspace.split_kv_counter.zero_()
+    wrapper.run(
+        q,
+        (k, v),
+        lengths,
+        table,
+        out=output,
+        bmm1_scale=bmm1,
+        bmm2_scale=bmm2,
+        validate=True,
+    )
     torch.cuda.synchronize()
     check_output()
 
@@ -1639,6 +1650,13 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
 
     with monkeypatch.context() as guard:
         guard.setattr(torch.Tensor, "item", no_host_read)
+        guard.setattr(torch.Tensor, "__float__", no_host_read)
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            run()
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()

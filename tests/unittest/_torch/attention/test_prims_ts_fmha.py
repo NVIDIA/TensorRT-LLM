@@ -722,25 +722,22 @@ def test_unsupported_matrix_falls_through(case: dict, expected_reason: str) -> N
 
 
 @pytest.mark.parametrize(
-    ("sm", "cutlass_version", "compiler_version", "is_mla", "expected"),
+    ("sm", "compiler_version", "is_mla", "expected"),
     [
-        (100, "4.7.0", "13.3", False, True),
-        (103, "4.7.0", "13.3", False, True),
-        (100, "4.7.0", "13.4", False, True),
-        (100, "4.7.0", "13.2", False, False),
-        (107, "4.7.0", "13.3", False, False),
-        (107, "4.8.0", "13.3", False, True),
-        (107, "4.8.0", "13.2", False, False),
-        (107, "4.8.0", "13.3", True, False),
-        (100, "4.7.0", "13.3", True, True),
-        (120, "4.7.0", "13.3", False, False),
-        (100, "4.6.2", "13.3", False, False),
+        (100, "13.3", False, True),
+        (103, "13.3", False, True),
+        (100, "13.4", False, True),
+        (100, "13.2", False, False),
+        (107, "13.3", False, True),
+        (107, "13.2", False, False),
+        (107, "13.3", True, False),
+        (100, "13.3", True, True),
+        (120, "13.3", False, False),
     ],
 )
 def test_static_availability_gate(
     monkeypatch: pytest.MonkeyPatch,
     sm: int,
-    cutlass_version: str,
     compiler_version: str,
     is_mla: bool,
     expected: bool,
@@ -757,14 +754,11 @@ def test_static_availability_gate(
         return object()
 
     monkeypatch.setattr(prims_ts_module, "get_sm_version", lambda: sm)
-    monkeypatch.setattr(prims_ts_module, "version", lambda _: cutlass_version)
     monkeypatch.setattr(prims_ts_module, "import_module", import_cutlass_module)
     monkeypatch.setattr(PrimsTSFmha, "_missing_fused_nanobind_ops", staticmethod(lambda: []))
 
     assert PrimsTSFmha.is_available(_Attention(is_mla=is_mla)) is expected
-    if (sm in (100, 103) and Version(cutlass_version) >= Version("4.7.0")) or (
-        sm == 107 and not is_mla and Version(cutlass_version) >= Version("4.8.0")
-    ):
+    if sm in (100, 103) or (sm == 107 and not is_mla):
         target_version.assert_called_once_with(min_version="13.3")
     else:
         target_version.assert_not_called()
@@ -775,7 +769,6 @@ def test_static_availability_gate_fails_closed_when_compiler_query_fails(
 ) -> None:
     cutlass = SimpleNamespace(target_version=Mock(side_effect=RuntimeError("query failed")))
     monkeypatch.setattr(prims_ts_module, "get_sm_version", lambda: 100)
-    monkeypatch.setattr(prims_ts_module, "version", lambda _: "4.7.0")
     monkeypatch.setattr(
         prims_ts_module,
         "import_module",
@@ -796,7 +789,6 @@ def test_unsupported_cutlass_compiler_excludes_prims_ts_from_fmha_selection(
     cutlass = SimpleNamespace(target_version=target_version)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts,fallback")
     monkeypatch.setattr(prims_ts_module, "get_sm_version", lambda: 100)
-    monkeypatch.setattr(prims_ts_module, "version", lambda _: "4.7.0")
     monkeypatch.setattr(
         prims_ts_module,
         "import_module",
@@ -1312,8 +1304,11 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert run_args[0].dtype == kernel_dtype
     assert generation_preprocess.call_args.args[35] is fp8
     if fp8:
-        assert run_kwargs["bmm1_scale_device"].data_ptr() == bmm1.data_ptr()
-        assert run_kwargs["bmm2_scale_device"].data_ptr() == bmm2.data_ptr()
+        assert run_kwargs["bmm1_scale"].data_ptr() == bmm1.data_ptr()
+        assert run_kwargs["bmm2_scale"].data_ptr() == bmm2.data_ptr()
+    else:
+        assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(attn.head_dim))
+        assert run_kwargs["bmm2_scale"] == 1.0
     k_cache, v_cache = run_args[1]
     assert k_cache.shape == v_cache.shape == (6, attn.num_kv_heads, 32, attn.head_dim)
     assert v_cache.storage_offset() - k_cache.storage_offset() == 6 * math.prod(kv_pool.shape[1:])
@@ -1326,8 +1321,6 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
         fixed_block_tables,
         torch.tensor([[0, 1, 2, 3], [2, 3, 4, 5]], dtype=torch.int32),
     )
-    assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(attn.head_dim))
-    assert run_kwargs["bmm2_scale"] == 1.0
     assert run_kwargs["out"].shape == (2, attn.num_heads, attn.head_dim)
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["validate"] is False
