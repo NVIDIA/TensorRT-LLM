@@ -429,9 +429,7 @@ def _build_topk_module() -> None:
     try:
         flashinfer.topk.get_topk_module()
     except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"flashinfer topk module background build failed. {type(e).__name__}: {e}"
-        )
+        logger.warning(f"flashinfer topk module background build failed. {type(e).__name__}: {e}")
 
 
 @_compiler_disable
