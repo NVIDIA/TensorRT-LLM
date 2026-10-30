@@ -345,6 +345,7 @@ l0_b200:
   # step that runs them (SM 100; they skip on other GPUs).
   - unittest/_torch/kernels/test_spec_step_copies.py
   - unittest/_torch/executor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/executor/test_context_logits_memory.py
   # Kimi K3 DSpark drafter attention (CuTe DSL, SM 100) and its modeling_v2 catalog entries, plus the sm_100 cells of
   # fused_qk_norm_rope, which the drafter calls.
   - unittest/_torch/kernels/kimi_k3/test_k3_drafter_attn.py

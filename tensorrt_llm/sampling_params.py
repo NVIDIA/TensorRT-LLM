@@ -704,13 +704,9 @@ class SamplingParams:
                 "internally enabling context logits for prompt logprobs computation. "
                 "context logits will be dropped after computation as the user didn't explicitly request them."
             )
-            # TODO: Find a more elegant way to do this.
-            # NOTE: This is an internal hack, so we can entirely avoid introducing
-            # `prompt_logprobs` into the executor bindings and further into
-            # model engine / sampler.
-            # This is because, prompt_logprobs is a derived quantity from
-            # context logits, and the capability to post-compute it
-            # already exists in the worker. (see _get_logprobs in base_worker.py)
+            # The context-output flag requests per-position predictions.
+            # Python workers carry prompt-logprob options separately to
+            # distinguish compact probability results from full logits.
             config_kwargs["return_context_logits"] = True
 
         if config_kwargs.get("additional_model_outputs") is not None:

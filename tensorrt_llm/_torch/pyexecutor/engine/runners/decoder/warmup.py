@@ -19,6 +19,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
+from tensorrt_llm._torch.modules.context_logits import context_logits_heads
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
@@ -353,6 +354,10 @@ class DecoderWarmup:
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
             warmup_sampling_module()
+            for head in context_logits_heads(
+                self.model, self.mapping, is_spec_decode=self._config.is_spec_decode
+            ):
+                head.prepare_context_logits_workspace()
             self._prewarm_engram_kernels(kv_cache_manager)
             self._prewarm_csa2_sparse_indexer(kv_cache_manager)
             self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)

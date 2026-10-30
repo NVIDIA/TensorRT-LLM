@@ -1378,6 +1378,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             _get_gemma4_kv_cache_layer_specs(model_config.pretrained_config)
         )
         super().__init__(Gemma4TextModel(model_config), model_config)
+        self.logits_processor.allow_context_logits_plan = False
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:

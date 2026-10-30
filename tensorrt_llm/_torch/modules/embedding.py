@@ -14,6 +14,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import allgather
+from .context_logits import ContextLogitsWorkspace
 from .linear import Linear, TensorParallelMode
 
 
@@ -157,6 +158,21 @@ class LMHead(Linear):
                     "LMHead output_dtype does not support ROW tensor-parallel "
                     "mode")
         self.output_dtype = output_dtype
+        self.context_logits_workspace: ContextLogitsWorkspace | None = None
+
+    @property
+    def supports_context_logits_workspace(self) -> bool:
+        """Whether this head supports dense single-rank output-buffer projection."""
+        return (not self.has_any_quant and self.tp_size == 1
+                and self.lora is None
+                and self._locality_domain_weight_shards is None
+                and self.weight.device.type == "cuda" and self.weight.dtype
+                in (torch.float16, torch.bfloat16, torch.float32))
+
+    def prepare_context_logits_workspace(self) -> None:
+        """Reserve and warm the dense single-rank context projection fallback."""
+        if self.context_logits_workspace is None and self.supports_context_logits_workspace:
+            self.context_logits_workspace = ContextLogitsWorkspace(self)
 
     def _writes_output_dtype(self) -> bool:
         """Whether the GEMM must store a dtype different from its weights."""

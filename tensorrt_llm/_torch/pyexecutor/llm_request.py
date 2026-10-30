@@ -131,6 +131,30 @@ class LogitsStorage:
             self._device_fragments: List[torch.Tensor] = []
             self._current_position = 0
 
+    def prepare(self,
+                vocab_size: int,
+                dtype: torch.dtype,
+                device: torch.device,
+                *,
+                cpu_fallback: bool = False) -> None:
+        """Allocate one-beam context storage, optionally falling back to host RAM."""
+        if self._storage is not None:
+            return
+        shape = (self.seq_length, 1, vocab_size)
+        if self.use_device_memory:
+            try:
+                storage = torch.empty(shape, dtype=dtype, device=device)
+            except torch.OutOfMemoryError:
+                if not cpu_fallback:
+                    raise
+                # Large complete outputs need not consume pinned host memory.
+                storage = torch.empty(shape, dtype=dtype, device="cpu")
+        else:
+            storage = torch.empty(shape, dtype=dtype, device="cpu")
+        self._storage = storage
+        self.beam_width = 1
+        self.vocab_size = vocab_size
+
     def _init(self, logits: torch.Tensor):
         _, self.beam_width, self.vocab_size = logits.shape
 
@@ -159,7 +183,7 @@ class LogitsStorage:
             pin_memory=prefer_pinned(),
             requires_grad=False)
 
-    def append(self, logits: torch.Tensor):
+    def append(self, logits: torch.Tensor, *, reusable: bool = False):
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
@@ -184,7 +208,8 @@ class LogitsStorage:
                 )
 
             self._storage[position:new_position].copy_(logits,
-                                                       non_blocking=True)
+                                                       non_blocking=not reusable
+                                                       or self._storage.is_cuda)
             self._logits_indices.append((position, new_position))
 
     def get(self, all_logits: bool, exclude_last: bool) -> torch.Tensor | None:
@@ -306,6 +331,9 @@ class PyResult:
         """
         exclude_last_generation_logits: bool | None = None
         context_logits_list: list[torch.Tensor] = field(default_factory=list)
+        context_logits_on_cpu: bool = False
+        prompt_logprobs: TokenLogprobs | SimpleTokenLogprobs | None = None
+        prompt_last_logits: torch.Tensor | None = None
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
@@ -341,6 +369,8 @@ class PyResult:
 
         # Note that in C++ implemnetation both context logits and generation logits are stored on host memory.
         # Here we only use host memory for generation logits if in chunked model.
+        self.context_prompt_logprobs: TokenLogprobs | SimpleTokenLogprobs | None = None
+        self.context_prompt_last_logits: torch.Tensor | None = None
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
             use_device_memory=use_device_memory,
@@ -373,6 +403,8 @@ class PyResult:
         self.diff = PyResult.Diff()
 
     def get_diff(self) -> Diff:
+        if self._context_logits is not None and self._context_logits._storage is not None:
+            self.diff.context_logits_on_cpu = self.context_logits_on_cpu
         for i, context_logits in enumerate(self.diff.context_logits_list):
             self.diff.context_logits_list[i] = context_logits.to("cpu")
         for i, generation_logits in enumerate(self.diff.generation_logits_list):
@@ -382,9 +414,24 @@ class PyResult:
         return self.diff
 
     def apply_diff(self, diff: Diff):
+        if diff.prompt_logprobs is not None:
+            if self.context_prompt_logprobs is None:
+                self.context_prompt_logprobs = []
+            self.context_prompt_logprobs.extend(diff.prompt_logprobs)
+        if diff.prompt_last_logits is not None:
+            self.context_prompt_last_logits = diff.prompt_last_logits
         if diff.exclude_last_generation_logits is not None:
             self._exclude_last_generation_logits = diff.exclude_last_generation_logits
         if len(diff.context_logits_list) > 0:
+            first = diff.context_logits_list[0]
+            # Preserve host fallback, including when only the receiving rank
+            # lacks space for the complete result.
+            device = torch.device(
+                "cpu" if diff.context_logits_on_cpu else "cuda")
+            self._context_logits.prepare(first.shape[-1],
+                                         first.dtype,
+                                         device,
+                                         cpu_fallback=True)
             for context_logits in diff.context_logits_list:
                 self._context_logits.append(context_logits)
         if len(diff.generation_logits_list) > 0:
@@ -415,9 +462,42 @@ class PyResult:
         self._exclude_last_generation_logits = exclude_last_generation_logits
         self.diff.exclude_last_generation_logits = exclude_last_generation_logits
 
-    def append_context_logits(self, context_logits: torch.Tensor):
+    def prepare_context_logits(self, vocab_size: int,
+                               device: torch.device) -> None:
+        assert self._context_logits is not None
+        self._context_logits.prepare(vocab_size,
+                                     torch.float32,
+                                     device,
+                                     cpu_fallback=True)
+
+    @property
+    def context_logits_on_cpu(self) -> bool:
+        assert self._context_logits is not None and self._context_logits._storage is not None
+        return self._context_logits._storage.device.type == "cpu"
+
+    def append_prompt_logprobs(
+            self, values: TokenLogprobs | SimpleTokenLogprobs) -> None:
+        if self.context_prompt_logprobs is None:
+            self.context_prompt_logprobs = []
+        if self.diff.prompt_logprobs is None:
+            self.diff.prompt_logprobs = []
+        self.context_prompt_logprobs.extend(values)
+        self.diff.prompt_logprobs.extend(values)
+
+    def set_prompt_last_logits(self, logits: torch.Tensor) -> None:
+        self.context_prompt_last_logits = logits
+        self.diff.prompt_last_logits = logits
+
+    def append_context_logits(self,
+                              context_logits: torch.Tensor,
+                              *,
+                              reusable: bool = False):
         if self._context_logits:
-            self._context_logits.append(context_logits)
+            self._context_logits.append(context_logits, reusable=reusable)
+            if reusable:
+                # Retain the owned destination view, never the next chunk's scratch.
+                begin, end = self._context_logits._logits_indices[-1]
+                context_logits = self._context_logits._storage[begin:end, 0]
             self.diff.context_logits_list.append(context_logits)
 
     def append_generation_logits(self, generation_logits: torch.Tensor):
@@ -618,8 +698,9 @@ class PyResult:
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'first_gen_log_probs', 'mm_embedding_handles',
+        ('context_logits', 'context_prompt_logprobs',
+         'context_prompt_last_logits', 'generation_logits', 'log_probs',
+         'cum_log_probs', 'first_gen_log_probs', 'mm_embedding_handles',
          'additional_context_outputs', 'additional_generation_outputs',
          'encoder_output', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
@@ -701,6 +782,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             client_id: int = None,
             return_log_probs: bool = False,
             return_context_logits: bool = False,
+            context_logits_explicit: bool = True,
+            prompt_logprobs: int | None = None,
+            prompt_logprobs_simple_format: bool = False,
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
             exclude_last_generation_logits: bool = False,
@@ -837,6 +921,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Router Replay: attach routed_experts to this request's output.
         self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
+        self.py_context_logits_explicit = context_logits_explicit
+        self.py_prompt_logprobs = prompt_logprobs
+        self.py_prompt_logprobs_simple_format = prompt_logprobs_simple_format
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_additional_outputs = additional_outputs
@@ -1225,6 +1312,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             client_id=self.py_client_id,
             return_log_probs=self.py_return_log_probs,
             return_context_logits=self.py_return_context_logits,
+            context_logits_explicit=self.py_context_logits_explicit,
+            prompt_logprobs=self.py_prompt_logprobs,
+            prompt_logprobs_simple_format=self.py_prompt_logprobs_simple_format,
             return_generation_logits=self.py_return_generation_logits,
             return_logits_device_memory=self.py_return_logits_device_memory,
             exclude_last_generation_logits=self.py_result.
@@ -1690,6 +1780,11 @@ def executor_request_to_llm_request(
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.
         return_context_logits,
+        context_logits_explicit=getattr(executor_request,
+                                        "py_context_logits_explicit", True),
+        prompt_logprobs=getattr(executor_request, "py_prompt_logprobs", None),
+        prompt_logprobs_simple_format=getattr(
+            executor_request, "py_prompt_logprobs_simple_format", False),
         return_perf_metrics=executor_request.output_config.return_perf_metrics,
         return_generation_logits=executor_request.output_config.
         return_generation_logits,

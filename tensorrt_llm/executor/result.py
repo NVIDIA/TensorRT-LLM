@@ -1357,7 +1357,7 @@ def compute_prompt_logprobs(
             # Only consume logits corresponding to the supplied tokens.
             logits = logits[:len(tokens)]
 
-        logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
+        logprobs = F.log_softmax(logits.to(dtype=torch.float32), dim=-1)
 
         # only return sampled token
         if top_k == 0:
@@ -1403,10 +1403,32 @@ def compute_prompt_logprobs(
             results.append(token_dict)
         return results
 
-    prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs, prompt_token_ids,
-        simple_prompt_logprobs
-    ) if k_prompt_logprobs is not None and context_logits is not None else None
+    if k_prompt_logprobs is None or context_logits is None:
+        return LogProbsResult(prompt=None)
+    if context_logits.dim() == 3:
+        context_logits = context_logits.squeeze(0)
+    if prompt_token_ids is not None:
+        context_logits = context_logits[:len(prompt_token_ids)]
+    # Bound softmax scratch independently of prompt length. On the GPU, a
+    # slice can fall back to CPU without retaining a full-vocabulary GPU result.
+    rows_per_chunk = max(1,
+                         (16 * 1024 * 1024) // (4 * context_logits.shape[-1]))
+    prompt_logprobs = []
+    for start in range(0, context_logits.shape[0], rows_per_chunk):
+        chunk = context_logits[start:start + rows_per_chunk]
+        tokens = None if prompt_token_ids is None else prompt_token_ids[
+            start:start + rows_per_chunk]
+        try:
+            values = _topk_logprobs(chunk, k_prompt_logprobs, tokens,
+                                    simple_prompt_logprobs)
+        except torch.OutOfMemoryError:
+            if not chunk.is_cuda:
+                raise
+            values = None
+        if values is None:
+            values = _topk_logprobs(chunk.cpu(), k_prompt_logprobs, tokens,
+                                    simple_prompt_logprobs)
+        prompt_logprobs.extend(values)
     return LogProbsResult(prompt=prompt_logprobs)
 
 
