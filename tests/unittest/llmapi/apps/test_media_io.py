@@ -201,6 +201,39 @@ class TestAudioDecodedSizeLimit:
             AudioMediaIO().load_bytes(encoded)
         assert audio_reads == [self.LIMIT // 2 + 1]
 
+    def test_unknown_length_audio_with_reservation(self, audio_reads):
+        original = _flac_bytes(frames=1000, channels=2)
+        encoded = _without_frame_count(original)
+        expected, expected_rate = soundfile.read(BytesIO(original))
+        audio_reads.clear()
+        reservation = Mock()
+        reserver = Mock(return_value=reservation)
+
+        data, rate = AudioMediaIO(decoded_memory_reserver=reserver).load_bytes(encoded)
+
+        assert rate == expected_rate
+        np.testing.assert_array_equal(data, expected, strict=True)
+        assert audio_reads == [self.LIMIT // 2 + 1]
+        assert reserver.call_count == 2  # Bounded read and final concatenation.
+        reservation.shrink.assert_called_once_with(data.nbytes)
+        reservation.commit.assert_any_call(data.nbytes)
+
+        unreserved, unreserved_rate = AudioMediaIO().load_bytes(encoded)
+        assert unreserved_rate == expected_rate
+        np.testing.assert_array_equal(unreserved, expected, strict=True)
+
+    def test_unknown_length_audio_over_limit_with_reservation(self, audio_reads):
+        encoded = _without_frame_count(_flac_bytes(frames=self.LIMIT, channels=2))
+        reservation = Mock()
+        reserver = Mock(return_value=reservation)
+
+        with pytest.raises(ValueError, match="more than 4000 samples"):
+            AudioMediaIO(decoded_memory_reserver=reserver).load_bytes(encoded)
+
+        assert audio_reads == [self.LIMIT // 2 + 1]
+        reservation.commit.assert_not_called()
+        reservation.release.assert_called_once()
+
     def test_audio_base64_over_encoded_limit_is_rejected(self, monkeypatch):
         encoded = _flac_bytes(frames=self.LIMIT // 2, channels=2)
         monkeypatch.setattr(media_io_module, "_MAX_RESPONSE_BYTES", len(encoded) // 2)
