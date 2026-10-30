@@ -23,8 +23,11 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 )
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    VisionNormalization,
     _is_mm_disagg,
     filter_mm_token_from_input_ids,
+    normalize_vision_pixels,
+    vision_normalization_from_processor,
 )
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -428,7 +431,13 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 m["total_num_frames"] = len(vd.frames)
                 video_metadata.append(m)
 
-        return self.processor(
+        do_rescale = proc_kwargs.pop("do_rescale", do_rescale)
+        normalization = self._get_vision_normalization(mm_data, mm_processor_kwargs)
+        host_do_rescale = do_rescale
+        if normalization:
+            do_rescale = False
+            proc_kwargs["do_normalize"] = False
+        processor_kwargs = dict(
             text=[text],
             images=images,
             videos=videos,
@@ -438,6 +447,44 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             video_metadata=video_metadata,
             **proc_kwargs,
         )
+        processed = self.processor(**processor_kwargs)
+        if normalization:
+            if any(
+                modality in normalization and processed[pixel_key].dtype != torch.uint8
+                for modality, pixel_key in (
+                    ("image", "pixel_values"),
+                    ("video", "pixel_values_videos"),
+                )
+            ):
+                processor_kwargs["do_rescale"] = host_do_rescale
+                processor_kwargs.pop("do_normalize")
+                return self.processor(**processor_kwargs)
+            processed["vision_normalization"] = normalization
+        return processed
+
+    def _get_vision_normalization(
+        self, mm_data: dict[str, Any], mm_processor_kwargs: dict[str, Any]
+    ) -> dict[str, VisionNormalization]:
+        if not self._vision_gpu_normalize or mm_processor_kwargs:
+            return {}
+
+        normalization = {}
+        for modality in ("image", "video"):
+            items = mm_data.get(modality)
+            if not items:
+                continue
+            frames = (
+                items if modality == "image" else [frame for item in items for frame in item.frames]
+            )
+            processor = getattr(self.processor, f"{modality}_processor", None)
+            params = vision_normalization_from_processor(frames, processor, self.dtype)
+            if params is None:
+                return {}
+            # The existing CPU call forces rescale on for raw images and videos.
+            if not processor.do_rescale:
+                return {}
+            normalization[modality] = params
+        return normalization
 
     def get_num_tokens_per_video(
         self,
@@ -946,6 +993,15 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self._rope_position_ids_buffer = torch.arange(
             max_num_tokens, dtype=torch.int32, device=self.device
         )
+        if (
+            self.model_config.multimodal_config is not None
+            and self.model_config.multimodal_config.vision_gpu_normalize
+        ):
+            # Warm the shared lookup kernel for the encoder output dtype.
+            normalize_vision_pixels(
+                torch.zeros((1, 1, 1024), dtype=torch.uint8, device=self.device),
+                VisionNormalization(1.0, (0.0,), (1.0,), self.patch_embed.proj.weight.dtype),
+            )
 
     def set_attn_max_seq_len(self, max_seq_len: int) -> None:
         if max_seq_len <= 0:
@@ -1213,6 +1269,10 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def forward(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        if pixel_values.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(
+                f"Patch projection requires normalized floating pixels, got {pixel_values.dtype}"
+            )
         grid_rows = grid_thw.tolist()
         seq_lens: List[int] = []
         for t, h, w in grid_rows:
@@ -1311,7 +1371,21 @@ def _qwen3vl_build_batched_input(
         for mp in multimodal_params:
             bucket = mp.multimodal_data.get(m)
             if bucket is not None:
-                pixels.append(bucket[pv_key])
+                if bucket[pv_key].dtype not in (
+                    torch.uint8,
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                ):
+                    raise ValueError(f"Unsupported pixel dtype: {bucket[pv_key].dtype}")
+                pixel_values = bucket[pv_key]
+                if pixel_values.dtype == torch.uint8:
+                    # Normalize each raw bucket before concatenation can promote its dtype.
+                    shape = pixel_values.shape
+                    pixel_values = normalize_vision_pixels(
+                        pixel_values.view(-1, 3, shape[-1] // 3), bucket["vision_normalization"]
+                    ).view(shape)
+                pixels.append(pixel_values)
                 grids.append(bucket[thw_key])
     return {
         "pixel_values": torch.cat(pixels, dim=0),
@@ -1389,6 +1463,8 @@ class Qwen3VisionModelBase(nn.Module):
         the hidden dim. Modality-agnostic — image and video items are
         distinguished only by ``grid_thw`` rows (image ``t=1``, video ``t>1``).
         """
+        if pixel_values.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported pixel dtype: {pixel_values.dtype}")
         pixel_values = pixel_values.to(self.model_dtype)
         embeds, deepstack = self.visual(pixel_values, grid_thw=grid_thw)
         # Shape: [seq_len, hidden_dim * (num_deepstack_layers + 1)]
@@ -1426,6 +1502,7 @@ class Qwen3VisionModelBase(nn.Module):
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_mm_encoder_item_scheduling = True
+    supports_vision_gpu_normalize = True
 
     def get_multimodal_item_partitions(
         self,

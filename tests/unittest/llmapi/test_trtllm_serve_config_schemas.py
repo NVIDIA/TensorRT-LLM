@@ -83,6 +83,31 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
         (
             generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": True}},
+            True,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": False}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": "invalid"}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": 1}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": None}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
             {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},
             True,
         ),

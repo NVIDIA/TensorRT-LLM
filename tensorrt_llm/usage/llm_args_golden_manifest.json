@@ -1117,6 +1117,11 @@
       "path": "multimodal_config.video_pruning_rate"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "multimodal_config.vision_gpu_normalize"
+    },
+    {
       "allowed_values": [
         "per_module"
       ],

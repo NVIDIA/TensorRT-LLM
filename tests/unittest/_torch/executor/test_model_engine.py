@@ -120,6 +120,47 @@ def _install_graph_runner_stub(runner: DecoderRunner, key: KeyType | None = None
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_init_from_args_forwards_vision_gpu_normalize(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    llm_args = SimpleNamespace(
+        encode_only=False,
+        mm_encoder_only=False,
+        get_runtime_sizes=lambda: (1, 16, 64, 4),
+        encoder_max_batch_size=None,
+        encoder_max_num_tokens=None,
+        multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled),
+        checkpoint_format="HF",
+        trust_remote_code=False,
+    )
+    create_input_processor = Mock()
+    monkeypatch.setattr(model_engine_module, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(model_engine_module, "create_input_processor", create_input_processor)
+    engine = SimpleNamespace()
+
+    ModelEngine._init_from_args(
+        engine,
+        model_path="dummy",
+        llm_args=llm_args,
+        mapping=Mapping(),
+        attn_runtime_features=None,
+        dist=None,
+        spec_config=None,
+    )
+
+    create_input_processor.assert_called_once_with(
+        "dummy",
+        tokenizer=None,
+        checkpoint_format="HF",
+        trust_remote_code=False,
+        **({"vision_gpu_normalize": True} if enabled else {}),
+    )
+    assert engine.input_processor is create_input_processor.return_value
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("failure_stage", [None, "loader", "graphs", "gc"])
 def test_cleanup_releases_runner_model_before_release_gc(
     monkeypatch: pytest.MonkeyPatch,

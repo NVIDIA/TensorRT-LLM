@@ -418,6 +418,9 @@ class MultimodalModelMixin:
       `get_multimodal_item_partitions`. Undeclared models retain legacy stacked/packed inference.
     """
 
+    supports_vision_gpu_normalize: ClassVar[bool] = False
+    """Whether the model accepts processor-described raw vision pixels."""
+
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
 

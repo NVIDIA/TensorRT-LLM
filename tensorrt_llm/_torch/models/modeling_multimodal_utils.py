@@ -19,18 +19,149 @@
 import functools
 import math
 import os
-from typing import (Any, Callable, Dict, List, Optional, Tuple, TypedDict,
-                    Union, cast)
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Tuple,
+                    TypedDict, Union, cast)
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from einops import rearrange
 from PIL import Image
 from torchvision.transforms import Normalize, Resize, ToTensor
+from transformers.image_processing_backends import TorchvisionBackend
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
+
+
+class VisionNormalization(NamedTuple):
+    """Processor statistics shared with vision encoder input preparation."""
+
+    rescale_factor: float | None
+    image_mean: tuple[float, ...] | None
+    image_std: tuple[float, ...] | None
+    out_dtype: torch.dtype
+    compute_dtype: torch.dtype | None = None
+
+
+def vision_normalization_from_processor(
+        frames: list[Any], processor: Any,
+        out_dtype: torch.dtype) -> VisionNormalization | None:
+    """Describe elementwise normalization for RGB PIL or uint8 HWC frames."""
+    # Workers reconstruct the table, so the processor must use the shared backend.
+    uses_shared_backend = all(
+        getattr(getattr(processor, name, None), "__func__", None) is getattr(
+            TorchvisionBackend, name)
+        for name in ("rescale_and_normalize", "rescale", "normalize"))
+    if not uses_shared_backend:
+        return None
+    if not (processor.do_rescale or processor.do_normalize):
+        return None
+    rgb_frames = frames and all(
+        (isinstance(frame, Image.Image) and frame.mode == "RGB") or
+        (isinstance(frame, np.ndarray) and frame.dtype == np.uint8
+         and frame.ndim == 3 and frame.shape[-1] == 3) for frame in frames)
+    if not rgb_frames:
+        return None
+    return VisionNormalization(
+        rescale_factor=processor.rescale_factor
+        if processor.do_rescale else None,
+        image_mean=((processor.image_mean, ) * 3 if np.isscalar(
+            processor.image_mean) else tuple(processor.image_mean))
+        if processor.do_normalize else None,
+        image_std=((processor.image_std, ) * 3 if np.isscalar(
+            processor.image_std) else tuple(processor.image_std))
+        if processor.do_normalize else None,
+        out_dtype=out_dtype,
+        compute_dtype=torch.get_default_dtype(),
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def _vision_normalization_table(
+    normalization: VisionNormalization,
+    device: torch.device,
+    channels: int,
+    default_dtype: torch.dtype,
+) -> torch.Tensor:
+    values = torch.arange(256, dtype=default_dtype,
+                          device="cpu").expand(channels, 1, -1)
+    image_mean, image_std = normalization.image_mean, normalization.image_std
+    if normalization.rescale_factor is not None and image_mean is not None:
+        image_mean = torch.tensor(image_mean, dtype=default_dtype,
+                                  device="cpu").unbind()
+        image_std = torch.tensor(image_std, dtype=default_dtype,
+                                 device="cpu").unbind()
+    values = TorchvisionBackend().rescale_and_normalize(
+        values,
+        do_rescale=normalization.rescale_factor is not None,
+        rescale_factor=normalization.rescale_factor,
+        do_normalize=normalization.image_mean is not None,
+        image_mean=image_mean,
+        image_std=image_std,
+    )
+    return values.to(dtype=normalization.out_dtype,
+                     device=device).reshape(channels, 256).contiguous()
+
+
+@triton.jit(do_not_specialize=["count", "channel_stride", "channels"])
+def _normalize_vision_pixels_kernel(source, table, target, count,
+                                    channel_stride, channels,
+                                    BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    pixels = tl.load(source + offsets, offsets < count, other=0).to(tl.int32)
+    channel = (offsets // channel_stride) % channels
+    values = tl.load(table + channel * 256 + pixels)
+    tl.store(target + offsets, values, offsets < count)
+
+
+def normalize_vision_pixels(
+    pixel_values: torch.Tensor,
+    normalization: VisionNormalization,
+) -> torch.Tensor:
+    """Apply processor normalization in the tensor's device.
+
+    Models reshape uint8 pixels to [..., channels, values_per_channel]. The
+    processor's shared elementwise step evaluates all 256 values on the CPU,
+    then casts once to the vision dtype. Models restore any padding inserted
+    after CPU normalization.
+    """
+    if pixel_values.dtype != torch.uint8:
+        raise ValueError("Device normalization requires uint8 pixels")
+    if pixel_values.ndim < 2:
+        raise ValueError("Vision pixels must include channel and value axes")
+    channels, channel_stride = pixel_values.shape[-2:]
+    if not channels or not channel_stride:
+        return pixel_values.to(normalization.out_dtype)
+    # Match the producer's intermediate precision when rebuilding the table.
+    table = _vision_normalization_table(
+        normalization, pixel_values.device, channels,
+        normalization.compute_dtype or torch.get_default_dtype())
+    if not pixel_values.is_cuda:
+        offsets = torch.arange(pixel_values.numel(), device=pixel_values.device)
+        channel = (offsets // channel_stride) % channels
+        return table[channel, pixel_values.reshape(-1).long()].reshape(
+            pixel_values.shape)
+    output = torch.empty_like(pixel_values,
+                              dtype=normalization.out_dtype,
+                              memory_format=torch.contiguous_format)
+    if pixel_values.numel():
+        _normalize_vision_pixels_kernel[(triton.cdiv(
+            pixel_values.numel(), 1024), )](
+                pixel_values.contiguous(),
+                table,
+                output,
+                pixel_values.numel(),
+                channel_stride,
+                channels,
+                BLOCK=1024,
+                num_warps=4,
+            )
+    return output
+
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 

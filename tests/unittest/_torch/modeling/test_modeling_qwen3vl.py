@@ -4,13 +4,16 @@
 import copy
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
+from PIL import Image
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
 from transformers import Qwen3VLConfig
@@ -18,8 +21,13 @@ from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditio
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models import modeling_qwen2vl, modeling_qwen3vl
+from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    VisionNormalization,
+    normalize_vision_pixels,
+    vision_normalization_from_processor,
+)
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
     Qwen3VLInputProcessorBase,
@@ -28,6 +36,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -1574,3 +1583,638 @@ def test_qwen3vl_vision_block_forward_end_to_end():
         attn_metadata=attn_metadata,
     )
     assert out.shape == hidden.shape
+
+
+def _metadata_fixture(dtype: torch.dtype, device: torch.device) -> SimpleNamespace:
+    return SimpleNamespace(
+        device=device,
+        patch_embed=SimpleNamespace(proj=SimpleNamespace(weight=SimpleNamespace(dtype=dtype))),
+        metadata_cls=lambda **kwargs: SimpleNamespace(**kwargs),
+        set_attn_max_seq_len=lambda _: None,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_normalization_startup_follows_encoder_dtype(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, dtype: torch.dtype
+) -> None:
+    seen = []
+    monkeypatch.setattr(
+        modeling_qwen3vl,
+        "normalize_vision_pixels",
+        lambda pixels, normalization: seen.append((pixels, normalization)),
+    )
+    model = _metadata_fixture(dtype, torch.device("cpu"))
+    model.model_config = SimpleNamespace(
+        multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled)
+    )
+    modeling_qwen3vl.Qwen3VisionModel.setup_attn_metadata(model, 16, {"attention": 4})
+    assert len(seen) == int(enabled)
+    if seen:
+        pixels, spec = seen[0]
+        assert pixels.dtype == torch.uint8
+        assert pixels.is_contiguous()
+        assert spec.out_dtype == dtype
+        assert spec.compute_dtype is None
+    assert model.attn_metadata.max_num_tokens == 16
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [None, False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "input_kind",
+    [
+        "rgb",
+        "array",
+        "grayscale",
+        "rgba",
+        "float",
+        "channel_first",
+        "video",
+        "mixed",
+        "video_float",
+        "custom_mean",
+        "custom_std",
+        "resize",
+        "nested",
+        "no_rescale",
+        "no_normalize",
+        "no_elementwise",
+        "output_float",
+        "disable_rescale",
+        "disable_normalize",
+        "rescale_factor",
+        "convert_rgb",
+        "default_float64",
+    ],
+)
+def test_normalization_processor_uses_config(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool | None,
+    dtype: torch.dtype,
+    input_kind: str,
+) -> None:
+    config = Qwen3VLConfig.from_dict(QWEN3_VL_8B_CONFIG)
+    config.text_config.dtype = dtype
+    hf_processor = MagicMock(
+        return_value={
+            "pixel_values": torch.zeros(1, 1536, dtype=torch.uint8),
+            "pixel_values_videos": torch.zeros(1, 1536, dtype=torch.uint8),
+        }
+    )
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    hf_processor.image_processor = Qwen2VLImageProcessor(
+        do_rescale=True,
+        do_normalize=True,
+        image_mean=[0.5] * 3,
+        image_std=[0.5] * 3,
+        rescale_factor=1 / 255,
+        patch_size=16,
+        temporal_patch_size=2,
+    )
+    hf_processor.video_processor = copy.deepcopy(hf_processor.image_processor)
+    if input_kind == "output_float":
+        hf_processor.return_value["pixel_values"] = torch.zeros(1, 1536, dtype=torch.float32)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor.from_pretrained",
+        lambda *args, **kwargs: hf_processor,
+    )
+    options = {} if enabled is None else {"vision_gpu_normalize": enabled}
+    processor = Qwen3VLInputProcessorBase("unused", config, MagicMock(), **options)
+    image = Image.new("RGB", (32, 32))
+    if input_kind == "array":
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+    elif input_kind in ("grayscale", "rgba"):
+        image = Image.new("L" if input_kind == "grayscale" else "RGBA", (32, 32))
+    elif input_kind == "float":
+        image = np.zeros((32, 32, 3), dtype=np.float32)
+    elif input_kind == "channel_first":
+        image = np.zeros((3, 32, 32), dtype=np.uint8)
+    mm_data = {"image": [image]}
+    if input_kind in ("video", "mixed", "video_float"):
+        frame = np.zeros((32, 32, 3), dtype=np.float32) if input_kind == "video_float" else image
+        mm_data["video"] = [SimpleNamespace(frames=[frame, frame], metadata={})]
+        if input_kind == "video":
+            mm_data.pop("image")
+    overrides = {
+        "custom_mean": {"image_mean": [0.4, 0.5, 0.6]},
+        "custom_std": {"image_std": [0.2, 0.3, 0.4]},
+        "resize": {"do_resize": False},
+        "nested": {"images_kwargs": {"do_normalize": False}},
+        "disable_rescale": {"do_rescale": False},
+        "disable_normalize": {"do_normalize": False},
+        "rescale_factor": {"rescale_factor": 1 / 128},
+        "convert_rgb": {"do_convert_rgb": False},
+    }.get(input_kind, {})
+    if input_kind == "no_rescale":
+        hf_processor.image_processor.do_rescale = False
+    elif input_kind == "no_normalize":
+        hf_processor.image_processor.do_normalize = False
+    elif input_kind == "no_elementwise":
+        hf_processor.image_processor = SimpleNamespace(do_rescale=True, do_normalize=True)
+    elif input_kind == "default_float64":
+        monkeypatch.setattr(torch, "get_default_dtype", lambda: torch.float64)
+    processed = processor._preprocess("prompt", mm_data, overrides)
+    expected = enabled is True and input_kind in (
+        "rgb",
+        "array",
+        "video",
+        "mixed",
+        "no_normalize",
+        "default_float64",
+    )
+    assert bool(processed.get("vision_normalization")) is expected
+    assert hf_processor.call_args.kwargs["do_rescale"] is overrides.get("do_rescale", not expected)
+    assert hf_processor.call_args.kwargs.get("do_normalize") is (
+        False if expected else overrides.get("do_normalize")
+    )
+    if expected:
+        assert set(processed["vision_normalization"]) == set(mm_data)
+        for spec in processed["vision_normalization"].values():
+            assert spec.out_dtype == dtype
+            assert isinstance(spec, VisionNormalization)
+            assert spec.image_mean == (None if input_kind == "no_normalize" else (0.5,) * 3)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_normalization_metadata_survives_processor_output(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype
+) -> None:
+    config = Qwen3VLConfig.from_dict(QWEN3_VL_8B_CONFIG)
+    config.text_config.dtype = dtype
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor.from_pretrained",
+        lambda *args, **kwargs: MagicMock(),
+    )
+    processor = Qwen3VLInputProcessorBase("unused", config, MagicMock())
+    spec = VisionNormalization(1 / 255, (0.5,) * 3, (0.5,) * 3, dtype)
+    processed = {
+        "input_ids": torch.zeros((1, 4), dtype=torch.long),
+        "pixel_values": torch.zeros((4, 1536), dtype=torch.uint8),
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        "pixel_values_videos": torch.zeros((4, 1536), dtype=torch.uint8),
+        "video_grid_thw": torch.tensor([[1, 2, 2]]),
+        "vision_normalization": {"image": spec, "video": spec},
+    }
+    monkeypatch.setattr(processor, "_preprocess", lambda *args: processed)
+    monkeypatch.setattr(processor, "get_mrope_config", lambda *args: {})
+    monkeypatch.setattr(processor, "_postprocess", lambda input_ids: input_ids)
+    _, extra = processor.call_with_text_prompt(
+        {"prompt": "prompt", "multi_modal_data": {"image": [None], "video": [None]}}, MagicMock()
+    )
+    for modality, pixel_key in (("image", "pixel_values"), ("video", "pixel_values_videos")):
+        bucket = extra["multimodal_data"][modality]
+        assert bucket[pixel_key].dtype == torch.uint8
+        assert bucket["vision_normalization"] == spec
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.float64])
+@pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("worker_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("scalar_statistics", [False, True])
+@pytest.mark.parametrize("do_rescale,do_normalize", [(True, True), (True, False), (False, True)])
+def test_normalization_enabled_operations(
+    dtype, default_dtype, worker_dtype, scalar_statistics, do_rescale, do_normalize
+):
+    import pickle
+
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    processor = Qwen2VLImageProcessor(
+        do_rescale=do_rescale,
+        do_normalize=do_normalize,
+        rescale_factor=1 / 127 if do_rescale else None,
+        image_mean=(0.2 if scalar_statistics else [0.2, 0.4, 0.6]) if do_normalize else None,
+        image_std=(0.1 if scalar_statistics else [0.1, 0.3, 0.7]) if do_normalize else None,
+    )
+    values = np.tile(np.arange(256, dtype=np.uint8).reshape(1, 256, 1), (2, 1, 3))
+    pixels = torch.from_numpy(values).permute(2, 0, 1).contiguous()
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(default_dtype)
+        spec = vision_normalization_from_processor([values], processor, dtype)
+        assert isinstance(spec, VisionNormalization)
+        assert spec.rescale_factor == (processor.rescale_factor if do_rescale else None)
+        assert spec.image_mean == (
+            ((processor.image_mean,) * 3 if scalar_statistics else tuple(processor.image_mean))
+            if do_normalize
+            else None
+        )
+        assert spec.compute_dtype == default_dtype
+        expected = processor.rescale_and_normalize(
+            pixels,
+            do_rescale=do_rescale,
+            rescale_factor=processor.rescale_factor,
+            do_normalize=do_normalize,
+            image_mean=processor.image_mean,
+            image_std=processor.image_std,
+        ).to(dtype)
+        spec = pickle.loads(pickle.dumps(spec))
+        torch.set_default_dtype(worker_dtype)
+        assert torch.equal(
+            normalize_vision_pixels(pixels.reshape(3, -1), spec), expected.reshape(3, -1)
+        )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case", ["empty", "noop", "no_elementwise", "custom_rescale", "custom_normalize"]
+)
+def test_normalization_builder_fallback(case):
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    frames = [Image.new("RGB", (16, 16))]
+    processor = Qwen2VLImageProcessor()
+    if case == "empty":
+        frames = []
+    elif case == "noop":
+        processor.do_rescale = processor.do_normalize = False
+    elif case == "no_elementwise":
+        processor = SimpleNamespace()
+    else:
+        setattr(processor, case.removeprefix("custom_"), lambda *args, **kwargs: None)
+    assert vision_normalization_from_processor(frames, processor, torch.bfloat16) is None
+
+
+def _normalization_processor_outputs(
+    sample: str, modality: str, dtype: torch.dtype, custom_constants: bool
+) -> tuple[torch.Tensor, torch.Tensor, VisionNormalization]:
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+    from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
+
+    if sample == "all_values":
+        values = torch.arange(1024, dtype=torch.int32).remainder(256).reshape(32, 32)
+        pixels = torch.stack([values, values.roll(17), values.roll(71)]).to(torch.uint8)
+        assert all(channel.unique().numel() == 256 for channel in pixels)
+    else:
+        default_path = Path(__file__).parents[3] / "integration/test_input_files/merlion.png"
+        path = Path(os.environ.get("TRTLLM_TEST_IMAGE", default_path))
+        if not path.is_file() or path.read_bytes().startswith(
+            b"version https://git-lfs.github.com/spec/"
+        ):
+            pytest.skip("Real-image fixture is not materialized")
+        with Image.open(path) as image:
+            pixels = torch.from_numpy(np.asarray(image.convert("RGB").resize((53, 79))).copy())
+        pixels = pixels.permute(2, 0, 1)
+    mean = (0.4, 0.5, 0.6) if custom_constants else (0.5,) * 3
+    std = (0.2, 0.3, 0.4) if custom_constants else (0.5,) * 3
+    if modality == "image":
+        processor = Qwen2VLImageProcessor(
+            image_mean=list(mean),
+            image_std=list(std),
+            patch_size=16,
+            temporal_patch_size=2,
+            size={"shortest_edge": 4096, "longest_edge": 16384},
+        )
+        kwargs = {"images": [pixels]}
+        pixel_key = "pixel_values"
+    else:
+        processor = Qwen3VLVideoProcessor(
+            image_mean=list(mean),
+            image_std=list(std),
+            size={"shortest_edge": 4096, "longest_edge": 16384},
+        )
+        kwargs = {"videos": [torch.stack([pixels, pixels.flip(-1)])], "do_sample_frames": False}
+        pixel_key = "pixel_values_videos"
+    do_resize = sample == "real_image"
+    expected = processor(**kwargs, do_resize=do_resize, return_tensors="pt")[pixel_key].to(dtype)
+    raw = processor(
+        **kwargs, do_resize=do_resize, do_rescale=False, do_normalize=False, return_tensors="pt"
+    )[pixel_key]
+    spec = vision_normalization_from_processor(
+        [Image.fromarray(pixels.permute(1, 2, 0).numpy())], processor, dtype
+    )
+    assert spec is not None
+    return raw, expected, spec
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("sample", ["all_values", "real_image"])
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("custom_constants", [False, True])
+def test_normalization_matches_cpu_processor(
+    dtype: torch.dtype, sample: str, modality: str, custom_constants: bool
+) -> None:
+    raw, expected, spec = _normalization_processor_outputs(
+        sample, modality, dtype, custom_constants
+    )
+    assert raw.dtype == torch.uint8
+    assert torch.equal(
+        normalize_vision_pixels(raw.view(-1, 3, raw.shape[-1] // 3), spec).view(raw.shape),
+        expected,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("sample", ["all_values", "real_image"])
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("custom_constants", [False, True])
+@pytest.mark.parametrize("producer_dtype", [torch.float32, torch.float64])
+def test_normalization_matches_gpu_processor(
+    dtype: torch.dtype,
+    sample: str,
+    modality: str,
+    custom_constants: bool,
+    producer_dtype: torch.dtype,
+) -> None:
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(producer_dtype)
+        raw, expected, spec = _normalization_processor_outputs(
+            sample, modality, dtype, custom_constants
+        )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    with torch.device("cuda"):
+        actual = normalize_vision_pixels(raw.cuda().view(-1, 3, raw.shape[-1] // 3), spec).view(
+            raw.shape
+        )
+    assert torch.equal(actual.cpu(), expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_normalization_mixed_raw_and_float_batches(dtype: torch.dtype) -> None:
+    raw, expected, spec = _normalization_processor_outputs("all_values", "image", dtype, True)
+    raw_video, expected_video, video_spec = _normalization_processor_outputs(
+        "all_values", "video", dtype, False
+    )
+    grid = torch.tensor([[1, 2, 2]])
+    params = [
+        MultimodalParams(
+            multimodal_data={
+                "image": {
+                    "pixel_values": raw,
+                    "image_grid_thw": grid,
+                    "vision_normalization": spec,
+                },
+                "video": {"pixel_values_videos": expected_video, "video_grid_thw": grid},
+            }
+        ),
+        MultimodalParams(
+            multimodal_data={
+                "image": {"pixel_values": expected, "image_grid_thw": grid},
+                "video": {
+                    "pixel_values_videos": raw_video,
+                    "video_grid_thw": grid,
+                    "vision_normalization": video_spec,
+                },
+            }
+        ),
+    ]
+    batched = modeling_qwen3vl._qwen3vl_build_batched_input(params)
+    assert batched["pixel_values"].dtype == dtype
+    assert torch.equal(
+        batched["pixel_values"], torch.cat([expected, expected, expected_video, expected_video])
+    )
+    assert torch.equal(batched["grid_thw"], grid.repeat(4, 1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_normalization_does_not_compile_after_startup(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype
+) -> None:
+    model = _metadata_fixture(dtype, torch.device("cuda"))
+    model.model_config = SimpleNamespace(
+        multimodal_config=MultimodalConfig(vision_gpu_normalize=True)
+    )
+    modeling_qwen3vl.Qwen3VisionModel.setup_attn_metadata(model, 16, {"attention": 4})
+
+    def unexpected_compile(*args, **kwargs) -> None:
+        pytest.fail("Raw-pixel normalization compiled after encoder startup")
+
+    monkeypatch.setattr(
+        modeling_multimodal_utils._normalize_vision_pixels_kernel, "_do_compile", unexpected_compile
+    )
+    for count in (256, 1536, 4096 * 1536):
+        pixels = torch.arange(count, device="cuda", dtype=torch.int32).to(torch.uint8)
+        spec = VisionNormalization(1 / 255, (0.5,), (0.5,), dtype)
+        expected = ((pixels.cpu().float() - 127.5) / 127.5).to(dtype)
+        assert torch.equal(
+            normalize_vision_pixels(pixels.view(1, 1, -1), spec).view(pixels.shape).cpu(),
+            expected,
+        )
+
+
+def _normalization_transport_spec():
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    return vision_normalization_from_processor(
+        [Image.new("RGB", (16, 16))],
+        Qwen2VLImageProcessor(image_mean=[0.25, 0.5, 0.75], image_std=[0.5] * 3),
+        torch.bfloat16,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("declared", [False, True])
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_normalization_transport_item_selection(declared: bool, modality: str) -> None:
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalItemPartition,
+    )
+
+    spec = _normalization_transport_spec()
+    pixel_key, grid_key = (
+        ("pixel_values", "image_grid_thw")
+        if modality == "image"
+        else ("pixel_values_videos", "video_grid_thw")
+    )
+    count = len(spec)
+    pixels = torch.arange(count * 3, dtype=torch.uint8).view(count, 3)
+    # Matching the tuple's field count must not turn shared metadata into item data.
+    param = MultimodalParams(
+        multimodal_data={
+            modality: {
+                pixel_key: pixels,
+                grid_key: torch.ones(count, 3, dtype=torch.int64),
+                "vision_normalization": spec,
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [(modality, i) for i in range(count)],
+                output_embedding_lengths=[1] * count,
+                input_partitions={
+                    modality: {
+                        pixel_key: MultimodalItemPartition(),
+                        grid_key: MultimodalItemPartition(),
+                    }
+                },
+            ),
+        }
+    )
+    copied_spec = copy.deepcopy(param).multimodal_data[modality]["vision_normalization"]
+    assert type(copied_spec) is type(spec) and copied_spec == spec
+    model = MultimodalModelMixin()
+    if not declared:
+        model.get_multimodal_item_partitions = lambda param, modality: None
+    selected, lengths, selected_modality = model.prepare_multimodal_encoder_inputs(
+        [(param, 3), (param, 1)]
+    )[0]
+    assert selected_modality == modality and lengths == (1, 1)
+    assert selected.multimodal_data[modality]["vision_normalization"] is spec
+    assert torch.equal(selected.multimodal_data[modality][pixel_key], pixels[[3, 1]])
+    assert param.multimodal_data[modality]["vision_normalization"] is spec
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target_keywords", [None, ["image"], ["image.vision_normalization"]])
+def test_normalization_transport_device(target_keywords) -> None:
+    from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
+
+    spec = _normalization_transport_spec()
+    pixels = torch.arange(12, dtype=torch.uint8)
+    param = MultimodalParams(
+        multimodal_data={"image": {"pixel_values": pixels, "vision_normalization": spec}}
+    )
+    # Exercise the CUDA dispatch without allocating a GPU or replacing metadata.
+    with patch.object(torch.Tensor, "to", autospec=True, return_value=pixels) as move:
+        param.to_device("multimodal_data", "cuda", target_keywords=target_keywords)
+    assert move.call_count == (0 if target_keywords == ["image.vision_normalization"] else 1)
+    assert param.multimodal_data["image"]["vision_normalization"] is spec
+    param.to_device("multimodal_data", "cpu")
+    assert param.multimodal_data["image"]["vision_normalization"] is spec
+    with nccl_window_tensor_scope([param]) as scope:
+        assert scope.escape(param) is param
+    assert param.multimodal_data["image"]["vision_normalization"] is spec
+
+
+def _normalization_transport_process(connection, payload) -> None:
+    import pickle
+
+    request = pickle.loads(payload)
+    request.multimodal_params.to_tensor("multimodal_data")
+    data = request.multimodal_params.multimodal_data["image"]
+    normalized = normalize_vision_pixels(
+        data["pixel_values"].reshape(3, -1), data["vision_normalization"]
+    )
+    connection.send(
+        (data["vision_normalization"], data["pixel_values"].tolist(), normalized.tolist())
+    )
+    connection.close()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("producer_dtype", [torch.float32, torch.float64])
+def test_normalization_transport_shared_handles_and_process(producer_dtype) -> None:
+    import multiprocessing
+    import pickle
+
+    from tensorrt_llm.executor.ipc import ZeroMqQueue
+    from tensorrt_llm.executor.request import GenerationRequest
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(producer_dtype)
+        spec = _normalization_transport_spec()
+        assert spec.compute_dtype == producer_dtype
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    pixels = torch.arange(12, dtype=torch.uint8)
+    params = MultimodalParams(
+        multimodal_data={"image": {"pixel_values": pixels, "vision_normalization": spec}}
+    )
+    params.to_handle("multimodal_data")
+    assert params.multimodal_data["image"]["vision_normalization"] is spec
+    assert isinstance(params.multimodal_data["image"]["pixel_values"], dict)
+    request = GenerationRequest([1, 2], SamplingParams(), multimodal_params=params)
+    # Use the IPC wire serializer without opening sockets.
+    queue = ZeroMqQueue.__new__(ZeroMqQueue)
+    queue.socket = queue.context = None
+    queue.use_hmac_encryption = True
+    queue.hmac_key = b"normalization-transport-test"
+    wire = queue._prepare_data(request)
+    restored = queue._parse_data(wire)
+    restored_spec = restored.multimodal_params.multimodal_data["image"]["vision_normalization"]
+    assert type(restored_spec) is type(spec) and restored_spec == spec
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe(duplex=False)
+    process = ctx.Process(
+        target=_normalization_transport_process, args=(child, pickle.dumps(restored))
+    )
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(60), "Multimodal transport child did not respond"
+        received_spec, received_pixels, received_normalized = parent.recv()
+        process.join(60)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        parent.close()
+    assert type(received_spec) is type(spec) and received_spec == spec
+    assert received_pixels == pixels.tolist()
+    assert received_normalized == normalize_vision_pixels(pixels.reshape(3, -1), spec).tolist()
+    unused = MultimodalParams(
+        multimodal_data={"image": {"pixel_values": pixels, "vision_normalization": spec}}
+    )
+    unused.to_handle("multimodal_data")
+    unused.release_handles()
+    assert unused.multimodal_data["image"]["vision_normalization"] is spec
+
+
+@pytest.mark.cpu_only
+def test_normalization_transport_partial_encoder_cache() -> None:
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+    from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalItemPartition,
+    )
+
+    spec = _normalization_transport_spec()
+    params = MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.arange(6, dtype=torch.uint8).view(2, 3),
+                "vision_normalization": spec,
+            },
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0), ("image", 1)],
+                output_embedding_lengths=[1, 1],
+                input_partitions={"image": {"pixel_values": MultimodalItemPartition()}},
+            ),
+        }
+    )
+    model = MultimodalModelMixin()
+    cache = TensorLRUCache(64)
+    cache.put("hit", torch.ones(1, 2))
+    partition = model.partition_encoder_cache(params, cache, keys=["hit", "miss"])
+    assert partition.miss_indices == [1]
+
+    def encode(residuals):
+        assert len(residuals) == 1
+        image = residuals[0].multimodal_data["image"]
+        assert image["vision_normalization"] is spec
+        assert image["pixel_values"].tolist() == [[3, 4, 5]]
+        return torch.full((1, 2), 2.0)
+
+    model.encode_multimodal_inputs = encode
+    model._encode_with_partial_cache([(params, partition)], cache)
+    assert params.multimodal_data["image"]["vision_normalization"] is spec
+    assert torch.equal(
+        params.multimodal_data["multimodal_embedding"], torch.tensor([[1.0, 1.0], [2.0, 2.0]])
+    )
+    assert torch.equal(cache.get("miss"), torch.full((1, 2), 2.0))
+    encoder = MagicMock(side_effect=AssertionError("Request-local cached output must be reused"))
+    attached = modeling_multimodal_utils.get_multimodal_embeddings(encoder, [params])
+    encoder.assert_not_called()
+    assert torch.equal(attached[0], params.multimodal_data["multimodal_embedding"])
+    assert params.multimodal_data["image"]["vision_normalization"] is spec

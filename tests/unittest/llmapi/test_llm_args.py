@@ -1815,6 +1815,7 @@ class TestMultimodalEncoderCudaGraphConfig:
 class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
+        assert MultimodalConfig().vision_gpu_normalize is False
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
@@ -1824,11 +1825,58 @@ class TestMultimodalConfig:
     def test_torch_llm_args_default_multimodal_config(self):
         args = TorchLlmArgs(model=llama_model_path)
         assert isinstance(args.multimodal_config, MultimodalConfig)
+        assert args.multimodal_config.vision_gpu_normalize is False
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_vision_gpu_normalize_yaml(self, enabled: bool):
+        config = yaml.safe_load(
+            f"multimodal_config:\n  vision_gpu_normalize: {str(enabled).lower()}\n"
+        )
+        args = TorchLlmArgs(model=llama_model_path, **config)
+        assert args.multimodal_config.vision_gpu_normalize is enabled
+        dumped = args.multimodal_config.model_dump()
+        assert dumped["vision_gpu_normalize"] is enabled
+
+    @pytest.mark.parametrize("value", [None, "invalid", 2, [], {}])
+    def test_vision_gpu_normalize_rejects_invalid_values(self, value):
+        with pytest.raises(ValidationError):
+            MultimodalConfig(vision_gpu_normalize=value)
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("encoder_only", [False, True])
+    def test_vision_gpu_normalize_reaches_input_processor(
+            self, enabled: bool, encoder_only: bool):
+        from tensorrt_llm.llmapi.llm import BaseLLM
+
+        cls = public_llmapi.MultimodalEncoder if encoder_only else TorchLLM
+        llm = cls.__new__(cls)
+        llm.shutdown = lambda: None
+        llm.args = SimpleNamespace(
+            multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled),
+            trust_remote_code=True,
+            enable_tokenization_cache=False,
+        )
+        llm._hf_model_dir = "unused"
+        for method in ("_try_load_tokenizer", "_try_load_hf_model_config",
+                       "_capture_usage_startup",
+                       "_reject_token_encoder_config_without_buckets",
+                       "_try_load_generation_config",
+                       "_try_load_generation_config_explicit_values"):
+            setattr(llm, method, lambda *args, **kwargs: None)
+        module = "mm_encoder" if encoder_only else "llm"
+        with patch.object(BaseLLM, "_build_model"), patch(
+                f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                side_effect=ValueError("input processor boundary")) as factory:
+            with pytest.raises(ValueError, match="input processor boundary"):
+                llm._build_model()
+        kwargs = factory.call_args.kwargs
+        assert kwargs.get("vision_gpu_normalize", False) is enabled
+        assert ("vision_gpu_normalize" in kwargs) is enabled
 
     def test_disable_mm_encoder_disables_encoder_cache(self):
         multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
