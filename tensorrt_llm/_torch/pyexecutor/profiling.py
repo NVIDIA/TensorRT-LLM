@@ -113,13 +113,13 @@ class PyExecutorProfileManager:
     code they replace; see the per-method docstrings for details.
     """
 
-    def __init__(self, executor: "PyExecutor") -> None:  # noqa: F821
+    def __init__(self, executor: "PyExecutor") -> None:  # type: ignore[name-defined]  # noqa: F821
         self._executor_ref = weakref.ref(executor)
 
     # ---- helpers ---------------------------------------------------
 
     @property
-    def _executor(self) -> "PyExecutor":  # noqa: F821
+    def _executor(self) -> "PyExecutor":  # type: ignore[name-defined]  # noqa: F821
         ex = self._executor_ref()
         if ex is None:
             raise RuntimeError(

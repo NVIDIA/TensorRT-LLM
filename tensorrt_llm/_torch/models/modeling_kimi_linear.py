@@ -3629,7 +3629,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                             return None
                         return handles[weight_map[source_key]].get_tensor(source_key)
 
-                    load_expert(*job, get_tensor, get_optional_tensor)
+                    load_expert(*job, get_tensor, get_optional_tensor)  # type: ignore[call-arg]
                 for file_name in files:
                     drop_file_pages(file_name)
 

@@ -1027,7 +1027,10 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         # tokenizer by this result's creator; None when unconfigured.
         self._post_processor_hook = post_processor_hook
 
-    def _handle_response(self, response: "GenerationExecutor.Response"):
+    def _handle_response(
+            self,
+            response: "GenerationExecutor.Response",  # type: ignore[name-defined]
+    ):
         GenerationResultBase._handle_response(self, response)
 
         # The postprocess has been performed, return directly

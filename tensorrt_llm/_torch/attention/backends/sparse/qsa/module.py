@@ -630,7 +630,7 @@ class QSASparseHooks(AttentionSparseHooks):
             )
 
         if attn_metadata.num_contexts == 0:
-            index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
+            index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)  # type: ignore[call-arg]
             if index_cache is None:
                 raise RuntimeError(
                     f"QSA index cache is unavailable for layer {attention.layer_idx}"
@@ -692,7 +692,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 output = attention.apply_output_gate(output, output_gate)
             return output
 
-        index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
+        index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)  # type: ignore[call-arg]
         if index_cache is None:
             raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")
         sequence_lengths = attn_metadata.qsa_sequence_lengths[:num_tokens]

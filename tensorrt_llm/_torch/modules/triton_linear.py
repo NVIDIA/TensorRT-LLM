@@ -74,7 +74,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
                                       weights: List[Dict]):
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights, **self.param_transform)
-        fused_weight = torch.cat(
+        fused_weight = torch.cat(  # type: ignore[call-arg]
             (q_weight, k_weight, v_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
@@ -84,7 +84,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
                                           weights: List[Dict]):
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights, **self.param_transform)
-        fused_weight = torch.cat(
+        fused_weight = torch.cat(  # type: ignore[call-arg]
             (gate_weight, up_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)

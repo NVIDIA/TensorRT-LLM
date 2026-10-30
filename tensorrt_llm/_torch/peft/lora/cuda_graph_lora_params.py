@@ -78,7 +78,7 @@ class CudaGraphLoraParams:
         self.device = device
         self.max_tokens_per_seq = max_tokens_per_seq
 
-        self.layer_params: Dict[self.LoraLayerKey, LoraLayerParams] = dict()
+        self.layer_params: Dict[self.LoraLayerKey, LoraLayerParams] = dict()  # type: ignore[name-defined]
 
         # sorted indices using token ids as keys, grouping tokens by their slot id.
         # For spec decode with tokens_per_seq > 1, this is per-token (size =

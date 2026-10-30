@@ -510,7 +510,7 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
             if attention_metadata_capacity is not None
             else self.get_encoder_attention_metadata_capacity(max_num_tokens)
         )
-        self.attn_metadata = self.metadata_cls(
+        self.attn_metadata = self.metadata_cls(  # type: ignore[call-arg]
             max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
@@ -614,7 +614,7 @@ class _Glm5NextVisionGraphMetadataProvider(EncoderMetadataProvider[AttentionMeta
 
     def build(self, key: EncoderGraphKey) -> AttentionMetadata:
         vit = self._vit
-        metadata = vit.metadata_cls(
+        metadata = vit.metadata_cls(  # type: ignore[call-arg]
             max_num_requests=key.num_contexts,
             max_num_tokens=key.total_tokens,
             kv_cache_manager=None,

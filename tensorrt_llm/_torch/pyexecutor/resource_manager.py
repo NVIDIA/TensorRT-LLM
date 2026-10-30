@@ -242,7 +242,7 @@ class BaseResourceManager(ABC):
         """
         return False
 
-    def add_dummy_requests(self, request_ids: List[int]):
+    def add_dummy_requests(self, request_ids: List[int], **kwargs):
         pass
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -3271,9 +3271,10 @@ class ResourceManager:
                 if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
                     if skip_kv_cache_manager:
                         continue
-                    resource_manager.update_resources(scheduled_batch,
-                                                      attn_metadata,
-                                                      kv_cache_dtype_byte_size)
+                    resource_manager.update_resources(
+                        scheduled_batch,  # type: ignore[call-arg]
+                        attn_metadata,
+                        kv_cache_dtype_byte_size)
                 else:
                     resource_manager.update_resources(scheduled_batch)
 

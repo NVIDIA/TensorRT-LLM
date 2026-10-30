@@ -1623,3 +1623,12 @@ repos:
         # the sampler source/test dirs.
         pass_filenames: false
         files: ^(tensorrt_llm/_torch/pyexecutor/sampler/|tests/unittest/_torch/sampler/)
+    -   id:  type-check-broad
+        name: Run mypy on tensorrt_llm for selected error codes
+        entry: scripts/run_mypy_broad.sh
+        language: script
+        verbose: true
+        # Checks all of tensorrt_llm/ (see mypy_broad.toml), so no
+        # file arguments are passed.
+        pass_filenames: false
+        files: ^tensorrt_llm/.*\.py$

@@ -932,7 +932,7 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             if attention_metadata_capacity is not None
             else self.get_encoder_attention_metadata_capacity(max_num_tokens)
         )
-        self.attn_metadata = self.metadata_cls(
+        self.attn_metadata = self.metadata_cls(  # type: ignore[call-arg]
             max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,

@@ -323,7 +323,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         with torch.cuda.device(q.device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Prepare and warm CSA2 metadata before CUDA Graph capture")
-            metadata = cls(
+            metadata = cls(  # type: ignore[call-arg]
                 max_num_requests=len(context_lengths) if context_lengths else count,
                 max_num_tokens=count,
             )

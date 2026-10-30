@@ -187,7 +187,7 @@ class EncoderConfig(RunnerConfig):
             if feature_shape is not None
             else (filtered_num_tokens[-1] if filtered_num_tokens else 0)
         )
-        return cls(
+        return cls(  # type: ignore[call-arg]
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             max_seq_len=max_seq_len,

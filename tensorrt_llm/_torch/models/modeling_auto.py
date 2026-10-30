@@ -75,6 +75,6 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             config._frozen = True
         extra_attrs = config.extra_attrs
         with model_extra_attrs(extra_attrs):
-            model = cls(config)
+            model = cls(config)  # type: ignore[call-arg]
         model.extra_attrs = extra_attrs
         return model

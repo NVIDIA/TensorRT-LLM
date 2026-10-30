@@ -491,10 +491,10 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def setup(self) -> None:
         # Build the request-sending clients from the coordinator's routers and share
         # them with the coordinator service so its readiness checks use the same pool.
-        self._ctx_client = self._client_factory(
+        self._ctx_client = self._client_factory(  # type: ignore[call-arg]
             self._ctx_router, ServerRole.CONTEXT, self._config.max_retries
         )
-        self._gen_client = self._client_factory(
+        self._gen_client = self._client_factory(  # type: ignore[call-arg]
             self._gen_router, ServerRole.GENERATION, self._config.max_retries
         )
         if hasattr(self._coordinator, "set_clients"):

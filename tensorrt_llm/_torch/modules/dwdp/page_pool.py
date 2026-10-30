@@ -368,7 +368,7 @@ class PagePool:
 
 
 def compute_slot_sizes(
-    layouts: dict[int, dict[str, "PageAlignedLayout"]],  # noqa: F821
+    layouts: dict[int, dict[str, "PageAlignedLayout"]],  # type: ignore[name-defined]  # noqa: F821
     buffer_slot_assignments: dict[int, int],
     num_slots: int,
 ) -> List[int]:

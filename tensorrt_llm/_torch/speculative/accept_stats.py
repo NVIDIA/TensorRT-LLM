@@ -87,7 +87,7 @@ def _resolve_default_confidence_provider() -> Optional[ConfidenceProvider]:
     without it (this MR alone) calibration rows are simply not collected.
     """
     try:
-        from .dspark_confidence import dspark_confidence_provider
+        from .dspark_confidence import dspark_confidence_provider  # type: ignore[import-not-found]
     except ImportError:
         return None
     return dspark_confidence_provider
