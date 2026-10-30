@@ -212,13 +212,17 @@ def _access_settled(driver: StoreDriver, op: OpHandle, timeout: float) -> bool:
 def _refuses_stray(
     h: Harness, direction: str, start: Callable[[], OpHandle], stray: Memory
 ) -> None:
-    """``start`` submits a row with a span in no registration; the driver must refuse it. One that
-    takes it may touch the stray span for as long as the operation runs, and no endpoint retains
-    that memory, so it is kept alive before the check fails."""
+    """``start`` submits a row with a span in no registration; the driver must refuse it with
+    ``DriverRejected``, the one raise that certifies nothing escaped. One that takes the row, or
+    raises anything else, may touch the stray span for as long as the operation runs, and no
+    endpoint retains that memory, so it is kept alive before the check fails."""
     try:
         start()
     except DriverRejected:
         return
+    except BaseException:
+        UNRELEASED_MEMORY.append(stray)
+        raise
     UNRELEASED_MEMORY.append(stray)
     pytest.fail(f"{direction} took a row with a span in no registration")
 

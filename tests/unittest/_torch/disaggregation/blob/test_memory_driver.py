@@ -1519,6 +1519,20 @@ class _TakesStraySpansAndNeverProvesItsEnd(MemoryDriver):
             self.mark_unprovable(op)
 
 
+class _RaisesOnAStraySpan(_TakesStraySpansAndNeverProvesItsEnd):
+    """Lets a raise that is not ``DriverRejected`` out of a put or get of a row with a span in no
+    registration, after the operation was recorded: the memory may be in use all the same."""
+
+    def _execute(self, op: MemoryOp) -> None:
+        super()._execute(op)
+        if op.unprovable:
+            raise RuntimeError("the binding failed with the row in flight")
+
+
+@pytest.mark.parametrize(
+    ("driver_cls", "outcome"),
+    [(_TakesStraySpansAndNeverProvesItsEnd, CHECK_FAILED), (_RaisesOnAStraySpan, RuntimeError)],
+)
 @pytest.mark.parametrize(
     "check",
     [
@@ -1526,12 +1540,17 @@ class _TakesStraySpansAndNeverProvesItsEnd(MemoryDriver):
         "test_every_span_of_a_row_is_checked_against_the_registrations",
     ],
 )
-def test_a_stray_span_a_driver_took_is_retained_when_its_rejection_check_fails(check: str) -> None:
-    """The check fails, and the stray memory the operation may still touch is kept alive, as the
-    endpoints of an unprovable operation are."""
-    suite = _conformance(_TakesStraySpansAndNeverProvesItsEnd, DEFAULT_CAPABILITIES)
+def test_a_stray_span_a_driver_took_is_retained_when_its_rejection_check_fails(
+    check: str,
+    driver_cls: type[MemoryDriver],
+    outcome: type[BaseException] | tuple[type[BaseException], ...],
+) -> None:
+    """A driver that took the row fails the check; one that raised something other than
+    ``DriverRejected`` lets that raise through. Either way the stray memory the operation may
+    still touch is kept alive, as the endpoints of an unprovable operation are."""
+    suite = _conformance(driver_cls, DEFAULT_CAPABILITIES)
     retained = len(UNRELEASED_MEMORY)
-    with pytest.raises(CHECK_FAILED):
+    with pytest.raises(outcome):
         _run_check(suite, check)
     assert len(UNRELEASED_MEMORY) == retained + 1
 
