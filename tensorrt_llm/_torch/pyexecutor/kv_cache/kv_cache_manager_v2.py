@@ -1816,6 +1816,12 @@ class KVCacheManagerV2(BaseResourceManager):
     # need snapshotted (request_prefix_snapshot); kept apart from the request's
     # own expect_snapshot_points, which other code rewrites. Created on first use.
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
+    # Declared on the class so managers built without __init__ have no layer specs.
+    layer_specs: Optional[Tuple["KVCacheLayerSpec", ...]] = None
+    # A subclass whose extra buffers may join explicit layer specs (draft layers then get their own lifecycle).
+    hosts_unified_draft_layers: bool = False
+    # Layer specs coalesce NVFP4 data and scales apart; a subclass addressing its pools by size opts out.
+    _separate_nvfp4_coalescing: bool = True
 
     def __init__(
         self,
@@ -1861,6 +1867,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if (
             self.layer_specs is not None
             and type(self)._extra_buffers_per_layer is not KVCacheManagerV2._extra_buffers_per_layer
+            and not self.hosts_unified_draft_layers
         ):
             raise ValueError(
                 f"{type(self).__name__} does not support layer_specs with "
@@ -3729,8 +3736,13 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
 
+        initial_pool_ratio = kv_cache_config.pool_ratio
         if self.layer_specs is not None:
             scale_roles = (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
+            # Subclass buffers beyond K/V/scales (e.g. MiniMax-M3's index-K) follow the spec-built ones.
+            extra_buffers_per_layer = (
+                self._extra_buffers_per_layer(tokens_per_block=tokens_per_block) or {}
+            )
             layer_configs = [
                 AttentionLayerConfig(
                     layer_id=LayerId(local_layer_id),
@@ -3741,18 +3753,41 @@ class KVCacheManagerV2(BaseResourceManager):
                             # Keep NVFP4 data (1), its scales (2), and other data (0)
                             # separate while preserving matching K/V page order.
                             coalescing_group=(
-                                1 + int(role in scale_roles) if layer.dtype == DataType.NVFP4 else 0
+                                1 + int(role in scale_roles)
+                                if layer.dtype == DataType.NVFP4 and self._separate_nvfp4_coalescing
+                                else 0
                             ),
                         )
                         for role in (Role.KEY, Role.VALUE, *scale_roles)
                         if role in layer.buffer_roles
-                    ],
+                    ]
+                    + list(extra_buffers_per_layer.get(local_layer_id, ())),
                     sliding_window_size=self.max_attention_window_vec[local_layer_id],
                     num_sink_tokens=layer.num_sink_tokens,
                     reuse_policy=layer.reuse_policy,
                 )
                 for local_layer_id, layer in enumerate(self.layer_specs)
             ]
+            if initial_pool_ratio is None and typical_step is None:
+                initial_pool_ratio = self._windowed_draft_pool_ratio(
+                    layer_configs,
+                    cache_tiers[0].quota,
+                    tokens_per_block,
+                    kv_cache_config.max_util_for_resume,
+                )
+                if initial_pool_ratio is not None:
+                    # Allocation rounds the ratio's byte target; this floor keeps one fresh
+                    # context chunk admissible in every lifecycle.
+                    constraints.append(
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                    history_length=0,
+                                )
+                            ]
+                        )
+                    )
         else:
             # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
             # per-layer BufferConfig entries — for example a sparse index-K
@@ -3827,7 +3862,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache_config.enable_block_reuse
                 and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
             ),
-            initial_pool_ratio=kv_cache_config.pool_ratio,
+            initial_pool_ratio=initial_pool_ratio,
             pool_rebalance=PoolRebalanceConfig(
                 min_sampled_kv_caches=rebalance_cfg.min_sampled_kv_caches,
                 cooldown_secs=rebalance_cfg.cooldown_secs,
@@ -3890,6 +3925,85 @@ class KVCacheManagerV2(BaseResourceManager):
             "The GPU cache quota cannot accommodate native pools and "
             f"external cache storage ({external_bytes} bytes)."
         )
+
+    def _windowed_draft_pool_ratio(
+        self,
+        layer_configs: List[AttentionLayerConfig],
+        gpu_quota: int,
+        tokens_per_block: int,
+        max_util_for_resume: float = 1.0,
+    ) -> Optional[List[float]]:
+        """Hot-tier ``[target, draft]`` byte ratios when the draft layers form one windowed lifecycle.
+
+        Without a pool ratio or typical step the backend splits the hot tier for one 2048-token
+        request, which says nothing about how many sequences hold a draft window at once. The
+        draft layers need every admissible sequence's window plus one context chunk, which is
+        what the KV cache cost already charges for them, over the resume watermark and capped
+        at an equal-token share.
+        """
+        if self.max_num_tokens is None or gpu_quota <= 0:
+            # Without a context-chunk bound or a quota the backend's split is the safe one.
+            return None
+        owners = [spec.owner for spec in self.layer_specs]
+        # Key layers as the backend groups them into lifecycles (sinks count in whole blocks).
+        life_cycles = [
+            AttnLifeCycle.make(
+                c.sliding_window_size, c.num_sink_tokens, tokens_per_block, c.reuse_policy
+            )
+            for c in layer_configs
+        ]
+        keys = [(lc.window_size, lc.num_sink_blocks, lc.reuse_policy) for lc in life_cycles]
+        target_keys = {key for key, owner in zip(keys, owners) if owner is KVCacheLayerOwner.TARGET}
+        draft_keys = {key for key, owner in zip(keys, owners) if owner is KVCacheLayerOwner.DRAFT}
+        # Lifecycle ids follow first appearance, so the target's must come first.
+        if (
+            len(target_keys) != 1
+            or len(draft_keys) != 1
+            or target_keys == draft_keys
+            or not next(iter(draft_keys))[0]
+            or owners[0] is not KVCacheLayerOwner.TARGET
+        ):
+            return None
+        draft_specs = [spec for spec in self.layer_specs if spec.owner is KVCacheLayerOwner.DRAFT]
+        draft_sizes = [spec.bytes_per_token() for spec in draft_specs]
+        _, window_bytes_per_sequence = _estimate_swa_cache_size(
+            draft_sizes,
+            [next(iter(draft_keys))[0]] * len(draft_specs),
+            tokens_per_block,
+            context=False,
+            scratch=False,
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            layer_specs=draft_specs,
+        )
+        # Sequences that can hold KV at once (see max_admissible_sequences), counting the overlap
+        # scheduler's retiring request: the pool is sized before the scheduler mode is known.
+        num_sequences = (
+            self.max_batch_size
+            * self.mapping.pp_size
+            * (2 if self.is_disagg or not self.mapping.has_pp() else 1)
+        )
+        draft_bytes = (
+            window_bytes_per_sequence * num_sequences + sum(draft_sizes) * self.max_num_tokens
+        ) / max_util_for_resume
+        bytes_per_block = {KVCacheLayerOwner.TARGET: 0, KVCacheLayerOwner.DRAFT: 0}
+        for config, owner in zip(layer_configs, owners):
+            bytes_per_block[owner] += sum(buffer.size for buffer in config.buffers)
+        # The context-chunk floor declared with this ratio: every lifecycle holds one fresh chunk
+        # below the resume watermark, each pool rounded to the allocation granularity (bounded
+        # here per buffer). Without room for it the backend keeps its own split.
+        chunk_blocks = -(-(self.max_num_tokens + self.num_extra_kv_tokens) // tokens_per_block)
+        floor_slots = math.ceil(chunk_blocks / float(np.float32(max_util_for_resume)))
+        granularity = _gpu_alloc_granularity(gpu_quota)
+        floor_bytes = sum(
+            -(-floor_slots * buffer.size // granularity) * granularity
+            for config in layer_configs
+            for buffer in config.buffers
+        )
+        if floor_bytes > gpu_quota:
+            return None
+        token_share = bytes_per_block[KVCacheLayerOwner.DRAFT] / sum(bytes_per_block.values())
+        draft_ratio = min(draft_bytes / gpu_quota, token_share)
+        return [1.0 - draft_ratio, draft_ratio]
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
