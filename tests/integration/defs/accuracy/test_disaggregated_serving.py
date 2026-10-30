@@ -37,7 +37,6 @@ import yaml
 from datasets import load_dataset
 from defs.common import wait_for_reported_addr
 
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
@@ -46,9 +45,9 @@ from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
-                        skip_pre_hopper)
+from ..conftest import (get_device_count, get_sm_version, llm_models_root,
+                        parametrize_with_ids, skip_no_hopper, skip_no_rubin,
+                        skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
                             LlmapiAccuracyTestHarness,
