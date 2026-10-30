@@ -41,9 +41,62 @@ QWEN38_GEOMETRY = (16, 48, 128, 128)
 ENGINE_SLOTS = 461
 
 
+#: A tp4/tep4 rank's Gated DeltaNet: tp1's 16 key / 48 value heads split four ways, the
+#: key-to-value head ratio (3) unchanged. A dep4 rank keeps `QWEN38_GEOMETRY`.
+RANK4_GEOMETRY = (4, 12, 128, 128)
+#: Per-rank recurrent-pool slot counts at core's config (bf16 KV and state, KV fraction
+#: 0.6, `max_batch_size` 128, `max_seq_len` 9216, TRTLLM MoE): the stock engine's
+#: `Qwen4ExpHybridCacheManager` on this checkpoint, read off its "PLE state views bound"
+#: log line (the PLE and GDN pools share one slot space) with the n-gram table
+#: host-resident, the same count on all four ranks. The V2 manager sizes the pool from the
+#: rank's memory budget, not from `max_batch_size`; a dep4 rank keeps every GDN head, so
+#: it holds fewer slots than a tep4 rank.
+TEP4_SLOTS = 1874
+DEP4_SLOTS = 850
+#: No engine has run tp4 (the stock MoE refuses its 160-row expert slice). A tp4 rank's
+#: GDN state per slot is a tep4 rank's, so tep4's count stands in for it.
+TP4_SLOTS = TEP4_SLOTS
+#: GDN layers whose states share one slot page in the stock manager (48 layers, every
+#: 4th full attention): the pool one layer receives is a view whose slot stride is 36
+#: `[HV, V, K]` states, so a tep4 rank's last slot starts 1.3e10 elements past the base.
+PAGE_LAYERS = 36
+
+
 def _engine_slots(num_seqs: int) -> tuple[int, ...]:
     """`num_seqs` distinct slots of the engine pool, slot 0 and the last live."""
     return ((0, ENGINE_SLOTS - 1) + tuple(i * 13 + 4 for i in range(num_seqs)))[:num_seqs]
+
+
+def _rank_slots(num_seqs: int, slots: int) -> tuple[int, ...]:
+    """`num_seqs` distinct slots of a `slots`-slot pool: the last and the first, then a
+    stride-37 walk over the interior (37 is coprime to 1874 - 2 and 850 - 2)."""
+    rest = tuple((i * 37 + 4) % (slots - 2) + 1 for i in range(max(num_seqs - 2, 0)))
+    picked = ((slots - 1, 0) + rest)[:num_seqs]
+    assert len(set(picked)) == num_seqs
+    return picked
+
+
+def _rank_cell(why: str, geometry, seqlens, slots: int, initial, fi_path: str) -> Cell:
+    """The target's call (`PrefillTarget._gdn_core`) at one rank's pool: the stock
+    manager's bf16 state page at the member's slot count, the layer's view of it, a
+    prefix view of a wider output buffer, `has_initial_state`, `linear_gate`. `fi_path` is
+    the FlashInfer kernel the call reaches on sm_103: `cp` (the context-parallel pipeline)
+    or `chunked`."""
+    return Cell(
+        why=why,
+        spec=dict(
+            geometry=geometry,
+            seqlens=seqlens,
+            slots=slots,
+            page_layers=PAGE_LAYERS,
+            indices=_rank_slots(len(seqlens), slots),
+            pool_dtype=torch.bfloat16,
+            output="slice",
+            initial=initial,
+            linear_gate=True,
+            fi_path=fi_path,
+        ),
+    )
 
 
 #: Elements of a `[V, K]` state plane a gather program copies.
@@ -172,8 +225,10 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: geometry (H, HV, K, V); seqlens; `slots`-row pool with `indices`
-    # (or _engine_slots); pool_dtype (fp32); output (None | "buffer"). Every cell is
-    # qwen3.8-flash-next-nvfp4's geometry, in place.
+    # (or _engine_slots); pool_dtype (fp32); output (None | "buffer" | "slice", a prefix
+    # view of a wider buffer); page_layers (the pool is the layer's view of the stock
+    # manager's state page, that many GDN states a slot); fi_path (the FlashInfer kernel
+    # reached). Every cell is in place: tp1's at 16/48, then one rank's of tp4/tep4/dep4.
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"qwen3.8 prefill into output=, 461-slot pool, seqlens {list(s)}",
@@ -219,7 +274,28 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
                 linear_gate=True,
             ),
         ),
-    )
+    ) + (
+        _rank_cell(
+            "tep4 4/12, fresh 8192-token prompt, CP path, 1874-slot bf16 page",
+            RANK4_GEOMETRY, (8192,), TEP4_SLOTS, (False,), "cp",
+        ),
+        _rank_cell(
+            "tep4 4/12, [200, 37, 91] carried/fresh/carried, CP path, 1874 slots",
+            RANK4_GEOMETRY, (200, 37, 91), TEP4_SLOTS, (True, False, True), "cp",
+        ),
+        _rank_cell(
+            "tp4 4/12, carried 8192-token chunk, CP path, 1874-slot bf16 page",
+            RANK4_GEOMETRY, (8192,), TP4_SLOTS, (True,), "cp",
+        ),
+        _rank_cell(
+            "dep4 16/48, carried 512-token prompt, 850-slot bf16 page",
+            QWEN38_GEOMETRY, (512,), DEP4_SLOTS, (True,), "chunked",
+        ),
+        _rank_cell(
+            "tep4 4/12 envelope, 8192 rows over 128 seqs of 63/65, chunked path",
+            RANK4_GEOMETRY, (63, 65) * 64, TEP4_SLOTS, (True, False) * 64, "chunked",
+        ),
+    )  # fmt: skip
 
     note = """
     Metadata consumed: none.
@@ -254,16 +330,48 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     ragged context rows, and the target's call (300 + 1024 + 500 tokens,
     the middle one fresh, `has_initial_state`, `linear_gate`, `output=`).
 
+    Certified per rank, as `PrefillTarget._gdn_core` calls it (bf16 pool,
+    `has_initial_state`, `linear_gate`, `output=` a prefix view of a wider
+    buffer whose tail stays untouched). The pool is the layer's view of the
+    stock manager's state page (`PAGE_LAYERS` states a slot), at the
+    member's slot count:
+      tp4/tep4 (`RANK4_GEOMETRY`, 4 k / 12 v heads), 1874 slots: one fresh
+        8192-token prompt, a carried 8192-token chunk, [200, 37, 91]
+        carried/fresh/carried, and 8192 rows over 128 sequences of 63/65
+        tokens (the envelope: max_num_tokens over max_batch_size).
+      dep4 (16 / 48), 850 slots: a carried 512-token prompt.
+    The last slot is named at every one: offsets of 1.3e10 (tep4) and
+    2.4e10 (dep4) elements, past int32; the gather and the scatter index the
+    slot in int64.
+
+    FlashInfer picks its kernel by `num_seqs x num_v_heads`: on sm_10x the
+    context-parallel pipeline (`cp_delta_rule_dsl_sm100`: t precompute, mn
+    precompute, fixup, prefill) when that times 4 is below the SM count
+    (`should_use_cp_host`), else the chunked kernel. GB300 has 152 SMs, so a
+    tp4/tep4 rank (12 v heads) runs CP for 1 to 3 context sequences and the
+    chunked kernel from 4; a dep4 rank (48) and tp1 always run the chunked
+    one. Both paths take the bf16 packed state. The cells hold the path
+    they reach (`fi_path`), and a CP fallback warning fails them.
+
+    Measured per cell against the fp64 reference (bf16 pool): o rel-L2
+    3.74e-3 to 3.79e-3, cosine 0.999993, max abs 4.9e-4; named slots'
+    states rel-L2 3.23e-3 to 3.45e-3, max abs 3.9e-3 -- the CP pipeline and
+    the chunked kernel alike. A value head reading the wrong key head at
+    4/12 (key heads rolled by one) is o rel-L2 1.41, max abs 7.6e-2, which
+    the band refuses.
+
     Memory per call: a packed copy of the named slots in and out in the pool's
     dtype (2 x 3 MiB per sequence fp32, half that bf16), `exp(g)` (not with
     `linear_gate`), and the
     output. q/k/v/beta are not copied
     when already contiguous / fp32.
 
-    JIT and streams: the first call per process compiles the CuTe-DSL
-    kernel in-process (seconds), and the installed FlashInfer keeps one TMA
-    workspace per device, so two streams must not run this op concurrently.
-    Needs CUDA >= 13 torch (FlashInfer raises otherwise).
+    JIT and streams: the first call per process and path compiles the
+    CuTe-DSL kernels in-process for the device it runs on (seconds; the
+    cells compiled and ran both paths for sm_103), and the installed
+    FlashInfer keeps one TMA workspace per device (the CP pipeline also a
+    cached initial-state workspace), so two streams must not run this op
+    concurrently. Needs CUDA >= 13 torch (FlashInfer raises otherwise).
 
     Numerics (measured vs an fp64 recurrence, 1 x 8192 tokens, qwen3.8
     geometry): o rel-L2 4.06e-3, max abs 1.26e-3; state rel-L2 3.31e-3 --
@@ -280,12 +388,20 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     caller or the flag).
 
     Not certified: `state_workspace=`, an fp16 pool, `scale` other than the
-    default, fp16 operands, K or V other than 128, other head ratios, and what the
-    target never passes: `inplace_indexed_state_update=False` (final states
-    returned) and `use_qk_l2norm_in_kernel`.
+    default, fp16 operands, K or V other than 128, head layouts other than
+    16/48 and 4/12, and what the target never passes:
+    `inplace_indexed_state_update=False` (final states returned) and
+    `use_qk_l2norm_in_kernel`. At 4/12: 2 context sequences on CP and 4 to
+    127 on the chunked kernel (the cells hold 1 and 3, and 128); a dep4 rank
+    at more than 512 carried tokens; tp4's own slot count (no engine has
+    run tp4; tep4's stands in) and any pool counted on this target's own
+    engines or under a variant (MTP, kv_fp8/kv_nvfp4, chunked, reuse);
+    a call inside a CUDA graph (the target calls it eagerly).
 
     Hard limits
-      none probed.
+      T: max_num_tokens (8192) rows a call is certified at; chunked
+         prefill of a longer prompt is one call per chunk.
+      slot offsets: past int32 at both members' last slots (certified).
     """
 
     def __call__(
