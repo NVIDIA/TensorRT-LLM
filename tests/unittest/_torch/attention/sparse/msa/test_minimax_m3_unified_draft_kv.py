@@ -144,7 +144,10 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
         # The unified drafter reads its layers' block offsets, so they keep attention-op pools.
         assert plain.num_attention_op_pools == 0
         assert unified.num_attention_op_pools > 0
-        (request,) = unified.add_dummy_requests([7], token_nums=[200])
+        # CUDA-graph padding passes the draft view (this manager) back in.
+        (request,) = unified.add_dummy_requests(
+            [7], token_nums=[200], draft_kv_cache_manager=unified.get_draft_kv_cache_view()
+        )
         offsets = torch.zeros(
             unified.num_attention_op_pools,
             1,

@@ -3918,9 +3918,10 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> Optional[List[float]]:
         """Hot-tier ``[target, draft]`` byte ratios when the draft layers form one windowed lifecycle.
 
-        Without a typical step the backend splits by bytes per token, handing the draft layers
-        as many tokens as the target. They need only every admissible sequence's window plus
-        one context chunk, which is what the KV cache cost already charges for them.
+        Without a pool ratio or typical step the backend splits the hot tier for one 2048-token
+        request, which says nothing about how many sequences hold a draft window at once. The
+        draft layers need every admissible sequence's window plus one context chunk, which is
+        what the KV cache cost already charges for them, capped at an equal-token share.
         """
         if self.max_num_tokens is None or gpu_quota <= 0:
             # Without a context-chunk bound or a quota the backend's split is the safe one.

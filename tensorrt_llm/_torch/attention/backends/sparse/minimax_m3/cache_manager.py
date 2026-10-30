@@ -658,9 +658,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         The base method mirrors dummy KV caches into a *separate* draft
         manager. With shared draft layers a dummy request's blocks already
         span the drafter's pool (pools allocate in lockstep per logical
-        block), and the view owns no block lifecycle.
+        block), and the view owns no block lifecycle. Explicit draft layers
+        are this manager's own, so their view is this manager itself.
         """
-        if isinstance(kwargs.get("draft_kv_cache_manager"), MiniMaxM3DraftKVCacheView):
+        draft_kv_cache_manager = kwargs.get("draft_kv_cache_manager")
+        if draft_kv_cache_manager is self or isinstance(
+            draft_kv_cache_manager, MiniMaxM3DraftKVCacheView
+        ):
             kwargs["draft_kv_cache_manager"] = None
         return super().add_dummy_requests(*args, **kwargs)
 
