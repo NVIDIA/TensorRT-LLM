@@ -1238,7 +1238,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "onto the server defaults (request wins per key). For "
             "`video`, overriding only one of `fps`/`num_frames` drops "
             "the other from the server default so the loader's built-in "
-            "is used. "
+            "is used. Decoded-memory limits such as "
+            "`video.max_decoded_frame_bytes` are server-only and rejected "
+            "here. "
             "Example: `{\"video\": {\"num_frames\": 32}}`."),
     )
 
