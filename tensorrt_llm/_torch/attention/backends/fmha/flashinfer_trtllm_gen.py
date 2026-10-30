@@ -1192,6 +1192,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
         )
         gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
+
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,
             kv_cache=(kv_pool, kv_pool),
