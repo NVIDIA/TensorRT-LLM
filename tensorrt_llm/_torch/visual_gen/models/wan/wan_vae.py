@@ -348,6 +348,20 @@ class WanCausalConv3d(nn.Conv3d):
         )
         self.padding = (0, self.padding[1], self.padding[2])
 
+    def _causal_input(self, x: torch.Tensor, cache_x: torch.Tensor | None) -> torch.Tensor:
+        """``x`` with its causal history in front: the cached frames ``cache_x``, then zero
+        frames for the rest of the temporal padding, channels-last."""
+        x = _channels_last_3d_if_needed(x)
+        padding = list(self._padding)
+        if cache_x is not None and self._padding[4] > 0:
+            cache_x = _to_device_if_needed(cache_x, x.device)
+            cache_x = _channels_last_3d_if_needed(cache_x)
+            x = torch.cat([cache_x, x], dim=2)
+            padding[4] -= cache_x.shape[2]
+        if any(padding):
+            x = F.pad(x, padding)
+        return _channels_last_3d_if_needed(x)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -361,16 +375,7 @@ class WanCausalConv3d(nn.Conv3d):
         split axis. Temporal padding remains explicitly causal through
         ``self._padding``.
         """
-        x = _channels_last_3d_if_needed(x)
-        padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = _to_device_if_needed(cache_x, x.device)
-            cache_x = _channels_last_3d_if_needed(cache_x)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        if any(padding):
-            x = F.pad(x, padding)
-        x = _channels_last_3d_if_needed(x)
+        x = self._causal_input(x, cache_x)
         if spatial_padding is None:
             x = super().forward(x)
         else:
@@ -1110,6 +1115,9 @@ class WanUpsample(nn.Upsample):
 
 
 class WanResample(nn.Module):
+    # Child module classes; a subclass swaps in its own.
+    _conv_cls = WanCausalConv3d
+
     def __init__(self, dim: int, mode: str, upsample_out_dim: int | None = None) -> None:
         super().__init__()
         self.dim = dim
@@ -1127,7 +1135,7 @@ class WanResample(nn.Module):
                 WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
                 WanConv2d(dim, upsample_out_dim, 3, padding=1),
             )
-            self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+            self.time_conv = self._conv_cls(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
         elif mode == "downsample2d":
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)), WanConv2d(dim, dim, 3, stride=(2, 2))
@@ -1136,7 +1144,7 @@ class WanResample(nn.Module):
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)), WanConv2d(dim, dim, 3, stride=(2, 2))
             )
-            self.time_conv = WanCausalConv3d(dim, dim, (3, 1, 1), stride=(2, 1, 1))
+            self.time_conv = self._conv_cls(dim, dim, (3, 1, 1), stride=(2, 1, 1))
         else:
             self.resample = nn.Identity()
 
@@ -1205,6 +1213,10 @@ class WanResample(nn.Module):
 
 
 class WanResidualBlock(nn.Module):
+    # Child module classes; a subclass swaps in its own.
+    _norm_cls = WanRMSNorm
+    _conv_cls = WanCausalConv3d
+
     def __init__(
         self, in_dim: int, out_dim: int, dropout: float = 0.0, non_linearity: str = "silu"
     ):
@@ -1212,13 +1224,13 @@ class WanResidualBlock(nn.Module):
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.nonlinearity = _activation(non_linearity)
-        self.norm1 = WanRMSNorm(in_dim, images=False)
-        self.conv1 = WanCausalConv3d(in_dim, out_dim, 3, padding=1)
-        self.norm2 = WanRMSNorm(out_dim, images=False)
+        self.norm1 = self._norm_cls(in_dim, images=False)
+        self.conv1 = self._conv_cls(in_dim, out_dim, 3, padding=1)
+        self.norm2 = self._norm_cls(out_dim, images=False)
         self.dropout = nn.Dropout(dropout)
-        self.conv2 = WanCausalConv3d(out_dim, out_dim, 3, padding=1)
+        self.conv2 = self._conv_cls(out_dim, out_dim, 3, padding=1)
         self.conv_shortcut = (
-            WanCausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+            self._conv_cls(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
         )
 
     def forward(
@@ -1302,15 +1314,19 @@ class WanAttentionBlock(nn.Module):
 
 
 class WanMidBlock(nn.Module):
+    # Child module classes; a subclass swaps in its own.
+    _resblock_cls = WanResidualBlock
+    _attention_cls = WanAttentionBlock
+
     def __init__(
         self, dim: int, dropout: float = 0.0, non_linearity: str = "silu", num_layers: int = 1
     ):
         super().__init__()
-        resnets = [WanResidualBlock(dim, dim, dropout, non_linearity)]
+        resnets = [self._resblock_cls(dim, dim, dropout, non_linearity)]
         attentions = []
         for _ in range(num_layers):
-            attentions.append(WanAttentionBlock(dim))
-            resnets.append(WanResidualBlock(dim, dim, dropout, non_linearity))
+            attentions.append(self._attention_cls(dim))
+            resnets.append(self._resblock_cls(dim, dim, dropout, non_linearity))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.gradient_checkpointing = False
@@ -1329,6 +1345,10 @@ class WanMidBlock(nn.Module):
 
 
 class WanResidualDownBlock(nn.Module):
+    # Child module classes; a subclass swaps in its own.
+    _resblock_cls = WanResidualBlock
+    _resample_cls = WanResample
+
     def __init__(
         self,
         in_dim: int,
@@ -1347,13 +1367,13 @@ class WanResidualDownBlock(nn.Module):
         )
         resnets = []
         for _ in range(num_res_blocks):
-            resnets.append(WanResidualBlock(in_dim, out_dim, dropout))
+            resnets.append(self._resblock_cls(in_dim, out_dim, dropout))
             in_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
         self.downsampler = None
         if down_flag:
             mode = "downsample3d" if temperal_downsample else "downsample2d"
-            self.downsampler = WanResample(out_dim, mode=mode)
+            self.downsampler = self._resample_cls(out_dim, mode=mode)
 
     def forward(
         self,
@@ -1370,6 +1390,14 @@ class WanResidualDownBlock(nn.Module):
 
 
 class WanEncoder3d(nn.Module):
+    # Child module classes; a subclass swaps in its own.
+    _conv_cls = WanCausalConv3d
+    _down_block_cls = WanResidualDownBlock
+    _resblock_cls = WanResidualBlock
+    _resample_cls = WanResample
+    _mid_block_cls = WanMidBlock
+    _norm_cls = WanRMSNorm
+
     def __init__(
         self,
         in_channels: int = 3,
@@ -1393,12 +1421,12 @@ class WanEncoder3d(nn.Module):
 
         dims = [dim * value for value in [1] + dim_mult]
         scale = 1.0
-        self.conv_in = WanCausalConv3d(in_channels, dims[0], 3, padding=1)
+        self.conv_in = self._conv_cls(in_channels, dims[0], 3, padding=1)
         self.down_blocks = nn.ModuleList([])
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             if is_residual:
                 self.down_blocks.append(
-                    WanResidualDownBlock(
+                    self._down_block_cls(
                         in_dim,
                         out_dim,
                         dropout,
@@ -1411,18 +1439,18 @@ class WanEncoder3d(nn.Module):
                 )
             else:
                 for _ in range(num_res_blocks):
-                    self.down_blocks.append(WanResidualBlock(in_dim, out_dim, dropout))
+                    self.down_blocks.append(self._resblock_cls(in_dim, out_dim, dropout))
                     if scale in attn_scales:
                         self.down_blocks.append(WanAttentionBlock(out_dim))
                     in_dim = out_dim
                 if i != len(dim_mult) - 1:
                     mode = "downsample3d" if temperal_downsample[i] else "downsample2d"
-                    self.down_blocks.append(WanResample(out_dim, mode=mode))
+                    self.down_blocks.append(self._resample_cls(out_dim, mode=mode))
                     scale /= 2.0
 
-        self.mid_block = WanMidBlock(out_dim, dropout, non_linearity, num_layers=1)
-        self.norm_out = WanRMSNorm(out_dim, images=False)
-        self.conv_out = WanCausalConv3d(out_dim, z_dim, 3, padding=1)
+        self.mid_block = self._mid_block_cls(out_dim, dropout, non_linearity, num_layers=1)
+        self.norm_out = self._norm_cls(out_dim, images=False)
+        self.conv_out = self._conv_cls(out_dim, z_dim, 3, padding=1)
         self.gradient_checkpointing = False
 
     def forward(
@@ -1455,6 +1483,10 @@ class WanEncoder3d(nn.Module):
 
 
 class WanResidualUpBlock(nn.Module):
+    # Child module classes; a subclass swaps in its own.
+    _resblock_cls = WanResidualBlock
+    _resample_cls = WanResample
+
     def __init__(
         self,
         in_dim: int,
@@ -1475,14 +1507,14 @@ class WanResidualUpBlock(nn.Module):
         current_dim = in_dim
         resnets = []
         for _ in range(num_res_blocks + 1):
-            resnets.append(WanResidualBlock(current_dim, out_dim, dropout, non_linearity))
+            resnets.append(self._resblock_cls(current_dim, out_dim, dropout, non_linearity))
             current_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
 
         self.upsampler = None
         if up_flag:
             mode = "upsample3d" if temperal_upsample else "upsample2d"
-            self.upsampler = WanResample(out_dim, mode=mode, upsample_out_dim=out_dim)
+            self.upsampler = self._resample_cls(out_dim, mode=mode, upsample_out_dim=out_dim)
         self.gradient_checkpointing = False
 
     def forward(
@@ -1503,6 +1535,10 @@ class WanResidualUpBlock(nn.Module):
 
 
 class WanUpBlock(nn.Module):
+    # Child module classes; a subclass swaps in its own.
+    _resblock_cls = WanResidualBlock
+    _resample_cls = WanResample
+
     def __init__(
         self,
         in_dim: int,
@@ -1516,12 +1552,12 @@ class WanUpBlock(nn.Module):
         current_dim = in_dim
         resnets = []
         for _ in range(num_res_blocks + 1):
-            resnets.append(WanResidualBlock(current_dim, out_dim, dropout, non_linearity))
+            resnets.append(self._resblock_cls(current_dim, out_dim, dropout, non_linearity))
             current_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
         self.upsamplers = None
         if upsample_mode is not None:
-            self.upsamplers = nn.ModuleList([WanResample(out_dim, mode=upsample_mode)])
+            self.upsamplers = nn.ModuleList([self._resample_cls(out_dim, mode=upsample_mode)])
         self.gradient_checkpointing = False
 
     def forward(
@@ -1540,6 +1576,13 @@ class WanUpBlock(nn.Module):
 
 
 class WanDecoder3d(nn.Module):
+    # Child module classes; a subclass swaps in its own.
+    _conv_cls = WanCausalConv3d
+    _mid_block_cls = WanMidBlock
+    _res_up_block_cls = WanResidualUpBlock
+    _up_block_cls = WanUpBlock
+    _norm_cls = WanRMSNorm
+
     def __init__(
         self,
         dim: int = 128,
@@ -1560,8 +1603,8 @@ class WanDecoder3d(nn.Module):
         self.nonlinearity = _activation(non_linearity)
 
         dims = [dim * value for value in [dim_mult[-1]] + dim_mult[::-1]]
-        self.conv_in = WanCausalConv3d(z_dim, dims[0], 3, padding=1)
-        self.mid_block = WanMidBlock(dims[0], dropout, non_linearity, num_layers=1)
+        self.conv_in = self._conv_cls(z_dim, dims[0], 3, padding=1)
+        self.mid_block = self._mid_block_cls(dims[0], dropout, non_linearity, num_layers=1)
         self.up_blocks = nn.ModuleList([])
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             if i > 0 and not is_residual:
@@ -1574,7 +1617,7 @@ class WanDecoder3d(nn.Module):
                 upsample_mode = "upsample2d"
 
             if is_residual:
-                up_block = WanResidualUpBlock(
+                up_block = self._res_up_block_cls(
                     in_dim=in_dim,
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
@@ -1584,7 +1627,7 @@ class WanDecoder3d(nn.Module):
                     non_linearity=non_linearity,
                 )
             else:
-                up_block = WanUpBlock(
+                up_block = self._up_block_cls(
                     in_dim=in_dim,
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
@@ -1594,8 +1637,8 @@ class WanDecoder3d(nn.Module):
                 )
             self.up_blocks.append(up_block)
 
-        self.norm_out = WanRMSNorm(out_dim, images=False)
-        self.conv_out = WanCausalConv3d(out_dim, out_channels, 3, padding=1)
+        self.norm_out = self._norm_cls(out_dim, images=False)
+        self.conv_out = self._conv_cls(out_dim, out_channels, 3, padding=1)
         self.gradient_checkpointing = False
 
     def forward(
@@ -1669,6 +1712,11 @@ def unpatchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
 class WanVAE(nn.Module):
     """Wan VAE implementation compatible with diffusers AutoencoderKLWan."""
 
+    # Child module classes; a subclass swaps in its own.
+    _encoder_cls = WanEncoder3d
+    _decoder_cls = WanDecoder3d
+    _conv_cls = WanCausalConv3d
+
     def __init__(
         self,
         config: WanVAEConfig | dict[str, Any] | None = None,
@@ -1683,7 +1731,7 @@ class WanVAE(nn.Module):
         self.temperal_downsample = config.temperal_downsample
         self.temperal_upsample = config.temperal_downsample[::-1]
 
-        self.encoder = WanEncoder3d(
+        self.encoder = self._encoder_cls(
             in_channels=config.in_channels,
             dim=config.base_dim,
             z_dim=config.z_dim * 2,
@@ -1694,9 +1742,9 @@ class WanVAE(nn.Module):
             dropout=config.dropout,
             is_residual=config.is_residual,
         )
-        self.quant_conv = WanCausalConv3d(config.z_dim * 2, config.z_dim * 2, 1)
-        self.post_quant_conv = WanCausalConv3d(config.z_dim, config.z_dim, 1)
-        self.decoder = WanDecoder3d(
+        self.quant_conv = self._conv_cls(config.z_dim * 2, config.z_dim * 2, 1)
+        self.post_quant_conv = self._conv_cls(config.z_dim, config.z_dim, 1)
+        self.decoder = self._decoder_cls(
             dim=config.decoder_base_dim,
             z_dim=config.z_dim,
             dim_mult=config.dim_mult,
