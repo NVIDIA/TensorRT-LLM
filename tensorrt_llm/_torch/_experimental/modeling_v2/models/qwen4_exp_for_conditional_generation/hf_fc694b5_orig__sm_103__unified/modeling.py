@@ -1020,25 +1020,29 @@ def _routed_experts(core, x, L: _LayerWeights) -> torch.Tensor:
     over the whole routing space (`renorm_moe_routing_op`), the NVFP4 activation with linear
     block scales at the layer's FC1 input global scale, and the trtllm-gen runner over this
     rank's expert window, pre-routed, finalized. A slot routed outside the window adds
-    nothing, so the window outputs sum to the layer's. Launches of more than the runner's
-    certified rows run in chunks (a host decision on `T`)."""
-    # The routing reads its logits as a dense row-major buffer; cublas_mm allocates them
-    # contiguous.
-    logits = cublas_mm(x, L.router)
-    topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=torch.bfloat16)
-    xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, False)
+    nothing, so the window outputs sum to the layer's.
+
+    Every step is row-wise, so `x` runs in chunks of at most the runner's certified rows (a
+    host decision on `T`): one chunk at a TP rank's rows, several over the rows an
+    attention-DP group gathers."""
     rows = x.shape[0]
-    xsf = torch.reshape(xsf, [rows, core.hidden // _SF_VEC])
     parts = []
     for lo in range(0, rows, _MOE_MAX_ROWS):
-        hi = min(rows, lo + _MOE_MAX_ROWS)
+        chunk = x[lo : min(rows, lo + _MOE_MAX_ROWS)]
+        # The routing reads its logits as a dense row-major buffer; cublas_mm allocates them
+        # contiguous.
+        logits = cublas_mm(chunk, L.router)
+        topk_ids, topk_w = renorm_moe_routing_op(
+            logits, topk=core.topk, output_dtype=torch.bfloat16
+        )
+        xq, xsf = fp4_quantize(chunk, L.moe_gscale, _SF_VEC, False, False)
         parts.append(
             fp4_block_scale_moe_runner(
                 routing_logits=None,
                 routing_bias=None,
-                hidden_states=xq[lo:hi],
+                hidden_states=xq,
                 # The runner reads the chunk's linear block scales flat.
-                hidden_states_scale=torch.reshape(xsf[lo:hi], [-1]).view(torch.float8_e4m3fn),
+                hidden_states_scale=torch.reshape(xsf, [-1]).view(torch.float8_e4m3fn),
                 gemm1_weights=L.fc1_w,
                 gemm1_weights_scale=L.fc1_s,
                 gemm1_bias=None,
@@ -1062,8 +1066,8 @@ def _routed_experts(core, x, L: _LayerWeights) -> torch.Tensor:
                 routing_method_type=_ROUTING_METHOD_RENORM,
                 do_finalize=True,
                 act_type=_ACT_TYPE_SWIGLU,
-                topk_weights=topk_w[lo:hi],
-                topk_ids=topk_ids[lo:hi],
+                topk_weights=topk_w,
+                topk_ids=topk_ids,
             )[0]
         )
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
