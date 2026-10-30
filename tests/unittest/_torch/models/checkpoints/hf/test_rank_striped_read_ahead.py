@@ -1,10 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import io
+import os
 import pickle
 import sys
 import threading
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import cloudpickle
@@ -34,6 +40,7 @@ def _isolated_loader_environment(monkeypatch):
     monkeypatch.delenv("TLLM_OVERRIDE_LAYER_NUM", raising=False)
     monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", False)
     monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: 1 << 40)
+    monkeypatch.setattr(read_ahead, "effective_available_host_memory", lambda: 1 << 40)
 
 
 def _write_checkpoint(tmp_path: Path) -> tuple[Path, dict[str, torch.Tensor]]:
@@ -446,6 +453,429 @@ def test_session_overlaps_materialization_and_cancels_tail(tmp_path, monkeypatch
     assert loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
 
 
+def test_node_major_page_faults_reads_vmstat(monkeypatch):
+    vmstat = "pgpgin 1\npgmajfault 1234\npgrefill 5\n"
+    monkeypatch.setattr(
+        read_ahead, "open", lambda *args, **kwargs: io.StringIO(vmstat), raising=False
+    )
+    assert read_ahead.node_major_page_faults() == 1234
+
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("/proc/vmstat")
+
+    monkeypatch.setattr(read_ahead, "open", unavailable, raising=False)
+    assert read_ahead.node_major_page_faults() is None
+
+
+def _two_file_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_counts: Callable[[], int | None],
+    *,
+    checkpoint_bytes: int | None = None,
+) -> tuple[read_ahead.RankStripedReadAheadSession, list[str], list[str]]:
+    """Build a one-rank session over two files whose node fault counts the test controls."""
+    paths = []
+    for name in ("a.safetensors", "b.safetensors"):
+        path = tmp_path / name
+        path.write_bytes(b"\1" * 8)
+        paths.append(str(path))
+    plan = read_ahead.ReadAheadPlan(
+        tuple(read_ahead.ReadAheadExtent(path, 0, 8) for path in paths), workers=2
+    )
+    reads = []
+    real_read_extent = read_ahead.RankStripedReadAheadSession._read_extent
+
+    def recording_read_extent(session, extent):
+        completed = real_read_extent(session, extent)
+        reads.append(extent.path)
+        return completed
+
+    monkeypatch.setattr(read_ahead, "_RESIDENCY_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(read_ahead, "node_major_page_faults", fault_counts)
+    monkeypatch.setattr(read_ahead, "effective_available_host_memory", lambda: 1 << 40)
+    monkeypatch.setattr(
+        read_ahead.RankStripedReadAheadSession, "_read_extent", recording_read_extent
+    )
+    session = read_ahead.RankStripedReadAheadSession(
+        None,
+        None,
+        plan,
+        checkpoint_bytes=plan.assigned_bytes if checkpoint_bytes is None else checkpoint_bytes,
+    )
+    return session, paths, reads
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.01)
+
+
+def test_major_faults_after_first_pass_reread_the_extents(tmp_path, monkeypatch):
+    # The first count is the baseline taken after the first pass. The next poll
+    # sees enough new major faults to mean the cache dropped pages; the count
+    # then stays flat, so exactly one re-read pass follows.
+    counts = iter([0])
+    session, paths, reads = _two_file_session(
+        tmp_path, monkeypatch, lambda: next(counts, read_ahead._REFRESH_MAJOR_FAULTS)
+    )
+    session.start()
+    _wait_until(lambda: len(reads) >= 4)
+
+    assert session.finish(None) is None
+    assert sorted(reads[:2]) == sorted(paths)
+    assert sorted(reads[2:]) == sorted(paths)
+
+
+def test_no_major_faults_after_first_pass_reads_nothing_more(tmp_path, monkeypatch):
+    counts = iter([7])
+    session, paths, reads = _two_file_session(
+        tmp_path, monkeypatch, lambda: next(counts, 7 + read_ahead._REFRESH_MAJOR_FAULTS - 1)
+    )
+    session.start()
+    _wait_until(lambda: len(reads) == 2)
+    time.sleep(0.2)
+
+    assert session.finish(None) is None
+    assert sorted(reads) == sorted(paths)
+
+
+def test_fault_counter_loss_stops_session_without_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fault_counts = mock.Mock(side_effect=[123, None])
+    session, paths, reads = _two_file_session(tmp_path, monkeypatch, fault_counts)
+    descriptors = list(session._file_descriptors.values())
+
+    try:
+        session.start()
+        assert session._thread is not None
+        session._thread.join(timeout=5)
+        assert not session._thread.is_alive()
+        assert fault_counts.call_count == 2
+        assert session.finish(None) is None
+        assert sorted(reads) == sorted(paths)
+        assert not session._file_descriptors
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        session.cancel_and_close()
+
+
+def _run_refresh_timeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_count: Callable[[float], int],
+    stop_at: float,
+    read_duration: float = 0,
+    *,
+    checkpoint_bytes: int | None = None,
+    available_memory: Callable[[float], int] | None = None,
+) -> tuple[list[tuple[float, float]], mock.Mock]:
+    now = 0.0
+    passes = []
+    session, _, _ = _two_file_session(
+        tmp_path, monkeypatch, lambda: fault_count(now), checkpoint_bytes=checkpoint_bytes
+    )
+    if available_memory is not None:
+        monkeypatch.setattr(
+            read_ahead, "effective_available_host_memory", lambda: available_memory(now)
+        )
+    monkeypatch.setattr(read_ahead, "_RESIDENCY_POLL_SECONDS", 5.0)
+    monkeypatch.setattr(read_ahead, "time", SimpleNamespace(monotonic=lambda: now), raising=False)
+    warning = mock.Mock()
+    monkeypatch.setattr(read_ahead.logger, "warning", warning)
+    real_read_pass = session._read_pass
+
+    def advance(timeout: float) -> bool:
+        nonlocal now
+        assert timeout == 5.0
+        now += timeout
+        if now > stop_at:
+            session._cancel.set()
+        return session._cancel.is_set()
+
+    def read_pass(
+        executor: ThreadPoolExecutor, extents: tuple[read_ahead.ReadAheadExtent, ...]
+    ) -> None:
+        nonlocal now
+        started = now
+        real_read_pass(executor, extents)
+        now += read_duration
+        passes.append((started, now))
+
+    monkeypatch.setattr(session._cancel, "wait", advance)
+    monkeypatch.setattr(session, "_read_pass", read_pass)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            real_read_pass(executor, session._plan.extents)
+            session._refresh_dropped_pages(executor)
+    finally:
+        assert session.finish(None) is None
+    return passes, warning
+
+
+def test_refresh_cooldown_uses_completion_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: int(now / 5) * 1024,
+        stop_at=220,
+        read_duration=3,
+    )
+
+    assert passes == [(5, 8), (18, 21), (41, 44), (84, 87), (147, 150), (210, 213)]
+    assert [current[0] - previous[1] for previous, current in zip(passes, passes[1:])] == [
+        10,
+        20,
+        40,
+        60,
+        60,
+    ]
+    warning.assert_called_once()
+    assert "60" in warning.call_args.args[0]
+
+
+def test_refresh_cooldown_coalesces_a_burst(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 * ((now >= 5) + (now >= 10)),
+        stop_at=100,
+    )
+
+    assert passes == [(5, 5), (15, 15)]
+    warning.assert_not_called()
+
+
+def test_refresh_cooldown_keeps_subthreshold_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 0 if now < 5 else 1024 + int((now - 5) / 5) * 600,
+        stop_at=100,
+    )
+
+    assert passes == [(5, 5)]
+    warning.assert_not_called()
+
+
+def test_refresh_after_quiet_period_keeps_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    passes, _ = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 * sum(now >= trigger for trigger in (5, 10, 600, 605)),
+        stop_at=700,
+    )
+
+    assert passes == [(5, 5), (15, 15), (600, 600), (640, 640)]
+
+
+def test_refresh_memory_admission_uses_checkpoint_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_bytes = 64 << 30
+    available_bytes = 40 << 30
+    assert read_ahead.memory_admission(16, available_bytes)[0]
+    assert not read_ahead.memory_admission(checkpoint_bytes, available_bytes)[0]
+    admission = mock.Mock(wraps=read_ahead.memory_admission)
+    monkeypatch.setattr(read_ahead, "memory_admission", admission)
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 if now >= 5 else 0,
+        stop_at=20,
+        checkpoint_bytes=checkpoint_bytes,
+        available_memory=lambda now: available_bytes,
+    )
+
+    assert passes == []
+    assert admission.call_args_list == [mock.call(checkpoint_bytes, available_bytes)] * 4
+    warning.assert_called_once()
+
+
+def test_refresh_memory_recovery_preserves_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes = []
+
+    def available_memory(now: float) -> int:
+        probes.append(now)
+        return (40 if now in (5, 10, 25, 30) else 128) << 30
+
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 * sum(now >= trigger for trigger in (5, 20, 40)),
+        stop_at=55,
+        checkpoint_bytes=64 << 30,
+        available_memory=available_memory,
+    )
+
+    assert passes == [(15, 15), (35, 35), (55, 55)]
+    assert probes == [5, 10, 15, 25, 30, 35, 55]
+    assert warning.call_count == 2
+
+
+@pytest.mark.parametrize("error_type", [OSError, ValueError, read_ahead.psutil.Error])
+def test_refresh_memory_probe_failure_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    probes = []
+
+    def available_memory(now: float) -> int:
+        probes.append(now)
+        if now < 15:
+            raise error_type("injected memory probe failure")
+        return 128 << 30
+
+    passes, warning = _run_refresh_timeline(
+        tmp_path,
+        monkeypatch,
+        lambda now: 1024 if now >= 5 else 0,
+        stop_at=25,
+        checkpoint_bytes=64 << 30,
+        available_memory=available_memory,
+    )
+
+    assert passes == [(15, 15)]
+    assert probes == [5, 10, 15]
+    warning.assert_called_once()
+
+
+@pytest.mark.parametrize("error_type", [TypeError, KeyboardInterrupt])
+def test_refresh_memory_probe_does_not_suppress_unexpected_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
+) -> None:
+    def available_memory(now: float) -> int:
+        raise error_type("unexpected memory probe failure")
+
+    with pytest.raises(error_type, match="unexpected memory probe failure"):
+        _run_refresh_timeline(
+            tmp_path,
+            monkeypatch,
+            lambda now: 1024 if now >= 5 else 0,
+            stop_at=20,
+            available_memory=available_memory,
+        )
+
+
+def test_finish_cancels_memory_deferred_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts = iter([0])
+    session, _, reads = _two_file_session(
+        tmp_path,
+        monkeypatch,
+        lambda: next(counts, read_ahead._REFRESH_MAJOR_FAULTS),
+        checkpoint_bytes=64 << 30,
+    )
+    descriptors = list(session._file_descriptors.values())
+    probed = threading.Event()
+    waiting = threading.Event()
+    real_wait = session._cancel.wait
+
+    def available_memory() -> int:
+        probed.set()
+        return 0
+
+    def wait(timeout: float) -> bool:
+        if probed.is_set():
+            waiting.set()
+            return real_wait(10)
+        return real_wait(timeout)
+
+    monkeypatch.setattr(read_ahead, "effective_available_host_memory", available_memory)
+    monkeypatch.setattr(session._cancel, "wait", wait)
+    try:
+        session.start()
+        assert waiting.wait(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(session.finish, None).result(timeout=2) is None
+        assert len(reads) == 2
+        assert not session._thread.is_alive()
+        assert not session._file_descriptors
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        session.cancel_and_close()
+
+
+@pytest.mark.parametrize("phase", ["wait", "read"])
+def test_finish_cancels_refresh_and_closes_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    counts = iter([0])
+    session, _, _ = _two_file_session(
+        tmp_path, monkeypatch, lambda: next(counts, read_ahead._REFRESH_MAJOR_FAULTS)
+    )
+    descriptors = list(session._file_descriptors.values())
+    entered = threading.Event()
+    release = threading.Event()
+    pass_count = 0
+    real_read_pass = session._read_pass
+    real_wait = session._cancel.wait
+    real_pread = os.pread
+
+    def read_pass(
+        executor: ThreadPoolExecutor, extents: tuple[read_ahead.ReadAheadExtent, ...]
+    ) -> None:
+        nonlocal pass_count
+        pass_count += 1
+        real_read_pass(executor, extents)
+
+    def wait(timeout: float) -> bool:
+        if phase == "wait" and pass_count == 2:
+            entered.set()
+            return real_wait(10)
+        return real_wait(timeout)
+
+    def pread(descriptor: int, size: int, offset: int) -> bytes:
+        if phase == "read" and pass_count == 2:
+            entered.set()
+            assert release.wait(timeout=5)
+        return real_pread(descriptor, size, offset)
+
+    monkeypatch.setattr(session, "_read_pass", read_pass)
+    monkeypatch.setattr(session._cancel, "wait", wait)
+    monkeypatch.setattr(read_ahead, "os", SimpleNamespace(pread=pread, close=os.close))
+    try:
+        session.start()
+        assert entered.wait(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            finished = executor.submit(session.finish, None)
+            try:
+                if phase == "read":
+                    assert session._cancel.wait(timeout=5)
+                    assert not finished.done()
+                    for descriptor in descriptors:
+                        os.fstat(descriptor)
+                    release.set()
+                assert finished.result(timeout=2) is None
+            finally:
+                release.set()
+        assert not session._thread.is_alive()
+        assert not session._file_descriptors
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        release.set()
+        session.cancel_and_close()
+
+
 def test_advisory_read_failure_keeps_materialized_weights(tmp_path, monkeypatch):
     checkpoint_dir, expected = _write_checkpoint(tmp_path)
     loader = _rank_striped_loader()
@@ -521,6 +951,29 @@ def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
     for name, expected_tensor in expected.items():
         assert torch.equal(native[name], expected_tensor)
         assert torch.equal(striped[name], expected_tensor)
+
+
+def test_loader_passes_full_checkpoint_bytes_to_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_dir, _ = _write_checkpoint(tmp_path)
+    checkpoint_bytes = sum(path.stat().st_size for path in checkpoint_dir.glob("*.safetensors"))
+    monkeypatch.setattr(read_ahead, "_CHUNK_SIZE", 8)
+    monkeypatch.setattr(
+        weight_loader_module,
+        "build_local_plan",
+        lambda files, rank, size: read_ahead.build_local_plan(files, 0, 2),
+    )
+    session_factory = mock.Mock(wraps=read_ahead.RankStripedReadAheadSession)
+    monkeypatch.setattr(weight_loader_module, "RankStripedReadAheadSession", session_factory)
+
+    with _rank_striped_loader().open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+        pass
+
+    session_factory.assert_called_once()
+    plan = session_factory.call_args.args[2]
+    assert plan.assigned_bytes < checkpoint_bytes
+    assert session_factory.call_args.kwargs["checkpoint_bytes"] == checkpoint_bytes
 
 
 def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:

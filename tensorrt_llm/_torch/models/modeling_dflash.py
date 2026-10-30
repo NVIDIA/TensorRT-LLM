@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import math
 from dataclasses import replace
 from typing import Dict, Optional
 
@@ -22,6 +23,7 @@ except ImportError:
 from ..distributed import AllReduce
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
+    DFLASH_CONTEXT_LOWERING,
     dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
     get_dflash_flash_attention,
@@ -31,6 +33,11 @@ from ..speculative.dflash_attention import (
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
+
+# trtllm-gen reports the log-sum-exp in base 2; the merge and the MLA fixup
+# (modeling_dspark) multiply by this to get the natural-log LSE flashinfer's
+# merge expects. One constant, so a flashinfer convention change is fixed once.
+TRTLLM_GEN_LSE_LN2 = math.log(2.0)
 
 
 def dspark_layer_window_size(
@@ -63,6 +70,129 @@ def dspark_layer_window_size(
     ):
         return (-1, -1)
     return (swa_window - 1, swa_window - 1)
+
+
+def dflash_merge_future_block_attention(
+    out_causal: torch.Tensor,
+    lse_causal: torch.Tensor,
+    query: torch.Tensor,
+    block_key: torch.Tensor,
+    block_value: torch.Tensor,
+    scale: float,
+    window_right: int,
+) -> torch.Tensor:
+    """Extend a causal block attention to a non-causal one, exactly.
+
+    A non-causal block query ``j`` attends the keys a causal one does (context
+    within the left window, block keys ``<= j``) plus the block keys after it,
+    ``j < k <= j + window_right``. Given the causal output and its natural-log
+    log-sum-exp, this adds that second key set's softmax mass and renormalizes:
+    the result is the non-causal attention up to rounding. It is how the TRTLLM
+    backend serves a non-causal sliding-window layer, which the trtllm-gen
+    context kernel rejects while its causal decode kernel windows natively.
+
+    Args:
+        out_causal: [B * blk, Hq, D] causal attention output.
+        lse_causal: [B * blk, Hq] float32 log-sum-exp of the scaled causal logits.
+        query: [B, blk, Hq, D] block queries, as the kernel saw them.
+        block_key / block_value: [B, blk, Hkv, D] block K/V, as appended to the cache.
+        scale: softmax scale the kernel applied to ``q @ k``.
+        window_right: inclusive right window in tokens; -1 means unbounded.
+    Returns:
+        [B * blk, Hq, D] in ``out_causal.dtype``.
+    """
+    B, blk, num_heads, head_dim = query.shape
+    num_kv_heads = block_key.shape[2]
+    group = num_heads // num_kv_heads
+    q = query.float().reshape(B, blk, num_kv_heads, group, head_dim)
+    logits = torch.einsum("bjhgd,bkhd->bhgjk", q, block_key.float()) * scale
+    offsets = torch.arange(blk, device=query.device)
+    distance = offsets.view(1, -1) - offsets.view(-1, 1)  # [j, k] = k - j
+    future = distance > 0
+    if window_right >= 0:
+        future &= distance <= window_right
+    logits = logits.masked_fill(~future, float("-inf"))
+    lse_future = torch.logsumexp(logits, dim=-1)  # [B, Hkv, g, blk], -inf for no future keys
+    lse_future_finite = torch.where(
+        torch.isfinite(lse_future), lse_future, torch.zeros_like(lse_future)
+    )
+    probs = torch.exp(logits - lse_future_finite.unsqueeze(-1))
+    out_future = torch.einsum("bhgjk,bkhd->bjhgd", probs, block_value.float())
+    out_future = out_future.reshape(B * blk, num_heads, head_dim)
+    lse_future = lse_future.permute(0, 3, 1, 2).reshape(B * blk, num_heads)
+
+    lse_total = torch.logaddexp(lse_causal, lse_future)
+    weight_causal = torch.exp(lse_causal - lse_total).unsqueeze(-1)
+    weight_future = torch.exp(lse_future - lse_total).unsqueeze(-1)
+    merged = weight_causal * out_causal.float() + weight_future * out_future
+    return merged.to(out_causal.dtype)
+
+
+def dflash_trtllm_windowed_block_attention(
+    trtllm_gen_ops,
+    query: torch.Tensor,
+    block_key: torch.Tensor,
+    block_value: torch.Tensor,
+    layer_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    causal: bool,
+    window_size: tuple[int, int],
+    workspace: torch.Tensor,
+    counters: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Block attention through the trtllm-gen decode kernel, into ``out``.
+
+    Serves a causal layer (windowed or not) and a non-causal windowed one; a
+    non-causal unwindowed layer takes the context kernel instead. trtllm-gen
+    windows only causal attention, so the non-causal windowed case runs the
+    causal decode with its log-sum-exp and then adds the block keys after each
+    query (:func:`dflash_merge_future_block_attention`).
+
+    Args:
+        query: [B, blk, Hq, D] block queries.
+        block_key / block_value: [B, blk, Hkv, D], already appended to ``layer_cache``.
+        layer_cache: [pages, 2, Hkv, page_size, D] HND pages of this layer.
+        seq_lens: [B] context plus block tokens per request.
+        window_size: (left, right) inclusive token bounds, -1 for none.
+        out: [B * blk, Hq, D] output.
+    """
+    B, block_size, num_heads, head_dim = query.shape
+    window_left, window_right = window_size
+    merge_future = not causal and window_left >= 0
+    decoded = trtllm_gen_ops.batch_decode_with_kv_cache(
+        query=query.reshape(-1, num_heads, head_dim),
+        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        bmm1_scale=head_dim**-0.5,
+        bmm2_scale=1.0,
+        window_left=window_left,
+        out=out,
+        sinks=None,
+        enable_pdl=False,
+        kv_layout="HND",
+        backend="trtllm-gen",
+        q_len_per_req=block_size,
+        max_q_len=None,
+        cum_seq_lens_q=None,
+        kv_cache_sf=None,
+        uses_shared_paged_kv_idx=True,
+        bmm1_scale_log2=None,
+        return_lse=merge_future,
+        multi_ctas_kv_counter_buffer=counters,
+    )
+    if merge_future:
+        lse = decoded[1] * TRTLLM_GEN_LSE_LN2
+        out.copy_(
+            dflash_merge_future_block_attention(
+                out, lse, query, block_key, block_value, head_dim**-0.5, window_right
+            )
+        )
 
 
 def declares_lilicorr(config: PretrainedConfig) -> bool:
@@ -1381,29 +1511,40 @@ class DFlashForCausalLM(nn.Module):
             window_size = swa_window
         return causal, window_size
 
-    def validate_block_attention_windows(self) -> None:
-        """Refuse windows the TRTLLM block-decode kernel cannot apply.
+    def validate_block_attention_windows(self) -> list[str]:
+        """Report how the TRTLLM block decode serves each draft layer's mask.
 
         TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
-        rejects ``causal=False`` with any finite ``window_left`` outright. A
-        non-causal windowed layer must therefore run on VANILLA or FA4, which
-        take a two-sided window.
+        rejects ``causal=False`` with any finite ``window_left``. A non-causal
+        windowed layer runs the causal windowed decode plus the block keys
+        after each query (``dflash_merge_future_block_attention``), which is
+        the same attention up to rounding.
+
+        Returns:
+            The lowering per draft layer; empty for the other backends, which
+            take both window bounds directly.
         """
         if self.dflash_attention_backend != "TRTLLM":
-            return
+            return []
         num_layers = getattr(self.config, "num_hidden_layers", None)
         if num_layers is None:
             num_layers = len(self.model.layers)
+        lowerings = []
         for layer_idx in range(num_layers):
-            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
-            if causal or window_left < 0:
-                continue
-            raise ValueError(
-                f"DFlash draft layer {layer_idx} attends non-causally within a "
-                f"{window_left + 1}-token sliding window. The TRTLLM DFlash "
-                "attention backend does not support non-causal sliding-window "
-                "attention. Use attention_backend=VANILLA or FA4."
+            causal, window_size = self._resolve_block_attention(layer_idx)
+            if causal:
+                lowering = "causal decode"
+            elif window_size[0] >= 0:
+                lowering = "causal decode + future-block merge"
+            else:
+                lowering = DFLASH_CONTEXT_LOWERING
+            logger.info_once(
+                f"DFlash draft layer {layer_idx}: causal={causal}, "
+                f"window={window_size}, TRTLLM lowering: {lowering}.",
+                key=f"dflash_block_attention_{id(self)}_{layer_idx}",
             )
+            lowerings.append(lowering)
+        return lowerings
 
     def _prepare_dflash_trtllm_gen_buffers(
         self,
@@ -1808,29 +1949,21 @@ class DFlashForCausalLM(nn.Module):
                     q_flat = q_flat.to(layer_cache.dtype)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
                 window_left = window_size[0]
-                if causal:
-                    trtllm_gen_ops.batch_decode_with_kv_cache(
-                        query=q_flat,
-                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
-                        workspace_buffer=self._dflash_trtllm_gen_workspace,
-                        block_tables=block_tables,
-                        seq_lens=seq_lens_after,
-                        max_seq_len=pages_per_slot * page_size,
-                        bmm1_scale=head_dim**-0.5,
-                        bmm2_scale=1.0,
-                        window_left=window_left,
-                        out=out_flat,
-                        sinks=None,
-                        enable_pdl=False,
-                        kv_layout="HND",
-                        backend="trtllm-gen",
-                        q_len_per_req=block_size,
-                        max_q_len=None,
-                        cum_seq_lens_q=None,
-                        kv_cache_sf=None,
-                        uses_shared_paged_kv_idx=True,
-                        bmm1_scale_log2=None,
-                        multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                if causal or window_left >= 0:
+                    dflash_trtllm_windowed_block_attention(
+                        trtllm_gen_ops,
+                        Q_bshd,
+                        k_noise_bshd,
+                        v_noise_bshd,
+                        layer_cache,
+                        block_tables,
+                        seq_lens_after,
+                        pages_per_slot * page_size,
+                        causal,
+                        window_size,
+                        self._dflash_trtllm_gen_workspace,
+                        self._dflash_trtllm_gen_counters,
+                        out_flat,
                     )
                 elif window_left == -1:
                     # Every block query attends the same keys (the history and

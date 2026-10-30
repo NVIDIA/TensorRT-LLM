@@ -120,6 +120,7 @@ from ..distributed import (
     allgather,
 )
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
+from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
@@ -2064,11 +2065,30 @@ class KimiMLARuntime(nn.Module):
                 "o_proj",
             )
         }
-        attention_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
+        kv_quant_algo = (
+            model_config.quant_config.kv_cache_quant_algo
             if model_config.quant_config is not None
             else None
         )
+        # The KV cache manager stores these layers in their own FP8 pool, so
+        # the attention backend runs them as FP8 KV-cache MLA.
+        fp8_kv_layer_ids = get_kimi_k3_fp8_kv_layer_ids(
+            cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4, mapping=mapping
+        )
+        if layer_idx in fp8_kv_layer_ids:
+            if kv_quant_algo != QuantAlgo.NVFP4:
+                raise ValueError(
+                    f"{KIMI_K3_FP8_KV_LAYERS_ENV} requires the model-wide "
+                    "KV cache dtype to be NVFP4."
+                )
+            kv_quant_algo = QuantAlgo.FP8
+            logger.info_once(
+                f"Kimi K3 MLA layers using FP8 KV-cache fallback: {sorted(fp8_kv_layer_ids)}.",
+                key="kimi_k3_fp8_kv_fallback_layers",
+            )
+        attention_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_quant_algo)
+        for projection_config in attention_config.quant_config_dict.values():
+            projection_config.kv_cache_quant_algo = kv_quant_algo
         attention_config._frozen = model_config._frozen
         self.mixer = KimiK3MLAAttention(
             hidden_size=cfg.hidden_size,

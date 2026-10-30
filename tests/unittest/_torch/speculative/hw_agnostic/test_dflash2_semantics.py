@@ -60,6 +60,7 @@ def _conv_case(block_size, taps, num_groups=4, group_size=2, batch=3, seed=0):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("block_size", [5, 8])
 @pytest.mark.parametrize("taps", [1, 2, 3])
 def test_grouped_conv_matches_reference(block_size, taps):
@@ -70,6 +71,7 @@ def test_grouped_conv_matches_reference(block_size, taps):
     )
 
 
+@pytest.mark.cpu_only
 def test_grouped_conv_anchor_slot_has_no_predecessor():
     """Block slot 0 holds the anchor token, so only the tap-0 term applies."""
     block_size, taps, group_size = 4, 2, 2
@@ -79,6 +81,7 @@ def test_grouped_conv_anchor_slot_has_no_predecessor():
     torch.testing.assert_close(out[::block_size], (coefficients * hidden)[::block_size])
 
 
+@pytest.mark.cpu_only
 def test_grouped_conv_does_not_cross_request_boundary():
     """Requests are packed back to back; taps must not cross the boundary."""
     block_size, taps, group_size = 4, 2, 2
@@ -107,6 +110,7 @@ def _block_conv(hidden_size=8, taps=2, group_size=2, seed=3):
     )
 
 
+@pytest.mark.cpu_only
 def test_block_conv_both_sides_share_the_input_projection():
     """``finish`` must use the coefficients ``prepare`` handed back, not a
     reprojection of the sublayer output."""
@@ -140,6 +144,7 @@ def test_block_conv_both_sides_share_the_input_projection():
     )
 
 
+@pytest.mark.cpu_only
 def test_block_conv_rejects_mismatched_checkpoint_shapes():
     generator = torch.Generator().manual_seed(4)
     with pytest.raises(ValueError, match="base_kernel has shape"):
@@ -187,6 +192,7 @@ def _selector_inputs(seed=1):
     )
 
 
+@pytest.mark.cpu_only
 def test_score_edges_matches_sequential_reference():
     """S_t(a, b) = U_t(b) + <A(a) * H(h_t), B(b)>, anchored at position 0."""
     inputs = _selector_inputs()
@@ -214,6 +220,7 @@ def test_score_edges_matches_sequential_reference():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.cpu_only
 def test_score_edges_accumulates_in_fp32():
     """bf16 rounding moves candidate argmaxes, so scores must not inherit the
     draft dtype."""
@@ -229,6 +236,7 @@ def test_score_edges_accumulates_in_fp32():
     assert scores.dtype == torch.float32
 
 
+@pytest.mark.cpu_only
 def test_score_edges_step0_ignores_the_predecessor_axis():
     """All step-0 predecessor slots hold the anchor, so the walk's arbitrary
     entry row is well defined."""
@@ -245,6 +253,7 @@ def test_score_edges_step0_ignores_the_predecessor_axis():
         torch.testing.assert_close(first[:, predecessor], first[:, 0])
 
 
+@pytest.mark.cpu_only
 def test_walk_reads_the_row_of_its_own_previous_choice():
     generator = torch.Generator().manual_seed(5)
     candidate_ids = torch.randint(VOCAB, (B, K, TOP_K), generator=generator)
@@ -260,6 +269,7 @@ def test_walk_reads_the_row_of_its_own_previous_choice():
             predecessor = int(row.argmax())
 
 
+@pytest.mark.cpu_only
 def test_walk_recovers_a_coherent_chain_that_marginal_picks_miss():
     """A decoy scores well under every predecessor but slightly worse than the
     planted chain, so only conditioning on the walk's own choice separates
@@ -297,6 +307,7 @@ def _selector(seed=7):
     )
 
 
+@pytest.mark.cpu_only
 def test_selector_rejects_mismatched_checkpoint_shapes():
     generator = torch.Generator().manual_seed(8)
     with pytest.raises(ValueError, match="predecessor_codebook has shape"):
@@ -329,6 +340,7 @@ def _dflash2_wrapper(**attributes):
     return wrapper
 
 
+@pytest.mark.cpu_only
 def test_select_candidate_path_restricts_logits_to_the_walk():
     """The rewritten rows must reproduce the walk under argmax and carry its
     scores, so both acceptance paths read the proposal distribution."""
@@ -369,6 +381,7 @@ def _worker(mapping=None):
     return worker
 
 
+@pytest.mark.cpu_only
 def test_global_top_k_full_vocab_rewrites_in_place():
     """The single-rank case must not allocate a second full-vocab tensor: a
     [num_gens, K, vocab] copy is hundreds of MB at real vocab sizes."""
@@ -386,6 +399,7 @@ def test_global_top_k_full_vocab_rewrites_in_place():
     torch.testing.assert_close(unary, expected_unary)
 
 
+@pytest.mark.cpu_only
 def test_global_top_k_tp_shards_agree_with_the_full_vocab_result():
     """The selector indexes full-vocab codebooks, so every rank must end up
     with the global candidates the unsharded path would pick."""
@@ -427,6 +441,7 @@ def test_global_top_k_tp_shards_agree_with_the_full_vocab_result():
         torch.testing.assert_close(unary, expected_unary.float())
 
 
+@pytest.mark.cpu_only
 def test_global_top_k_rejects_a_width_it_cannot_interpret():
     worker = _worker(SimpleNamespace(tp_size=2, tp_rank=0, enable_attention_dp=False))
     with pytest.raises(NotImplementedError, match="plain TP column shard"):
@@ -451,6 +466,7 @@ def _bind_drafter(is_dflash2: bool, d2t):
     return worker
 
 
+@pytest.mark.cpu_only
 def test_dflash2_drafter_with_a_remapped_draft_vocab_fails_at_bind():
     """The codebooks are indexed by draft-vocab id, so a d2t remap would score
     the wrong tokens. No DFlash 2 drafter ships one, so it is an invariant
@@ -459,6 +475,7 @@ def test_dflash2_drafter_with_a_remapped_draft_vocab_fails_at_bind():
         _bind_drafter(is_dflash2=True, d2t=torch.zeros(VOCAB, dtype=torch.long))
 
 
+@pytest.mark.cpu_only
 def test_d2t_binding_is_otherwise_unrestricted():
     """Plain DFlash keeps its d2t support, and a DFlash 2 drafter without d2t
     binds and caches the absent map."""
@@ -484,6 +501,7 @@ RELEASED_DFLASH_CONFIG = {
 }
 
 
+@pytest.mark.cpu_only
 def test_architecture_detection():
     """Matching on the "dflash2" stem picks up per-target label variants."""
     assert is_dflash2_checkpoint(["DFlash2DraftModel"], {})
@@ -494,6 +512,7 @@ def test_architecture_detection():
     assert not is_dflash2_checkpoint(None, {})
 
 
+@pytest.mark.cpu_only
 def test_settings_detection():
     """Either DFlash 2 feature's settings declare it without the label."""
     assert is_dflash2_checkpoint(["DFlashDraftModel"], {"conv_kernel_size": 2})
@@ -514,6 +533,7 @@ def _validation_wrapper(**overrides):
     return _dflash2_wrapper(**values)
 
 
+@pytest.mark.cpu_only
 def test_validate_dflash2_config_accepts_the_released_recipe():
     _validation_wrapper()._validate_dflash2_config()
 
@@ -527,12 +547,14 @@ def test_validate_dflash2_config_accepts_the_released_recipe():
         "_dflash2_selector_top_k",
     ],
 )
+@pytest.mark.cpu_only
 def test_validate_dflash2_config_rejects_a_partial_recipe(missing):
     """A partial recipe would silently degrade to DFlash 1 acceptance."""
     with pytest.raises(ValueError, match="missing required dflash_config"):
         _validation_wrapper(**{missing: 0})._validate_dflash2_config()
 
 
+@pytest.mark.cpu_only
 def test_validate_dflash2_config_rejects_a_degenerate_top_k():
     with pytest.raises(ValueError, match="no candidates to choose between"):
         _validation_wrapper(_dflash2_selector_top_k=1)._validate_dflash2_config()
@@ -568,6 +590,7 @@ def _all_sliding_config(sliding_window, num_layers=2, **overrides):
     return SimpleNamespace(**config)
 
 
+@pytest.mark.cpu_only
 def test_released_drafter_attention_is_non_causal_and_symmetrically_windowed():
     """The released config declares is_causal=false with all-sliding layers;
     read as causal it would mask the block's own future positions."""
@@ -586,6 +609,7 @@ def test_released_drafter_attention_is_non_causal_and_symmetrically_windowed():
         assert wrapper._get_attention_mask_args(layer_idx) == (False, (2047, 2047))
 
 
+@pytest.mark.cpu_only
 def test_explicit_is_causal_overrides_the_layer_type_default():
     """Without the flag a sliding layer reads as causal; the flag has to win in
     both directions."""
@@ -611,60 +635,82 @@ def test_explicit_is_causal_overrides_the_layer_type_default():
     assert causal._get_attention_mask_args(1) == (True, (-1, -1))
 
 
-def test_is_causal_is_ignored_for_a_plain_dflash_drafter():
-    """No-regression: an older drafter that happens to carry is_causal must
-    keep resolving its windows the old way."""
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_causal", [None, False, True])
+@pytest.mark.parametrize("explicit_window", [False, True])
+def test_is_causal_is_ignored_for_a_plain_dflash_drafter(is_causal, explicit_window):
+    """No-regression: a plain DFlash drafter keeps the causal windowed decode
+    whatever causality metadata it carries, and whether the window is inferred
+    from the layer types or switched on explicitly; the DSpark override does
+    not reach it."""
     config = SimpleNamespace(
-        is_causal=False,
         num_hidden_layers=2,
         layer_types=["sliding_attention", "full_attention"],
         sliding_window=512,
-        use_sliding_window=True,
     )
+    if is_causal is not None:
+        config.is_causal = is_causal
+    if explicit_window:
+        config.use_sliding_window = True
     wrapper = _mask_wrapper(config, is_dflash2=False)
     assert wrapper._get_attention_mask_args(0) == (True, (511, 0))
     assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
 
 
 # ---------------------------------------------------------------------------
-# TRTLLM block-decode backend: no non-causal sliding window
+# TRTLLM block-decode backend: a non-causal sliding window is lowered to the
+# causal windowed decode plus the future-block merge
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_released_drafter_window_runs_on_two_sided_backends():
     """VANILLA and FA4 hand both window bounds to their kernels."""
     for backend in ("VANILLA", "FA4"):
-        _mask_wrapper(_all_sliding_config(2048), backend=backend).validate_block_attention_windows()
+        assert (
+            _mask_wrapper(
+                _all_sliding_config(2048), backend=backend
+            ).validate_block_attention_windows()
+            == []
+        )
 
 
-def test_trtllm_backend_rejects_the_released_drafter_window():
+@pytest.mark.cpu_only
+def test_trtllm_backend_lowers_the_released_drafter_window():
     """flashinfer's trtllm-gen context kernel refuses causal=False with any
-    finite window_left, so the released non-causal 2048 window cannot run."""
+    finite window_left, so the released non-causal 2048 window runs as the
+    causal windowed decode plus the future-block merge."""
     wrapper = _mask_wrapper(_all_sliding_config(2048), backend="TRTLLM")
-    with pytest.raises(ValueError, match="non-causally within a 2048-token sliding window"):
-        wrapper.validate_block_attention_windows()
+    assert wrapper.validate_block_attention_windows() == ["causal decode + future-block merge"] * 2
 
 
-def test_trtllm_backend_accepts_causal_or_unwindowed_layers():
-    # A causal sliding window is supported by the kernel.
-    _mask_wrapper(
-        _all_sliding_config(4, is_causal=True), backend="TRTLLM"
-    ).validate_block_attention_windows()
-    # No window at all, either.
-    _mask_wrapper(
-        SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
-        backend="TRTLLM",
-    ).validate_block_attention_windows()
+@pytest.mark.cpu_only
+def test_trtllm_backend_keeps_causal_and_unwindowed_layers_on_their_kernels():
+    # A causal sliding window is supported by the decode kernel directly.
+    assert (
+        _mask_wrapper(
+            _all_sliding_config(4, is_causal=True), backend="TRTLLM"
+        ).validate_block_attention_windows()
+        == ["causal decode"] * 2
+    )
+    # No window at all runs the non-causal context kernel.
+    assert (
+        _mask_wrapper(
+            SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
+            backend="TRTLLM",
+        ).validate_block_attention_windows()
+        == ["non-causal context"] * 2
+    )
 
 
+@pytest.mark.cpu_only
 def test_trtllm_window_check_reads_the_use_swa_override():
     """A use_swa window replaces the checkpoint-inferred one in the block
     decode, so the check must resolve the same window the forward uses."""
     config = SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2)
     wrapper = _mask_wrapper(config, backend="TRTLLM", layer_windows=[(3, 3), (3, 3)])
     assert wrapper._resolve_block_attention(0) == (False, (3, 3))
-    with pytest.raises(ValueError, match="draft layer 0"):
-        wrapper.validate_block_attention_windows()
+    assert wrapper.validate_block_attention_windows() == ["causal decode + future-block merge"] * 2
 
 
 # ---------------------------------------------------------------------------

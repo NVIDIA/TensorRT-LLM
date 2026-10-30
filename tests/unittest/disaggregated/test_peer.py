@@ -28,6 +28,7 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     IntactMapper,
     NHDHeadMismatchMapper,
     ReplicatedMapper,
+    RingMapper,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
@@ -873,6 +874,70 @@ def test_replicated_pool_owner_rotates_by_destination_dp_rank(peer_dp_rank):
     # slot selected by the destination dp rank.
     assert sum(ownership) == 1
     assert ownership.index(True) == peer_dp_rank % 8
+
+
+@pytest.mark.parametrize(
+    "peer_block_bytes,expected_mapper",
+    [(1344, RingMapper), (1024, ReplicatedMapper)],
+    ids=["ring_sizes_differ", "ring_sizes_match"],
+)
+def test_ring_views_move_positions_only_when_ring_sizes_differ(peer_block_bytes, expected_mapper):
+    """A 16-slot ring feeding a 21-slot ring needs the position-wise mapper.
+
+    Equal rings keep every position in the same slot, so the region copy is
+    already exact and stays in use.
+    """
+    self_pt = make_page_table(global_layer_ids=[0], block_bytes=[1024])
+    peer_pt = make_page_table(global_layer_ids=[0], block_bytes=[peer_block_bytes])
+    for page_table in (self_pt, peer_pt):
+        view = page_table.layer_groups[0].pool_views[0]
+        view.pool_role = frozenset({"mla_hp_tail"})
+        view.mapper_kind = MapperKind.REPLICATED
+        view.ring_slot_bytes = 64
+
+    reg = _make_peer_registrar(
+        make_rankinfo(instance_name="local", kv_heads_per_rank=1, page_table=self_pt)
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=4,
+        tp_size=1,
+        kv_heads_per_rank=1,
+        layer_num_per_pp=[1],
+        page_table=peer_pt,
+    )
+    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    assert type(mapper) is expected_mapper
+    if expected_mapper is RingMapper:
+        assert (mapper.src_num_slots, mapper.dst_num_slots) == (16, 21)
+        assert mapper.retained_positions == 16
+
+
+def test_ring_mapper_splits_positions_where_either_ring_wraps():
+    """Positions 30..45 of a 16-slot ring land in their slots of a 21-slot ring."""
+    mapper = RingMapper([0, 100], [0, 200], slot_bytes=2, src_num_slots=16, dst_num_slots=21)
+    pairs = mapper.map_positions(np.array([1000]), np.array([5000]), [(30, 46)])
+
+    moved = {}
+    for pair in pairs:
+        size = pair.src.memory.bytes_per_region
+        assert pair.dst.memory.bytes_per_region == size
+        for src, dst in zip(pair.src.memory.ptrs.tolist(), pair.dst.memory.ptrs.tolist()):
+            for i in range(size // 2):
+                moved[src + 2 * i] = dst + 2 * i
+    expected = {
+        1000 + layer_src + (p % 16) * 2: 5000 + layer_dst + (p % 21) * 2
+        for layer_src, layer_dst in ((0, 0), (100, 200))
+        for p in range(30, 46)
+    }
+    assert moved == expected
+    # Runs break at src slot 16 (p=32) and dst slot 21 (p=42): 2 + 10 + 4.
+    assert sorted(pair.src.memory.bytes_per_region // 2 for pair in pairs) == [2, 4, 10]
+
+    with pytest.raises(ValueError, match="positions both rings retain"):
+        mapper.map_positions(np.array([1000]), np.array([5000]), [(29, 46)])
+    with pytest.raises(NotImplementedError):
+        mapper.map(None, None)
 
 
 def test_peer_registrar_tpb_divisible_warns_but_compatible():
