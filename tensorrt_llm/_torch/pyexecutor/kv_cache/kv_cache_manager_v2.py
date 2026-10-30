@@ -1860,12 +1860,22 @@ class KVCacheManagerV2(BaseResourceManager):
             and getattr(kv_cache_config, "mixed_precision_kv", None) is not None
         ):
             raise ValueError("layer_specs does not support mixed-precision KV cache.")
+        # The cold-page retained window follows the draft rule of kv_cache_config.dtype:
+        # MTP layers go mixed with the target, a drafter with its own architecture
+        # keeps a plain cache (its separate manager takes no window).
+        window_provider = cold_page_codec_provider
+        if (
+            is_draft
+            and spec_config is not None
+            and not spec_config.spec_dec_mode.is_mtp_one_model()
+        ):
+            window_provider = None
         self._init_mixed_precision(
             kv_cache_config,
             kwargs.get("pretrained_config"),
             max_seq_len,
             dtype,
-            cold_page_codec_provider=cold_page_codec_provider,
+            cold_page_codec_provider=window_provider,
         )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg

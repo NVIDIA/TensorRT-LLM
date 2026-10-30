@@ -4481,6 +4481,26 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                      kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
                                                    dtype="mixed_nvfp4_fp8"),
                      kv_cache_compression_config=retained)
+    # Speculative decoding is allowed, except dynamic-tree drafting.
+    TorchLlmArgs(model="/tmp/dummy_model",
+                 kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+                 kv_cache_compression_config=retained,
+                 speculative_config={
+                     "decoding_type": "MTP",
+                     "num_nextn_predict_layers": 1
+                 })
+    with pytest.raises(NotImplementedError, match="dynamic-tree"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+            kv_cache_compression_config=retained,
+            speculative_config={
+                "decoding_type": "MTP",
+                "num_nextn_predict_layers": 1,
+                "max_draft_len": 1,
+                "use_dynamic_tree": True,
+                "dynamic_tree_max_topK": 2,
+            })
     # Plain cold-page compression keeps its unrestricted backend choice.
     TorchLlmArgs(
         model="/tmp/dummy_model",

@@ -413,6 +413,56 @@ def test_separate_mtp_draft_manager_goes_mixed(make_manager):
     assert manager.high_layers == {0: 1}
 
 
+@pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
+def test_cold_page_window_appended_draft_layers(make_manager, drafter):
+    """The cold-page window follows the same rule: MTP layers get twins, an Eagle3 layer does not."""
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+
+    spec_config = (
+        MTPDecodingConfig(num_nextn_predict_layers=1)
+        if drafter == "mtp"
+        else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
+    )
+    provider = _ColdPageProvider()
+    manager = make_manager(
+        config=cold_page_config(pool_ratio=None),
+        num_layers=2,
+        spec_config=spec_config,
+        cold_page_codec_provider=provider,
+    )
+    assert manager.pp_layers == [0, 1, 2]
+    assert manager.high_layers == ({0: 3, 1: 4, 2: 5} if drafter == "mtp" else {0: 3, 1: 4})
+    # Every twin stays out of the cold-page codec.
+    assert [call["retained_layers"] for call in provider.calls] == [
+        tuple(manager.high_layers.values())
+    ]
+
+
+@pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
+def test_cold_page_window_separate_draft_manager(make_manager, drafter):
+    """A separate MTP draft manager takes the cold-page window; another drafter keeps a plain cache."""
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+
+    spec_config = (
+        MTPDecodingConfig(num_nextn_predict_layers=1)
+        if drafter == "mtp"
+        else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
+    )
+    provider = _ColdPageProvider()
+    manager = make_manager(
+        config=cold_page_config(pool_ratio=None),
+        num_layers=1,
+        layer_mask=[False, False, True],
+        spec_config=spec_config,
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+        is_draft=True,
+        cold_page_codec_provider=provider,
+    )
+    assert manager.pp_layers == [2]
+    assert manager.high_layers == ({0: 1} if drafter == "mtp" else {})
+    assert [call["is_draft"] for call in provider.calls] == [True]
+
+
 def test_mixed_precision_page_tables_match_base_page_indices(make_manager):
     """The batched page-table gather equals reading each request's base page indices."""
     import numpy as np

@@ -7256,8 +7256,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"attention algorithms; got {sparse.algorithm!r}.")
         if hot and self.kv_cache_compression_config is not None:
             raise ValueError(
-                "Mixed-precision KV is not supported together with cold-page "
-                "compression.")
+                "Mixed-precision KV currently requires single-beam execution "
+                "without cold-page compression.")
         if self.max_beam_width != 1:
             raise ValueError(f"{feature} requires single-beam execution.")
         if getattr(self.speculative_config, "use_dynamic_tree", False):
@@ -7265,10 +7265,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"{feature} does not support dynamic-tree speculative "
                 "decoding, which moves accepted KV rows inside the cache pools."
             )
-        if cold and self.speculative_config is not None:
-            raise ValueError(
-                f"{feature} currently requires single-beam execution without "
-                "speculative decoding.")
         return self
 
     @model_validator(mode="after")
