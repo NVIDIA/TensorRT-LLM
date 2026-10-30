@@ -21,12 +21,12 @@ l0_h100:
   # Covers the GPU cases of tests/unittest/_torch/attention/ on H100; its cpu_only cases
   # run on CPU (l0_cpu). kernels/ has no entry of its own on any list, so this entry is
   # what runs it here. multi_gpu/ cases need >= 2 GPUs and most also need Blackwell, so
-  # they skip here and run on Blackwell multi-GPU stages: l0_gb300 (post_merge)
+  # they skip here and run on Blackwell multi-GPU stages: l0_gb300_multi_gpus (post_merge)
   # and l0_dgx_b300, which runs test_helix_zero_kv.py in its pre_merge block and the rest
   # in post_merge. Collecting them still runs their helix files' import-time rebinding of
   # mpi4py's serializer, which applies to the whole pytest process.
   # The GPU cases of kernels/parallel_hw_agnostic/ run here; l0_b200 and l0_b300 ignore
-  # that directory, so on Blackwell only GB300 (l0_gb300, post_merge) runs them.
+  # that directory, so on Blackwell only GB300 (l0_gb300_multi_gpus, post_merge) runs them.
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
@@ -58,7 +58,7 @@ l0_h100:
   # Any-CUDA (Triton trtllm::situ_and_mul op + torch reference, requires_cuda
   # only; not SM100/SM103-gated), so they run on Hopper rather than consuming
   # scarce Blackwell pre-merge capacity. The Blackwell-gated K3 suites live in
-  # l0_b200.yml / l0_gb300.yml. (TRTLLM-15177)
+  # l0_b200.yml / l0_gb300_multi_gpus.yml. (TRTLLM-15177)
   - unittest/_torch/moe/test_kimi_k3_mlp.py
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py
   - unittest/_torch/moe/test_kimi_k3_situ_and_mul.py

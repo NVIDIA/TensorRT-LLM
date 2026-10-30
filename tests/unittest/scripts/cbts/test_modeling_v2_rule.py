@@ -51,7 +51,7 @@ def rule(tmp_path) -> ModelingV2Rule:
             ],
         ),
         Block(
-            yaml_stem="l0_gb300",
+            yaml_stem="l0_gb300_multi_gpus",
             block_index=0,
             condition={},
             tests=[_COMM, _DEEPSEEK_ACCURACY],
@@ -61,7 +61,9 @@ def rule(tmp_path) -> ModelingV2Rule:
     ]
     stages = {
         "B300-PyTorch-1": Stage("B300-PyTorch-1", "l0_b300", "aarch64", 1, 2),
-        "GB300-4_GPUs-PyTorch-1": Stage("GB300-4_GPUs-PyTorch-1", "l0_gb300", "aarch64", 1, 1),
+        "GB300-4_GPUs-PyTorch-1": Stage(
+            "GB300-4_GPUs-PyTorch-1", "l0_gb300_multi_gpus", "aarch64", 1, 1
+        ),
         "B200-PyTorch-1": Stage("B200-PyTorch-1", "l0_b200", "x86_64", 1, 1),
         "CPU-Generic-x86-1": Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1),
     }
