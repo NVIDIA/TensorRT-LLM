@@ -1351,7 +1351,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # ceil(hidden / 64) * 4 == megamoe_activation_sf_bytes_per_row(hidden)``;
         # ``hidden // 16`` is short by 2 bytes for hidden % 64 != 0
         # (1568, 1632, 2080, ...) and triggers a host copy_ shape
-        # mismatch in the backend's ``_stage_inputs``. See dispatch
+        # mismatch in ``MegaMoeWorkspace.stage_inputs``. See dispatch
         # kernel sf_addr formula in dispatch_kernel.py.
         activation_sf: torch.Tensor  # (max_T, sf_bytes_per_row) uint8 (FP8 SF)
         topk_weights: torch.Tensor  # (max_T, num_topk) float32

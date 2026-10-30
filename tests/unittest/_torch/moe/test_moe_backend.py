@@ -2064,9 +2064,10 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
     built; re-selecting a device here would move later layers to another GPU.
     """
     import tensorrt_llm._utils as utils
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe.cute_dsl_runtime import (
+        maybe_init_torch_dist_under_mpi,
+    )
 
-    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
-    moe.ep_size = 8
     mpi_comm = MagicMock()
     mpi_comm.bcast.return_value = ("127.0.0.1", "29500")
     local_mpi_comm = MagicMock()
@@ -2085,7 +2086,7 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
     monkeypatch.setattr(torch.cuda, "set_device", set_device)
 
-    moe._maybe_init_torch_dist_under_mpi()
+    maybe_init_torch_dist_under_mpi(ep_size=8)
 
     set_device.assert_not_called()
     # Split_type is a collective; it must not run in this bootstrap.
