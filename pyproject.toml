@@ -857,9 +857,6 @@ search-path = ["."]
 python-version = "3.10"
 check-unannotated-defs = true
 infer-return-types = "never"
-baseline = "scripts/pyrefly_baseline.json"
-baseline-matching-mode = "column-ordered"
-baseline-format = "full"
 ignore-missing-imports = [
     "torch.*",
     "tensorrt_llm.bindings",

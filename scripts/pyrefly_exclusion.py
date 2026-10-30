@@ -146,8 +146,7 @@ def matches_symbol_reference(name: str, patterns: tuple[str, ...]) -> bool:
         if pattern.endswith(".*"):
             prefix = pattern[:-2].split(".")
             if any(
-                parts[index : index + len(prefix)] == prefix
-                and len(parts) > index + len(prefix)
+                parts[index : index + len(prefix)] == prefix and len(parts) > index + len(prefix)
                 for index in range(len(parts))
             ):
                 return True

@@ -1614,10 +1614,10 @@ repos:
           ^(\.claude/skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
     -   id:  type-check
         name: Record advisory Pyrefly type-check report
-        entry: scripts/run_pyrefly.sh
+        entry: scripts/run_pyrefly.sh --rebase-upstream
         language: script
         verbose: true
         require_serial: true
         # Pass changed paths; the wrapper skips non-product Python inputs.
         pass_filenames: true
-        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(pyrefly_exclusion\.json|pyrefly_baseline\.json|run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)
+        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(pyrefly_exclusion\.json|run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)
