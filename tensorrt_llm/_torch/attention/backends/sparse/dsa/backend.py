@@ -21,7 +21,11 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..mixed_precision_retained_rows import overlay_retained_rows
+from ..mixed_precision_retained_rows import (
+    gather_pool_rows_for_context,
+    gather_pool_rows_for_generation,
+    overlay_retained_rows,
+)
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -243,6 +247,19 @@ class DSATrtllmAttention(TrtllmAttention):
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
 
+        if metadata.has_mixed_precision_retained_rows and not is_generation:
+            # Plain pool with retained-token twins: the NVFP4 shape, with a copy for the gather.
+            metadata.nvfp4_mla_context_fp8_scratch = None
+            scratch, compact_indices = gather_pool_rows_for_context(
+                metadata, local_layer_idx, topk_indices
+            )
+            overlay_retained_rows(
+                self, metadata, topk_indices, metadata._cached_req_idx_ctx, compact_indices, scratch
+            )
+            metadata.nvfp4_mla_context_fp8_scratch = scratch
+            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
+            return compact_indices, None
+
         topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
 
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
@@ -280,6 +297,34 @@ class DSATrtllmAttention(TrtllmAttention):
                 )
             # Static sparse MLA treats indices as offsets from kvPtr. Feed it
             # compact offsets and the FP8 scratch base; TRTLLMGen is unchanged.
+            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
+            return compact_indices, None
+
+        if metadata.has_mixed_precision_retained_rows:
+            # Plain pool with retained-token twins: the NVFP4 shape, with a copy for the gather.
+            scratch = metadata.nvfp4_mla_fp8_scratch
+            compact_indices = metadata.nvfp4_mla_compact_indices
+            if scratch is None or compact_indices is None:
+                raise RuntimeError("MLA scratch buffers were not allocated")
+            num_rows = topk_indices_global.shape[0]
+            if num_rows > scratch.shape[0] or num_rows > compact_indices.shape[0]:
+                raise RuntimeError(
+                    "MLA generation rows exceed the allocated MTP workspace: "
+                    f"requested {num_rows}, capacity {scratch.shape[0]}"
+                )
+            scratch = scratch[:num_rows]
+            compact_indices = compact_indices[:num_rows]
+            gather_pool_rows_for_generation(
+                metadata._cached_pool_view, topk_indices_global, scratch, compact_indices
+            )
+            overlay_retained_rows(
+                self,
+                metadata,
+                topk_indices,
+                metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens],
+                compact_indices,
+                scratch,
+            )
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
 

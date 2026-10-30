@@ -45,6 +45,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
                                           DSparkDecodingConfig,
@@ -4501,6 +4502,20 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                 "use_dynamic_tree": True,
                 "dynamic_tree_max_topK": 2,
             })
+    # DSA reads the retained rows through the same gather as the mixed-precision
+    # KV cache; DeepSeek-V4 is pending.
+    TorchLlmArgs(model="/tmp/dummy_model",
+                 kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+                 kv_cache_compression_config=retained,
+                 sparse_attention_config=DeepSeekSparseAttentionConfig(
+                     index_head_dim=128))
+    with pytest.raises(NotImplementedError, match="deepseek_v4"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+            kv_cache_compression_config=retained,
+            sparse_attention_config=DeepSeekV4SparseAttentionConfig(
+                index_head_dim=128, window_size=128, compress_ratios=[1, 4]))
     # Plain cold-page compression keeps its unrestricted backend choice.
     TorchLlmArgs(
         model="/tmp/dummy_model",

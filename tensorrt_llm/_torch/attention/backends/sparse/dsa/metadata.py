@@ -16,7 +16,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import binding_to_torch_dtype, get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
@@ -935,10 +935,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
 
     def _create_nvfp4_mla_generation_buffers(self, capture_graph=False):
-        """Allocate stable NVFP4 gather outputs for all MTP generation rows."""
+        """Allocate stable gather outputs for all MTP generation rows.
+
+        An NVFP4 pool dequantizes into FP8 rows; a plain pool with retained-token twins
+        copies rows of its own dtype.
+        """
         self.nvfp4_mla_fp8_scratch = None
         self.nvfp4_mla_compact_indices = None
-        if getattr(self.kv_cache_manager, "dtype", None) != tensorrt_llm.bindings.DataType.NVFP4:
+        pool_dtype = getattr(self.kv_cache_manager, "dtype", None)
+        if pool_dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            scratch_dtype = torch.float8_e4m3fn
+        elif self.retained_block_table is not None:
+            scratch_dtype = binding_to_torch_dtype(pool_dtype)
+        else:
             return
 
         # MTP verifies the current token and max_draft_tokens draft tokens for
@@ -955,7 +964,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.kv_cache_manager.head_dim,
             ),
             cache_name="nvfp4_mla_fp8_scratch",
-            dtype=torch.float8_e4m3fn,
+            dtype=scratch_dtype,
             capture_graph=capture_graph,
         )
         self.nvfp4_mla_compact_indices = self.get_empty(

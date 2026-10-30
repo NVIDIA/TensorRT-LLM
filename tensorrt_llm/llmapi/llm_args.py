@@ -7265,6 +7265,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"{feature} does not support dynamic-tree speculative "
                 "decoding, which moves accepted KV rows inside the cache pools."
             )
+        if cold and sparse is not None and sparse.algorithm == "deepseek_v4":
+            # Its compressed-pool read path is not wired for a plain pool yet.
+            raise NotImplementedError(
+                f"{feature} are not supported with the deepseek_v4 sparse "
+                "attention algorithm yet.")
         return self
 
     @model_validator(mode="after")
