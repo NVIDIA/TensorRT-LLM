@@ -198,6 +198,25 @@ FROM ${DEVEL_IMAGE} AS release
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb
 
 WORKDIR /app/tensorrt_llm
+# An external devel image can retain an older native trust store.
+RUN --mount=type=bind,source=docker/common/verify_system_ca.py,target=/tmp/verify_system_ca.py \
+    . /etc/os-release && \
+    case "${ID}" in \
+      ubuntu) \
+        apt-get update && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates && \
+        update-ca-certificates --fresh ;; \
+      rocky) \
+        dnf --refresh upgrade -y ca-certificates && \
+        update-ca-trust extract ;; \
+      *) echo "Unsupported base OS: ${ID}" >&2; exit 1 ;; \
+    esac && \
+    python3 /tmp/verify_system_ca.py && \
+    if [ "${ID}" = "ubuntu" ]; then \
+        apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    else \
+        dnf clean all; \
+    fi
 ARG GITHUB_MIRROR=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
     if [ -n "$GITHUB_MIRROR" ]; then \
