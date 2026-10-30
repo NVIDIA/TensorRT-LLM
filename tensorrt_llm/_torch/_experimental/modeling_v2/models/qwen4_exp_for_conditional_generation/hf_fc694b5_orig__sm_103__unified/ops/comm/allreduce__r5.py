@@ -169,7 +169,7 @@ class Allreduce(OpWrapper):
             spec=dict(world=8, rows=8192, **_DEEPSEEK),
         ),
         # Qwen3.8-Flash-Next at tp4 / tep4. AUTO takes the one-shot IPC kernel
-        # up to 1024 rows and NCCL from 2048 (see `note`).
+        # below 2048 rows and NCCL from 2048 (see `note`).
         Cell(
             why="qwen4 plain sum, decode, one token, tp4: the one-shot kernel",
             spec=dict(world=4, rows=1, **_QWEN4),
@@ -201,11 +201,12 @@ class Allreduce(OpWrapper):
     (`AllreduceOp::selectImplementation`). It goes to NCCL when the message
     outgrows the IPC workspace (64 MiB, `getMaxRequiredWorkspaceSize`, and
     `max_workspace_size_auto` on the Python side). Otherwise it reads
-    `selectStrategyLookUpTable`, keyed by `log2(hidden)` truncated, so hidden
-    2560 reads the 2048 row. At world 4 with `NONE` on sm_10x that row
-    picks ONESHOT up to 1024 rows and NCCL from 2048 rows. So the 1, 128 and
-    1024-row cells run the one-shot IPC kernel, and the 8192-row cell (40 MiB,
-    inside the workspace) runs NCCL.
+    `selectStrategyLookUpTable`, keyed by `log2(hidden)` and `log2(rows)`,
+    both truncated, so hidden 2560 reads the 2048 row. At world 4 with `NONE`
+    on sm_10x that row picks ONESHOT for every row bucket below 2048 (1 to
+    2047 rows) and NCCL from 2048 rows. So the 1, 128 and 1024-row cells run
+    the one-shot IPC kernel, and the 8192-row cell (40 MiB, inside the
+    workspace) runs NCCL. 1025 to 2047 rows share the 1024 cell's bucket.
 
     `NONE` returns the sum alone; `residual`, `norm_weight` and `eps` are
     not read, and the caller adds its own residual.
