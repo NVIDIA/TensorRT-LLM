@@ -3776,6 +3776,18 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"internal layers {unnamed} are no local layers, and the manager names no "
                     "model layer for them (_virtual_layers, _page_layer_ids)"
                 )
+            # Internal layer i is the stage's i-th model layer, as layer_offsets numbers it.
+            offsets = getattr(self, "layer_offsets", None)
+            if offsets is not None:
+                renumbered = [
+                    lid for lid in internal if offsets.get(int(self.pp_layers[lid])) != lid
+                ]
+                if renumbered:
+                    raise ValueError(
+                        f"internal layers {renumbered} are not the local index layer_offsets gives "
+                        "their model layers; a manager numbering its layers otherwise names them "
+                        "(_layer_attn_to_layer_id, _page_layer_ids)"
+                    )
             return {lid: (int(self.pp_layers[lid]),) * 2 for lid in internal}
         types_of, num_types = virtual
         unnamed = [lid for lid in internal if lid not in types_of]

@@ -1386,6 +1386,19 @@ def test_layers_named_for_model_layers_the_stage_lacks_or_alike_are_refused():
         manager.get_page_table()
 
 
+@pytest.mark.cpu_only
+def test_layers_numbered_otherwise_than_layer_offsets_are_refused():
+    """The default naming takes internal layer ``i`` for the stage's ``i``-th model layer, as
+    ``layer_offsets`` numbers it; a manager renumbering its storage without naming its layers
+    would name each by another model layer, and is refused."""
+    manager = Manager([kv_group(lids=(0, 1))], pp_layers=[4, 5])
+    manager.layer_offsets = {4: 0, 5: 1}
+    assert manager.get_page_table().page_layout.layer_groups[0].model_layers == (4, 5)
+    manager.layer_offsets = {4: 1, 5: 0}
+    with pytest.raises(ValueError, match=r"internal layers \[0, 1\] are not the local index"):
+        manager.get_page_table()
+
+
 def stage_placed(pp_layers):
     """A stage of a manager keeping a request-wide cache in a virtual layer of its own, attached
     to the stage's first model layer."""
