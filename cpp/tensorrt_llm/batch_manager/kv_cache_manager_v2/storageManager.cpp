@@ -1844,6 +1844,14 @@ void StorageManager::shrinkPoolGroupToWindow(CacheLevel level, PoolGroupIndex pg
         if (!target.contains(s->slot().slotId()))
             overflowScratch.push_back(s);
     }
+    // The callers gather these by iterating KvCache pointers (a std::set ordered by address), so their order differs
+    // between processes. Relocation hands out free slots in list order, so sort by slot id: TP ranks must end up
+    // with the same slot layout, because later shrinks evict and migrate by slot position.
+    auto const bySlotId = [](auto const& a, auto const& b) { return a->slotId() < b->slotId(); };
+    std::sort(overflowPersistent.begin(), overflowPersistent.end(), bySlotId);
+    std::sort(overflowLocked.begin(), overflowLocked.end(), bySlotId);
+    std::sort(overflowScratch.begin(), overflowScratch.end(),
+        [](ScratchSlotLock const* a, ScratchSlotLock const* b) { return a->slot().slotId() < b->slot().slotId(); });
     // Pages that must move and cannot be evicted.
     SlotCount const numMustMove = numOverflowPersistent
         + slotCountValueFromSize(overflowLocked.size() + overflowScratch.size());
