@@ -129,6 +129,16 @@ def _build(spec, seed: int, pool=None):
         used += cols
         allocated_cols.append(cols)
     assert used <= pages and len(segments) <= slots, "pool or table too small for the batch"
+    if spec.get("last_page") is not None:
+        # The named request's last page becomes the pool's last slot; the live entry that held
+        # it, if any, takes the swapped-out page, so the live pages stay distinct.
+        r = spec["last_page"]
+        column = allocated_cols[r] - 1
+        live = table[: len(segments)]
+        holder = (live == pages - 1).nonzero()
+        if holder.numel():
+            live[holder[0, 0], holder[0, 1]] = live[r, column]
+        live[r, column] = pages - 1
     if spec["hole"] is not None:
         request, position = _hole(spec, table, allocated_cols)
         requests.append(request)
@@ -167,10 +177,6 @@ def _build(spec, seed: int, pool=None):
 
 def _snapshot(pool):
     return tuple(t.clone() for t in pool)
-
-
-def _pools_equal(a, b) -> bool:
-    return all(torch.equal(x, y) for x, y in zip(a, b))
 
 
 def _graph_replay(spec, seed: int, graph_batches) -> None:
@@ -327,7 +333,30 @@ def _thop_equality(spec, seed: int) -> None:
         cached = [c + n for c, n in zip(cached, new)]
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def _wrote(planes) -> bool:
+    """Whether any byte of the call's four planes moved off its sentinel."""
+    fills = (DATA_FILL, DATA_FILL, SCALE_FILL, SCALE_FILL)
+    return any(bool((plane != fill).any()) for plane, fill in zip(planes, fills))
+
+
+def _assert_straddles(spec, args) -> None:
+    """The request named by `last_page` stores into the pool's last slot, which lies past
+    2^31 bytes of both the data and the scale plane: every offset has to be formed in 64 bits."""
+    row = sum(n for _, n in spec["segments"][: spec["last_page"] + 1]) - 1
+    column = int(args["logical_positions"][row]) // spec["tokens_per_block"]
+    request = int(args["request_indices"][row])
+    assert int(args["block_table"][request, column]) == spec["pages"] - 1
+    for name in ("k_cache", "k_scale_cache"):
+        assert (spec["pages"] - 1) * args[name].stride(0) >= 2**31, (name, args[name].stride())
+
+
+# A pool sized to a member's measured page count does not fit a normal cell's 40 GiB.
+_CELL_PARAMS = [
+    pytest.param(c, marks=pytest.mark.large) if c.spec.get("large") else c for c in op.CELLS
+]
+
+
+@pytest.mark.parametrize("cell", _CELL_PARAMS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
     seed = zlib.crc32(cell.why.encode())
@@ -335,13 +364,13 @@ def test_certified_cells(cell, certifying):  # noqa: F811
         _thop_equality(cell.spec, seed=seed)
         return
     args, pool, _ = _build(cell.spec, seed=seed)
-    before = _snapshot(pool)
+    if cell.spec.get("last_page") is not None:
+        _assert_straddles(cell.spec, args)
     ref = op.reference(**args)
     out = op(**args)
     assert out[0] is args["k_cache"] and out[3] is args["v_scale_cache"]
     _compare(out, ref)
-    wrote = not _pools_equal(pool, before)
-    assert wrote == bool(cell.spec["segments"]), (
+    assert _wrote(_planes(args)) == bool(cell.spec["segments"]), (
         "a cell with rows must write, an empty one must not"
     )
     _assert_other_roles_untouched(cell.spec, pool)
