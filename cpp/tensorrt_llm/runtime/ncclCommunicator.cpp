@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
@@ -171,7 +172,9 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
     }
     mpiComm.bcastValue(id, 0);
     ncclComm_t comm;
+    auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
     TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
+    tensorrt_llm::common::recordNativeAllocationMeasured("nccl_communicators", freeBefore);
     return comm;
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable

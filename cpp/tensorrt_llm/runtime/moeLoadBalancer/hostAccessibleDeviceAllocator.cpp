@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 
 namespace tensorrt_llm::runtime
 {
@@ -349,6 +350,17 @@ void HostAccessibleDeviceAllocator::memcpyToDevice(void* dst, void const* src, s
     }
 }
 
+char const* HostAccessibleDeviceAllocator::nativeMemoryLabel(bool gdr) const
+{
+    // Only the GDRCopy path is plain device memory. The NUMA path maps the GPU's memory as a host NUMA node and the
+    // fallback is managed memory; neither is reliably in the device's per-process usage, so they are kept apart.
+    if (gdr)
+    {
+        return "eplb_device";
+    }
+    return mGpuMemNumaId >= 0 ? "eplb_gpu_numa" : "eplb_managed";
+}
+
 void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
 {
     int currentDevId = -1;
@@ -380,6 +392,8 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
         hostPtr = devPtr;
     }
     recordAllocation(devPtr, memorySize, hostPtr, memDesc);
+    tensorrt_llm::common::recordNativeAllocation(
+        nativeMemoryLabel(memDesc != nullptr), currentDevId, static_cast<std::int64_t>(memorySize));
     return devPtr;
 }
 
@@ -405,6 +419,8 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
                 mAllowManagedFallback, "HostAccessibleDeviceAllocator is not supported on the current system.");
             TLLM_CUDA_CHECK(cudaFree(ptr));
         }
+        tensorrt_llm::common::recordNativeRelease(
+            nativeMemoryLabel(allocInfo.memDesc != nullptr), mDevId, static_cast<std::int64_t>(allocInfo.size));
         void* hostPtr = it->second.hostPtr;
         TLLM_CHECK_WITH_INFO(mHostAllocations.count(hostPtr) == 1, "host pointer not recorded.");
         mDeviceAllocations.erase(it);

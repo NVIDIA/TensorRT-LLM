@@ -215,6 +215,26 @@ def _multi_pg_logic(rank: int, world_size: int):
         )
 
 
+def _slot_memory_logic(rank: int, world_size: int):
+    """A slot's send and symmetric receive buffers are outside PyTorch's
+    allocator; the op records both in the native memory ledger."""
+    device = torch.device(f"cuda:{rank}")
+
+    def recorded():
+        labels, counts, sizes = torch.ops.trtllm.get_native_memory_usage(rank)
+        usage = dict(zip(labels, zip(counts, sizes)))
+        return usage.get("ulysses_a2a_slots", (0, 0))
+
+    B, S_local, H, D = 2, 64, world_size * 8, 128
+    x = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device=device)
+    # A group of its own gets a fresh slot ring, whatever ran in this worker before.
+    pg = dist.new_group(ranks=list(range(world_size)))
+    count, size = recorded()
+    torch.ops.trtllm.ulysses_a2a_async_prepare(x, pg.boxed())
+    torch.cuda.synchronize()
+    assert recorded() == (count + 1, size + 2 * x.numel() * x.element_size())
+
+
 def _run(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
@@ -245,3 +265,8 @@ def test_multi_pg():
     so each must yield its own cached ``AsyncUlyssesOp`` instance + slot ring.
     """
     _run(2, _multi_pg_logic)
+
+
+def test_slot_memory_is_recorded():
+    """Each new slot shows up in the native memory ledger the memory monitor reads."""
+    _run(2, _slot_memory_logic)

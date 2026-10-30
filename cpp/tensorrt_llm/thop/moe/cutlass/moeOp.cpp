@@ -32,6 +32,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
@@ -488,6 +489,8 @@ public:
             auto const cu_free_status = cudaFree(mProfileWorkspace);
             TORCH_CHECK(
                 cu_free_status == cudaSuccess, "Can't free profile workspace during FusedMoeRunner destruction.");
+            tensorrt_llm::common::recordNativeRelease(
+                kProfileWorkspaceLabel, mProfileWorkspaceDevice, static_cast<std::int64_t>(mProfileWorkspaceSize));
         }
     }
 
@@ -1215,6 +1218,10 @@ public:
             size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
             auto const cu_malloc_status = cudaMalloc(&mProfileWorkspace, profile_workspace_size);
             TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
+            mProfileWorkspaceSize = profile_workspace_size;
+            TLLM_CUDA_CHECK(cudaGetDevice(&mProfileWorkspaceDevice));
+            tensorrt_llm::common::recordNativeAllocation(
+                kProfileWorkspaceLabel, mProfileWorkspaceDevice, static_cast<std::int64_t>(mProfileWorkspaceSize));
 
             mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, stream);
         }
@@ -1240,6 +1247,10 @@ private:
     // e.g. 16 nvfp4 elements are packed into a single int64 element
     int64_t mInnerDimMultiplier;
     char* mProfileWorkspace = nullptr;
+    // Held from a profiling preparation until the next MoE run, preparation or destruction.
+    size_t mProfileWorkspaceSize = 0;
+    int mProfileWorkspaceDevice = 0;
+    static constexpr char const* kProfileWorkspaceLabel = "moe_gemm_profiler_workspace";
     std::map<std::pair<int, cudaStream_t>, WorkspaceInfo> mStreamWorkspaces;
     ActivationParamBuffers mActivationParamBuffers;
 
@@ -1396,6 +1407,9 @@ private:
             TORCH_CHECK(cu_free_status == cudaSuccess,
                 "Can't free profile workspace for MoE GEMM profile during memory reallocation.");
             mProfileWorkspace = nullptr;
+            tensorrt_llm::common::recordNativeRelease(
+                kProfileWorkspaceLabel, mProfileWorkspaceDevice, static_cast<std::int64_t>(mProfileWorkspaceSize));
+            mProfileWorkspaceSize = 0;
         }
     }
 

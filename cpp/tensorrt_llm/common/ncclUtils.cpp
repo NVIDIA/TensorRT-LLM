@@ -1114,6 +1114,29 @@ size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm) const
     return count;
 }
 
+NCCLWindowAllocator::DeviceUsage NCCLWindowAllocator::getDeviceUsage(int device) const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    DeviceUsage usage;
+    for (auto const& [comm, buffers] : mBufferPool)
+    {
+        for (auto const& entry : buffers)
+        {
+            if (entry.device != device)
+            {
+                continue;
+            }
+            ++usage.bufferCount;
+            usage.totalBytes += entry.buffer.size;
+            if (entry.inUse)
+            {
+                usage.inUseBytes += entry.buffer.size;
+            }
+        }
+    }
+    return usage;
+}
+
 bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 {
     // Simply check for null - all non-null comms are valid

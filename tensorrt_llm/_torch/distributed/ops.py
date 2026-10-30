@@ -152,8 +152,10 @@ def warmup_named_allreduce_topologies(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, AllReduce) and module._group_name:
             mappings.setdefault(module._group_name, module.mapping)
-    for group_name in sorted(mappings):
-        _warmup_named_allreduce_topology(mappings[group_name], group_name)
+    # The first collective on each group creates its NCCL communicator.
+    with monitor_region("NCCL communicators (torch.distributed)"):
+        for group_name in sorted(mappings):
+            _warmup_named_allreduce_topology(mappings[group_name], group_name)
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
