@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -832,6 +833,43 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
+void StorageManager::initializeColdSlot(LifeCycleId lc, CacheLevel level, Slot& destination)
+{
+    TLLM_CHECK(level != kHotLevel);
+    PoolGroupIndex const hotGroup = getPoolGroupIndex(kHotLevel, lc);
+    auto slots = newSlotsForPoolGroup(kHotLevel, hotGroup, 1);
+    auto source = std::move(slots.front());
+    auto releaseSource = FuncGuard([&]() { releaseSlot(lc, kHotLevel, std::move(source)); });
+    TemporaryCudaStream stream({source.readyEvent.handle(), destination.readyEvent.handle()});
+    auto finish = FuncGuard(
+        [&]()
+        {
+            auto event = stream.takeFinishEvent();
+            source.readyEvent = event;
+            destination.readyEvent = event;
+        });
+    {
+        auto scope = stream.enter();
+        auto const sizes = slotSize(kHotLevel, hotGroup);
+        for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
+        {
+            auto const address = std::get<MemAddress>(slotAddress(kHotLevel, hotGroup, source.slotId(), pool));
+            if (poolMedium(kHotLevel, hotGroup, pool) == CacheTier::HOST_MEM)
+            {
+                source.readyEvent.synchronize();
+                std::memset(reinterpret_cast<void*>(address), 0, sizes[pool]);
+            }
+            else
+            {
+                cuCheck(cuMemsetD8Async(static_cast<CUdeviceptr>(address), 0, sizes[pool], stream.get()));
+            }
+        }
+        copySlotData(lc, level, kHotLevel, destination.slotId(), source.slotId(), stream.get());
+    }
+    finish.run();
+    destination.readyEvent.synchronize();
+}
+
 // ---------------------------------------------------------------------------
 // isEvictable
 // ---------------------------------------------------------------------------
@@ -1452,7 +1490,12 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     catch (...)
     {
         for (auto& s : dstSlots)
-            dstPoolGroup.release(std::move(s));
+        {
+            if (s.hasValidSlot())
+            {
+                dstPoolGroup.release(std::move(s));
+            }
+        }
         throw;
     }
 }
@@ -1699,6 +1742,101 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
     TLLM_CHECK_DEBUG(newNumSlots > pg.numSlots());
     pg.resizePools(newNumSlots);
     pg.slotAllocator().expand(newNumSlots);
+}
+
+void StorageManager::releaseMemory(bool discard)
+{
+    TLLM_CHECK_WITH_INFO(!mSleepingPoolSlots.has_value(), "Cache memory is already released");
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> slotCounts(numCacheLevels());
+    // Eviction only moves toward colder levels. Visit in that order so pages
+    // entering a cold GPU pool are also moved off the device before unmapping.
+    for (CacheLevel level{0}; level < numCacheLevels(); ++level)
+    {
+        auto& lvl = mLevels.at(level);
+        if (lvl.cacheTier != CacheTier::GPU_MEM && !(discard && lvl.cacheTier == CacheTier::HOST_MEM))
+        {
+            continue;
+        }
+        slotCounts[level] = lvl.storage->slotCountList();
+        if (!discard)
+        {
+            TypedVec<PoolGroupIndex, SlotCount> evictCounts(slotCounts[level].size(), 0);
+            for (PoolGroupIndex pgIdx{0}; pgIdx < evictCounts.size(); ++pgIdx)
+            {
+                evictCounts[pgIdx] = lvl.controller.numEvictablePages(pgIdx);
+            }
+            forceEvict(level, evictCounts);
+        }
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
+        {
+            TLLM_CHECK_WITH_INFO(poolGroup(level, pgIdx).slotAllocator().numOccupiedSlots() == 0,
+                "Cache memory still has held pages; discard them or provide sufficient offload capacity");
+        }
+    }
+    // Complete codec copies before any source buffer is unmapped.
+    cuCheck(cuCtxSynchronize());
+    mSleepingPoolSlots = slotCounts;
+    for (CacheLevel level{0}; level < slotCounts.size(); ++level)
+    {
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
+        {
+            if (slotCounts[level][pgIdx] != 0)
+            {
+                auto& pg = poolGroup(level, pgIdx);
+                auto& allocator = pg.slotAllocator();
+                allocator.prepareForShrink(0);
+                TLLM_CHECK(allocator.finishShrink());
+                pg.resizePools(0);
+            }
+        }
+    }
+    mGpuPhysMemAllocator->clear();
+}
+
+void StorageManager::materializeMemory(bool zero)
+{
+    TLLM_CHECK_WITH_INFO(mSleepingPoolSlots.has_value(), "Cache memory is not released");
+    auto const& slotCounts = *mSleepingPoolSlots;
+    for (auto const tier : {CacheTier::HOST_MEM, CacheTier::GPU_MEM})
+    {
+        for (CacheLevel level{0}; level < slotCounts.size(); ++level)
+        {
+            if (mLevels.at(level).cacheTier != tier)
+            {
+                continue;
+            }
+            for (PoolGroupIndex pgIdx{0}; pgIdx < slotCounts[level].size(); ++pgIdx)
+            {
+                auto const capacity = slotCounts[level][pgIdx];
+                // Completed groups survive a retry; individual pools also keep successful allocations.
+                if (poolGroup(level, pgIdx).numSlots() < capacity)
+                {
+                    expandPoolGroup(level, pgIdx, capacity);
+                }
+                // Host pages are zero-filled asynchronously; slot allocation waits before publishing them.
+                // Repeat GPU zeroing on retry if an earlier attempt failed after expansion.
+                if (zero && tier == CacheTier::GPU_MEM && capacity != 0)
+                {
+                    auto const& sizes = slotSize(level, pgIdx);
+                    for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+                    {
+                        if (poolMedium(level, pgIdx, poolIdx) == CacheTier::GPU_MEM)
+                        {
+                            auto const address = mLevels.at(level).storage->getBaseAddress(pgIdx, poolIdx, SlotId{0});
+                            auto const bytes = slotCountToSizeT(capacity) * sizes[poolIdx];
+                            cuCheck(cuMemsetD8(static_cast<CUdeviceptr>(address), 0, bytes));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (zero)
+    {
+        // Pool memset must finish before nonblocking codec streams initialize retained cold pages.
+        cuCheck(cuCtxSynchronize());
+    }
+    mSleepingPoolSlots.reset();
 }
 
 // ---------------------------------------------------------------------------

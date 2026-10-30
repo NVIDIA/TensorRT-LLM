@@ -338,6 +338,63 @@ configured separately from `KvCacheConfig`; see
 [KV Cache Compression](kv-cache-compression.md) for the available methods and
 their activation points.
 
+### Sleep and Wakeup with V2
+
+When releasing V2 KV cache with `CPU` or `PINNED` preservation, GPU pages are
+evicted into a host cache tier below all GPU cache levels. To back up the full GPU
+cache, give that tier a quota at least as large as the combined GPU cache quota
+for each KV manager on each rank, including draft managers, by setting
+`kv_cache_config.host_cache_size`; speculative decoding splits this budget between
+the target and draft managers. Automatic host sizing uses the minimum across ranks
+and may choose a smaller quota because of available host memory or pinned-memory
+limits. A smaller host tier logs a warning before release: reusable pages may then
+be dropped, and the release fails if live pages of retained internal requests do
+not fit in the configured tiers. Weights-only release and KV `NONE`/`MEMSET`
+release do not use this backup capacity; ordinary host-tier sizing and
+sparse-attention requirements still apply.
+
+The `kv_cache` entry in `sleep_config.restore_modes` controls the KV data policy:
+
+| Mode | Sleep | Wakeup |
+| --- | --- | --- |
+| `CPU`, `PINNED` | Suspend internal requests and evict GPU pages through the configured host and optional disk tiers. Reusable pages may be dropped under capacity pressure. | Restore GPU pool capacity and resume internal requests. Reusable pages return to GPU on demand. |
+| `NONE` | Discard KV contents and reusable prefixes, release GPU and HOST pool backing, and retain native cache objects and their logical state. | Restore pool capacities and materialize the retained caches' pages with unspecified KV contents. |
+| `MEMSET` | Discard KV contents and reusable prefixes as for `NONE`. | Zero the restored GPU pools and materialized host pages, then resume the retained caches. |
+
+V2 uses its existing pinned host tier for both `CPU` and `PINNED`; these modes
+provide the same KV-cache policy and do not promise to retain every reusable
+prefix. Other memory tags retain their runtime restore-mode behavior. Live pages
+held by suspended internal requests cannot be dropped; an inability to place
+those pages in the configured tiers fails the sleep operation.
+
+Sleep drains user requests before changing memory. Internal padding requests
+retain their native cache identities, logical state, and metadata buffers. Wakeup
+resumes them through normal page and scratch allocation and refreshes their KV
+and SSM indices before execution. Slot IDs may change; CUDA graphs consume the
+updated indices through stable metadata buffers. GPU pool virtual addresses
+remain reserved throughout sleep. Both hot and cold GPU pools release their
+physical backing and recover their capacities on wakeup. Encoded cold pages retain
+their representation when moved from GPU to host. Discard modes also release HOST
+pool backing without migrating its contents to disk; independent disk staging
+buffers are retained. HOST virtual addresses remain reserved, and HOST backing
+is restored before cache pages.
+
+Native `Batch` objects retain their rows, sparse arena leases, and graph-visible
+addresses. Preserving sleep also saves the bounded sparse GPU arena to temporary
+host memory, including units not yet written back to host pages. This memory is
+additional to the configured cold host-tier quota and is freed after wakeup.
+Discard sleep resets arena residency instead. Wakeup restores pool and arena
+backing, resumes members, and republishes their indices before execution.
+Batch mutation and sparse fetch are not permitted while memory is released.
+
+V2 KV sleep is rejected with a cache transceiver or a KV-moving
+connector because sleep/wake does not rebuild their memory registrations. This
+connector restriction also applies to host-staged transfers until connector
+sleep/wake compatibility is qualified. Capacity-only connectors move no KV and
+do not prevent sleep. These restrictions do not affect weights-only release.
+An attached KV cache lender also prevents KV sleep because its retained leases,
+staging copies, and backend access have no sleep/wake lifecycle.
+
 ### Partial Reuse
 
 Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False.

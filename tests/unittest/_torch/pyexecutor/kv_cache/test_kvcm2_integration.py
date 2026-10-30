@@ -42,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -3587,6 +3588,109 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
     assert torch.equal(buffer[22], torch.full((2,), 5.0))
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "host_tiers,mode,warning",
+    [
+        ([], RestoreMode.NONE, None),
+        ([], RestoreMode.CPU, "shortfall: 33554432 bytes"),
+        ([16 << 20], RestoreMode.CPU, "shortfall: 16777216 bytes"),
+        ([32 << 20], RestoreMode.PINNED, None),
+    ],
+)
+def test_sleep_warns_when_host_capacity_below_gpu(
+    host_tiers: list[int], mode: RestoreMode, warning: str | None
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    # Hot and cold GPU levels both count toward the backup capacity.
+    tiers = [GpuCacheTierConfig(quota=16 << 20), GpuCacheTierConfig(quota=16 << 20)]
+    tiers.extend(HostCacheTierConfig(quota=quota) for quota in host_tiers)
+    manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning"
+    ) as mock_warning:
+        manager.validate_sleep_config(mode)
+    if warning is None:
+        mock_warning.assert_not_called()
+    else:
+        mock_warning.assert_called_once()
+        assert warning in mock_warning.call_args.args[0]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+def test_sleep_rejects_attached_lender_before_mutation(mode: RestoreMode) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sharing = Mock()
+    manager._sleep_restore_mode = None
+    manager._sleeping_active_caches = set()
+    manager.impl = Mock()
+
+    with pytest.raises(ValueError, match="attached KV cache lender"):
+        manager.validate_sleep_config(mode)
+    with pytest.raises(ValueError, match="attached KV cache lender"):
+        manager.release_memory(mode)
+
+    assert manager._sleep_restore_mode is None
+    assert not manager._sleeping_active_caches
+    manager.impl.release_gpu_memory.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+def test_wakeup_zeroes_pools_for_memset_and_fp4_mla(mode: RestoreMode) -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = mode
+    manager._sleeping_active_caches = set()
+    manager.kv_cache_map = {}
+    manager.sparse_metadata_batch = None
+    manager._stream = SimpleNamespace(synchronize=lambda: None)
+    manager.impl = Mock()
+    manager.materialize_memory()
+    manager.impl.materialize_gpu_memory.assert_called_once_with(zero=mode == RestoreMode.MEMSET)
+
+    # FP4 MLA reads whole V-scale pages, so remapped pools must start zeroed.
+    assert object.__new__(Fp4MlaKVCacheManagerV2)._zero_pools_on_wakeup(mode)
+
+
+@pytest.mark.cpu_only
+def test_wakeup_keeps_native_batch_bindings() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = RestoreMode.CPU
+    manager._sleeping_active_caches = {1}
+    cache = Mock(batch_row=1, is_active=True)
+    manager.kv_cache_map = {1: cache}
+    manager.sparse_metadata_batch = Mock()
+    manager._stream = Mock()
+    manager.impl = Mock()
+    manager._restore_page_index_bufs = Mock()
+
+    manager.materialize_memory()
+
+    cache.resume.assert_not_called()
+    manager._restore_page_index_bufs.assert_not_called()
+    manager.sparse_metadata_batch.wait_published.assert_called_once_with()
+    manager.sparse_metadata_batch.publish.assert_called_once_with()
+    manager._stream.synchronize.assert_called_once_with()
+    assert manager._sleep_restore_mode is None
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_rejects_sleep_with_index_value_buffers() -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+        MiniMaxM3KVCacheManagerV2,
+    )
+
+    manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager._index_v_buffers = {3: torch.zeros(1)}
+    with pytest.raises(ValueError, match="index-V buffers"):
+        manager.validate_sleep_config(RestoreMode.NONE)
+    manager._index_v_buffers = {}
+    manager.validate_sleep_config(RestoreMode.NONE)
+
+
 class _GuardKVCache:
     """Scriptable stand-in for the guard sequence's KV cache."""
 
@@ -3595,9 +3699,13 @@ class _GuardKVCache:
         self.resize_ok = resize_ok
         self.closed = False
         self.committing_stopped = False
+        self.is_active = True
+        self.num_committed_tokens = 0
+        self.batch_row = None
 
     def resume(self, stream: object) -> bool:
         del stream
+        self.is_active = self.resume_ok
         return self.resume_ok
 
     def stop_committing(self) -> None:
@@ -3609,6 +3717,9 @@ class _GuardKVCache:
 
     def close(self) -> None:
         self.closed = True
+
+    def suspend(self) -> None:
+        self.is_active = False
 
 
 def _make_guard_manager(
@@ -3622,12 +3733,21 @@ def _make_guard_manager(
     manager._guard_page_fill = "nan"
     manager._guard_page_value = float("nan")
     manager._guard_page_by_layer = {}
+    manager._sleep_restore_mode = None
+    manager._sleeping_active_caches = set()
+    manager._fresh_pages_filled = {}
+    manager.conversation_manager = None
+    manager.sparse_metadata_batch = None
+    manager.validate_sleep_config = Mock()
+    manager._restore_page_index_bufs = Mock()
     manager.num_extra_kv_tokens = 0
     manager.pp_layers = [0]
-    manager._stream = SimpleNamespace(cuda_stream=None)
+    manager._stream = SimpleNamespace(cuda_stream=None, synchronize=lambda: None)
     manager.kv_cache_map = {}
     manager.index_mapper = Mock()
     manager.impl = Mock()
+    if kv_cache is not None:
+        manager.impl.release_gpu_memory.side_effect = lambda **kwargs: kv_cache.suspend()
 
     def create_kv_cache(request_id: int, *args: object, **kwargs: object) -> object | None:
         del args, kwargs
@@ -3657,6 +3777,16 @@ def test_reserve_guard_page_fills_and_publishes_the_page(
     # Never committed: the reuse tree must never hand this page to a request.
     assert kv_cache.committing_stopped
     assert not kv_cache.closed
+
+    manager.release_memory(RestoreMode.NONE)
+    manager.impl.release_gpu_memory.assert_called_once_with(discard=True)
+    buffer.fill_(1)
+    manager.materialize_memory()
+    assert torch.isnan(buffer[3]).all()
+    assert torch.equal(buffer[2], torch.ones(2))
+    assert manager.guard_page_indices() == frozenset({3})
+    assert not kv_cache.closed
+    manager.impl.create_kv_cache.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["create", "resume", "resize", "no_layer"])

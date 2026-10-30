@@ -228,13 +228,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 for worker in workers
             ])
 
-    @unwrap_ray_errors()
-    def collective_rpc(
+    def _collective_rpc_refs(
             self,
             method: str,
             args: tuple = (),
             kwargs: Optional[dict] = None,
-            non_block: bool = False,
             unique_reply_rank: Optional[int] = None,
             target_ranks: int | list[int] | None = None) -> list[Any]:
         if target_ranks is None:
@@ -254,6 +252,23 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                 # Ray actor doesn't work with __getattr__ delegation.
                 refs.append(w.call_worker_method.remote(method, *args,
                                                         **kwargs))
+        return refs
+
+    @unwrap_ray_errors()
+    def collective_rpc(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
+        if method == "sleep":
+            ray.get(
+                self._collective_rpc_refs("validate_sleep", args, kwargs,
+                                          unique_reply_rank, target_ranks))
+        refs = self._collective_rpc_refs(method, args, kwargs,
+                                         unique_reply_rank, target_ranks)
         return refs if non_block else ray.get(refs)
 
     @unwrap_ray_errors()
@@ -264,12 +279,12 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             kwargs: Optional[dict] = None,
             unique_reply_rank: Optional[int] = None,
             target_ranks: int | list[int] | None = None) -> list[Any]:
-        refs = self.collective_rpc(method,
-                                   args,
-                                   kwargs,
-                                   non_block=True,
-                                   unique_reply_rank=unique_reply_rank,
-                                   target_ranks=target_ranks)
+        if method == "sleep":
+            await asyncio.gather(*self._collective_rpc_refs(
+                "validate_sleep", args, kwargs, unique_reply_rank, target_ranks)
+                                 )
+        refs = self._collective_rpc_refs(method, args, kwargs,
+                                         unique_reply_rank, target_ranks)
         return await asyncio.gather(*refs)
 
     def get_startup_metrics(self) -> dict:

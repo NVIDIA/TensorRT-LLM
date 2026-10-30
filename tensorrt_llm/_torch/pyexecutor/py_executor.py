@@ -745,6 +745,7 @@ class PyExecutor:
         self._pp_rebalance_drain_iters: Optional[int] = None
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
+        self._sleeping_memory_tags: set[ExecutorMemoryType] = set()
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -2475,8 +2476,71 @@ class PyExecutor:
         return self.executor_request_queue.can_enqueue_request()
 
     def begin_sleep_transition(self, tags: list[ExecutorMemoryType]) -> None:
+        self.validate_sleep_tags(tags)
         self.executor_request_queue.begin_sleep_transition(tag.value
                                                            for tag in tags)
+
+    def validate_sleep_tags(self, tags: list[ExecutorMemoryType]) -> None:
+        if not self._is_kv_manager_v2 or ExecutorMemoryType.KV_CACHE not in tags:
+            return
+        if self.kv_cache_transceiver is not None:
+            raise NotImplementedError(
+                "Sleep of registered V2 KV cache requires remote "
+                "memory re-registration, which is not supported. "
+                "Exclude KV_CACHE when using a cache transceiver.")
+        if self._kv_connector_moves_kv:
+            raise NotImplementedError(
+                "V2 KV cache sleep with a KV-moving connector requires "
+                "connector memory re-registration, which is not supported. "
+                "Exclude KV_CACHE when using a KV-moving connector.")
+
+    def _kv_memory_resources(self) -> list[KVCacheManagerV2]:
+        managers: list[KVCacheManagerV2] = []
+        for manager in self.resource_manager.resource_managers.values():
+            if isinstance(manager, KVCacheManagerV2) and not any(
+                    manager is existing for existing in managers):
+                managers.append(manager)
+        return managers
+
+    def validate_sleep_config(self, tags: list[ExecutorMemoryType]) -> None:
+        """Validate this rank before committing a KV-preserving release."""
+        if not self._is_kv_manager_v2 or ExecutorMemoryType.KV_CACHE not in tags:
+            return
+        mode = self.llm_args.sleep_config.restore_modes[
+            ExecutorMemoryType.KV_CACHE]
+        errors = []
+        for manager in self._kv_memory_resources():
+            if manager.is_estimating_kv_cache:
+                continue
+            try:
+                manager.validate_sleep_config(mode)
+            except ValueError as error:
+                errors.append(str(error))
+        if errors:
+            raise ValueError("Invalid sleep configuration: " +
+                             "; ".join(errors))
+
+    def release_memory(self, tags: tuple[str, ...]) -> None:
+        """Release native KV pools before the runtime releases tagged auxiliary buffers."""
+        if not self._is_kv_manager_v2:
+            return
+        self._sleeping_memory_tags.update(
+            ExecutorMemoryType(tag) for tag in tags)
+        self._pp_rebalance_drain_iters = None
+        if ExecutorMemoryType.KV_CACHE in tags:
+            mode = self.llm_args.sleep_config.restore_modes[
+                ExecutorMemoryType.KV_CACHE]
+            for manager in self._kv_memory_resources():
+                manager.release_memory(mode)
+
+    def materialize_memory(self, tags: tuple[str, ...]) -> None:
+        """Restore native KV pools after tagged auxiliary buffers are available."""
+        if not self._is_kv_manager_v2:
+            return
+        if ExecutorMemoryType.KV_CACHE in tags:
+            for manager in self._kv_memory_resources():
+                manager.materialize_memory()
+        self._sleeping_memory_tags.difference_update(tags)
 
     def complete_sleep_transition(self) -> None:
         self.executor_request_queue.complete_sleep_transition()
@@ -2495,6 +2559,8 @@ class PyExecutor:
         self.executor_request_queue.abort_wakeup_transition()
 
     def fail_sleep_wakeup_transition(self) -> None:
+        self._sleeping_memory_tags.update(ExecutorMemoryType)
+        self._pp_rebalance_drain_iters = None
         self.executor_request_queue.fail_sleep_wakeup_transition()
 
     def get_memory_status(self) -> dict[str, object]:
@@ -4105,6 +4171,8 @@ class PyExecutor:
                         else:
                             torch.cuda.synchronize()
                             if action == _SleepWakeupAction.PREPARE:
+                                if target_action == _SleepWakeupAction.SLEEP:
+                                    self.validate_sleep_config(tags)
                                 # Prepared means this rank is quiesced and
                                 # ready to commit, but VMM state is unchanged.
                                 has_mnnvl_resources = (
@@ -4114,12 +4182,12 @@ class PyExecutor:
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
                                 self.invalidate_v1_prefix_cache_for_sleep(tags)
-                                release_with_tag(*tags)
+                                release_with_tag(*tags, resource=self)
                                 torch.cuda.synchronize()
                                 gc.collect()
                                 torch.cuda.empty_cache()
                             elif target_action == _SleepWakeupAction.WAKEUP:
-                                materialize_with_tag(*tags)
+                                materialize_with_tag(*tags, resource=self)
                                 torch.cuda.synchronize()
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
@@ -6065,6 +6133,8 @@ class PyExecutor:
         return early here cannot carry a lasting cadence offset out of it.
         """
         if not self.enable_kv_pool_rebalance:
+            return False
+        if self._sleeping_memory_tags:
             return False
         if self.kv_cache_transceiver is not None:
             return False
@@ -10615,13 +10685,6 @@ class PyExecutor:
                                 "route_capture", None)
         if route_capture is not None:
             route_capture.clear_shared()
-
-    def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
-        """Reject runtime-memory tags unsupported by the active KV manager."""
-        if (self._is_kv_manager_v2 and ExecutorMemoryType.KV_CACHE in tags):
-            raise ValueError(
-                "KV_CACHE sleep is not supported with KVCacheManagerV2 because "
-                "its main pools are not managed by tagged virtual memory.")
 
     def invalidate_v1_prefix_cache_for_sleep(
             self, tags: List[ExecutorMemoryType]) -> None:

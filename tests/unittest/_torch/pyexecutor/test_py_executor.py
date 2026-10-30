@@ -3990,6 +3990,50 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
     stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
 
 
+def test_sleep_routes_native_kv_memory_around_runtime_vmm(monkeypatch):
+    from tensorrt_llm._torch import virtual_memory
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    stub = object.__new__(PyExecutor)
+    stub._is_kv_manager_v2 = True
+    stub._sleeping_memory_tags = set()
+    stub.llm_args = types.SimpleNamespace(
+        sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: "CPU"})
+    )
+    main = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
+    draft = Mock(spec=KVCacheManagerV2, is_estimating_kv_cache=False)
+    # Aliased managers are released once.
+    managers = {"main": main, "alias": main, "draft": draft, "spec": Mock()}
+    stub.resource_manager = types.SimpleNamespace(resource_managers=managers)
+    events = []
+    for manager in (main, draft):
+        manager.release_memory.side_effect = lambda _: events.append("native_release")
+        manager.materialize_memory.side_effect = lambda: events.append("native_materialize")
+    runtime = Mock()
+    runtime.release_with_tag.side_effect = lambda _: events.append("runtime_release") or 1
+    runtime.materialize_with_tag.side_effect = lambda _: events.append("runtime_materialize") or 1
+    monkeypatch.setattr(virtual_memory, "get_virtual_memory_manager", lambda: runtime)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    tags = [ExecutorMemoryType.KV_CACHE]
+
+    stub.validate_sleep_config(tags)
+    main.validate_sleep_config.assert_called_once_with(virtual_memory.RestoreMode.CPU)
+    virtual_memory.release_with_tag(*tags, resource=stub)
+    virtual_memory.materialize_with_tag(*tags, resource=stub)
+
+    # Native pools are released before, and restored after, the tagged runtime allocations.
+    assert events == [
+        "native_release",
+        "native_release",
+        "runtime_release",
+        "runtime_materialize",
+        "native_materialize",
+        "native_materialize",
+    ]
+    assert not stub._sleeping_memory_tags
+
+
 class TestPendingTransferResponseFlush:
     def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
         """A lone fatal rank must fail locally rather than desynchronize TP."""

@@ -314,6 +314,20 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                         result_wait_queue: Queue | None = None) -> int:
         return self._enqueue_request(request, result_wait_queue)
 
+    def validate_sleep(self, sleep_tags: List[str]) -> None:
+        """Read-only preflight called on every actor before any actor sleeps."""
+        assert isinstance(self.llm_args,
+                          TorchLlmArgs), "sleep() only available for TorchLLM"
+        if self.llm_args.sleep_config is None:
+            raise ValueError(
+                "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
+            )
+        tags = self._prepare_sleep_tags(
+            [ExecutorMemoryType(tag) for tag in sleep_tags])
+        if tags:
+            self._validate_sleep_tags(tags)
+            self._validate_sleep_config(tags)
+
     def sleep(self, sleep_tags: List[str]) -> None:
         assert isinstance(self.llm_args,
                           TorchLlmArgs), "sleep() only available for TorchLLM"
@@ -334,9 +348,10 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         try:
             with self.engine.control_action():
                 torch.cuda.synchronize()
+                self._validate_sleep_config(tags)
                 mutation_started = True
                 self._invalidate_v1_prefix_cache_for_sleep(tags)
-                release_with_tag(*tags)
+                release_with_tag(*tags, resource=self.engine)
                 torch.cuda.synchronize()
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -372,7 +387,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         try:
             torch.cuda.synchronize()
             mutation_started = True
-            materialize_with_tag(*tags)
+            materialize_with_tag(*tags, resource=self.engine)
             torch.cuda.synchronize()
         except Exception:
             if mutation_started:

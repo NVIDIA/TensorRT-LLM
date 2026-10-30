@@ -63,47 +63,67 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         abort_wakeup_transition=MagicMock(),
         fail_sleep_wakeup_transition=MagicMock(),
         validate_sleep_tags=MagicMock(),
+        validate_sleep_config=MagicMock(),
         invalidate_v1_prefix_cache_for_sleep=MagicMock(),
     )
     return w
 
 
-class TestV2KvCacheSleepRejection:
-    @pytest.mark.parametrize(
-        "use_v2,tags,should_raise",
-        [
-            (True, ["kv_cache"], True),
-            (True, ["model", "kv_cache"], True),
-            (True, ["model"], False),
-            (False, ["kv_cache"], False),
-        ],
-    )
-    def test_validation_conditions(self, use_v2, tags, should_raise):
+class TestRegisteredV2KvCacheSleepRejection:
+    @pytest.mark.parametrize("use_v2", [False, True])
+    @pytest.mark.parametrize("has_transceiver", [False, True])
+    @pytest.mark.parametrize("connector_capacity_only", [None, False, True])
+    @pytest.mark.parametrize("tags", [["kv_cache"], ["model", "kv_cache"], ["model"]])
+    def test_validation_conditions(self, use_v2, has_transceiver, connector_capacity_only, tags):
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         executor = object.__new__(PyExecutor)
         executor._is_kv_manager_v2 = use_v2
+        executor.kv_cache_transceiver = MagicMock() if has_transceiver else None
+        executor.kv_connector_manager = (
+            None
+            if connector_capacity_only is None
+            else SimpleNamespace(capacity_only=connector_capacity_only)
+        )
         parsed_tags = [ExecutorMemoryType(tag) for tag in tags]
+        should_raise = (
+            use_v2 and "kv_cache" in tags and (has_transceiver or connector_capacity_only is False)
+        )
 
         if should_raise:
             with pytest.raises(
-                ValueError,
-                match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+                NotImplementedError,
+                match="memory re-registration",
             ):
                 executor.validate_sleep_tags(parsed_tags)
         else:
             executor.validate_sleep_tags(parsed_tags)
 
+    def test_connector_rejected_before_admission_changes(self):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = True
+        executor.kv_cache_transceiver = None
+        executor.kv_connector_manager = SimpleNamespace(capacity_only=False)
+        executor.executor_request_queue = MagicMock()
+
+        with pytest.raises(NotImplementedError, match="connector"):
+            executor.begin_sleep_transition([ExecutorMemoryType.KV_CACHE])
+
+        executor.executor_request_queue.begin_sleep_transition.assert_not_called()
+
     def test_rejected_before_transition_or_mpi_dispatch(self):
         worker = _make_worker(world_size=2)
-        worker.engine.validate_sleep_tags.side_effect = ValueError(
-            "KV_CACHE sleep is not supported with KVCacheManagerV2"
+        worker.engine.validate_sleep_tags.side_effect = NotImplementedError(
+            "remote memory re-registration"
         )
 
         with pytest.raises(
-            ValueError,
-            match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+            NotImplementedError,
+            match="remote memory re-registration",
         ):
             worker.sleep(["kv_cache"])
 
@@ -299,7 +319,7 @@ class TestBaseWorkerRetrySemantics:
 
         expected = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
         w.engine.begin_wakeup_transition.assert_called_once_with(expected)
-        materialize.assert_called_once_with(*expected)
+        materialize.assert_called_once_with(*expected, resource=w.engine)
         w.engine.complete_wakeup_transition.assert_called_once_with()
 
     def test_transitional_state_rejects_operations(self):
@@ -685,7 +705,7 @@ class TestMnnvlSleepWakeupCoordination:
         with (
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=lambda *tags: events.append(("local_vmm", "sleep")),
+                side_effect=lambda *tags, resource=None: events.append(("local_vmm", "sleep")),
             ),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
             patch("torch.cuda.synchronize"),
@@ -1107,7 +1127,9 @@ class TestMultiRankSendFailureRecovery:
             _SleepWakeupAction.SLEEP,
             [ExecutorMemoryType.MODEL_ENGINE_MAIN],
         )
-        release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+        release.assert_called_once_with(
+            ExecutorMemoryType.MODEL_ENGINE_MAIN, resource=worker.engine
+        )
         fail_stop.assert_called_once()
 
     def test_mnnvl_all_commit_send_errors_are_treated_as_uncertain_delivery(self):
@@ -1180,7 +1202,9 @@ class TestMultiRankSendFailureRecovery:
             _SleepWakeupAction.SLEEP,
             [ExecutorMemoryType.MODEL_ENGINE_MAIN],
         )
-        release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+        release.assert_called_once_with(
+            ExecutorMemoryType.MODEL_ENGINE_MAIN, resource=worker.engine
+        )
         fail_stop.assert_called_once()
 
     def test_postcommit_non_runtime_error_fail_stops_worker(self):
@@ -1305,6 +1329,10 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         executor._is_kv_manager_v2 = False
         executor.enable_kv_cache_reuse = False
 
+        def fail_release(*tags, resource):
+            assert resource is executor
+            raise MemoryError("simulated OOM outside except list")
+
         with (
             patch("torch.cuda.set_device"),
             patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
@@ -1312,7 +1340,7 @@ class TestListenerUncaughtExceptionSendsErrorAck:
             patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=MemoryError("simulated OOM outside except list"),
+                side_effect=fail_release,
             ),
             patch("torch.cuda.synchronize"),
         ):
@@ -1369,6 +1397,7 @@ class TestListenerAbortAndShutdown:
         executor.control_request_barrier.set()
         executor.control_action_done = threading.Event()
         executor._active_control_id = op_id
+        executor.validate_sleep_config = MagicMock()
 
         with (
             patch("torch.cuda.set_device"),
@@ -1384,6 +1413,7 @@ class TestListenerAbortAndShutdown:
                 pass
 
         release.assert_not_called()
+        executor.validate_sleep_config.assert_called_once()
         assert executor.control_request_barrier.is_set()
         assert not executor.control_action_done.is_set()
         assert sent_acks == [

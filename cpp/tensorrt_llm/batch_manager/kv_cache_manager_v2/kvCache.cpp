@@ -33,6 +33,7 @@
 #include <array>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -531,7 +532,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     // Check utilization against threshold.
     auto const utilizations = mManager->storage().getUtilization(kHotLevel);
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
-    if (utilization > mManager->config().maxUtilForResume)
+    if (!mResumeAfterSleep && utilization > mManager->config().maxUtilForResume)
     {
         return false;
     }
@@ -884,6 +885,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     bool const firstActivation = mNeverResumed;
     mNeverResumed = false;
     mStatus = Status::ACTIVE;
+    mResumeAfterSleep = false;
     if (!firstActivation && _shouldRecordStats())
     {
         mManager->recordRequestResumed();
@@ -895,6 +897,8 @@ bool KvCache::prefetch(CacheLevel target)
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
+    if (mStatus == Status::UNMATERIALIZED)
+        throw LogicError("Cannot prefetch while cache memory is released");
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
     CacheLevel const numTiers = storageMgr.numCacheLevels();
@@ -986,6 +990,120 @@ void KvCache::suspend()
     if (_shouldRecordStats())
     {
         mManager->recordRequestSuspended();
+    }
+}
+
+void KvCache::releaseMemory()
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    TLLM_CHECK_WITH_INFO(mStatus == Status::SUSPENDED && numCommittedTokens() == 0,
+        "Releasing cache pages requires a suspended cache with no committed tokens");
+    stopCommitting();
+    mOptionalCandidates.clear();
+    for (auto const& ap : _activePages())
+    {
+        auto& bp = ap.ordinal == kBadBlockOrdinal ? mSsmBlocks[ap.beamIdx][ap.lcId]
+                                                  : mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
+        auto const page = blockPageGetPage(bp);
+        TLLM_CHECK_DEBUG(page && !page->isCommitted());
+        bp = UnmaterializedPage{page->cacheLevel};
+    }
+    mStatus = Status::UNMATERIALIZED;
+    TLLM_CHECK_DEBUG(_checkSanity());
+}
+
+void KvCache::materializeMemory(std::vector<KvCache*> const& caches)
+{
+    KVCM2_API_GUARD();
+    if (caches.empty())
+    {
+        return;
+    }
+    auto const apiLock = caches.front()->mManager->lockExclusive();
+    auto& storage = caches.front()->mManager->storage();
+    TypedVec<CacheLevel, TypedVec<LifeCycleId, SlotCount>> counts(
+        storage.numCacheLevels(), TypedVec<LifeCycleId, SlotCount>(storage.numLifeCycles(), 0));
+
+    struct ReleasedPage
+    {
+        KvCache* cache;
+        ActivePage descriptor;
+        BlockPage* target;
+    };
+
+    std::vector<ReleasedPage> released;
+    for (auto* cache : caches)
+    {
+        TLLM_CHECK_WITH_INFO(cache->mStatus == Status::UNMATERIALIZED, "Cache pages have not been released");
+        for (auto const& ap : cache->_activePages())
+        {
+            auto& bp = ap.ordinal == kBadBlockOrdinal ? cache->mSsmBlocks[ap.beamIdx][ap.lcId]
+                                                      : cache->mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
+            ++counts[std::get<UnmaterializedPage>(bp).level][ap.lcId];
+            released.push_back({cache, ap, &bp});
+        }
+    }
+
+    struct PendingPage
+    {
+        BlockPage* target;
+        SharedPtr<PageHolder> holder;
+    };
+
+    std::vector<PendingPage> pending;
+    pending.reserve(released.size());
+    // Cold initialization borrows a hot slot, so finish it for every cache before allocating hot pages.
+    for (CacheLevel level{storage.numCacheLevels()}; level > kHotLevel;)
+    {
+        --level;
+        auto slots = storage.newSlots(level, counts[level]);
+        auto releaseSlots = FuncGuard(
+            [&]()
+            {
+                for (LifeCycleId lc{0}; lc < slots.size(); ++lc)
+                {
+                    for (auto& slot : slots[lc])
+                    {
+                        if (slot.hasValidSlot())
+                        {
+                            storage.releaseSlot(lc, level, std::move(slot));
+                        }
+                    }
+                }
+            });
+        for (auto const& entry : released)
+        {
+            if (std::get<UnmaterializedPage>(*entry.target).level != level)
+            {
+                continue;
+            }
+            auto const& ap = entry.descriptor;
+            auto& slot = slots[ap.lcId].back();
+            if (level != kHotLevel)
+            {
+                storage.initializeColdSlot(ap.lcId, level, slot);
+            }
+            auto page = makeShared<UncommittedPage>(*entry.cache, ap.ordinal, ap.lcId, level, ap.beamIdx);
+            page->setSlot(slot);
+            pending.push_back({entry.target, page->hold()});
+            slots[ap.lcId].pop_back();
+        }
+    }
+    // Publish only after allocation and eviction registration succeed. Temporary holders remove
+    // their eviction entries and release their slots on failure, leaving every placeholder intact.
+    for (auto const& entry : pending)
+    {
+        storage.scheduleForEviction(*entry.holder->page);
+    }
+    for (auto& entry : pending)
+    {
+        *entry.target = std::move(entry.holder);
+    }
+    for (auto* cache : caches)
+    {
+        cache->mStatus = Status::SUSPENDED;
+        TLLM_CHECK_DEBUG(cache->_checkSanity());
     }
 }
 
@@ -1933,6 +2051,8 @@ void KvCache::setBeamWidth(BeamIndex beamWidth)
         return;
     if (mStatus == Status::CLOSED)
         throw LogicError("Cannot change beam_width after close()");
+    if (mStatus == Status::UNMATERIALIZED)
+        throw LogicError("Cannot change beam_width while cache memory is released");
     auto const apiLock = mManager->lockExclusive();
     if (mManager->enablePartialCommit())
         throw AssertionError("beam_width changes are not supported with partial commit");
@@ -3146,6 +3266,10 @@ bool KvCache::_checkSanity() const
                             || (blockPageIsNull(bp) && (mCommittedTokens.empty() || mManager->commitMinSnapshot())));
                     }
                 }
+                else if (mStatus == Status::UNMATERIALIZED)
+                {
+                    TLLM_CHECK_DEBUG(std::holds_alternative<UnmaterializedPage>(bp));
+                }
                 else
                 {
                     // The page must be present, and locked exactly when the cache is
@@ -3154,7 +3278,7 @@ bool KvCache::_checkSanity() const
                         && ((mStatus == Status::ACTIVE) == std::holds_alternative<SharedPageLock>(bp)));
                 }
 
-                if (!blockPageIsNull(bp))
+                if (!blockPageIsNull(bp) && mStatus != Status::UNMATERIALIZED)
                 {
                     auto page = blockPageGetPage(bp);
                     auto const* attention = std::get_if<AttnLifeCycle>(&lcs[lc]);
@@ -3179,6 +3303,11 @@ bool KvCache::_checkSanity() const
         for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
         {
             auto const& bp = mSsmBlocks[bi][lcId];
+            if (mStatus == Status::UNMATERIALIZED)
+            {
+                TLLM_CHECK_DEBUG(mNeverResumed ? blockPageIsNull(bp) : std::holds_alternative<UnmaterializedPage>(bp));
+                continue;
+            }
             if (!blockPageIsNull(bp))
             {
                 if (mNeverResumed)
