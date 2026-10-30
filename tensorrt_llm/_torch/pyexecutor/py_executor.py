@@ -3477,8 +3477,10 @@ class PyExecutor:
                                 # Copy the batch outputs as sampler inputs
                                 # to avoid next forward step overwriting them.
                                 batch_outputs_copy = {
-                                    name: tensor.clone()
-                                    for name, tensor in batch_outputs.items()
+                                    name:
+                                    value.clone() if isinstance(
+                                        value, torch.Tensor) else value
+                                    for name, value in batch_outputs.items()
                                 }
                                 self.sample_stream.wait_stream(
                                     torch.cuda.current_stream())
