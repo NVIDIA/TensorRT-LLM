@@ -6,11 +6,12 @@ The first launch turns each row's selection (the columns the prefill bound
 lets it read) into a bitmap over logical token positions. A plan launch forms,
 per group of consecutive rows of one request, the union of its rows' resident
 selected tokens as a packed list of physical cache slots, and each row's
-bitmap re-indexed onto that list. The row-tile launch runs one program per
-(group, KV head) that walks the packed list in 64-slot tiles, each tile's K/V
-loaded once for every row and head of the group, each row masked to its own
-bits. A group whose rows span requests (generation rows of a mixed batch)
-walks each row's own selected columns instead, as the per-row kernel does.
+bitmap re-indexed onto that list. The row-tile launch is persistent: one
+program per SM takes (group, KV head) items longest first and walks each packed
+list in 64-slot tiles, each tile's K/V loaded once for every row and head of the
+group, each row masked to its own bits. A group whose rows span requests
+(generation rows of a mixed batch) walks each row's own selected columns
+instead, as the per-row kernel does.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 from .qsa_paged_sparse_gqa import qsa_paged_sparse_gqa as _per_row_entry
 from .qsa_rowtile_attention_cute import BLOCK_M, BLOCK_N
 from .qsa_rowtile_attention_cute import eligible as _cute_eligible
+from .qsa_rowtile_attention_cute import num_ctas as _rowtile_ctas
 from .qsa_rowtile_attention_cute import rowtile_attention_cute as _rowtile_attention_cute
 
 _INTEGER_DTYPES = (torch.int32, torch.int64)
@@ -261,8 +263,9 @@ def _rowtile_plan_kernel(
     request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
     lone_rows, lone_count, rows,
     bits_stride_row, block_table_stride_request, block_table_stride_page, slots_stride_group,
-    ROWS_PER_TILE: tl.constexpr, NUM_REQUESTS: tl.constexpr, ROWS_POW2: tl.constexpr,
-    BLOCK_N: tl.constexpr, SHARED_TILE_COST: tl.constexpr, NUM_CACHE_PAGES: tl.constexpr,
+    NUM_REQUESTS, NUM_CACHE_PAGES,
+    ROWS_PER_TILE: tl.constexpr, ROWS_POW2: tl.constexpr,
+    BLOCK_N: tl.constexpr, SHARED_TILE_COST: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, PLAN_WORDS: tl.constexpr,
 ):  # fmt: skip
     """Per group of rows of one request: list the union of its rows' resident
@@ -355,10 +358,11 @@ def _rowtile_lone_kernel(
     selected_stride_row: tl.constexpr, selected_stride_token: tl.constexpr,
     output_stride_row: tl.constexpr, output_stride_head: tl.constexpr,
     output_stride_dim: tl.constexpr,
-    NUM_CACHE_PAGES: tl.constexpr, NUM_REQUESTS: tl.constexpr, PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_CACHE_PAGES, NUM_REQUESTS, LONE_PROGRAMS,
+    PAGE_TABLE_WIDTH: tl.constexpr,
     GROUP_SIZE: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, ROWS_PER_TILE: tl.constexpr,
     ROWS_POW2: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
-    HEAD_DIM: tl.constexpr, LONE_PROGRAMS: tl.constexpr, USE_PDL: tl.constexpr,
+    HEAD_DIM: tl.constexpr, USE_PDL: tl.constexpr,
     LONE_STAGES: tl.constexpr,
 ):  # fmt: skip
     """Rows of groups the row-tile pass does not serve: each its own columns, gathered."""
@@ -391,7 +395,7 @@ def _rowtile_lone_row(
     block_table_stride_request, block_table_stride_page,
     selected_stride_row, selected_stride_token,
     output_stride_row, output_stride_head, output_stride_dim,
-    NUM_CACHE_PAGES: tl.constexpr, NUM_REQUESTS: tl.constexpr, PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_CACHE_PAGES, NUM_REQUESTS, PAGE_TABLE_WIDTH: tl.constexpr,
     GROUP_SIZE: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, LONE_STAGES: tl.constexpr,
 ):  # fmt: skip
@@ -571,15 +575,17 @@ def qsa_rowtile_sparse_gqa(
     packed_bits = torch.zeros((rows, num_words), dtype=torch.int64, device=q.device)
     group_plan = torch.empty((num_groups, 2), dtype=torch.int32, device=q.device)
     lone_rows = torch.empty((rows,), dtype=torch.int32, device=q.device)
-    lone_count = torch.zeros((1,), dtype=torch.int32, device=q.device)
+    # [0]: the lone list's length; [1]: the row-tile pass's work-ticket counter.
+    counters = torch.zeros((2,), dtype=torch.int32, device=q.device)
+    lone_count = counters[:1]
     _rowtile_plan_kernel[(num_groups,)](
         request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
         lone_rows, lone_count, rows,
         bits.stride(0), block_table.stride(0), block_table.stride(1), slots.stride(0),
-        ROWS_PER_TILE=rows_per_tile, NUM_REQUESTS=block_table.shape[0], ROWS_POW2=rows_pow2,
-        BLOCK_N=BLOCK_N, SHARED_TILE_COST=_SHARED_TILE_COST, NUM_CACHE_PAGES=k_cache.shape[0],
-        PAGE_TABLE_WIDTH=table_width, TOKENS_PER_BLOCK=tokens_per_block,
-        PLAN_WORDS=_PLAN_WORDS, num_warps=_PLAN_WARPS,
+        block_table.shape[0], k_cache.shape[0],
+        ROWS_PER_TILE=rows_per_tile, ROWS_POW2=rows_pow2, BLOCK_N=BLOCK_N,
+        SHARED_TILE_COST=_SHARED_TILE_COST, PAGE_TABLE_WIDTH=table_width,
+        TOKENS_PER_BLOCK=tokens_per_block, PLAN_WORDS=_PLAN_WORDS, num_warps=_PLAN_WARPS,
     )  # fmt: skip
     use_pdl = get_env_enable_pdl()
     _rowtile_lone_kernel[(min(rows, _LONE_PROGRAMS), num_kv_heads)](
@@ -590,8 +596,9 @@ def qsa_rowtile_sparse_gqa(
         LONE_PROGRAMS=min(rows, _LONE_PROGRAMS), USE_PDL=use_pdl, LONE_STAGES=_LONE_STAGES,
         num_warps=_LONE_WARPS, **geometry,
     )  # fmt: skip
-    _rowtile_attention_cute[(num_groups, num_kv_heads)](
-        q, k_cache, v_cache, slots, packed_bits, group_plan, output, softmax_scale, rows,
+    _rowtile_attention_cute[(_rowtile_ctas(num_groups * num_kv_heads, q.device),)](
+        q, k_cache, v_cache, slots, packed_bits, group_plan, output, counters[1:], softmax_scale,
+        rows,
         group_size=group_size, rows_per_tile=rows_per_tile, tokens_per_block=tokens_per_block,
         use_pdl=use_pdl,
     )  # fmt: skip
@@ -655,13 +662,15 @@ class QsaSparseGqaRowtile(OpWrapper):
     less than the rows' own columns would; otherwise -- or when its rows span
     requests -- its rows join the lone list. A lone-row pass (256 programs
     per KV head striding the list) serves listed rows over their own columns,
-    as the per-row kernel does. The row-tile pass runs one program per
-    (group, KV head), loads each listed tile's K/V once for the 120 (row,
-    head) pairs and masks each row to its own re-indexed bits; it is launched
+    as the per-row kernel does. The row-tile pass is persistent (one program
+    per SM drawing (group, KV head) items from a ticket counter, the plan's
+    last groups first); per item it loads each listed tile's K/V once for the
+    120 (row, head) pairs and masks each row to its own re-indexed bits, and
+    one item's epilogue overlaps the next item's first MMAs. It is launched
     programmatically dependent on the lone pass, whose rows are disjoint, so
     the two overlap. That pass is `qsa_rowtile_attention_cute` (tcgen05 MMAs,
-    S / P / O in tensor memory, a cp.async gather of the K/V rows), so the entry
-    serves SM103, bf16 q and K/V and D = 256.
+    S / P / O in tensor memory, a cp.async gather of the K/V rows, a TMA store
+    of O), so the entry serves SM103, bf16 q and K/V and D = 256.
 
     Fusion boundary: as `qsa_paged_sparse_gqa` -- the block-table gather,
     scale, online softmax and P.V are inside; deciding what to attend to,
@@ -717,8 +726,13 @@ class QsaSparseGqaRowtile(OpWrapper):
     does (16292-row mixed step: 3859 vs 3836 us). Below a few hundred rows
     it is slower than the per-row kernel (generation-only launches 1.4-2x);
     the target's served context launches are thousands of rows. The tensor-core
-    row-tile pass alone, on two dumped 16384-row context launches of the
-    target (GB300): 631 and 887 us.
+    row-tile pass alone, on six dumped 16384-row context launches of the
+    target (GB300, layers 0-5 of one step): 581-775 us, against 694-886 us for
+    the one-program-per-item pass it replaced (the same output, bit for bit).
+
+    Compiled once per (group size, rows per tile, tokens per block, PDL):
+    nothing in the row-tile pass's compile key depends on the row count or
+    the plan.
 
     Scratch per call: the bitmap and the re-indexed bitmap, each `rows x
     ceil(table_width * tpb / 64)` int64 words (21 MB at 16384 rows and 320

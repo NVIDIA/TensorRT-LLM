@@ -173,6 +173,45 @@ def test_bind_step_buffers_uses_manager_layer_views(replay: bool) -> None:
             assert view.shape == storage.shape[1:]
 
 
+def test_bf16_replay_pool_switches_the_managers_all_layer_commit_off() -> None:
+    """A bf16 pool replays on the CuTe kernel, which commits every wrapping checkpoint itself.
+
+    Binding it must leave the manager's all-layer commit off: kept on, the manager would commit
+    those checkpoints a second time after a step of 16 or more requests, and below that the
+    metadata would skip building the work items the kernel reads each row's slot from.
+    """
+    state = GDNReplayState(tokens_per_gen_step=2)
+    state.intermediate_conv = _t(2, SLOTS, 2, G.conv_dim, G.conv_kernel - 1)
+    state.intermediate_indices = _t(SLOTS, dtype=torch.int32)
+    state.prev_num_accepted_tokens = _t(SLOTS, dtype=torch.int32)
+    state.cache_buf_idx = _t(SLOTS, dtype=torch.int32)
+    state.old_x = _t(2, SLOTS, 2, HISTORY, G.num_v_heads, G.head_v_dim)
+    state.old_B = _t(2, SLOTS, 2, HISTORY, G.num_k_heads, G.head_k_dim)
+    state.old_dt = _t(2, SLOTS, 2, G.num_v_heads, HISTORY, dtype=torch.float32)
+    state.old_dA_cumsum = torch.empty_like(state.old_dt)
+    state._state_strides = (2, 0, 1)
+    manager = Qwen4ExpHybridCacheManager.__new__(Qwen4ExpHybridCacheManager)
+    manager.spec_config = SimpleNamespace(tokens_per_gen_step=2)
+    manager._speculative_state = state
+    manager.mamba_layer_offsets = {3: 1, 7: 0}
+    manager.all_conv_states = [_conv(), _conv()]
+    manager.all_ssm_states = [_ssm(torch.bfloat16), _ssm(torch.bfloat16)]
+    assert manager.use_gdn_cached_replay_all_layer_commit
+
+    core = M.Qwen4ExpTp1ModelingV2.__new__(M.Qwen4ExpTp1ModelingV2)
+    torch.nn.Module.__init__(core)
+    core.gdn_layers = [3, 7]
+    metadata = SimpleNamespace(
+        replay_work_items=_t(SLOTS, 4, dtype=torch.int32),
+        replay_n_writes=_t(1, dtype=torch.int32),
+    )
+    replay = core._bind_step_buffers(manager, G, metadata, _conv(), _ssm(torch.bfloat16))["replay"]
+
+    assert replay.cute and not replay.all_layer_commit
+    assert not manager.use_gdn_cached_replay_all_layer_commit
+    assert not state.all_layer_commit_enabled
+
+
 @pytest.mark.parametrize(
     "plane, match",
     [

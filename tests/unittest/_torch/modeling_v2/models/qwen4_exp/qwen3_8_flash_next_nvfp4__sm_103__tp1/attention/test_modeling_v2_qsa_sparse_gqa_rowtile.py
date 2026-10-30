@@ -187,7 +187,12 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     groups = math.ceil(rows / 10)
     assert launches[0][1] == (rows,) and launches[1][1] == (groups,)
     assert launches[2][1] == (min(rows, 256), spec["kv_heads"])
-    assert launches[3][1] == (groups, spec["kv_heads"])
+    # The row-tile pass is persistent: one CTA per SM, never more than (group, KV head) items.
+    items = groups * spec["kv_heads"]
+    assert launches[3][1] == (_module._rowtile_ctas(items, args["q"].device),)
+    assert launches[3][1][0] == min(
+        items, torch.cuda.get_device_properties(0).multi_processor_count
+    )
     assert out.shape == (rows, spec["q_heads"], spec["head_dim"])
     assert out.dtype == args["q"].dtype and out.is_contiguous()
     assert not bool(out.isnan().any())
@@ -200,6 +205,23 @@ assert (CKPT["q_heads"], CKPT["kv_heads"], CKPT["head_dim"]) == (24, 2, 256)
 
 def _with(segments, **overrides):
     return {**CKPT, "segments": tuple(segments), **overrides}
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        # Fewer items (2 groups x 2 KV heads) than SMs: a 4-CTA grid, mostly one item a CTA.
+        [(5000, 17)],
+        # A lone group (rows of two requests) between row-tile groups of each request.
+        [(3000, 25), (7000, 25)],
+    ],
+    ids=["fewer items than SMs", "a lone group between row-tile groups"],
+)
+def test_small_launches_match_the_reference(segments) -> None:
+    """The persistent pass's edges: CTAs left without a second item, and an item the pass
+    skips (a lone group) between items it serves."""
+    args = _build(_with(segments, slots=8), seed=7700 + len(segments))
+    _compare(op(**args), op.reference(**args))
 
 
 def test_calls_are_bitwise_deterministic() -> None:
