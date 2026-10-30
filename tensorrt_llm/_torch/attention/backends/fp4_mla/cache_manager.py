@@ -29,7 +29,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, KvCacheConfig
 
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
@@ -46,6 +46,10 @@ from .layout import get_fp4_mla_v_scale_pool_size
 # The serving launcher publishes the worker role here, and every MPI rank of
 # the worker inherits it.
 _DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
+
+# Sequence length the KV cache manager V2 core assumes for pool sizing when
+# nothing configures one.
+_FP4_MLA_DEFAULT_TYPICAL_SEQ_LEN = 2048
 
 
 def _persistent_cache_view_mode() -> torch.inference_mode:
@@ -1099,6 +1103,22 @@ class Fp4MlaV2CacheLayoutPolicy:
         # Pipeline stages retain different in-flight microbatches, and every
         # resident sequence needs one native HP ring page per local layer.
         return self.max_batch_size * self.mapping.pp_size
+
+    def _get_typical_seq_len(self, kv_cache_config: "KvCacheConfig") -> int:
+        """Size the pools from a whole typical batch, also without ``avg_seq_len``.
+
+        The quota is split between lifecycles whose slots differ in size by
+        orders of magnitude: the full-history pool of the MLA layers and the
+        per-request HP rings. Without a typical length the core derives the
+        split from a single 2048-token request and rounds each pool of it up
+        to the allocation granularity first, which hands the HP rings a share
+        of the quota they never use. A batch of such requests, one per
+        resident sequence plus a context chunk, keeps the 2048-token default
+        and makes the rounding negligible.
+        """
+        if kv_cache_config.avg_seq_len is not None:
+            return kv_cache_config.avg_seq_len
+        return min(self.max_seq_len, _FP4_MLA_DEFAULT_TYPICAL_SEQ_LEN)
 
     def get_cache_bytes_per_token(self) -> int:
         sizes, _ = self._get_runtime_cache_size_layer_components()
