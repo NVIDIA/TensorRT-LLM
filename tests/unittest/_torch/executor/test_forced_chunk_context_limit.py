@@ -98,6 +98,21 @@ def test_other_policies_keep_small_limits(make_scheduler, policy):
     make_scheduler(16, policy)
 
 
+@pytest.mark.parametrize(
+    "policy, expected",
+    [
+        (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, ChunkingPolicy.FIRST_COME_FIRST_SERVED),
+        (ContextChunkingPolicy.EQUAL_PROGRESS, ChunkingPolicy.EQUAL_PROGRESS),
+        (ContextChunkingPolicy.FORCE_CHUNK, ChunkingPolicy.FORCE_CHUNK),
+    ],
+)
+def test_unified_scheduler_keeps_the_configured_policy(policy, expected):
+    # A policy mapped to FIRST_COME_FIRST_SERVED by mistake would pass the limit
+    # cases above, so the mapping itself is asserted.
+    scheduler = _unified_scheduler(8192, policy)
+    assert scheduler.micro_batch_scheduler.ctx_chunk_config.chunking_policy is expected
+
+
 @pytest.mark.parametrize("make_scheduler", [_py_scheduler, _bind_scheduler])
 @pytest.mark.parametrize("prompt_len", [2, UNIT, 3 * UNIT])
 def test_smallest_accepted_limit_schedules_context(make_scheduler, prompt_len):
