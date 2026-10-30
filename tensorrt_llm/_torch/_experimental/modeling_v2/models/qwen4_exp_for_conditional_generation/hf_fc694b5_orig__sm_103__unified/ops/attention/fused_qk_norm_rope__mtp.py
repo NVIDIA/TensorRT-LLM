@@ -96,6 +96,33 @@ class FusedQkNormRope(OpWrapper):
     (`freq` from `exp2f`), turned into sin/cos by the fast `__sincosf`.
     `ARCHS` is what this variant drove; the catalog entry's record also covers
     sm_100 for the cells it shares.
+
+    This variant's own cells are in its test's `TARGET_CELLS` under the unified
+    target: the MTP layer's rope on its separate `[q | k | v]` scratch at
+    attention TP4 (tp4, tep4), 6 q / 1 k / 1 v heads of 256 (2048 wide) -- the
+    tp1 MTP layer's 24 / 2 / 2 at the per-rank head counts, at the MTP module's
+    `rope_theta`, which is the trunk's 1e7. Rows: 1 and 128 (draft steps),
+    512 and 1024 (the depth-3 and depth-7 verify of 128 requests) and 8192 (a
+    prefill chunk at max_num_tokens). The 1- and 128-token cells are also
+    captured as two CUDA graphs sharing one pool and replayed with their
+    buffers refilled in place; each replay is bitwise the eager call.
+    Measured on sm_103 over 12 seeds per cell, positions below 32768: worst
+    element 1.84 bf16 ulp of the row scale at 1024 tokens (max abs 0.0625) on
+    the 2-ulp gate, and 1.98 at 8192 tokens under the test's
+    GEMMA_PREFILL_ATOL; relative RMS at most 0.15 ulp, cosine at least
+    0.9999998. Against a float64 evaluation (4 seeds per cell) the kernel
+    (<= 1.32 ulp, RMS 0.42-0.44) and `reference` (<= 0.99 ulp, RMS 0.42-0.44)
+    sit equally far, so what separates them is the two bf16 roundings.
+
+    Positions past 32768 are uncertified. Drawn below 262144 (the
+    checkpoint's `max_position_embeddings`, and the tune's longest prompts),
+    the kernel's fast sincos puts the MTP cells' worst element against
+    float64 at 0.258 abs / 8.7 ulp of the row scale (RMS 0.60 ulp, cosine
+    0.999997) at 8192 tokens, and 0.19 / 7.4 ulp at 128, where `reference`
+    stays at 0.067 / 2.3 ulp. The stock attention
+    (`_torch/attention/qk_norm_attention.py`) reads its cos/sin from a
+    precomputed fp32 table (`fused_qkv_gemma_rmsnorm_rope_gate`), so past that
+    range this entry and the stock path differ by more than bf16 rounding.
     """
 
     def __call__(

@@ -66,6 +66,13 @@ def _compare(out: torch.Tensor, ref: torch.Tensor, *, element_atol: float | None
     ceiling) gates each element at `GEMMA_PREFILL_ATOL + 1.6e-2 |ref|` instead
     and keeps the RMS gate (0.13 measured). Every wrong mRoPE wiring lands
     11-19 away, ~100x outside it.
+
+    The unified target's MTP cells (6 q / 1 k / 1 v heads), 12 seeds each,
+    positions below 32768: the worst element is 1.84 ulp of the row scale
+    (max abs 0.0625) at 1024 tokens, on the 2-ulp gate, and 1.98 at 8192
+    tokens, under GEMMA_PREFILL_ATOL; relative RMS at most 0.15 ulp. Against
+    a float64 evaluation the kernel and the reference sit equally far (RMS
+    0.42-0.44 ulp each, the bf16 rounding floor).
     """
     if element_atol is None:
         assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=1.0)
