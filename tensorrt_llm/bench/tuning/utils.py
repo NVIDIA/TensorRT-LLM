@@ -41,13 +41,35 @@ DEFAULT_HF_MODEL_DIRS = {
 }
 
 
+# cgroup v2, then v1. A v1 file holds a huge sentinel value when there is no limit.
+_CGROUP_MEMORY_LIMIT_FILES = (
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+)
+
+
+def _cgroup_memory_limit():
+    """Return the cgroup memory limit in bytes, or None if there is none."""
+    for path in _CGROUP_MEMORY_LIMIT_FILES:
+        try:
+            with open(path) as f:
+                value = f.read().strip()
+        except OSError:
+            continue
+        if value.isdigit():
+            return int(value)
+        return None
+    return None
+
+
 def get_device_memory():
     """Return the total memory of GPU 0 in GiB.
 
     On unified-memory systems such as DGX Spark (GB10), NVML does not report
     device memory and ``nvmlDeviceGetMemoryInfo`` raises
     ``NVMLError_NotSupported``. The GPU then shares system memory, so fall
-    back to the total system memory.
+    back to the total system memory, capped by the cgroup memory limit when
+    running inside a container that has one.
     """
     pynvml.nvmlInit()
     try:
@@ -56,10 +78,14 @@ def get_device_memory():
             total_memory = pynvml.nvmlDeviceGetMemoryInfo(handle).total
         except pynvml.NVMLError_NotSupported:
             total_memory = psutil.virtual_memory().total
+            cgroup_limit = _cgroup_memory_limit()
+            if cgroup_limit is not None:
+                total_memory = min(total_memory, cgroup_limit)
             logger.warning(
                 "NVML does not support device memory queries for GPU 0 "
-                "(e.g. unified memory on DGX Spark). Using total system "
-                f"memory ({total_memory / (1024**3):.2f} GiB) to estimate "
+                "(e.g. unified memory on DGX Spark). Using system memory "
+                f"({total_memory / (1024**3):.2f} GiB, capped by the cgroup "
+                "memory limit if any) to estimate "
                 "max_batch_size and max_num_tokens."
             )
     finally:

@@ -251,6 +251,8 @@ def _patch_nvml(monkeypatch, get_memory_info):
     monkeypatch.setattr(nvml, "nvmlDeviceGetMemoryInfo", get_memory_info)
     bench_logger = mock.Mock()
     monkeypatch.setattr(tuning_utils, "logger", bench_logger, raising=False)
+    # Ignore the cgroup of the machine running the tests.
+    monkeypatch.setattr(tuning_utils, "_CGROUP_MEMORY_LIMIT_FILES", ())
     return calls, bench_logger
 
 
@@ -292,3 +294,25 @@ def test_get_device_memory_shuts_down_nvml_on_other_errors(monkeypatch):
         tuning_utils.get_device_memory()
     bench_logger.warning.assert_not_called()
     assert calls == ["init", "shutdown"]
+
+
+@pytest.mark.parametrize(
+    ("cgroup_value", "expected_gib"),
+    [
+        ("34359738368\n", 32.0),  # cgroup v2 limit below system memory
+        ("max\n", 128.0),  # cgroup v2 without a limit
+        ("9223372036854771712\n", 128.0),  # cgroup v1 "unlimited" sentinel
+    ],
+)
+def test_get_device_memory_fallback_respects_cgroup_limit(
+    monkeypatch, tmp_path, cgroup_value, expected_gib
+):
+    """Inside a container, the fallback must not report more than the container may use."""
+    _patch_nvml(monkeypatch, _raise_nvml(pynvml.NVML_ERROR_NOT_SUPPORTED))
+    limit_file = tmp_path / "memory.max"
+    limit_file.write_text(cgroup_value)
+    monkeypatch.setattr(
+        tuning_utils, "_CGROUP_MEMORY_LIMIT_FILES", (str(tmp_path / "missing"), str(limit_file))
+    )
+    with mock.patch("psutil.virtual_memory", return_value=SimpleNamespace(total=128 * 1024**3)):
+        assert tuning_utils.get_device_memory() == pytest.approx(expected_gib)
