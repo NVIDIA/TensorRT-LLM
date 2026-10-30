@@ -4083,6 +4083,12 @@ def create_py_executor_resources(
         llm_args,
         max_num_sequences=max_num_sequences)
 
+    # Reject a live phase before mutating the resource bundle or allocating LoRA state.
+    seq_slot_manager = resources.get(ResourceManagerType.SEQ_SLOT_MANAGER)
+    if seq_slot_manager is not None and seq_slot_manager.slot_manager.slot_mapping:
+        raise RuntimeError(
+            "Sequence slots must be released before resource rebinding")
+
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
@@ -4249,8 +4255,10 @@ def create_py_executor_resources(
         model_engine.init_cuda_graph_lora_manager(lora_config)
 
     validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
-    resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
-        max_num_sequences)
+    if (seq_slot_manager is None
+            or seq_slot_manager.get_max_resource_count() != max_num_sequences):
+        seq_slot_manager = SeqSlotManager(max_num_sequences)
+    resources[ResourceManagerType.SEQ_SLOT_MANAGER] = seq_slot_manager
 
     compression_manager = resources.get(
         ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)

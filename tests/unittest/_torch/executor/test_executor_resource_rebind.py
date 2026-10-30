@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler import AsyncWorkerMixin
+from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 
 pytestmark = pytest.mark.cpu_only
 
@@ -54,6 +55,8 @@ def executor(monkeypatch):
     ex.model_engine = engine
     ex.draft_model_engine = None
     ex.execution_stream = object()
+    ex.sample_stream = object()
+    ex.finish_sample_event = object()
     ex.dist = SimpleNamespace(pp_size=1)
     ex.worker_started = True
     ex._mpi_progress_thread = None
@@ -71,7 +74,11 @@ def executor(monkeypatch):
     ex.encoder_launch_executor = None
     ex.kv_connector_manager = None
     ex.kv_cache_transceiver = transceiver
-    ex.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: cache})
+    slots = SeqSlotManager(2)
+    slots.slot_manager.add_slot(17)
+    ex.resource_manager = ResourceManager(
+        {ResourceManagerType.KV_CACHE_MANAGER: cache, ResourceManagerType.SEQ_SLOT_MANAGER: slots}
+    )
     ex.virtual_memory_pools = None
     ex.sampler = object()
     ex.dwdp_manager = None
@@ -107,8 +114,22 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
     ex.sampler.async_worker_enabled.return_value = True
     ex.sampler.async_worker_stop.side_effect = lambda: events.append("sampler_stop")
     engine, stream, sampler = ex.model_engine, ex.execution_stream, ex.sampler
+    sample_stream, sample_event = ex.sample_stream, ex.finish_sample_event
+    slots = ex.resource_manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER]
+    release_slots = slots.shutdown
+
+    def shutdown_slots():
+        events.append("slots")
+        release_slots()
+
+    slots.shutdown = shutdown_slots
+    ex.resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER)
     ex.release_resources()
 
+    assert slots.slot_manager.slot_mapping == {}
+    assert slots.slot_manager.free_slots == {0, 1}
+    assert ex.sample_stream is sample_stream
+    assert ex.finish_sample_event is sample_event
     assert events == [
         "stop",
         "join",
@@ -117,6 +138,7 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
         "draft_graphs",
         "synchronize",
         "unregister",
+        "slots",
         "cache",
     ]
     assert ex.draft_model_engine is draft_engine
@@ -284,6 +306,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     ex.profile_stop_iters = set()
     old_shutdown_event = ex.shutdown_event
     engine, stream = ex.model_engine, ex.execution_stream
+    sample_stream, sample_event = ex.sample_stream, ex.finish_sample_event
     ex.release_resources()
     bound_fields = {
         "resource_manager",
@@ -326,6 +349,8 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         assert ex.max_num_active_requests == engine.get_max_num_sequences.return_value
         assert ex.kv_cache_manager is cache
         assert ex.model_engine is engine and ex.execution_stream is stream
+        assert ex.sample_stream is sample_stream
+        assert ex.finish_sample_event is sample_event
         assert not ex._resources_released
         engine.warmup.assert_called_once_with(resources.resource_manager)
         ex.start_worker.assert_not_called()
@@ -356,6 +381,7 @@ def test_failed_rebind_cannot_be_retried_over_partial_resources(executor):
 
 def test_hung_worker_does_not_release_live_resources(executor):
     ex, events = executor
+    slots = ex.resource_manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER]
     ex.hang_detector.detected.return_value = True
     ex._pp_mpi_progress_stop = threading.Event()
     progress_thread = Mock()
@@ -368,16 +394,19 @@ def test_hung_worker_does_not_release_live_resources(executor):
     assert ex._mpi_progress_thread is None
     assert ex.resource_manager is not None
     assert not ex._resources_released
+    assert slots.slot_manager.get_slot(17) is not None
 
 
 def test_transfer_shutdown_failure_keeps_cache_owned(executor):
     ex, events = executor
     manager = ex.resource_manager
+    slots = manager.resource_managers[ResourceManagerType.SEQ_SLOT_MANAGER]
     ex.kv_cache_transceiver.shutdown = Mock(side_effect=RuntimeError("DMA still active"))
     with pytest.raises(RuntimeError, match="DMA still active"):
         ex.release_resources()
     assert "cache" not in events
     assert ex.resource_manager is manager
+    assert slots.slot_manager.get_slot(17) is not None
     assert not ex._resources_released
 
 
