@@ -230,12 +230,16 @@ def test_nvfp4_draft_layers_are_rejected() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 @pytest.mark.parametrize(
-    "sparse_attention_freq,expected",
-    [(None, [3]), ([0, 1, 0, 1], [1, 3])],
-    ids=["default", "config"],
+    "sparse_attention_freq,num_specs,expected",
+    [
+        (None, NUM_TARGET + NUM_DRAFT, [3]),
+        ([0, 1, 0, 1], NUM_TARGET + NUM_DRAFT, [1, 3]),
+        ([0, 1, 0, 1], NUM_TARGET, [1, 3]),
+    ],
+    ids=["default", "config", "config-target-only"],
 )
 def test_specs_decide_the_sparse_target_layers(
-    sparse_attention_freq: Optional[list[int]], expected: list[int]
+    sparse_attention_freq: Optional[list[int]], num_specs: int, expected: list[int]
 ) -> None:
     """A per-layer head list spanning the drafter keeps the target's sparse split."""
     torch.cuda.init()
@@ -266,7 +270,7 @@ def test_specs_decide_the_sparse_target_layers(
         sparse_attention_config=MiniMaxM3SparseAttentionConfig(
             implementation="msa", indexer_kv_dtype="fp8"
         ),
-        layer_specs=_specs(),
+        layer_specs=_specs()[:num_specs],
         pretrained_config=pretrained_config,
     )
     try:
@@ -380,6 +384,7 @@ def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
     manager.mapping = Mapping(world_size=pp_size, rank=0, pp_size=pp_size)
     manager.is_disagg = is_disagg
     manager._generation_kv_capacity_headroom = 1
+    manager.num_extra_kv_tokens = 0
     configs = _configs(manager.layer_specs)
     draft_bytes_per_token = 2 * HEADS * HEAD_DIM * 2 * NUM_DRAFT
     # Admissible sequences (batch x PP stages, doubled for the overlap scheduler's retiring
@@ -400,8 +405,11 @@ def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
     assert manager._windowed_draft_pool_ratio(configs, 1 << 20, 128)[1] == pytest.approx(
         token_share
     )
-    # A quota that cannot hold the context-chunk floor keeps the backend's split.
-    assert manager._windowed_draft_pool_ratio(configs, 1 << 19, 128) is None
+    # The quota must hold the context-chunk floor: two blocks per lifecycle, over the resume
+    # watermark; otherwise the backend keeps its own split.
+    floor_bytes = 3 * sum(spec.bytes_per_token() * 128 for spec in manager.layer_specs)
+    assert manager._windowed_draft_pool_ratio(configs, floor_bytes - 1, 128, 0.95) is None
+    assert manager._windowed_draft_pool_ratio(configs, floor_bytes, 128, 0.95) is not None
     # Without a context-chunk bound the backend keeps its own split.
     manager.max_num_tokens = None
     assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128) is None
