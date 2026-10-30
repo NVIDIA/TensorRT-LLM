@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import DecodePrologue
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
@@ -328,6 +329,9 @@ class DecoderInputPreparer:
     A model family with its own per-sequence inputs or a specialized whole-batch
     path overrides ``_new_extra_inputs`` and ``_prepare_inputs_fast_path``.
     """
+
+    # The model's decode prologue (RuntimeHooks.decode_prologue), set by the runner.
+    decode_prologue: DecodePrologue | None = None
 
     def __init__(
         self,
@@ -2848,6 +2852,16 @@ class DecoderInputPreparer:
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
         attn_meta = inputs.get("attn_metadata")
+        # A model's decode prologue may replace the device work below with one
+        # launch; it decides on the host before any device work and returns
+        # False to keep the code below.
+        prologue = self.decode_prologue
+        if prologue is not None and prologue(
+            self, inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
+        ):
+            if self.guided_decoder is not None:
+                self.guided_decoder.token_event.record()
+            return inputs
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
         if attn_meta is not None:
             attn_meta.on_update_kv_lens()

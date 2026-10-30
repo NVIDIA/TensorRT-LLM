@@ -609,6 +609,8 @@ def _estimate_mamba_hybrid_cache_cost(
     extra_state_bytes_per_rank: int = 0,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
+    attention_slope_override: Optional[int] = None,
+    attention_page_bytes_override: int = 0,
     **kwargs,
 ) -> Tuple[int, int]:
     spec_config = kwargs.get("spec_config")
@@ -619,16 +621,18 @@ def _estimate_mamba_hybrid_cache_cost(
         is_draft=is_draft,
         use_separate_draft_kv_cache=use_separate_draft_kv_cache,
     )
-    attention_slope = (
-        KVCacheManager.get_cache_size_per_token(
-            model_config,
-            mapping,
-            num_layers=local_attention_layers,
-            **kwargs,
+    attention_slope = attention_slope_override
+    if attention_slope is None:
+        attention_slope = (
+            KVCacheManager.get_cache_size_per_token(
+                model_config,
+                mapping,
+                num_layers=local_attention_layers,
+                **kwargs,
+            )
+            if local_attention_layers > 0
+            else 0
         )
-        if local_attention_layers > 0
-        else 0
-    )
     state_bytes_per_rank = local_mamba_layers * params.get_states_bytes_per_layer(mapping)
     state_bytes_per_rank += extra_state_bytes_per_rank
     max_resident_sequences = max_batch_size * mapping.pp_size
@@ -655,8 +659,10 @@ def _estimate_mamba_hybrid_cache_cost(
         partial_attention_slots = max_resident_sequences if has_non_live_ssm_capacity else 0
     else:
         partial_attention_slots = max_resident_sequences * unaligned_fixed_rules
-    intercept = (
-        fixed_state_slots * state_bytes_per_rank + partial_attention_slots * attention_block_bytes
+    # attention_page_bytes_override adds the per-sequence attention state
+    # that a retained partial page also pins (the FP4 MLA HP ring).
+    intercept = fixed_state_slots * state_bytes_per_rank + partial_attention_slots * (
+        attention_block_bytes + attention_page_bytes_override
     )
 
     if interval is None:

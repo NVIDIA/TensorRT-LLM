@@ -1284,6 +1284,19 @@ def launch_visual_gen_server(
                   help="Protocol used when --grpc is enabled.",
                   status="prototype")
 @stability_option(
+    "--openengine-metrics-port",
+    type=click.IntRange(1, 65535),
+    default=None,
+    help="OpenEngine Prometheus HTTP port (default: 8001). "
+    "Enabled by return_perf_metrics or perf_metrics_output_dir in the engine configuration.",
+    status="prototype")
+@stability_option(
+    "--openengine-metrics-host",
+    type=str,
+    default=None,
+    help="Bind address for OpenEngine Prometheus (default: --host).",
+    status="prototype")
+@stability_option(
     "--openengine-enable-load-metrics",
     is_flag=True,
     default=False,
@@ -1391,6 +1404,8 @@ def serve(
     grpc: bool,
     grpc_protocol: str,
     openengine_enable_load_metrics: bool,
+    openengine_metrics_port: Optional[int],
+    openengine_metrics_host: Optional[str],
     enable_visual_gen: bool,
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
@@ -1423,6 +1438,20 @@ def serve(
         raise click.UsageError(
             "--openengine-enable-load-metrics requires --grpc --grpc-protocol openengine"
         )
+    if openengine_metrics_port is not None and (not grpc or grpc_protocol
+                                                != "openengine"):
+        raise click.UsageError(
+            "--openengine-metrics-port requires --grpc --grpc-protocol openengine"
+        )
+    if openengine_metrics_host is not None and (not grpc or grpc_protocol
+                                                != "openengine"):
+        raise click.UsageError(
+            "--openengine-metrics-host requires --grpc --grpc-protocol openengine"
+        )
+    if openengine_metrics_port is not None and openengine_metrics_port == port:
+        raise click.UsageError(
+            "--openengine-metrics-port must differ from --port")
+
     if moe_cluster_parallel_size is not None:
         logger.warning(
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
@@ -1682,6 +1711,9 @@ def serve(
                         served_model_name=served_model_name,
                         report_failure=_report_observed_child_failure,
                         enable_load_metrics=openengine_enable_load_metrics,
+                        metrics_host=openengine_metrics_host,
+                        metrics_port=8001 if openengine_metrics_port is None
+                        else openengine_metrics_port,
                         subagent_affinity_auth_key=internal_disagg_auth_key)
         else:
             # Default: launch OpenAI HTTP server

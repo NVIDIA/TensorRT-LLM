@@ -139,7 +139,6 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.enable_early_first_token_response = False
     executor.drafter = None
     executor.model_engine = None
-    executor._overlap_loop_on_execution_stream = False
     executor.previous_batch = None
     executor.active_requests = []
     executor.waiting_queue = []

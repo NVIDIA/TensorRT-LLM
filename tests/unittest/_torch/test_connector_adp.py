@@ -92,7 +92,6 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.active_requests = []
     executor.hang_detector = MagicMock()
     executor.hang_detector.detected.return_value = False
-    executor._overlap_loop_on_execution_stream = False
     executor._profile_manager = MagicMock()
     executor.sampler = None
     executor.worker_thread = MagicMock()

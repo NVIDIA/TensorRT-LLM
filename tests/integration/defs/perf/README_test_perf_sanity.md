@@ -26,9 +26,17 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 
 | List | Count | Contents |
 |------|-------|----------|
-| `MAXIMIZE_METRICS` | 8 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + TPOT (`d_mean_tpot`, `d_median_tpot`, `d_p99_tpot`) + spec-decoding `d_al` |
-| `MINIMIZE_METRICS` | 14 + 108 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
+| `MAXIMIZE_METRICS` | 5 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + spec-decoding `d_al` |
+| `MINIMIZE_METRICS` | 17 + 108 | TTFT, ITL, TPOT, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
+
+TPOT is time per output token, so lower values are better. Its reported delta is
+negative when latency exceeds the selected baseline. A stored `d_baseline_*`
+override takes precedence; otherwise, the baseline is recalculated as P5 of the
+smoothed history, as for the other latency metrics. Calculated baselines are not
+automatically stored as overrides. Historical TPOT measurements remain valid
+when the comparison direction changes. TPOT is not in `REGRESSION_METRICS`, so
+these statistics are diagnostic and do not determine the default pass/fail verdict.
 
 **Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
 

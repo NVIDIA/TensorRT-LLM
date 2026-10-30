@@ -167,6 +167,9 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_ltx23_registry.py
+  - unittest/_torch/visual_gen/test_ltx23_pipeline_config.py
+  - unittest/_torch/visual_gen/test_ltx23_retake_initialization.py
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
@@ -194,6 +197,7 @@ l0_cpu:
   - unittest/docs/test_llmapi_reference_docs.py
   - unittest/dynamo
   - unittest/evaluate/test_image_generation_eval_cli.py
+  - unittest/evaluate/test_json_mode_eval.py
   - unittest/executor/test_base_worker.py ISOLATION
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py
@@ -215,6 +219,7 @@ l0_cpu:
   - unittest/grpc/openengine/test_multimodal.py
   - unittest/grpc/openengine/test_node.py
   - unittest/grpc/openengine/test_openengine.py
+  - unittest/grpc/openengine/test_metrics.py
   - unittest/grpc/openengine/test_servicer.py
   - unittest/grpc/smg/test_smg.py::test_streaming_deltas_preserve_sequences_logprobs_and_final_tokens
   - unittest/grpc/smg/test_smg.py::test_streaming_empty_token_history

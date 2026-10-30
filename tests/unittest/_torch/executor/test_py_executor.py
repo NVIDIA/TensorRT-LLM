@@ -83,6 +83,7 @@ def _forward_step_executor(
         runtime_draft_len=runtime_draft_len,
         sampler=Mock(get_cache_indirection=Mock(return_value=object())),
         execution_stream=Mock(),
+        _loop_on_execution_stream=False,
         _iter_adp_dummy_ctx_tokens=0,
         _iter_adp_dummy_gen_tokens=0,
         _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
@@ -2606,6 +2607,8 @@ class _CleanupStub:
     """Stub for _executor_loop_cleanup: records the order in which the
     shutdown notification and PP-handle wait happen."""
 
+    _executor_events = None
+
     def __init__(self, pp_handles_raise=False):
         self.response_lock = threading.Lock()
         self.response_cv = threading.Condition(self.response_lock)
@@ -3735,6 +3738,59 @@ def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
     assert stub._pending_adp_dummy_request is dummy
 
 
+def test_pad_empty_batch_uses_context_dummy_on_context_only_fp4_mla_cache():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.fp4_mla_context_only_cache = True
+    stub.max_total_draft_tokens = 3
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    # A context-only FP4 MLA cache keeps no V scales, so a generation dummy
+    # would fail in attention.
+    assert scheduled_batch.generation_requests == []
+    assert len(scheduled_batch.context_requests) == 1
+    dummy = scheduled_batch.context_requests[0]
+    assert dummy.is_attention_dp_dummy is True
+    call = stub.add_dummy_calls[0]
+    assert call["is_gen"] is False
+    assert call["token_nums"] == [1]
+    assert call["max_num_draft_tokens"] == 0
+    assert stub._pending_adp_dummy_request is dummy
+
+
+@pytest.mark.parametrize("enable_non_overlap_adp_forward_intent", [False, True])
+@pytest.mark.parametrize("context_only_attr", ["fp4_mla_context_only_cache", "kda_context_only"])
+def test_pad_dummy_is_context_on_context_only_cache(
+    enable_non_overlap_adp_forward_intent, context_only_attr
+):
+    # The default role and the peers' intent say generation, but a
+    # context-only cache cannot run a generation row.
+    stub = _StubADPExecutor(
+        enable_non_overlap_adp_forward_intent=enable_non_overlap_adp_forward_intent,
+        peer_forward_intent=_ADPForwardIntent.GENERATION,
+    )
+    setattr(stub.kv_cache_manager, context_only_attr, True)
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    call = stub.add_dummy_calls[0]
+    assert call["is_gen"] is False
+    assert call["token_nums"] == [1]
+    assert stub._adp_dummy_is_gen is False
+
+
+def test_pad_dummy_keeps_generation_role_on_full_cache():
+    stub = _StubADPExecutor(peer_forward_intent=_ADPForwardIntent.GENERATION)
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["is_gen"] is True
+
+
 def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
     stub, scheduled_batch = _unfittable_rank()
     stub.kv_cache_manager.kda_context_only = True
@@ -4037,7 +4093,6 @@ class TestPendingTransferResponseFlush:
         executor._is_kv_manager_v2 = False
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
-        executor._overlap_loop_on_execution_stream = False
         executor._flush_pending_transfer_responses = Mock()
         return executor
 

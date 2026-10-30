@@ -1674,7 +1674,9 @@ async def test_preprocessing_errors_are_classified(image_llm, monkeypatch, error
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
     monkeypatch.setattr(llm, "preprocess", preprocess)
-    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+    outcomes = []
+    metrics = SimpleNamespace(record_outcome=lambda *args: outcomes.append(args))
+    servicer = OpenEngineInferenceServicer(llm, model="image-model", metrics=metrics)
     request = generation_pb2.GenerateRequest(
         request_id="preprocess-error",
         model="image-model",
@@ -1690,6 +1692,10 @@ async def test_preprocessing_errors_are_classified(image_llm, monkeypatch, error
             pass
 
     assert context.abort_code == expected_code
+    expected_outcome = (
+        "rejected" if expected_code == grpc.StatusCode.INVALID_ARGUMENT else "engine_error"
+    )
+    assert outcomes == [("aggregated", expected_outcome)]
     assert llm.generate_kwargs is None
     assert servicer.active_request_count() == 0
 

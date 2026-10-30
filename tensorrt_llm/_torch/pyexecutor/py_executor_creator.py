@@ -72,6 +72,51 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 FP4_MLA_TOKENS_PER_BLOCK = 128
+# NVFP4 MLA quantizes the latent cache in 16-token tiles.
+FP4_MLA_QUANTIZATION_TILE_SIZE = 16
+
+
+def _validate_fp4_mla_chunk_unit(
+        model_config, ctx_chunk_config: Optional[Tuple[StrEnum, int]]) -> None:
+    """Require a tile-aligned chunk unit for FP4 MLA chunked prefill.
+
+    The schedulers round every non-final context chunk that the token budget
+    or the context length truncates down to a multiple of the chunk unit, and
+    the hybrid FP4 MLA manager aligns snapshot points (which end forced
+    chunks) to cache blocks. A tile-aligned unit therefore keeps every
+    non-final chunk on a whole FP4 quantization tile; only the final chunk of
+    a request may end inside a tile, which the HP pool holds.
+    """
+    if ctx_chunk_config is None or not uses_fp4_mla_attention(model_config):
+        return
+    chunk_unit_size = ctx_chunk_config[1]
+    if chunk_unit_size % FP4_MLA_QUANTIZATION_TILE_SIZE != 0:
+        raise ValueError(
+            "NVFP4 MLA chunked prefill requires a context chunk unit that is "
+            f"a multiple of {FP4_MLA_QUANTIZATION_TILE_SIZE}, got "
+            f"{chunk_unit_size}.")
+
+
+def _fp4_mla_block_reuse_blocker(pretrained_config, *,
+                                 enable_chunked_prefill: bool) -> Optional[str]:
+    """Why FP4 MLA cannot reuse KV cache blocks, or ``None`` if it can.
+
+    A reused prefix must end on a full 16-token FP4 quantization tile. On
+    hybrid linear-attention models (Kimi K3) it ends on a recurrent-state
+    snapshot, which the cache manager places on a cache block. A dense FP4
+    MLA prefix can end mid-tile: the reuse match backs off by the
+    one-model draft's prompt lookahead. The cached prefix is attended
+    through the MLA chunked-prefill partitions, which read it back from the
+    FP4 pages.
+    """
+    if not is_hybrid_linear(pretrained_config):
+        return ("only hybrid linear-attention models, whose reused prefix "
+                "ends on a recurrent-state snapshot at a cache block, resume "
+                "on a full FP4 quantization tile")
+    if not enable_chunked_prefill:
+        return ("the cached prefix is attended through MLA chunked-prefill "
+                "partitions; set enable_chunked_prefill=True")
+    return None
 
 
 class _ExecutorMemoryMonitor:
@@ -861,18 +906,13 @@ def _create_py_executor(
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = model_engine.max_num_seq_slots
     if is_mla(config):
-        if uses_fp4_mla_attention(model_engine.model.model_config):
+        fp4_mla = uses_fp4_mla_attention(model_engine.model.model_config)
+        if fp4_mla:
             tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
             kv_cache_config.tokens_per_block = tokens_per_block
             logger.info(
                 f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
             )
-            if kv_cache_config.enable_block_reuse:
-                logger.warning(
-                    "FP4 MLA cached-context attention is not supported yet; "
-                    "disabling KV cache block reuse.")
-                kv_cache_config.enable_block_reuse = False
-                model_engine.attn_runtime_features.cache_reuse = False
         elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
@@ -907,10 +947,10 @@ def _create_py_executor(
         if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
                 == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8
-                or nvfp4_sparse_cache_reuse):
+                or nvfp4_sparse_cache_reuse or fp4_mla):
             logger.warning(
                 f"KV cache reuse for MLA can only be enabled without KV cache quantization, with FP8 quantization, "
-                f"or with NVFP4 quantization on the DSA or DeepSeek-V4 sparse paths, "
+                f"or with NVFP4 quantization on the DSA or DeepSeek-V4 sparse paths or FP4 MLA, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
@@ -922,6 +962,14 @@ def _create_py_executor(
                            f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
+        if fp4_mla and kv_cache_config.enable_block_reuse:
+            fp4_mla_reuse_blocker = _fp4_mla_block_reuse_blocker(
+                config, enable_chunked_prefill=enable_chunked_context)
+            if fp4_mla_reuse_blocker is not None:
+                logger.warning("Disabling KV cache block reuse for FP4 MLA: "
+                               f"{fp4_mla_reuse_blocker}.")
+                kv_cache_config.enable_block_reuse = False
+                model_engine.attn_runtime_features.cache_reuse = False
 
     if (kv_cache_config.enable_block_reuse
             and model_engine.model.model_config.is_encoder_decoder
@@ -976,6 +1024,9 @@ def _create_py_executor(
         # Snapshot boundaries come from expect_snapshot_points.  The unit is
         # only used to align chunks shortened by the scheduling budget.
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
+    if is_mla(config):
+        _validate_fp4_mla_chunk_unit(model_engine.model.model_config,
+                                     ctx_chunk_config)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:

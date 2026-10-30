@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
+    is_context_only_kv_cache,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import get_draft_kv_cache_manager, get_num_extra_kv_tokens
@@ -126,9 +127,10 @@ class DummyRequestFactory:
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if num_gen_requests and getattr(kv_cache_manager, "kda_context_only", False) is True:
-            # A disaggregated KDA context server keeps no draft-verify state,
-            # so generation shapes cannot run there.
+        if num_gen_requests and is_context_only_kv_cache(kv_cache_manager):
+            # A disaggregated context server keeps no generation-only cache
+            # state (KDA draft-verify buffers, FP4 MLA V scales), so
+            # generation shapes cannot run there.
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
@@ -326,10 +328,9 @@ class DummyRequestFactory:
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if (
-            getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
-            or getattr(kv_cache_manager, "kda_context_only", False) is True
-        ):
+        if getattr(
+            kv_cache_manager, "context_swa_layer_limit", None
+        ) is not None or is_context_only_kv_cache(kv_cache_manager):
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
