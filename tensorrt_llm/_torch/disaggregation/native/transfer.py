@@ -2143,6 +2143,47 @@ class TxSession(TxSessionBase):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
+    def _timeout_progress_description(self) -> str:
+        """Describe observed send progress without advancing state or waiting.
+
+        Counts cover per-peer KV and AUX operations, not requests. They can
+        contain several phases at once and are not an all-receiver readiness
+        barrier or a snapshot of the earlier deadline-expiry instant.
+
+        Returns:
+            Best-effort local progress, with unavailable evidence explicit.
+        """
+        if not self.lock.acquire(blocking=False):
+            return "progress_at_observation=unavailable(session_busy)"
+        try:
+            tasks = list(self.kv_tasks)
+            source_pieces = len(tasks)
+            receiver_ready_seen = self.receiver_ready
+            if self.aux_task is not None:
+                tasks.append(self.aux_task)
+        finally:
+            self.lock.release()
+        prefix = (
+            f"progress_at_observation=tx source_pieces={source_pieces} "
+            f"receiver_readiness_seen={receiver_ready_seen}"
+        )
+        if not self._enforce_physical_ownership:
+            return f"{prefix} operation_phases=unavailable(ownership_disabled)"
+        counts = dict.fromkeys(_PhysicalOperationState, 0)
+        busy_tasks = 0
+        for task in tasks:
+            states = task._physical_owner.try_snapshot_operation_states()
+            if states is None:
+                busy_tasks += 1
+                continue
+            for state in states:
+                counts[state] += 1
+        phases = ",".join(
+            f"{'pre_submission' if state is _PhysicalOperationState.ADMITTED else state.value.lower()}={count}"
+            for state, count in counts.items()
+        )
+        return f"{prefix} operation_phases=[{phases}] unavailable_tasks={busy_tasks}"
+
     def send(self, chunk: Chunk) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
@@ -3406,6 +3447,59 @@ class RxSession(RxSessionBase):
             ):
                 return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
+
+    def _timeout_progress_description(self) -> str:
+        """Describe local receive evidence without polling lifecycle or backend state.
+
+        Counts include KV and AUX owners. Publication and writer results do
+        not establish when the remote sender submitted work to its backend.
+
+        Returns:
+            Observation-time local evidence, with remote submission unknown.
+        """
+        if not self.lock.acquire(blocking=False):
+            return "progress_at_observation=unavailable(session_busy) ctx_submission=unknown"
+        try:
+            owners = [task._physical_owner for task in self._kv_tasks]
+            if self._aux_physical_owner is not None:
+                owners.append(self._aux_physical_owner)
+            publication_escaped = self._publication_may_have_escaped
+        finally:
+            self.lock.release()
+        prefix = "progress_at_observation=rx ctx_submission=unknown"
+        if not self._enforce_physical_ownership:
+            return f"{prefix} receive_phases=unavailable(ownership_disabled)"
+        prefix += f" publication_may_have_escaped={publication_escaped}"
+        counts = dict.fromkeys(
+            (
+                "unpublished_owners",
+                "publication_pending",
+                "expected_writer_results",
+                "received_writer_results",
+                "in_doubt_writers",
+                "local_completion_pending",
+                "unavailable_owners",
+            ),
+            0,
+        )
+        for owner in owners:
+            if owner is None:
+                counts["unpublished_owners"] += 1
+                continue
+            if not owner._lock.acquire(blocking=False):
+                counts["unavailable_owners"] += 1
+                continue
+            try:
+                counts["unpublished_owners"] += owner._expected_writers is None
+                counts["publication_pending"] += owner._publication_pending
+                counts["expected_writer_results"] += owner._expected_writers or 0
+                counts["received_writer_results"] += len(owner._writer_results)
+                counts["in_doubt_writers"] += len(owner._in_doubt_writers)
+                counts["local_completion_pending"] += owner._local_completion_pending
+            finally:
+                owner._lock.release()
+        phases = ",".join(f"{name}={count}" for name, count in counts.items())
+        return f"{prefix} receive_phases=[{phases}]"
 
     def try_begin_transfer(
         self,
