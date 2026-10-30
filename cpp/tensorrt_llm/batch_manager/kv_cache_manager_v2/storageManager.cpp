@@ -298,6 +298,67 @@ bool StorageManager::submitColdPageCodec(
     return true;
 }
 
+bool StorageManager::submitBoundPoolColdPageCodec(bool encode, LayerGroupId batchingLayerGroupId,
+    PoolGroupIndex hotPgIdx, void const* coldBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    auto& hot = poolGroup(kHotLevel, hotPgIdx);
+    size_t const numPools = static_cast<size_t>(hot.numPools().value());
+    thread_local std::vector<std::vector<PageIndexPair>> perPool;
+    perPool.resize(numPools);
+    for (PoolIndex poolIdx{0}; poolIdx < hot.numPools(); ++poolIdx)
+    {
+        auto& indices = perPool[static_cast<size_t>(poolIdx.value())];
+        indices.assign(pageIndices, pageIndices + numPages);
+        if (!hot.isBoundPool(poolIdx))
+            continue;
+        auto const& pool = hot.arenaPool(poolIdx);
+        for (auto& pair : indices)
+        {
+            int32_t& hotIndex = encode ? pair.src : pair.dst;
+            auto const local = pool.localId(SlotId{hotIndex});
+            TLLM_CHECK_WITH_INFO(local.has_value(), "Bound pool %d has no binding for group slot id %d",
+                static_cast<int>(poolIdx.value()), hotIndex);
+            hotIndex = slotIdToPageIndexValue(*local);
+        }
+    }
+    std::vector<PageIndexPair const*> arrays(numPools);
+    auto submit = [&](size_t count)
+    {
+        auto const cudaStream = reinterpret_cast<cudaStream_t>(stream);
+        return encode ? mColdPageCodec->encodePools(batchingLayerGroupId, const_cast<void*>(coldBase), arrays.data(),
+                   numPools, count, cudaStream)
+                      : mColdPageCodec->decodePools(
+                          batchingLayerGroupId, coldBase, arrays.data(), numPools, count, cudaStream);
+    };
+    if (mPageIndexLocations.at(batchingLayerGroupId) == PageIndexLocation::kHost || numPages == 0)
+    {
+        for (size_t p = 0; p < numPools; ++p)
+            arrays[p] = perPool[p].data();
+        return submit(numPages);
+    }
+    TLLM_CHECK_WITH_INFO(mIndexStagingManager, "Device page indices need index staging");
+    // Device page indices: stage every pool's chunk in one slice, pool after pool.
+    size_t const rowBytes = numPools * sizeof(PageIndexPair);
+    size_t offset = 0;
+    while (offset < numPages)
+    {
+        size_t const maxBytes = std::max(rowBytes, roundDown(std::min((numPages - offset) * rowBytes, kMaxIndexBatchBytes), rowBytes));
+        auto device = mIndexStagingManager->acquire(rowBytes, maxBytes, rowBytes, alignof(PageIndexPair), stream);
+        size_t const chunkPages = std::min(numPages - offset, device.size() / rowBytes);
+        TLLM_CHECK_DEBUG(chunkPages > 0);
+        for (size_t p = 0; p < numPools; ++p)
+        {
+            MemAddress const address = device.address() + p * chunkPages * sizeof(PageIndexPair);
+            copyToDeviceSyncSource(static_cast<CUdeviceptr>(address), perPool[p].data() + offset, chunkPages, stream);
+            arrays[p] = reinterpret_cast<PageIndexPair const*>(address);
+        }
+        if (!submit(chunkPages))
+            return false;
+        offset += chunkPages;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // StorageManager
 // ---------------------------------------------------------------------------
@@ -505,11 +566,12 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             roundUp(ArenaGpuCacheLevelStorage::minArenaBytes(slotSizeLists, mHotMinSlots), gpuGranularity));
         auto arena = std::make_unique<ArenaGpuCacheLevelStorage>(
             slotDescList(kHotLevel), arenaBytes, hotRatio, mHotMinSlots, *mGpuPhysMemAllocator);
-        // Migration to and from lower tiers addresses every pool of a GPU slot by one slot id (the
-        // cold-page codec); bound pools have their own ids, which it does not know yet.
-        TLLM_CHECK_WITH_INFO(!arena->hasBoundPools() || config.cacheTiers.size() == CacheLevel{1},
-            "Copy-based rebalancing with several pools in a pool group does not support host or disk "
-            "cache tiers yet");
+        // Migration to and from lower tiers: a bound pool has its own slot ids, so the cold-page codec gets one
+        // page-index array per pool (submitBoundPoolColdPageCodec), which it must accept.
+        TLLM_CHECK_WITH_INFO(!arena->hasBoundPools() || config.cacheTiers.size() == CacheLevel{1}
+                || codec.supportsPerPoolPageIndices(),
+            "Copy-based rebalancing with several pools in a pool group needs a cold-page codec that supports "
+            "per-pool page indices (supportsPerPoolPageIndices) for host or disk cache tiers");
         mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, std::move(arena));
     }
     else
@@ -676,8 +738,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             size_t const unit = ArenaHostCacheLevelStorage::arenaUnitBytes(tierCommitUnit(tierConfig, gpuGranularity));
             size_t const arenaBytes = std::max(roundDown(cacheTierQuota(tierConfig), unit),
                 roundUp(ArenaGpuCacheLevelStorage::minArenaBytes(coldSlotSizeLists, coldMinSlots), unit));
-            auto arena = std::make_unique<ArenaHostCacheLevelStorage>(
-                slotDescList(level), arenaBytes, unit, coldRatio, coldMinSlots, tierBackingOptions(tierConfig, gpuGranularity, config.hostMemBacking));
+            auto arena = std::make_unique<ArenaHostCacheLevelStorage>(slotDescList(level), arenaBytes, unit, coldRatio,
+                coldMinSlots, tierBackingOptions(tierConfig, gpuGranularity, config.hostMemBacking));
             mLevels.emplace_back(lifeCycleGrouping(level), level, std::move(arena));
             continue;
         }
@@ -1072,6 +1134,13 @@ Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, Slot
 bool StorageManager::encodeColdPages(
     LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {
+    // A hot pool group with bound pools (copy-based rebalancing) translates its slot ids per pool.
+    PoolGroupIndex const hotPgIdx = getPoolGroupIndex(kHotLevel, layerGroup);
+    if (poolGroup(kHotLevel, hotPgIdx).hasBoundPools())
+    {
+        return submitBoundPoolColdPageCodec(
+            /*encode=*/true, layerGroup, hotPgIdx, dstBase, pageIndices, numPages, stream);
+    }
     return submitColdPageCodec(mPageIndexLocations.at(layerGroup), pageIndices, numPages, stream,
         [this, layerGroup, dstBase](PageIndexPair const* submitted, size_t submittedPages, CUstream submittedStream)
         {
@@ -1083,6 +1152,12 @@ bool StorageManager::encodeColdPages(
 bool StorageManager::decodeColdPages(
     LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {
+    PoolGroupIndex const hotPgIdx = getPoolGroupIndex(kHotLevel, layerGroup);
+    if (poolGroup(kHotLevel, hotPgIdx).hasBoundPools())
+    {
+        return submitBoundPoolColdPageCodec(
+            /*encode=*/false, layerGroup, hotPgIdx, srcBase, pageIndices, numPages, stream);
+    }
     return submitColdPageCodec(mPageIndexLocations.at(layerGroup), pageIndices, numPages, stream,
         [this, layerGroup, srcBase](PageIndexPair const* submitted, size_t submittedPages, CUstream submittedStream)
         {

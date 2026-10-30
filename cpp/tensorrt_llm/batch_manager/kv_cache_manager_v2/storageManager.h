@@ -630,6 +630,11 @@ private:
     //! transfer on the host throws RemoteMemError before any page is pointed at its new slot.
     void submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
         PoolGroupIndex srcPgIdx, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+    //! Hot<->cold codec call for a hot pool group with bound pools (copy-based rebalancing, several pools per group):
+    //! `pageIndices` carry the group's slot ids on the hot side; each pool gets its own array with the hot side
+    //! translated to that pool's ids (encodePools/decodePools). `coldBase` is the cold base (encode: destination).
+    bool submitBoundPoolColdPageCodec(bool encode, LayerGroupId batchingLayerGroupId, PoolGroupIndex hotPgIdx,
+        void const* coldBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
 
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
