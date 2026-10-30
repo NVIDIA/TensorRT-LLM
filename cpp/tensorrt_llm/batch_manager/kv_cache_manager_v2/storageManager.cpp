@@ -247,15 +247,30 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // their page sizes. Nothing may read a cold level before then.
     TLLM_CHECK(appendLevelSlotDescList(config.slotDescList) == kHotLevel);
 
-    // Compute layer attributes and slot utilization fractions for scratch support.
-    mLayerAttributes = config.layerAttributes();
+    // A scratch slot serves one layer at a time. Reserve the largest layer share
+    // across the coalesced pools of each lifecycle, retaining exact fractions.
     mSlotUtilFracMax.resize(lifeCycles.size(), Rational{0, 1});
-    for (auto const& [layerId, layerAttr] : mLayerAttributes)
+    for (auto const& slotDesc : config.slotDescList)
     {
-        LifeCycleId const lcIdx = layerAttr.lifeCycleId;
-        if (layerAttr.slotUtilFracMax > mSlotUtilFracMax[lcIdx])
+        for (auto const& variant : slotDesc.variants)
         {
-            mSlotUtilFracMax[lcIdx] = layerAttr.slotUtilFracMax;
+            for (auto const& buffers : variant.coalescedBuffers)
+            {
+                std::unordered_map<LayerId, int> counts;
+                for (auto const& buffer : buffers.bufferIds)
+                {
+                    ++counts[buffer.layerId];
+                }
+                for (auto const& [layer, count] : counts)
+                {
+                    Rational const fraction{count, buffers.numBuffers()};
+                    auto& maximum = mSlotUtilFracMax[variant.lifeCycleId];
+                    if (fraction > maximum)
+                    {
+                        maximum = fraction;
+                    }
+                }
+            }
         }
     }
 
@@ -432,12 +447,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     TypedVec<LifeCycleId, PoolGroupIndex> coldGrouping(numLifeCycles());
     TypedVec<PoolGroupIndex, SlotDesc> coldSlotDescList;
-    std::map<std::pair<AttentionReusePolicy, size_t>, PoolGroupIndex> coldGroupByPageBytes;
+    std::map<std::pair<ReusePolicy, size_t>, PoolGroupIndex> coldGroupByPageBytes;
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
     {
         size_t const coldPageBytes = coldPageBytesByLifeCycle[lifeCycle];
-        auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[lifeCycle]);
-        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
+        auto const policy = reusePolicy(mLifeCycles[lifeCycle]);
         auto [it, inserted] = coldGroupByPageBytes.emplace(
             std::make_pair(policy, coldPageBytes), PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
         PoolGroupIndex const coldPgIdx = it->second;
@@ -1630,14 +1644,6 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
     return result;
 }
 
-LayerAttr const& StorageManager::getLayerAttr(LayerId layerId) const
-{
-    auto it = mLayerAttributes.find(layerId);
-    if (it == mLayerAttributes.end())
-        throw std::out_of_range("Unknown LayerId for LayerAttr");
-    return it->second;
-}
-
 SlotCount StorageManager::numSlots(PoolGroupIndex pgIdx, CacheLevel level) const
 {
     return mLevels.at(level).storage->numSlots(pgIdx);
@@ -1885,14 +1891,13 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
     // same boundary KvCache::_appendBeams() uses.
     HalfOpenRange<BlockOrdinal> const sharedRange{0, std::min(std::max(promptLength, 0) / tokensPerBlock, numBlocks)};
     TypedVec<LifeCycleId, size_t> numBytes(numLifeCycles(), 0);
-    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
     auto const& lifeCycles = mLifeCycles.getAll();
     for (LifeCycleId lifeCycle{0}; lifeCycle < lifeCycles.size(); ++lifeCycle)
     {
         auto const poolSizes = slotSize(level, getPoolGroupIndex(level, lifeCycle));
         size_t const slotBytes = std::accumulate(poolSizes.begin(), poolSizes.end(), size_t{0});
         int numRequiredBlocks;
-        if (ssmLcId.has_value() && lifeCycle == *ssmLcId)
+        if (mLifeCycles.isSsm(lifeCycle))
         {
             // One recurrent-state block per beam.
             numRequiredBlocks = effBeamWidth;
@@ -1953,9 +1958,9 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
     auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
     // A soft preference, not a feasibility floor: keep one optional endpoint
     // per typical request in addition to its private working pages.
-    for (auto const& [lc, attention] : mLifeCycles.attentionLifeCycles())
+    for (auto const& [lc, lifeCycle] : mLifeCycles)
     {
-        if (attention->allowsCheckpoint())
+        if (reusePolicy(lifeCycle) == ReusePolicy::OPTIONAL)
         {
             numSlots[lc] += slotCountValueFromSize(batch.kvCaches.size());
         }
@@ -2052,12 +2057,11 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
     BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
     TypedVec<LifeCycleId, SlotCount> numSlots(numLifeCycles(), 0);
-    auto ssmLcId = mLifeCycles.ssmLifeCycleId();
     int sysBlocks = batch.systemPromptLength / tokensPerBlock;
 
     for (auto const& [lcIdx, lc] : mLifeCycles)
     {
-        if (ssmLcId.has_value() && lcIdx == *ssmLcId)
+        if (mLifeCycles.isSsm(lcIdx))
         {
             // SSM: one dedicated block per request per beam, never shared.
             // _appendBeams() gives every beam its own recurrent-state slot.
