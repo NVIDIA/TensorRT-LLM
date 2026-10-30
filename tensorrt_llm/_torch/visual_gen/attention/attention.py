@@ -580,6 +580,37 @@ class Attention(nn.Module):
             tokens_per_batch,
         )
 
+    def apply_packed_qk_norm_rope_fp8(
+        self,
+        qkv: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        qk_mul: float,
+        v_amax: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full-dim QK Norm + RoPE + FP8 quantization of a packed QKV tensor [B, S, 3*H*D].
+
+        Q and K are quantized as x * qk_mul (callers fold their descale into qk_mul). V uses a
+        per-tensor scale from ``v_amax`` (e.g. reduced across sequence-parallel ranks), or from the
+        local |V| maximum when it is None. Returns e4m3 Q, K, V [B*S, H, D] and the fp32 [1] V
+        descale.
+        """
+        B, S, D = qkv.shape
+        assert self.tp_size == 1, "fused_dit_qk_norm_rope_fp8 does not support TP"
+        return torch.ops.trtllm.fused_dit_qk_norm_rope_fp8(
+            qkv.view(B * S, D),
+            self.num_attention_heads,
+            self.head_dim,
+            self.eps,
+            self.norm_q.weight,
+            self.norm_k.weight,
+            freqs_cos,
+            freqs_sin,
+            self.interleave,
+            qk_mul,
+            v_amax,
+        )
+
     def apply_split_norm_rope(
         self,
         tensor: torch.Tensor,
