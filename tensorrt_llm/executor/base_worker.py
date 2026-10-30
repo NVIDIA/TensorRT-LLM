@@ -538,6 +538,8 @@ class BaseWorker(GenerationExecutor):
             if request.conversation_params is not None:
                 executor_request.py_conversation_params = request.conversation_params
 
+            executor_request.py_kv_hints = request.kv_hints
+
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 

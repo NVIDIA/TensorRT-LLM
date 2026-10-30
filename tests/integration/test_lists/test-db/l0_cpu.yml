@@ -280,6 +280,7 @@ l0_cpu:
   - unittest/llmapi/test_gc_utils.py
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
+  - unittest/llmapi/test_kv_hints.py
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_gms_args.py
   - unittest/llmapi/test_mx_args.py

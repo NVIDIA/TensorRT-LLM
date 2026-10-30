@@ -16,6 +16,7 @@
 # yapf: disable
 import asyncio
 import json
+import os
 import signal
 import socket
 import traceback
@@ -56,6 +57,7 @@ from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
+from tensorrt_llm.serve.kv_hints import KvHintsRoute
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
@@ -290,6 +292,8 @@ class OpenAIDisaggServer:
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+        self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:
             self.app.add_middleware(
