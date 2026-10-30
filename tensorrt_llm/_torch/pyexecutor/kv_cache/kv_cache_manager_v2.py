@@ -1816,6 +1816,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # need snapshotted (request_prefix_snapshot); kept apart from the request's
     # own expect_snapshot_points, which other code rewrites. Created on first use.
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
+    # Declared on the class so managers built without __init__ have no layer specs.
+    layer_specs: Optional[Tuple["KVCacheLayerSpec", ...]] = None
     # A subclass whose extra buffers may join explicit layer specs (draft layers then get their own lifecycle).
     hosts_unified_draft_layers: bool = False
     # Layer specs coalesce NVFP4 data and scales apart; a subclass addressing its pools by size opts out.
