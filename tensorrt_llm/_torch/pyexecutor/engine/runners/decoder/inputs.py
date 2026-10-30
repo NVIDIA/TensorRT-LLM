@@ -2416,6 +2416,9 @@ class DecoderInputPreparer:
             total_draft_lens = sum(host.lists.draft_lens)
             spec_metadata.draft_tokens = self._buffers.draft_tokens_cuda[:total_draft_lens]
             spec_metadata.request_ids = host.lists.request_ids
+            spec_metadata.paused_in_place_ids = getattr(
+                scheduled_requests, "paused_in_place_ids", frozenset()
+            )
             spec_metadata.gather_ids = self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().

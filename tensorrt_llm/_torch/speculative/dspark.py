@@ -232,7 +232,8 @@ class DSparkSpecMetadata(SpecMetadata):
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = getattr(self, "_dspark_worker", None)
         if worker is not None and worker._win_inited:
-            current = set(self.request_ids)
+            # Requests paused in place (GEN slot preemption) keep their window.
+            current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
@@ -385,10 +386,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._win_inited = False
         self._output_verify_lens: Optional[torch.Tensor] = None
         self._attention_warmup_attempted = False
-        self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
-        self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
-        self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
-        self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
+        self._kv_windows: Optional[torch.Tensor] = None  # [num_slots + 1, num_stages, win, hd]
+        self._ctx_len: Optional[torch.Tensor] = None  # [num_slots + 1] abs decode position
+        self._valid_len: Optional[torch.Tensor] = None  # [num_slots + 1] written window entries
+        self._position_initialized: Optional[torch.Tensor] = None  # [num_slots + 1] bool
         self._win = 0
         # Set in _lazy_init from the RoPE table the drafter will build; None
         # leaves positions unbounded (direct construction in tests).
@@ -403,7 +404,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
         # Index of the throwaway "scratch" window row that absorbs padded /
-        # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
+        # unknown request IDs (set in ``_lazy_init`` to ``num_slots``); it is
         # never handed out through ``_free_slots``.
         self._scratch_slot = 0
 
@@ -411,7 +412,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # captured draft graph cannot diverge. ``_confidence_logits`` is the
         # slot-indexed handoff to the verification scheduler.
         self.return_confidence = bool(getattr(spec_config, "enable_confidence_scheduling", False))
-        self._confidence_logits: Optional[torch.Tensor] = None  # [max_batch+2, block]
+        self._confidence_logits: Optional[torch.Tensor] = None  # [num_slots + 2, block]
         # Draft-pass stamps for the buffer above; allocated in ``_lazy_init``.
         self._confidence_stamp: Optional[torch.Tensor] = None
         self._draft_seq_host = 0
@@ -552,15 +553,20 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._win = int(draft_model._attn_params["window_size"])
             head_dim = int(draft_model._attn_params["head_dim"])
 
-            # Real requests occupy slots ``[0, max_batch)``; one extra "scratch" row
-            # at index ``max_batch`` absorbs padded / unknown request IDs (CUDA-graph
+            # Real requests occupy slots ``[0, num_slots)``: ``max_batch`` plus
+            # the requests GEN slot preemption may hold paused in place, which
+            # keep their slot while others run. One extra "scratch" row at index
+            # ``num_slots`` absorbs padded / unknown request IDs (CUDA-graph
             # padding, ADP idle requests, or disagg seed forwards that arrive without
             # a real request id) so they can never overwrite a live request's rolling
             # window. Previously such IDs aliased to slot 0 and corrupted whichever
             # real request occupied it. The scratch row is never handed out through
             # ``_free_slots`` and its contents are throwaway.
-            self._scratch_slot = max_batch
-            num_rows = max_batch + 1
+            from ..pyexecutor.scheduler.gen_preemption import resident_headroom
+
+            num_slots = max_batch + resident_headroom()
+            self._scratch_slot = num_slots
+            num_rows = num_slots + 1
 
             # Both CUDA-graph padding variants, each with K+1 runtime widths,
             # use ``[CUDA_GRAPH_DUMMY_REQUEST_ID - 2*(K+1) + 1,
@@ -608,12 +614,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 with torch.inference_mode(False):
                     self._draft_seq_cuda = torch.zeros((), dtype=torch.int32, device="cuda")
                 self._build_verify_planner(draft_model, block_size)
-            self._free_slots = deque(range(max_batch))
+            self._free_slots = deque(range(num_slots))
             self._req_to_slot = {}
             logger.info(
                 f"DSpark: allocated rolling KV windows "
                 f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
-                f"({max_batch} request slots + 1 scratch row)"
+                f"({num_slots} request slots + 1 scratch row)"
             )
             # Buffer state is complete independently of CuTe DSL prewarming.
             # A failed prewarm must not cause the next forward to recreate the

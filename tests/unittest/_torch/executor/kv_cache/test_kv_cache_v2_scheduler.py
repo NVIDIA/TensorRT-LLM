@@ -1873,6 +1873,67 @@ class TestKVCacheFailuresCtxChunked:
 
 
 # ===========================================================================
+# GEN slot preemption: pause in place (driven by PyExecutor, see
+# gen_preemption.py)
+# ===========================================================================
+
+
+class TestGenSlotPreemption:
+    def test_paused_requests_stay_resident_and_unscheduled(self):
+        mgr = make_kv_cache_manager(can_evict=True)
+        draft = make_kv_cache_manager(can_evict=True)
+        sched = make_scheduler(mgr, draft_kv_cache_manager=draft)
+        reqs = [make_gen_request(i) for i in range(3)]
+        reqs[1].py_batch_idx = 5
+        sched.set_gen_paused_ids(frozenset({1}))
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 2]
+        assert out.paused_requests == [] and out.num_fitting_requests == 2
+        allocated = [c.args[0].py_request_id for c in mgr.try_allocate_generation.call_args_list]
+        assert allocated == [0, 2]
+        # Pausing in place touches no pool: nothing is suspended or freed.
+        for m in (mgr, draft):
+            m.suspend_request.assert_not_called()
+            m.free_resources.assert_not_called()
+        # Its next step reads its token from the host, not a stale batch slot.
+        assert reqs[1].py_batch_idx is None
+
+    def test_paused_requests_do_not_take_batch_slots(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_batch_size=2)
+        reqs = [make_gen_request(i) for i in range(4)]
+        sched.set_gen_paused_ids(frozenset({0, 2}))
+        assert ids(sched.schedule_request(reqs, set()).generation_requests) == [1, 3]
+
+    def test_resumed_requests_are_scheduled_again(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr)
+        reqs = [make_gen_request(i) for i in range(3)]
+        sched.set_gen_paused_ids(frozenset({1}))
+        sched.schedule_request(reqs, set())
+        sched.set_gen_paused_ids(frozenset())
+        assert ids(sched.schedule_request(reqs, set()).generation_requests) == [0, 1, 2]
+
+    def test_off_schedules_as_before(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr)
+        assert sched._gen_paused_ids == frozenset()
+        reqs = [make_gen_request(i) for i in range(3)]
+        for req in reqs:
+            req.py_batch_idx = req.py_request_id
+        assert ids(sched.schedule_request(reqs, set()).generation_requests) == [0, 1, 2]
+        assert [req.py_batch_idx for req in reqs] == [0, 1, 2]
+
+    def test_helix_alloc_failure_still_raises(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        mgr._has_cp_helix = True
+        sched = make_scheduler(mgr)
+        sched.set_gen_paused_ids(frozenset({1}))
+        with pytest.raises(RuntimeError, match="eviction is disabled under helix"):
+            sched.schedule_request([make_gen_request(0), make_gen_request(1)], set())
+
+
+# ===========================================================================
 # Eviction (MAX_UTILIZATION)
 # ===========================================================================
 

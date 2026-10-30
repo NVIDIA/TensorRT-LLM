@@ -2569,6 +2569,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
         self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
+        if not mapping.has_pp():
+            # GEN slot preemption keeps paused requests resident beside the
+            # requests that took their slots.
+            from ..scheduler.gen_preemption import resident_headroom
+
+            self.max_admissible_sequences += resident_headroom()
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
