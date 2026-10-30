@@ -405,6 +405,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
     import tensorrt_llm._torch.attention.mla as mla_module
 
     class FakeTrtllmAttention:
+        uses_fp4_mla_attention = False
 
         @staticmethod
         def has_cached_kv_for_mla_context_warmup(_metadata):
