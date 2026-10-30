@@ -163,13 +163,11 @@ class VisualGenRule(Rule):
             entries = _vg_entries(block)
             if _VG_SCHEMA_PATH in claimed:
                 for entry in block.tests:
-                    target = _entry_target(entry)
-                    if target and (
-                        target == _SCHEMA_TEST_TARGET
-                        or _SCHEMA_TEST_TARGET.startswith(target.rstrip("/") + "/")
-                    ):
+                    if _covers_check(entry, _SCHEMA_TEST_TARGET):
                         key = (block.yaml_stem, block.block_index)
-                        schema_filters.setdefault(key, {}).setdefault(target, set()).add(entry)
+                        schema_filters.setdefault(key, {}).setdefault(
+                            _entry_target(entry), set()
+                        ).add(entry)
             if not entries:
                 continue
             key = (block.yaml_stem, block.block_index)

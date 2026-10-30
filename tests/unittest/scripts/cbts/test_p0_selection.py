@@ -120,6 +120,7 @@ def test_formatting_does_not_hide_a_renamed_files_old_path(tmp_path: Path) -> No
     pr.changed_files.append("tensorrt_llm/old.py")
     result = Selector({}).run(pr, [PythonFormattingRule()])
     assert result.scope is None
+    assert result.reasons[-1]["files"] == ["tensorrt_llm/old.py"]
 
 
 def test_rename_from_noop_path_is_not_classified_as_formatting(tmp_path: Path) -> None:
@@ -160,6 +161,15 @@ def test_schema_claim_is_exact_and_retains_validation() -> None:
 def test_schema_requires_runnable_validation(schema_tests: bool, cpu_stage: bool) -> None:
     result = _vg_rule(schema_tests=schema_tests, cpu_stage=cpu_stage).apply(PRInputs([SCHEMA], {}))
     assert result is not None and result.scope is None
+
+
+@pytest.mark.parametrize("suffix", [" -k unrelated", " --ignore=anything", " SKIP (bug)"])
+def test_schema_requires_unfiltered_validation(suffix: str) -> None:
+    rule = _vg_rule()
+    rule.yaml_index.blocks[1].tests[:] = [SCHEMA_TEST + suffix]
+    result = rule.apply(PRInputs([SCHEMA], {}))
+    assert result is not None and result.scope is None
+    assert "schema validation stages unavailable" in result.reason
 
 
 def test_public_api_falls_back_without_shared_validation() -> None:

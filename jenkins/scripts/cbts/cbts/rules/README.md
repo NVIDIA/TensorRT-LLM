@@ -220,7 +220,7 @@ Path-only rule. Claims source files under `examples/visual_gen/`,
 `tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding documentation,
 which `DocsRule` handles). It also claims the exact generated schema
 `tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.json`.
-fused-DiT paths stay unclaimed:
+Fused-DiT paths stay unclaimed:
 those diffs also touch `inplace_info()` in
 `tensorrt_llm/_torch/compilation/utils.py`, which no VG rule claims.
 Image suffixes are intentionally NOT excluded: VG ships reference images
