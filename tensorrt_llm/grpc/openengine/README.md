@@ -69,11 +69,29 @@ Set `failureThreshold * periodSeconds` to cover the longest expected model start
 
 OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
 
+For models that do not accept token-ID input, including Whisper, the optional
+`Health(include_inference_probe=True)` check reports the inference probe as not
+applicable. It does not submit inference and does not establish inference liveness;
+the ordinary lifecycle and executor health checks still apply.
+
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, unsupported media modalities, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+
+### Media capability discovery
+
+`GetModelInfo.supports_multimodal` and `extra.trtllm_supported_modalities` reflect
+the loaded processor's read-only `supported_modalities` property, intersected
+with registered placeholders and implemented OpenEngine handlers. Both discovery
+and request validation use this result. `InputProcessor` defaults to text-only;
+`BaseMultimodalInputProcessor` defaults to its registered modalities. Processors
+with checkpoint-dependent encoders override the property to narrow that set.
+Gemma4 excludes audio without `audio_config` and images/video without
+`vision_config`. Nemotron excludes audio without an
+initialized audio extractor, and Whisper declares audio only. Registered custom
+processors must declare the property to advertise media support.
 
 ### Media preparation
 

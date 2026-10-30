@@ -16,11 +16,13 @@ import grpc
 
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.inputs.media_io import (
+    AudioMediaIO,
     ImageMediaIO,
     MediaFetchError,
     VideoMediaIO,
     _decoded_video_bytes,
 )
+from tensorrt_llm.inputs.multimodal_data import AudioData
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
@@ -180,6 +182,12 @@ def conversation_affinity_enabled(llm: Any) -> bool:
     return getattr(args, "enable_attention_dp", False) is True and (
         getattr(config, "kv_cache_routing_conversation_affinity", False) is True
     )
+
+
+def token_ids_input_supported(llm: Any) -> bool:
+    """Whether the loaded input processor consumes pre-tokenized prompts."""
+    input_processor = getattr(llm, "input_processor", None)
+    return getattr(input_processor, "supports_token_ids_input", True) is not False
 
 
 def _top_n_candidates(selection: Any, name: str) -> int:
@@ -395,12 +403,16 @@ def _metadata_from_context(
 
 
 def _base_input_from_request(
-    request: generation_pb2.GenerateRequest,
+    request: generation_pb2.GenerateRequest, llm: Any
 ) -> str | dict[str, list[int]]:
     input_kind = request.WhichOneof("input")
     if input_kind == "prompt":
         return request.prompt
     if input_kind == "token_ids":
+        if not token_ids_input_supported(llm):
+            raise UnsupportedFeatureError(
+                "token-ID input is not supported by the loaded model; send a text prompt"
+            )
         return {"prompt_token_ids": request.token_ids.ids[:]}
     raise ValueError("exactly one of prompt or token_ids must be set")
 
@@ -459,6 +471,10 @@ def _validate_image_item(item: generation_pb2.MediaItem, index: int) -> None:
     _validate_media_item(item, index, "image")
 
 
+def _validate_audio_item(item: generation_pb2.MediaItem, index: int) -> None:
+    _validate_media_item(item, index, "audio")
+
+
 def _validate_video_item(item: generation_pb2.MediaItem, index: int) -> None:
     _validate_media_item(item, index, "video")
 
@@ -507,6 +523,17 @@ def _video_loader_factory(llm: Any, budget: _DecodedMediaBudget) -> _MediaLoader
     return load
 
 
+def _audio_loader_factory(llm: Any, budget: _DecodedMediaBudget) -> _MediaLoader:
+    audio_io = _media_io_for_model(
+        llm, "audio", AudioMediaIO, {"decoded_memory_reserver": budget.reserve}
+    )
+
+    async def load(item: generation_pb2.MediaItem, index: int) -> Any:
+        return await _load_media_item(item, audio_io, index, "audio")
+
+    return load
+
+
 def _decoded_image_bytes(image: Any) -> int:
     import numpy as np
     import torch
@@ -519,6 +546,23 @@ def _decoded_image_bytes(image: Any) -> int:
     if isinstance(image, Image.Image):
         return image.width * image.height * len(image.getbands())
     raise TypeError(f"unsupported decoded image type: {type(image).__name__}")
+
+
+def _decoded_audio_data_bytes(audio: AudioData) -> int:
+    import numpy as np
+    import torch
+
+    if isinstance(audio.samples, torch.Tensor):
+        return audio.samples.numel() * audio.samples.element_size()
+    if isinstance(audio.samples, np.ndarray):
+        return audio.samples.nbytes
+    raise TypeError(f"unsupported decoded audio type: {type(audio.samples).__name__}")
+
+
+def _decoded_audio_bytes(audio: Any) -> int:
+    if not isinstance(audio, tuple) or len(audio) != 2:
+        raise TypeError(f"unsupported decoded audio type: {type(audio).__name__}")
+    return _decoded_audio_data_bytes(AudioData(samples=audio[0], sample_rate=audio[1]))
 
 
 def _video_runtime_available() -> bool:
@@ -539,6 +583,13 @@ _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
         _video_loader_factory,
         _decoded_video_bytes,
         _video_runtime_available,
+        reserves_decoded_bytes=True,
+    ),
+    generation_pb2.MODALITY_AUDIO: _MediaHandler(
+        "audio",
+        _validate_audio_item,
+        _audio_loader_factory,
+        _decoded_audio_bytes,
         reserves_decoded_bytes=True,
     ),
 }
@@ -564,7 +615,7 @@ def _prepare_input_from_request(
     media_capabilities: MediaCapabilities | None = None,
 ) -> _PreparedInput:
     """Validate request media without starting any fetch or decode work."""
-    inputs = _base_input_from_request(request)
+    inputs = _base_input_from_request(request, llm)
     if not request.media:
         return _PreparedInput(inputs, (), None)
 
@@ -632,6 +683,8 @@ def _validate_media_placeholders(
     if not prepared.media or prepared.capabilities is None:
         return
     processor = llm.input_processor
+    if not isinstance(processor, BaseMultimodalInputProcessor):
+        return
     if not processor.requires_input_placeholders(tokenized=not isinstance(prepared.inputs, str)):
         return
     tokenizer = llm.tokenizer
@@ -753,4 +806,5 @@ async def _input_from_request(
 __all__ = [
     "conversation_params_from_request",
     "sampling_params_from_request",
+    "token_ids_input_supported",
 ]

@@ -36,6 +36,7 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     server_pb2,
 )
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
+from tensorrt_llm.inputs.media_io import _get_aiohttp_session  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
 # down only once its internal state is released, which happens after the event
@@ -55,9 +56,10 @@ def test_format_bind_address_brackets_ipv6() -> None:
 
 
 @pytest.mark.parametrize("fail_stop", [False, True])
+@pytest.mark.parametrize("fail_metrics", [False, True])
 @pytest.mark.parametrize("first_released", [0, 1])
-def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(
-    fail_stop, first_released
+def test_stop_drains_both_media_pools_even_if_shutdown_fails(
+    fail_stop, fail_metrics, first_released
 ) -> None:
     async def exercise_stop():
         loop = asyncio.get_running_loop()
@@ -77,7 +79,9 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(
         )
         server._health = SimpleNamespace(enter_graceful_shutdown=AsyncMock())
         server._health_task = None
-        server._metrics = SimpleNamespace(stop=AsyncMock())
+        server._metrics = SimpleNamespace(
+            stop=AsyncMock(side_effect=RuntimeError("metrics failed") if fail_metrics else None)
+        )
         server._input_executor = TrackedPool()
         server._media_executor = TrackedPool()
         pools = (server._input_executor, server._media_executor)
@@ -90,7 +94,9 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(
 
         futures = [pool.submit(work, index) for index, pool in enumerate(pools)]
         stop_task = None
+        media_session = None
         try:
+            media_session = await _get_aiohttp_session()
             for event in started:
                 assert await asyncio.to_thread(event.wait, 5)
             stop_task = asyncio.create_task(server.stop(grace=0))
@@ -104,11 +110,13 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(
             done, _ = await asyncio.wait({stop_task}, timeout=0.05)
             assert not done
             release[1 - first_released].set()
-            if fail_stop:
-                with pytest.raises(RuntimeError, match="stop failed"):
+            if fail_stop or fail_metrics:
+                message = "metrics failed" if fail_metrics else "stop failed"
+                with pytest.raises(RuntimeError, match=message):
                     await asyncio.wait_for(stop_task, 5)
             else:
                 await asyncio.wait_for(stop_task, 5)
+            assert media_session.closed
             assert all(future.done() for future in futures)
             for future in futures:
                 future.result()
@@ -119,6 +127,8 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(
                 await asyncio.wait_for(asyncio.gather(stop_task, return_exceptions=True), 5)
             for pool in pools:
                 await asyncio.to_thread(pool.shutdown)
+            if media_session is not None:
+                await media_session.close()
         assert server._stopping
         server._metrics.stop.assert_awaited_once()
         server._health.enter_graceful_shutdown.assert_awaited_once()

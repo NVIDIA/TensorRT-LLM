@@ -52,11 +52,12 @@ struct MoeLoraGroupedGemmModule;
 //   output_base:         base of the module's output buffer; the implementation
 //                        accumulates into it, so callers must initialize it.
 //   data_type:           scalar dtype expected by the GEMM wrappers
-//                        (fp16/bf16/fp32).
+//                        (fp8/fp16/bf16/fp32).
+//   output_data_type:    scalar dtype of output_base.
 //   stream:              CUDA stream to launch onto.
 using MoeLoraGroupedGemmRunFn = void (*)(MoeLoraGroupedGemmModule const& mod, int64_t num_permuted_tokens,
     int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, void const* input_base,
-    void* output_base, tensorrt_llm::DataType data_type, cudaStream_t stream);
+    void* output_base, tensorrt_llm::DataType data_type, tensorrt_llm::DataType output_data_type, cudaStream_t stream);
 
 // Per-module device-resident scratch for the MoE LoRA capture-safe path.
 // Pointers refer to device memory unless noted.
@@ -140,11 +141,12 @@ struct MoeLoraGroupedGemm
 {
     bool enabled = false;
 
-    // Scalars common to all three modules. Fixed for the lifetime of the
-    // FusedMoeRunner once the scratch is allocated.
+    // Scalars common to all three modules, populated for each invocation.
+    // The runner retains scratch capacity across changes in adapter dtype.
     int64_t in_hidden_size = 0;
     int64_t max_lora_rank = 0;
     int64_t dtype_bytes = 0;
+    tensorrt_llm::DataType data_type = tensorrt_llm::DataType::kBF16;
     int64_t splitk_slices = 0;
 
     bool has_gated = false;

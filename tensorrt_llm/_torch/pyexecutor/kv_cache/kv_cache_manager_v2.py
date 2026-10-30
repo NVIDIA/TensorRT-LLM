@@ -1075,6 +1075,7 @@ def _augment_tokens_with_mm_run_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
     multimodal_hashes: Sequence[Sequence[int]],
+    multimodal_uuids: Sequence[str | None] | None,
     metadata: _MmRunMetadata,
     chunk_start: int,
     chunk_end: int,
@@ -1109,6 +1110,7 @@ def _augment_tokens_with_mm_run_metadata(
 
     current_item_idx: Optional[int] = None
     digest = b""
+    uuid: str | None = None
     for item_idx, chunk_result_offset, item_token_offset, length in zip(
         overlap_run_item_indices.tolist(),
         chunk_result_offsets.tolist(),
@@ -1119,13 +1121,22 @@ def _augment_tokens_with_mm_run_metadata(
         if item_idx != current_item_idx:
             current_item_idx = item_idx
             digest = _hash_to_digest(multimodal_hashes[item_idx])
+            uuid = (
+                multimodal_uuids[item_idx]
+                if multimodal_uuids is not None and item_idx < len(multimodal_uuids)
+                else None
+            )
         # Feed the coarse item property (content digest) and granular run
         # properties (item-local offset and span length) into the key
         # generator, so cache keys reflect the actual multimodal tokens being
         # rewritten.
         result[chunk_result_offset : chunk_result_offset + length] = (
             gen_multimodal_cache_key_tokens(
-                vocab_size, digest, length, token_offset=item_token_offset
+                vocab_size,
+                digest,
+                length,
+                token_offset=item_token_offset,
+                uuid=uuid,
             )
         )
 
@@ -1136,6 +1147,7 @@ def _augment_tokens_with_contiguous_mm_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
     multimodal_hashes: Sequence[Sequence[int]],
+    multimodal_uuids: Sequence[str | None] | None,
     multimodal_positions: Sequence[int] | torch.Tensor,
     multimodal_lengths: Sequence[int] | torch.Tensor,
     chunk_start: int,
@@ -1163,6 +1175,11 @@ def _augment_tokens_with_contiguous_mm_metadata(
             _hash_to_digest(multimodal_hashes[item_idx]),
             overlap_length,
             token_offset=source_offset,
+            uuid=(
+                multimodal_uuids[item_idx]
+                if multimodal_uuids is not None and item_idx < len(multimodal_uuids)
+                else None
+            ),
         )
 
     return result
@@ -2588,10 +2605,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 }
             )
         )
-        if self._sparse_layer_group_ids:
-            self.sparse_metadata_batch = Batch(
-                self.impl, index_mapper_capacity, self.max_blocks_per_seq, self.max_beam_width
-            )
+        # Metadata publication belongs to the sparse fetch path, which builds the Batch
+        # it publishes through; this manager does not. Every use of
+        # `sparse_metadata_batch` is guarded on it being set, so leaving it unset keeps
+        # those paths inert. Restore this with the full sparse attention support, which
+        # brings that fetch path with it -- it is dropped here only so the KVCM2 core
+        # change stands alone.
 
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
@@ -6134,13 +6153,20 @@ class KVCacheManagerV2(BaseResourceManager):
         run_metadata = _resolve_multimodal_run_metadata(req)
         if run_metadata is not None:
             return _augment_tokens_with_mm_run_metadata(
-                self.vocab_size, result, req.multimodal_hashes, run_metadata, chunk_start, chunk_end
+                self.vocab_size,
+                result,
+                req.multimodal_hashes,
+                req.multimodal_uuids,
+                run_metadata,
+                chunk_start,
+                chunk_end,
             )
 
         return _augment_tokens_with_contiguous_mm_metadata(
             self.vocab_size,
             result,
             req.multimodal_hashes,
+            req.multimodal_uuids,
             req.multimodal_positions,
             req.multimodal_lengths,
             chunk_start,
