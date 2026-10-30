@@ -387,6 +387,11 @@
 # Individual handles rather than a team, like SCAFFOLDING: this is one bounded
 # experiment with named owners, not a standing domain.
 /tensorrt_llm/_torch/_experimental/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+# What every modeling_v2 family library shares (the discovery and the common/
+# macros): the modeling_v2 owners, and the kernels owners because it is CUDA and
+# links against the stock libraries.
+/cpp/tensorrt_llm/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
+/cpp/cmake/modules/modeling_v2.cmake @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
 /tests/integration/defs/accuracy/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
 # The two catalog categories whose contracts state kernel behaviour the
@@ -399,6 +404,10 @@
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
 /cpp/tensorrt_llm/kernels/glmMoeDsa @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
 /cpp/tensorrt_llm/thop/glmMoeDsa/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
+# A family's native code lives in its csrc/ directories: the kernels owners
+# co-own it. Last, so it applies under the family rules above; a family with its
+# own owners adds them here.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/ @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners

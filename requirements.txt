@@ -1,5 +1,9 @@
 --extra-index-url https://download.pytorch.org/whl/cu132
 -c constraints.txt
+# filelock 4.2.1 requires Python 3.11+. Pin Python 3.10 to 3.20.3 to exclude
+# vulnerable releases 3.20.4 through 4.2.0; newer Python can use 4.2.1 or later.
+filelock==3.20.3; python_version < "3.11"
+filelock>=4.2.1; python_version >= "3.11"
 accelerate>=1.7.0
 build
 colored

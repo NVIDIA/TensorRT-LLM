@@ -857,9 +857,11 @@ class HfWeightLoader(BaseWeightLoader):
         setup_error = None
         try:
             plan = build_local_plan(file_sizes, local_rank, local_size)
-            session = RankStripedReadAheadSession(active_communicator,
-                                                  node_communicator,
-                                                  plan).start()
+            session = RankStripedReadAheadSession(
+                active_communicator,
+                node_communicator,
+                plan,
+                checkpoint_bytes=checkpoint_bytes).start()
         except Exception as error:
             setup_error = error
         coordinated_setup_error = coordinate_error(active_communicator,
