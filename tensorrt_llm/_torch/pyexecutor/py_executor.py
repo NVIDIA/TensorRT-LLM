@@ -6839,6 +6839,10 @@ class PyExecutor:
             # can be allowed once its semantics are defined (TRTLLM-14792).
             beam_width_array = sampling_config.beam_width_array
             if beam_width_array:
+                if (not self.disable_overlap_scheduler
+                        and len(set(beam_width_array)) > 1):
+                    raise ValueError("Variable-width beam search requires "
+                                     "disable_overlap_scheduler=True.")
                 if any(b < a
                        for a, b in zip(beam_width_array, beam_width_array[1:])):
                     raise ValueError(

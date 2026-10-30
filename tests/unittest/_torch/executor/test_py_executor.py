@@ -624,6 +624,7 @@ def _make_admission_executor(model, requests):
         kv_cache_manager=None,
         kv_cache_transceiver=None,
         max_beam_width=1,
+        disable_overlap_scheduler=False,
         sampler=Mock(),
         waiting_queue=object(),
         active_requests=[],
@@ -645,6 +646,36 @@ def _make_admission_request(request_id: int) -> types.SimpleNamespace:
         sampling_config=None,
         kv_cache_retention_config=None,
     )
+
+
+@pytest.mark.parametrize(
+    ("disable_overlap_scheduler", "beam_width_array", "error"),
+    [
+        pytest.param(False, [2, 3], True, id="widening-overlap"),
+        pytest.param(True, [2, 3], False, id="widening-no-overlap"),
+        pytest.param(False, [3, 3], False, id="constant-overlap"),
+    ],
+)
+def test_request_validation_rejects_variable_beam_width_with_overlap(
+    disable_overlap_scheduler: bool,
+    beam_width_array: list[int],
+    error: bool,
+) -> None:
+    request = _make_admission_request(0)
+    request.sampling_config = types.SimpleNamespace(
+        beam_width=3,
+        beam_width_array=beam_width_array,
+        length_penalty=None,
+    )
+    executor = _make_admission_executor(None, [request])
+    executor.max_beam_width = 3
+    executor.disable_overlap_scheduler = disable_overlap_scheduler
+
+    if error:
+        with pytest.raises(ValueError, match="Variable-width beam search requires"):
+            PyExecutor._validate_request(executor, request)
+    else:
+        PyExecutor._validate_request(executor, request)
 
 
 def test_model_validation_fails_only_the_request_it_rejects() -> None:
