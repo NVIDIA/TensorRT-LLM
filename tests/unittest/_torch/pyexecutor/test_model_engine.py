@@ -1124,28 +1124,50 @@ def test_pcg_fx_fallback_policy_is_model_specific(
 
 class TestWarmupCleanup(unittest.TestCase):
     @pytest.mark.cpu_only
-    def test_allreduce_tuning_uses_model_configuration(self) -> None:
-        """Exercise the real engine helper without stubbing engine methods."""
+    def test_allreduce_tuning_uses_resolved_token_budget(self) -> None:
+        """Use the post-clamp budget, independently of the encoder configuration."""
         engine = object.__new__(ModelEngine)
         engine.llm_args = SimpleNamespace(enable_autotuner=True)
-        engine.max_num_tokens = 40000
+        engine.max_seq_len = 2048
+        engine.batch_size = 2
         engine.encoder_max_num_tokens = 65536
-        for config, expected in (
-            (SimpleNamespace(), 40000),
-            (SimpleNamespace(is_encoder_decoder=False), 40000),
-            (SimpleNamespace(is_encoder_decoder=True), 65536),
+        engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
+        for configured, expected in (
+            (40000, 4096),
+            (None, 4096),
+            (3000, 3000),
         ):
             with (
-                self.subTest(config=config),
+                self.subTest(configured=configured),
                 patch.object(AllReduceRunner, "configure_tuning_buckets") as configure,
             ):
-                engine.model = SimpleNamespace(model_config=config)
+                engine.max_num_tokens = configured
+                engine._init_max_num_tokens()
                 engine._configure_allreduce_tuning()
                 configure.assert_called_once_with(expected)
         engine.llm_args.enable_autotuner = False
         with patch.object(AllReduceRunner, "configure_tuning_buckets") as configure:
             engine._configure_allreduce_tuning()
             configure.assert_not_called()
+
+    @pytest.mark.cpu_only
+    def test_allreduce_configuration_precedes_runner_warmup(self) -> None:
+        for runner_type in (
+            model_engine_module.PackedModelRunner,
+            model_engine_module.ScheduledModelRunner,
+        ):
+            with self.subTest(runner_type=runner_type):
+                engine = object.__new__(ModelEngine)
+                engine._runner = Mock(spec=runner_type)
+                events = []
+                engine._runner.warmup.side_effect = lambda *args: events.append("warmup")
+                with patch.object(
+                    engine,
+                    "_configure_allreduce_tuning",
+                    side_effect=lambda: events.append("configure"),
+                ):
+                    engine._warmup_impl(Mock(spec=ResourceManager))
+                self.assertEqual(events, ["configure", "warmup"])
 
     @pytest.mark.cpu_only
     def test_allreduce_forward_routes_tuning_and_inference(self) -> None:
@@ -1167,15 +1189,23 @@ class TestWarmupCleanup(unittest.TestCase):
             patch.object(torch.ops.trtllm, "autotuned_allreduce", return_value=[output]) as native,
         ):
             for tuning in (True, False):
-                with self.subTest(tuning=tuning):
-                    tunable.reset_mock()
-                    native.reset_mock()
-                    distributed_ops.set_allreduce_autotuner_tuning_mode(tuning)
-                    self.assertIs(layer.forward(inputs), output)
-                    selected, unused = (tunable, native) if tuning else (native, tunable)
-                    selected.assert_called_once()
-                    self.assertIs(selected.call_args.kwargs["input"], inputs)
-                    unused.assert_not_called()
+                for exclude_nccl_symmetric in (True, False):
+                    with self.subTest(tuning=tuning, exclude_nccl_symmetric=exclude_nccl_symmetric):
+                        layer._exclude_nccl_symmetric = exclude_nccl_symmetric
+                        tunable.reset_mock()
+                        native.reset_mock()
+                        distributed_ops.set_allreduce_autotuner_tuning_mode(tuning)
+                        self.assertIs(layer.forward(inputs), output)
+                        use_python = tuning or exclude_nccl_symmetric
+                        selected, unused = (tunable, native) if use_python else (native, tunable)
+                        selected.assert_called_once()
+                        self.assertIs(selected.call_args.kwargs["input"], inputs)
+                        if use_python:
+                            self.assertEqual(
+                                selected.call_args.kwargs["exclude_nccl_symmetric"],
+                                exclude_nccl_symmetric,
+                            )
+                        unused.assert_not_called()
 
     @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self) -> None:
