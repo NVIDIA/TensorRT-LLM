@@ -276,6 +276,7 @@ def fused_moe(
     host_request_types: Optional[torch.Tensor] = None,
     host_context_lengths: Optional[torch.Tensor] = None,
     lora_max_low_rank: int = 0,
+    lora_dtype: Optional[torch.dtype] = None,
     # Slot-indexed CUDA-graph LoRA inputs (mutually exclusive with the per-request
     # tensors above). When fc1_slot_lora_ranks is provided, the per-token expansion
     # is performed inside the op via token_to_slot indexed into the slot tables.
@@ -383,9 +384,10 @@ def fused_moe(
             use_dynamic_fc2_scale, fc1_lora_ranks, fc1_lora_weight_ptrs,
             fc2_lora_ranks, fc2_lora_weight_ptrs, gated_lora_ranks,
             gated_lora_weight_ptrs, host_request_types, host_context_lengths,
-            lora_max_low_rank, fc1_slot_lora_ranks, fc1_slot_lora_weight_ptrs,
-            fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
-            gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
+            lora_max_low_rank, lora_dtype, fc1_slot_lora_ranks,
+            fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks,
+            fc2_slot_lora_weight_ptrs, gated_slot_lora_ranks,
+            gated_slot_lora_weight_ptrs, token_to_slot
         ]
     run_moe_args.append(swiglu_clamp_after_silu)
     try:
@@ -455,6 +457,7 @@ def _(input: torch.Tensor,
       host_request_types: Optional[torch.Tensor] = None,
       host_context_lengths: Optional[torch.Tensor] = None,
       lora_max_low_rank: int = 0,
+      lora_dtype: Optional[torch.dtype] = None,
       fc1_slot_lora_ranks: Optional[torch.Tensor] = None,
       fc1_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       fc2_slot_lora_ranks: Optional[torch.Tensor] = None,

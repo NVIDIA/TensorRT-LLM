@@ -32,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -76,12 +77,20 @@ std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndi
             // base_indices.
             int blockPos = ordinal - scratchRange.beg;
             int totalOffset = blockPos * scratchPages;
+            bool const crossesSlots = scale % scratchPages != 0;
+            if (crossesSlots)
+            {
+                // Unequal layer shares can put a block across two slots. Pack
+                // the layer's consecutive roles before resolving the slot ID,
+                // so a trailing role cannot wrap over an earlier block's data.
+                totalOffset += appliedLayerOffset % scratchPages;
+            }
             int slotIdx = totalOffset / scale;
             TLLM_CHECK_DEBUG_WITH_INFO(slotIdx < scratchSlots.size(), "Scratch slot %d past the %d the range describes",
                 slotIdx, scratchSlots.size());
             int slotId = scratchSlots[slotIdx];
             int offset = totalOffset % scale;
-            index = slotId * scale + (offset + appliedLayerOffset) % scale;
+            index = slotId * scale + (crossesSlots ? offset : (offset + appliedLayerOffset) % scale);
         }
         else if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value())
         {
@@ -175,7 +184,7 @@ void KvCacheManager::_computeSparseCacheShape()
         {
             continue;
         }
-        LifeCycleId const lcId = mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock));
+        LifeCycleId const lcId = getLayerGroupId(attn->layerId);
         auto const& cache = *attn->sparseCache;
         int const unitsPerPage = cache.unitsPerPage(mConfig.tokensPerBlock);
 
@@ -287,7 +296,7 @@ std::vector<SparseBufferPlan> KvCacheManager::_sparseBufferPlan(LifeCycleId life
     for (auto const& layer : mConfig.layers)
     {
         auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
-        if (attn == nullptr || mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock)) != lifeCycle)
+        if (attn == nullptr || !attn->sparseCache.has_value() || getLayerGroupId(attn->layerId) != lifeCycle)
         {
             continue;
         }
@@ -602,11 +611,9 @@ int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
-    auto const& layerAttr = mStorage->getLayerAttr(layerId);
     int scale = mStorage->mSlotToPageIndices.at(attr.lifeCycleId).at(attr.poolIndex);
     int offset = exactDiv(static_cast<int>(attr.offset), static_cast<int>(attr.size));
-    int scratchPages = layerAttr.slotUtil.at(attr.poolIndex);
-    return PageIndexConverter{scale, attr.expansion, offset, scratchPages};
+    return PageIndexConverter{scale, attr.expansion, offset, attr.scratchPagesPerBlock};
 }
 
 int KvCacheManager::_scratchSlotsFor(
@@ -800,16 +807,46 @@ std::vector<LayerId> KvCacheManager::layerIds() const
 
 LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 {
-    return mStorage->layerToLifeCycleIds().at(layerId);
+    auto const& lifeCycles = mStorage->layerToLifeCycleIds().at(layerId);
+    TLLM_CHECK_WITH_INFO(lifeCycles.size() == 1,
+        "Layer %d has buffers in %zu layer groups because its buffers use different reuse policies; "
+        "look up its layer group per buffer with get_buffer_group_id(layer_id, role) / getBufferGroupId(layerId, role)",
+        layerId, lifeCycles.size());
+    return lifeCycles.front();
+}
+
+CacheGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
+{
+    return mStorage->getBufferAttr(layerId, role).lifeCycleId;
 }
 
 TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() const
 {
     LifeCycleId numLc = mLifeCycles.size();
     TypedVec<LayerGroupId, std::vector<LayerId>> result(numLc);
-    for (auto const& [lid, lc] : mStorage->layerToLifeCycleIds())
+    for (auto const& [lid, lifeCycles] : mStorage->layerToLifeCycleIds())
     {
-        result.at(lc).push_back(lid);
+        result.at(getLayerGroupId(lid)).push_back(lid);
+    }
+    return result;
+}
+
+TypedVec<CacheGroupId, std::vector<BufferId>> KvCacheManager::bufferGrouping() const
+{
+    TypedVec<CacheGroupId, std::vector<BufferId>> result(mLifeCycles.size());
+    std::unordered_map<LayerId, std::vector<BufferId>> buffersByLayer;
+    for (auto const& buffer : allBufferIds())
+    {
+        buffersByLayer[buffer.layerId].push_back(buffer);
+    }
+    // Keep layer order consistent with layerGrouping() for consumers that pair
+    // group membership with a declared list of global model layer IDs.
+    for (auto const& [layer, lifeCycles] : mStorage->layerToLifeCycleIds())
+    {
+        for (auto const& buffer : buffersByLayer.at(layer))
+        {
+            result.at(getBufferGroupId(buffer.layerId, buffer.role)).push_back(buffer);
+        }
     }
     return result;
 }

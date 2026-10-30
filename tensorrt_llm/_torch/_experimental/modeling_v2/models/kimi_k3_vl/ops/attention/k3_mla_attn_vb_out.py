@@ -44,7 +44,7 @@ class K3MlaAttnVbOut(OpWrapper):
     ``gate``) for the decode attention o of R <= 8 requests of T <= 8 tokens over their pages of ``pool``. Uses
     ``workspace``'s partial slots and, past 7 clusters, advances its counters."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -136,7 +136,7 @@ class K3MlaAttnVbOut(OpWrapper):
     already raise ValueError before launch. First calls compile outside graph
     capture. is_valid checks lengths, not whether an earlier call actually
     wrote the rows or whether another stream is using the workspace.
-    tests/unittest/_torch/kernels/kimi_k3/test_k3_mla_attn.py additionally
+    tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_attn.py additionally
     covers every split of up to eight tokens, R x 8 verification, stock
     cute_dsl_mla_decode_fp16_blackwell parity, 640-element interleaved rows,
     poison/counter-wrap checks, refusals and optional K3_BASE_TRTLLM identity.

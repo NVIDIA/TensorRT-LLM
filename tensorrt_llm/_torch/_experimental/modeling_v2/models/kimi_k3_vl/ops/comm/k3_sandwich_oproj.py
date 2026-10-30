@@ -140,7 +140,7 @@ class K3SandwichOproj(OpWrapper):
     (the sum alone without ``prefix``), ``normed`` = RMSNorm(attn_res(block_residual..., updated)). Advances
     ``workspace`` by one call: every rank of the group makes the same calls on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"{tokens} decode tokens, {snapshots} snapshots, prefix={prefix}: attention projection",

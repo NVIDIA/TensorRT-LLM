@@ -23,6 +23,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <optional>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -51,6 +54,19 @@ struct alignas(kDIGEST_LEN) Digest : std::array<std::byte, kDIGEST_LEN>
     }
 };
 
+//! Multimodal item metadata carried by a digest token. UUID does not
+//! participate in equality or radix-tree hashing.
+struct MmItemContext
+{
+    Digest digest;
+    std::optional<std::string> uuid;
+
+    bool operator==(MmItemContext const& other) const noexcept
+    {
+        return digest == other.digest;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // TokenIdExt — 4-byte self-describing token handle (RAII value type).
 //
@@ -58,7 +74,7 @@ struct alignas(kDIGEST_LEN) Digest : std::array<std::byte, kDIGEST_LEN>
 //   - tag 0: normal token id (stored verbatim). An all-normal array is a
 //     contiguous little-endian int32 array, hashed in one CSHA256::Write(N*4).
 //   - tag 1: multi-modal digest; low bits index a slot in an internal pool that
-//     holds the 32-byte Digest.
+//     holds immutable digest and optional UUID context.
 //
 // A digest handle owns its pool slot: construct from a Digest to allocate, copy
 // to clone into a fresh slot, and destroy to free. Normal handles own nothing.
@@ -89,8 +105,9 @@ public:
         TLLM_CHECK_DEBUG(id >= 0 && id <= static_cast<TokenId>(kMaxValue));
     }
 
-    // Multi-modal digest (tag 1): copies `digest` into a fresh pool slot.
-    explicit TokenIdExt(Digest const& digest);
+    // Multi-modal digest (tag 1): stores immutable item context in a fresh pool slot.
+    explicit TokenIdExt(Digest const& digest, std::optional<std::string> uuid = std::nullopt);
+    explicit TokenIdExt(MmItemContext context);
 
     ~TokenIdExt()
     {
@@ -154,6 +171,12 @@ public:
         TLLM_CHECK_DEBUG(!isDigest());
         return static_cast<TokenId>(mBits);
     }
+
+    // The pooled multimodal item context. Precondition: isDigest().
+    [[nodiscard]] MmItemContext const& mmItemContext() const;
+
+    // Shared ownership of the pooled multimodal item context. Precondition: isDigest().
+    [[nodiscard]] std::shared_ptr<MmItemContext const> sharedMmItemContext() const;
 
     // The pooled 32-byte digest. Precondition: isDigest().
     [[nodiscard]] Digest const& digest() const;

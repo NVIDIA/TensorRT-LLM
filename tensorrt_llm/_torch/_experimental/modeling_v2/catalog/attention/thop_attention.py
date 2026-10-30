@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused attention core with fully explicit state: paged KV-cache append + masked FMHA.
 
-Wraps the pybind binding ``tensorrt_llm.bindings.internal.thop.attention``
-(approved policy exception to the ``torch.ops.trtllm.*`` entry shape): the same
-C++ attention op behind the TRTLLM backend, but every piece of batch state and
-layer config arrives as an explicit argument -- no registered layers, no
-thread-local metadata.
+Wraps ``FallbackFmha.attention``, which dispatches to the native
+``AttentionOp`` context and generation methods. Every piece of batch state
+and layer config arrives as an explicit argument; native runners are cached
+by static configuration, device, and thread.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from tensorrt_llm.bindings.internal import thop
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 
 from .._op import Arch, Cell, OpWrapper
 
@@ -89,14 +88,11 @@ _FP8_24_4_256 = dict(
 class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
 
-    The most load-bearing entry in the catalog and the only one wrapping a
-    pybind binding rather than a registered torch op. Three targets go through
-    it, by different paths: gpt-oss on the standard path with attention sinks
-    and an alternating sliding window, deepseek on MLA's two phases, and
-    qwen4_exp on the standard path twice over -- its full-attention layers and
-    MTP module (GQA 24/2/256 over a bf16 or an fp8-e4m3 pool, a P-token draft
-    block per generation sequence, a two-pool hybrid mapping), and its vision
-    tower with no KV cache at all.
+    The shipped targets use the native phased ``AttentionOp`` through
+    ``FallbackFmha.attention``: gpt-oss uses attention sinks and an alternating
+    sliding window, deepseek uses MLA's two phases, and qwen4_exp uses packed
+    GQA over a bf16 or an fp8-e4m3 pool for its full-attention and MTP layers
+    and uncached MHA for vision.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
@@ -366,7 +362,7 @@ class ThopAttention(OpWrapper):
         v: Optional[torch.Tensor],
         output: torch.Tensor,
         output_sf: Optional[torch.Tensor],
-        workspace_: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
         sequence_length: torch.Tensor,
         host_past_key_value_lengths: torch.Tensor,
         host_total_kv_lens: torch.Tensor,
@@ -432,7 +428,7 @@ class ThopAttention(OpWrapper):
         use_spec_decoding: bool,
         is_spec_dec_tree: bool,
         spec_decoding_generation_lengths: Optional[torch.Tensor],
-        spec_decoding_position_offsets_for_cpp: Optional[torch.Tensor],
+        spec_decoding_position_offsets: Optional[torch.Tensor],
         spec_decoding_packed_mask: Optional[torch.Tensor],
         spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor],
         spec_decoding_bl_tree_mask: Optional[torch.Tensor],
@@ -483,13 +479,15 @@ class ThopAttention(OpWrapper):
         """Writes `output` in place and returns it -- the op destroys its
         prior contents in rows `[:num_tokens]`, so a caller that wants them
         has to have kept its own copy beforehand."""
-        thop.attention(
+        if is_mla_enable and q_lora_rank is None:
+            raise ValueError("q_lora_rank must be an int for MLA; use 0 when there is no q-LoRA.")
+        FallbackFmha.attention(
             q=q,
             k=k,
             v=v,
             output=output,
             output_sf=output_sf,
-            workspace_=workspace_,
+            workspace=workspace,
             sequence_length=sequence_length,
             host_past_key_value_lengths=host_past_key_value_lengths,
             host_total_kv_lens=host_total_kv_lens,
@@ -555,7 +553,7 @@ class ThopAttention(OpWrapper):
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
             spec_decoding_generation_lengths=spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=spec_decoding_position_offsets_for_cpp,
+            spec_decoding_position_offsets=spec_decoding_position_offsets,
             spec_decoding_packed_mask=spec_decoding_packed_mask,
             spec_decoding_bl_tree_mask_offset=spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask=spec_decoding_bl_tree_mask,
