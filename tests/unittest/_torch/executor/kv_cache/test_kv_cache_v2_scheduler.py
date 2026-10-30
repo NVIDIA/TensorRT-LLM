@@ -1217,6 +1217,52 @@ class TestKVCacheFailuresGen:
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
 
+    def test_recompute_pause_waits_while_generation_progresses_gpu_only(self):
+        """The same holds in a GPU-only pool, where suspension frees nothing.
+
+        There the teardown candidate is a request suspended in an earlier pass:
+        it still holds its pages, and recompute pause is the only way to get
+        them back.
+        """
+
+        def alloc_fn(req):
+            return req.request_id == 0
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn, can_evict=False, has_cache_tier_below_gpu=False
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        out = sched.schedule_request([make_gen_request(0), make_gen_request(1), victim], set())
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.paused_requests) == [1]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    def test_first_generation_request_recompute_pauses_gpu_only(self):
+        """In a GPU-only pool the first generation request of a pass still tears
+        down a request suspended in an earlier pass, which is the only way out
+        of a full pool there.
+        """
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return req.request_id == 1 and 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn, can_evict=False, has_cache_tier_below_gpu=False
+        )
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        out = sched.schedule_request([make_gen_request(1), victim], set())
+        assert ids(out.generation_requests) == [1]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(victim)
+
     def test_requests_in_flight_do_not_hold_back_recompute_pause(self):
         """Work in flight from an earlier pass does not count as progress.
 
