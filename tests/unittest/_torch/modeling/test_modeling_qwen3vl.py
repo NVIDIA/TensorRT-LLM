@@ -20,6 +20,11 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
+    MultimodalModelMixin,
+    encode_multimodal_by_groups,
+)
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
     Qwen3VLInputProcessorBase,
@@ -27,7 +32,15 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     _triton_pos_embed_interpolate,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
+    MultimodalParams,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -355,6 +368,177 @@ class TestQwen3VL(TestModelingMultimodal):
                 hf_model_state_dict=self.hf_model.state_dict(),
                 disable_fuse_rope=True,
             )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "selection", ["full", "reversed_requests", "reordered_items", "partial", "partial_cache"]
+)
+def test_qwen3vl_common_batching_preserves_packing_and_deepstack_order(selection: str) -> None:
+    def make_params(
+        image_markers: list[int], video_marker: int, refs: list[tuple[str, int]]
+    ) -> MultimodalParams:
+        return MultimodalParams(
+            multimodal_data={
+                "image": {
+                    "pixel_values": torch.tensor(image_markers, dtype=torch.float32)
+                    .repeat_interleave(4)
+                    .reshape(-1, 1),
+                    "image_grid_thw": torch.tensor([[1, 2, 2]] * len(image_markers)),
+                },
+                "video": {
+                    "pixel_values_videos": torch.full((8, 1), float(video_marker)),
+                    "video_grid_thw": torch.tensor([[2, 2, 2]]),
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    refs,
+                    encoder_token_lengths=[8 if modality == "video" else 4 for modality, _ in refs],
+                    output_embedding_lengths=[
+                        2 if modality == "video" else 1 for modality, _ in refs
+                    ],
+                    input_partitions={
+                        "image": {
+                            "pixel_values": MultimodalItemPartition(
+                                item_lengths=(4,) * len(image_markers)
+                            ),
+                            "image_grid_thw": MultimodalItemPartition(),
+                        },
+                        "video": {
+                            "pixel_values_videos": MultimodalItemPartition(item_lengths=(8,)),
+                            "video_grid_thw": MultimodalItemPartition(),
+                        },
+                    },
+                ),
+            }
+        )
+
+    first = make_params([10, 20], 30, [("video", 0), ("image", 1), ("image", 0)])
+    second = make_params([40], 50, [("image", 0), ("video", 0)])
+    if selection in ("full", "partial_cache"):
+        params, markers = [first, second], [30, 30, 20, 10, 40, 50, 50]
+    elif selection == "reversed_requests":
+        params, markers = [second, first], [40, 50, 50, 30, 30, 20, 10]
+    else:
+        selected = [(first, 1), (second, 1)]
+        markers = [20, 50, 50]
+        if selection == "reordered_items":
+            selected.insert(1, (first, 2))
+            markers.insert(1, 10)
+        params = [
+            prepared
+            for prepared, _, _ in MultimodalModelMixin().prepare_multimodal_encoder_inputs(selected)
+        ]
+
+    # Keep the previous builder's literal packing as an independent reference.
+    pixels, grids = [], []
+    for modality, pixel_key, grid_key in (
+        ("image", "pixel_values", "image_grid_thw"),
+        ("video", "pixel_values_videos", "video_grid_thw"),
+    ):
+        for param in params:
+            bucket = param.multimodal_data.get(modality)
+            if bucket is not None:
+                pixels.append(bucket[pixel_key])
+                grids.append(bucket[grid_key])
+    packed = modeling_qwen3vl._qwen3vl_build_batched_input(params)
+    assert torch.equal(packed["pixel_values"], torch.cat(pixels))
+    assert torch.equal(packed["grid_thw"], torch.cat(grids))
+
+    encoder_inputs_seen = []
+
+    def visual(
+        pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        primary = pixel_values[::4]
+        encoder_inputs_seen.append(primary.clone())
+        return primary, [primary + 100, primary + 200]
+
+    encoder = SimpleNamespace(model_dtype=torch.float32, visual=visual)
+    group = EncoderGroup(
+        ("image", "video"),
+        lambda **kwargs: modeling_qwen3vl.Qwen3VisionModelBase.encode_batched(encoder, **kwargs),
+        modeling_qwen3vl._qwen3vl_build_batched_input,
+    )
+    actual = encode_multimodal_by_groups((group,), params)
+    primary = torch.tensor(markers, dtype=torch.float32).reshape(-1, 1)
+    expected = torch.cat([primary, primary + 100, primary + 200], dim=1)
+    assert torch.equal(actual, expected)
+    assert torch.equal(
+        actual,
+        torch.cat([encode_multimodal_by_groups((group,), [param]) for param in params]),
+    )
+    assert first.item_metadata.item_refs == (("video", 0), ("image", 1), ("image", 0))
+    if selection == "partial_cache":
+
+        class CachedEncoder(MultimodalModelMixin):
+            def encode_multimodal_inputs(
+                self, multimodal_params: list[MultimodalParams]
+            ) -> torch.Tensor:
+                return encode_multimodal_by_groups((group,), multimodal_params)
+
+        model = CachedEncoder()
+        model._multimodal_encoder_cache = TensorLRUCache(4096)
+        expected_items = []
+        for request_index, param in enumerate(params):
+            lengths = param.item_metadata.output_embedding_lengths
+            param.multimodal_input = MultimodalInput.from_components(
+                [[request_index * 10 + index + 1] * 8 for index in range(len(lengths))],
+                [sum(lengths[:index]) for index in range(len(lengths))],
+                list(lengths),
+            )
+            param.multimodal_data["mm_processor_kwargs_hash"] = "test"
+            item_outputs = torch.split(encode_multimodal_by_groups((group,), [param]), lengths)
+            keys = model._encoder_cache_keys(param)
+            model._multimodal_encoder_cache.put(keys[0], item_outputs[0])
+            expected_items.extend(zip(keys, item_outputs))
+        encoder_inputs_seen.clear()
+        assert torch.equal(model._get_or_encode_multimodal_embeddings(params), expected)
+        assert len(encoder_inputs_seen) == 1
+        assert encoder_inputs_seen[0].flatten().tolist() == [20, 10, 50, 50]
+        for key, item_output in expected_items:
+            assert torch.equal(model._multimodal_encoder_cache.get(key), item_output)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("preferred_pixels", "preferred_grid", "expected_pixels", "expected_grid"),
+    [
+        (
+            torch.tensor([[5.0]]),
+            torch.tensor([[7, 8, 9]]),
+            [[1.0], [5.0]],
+            [[1, 2, 3], [7, 8, 9]],
+        ),
+        (None, None, [[1.0], [3.0]], [[1, 2, 3], [4, 5, 6]]),
+    ],
+    ids=["tensor", "none"],
+)
+def test_qwen3vl_common_batching_preserves_video_alias_priority(
+    preferred_pixels: Optional[torch.Tensor],
+    preferred_grid: Optional[torch.Tensor],
+    expected_pixels: list[list[float]],
+    expected_grid: list[list[int]],
+) -> None:
+    image = {
+        "pixel_values": torch.tensor([[1.0]]),
+        "image_grid_thw": torch.tensor([[1, 2, 3]]),
+    }
+    video = {
+        "pixel_values_videos": torch.tensor([[3.0]]),
+        "video_grid_thw": torch.tensor([[4, 5, 6]]),
+        "pixel_values": preferred_pixels,
+        "image_grid_thw": preferred_grid,
+    }
+    params = [MultimodalParams(multimodal_data={"video": video, "image": image})]
+
+    packed = modeling_qwen3vl._qwen3vl_build_batched_input(params)
+
+    assert torch.equal(packed["pixel_values"], torch.tensor(expected_pixels))
+    assert torch.equal(packed["grid_thw"], torch.tensor(expected_grid))
+    for result in packed.values():
+        for source in (*image.values(), *video.values()):
+            if source is not None:
+                assert result.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

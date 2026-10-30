@@ -54,8 +54,10 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
 from .modeling_multimodal_mixin import (
     EncoderGroup,
+    EncoderInputField,
     MultimodalModelMixin,
     PreparedLlmInputs,
+    batch_encoder_inputs,
     encode_multimodal_by_groups,
 )
 from .modeling_qwen2vl import (
@@ -1297,26 +1299,67 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetad
         self._vision.prepare_attn_metadata(list(padded_seq_lengths), metadata)
 
 
+_QWEN3VL_ENCODER_INPUT_FIELDS = {
+    "pixel_values": EncoderInputField(("pixel_values", "pixel_values_videos")),
+    "grid_thw": EncoderInputField(("image_grid_thw", "video_grid_thw")),
+}
+_QWEN3VL_SINGLE_MODALITY_FIELDS = tuple(
+    {
+        name: EncoderInputField((field.source_names[index],))
+        for name, field in _QWEN3VL_ENCODER_INPUT_FIELDS.items()
+    }
+    for index in (0, 1)
+)
+
+
 def _qwen3vl_build_batched_input(
     multimodal_params: list[MultimodalParams],
 ) -> dict[str, Any]:
     """Cat image items then video items across requests (matching the
     ``EncoderGroup.modalities`` order) into one ViT input."""
-    pixels: list[torch.Tensor] = []
-    grids: list[torch.Tensor] = []
-    for m, pv_key, thw_key in (
-        ("image", "pixel_values", "image_grid_thw"),
-        ("video", "pixel_values_videos", "video_grid_thw"),
-    ):
-        for mp in multimodal_params:
-            bucket = mp.multimodal_data.get(m)
+    pixels, grids = [], []
+    try:
+        for param in multimodal_params:
+            bucket = param.multimodal_data.get("image")
             if bucket is not None:
-                pixels.append(bucket[pv_key])
-                grids.append(bucket[thw_key])
-    return {
-        "pixel_values": torch.cat(pixels, dim=0),
-        "grid_thw": torch.cat(grids, dim=0),
-    }
+                pixels.append(bucket["pixel_values"])
+                grids.append(bucket["image_grid_thw"])
+        has_images = bool(pixels)
+        for param in multimodal_params:
+            bucket = param.multimodal_data.get("video")
+            if bucket is not None:
+                # Two canonical fields leave no room for a preferred image alias.
+                if (
+                    len(bucket) > 2
+                    and has_images
+                    and ("pixel_values" in bucket or "image_grid_thw" in bucket)
+                ):
+                    break
+                pixels.append(bucket["pixel_values_videos"])
+                grids.append(bucket["video_grid_thw"])
+        else:
+            if pixels:
+                return {
+                    "pixel_values": _QWEN3VL_ENCODER_INPUT_FIELDS["pixel_values"].batch(pixels),
+                    "grid_thw": _QWEN3VL_ENCODER_INPUT_FIELDS["grid_thw"].batch(grids),
+                }
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    # Preserve field-major alias lookup and error priority for noncanonical inputs.
+    inputs_by_modality = [
+        [
+            bucket
+            for param in multimodal_params
+            if (bucket := param.multimodal_data.get(modality)) is not None
+        ]
+        for modality in ("image", "video")
+    ]
+    images, videos = inputs_by_modality
+    if images and videos:
+        return batch_encoder_inputs(images + videos, _QWEN3VL_ENCODER_INPUT_FIELDS)
+    index = 0 if images else 1
+    return batch_encoder_inputs(inputs_by_modality[index], _QWEN3VL_SINGLE_MODALITY_FIELDS[index])
 
 
 class Qwen3VisionModelBase(nn.Module):

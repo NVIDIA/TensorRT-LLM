@@ -58,8 +58,10 @@ from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_mixin import (
     EncoderCachePartition,
+    EncoderInputField,
     MultimodalModelMixin,
     PreparedLlmInputs,
+    batch_encoder_inputs,
 )
 from .modeling_multimodal_utils import _MULTIMODAL_ENV_NAME, _is_mm_disagg
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
@@ -84,6 +86,12 @@ from transformers import (  # noqa: E402
 from transformers.models.gemma4.image_processing_gemma4 import (  # noqa: E402
     get_aspect_ratio_preserving_size,
 )
+
+_GEMMA4_PIXEL_FIELD = {"pixel_values": EncoderInputField(("pixel_values",))}
+_GEMMA4_VISION_FIELDS = {
+    **_GEMMA4_PIXEL_FIELD,
+    "image_position_ids": EncoderInputField(("image_position_ids",)),
+}
 
 
 class RMSNormNoScale(nn.Module):
@@ -1043,107 +1051,91 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                 "Gemma4 requests containing multiple multimodal input types are not supported."
             )
 
-        # The cache helper splits this tensor by request. Preserve that order while still batching
-        # consecutive requests with the same modality.
-        if (
-            all(len(modalities) == 1 for modalities in param_modalities)
-            and len({modalities[0] for modalities in param_modalities}) > 1
-        ):
-            embeddings = []
-            for _, param_group in groupby(
-                zip(param_modalities, multimodal_params), key=lambda item: item[0][0]
-            ):
-                embeddings.append(
-                    self.encode_multimodal_inputs(
-                        [multimodal_param for _, multimodal_param in param_group]
-                    )
+        # The cache helper splits this tensor by request. Preserve consecutive
+        # modality runs and their encoder call composition without rechecking
+        # each run through a recursive encoder entry.
+        single_modality_inputs = all(len(modalities) == 1 for modalities in param_modalities)
+        mixed_modality_runs = (
+            single_modality_inputs and len({modalities[0] for modalities in param_modalities}) > 1
+        )
+        if mixed_modality_runs:
+            input_groups = [
+                (modality, [param.multimodal_data[modality] for _, param in param_group])
+                for modality, param_group in groupby(
+                    zip(param_modalities, multimodal_params), key=lambda item: item[0][0]
                 )
-            return torch.cat(embeddings, dim=0)
-
-        pixel_values_list = []
-        image_position_ids_list = []
-        image_seq_lens_extended: List[int] = []
-        audio_features_list = []
-        audio_features_mask_list: List[Optional[torch.Tensor]] = []
-        video_pixel_values_list = []
-        video_position_ids_list = []
-        video_seq_lens_extended: List[int] = []
-
-        for multimodal_param in multimodal_params:
-            multimodal_data = multimodal_param.multimodal_data
-            image_data = multimodal_data.get("image", {})
-            pixel_values = image_data.get("pixel_values")
-            if pixel_values is not None:
-                pixel_values_list.append(pixel_values)
-                image_position_ids = image_data.get("image_position_ids")
-                if image_position_ids is not None:
-                    image_position_ids_list.append(image_position_ids)
-                image_seq_lens = image_data.get("image_seq_lens")
-                if image_seq_lens is not None:
-                    image_seq_lens_extended.extend(image_seq_lens)
-
-            audio_data = multimodal_data.get("audio", {})
-            audio_features = audio_data.get("audio_features")
-            if audio_features is not None:
-                audio_features_list.append(audio_features)
-                audio_features_mask_list.append(audio_data.get("audio_features_mask"))
-
-            video_data = multimodal_data.get("video", {})
-            video_pixel_values = video_data.get("pixel_values")
-            if video_pixel_values is not None:
-                video_pixel_values_list.append(video_pixel_values)
-                video_position_ids = video_data.get("image_position_ids")
-                if video_position_ids is not None:
-                    video_position_ids_list.append(video_position_ids)
-                video_seq_lens = video_data.get("image_seq_lens")
-                if video_seq_lens is not None:
-                    video_seq_lens_extended.extend(video_seq_lens)
+            ]
+        elif single_modality_inputs and multimodal_params:
+            modality = param_modalities[0][0]
+            input_groups = [
+                (modality, [param.multimodal_data[modality] for param in multimodal_params])
+            ]
+        else:
+            input_groups = [
+                (
+                    modality,
+                    [
+                        data
+                        for param in multimodal_params
+                        if (data := param.multimodal_data.get(modality, {})).get(input_field)
+                        is not None
+                    ],
+                )
+                for modality, input_field in modality_inputs
+            ]
 
         multimodal_embeddings = []
-        if pixel_values_list:
-            pixel_values = torch.cat(pixel_values_list)
-            image_position_ids = (
-                torch.cat(image_position_ids_list)
-                if len(image_position_ids_list) == len(pixel_values_list)
-                else None
+        for modality, inputs in input_groups:
+            if not inputs:
+                continue
+            if modality == "audio":
+                if self.embed_audio is not None:
+                    multimodal_embeddings.append(
+                        torch.cat(
+                            [
+                                self._get_audio_features(
+                                    data["audio_features"], data.get("audio_features_mask")
+                                )
+                                for data in inputs
+                            ],
+                            dim=0,
+                        )
+                    )
+                    if mixed_modality_runs:
+                        multimodal_embeddings[-1] = multimodal_embeddings[-1].clone(
+                            memory_format=torch.contiguous_format
+                        )
+                elif mixed_modality_runs:
+                    raise ValueError(
+                        "Gemma4 received active multimodal parameters without encoder inputs"
+                    )
+                continue
+            fields = (
+                _GEMMA4_VISION_FIELDS
+                if all(data.get("image_position_ids") is not None for data in inputs)
+                else _GEMMA4_PIXEL_FIELD
             )
+            batched = batch_encoder_inputs(inputs, fields)
+            image_seq_lens = []
+            for data in inputs:
+                if data.get("image_seq_lens") is not None:
+                    image_seq_lens.extend(data["image_seq_lens"])
             multimodal_embeddings.append(
                 self._get_image_features(
-                    pixel_values=pixel_values,
-                    image_position_ids=image_position_ids,
+                    pixel_values=batched["pixel_values"],
+                    image_position_ids=batched.get("image_position_ids"),
                     image_seq_lens=(
-                        image_seq_lens_extended
-                        if len(image_seq_lens_extended) == pixel_values.shape[0]
+                        image_seq_lens
+                        if len(image_seq_lens) == batched["pixel_values"].shape[0]
                         else None
                     ),
                 )
             )
-
-        if video_pixel_values_list:
-            video_pixel_values = torch.cat(video_pixel_values_list)
-            video_position_ids = (
-                torch.cat(video_position_ids_list)
-                if len(video_position_ids_list) == len(video_pixel_values_list)
-                else None
-            )
-            multimodal_embeddings.append(
-                self._get_image_features(
-                    pixel_values=video_pixel_values,
-                    image_position_ids=video_position_ids,
-                    image_seq_lens=(
-                        video_seq_lens_extended
-                        if len(video_seq_lens_extended) == video_pixel_values.shape[0]
-                        else None
-                    ),
+            if mixed_modality_runs:
+                # Own this run's storage before another call can replay a graph.
+                multimodal_embeddings[-1] = multimodal_embeddings[-1].clone(
+                    memory_format=torch.contiguous_format
                 )
-            )
-
-        if audio_features_list and self.embed_audio is not None:
-            per_audio_embeddings = [
-                self._get_audio_features(audio_features, audio_features_mask_list[index])
-                for index, audio_features in enumerate(audio_features_list)
-            ]
-            multimodal_embeddings.append(torch.cat(per_audio_embeddings, dim=0))
 
         if not multimodal_embeddings:
             raise ValueError("Gemma4 received active multimodal parameters without encoder inputs")
