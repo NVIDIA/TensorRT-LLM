@@ -15,6 +15,19 @@ from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 
 
+def _picks_num_frontends(cli_args: List[str],
+                         extra_config: Optional[dict]) -> bool:
+    """Whether a test sets num_serve_frontends (a --set override wins anyway)."""
+    configs = [extra_config or {}]
+    for arg, value in zip(cli_args, cli_args[1:] + [""]):
+        if arg.split("=")[0] == "--num_serve_frontends":
+            return True
+        if arg in ("--config", "--extra_llm_api_options") and value:
+            with open(value) as f:
+                configs.append(yaml.safe_load(f) or {})
+    return any("num_serve_frontends" in config for config in configs)
+
+
 class RemoteOpenAIServer:
     DUMMY_API_KEY = "tensorrt_llm"
     MAX_SERVER_START_WAIT_S = 7200  # wait for server to start for 7200 seconds (~ 2 hours) for LLM models weight loading
@@ -51,6 +64,10 @@ class RemoteOpenAIServer:
                 f.write(yaml.dump(extra_config))
                 self.extra_config_file = f.name
             args += ["--extra_llm_api_options", self.extra_config_file]
+        # trtllm-serve defaults to several frontend processes; test servers
+        # run one unless the test picks a count.
+        if not _picks_num_frontends(cli_args or [], extra_config):
+            args += ["--num_serve_frontends", "1"]
         launch_cmd = ["trtllm-serve"] + [model] + args
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes
