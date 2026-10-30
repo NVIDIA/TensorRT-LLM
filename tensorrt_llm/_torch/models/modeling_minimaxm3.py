@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -54,7 +55,7 @@ from ..attention.backends.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..attention.backends.sparse.minimax_m3.common import index_head_range
+from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
@@ -72,13 +73,21 @@ from ..modules.linear import (
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
+from .checkpoints.hf.weight_mapper import convert_compressed_tensors_nvfp4_weights
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    ModelConfig,
+    filter_weights,
+    layerwise_moe_quant_config,
+    register_auto_model,
+)
 
 # Legacy dense fallback: cuDNN cannot consume this SDPA layout.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
@@ -431,26 +440,6 @@ def _validate_sparse_attention_runtime_config(
             )
 
 
-def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
-    """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
-    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-    n_layers = int(text_config.num_hidden_layers)
-    if sparse_cfg is None:
-        return list(range(n_layers)), []
-    if not sparse_cfg.get("use_sparse_attention", True):
-        return list(range(n_layers)), []
-    freq = sparse_cfg.get("sparse_attention_freq")
-    if freq is None:
-        return list(range(n_layers)), []
-    if len(freq) != n_layers:
-        raise ValueError(
-            f"sparse_attention_freq length {len(freq)} does not match num_hidden_layers {n_layers}"
-        )
-    dense = [i for i, f in enumerate(freq) if int(f) == 0]
-    sparse = [i for i, f in enumerate(freq) if int(f) != 0]
-    return dense, sparse
-
-
 def get_sparse_disable_index_value_layer_ids(
     text_config: PretrainedConfig,
 ) -> List[int]:
@@ -733,7 +722,12 @@ class MiniMaxM3MoE(nn.Module):
             return QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         if getattr(model_config, "quant_config_dict", None) is None:
             return quant_config
-        return model_config.quant_config_dict.get(experts_name, quant_config)
+        experts_quant_config = layerwise_moe_quant_config(
+            model_config.quant_config_dict, experts_name
+        )
+        if experts_quant_config is None:
+            return quant_config
+        return experts_quant_config
 
     def __init__(
         self,
@@ -1298,6 +1292,11 @@ class MiniMaxM3Attention(Attention):
             # A fallback-first policy cannot serve P128 cached prefill safely.
             return
         if not FlashInferTrtllmGenFmha.is_environment_available():
+            return
+        if get_sm_version() == 107:
+            # SM107 admits the library only for the KV manager's extra page sizes
+            # (the Eagle3 draft layers at 128-token pages). Dense layers keep SDPA
+            # there, as before SM107 was admitted.
             return
         # Q/K norm and partial RoPE run in the model before backend dispatch.
         native_attn = TrtllmAttention(
@@ -3039,6 +3038,10 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         params_map: Optional[Dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
+        # Accept compressed-tensors NVFP4 names before any loader below reads
+        # the dict. Keyed on the tensor names, not on the global quant config:
+        # that is MIXED_PRECISION when NVFP4 covers only some modules.
+        weights = convert_compressed_tensors_nvfp4_weights(weights)
         # Pack the opt-in five-way projection with MiniMax-specific TP
         # sharding before the generic mapper handles the compatibility path.
         packed_projection_modules = _load_qkv_index_proj_weights(self, weights)
@@ -3137,8 +3140,10 @@ def _build_minimax_m3_vl_input_processor_registration():
         model_type="minimax_m3_vl",
         placeholder_metadata=MultimodalPlaceholderMetadata(
             placeholder_map={
-                "image": "]<]start of image[>[]<]image[>[]<]end of image[>[",
-                "video": "]<]start of image[>[]<]video[>[]<]end of image[>[",
+                # The bare per-item markers the M3 chat template renders; the
+                # HF processor adds the start/end-of-image framing.
+                "image": "]<]image[>[",
+                "video": "]<]video[>[",
             },
             placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
             content_format=ContentFormat.STRING,
@@ -3160,6 +3165,8 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
     ``multi_modal_projector.*`` and ``patch_merge_mlp.*`` checkpoint
     blobs under that namespace.
     """
+
+    lora_owner = DecoderLoraOwner(module_path="model")
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         # Capture the raw VL config before ``super().__init__`` swaps in
@@ -3308,6 +3315,16 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
                     vid.get("pixel_values_videos") is not None
                     or vid.get("pixel_values") is not None
                 )
+                # A request whose placeholder rows are all cached or beyond
+                # this chunk needs no vision forward; dropping it here keeps
+                # the tower calls and the embedding rows to the active params.
+                # This skip must stay ahead of the append: ``find_input_mm_embeds``
+                # below advances its row cursor once per entry of
+                # ``mm_params_with_data``, so the list that feeds the vision
+                # tower has to be the list whose rows it slices.
+                runtime = getattr(param, "multimodal_runtime", None)
+                if runtime is not None and runtime.num_mm_tokens_in_chunk == 0:
+                    continue
                 if has_image_pv or has_video_pv:
                     mm_params_with_data.append(param)
 
@@ -3329,7 +3346,7 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             # ``input_ids`` for ``mm_token_ids`` — exactly the right
             # semantics for visual-input requests.
             from .modeling_minimaxm3_vl import extract_multimodal_items_in_request_order
-            from .modeling_multimodal_utils import fuse_input_embeds
+            from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 
             # Walk ``multimodal_params`` in left-to-right request order
             # and produce ``mm_embeds`` per-item so the concatenated rows
@@ -3354,15 +3371,30 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             # device for the fuse path (registry buffer device follows
             # ``model.to(device)`` automatically, but the standalone
             # unit-test path may use a different device).
-            fused_ids, fused_embeds = fuse_input_embeds(
-                embedding_layer=embed_tokens,
-                input_ids=flat_ids,
-                mm_embeds=mm_embeds,
-                mm_token_ids=self.mm_token_ids.to(flat_ids.device),
-                **kwargs,
-            )
-            input_ids = fused_ids
-            inputs_embeds = fused_embeds
+            # With KV-cache reuse or chunked prefill, part of a request's
+            # placeholder span may already be cached or lie beyond the
+            # current chunk; keep only the embedding rows whose tokens are in
+            # this forward (``multimodal_runtime`` carries the counts). The
+            # list is pre-concatenated in request order so one cursor covers
+            # multi-image requests.
+            mm_embeds = find_input_mm_embeds([torch.cat(mm_embeds, dim=0)], mm_params_with_data)
+            if mm_embeds:
+                fused_ids, fused_embeds = fuse_input_embeds(
+                    embedding_layer=embed_tokens,
+                    input_ids=flat_ids,
+                    mm_embeds=mm_embeds,
+                    mm_token_ids=self.mm_token_ids.to(flat_ids.device),
+                    **kwargs,
+                )
+                input_ids = fused_ids
+                inputs_embeds = fused_embeds
+                # ``fuse_input_embeds`` returns ``input_ids=None`` once the
+                # embeddings are materialised. The speculative-decoding
+                # workers (DSpark/DFlash, MTP, Eagle) still need the
+                # per-position token ids of the fused batch;
+                # ``SpecDecOneEngineForCausalLM`` reads them from
+                # ``orig_input_ids`` when ``input_ids`` is None.
+                kwargs["orig_input_ids"] = flat_ids
 
         return super().forward(
             attn_metadata=attn_metadata,

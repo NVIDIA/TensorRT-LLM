@@ -286,7 +286,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     // {128, 256} or head_dim != head_dim_v, non-causal / sliding-window / custom
     // mask, non-PACKED_QKV layout, alibi, logit softcapping, sage attention,
     // interleaved, and returning softmax stats.
-    if ((mSM == kSM_120 || mSM == kSM_121) && launch_params.flash_attention && mInputDataType == DATA_TYPE_BF16
+    if (tensorrt_llm::common::isSM120Family(mSM) && launch_params.flash_attention && mInputDataType == DATA_TYPE_BF16
         && mOutputDataType == DATA_TYPE_BF16 && params.d == params.dv && (params.d == 128 || params.d == 256)
         && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
         && launch_params.attention_input_layout == AttentionInputLayout::PACKED_QKV && !params.has_alibi

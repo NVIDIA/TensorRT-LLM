@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only unit tests for CutlassFusedMoE._extract_moe_lora_tensors.
+"""CPU-only unit tests for CutlassMoELoraMixin._extract_moe_lora_tensors.
 
 This function maps the per-layer lora_params dict (keyed by LoraModuleType)
 onto the fc1, gated, and fc2 kwargs the fused MoE op expects. The op-level
@@ -21,31 +21,31 @@ pytestmark = pytest.mark.cpu_only
 
 
 # These imports are pure-Python; skip cleanly if the package layout changes.
-fused_moe_cutlass = pytest.importorskip("tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass")
+cutlass = pytest.importorskip("tensorrt_llm._torch.moe.fused_moe.cutlass")
 lora_layer = pytest.importorskip("tensorrt_llm._torch.peft.lora.layer")
 
-CutlassFusedMoE = fused_moe_cutlass.CutlassFusedMoE
+CutlassMoELoraMixin = cutlass.CutlassMoELoraMixin
 LoraModuleType = lora_layer.LoraModuleType
 
 
 class _ExtractStub:
-    """Minimal stand-in for a CutlassFusedMoE instance.
+    """Minimal stand-in for a CUTLASS LoRA leaf instance.
 
     _extract_moe_lora_tensors reads self.layer_idx and the small slot-gathering
-    helpers, which we borrow from CutlassFusedMoE so the unbound method can run
+    helpers, which we borrow from CutlassMoELoraMixin so the unbound method can run
     without constructing real weights or a GPU layer.
     """
 
-    _gather_moe_lora_slots = CutlassFusedMoE._gather_moe_lora_slots
-    _require_fc1_fc2 = staticmethod(CutlassFusedMoE._require_fc1_fc2)
-    _empty_kernel_slot_dict = staticmethod(CutlassFusedMoE._empty_kernel_slot_dict)
+    _gather_moe_lora_slots = CutlassMoELoraMixin._gather_moe_lora_slots
+    _require_fc1_fc2 = staticmethod(CutlassMoELoraMixin._require_fc1_fc2)
+    _empty_kernel_slot_dict = staticmethod(CutlassMoELoraMixin._empty_kernel_slot_dict)
 
     def __init__(self, layer_idx=0):
         self.layer_idx = layer_idx
 
 
 def _extract(layer_idx, lora_params):
-    return CutlassFusedMoE._extract_moe_lora_tensors(_ExtractStub(layer_idx), lora_params)
+    return CutlassMoELoraMixin._extract_moe_lora_tensors(_ExtractStub(layer_idx), lora_params)
 
 
 def _module_entry(rank: int, a_ptr: int, b_ptr: int, num_seqs: int = 1):
@@ -71,6 +71,30 @@ def _make_lora_params(layer_idx, modules, num_seqs=1):
         "prompt_lens_cpu": torch.ones(num_seqs, dtype=torch.int32),
         layer_idx: layer_dict,
     }
+
+
+# ---------------------------------------------------------------------------
+# Cache dtype propagation.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_propagates_fp8_cache_dtype():
+    layer_idx = 0
+    modules = {
+        LoraModuleType.MOE_H_TO_4H: (16, 0x1110, 0x1111),
+        LoraModuleType.MOE_4H_TO_H: (16, 0x2220, 0x2221),
+    }
+    lora_params = _make_lora_params(layer_idx, modules)
+    lora_params["data_type"] = torch.float8_e4m3fn
+
+    result = _extract(layer_idx, lora_params)
+
+    assert result is not None
+    assert result["lora_dtype"] == torch.float8_e4m3fn
+
+
+def test_extract_allows_fp8_cache_without_active_moe_weights():
+    assert _extract(0, {"data_type": torch.float8_e4m3fn}) is None
 
 
 # ---------------------------------------------------------------------------

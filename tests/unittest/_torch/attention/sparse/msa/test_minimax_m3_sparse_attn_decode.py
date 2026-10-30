@@ -1218,7 +1218,7 @@ def test_resolve_num_topk_chunks_is_shape_only_power_of_two(total_q, num_kv_head
         (33, {}),
     ],
 )
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_sm100f_nvfp4_launch_options(local_batch, expected, capability):
     if capability != (10, 3):
         expected = {}
@@ -1252,7 +1252,7 @@ def test_sm100f_nvfp4_launch_options(local_batch, expected, capability):
         (15, None),
     ],
 )
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_sm100f_nvfp4_num_topk_chunks(local_batch, expected, capability):
     if capability != (10, 3):
         expected = None
@@ -1273,7 +1273,7 @@ def test_sm100f_nvfp4_num_topk_chunks(local_batch, expected, capability):
     ("local_batch", "expected"),
     [(10, 1), (11, 2), (12, 2), (14, 2), (15, 1)],
 )
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_sm100f_nvfp4_query_group_size_is_narrowly_scoped(local_batch, expected, capability):
     if capability != (10, 3):
         expected = 1
@@ -1319,7 +1319,7 @@ def test_sm100f_nvfp4_launch_options_rejects_unmeasured_shapes():
         (8, 14, False),
     ],
 )
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_sm100f_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected, capability):
     if capability != (10, 3):
         expected = False
@@ -1350,7 +1350,7 @@ def test_sm100f_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected,
         (12, {}),
     ],
 )
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_sm100f_nvfp4_merge_launch_options_is_narrowly_scoped(local_batch, expected, capability):
     if capability != (10, 3):
         expected = {}

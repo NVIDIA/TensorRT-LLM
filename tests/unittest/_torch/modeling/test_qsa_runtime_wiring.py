@@ -10,18 +10,22 @@ from tensorrt_llm._torch.attention.backends.interface import PredefinedAttention
 from tensorrt_llm._torch.attention.backends.sparse.hooks import get_sparse_attention_hooks
 from tensorrt_llm._torch.attention.backends.sparse.qsa import (
     QSAAttentionMetadata,
-    QSAMambaHybridCacheManagerV2,
     QSASparseMetadataParams,
     QSASparseParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import QSASparseHooks
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, QSASparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    QSASparseAttentionConfig,
+    SkipSoftmaxAttentionConfig,
+)
 
 
 def _sparse_params() -> QSASparseParams:
@@ -222,7 +226,7 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
 
 def test_qsa_metadata_allows_a_pp_rank_without_local_sparse_layers(monkeypatch) -> None:
     monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = None
     metadata = object.__new__(QSAAttentionMetadata)
     metadata.kv_cache_manager = manager
@@ -253,7 +257,7 @@ def test_qsa_hybrid_routes_to_sparse_v2_cache_manager(monkeypatch) -> None:
 
     manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
 
-    assert manager_cls is QSAMambaHybridCacheManagerV2
+    assert manager_cls is Qwen4ExpHybridCacheManager
 
 
 def test_qsa_hybrid_rejects_kv_cache_manager_v1(monkeypatch) -> None:
@@ -293,8 +297,13 @@ def test_qsa_rejects_non_hybrid_models(monkeypatch) -> None:
         )
 
 
-def test_qsa_cache_manager_uses_resolved_index_geometry(
+@pytest.mark.parametrize(
+    "sparse_config",
+    [None, QSASparseAttentionConfig(), SkipSoftmaxAttentionConfig(threshold_scale_factor=1.0)],
+)
+def test_qwen4_cache_manager_uses_only_qsa_index_geometry(
     monkeypatch,
+    sparse_config,
 ) -> None:
     from tensorrt_llm._torch.pyexecutor import _util
 
@@ -327,24 +336,23 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
     monkeypatch.setattr(_util, "is_kimi_linear", lambda config: False)
     monkeypatch.setattr(_util, "is_mla", lambda config: False)
     monkeypatch.setattr(_util, "is_nemotron_hybrid", lambda config: False)
-    monkeypatch.setattr(_util, "is_qwen3_hybrid", lambda config: True)
+    monkeypatch.setattr(_util, "is_qwen3_hybrid", lambda config: False)
+    monkeypatch.setattr(_util, "is_qwen4_exp", lambda config: True)
     monkeypatch.setattr(
         _util, "extract_mamba_kv_cache_params", lambda *args, **kwargs: mamba_params
     )
-    monkeypatch.setattr(_util, "get_sm_version", lambda: 103)
-    monkeypatch.setattr(_util, "is_gdn_replay_enabled", lambda: False)
     monkeypatch.setattr(MambaHybridCacheManagerV2, "__init__", lambda self, *args, **kwargs: None)
 
     manager = _create_kv_cache_manager(
         model_engine=None,
-        kv_cache_manager_cls=QSAMambaHybridCacheManagerV2,
+        kv_cache_manager_cls=Qwen4ExpHybridCacheManager,
         mapping=SimpleNamespace(enable_attention_dp=False),
         kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
         tokens_per_block=128,
         max_seq_len=4096,
         max_batch_size=8,
         spec_config=None,
-        sparse_attention_config=QSASparseAttentionConfig(),
+        sparse_attention_config=sparse_config,
         max_num_tokens=1024,
         max_beam_width=1,
         kv_connector_manager=None,
@@ -356,21 +364,28 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
         is_draft=False,
     )
 
-    assert manager.qsa_index_dim == 96
-    assert manager.qsa_index_kv_heads == 1
+    qsa_enabled = isinstance(sparse_config, QSASparseAttentionConfig)
+    assert manager._qsa_enabled == qsa_enabled
+    assert manager.qsa_index_dim == (96 if qsa_enabled else 0)
+    assert manager.qsa_index_kv_heads == (1 if qsa_enabled else 0)
+    if not qsa_enabled:
+        assert manager._extra_buffers_per_layer(tokens_per_block=128) == {}
 
 
-def test_qsa_cache_manager_requires_sparse_config() -> None:
-    with pytest.raises(ValueError, match="sparse_attention_config is required"):
-        QSAMambaHybridCacheManagerV2(layer_mask=[True])
+def test_qwen4_manager_also_supports_dense_attention(monkeypatch) -> None:
+    monkeypatch.setattr(MambaHybridCacheManagerV2, "__init__", lambda self, *args, **kwargs: None)
+    manager = Qwen4ExpHybridCacheManager(layer_mask=[True])
+    assert not manager._qsa_enabled
+    assert manager._extra_buffers_per_layer(tokens_per_block=32) == {}
 
 
-@pytest.mark.parametrize("dtype", (DataType.NVFP4, DataType.FLOAT))
+@pytest.mark.parametrize("dtype", (DataType.FLOAT,))
 def test_qsa_cache_manager_delegates_regular_kv_layout(
     monkeypatch: pytest.MonkeyPatch, dtype: DataType
 ) -> None:
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.dtype = dtype
+    manager._qsa_enabled = True
     sentinel = torch.empty(0, dtype=torch.int8)
     calls: list[tuple[object, int, str]] = []
 

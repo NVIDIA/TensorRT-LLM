@@ -460,6 +460,49 @@ class TestPythonChatTemplate:
             )
 
 
+class TestProcessorWithoutChatTemplate:
+    """A processor that has no chat template must not hide the tokenizer's."""
+
+    @staticmethod
+    def _tokenizer(template):
+        class JinjaTokenizer:
+            chat_template = template
+
+            def get_chat_template(self, chat_template=None, tools=None):
+                return self.chat_template
+
+            def apply_chat_template(self, **kwargs):
+                # Return the template it was asked to render, so the result names the winner.
+                return kwargs["chat_template"]
+
+        return JinjaTokenizer()
+
+    @staticmethod
+    def _render(tokenizer, processor):
+        return apply_chat_template(
+            model_type="test_string_model",
+            tokenizer=tokenizer,
+            processor=processor,
+            conversation=[ConversationMessage(role="user", content="hello", media=[])],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+        )
+
+    def test_falls_back_to_tokenizer_template(self):
+        class Processor:
+            chat_template = None
+
+        tokenizer = self._tokenizer("{{ 'tokenizer template' }}")
+        assert self._render(tokenizer, Processor()) == "{{ 'tokenizer template' }}"
+
+    def test_processor_template_is_still_preferred(self):
+        class Processor:
+            chat_template = "{{ 'processor template' }}"
+
+        tokenizer = self._tokenizer("{{ 'tokenizer template' }}")
+        assert self._render(tokenizer, Processor()) == "{{ 'processor template' }}"
+
+
 class TestServingChatTemplateGather:
     """Cover the asyncio.gather integration in the serving chat-template paths."""
 

@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Blackwell persistent work-ID claim backends."""
 
 import dataclasses
@@ -10,13 +7,10 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import Boolean, Int32, Int64, extract_mlir_values, new_from_mlir_values
 
-from ...helpers.ptx_helpers import (
-    mbarrier_arrive_expect_tx_on_peer,
-    nanosleep,
-    store_i32_to_peer_cluster_smem_async,
-)
+from ...helpers.ptx_helpers import mbarrier_arrive_expect_tx_on_peer, nanosleep, store_i32_to_peer_cluster_smem_async
 
 
 class GridStrideWorkIdState:
@@ -42,9 +36,7 @@ class GridStrideWorkIdState:
             )
         return type(self)(
             next_work_id=new_from_mlir_values(self.next_work_id, values[:next_work_id_value_count]),
-            work_id_stride=new_from_mlir_values(
-                self.work_id_stride, values[next_work_id_value_count:]
-            ),
+            work_id_stride=new_from_mlir_values(self.work_id_stride, values[next_work_id_value_count:]),
         )
 
 
@@ -62,11 +54,7 @@ class AtomicCounterWorkIdState:
         consumer_state,
         cluster_size: int | Int32,
     ) -> None:
-        if (
-            isinstance(counter_count, bool)
-            or not isinstance(counter_count, int)
-            or counter_count <= 0
-        ):
+        if isinstance(counter_count, bool) or not isinstance(counter_count, int) or counter_count <= 0:
             raise ValueError("counter_count must be a positive Python int.")
         self.counter_pointer = counter_pointer
         self.counter_count = counter_count
@@ -97,9 +85,7 @@ class AtomicCounterWorkIdState:
         def rebuild(field):
             nonlocal value_index
             field_value_count = len(extract_mlir_values(field))
-            result = new_from_mlir_values(
-                field, values[value_index : value_index + field_value_count]
-            )
+            result = new_from_mlir_values(field, values[value_index : value_index + field_value_count])
             value_index += field_value_count
             return result
 
@@ -111,9 +97,7 @@ class AtomicCounterWorkIdState:
             cluster_pipeline=self.cluster_pipeline,
             producer_state=rebuild(self.producer_state),
             consumer_state=rebuild(self.consumer_state),
-            cluster_size=rebuild(self.cluster_size)
-            if isinstance(self.cluster_size, Int32)
-            else self.cluster_size,
+            cluster_size=rebuild(self.cluster_size) if isinstance(self.cluster_size, Int32) else self.cluster_size,
         )
         if value_index != len(values):
             raise ValueError(
@@ -180,17 +164,13 @@ class FixedGroupMixedCgaAtomicCounterWorkIdState:
             values.extend(extract_mlir_values(field))
         return values
 
-    def __new_from_mlir_values__(
-        self, values: List[ir.Value]
-    ) -> "FixedGroupMixedCgaAtomicCounterWorkIdState":
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "FixedGroupMixedCgaAtomicCounterWorkIdState":
         value_index = 0
 
         def rebuild(field):
             nonlocal value_index
             field_value_count = len(extract_mlir_values(field))
-            result = new_from_mlir_values(
-                field, values[value_index : value_index + field_value_count]
-            )
+            result = new_from_mlir_values(field, values[value_index : value_index + field_value_count])
             value_index += field_value_count
             return result
 
@@ -234,9 +214,7 @@ class GridWorkId:
         if len(values) != 4:
             raise ValueError(f"GridWorkId expects four MLIR values, got {len(values)}.")
         fields = (self.grid_m, self.grid_n, self.grid_l, self.is_valid)
-        return type(self)(
-            *(new_from_mlir_values(field, [value]) for field, value in zip(fields, values))
-        )
+        return type(self)(*(new_from_mlir_values(field, [value]) for field, value in zip(fields, values)))
 
 
 class ClusterLaunchControlWorkIdState:
@@ -291,9 +269,7 @@ class ClusterLaunchControlWorkIdState:
         def rebuild(field):
             nonlocal value_index
             field_value_count = len(extract_mlir_values(field))
-            rebuilt_field = new_from_mlir_values(
-                field, values[value_index : value_index + field_value_count]
-            )
+            rebuilt_field = new_from_mlir_values(field, values[value_index : value_index + field_value_count])
             value_index += field_value_count
             return rebuilt_field
 
@@ -317,10 +293,93 @@ class ClusterLaunchControlWorkIdState:
         return result
 
 
+class ClcMixedCgaWorkIdState:
+    """Cluster-wide state for hardware CLC claims on a runtime-sized (mixed-CGA) cluster.
+
+    ``PipelineClcFetchAsync`` needs a static cluster layout, so this drives a plain ``PipelineAsync``
+    with the atomic broadcast's peer barrier protocol instead.
+    """
+
+    def __init__(
+        self,
+        response_pending: Boolean,
+        grid_m: Int32,
+        grid_n: Int32,
+        grid_l: Int32,
+        response_is_valid: Boolean,
+        cta_coord_in_cluster: cute.Coord,
+        cluster_pipeline: pipeline.PipelineAsync,
+        producer_state,
+        consumer_state,
+        is_leader_cta: Boolean,
+        response_pointer: cute.Pointer,
+        cluster_size: int | Int32,
+    ) -> None:
+        self.response_pending = response_pending
+        self.grid_m = grid_m
+        self.grid_n = grid_n
+        self.grid_l = grid_l
+        self.response_is_valid = response_is_valid
+        self.cta_coord_in_cluster = cta_coord_in_cluster
+        self.cluster_pipeline = cluster_pipeline
+        self.producer_state = producer_state
+        self.consumer_state = consumer_state
+        self.is_leader_cta = is_leader_cta
+        self.response_pointer = response_pointer
+        self.cluster_size = cluster_size
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        values: List[ir.Value] = []
+        for field in (
+            self.response_pending,
+            self.grid_m,
+            self.grid_n,
+            self.grid_l,
+            self.response_is_valid,
+            self.cta_coord_in_cluster,
+            self.producer_state,
+            self.consumer_state,
+            self.is_leader_cta,
+            self.response_pointer,
+        ):
+            values.extend(extract_mlir_values(field))
+        if isinstance(self.cluster_size, Int32):
+            values.extend(extract_mlir_values(self.cluster_size))
+        return values
+
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "ClcMixedCgaWorkIdState":
+        value_index = 0
+
+        def rebuild(field):
+            nonlocal value_index
+            field_value_count = len(extract_mlir_values(field))
+            rebuilt_field = new_from_mlir_values(field, values[value_index : value_index + field_value_count])
+            value_index += field_value_count
+            return rebuilt_field
+
+        result = type(self)(
+            response_pending=rebuild(self.response_pending),
+            grid_m=rebuild(self.grid_m),
+            grid_n=rebuild(self.grid_n),
+            grid_l=rebuild(self.grid_l),
+            response_is_valid=rebuild(self.response_is_valid),
+            cta_coord_in_cluster=rebuild(self.cta_coord_in_cluster),
+            cluster_pipeline=self.cluster_pipeline,
+            producer_state=rebuild(self.producer_state),
+            consumer_state=rebuild(self.consumer_state),
+            is_leader_cta=rebuild(self.is_leader_cta),
+            response_pointer=rebuild(self.response_pointer),
+            cluster_size=rebuild(self.cluster_size) if isinstance(self.cluster_size, Int32) else self.cluster_size,
+        )
+        if value_index != len(values):
+            raise ValueError(
+                f"ClcMixedCgaWorkIdState MLIR value count mismatch: consumed {value_index}, got {len(values)}."
+            )
+        return result
+
+
 @cute.jit
-def _claim_grid_stride_work_id(
-    work_id_state: GridStrideWorkIdState,
-) -> Tuple[Int32, GridStrideWorkIdState]:
+def _claim_grid_stride_work_id(work_id_state: GridStrideWorkIdState) -> Tuple[Int32, GridStrideWorkIdState]:
     """Claim the next ID from one monotonic grid-stride stream."""
     linear_work_id = work_id_state.next_work_id
     work_id_state.next_work_id = linear_work_id + work_id_state.work_id_stride
@@ -345,17 +404,13 @@ def _claim_atomic_counter_work_id(
 
     if work_id_state.is_leader_cta:
         cluster_pipeline.producer_acquire(work_id_state.producer_state)
-        full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
-            work_id_state.producer_state.index
-        )
+        full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(work_id_state.producer_state.index)
         thread_idx, _, _ = cute.arch.thread_idx()
         lane_idx = thread_idx % Int32(32)
         atomic_work_id = Int32(0)
         if lane_idx == Int32(0):
             atomic_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1))
-        atomic_work_id = cute.arch.shuffle_sync(
-            atomic_work_id, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
-        )
+        atomic_work_id = cute.arch.shuffle_sync(atomic_work_id, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
         if lane_idx < Int32(work_id_state.cluster_size):
             store_i32_to_peer_cluster_smem_async(
                 work_id_state.broadcast_pointer, atomic_work_id, full_barrier_pointer, lane_idx
@@ -372,15 +427,172 @@ def _claim_atomic_counter_work_id(
 
 
 @cute.jit
+def broadcast_atomic_counter_ready(
+    work_id_state: AtomicCounterWorkIdState,
+    counter_pointer: cute.Pointer,
+    ready_threshold: Int32,
+    ready_is_mask: bool = False,
+) -> Tuple[Boolean, AtomicCounterWorkIdState]:
+    """Load one global readiness counter on the leader and broadcast the predicate.
+
+    The scheduler makes publication decisions at preferred-cluster granularity,
+    so a CTA-local peek is not sufficient: the two scheduler warps must either
+    both defer or both publish their CTA halves of a work tile.  Reusing the
+    atomic work-ID broadcast channel gives the readiness decision the same
+    cluster-uniform ordering as a work-ID claim.
+    """
+    if cutlass.const_expr(not isinstance(ready_is_mask, bool)):
+        raise TypeError("ready_is_mask must be a Python bool.")
+
+    broadcast_tensor = cute.make_tensor(
+        work_id_state.broadcast_pointer, cute.make_layout((1,))
+    )
+    cluster_pipeline = work_id_state.cluster_pipeline
+
+    if work_id_state.is_leader_cta:
+        cluster_pipeline.producer_acquire(work_id_state.producer_state)
+        full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
+            work_id_state.producer_state.index
+        )
+        thread_idx, _, _ = cute.arch.thread_idx()
+        lane_idx = thread_idx % Int32(32)
+        ready_payload = Int32(0)
+        if lane_idx == Int32(0):
+            observed = cute.arch.load(
+                counter_pointer, Int32, sem="acquire", scope="gpu"
+            )
+            if cutlass.const_expr(ready_is_mask):
+                if (observed & ready_threshold) == ready_threshold:
+                    ready_payload = Int32(1)
+            else:
+                if observed >= ready_threshold:
+                    ready_payload = Int32(1)
+        ready_payload = cute.arch.shuffle_sync(
+            ready_payload, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
+        )
+        if lane_idx < Int32(work_id_state.cluster_size):
+            store_i32_to_peer_cluster_smem_async(
+                work_id_state.broadcast_pointer,
+                ready_payload,
+                full_barrier_pointer,
+                lane_idx,
+            )
+            mbarrier_arrive_expect_tx_on_peer(
+                full_barrier_pointer, Int32(4), lane_idx
+            )
+    work_id_state.producer_state.advance()
+
+    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    ready_payload = broadcast_tensor[0]
+    cute.arch.fence_acq_rel_cta()
+    cluster_pipeline.sync_object_empty.arrive(
+        work_id_state.consumer_state.index, Int32(0)
+    )
+    work_id_state.consumer_state.advance()
+    return ready_payload != Int32(0), work_id_state
+
+
+@cute.jit
+def broadcast_atomic_counter_ready_or_claim(
+    work_id_state: AtomicCounterWorkIdState,
+    ready_counter_pointer: cute.Pointer,
+    ready_threshold: Int32,
+    atomic_counter_index=0,
+    ready_is_mask: bool = False,
+) -> Tuple[Boolean, Int32, AtomicCounterWorkIdState]:
+    """Probe readiness or claim one work ID in one cluster transaction.
+
+    The leader first performs the same acquire readiness load as
+    :func:`broadcast_atomic_counter_ready`.  When the counter is not ready it
+    immediately claims one ID from ``atomic_counter_index`` before broadcasting
+    the result.  A negative payload denotes readiness; valid work IDs are
+    non-negative, so the one-word cluster broadcast ABI remains unchanged.
+
+    This primitive is intentionally limited to a single claimed ID.  It is the
+    bundle-1 fast path used while a full-readiness-gated consumer is held
+    outside the execution FIFO.
+    """
+    if cutlass.const_expr(not isinstance(ready_is_mask, bool)):
+        raise TypeError("ready_is_mask must be a Python bool.")
+    invalid_static_index = isinstance(atomic_counter_index, int) and (
+        atomic_counter_index < 0
+        or atomic_counter_index >= work_id_state.counter_count
+    )
+    if cutlass.const_expr(invalid_static_index):
+        raise ValueError(
+            "atomic_counter_index must be in [0, "
+            f"{work_id_state.counter_count}), got {atomic_counter_index}."
+        )
+
+    broadcast_tensor = cute.make_tensor(
+        work_id_state.broadcast_pointer, cute.make_layout((1,))
+    )
+    cluster_pipeline = work_id_state.cluster_pipeline
+    selected_counter_pointer = (
+        work_id_state.counter_pointer + Int32(atomic_counter_index)
+    )
+
+    if work_id_state.is_leader_cta:
+        cluster_pipeline.producer_acquire(work_id_state.producer_state)
+        full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
+            work_id_state.producer_state.index
+        )
+        thread_idx, _, _ = cute.arch.thread_idx()
+        lane_idx = thread_idx % Int32(32)
+        # -1 is the ready sentinel.  A failed probe replaces it with the
+        # non-negative ID returned by the Linear1 atomic counter.
+        payload = Int32(-1)
+        if lane_idx == Int32(0):
+            observed = cute.arch.load(
+                ready_counter_pointer, Int32, sem="acquire", scope="gpu"
+            )
+            ready = Boolean(False)
+            if cutlass.const_expr(ready_is_mask):
+                ready = (observed & ready_threshold) == ready_threshold
+            else:
+                ready = observed >= ready_threshold
+            if not ready:
+                payload = cute.arch.atomic_add(
+                    selected_counter_pointer, Int32(1)
+                )
+        payload = Int32(
+            cute.arch.shuffle_sync(
+                payload,
+                offset=0,
+                mask=0xFFFFFFFF,
+                mask_and_clamp=31,
+            )
+        )
+        if lane_idx < Int32(work_id_state.cluster_size):
+            store_i32_to_peer_cluster_smem_async(
+                work_id_state.broadcast_pointer,
+                payload,
+                full_barrier_pointer,
+                lane_idx,
+            )
+            mbarrier_arrive_expect_tx_on_peer(
+                full_barrier_pointer, Int32(4), lane_idx
+            )
+    work_id_state.producer_state.advance()
+
+    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    payload = broadcast_tensor[0]
+    cute.arch.fence_acq_rel_cta()
+    cluster_pipeline.sync_object_empty.arrive(
+        work_id_state.consumer_state.index, Int32(0)
+    )
+    work_id_state.consumer_state.advance()
+    return payload == Int32(-1), payload, work_id_state
+
+
+@cute.jit
 def initialize_fixed_group_mixed_cga_work_id_state(
     work_id_state: FixedGroupMixedCgaAtomicCounterWorkIdState,
 ) -> FixedGroupMixedCgaAtomicCounterWorkIdState:
     """Register one physical fallback cluster and broadcast its fixed group coordinates."""
     atomic_counter_state = work_id_state.atomic_counter_state
     if work_id_state.is_fallback_cluster:
-        broadcast_tensor = cute.make_tensor(
-            atomic_counter_state.broadcast_pointer, cute.make_layout((1,))
-        )
+        broadcast_tensor = cute.make_tensor(atomic_counter_state.broadcast_pointer, cute.make_layout((1,)))
         cluster_pipeline = atomic_counter_state.cluster_pipeline
         if atomic_counter_state.is_leader_cta:
             cluster_pipeline.producer_acquire(atomic_counter_state.producer_state)
@@ -395,16 +607,11 @@ def initialize_fixed_group_mixed_cga_work_id_state(
                     work_id_state.registration_counter_pointer, Int32(1), sem="relaxed", scope="gpu"
                 )
             fallback_ordinal = Int32(
-                cute.arch.shuffle_sync(
-                    fallback_ordinal, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
-                )
+                cute.arch.shuffle_sync(fallback_ordinal, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
             )
             if lane_idx < Int32(atomic_counter_state.cluster_size):
                 store_i32_to_peer_cluster_smem_async(
-                    atomic_counter_state.broadcast_pointer,
-                    fallback_ordinal,
-                    full_barrier_pointer,
-                    lane_idx,
+                    atomic_counter_state.broadcast_pointer, fallback_ordinal, full_barrier_pointer, lane_idx
                 )
                 mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
         atomic_counter_state.producer_state.advance()
@@ -412,16 +619,12 @@ def initialize_fixed_group_mixed_cga_work_id_state(
         cluster_pipeline.consumer_wait(atomic_counter_state.consumer_state)
         fallback_ordinal = broadcast_tensor[0]
         cute.arch.fence_acq_rel_cta()
-        cluster_pipeline.sync_object_empty.arrive(
-            atomic_counter_state.consumer_state.index, Int32(0)
-        )
+        cluster_pipeline.sync_object_empty.arrive(atomic_counter_state.consumer_state.index, Int32(0))
         atomic_counter_state.consumer_state.advance()
 
         fallback_group_idx = fallback_ordinal // Int32(work_id_state.split_factor)
         work_id_state.fallback_group_idx = fallback_group_idx
-        work_id_state.in_group_idx = fallback_ordinal - fallback_group_idx * Int32(
-            work_id_state.split_factor
-        )
+        work_id_state.in_group_idx = fallback_ordinal - fallback_group_idx * Int32(work_id_state.split_factor)
     work_id_state.atomic_counter_state = atomic_counter_state
     return work_id_state
 
@@ -440,17 +643,13 @@ def _claim_fixed_group_fallback_work_id(
             f"atomic_counter_index must be in [0, {atomic_counter_state.counter_count}), got {atomic_counter_index}."
         )
 
-    broadcast_tensor = cute.make_tensor(
-        atomic_counter_state.broadcast_pointer, cute.make_layout((1,))
-    )
+    broadcast_tensor = cute.make_tensor(atomic_counter_state.broadcast_pointer, cute.make_layout((1,)))
     cluster_pipeline = atomic_counter_state.cluster_pipeline
     selected_counter_pointer = atomic_counter_state.counter_pointer + Int32(atomic_counter_index)
 
     if atomic_counter_state.is_leader_cta:
         cluster_pipeline.producer_acquire(atomic_counter_state.producer_state)
-        full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
-            atomic_counter_state.producer_state.index
-        )
+        full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(atomic_counter_state.producer_state.index)
         thread_idx, _, _ = cute.arch.thread_idx()
         lane_idx = thread_idx % Int32(32)
         group_base_offset = work_id_state.fallback_group_idx * Int32(work_id_state.split_factor)
@@ -462,9 +661,7 @@ def _claim_fixed_group_fallback_work_id(
             while not all_members_consumed:
                 observed_token = work_id_state.previous_token
                 if lane_idx < Int32(work_id_state.split_factor):
-                    observed_token = cute.arch.load(
-                        group_token_pointer + lane_idx, Int64, sem="acquire", scope="gpu"
-                    )
+                    observed_token = cute.arch.load(group_token_pointer + lane_idx, Int64, sem="acquire", scope="gpu")
                 lane_is_ready = (lane_idx >= Int32(work_id_state.split_factor)) | (
                     observed_token == work_id_state.previous_token
                 )
@@ -475,18 +672,12 @@ def _claim_fixed_group_fallback_work_id(
 
             claimed_work_id = Int32(0)
             if lane_idx == Int32(0):
-                claimed_work_id = cute.arch.atomic_add(
-                    selected_counter_pointer, Int32(1), sem="relaxed", scope="gpu"
-                )
+                claimed_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1), sem="relaxed", scope="gpu")
             claimed_work_id = Int32(
-                cute.arch.shuffle_sync(
-                    claimed_work_id, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
-                )
+                cute.arch.shuffle_sync(claimed_work_id, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
             )
             claimed_payload = claimed_work_id | (Int32(atomic_counter_index) << Int32(31))
-            token = (Int64(work_id_state.next_generation) << Int64(32)) | (
-                Int64(claimed_payload) & Int64(0xFFFFFFFF)
-            )
+            token = (Int64(work_id_state.next_generation) << Int64(32)) | (Int64(claimed_payload) & Int64(0xFFFFFFFF))
             if lane_idx == Int32(0):
                 cute.arch.store(group_token_pointer, token, sem="relaxed", scope="gpu")
             work_id_state.previous_token = token
@@ -497,36 +688,22 @@ def _claim_fixed_group_fallback_work_id(
                 token_high = Int32(0)
                 token_low = Int32(0)
                 if lane_idx == Int32(0):
-                    observed_token = cute.arch.load(
-                        group_token_pointer, Int64, sem="relaxed", scope="gpu"
-                    )
+                    observed_token = cute.arch.load(group_token_pointer, Int64, sem="relaxed", scope="gpu")
                     token_high = Int32(observed_token >> Int64(32))
                     token_low = Int32(observed_token & Int64(0xFFFFFFFF))
-                token_high = Int32(
-                    cute.arch.shuffle_sync(token_high, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
-                )
-                token_low = Int32(
-                    cute.arch.shuffle_sync(token_low, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
-                )
+                token_high = Int32(cute.arch.shuffle_sync(token_high, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31))
+                token_low = Int32(cute.arch.shuffle_sync(token_low, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31))
                 token = (Int64(token_high) << Int64(32)) | (Int64(token_low) & Int64(0xFFFFFFFF))
                 if token == work_id_state.previous_token:
                     nanosleep(500)
             claimed_payload = Int32(token & Int64(0xFFFFFFFF))
             if lane_idx == Int32(0):
-                cute.arch.store(
-                    group_token_pointer + work_id_state.in_group_idx,
-                    token,
-                    sem="relaxed",
-                    scope="gpu",
-                )
+                cute.arch.store(group_token_pointer + work_id_state.in_group_idx, token, sem="relaxed", scope="gpu")
             work_id_state.previous_token = token
 
         if lane_idx < Int32(atomic_counter_state.cluster_size):
             store_i32_to_peer_cluster_smem_async(
-                atomic_counter_state.broadcast_pointer,
-                claimed_payload,
-                full_barrier_pointer,
-                lane_idx,
+                atomic_counter_state.broadcast_pointer, claimed_payload, full_barrier_pointer, lane_idx
             )
             mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
     atomic_counter_state.producer_state.advance()
@@ -555,9 +732,7 @@ def _claim_fixed_group_mixed_cga_work_id(
         work_id_state.atomic_counter_state = atomic_counter_state
         work_id_state.claimed_counter_index = Int32(atomic_counter_index)
     else:
-        linear_work_id, work_id_state = _claim_fixed_group_fallback_work_id(
-            work_id_state, atomic_counter_index
-        )
+        linear_work_id, work_id_state = _claim_fixed_group_fallback_work_id(work_id_state, atomic_counter_index)
     return linear_work_id, work_id_state
 
 
@@ -578,9 +753,7 @@ def _claim_cluster_launch_control_work_id(
         state_before_leader_query = work_id_state
         if work_id_state.is_leader_cta:
             work_id_state.cluster_pipeline.producer_acquire(work_id_state.producer_state)
-            response_barrier = work_id_state.cluster_pipeline.producer_get_barrier(
-                work_id_state.producer_state
-            )
+            response_barrier = work_id_state.cluster_pipeline.producer_get_barrier(work_id_state.producer_state)
             with cute.arch.elect_one():
                 cute.arch.issue_clc_query(response_barrier, work_id_state.response_pointer)
         else:
@@ -614,6 +787,68 @@ def _claim_cluster_launch_control_work_id(
 
 
 @cute.jit
+def _claim_clc_mixed_cga_work_id(
+    work_id_state: ClcMixedCgaWorkIdState,
+) -> Tuple[GridWorkId, ClcMixedCgaWorkIdState]:
+    """Claim the next canceled cluster (first claim: own blockIdx) and return this CTA's grid coordinate."""
+    use_bootstrap = work_id_state.response_pending
+    state_before_bootstrap = work_id_state
+    if use_bootstrap:
+        work_id_state.response_pending = Boolean(False)
+    else:
+        work_id_state = state_before_bootstrap
+
+    state_before_query = work_id_state
+    if not use_bootstrap:
+        cluster_pipeline = work_id_state.cluster_pipeline
+        state_before_leader_query = work_id_state
+        if work_id_state.is_leader_cta:
+            cluster_pipeline.producer_acquire(work_id_state.producer_state)
+            full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(work_id_state.producer_state.index)
+            thread_idx, _, _ = cute.arch.thread_idx()
+            lane_idx = thread_idx % Int32(32)
+            if lane_idx < Int32(work_id_state.cluster_size):
+                # 16-byte CLC response.
+                mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(16), lane_idx)
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(full_barrier_pointer, work_id_state.response_pointer)
+        else:
+            work_id_state = state_before_leader_query
+        work_id_state.producer_state.advance()
+
+        cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+        (cluster_origin_m, cluster_origin_n, grid_l, response_is_valid) = cute.arch.clc_response(
+            work_id_state.response_pointer
+        )
+        cute.arch.fence_acq_rel_cta()
+        cute.arch.fence_proxy("async.shared", space="cta")
+        # Cluster-scoped release orders this CTA's read of the response before the leader's next overwrite.
+        cute.arch.mbarrier_arrive(
+            cluster_pipeline.sync_object_empty.get_barrier(work_id_state.consumer_state.index),
+            Int32(0),
+            scope=_nvvm.MemScopeKind.CLUSTER,
+        )
+        work_id_state.consumer_state.advance()
+
+        work_id_state.grid_m = cluster_origin_m + work_id_state.cta_coord_in_cluster[0]
+        work_id_state.grid_n = cluster_origin_n + work_id_state.cta_coord_in_cluster[1]
+        work_id_state.grid_l = grid_l
+        work_id_state.response_is_valid = response_is_valid != Int32(0)
+    else:
+        work_id_state = state_before_query
+
+    return (
+        GridWorkId(
+            grid_m=work_id_state.grid_m,
+            grid_n=work_id_state.grid_n,
+            grid_l=work_id_state.grid_l,
+            is_valid=work_id_state.response_is_valid,
+        ),
+        work_id_state,
+    )
+
+
+@cute.jit
 def claim_work_id(work_id_state, atomic_counter_index=0):
     """Claim the next work ID using the backend encoded by the state type."""
     if cutlass.const_expr(isinstance(work_id_state, GridStrideWorkIdState)):
@@ -624,15 +859,20 @@ def claim_work_id(work_id_state, atomic_counter_index=0):
         return _claim_fixed_group_mixed_cga_work_id(work_id_state, atomic_counter_index)
     if cutlass.const_expr(isinstance(work_id_state, ClusterLaunchControlWorkIdState)):
         return _claim_cluster_launch_control_work_id(work_id_state)
+    if cutlass.const_expr(isinstance(work_id_state, ClcMixedCgaWorkIdState)):
+        return _claim_clc_mixed_cga_work_id(work_id_state)
     raise TypeError(f"Unsupported work-ID state: {type(work_id_state).__name__}.")
 
 
 __all__ = [
     "AtomicCounterWorkIdState",
+    "ClcMixedCgaWorkIdState",
     "ClusterLaunchControlWorkIdState",
     "FixedGroupMixedCgaAtomicCounterWorkIdState",
     "GridStrideWorkIdState",
     "GridWorkId",
+    "broadcast_atomic_counter_ready",
+    "broadcast_atomic_counter_ready_or_claim",
     "claim_work_id",
     "initialize_fixed_group_mixed_cga_work_id_state",
 ]

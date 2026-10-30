@@ -147,12 +147,17 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
 {
 #if ENABLE_MULTI_DEVICE
 
-// Need static connection initialization for accurate KV cache size estimation.
+// NCCL_RUNTIME_CONNECT=0: static connection initialization, for accurate KV cache size estimation.
+// NCCL_GRAPH_REGISTER=0: same default as getComm(). NCCL caches the value on its first read, which can come from
+// send/recv on this communicator captured into a CUDA graph before any getComm() communicator exists.
 #if defined(_WIN32)
     if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
         _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+    if (getenv("NCCL_GRAPH_REGISTER") == nullptr)
+        _putenv_s("NCCL_GRAPH_REGISTER", "0");
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+    setenv("NCCL_GRAPH_REGISTER", "0", 0);
     if (getenv("NCCL_NVLS_ENABLE") == nullptr && !ipcNvlsFabricUsable())
     {
         setenv("NCCL_NVLS_ENABLE", "0", 0);

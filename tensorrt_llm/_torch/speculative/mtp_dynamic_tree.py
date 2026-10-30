@@ -21,7 +21,7 @@ import torch
 import triton
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed.ops import allgather
@@ -173,9 +173,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self._mask_repack_buf = torch.zeros(
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
-        # sm>=100 (except 120/121): prepareCustomMask keeps padded 3D; no repack.
+        # SM100 family: prepareCustomMask keeps padded 3D; no repack.
         sm = get_sm_version()
-        self._needs_mask_repack = sm < 100 or sm in (120, 121)
+        self._needs_mask_repack = not is_sm_100f(sm)
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
@@ -195,10 +195,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._saved_packed_mask = None
         if attn_metadata.spec_decoding_position_offsets is not None:
             self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone()
-            self._saved_position_offsets_cpp = attn_metadata.spec_decoding_position_offsets_cpp
+            self._saved_spec_decoding_query_len = attn_metadata.spec_decoding_query_len
         else:
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if attn_metadata.spec_decoding_generation_lengths is not None:
             self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[
                 :batch_size
@@ -225,9 +225,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._saved_packed_mask = None
         if self._saved_position_offsets is not None:
             attn_metadata.spec_decoding_position_offsets.copy_(self._saved_position_offsets)
-            attn_metadata.spec_decoding_position_offsets_cpp = self._saved_position_offsets_cpp
+            attn_metadata.spec_decoding_query_len = self._saved_spec_decoding_query_len
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
@@ -253,9 +253,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
     def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
-        """Set spec-dec gen lengths and refresh the C++ position-offset view."""
+        """Set the current speculative query lengths and position-offset layout."""
         attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
-        attn_metadata.update_position_offsets_for_cpp(query_len)
+        attn_metadata.spec_decoding_query_len = query_len
 
     def _refresh_blackwell_tree_mask_metadata(self, attn_metadata):
         if not getattr(attn_metadata, "use_spec_decoding", False):

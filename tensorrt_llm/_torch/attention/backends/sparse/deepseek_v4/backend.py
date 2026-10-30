@@ -43,6 +43,31 @@ from .params import DeepseekV4AttentionType, DeepSeekV4Params
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
+# The trtllm-gen DSv4 dynamic sparse MLA FMHA can read its aux KV pool up to one KV tile
+# (tileSizeKv, 128 rows) past the rows named in the sparse indices. With FP8 KV the aux pool
+# is the whole compressed KV pool, so those reads stay inside it; with NVFP4 KV it is the
+# per-call FP8 scratch below, which is sized to the batch.
+_SPARSE_MLA_FMHA_KV_TILE_SIZE = 128
+
+
+def _alloc_nvfp4_compress_fp8_scratch(
+    num_rows: int, head_dim: int, device: torch.device
+) -> torch.Tensor:
+    """Allocate the FP8 scratch the sparse MLA FMHA reads as its aux KV pool.
+
+    Rows [0, num_rows) receive the dequantized compressed KV. A zeroed tail of one FMHA KV tile
+    keeps the kernel's reads past the last indexed row inside the allocation; without it the
+    FMHA faults whenever the caching allocator places the scratch at the end of a mapped
+    segment (https://nvbugs/6796296).
+    """
+    scratch = torch.empty(
+        (num_rows + _SPARSE_MLA_FMHA_KV_TILE_SIZE, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    scratch[num_rows:].zero_()
+    return scratch
+
 
 class DeepseekV4TrtllmAttention(TrtllmAttention):
     Metadata = DeepseekV4TrtllmAttentionMetadata
@@ -180,7 +205,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         self,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
-    ) -> None:
+    ) -> AttentionForwardArgs:
         attention_input_type = forward_args.attention_input_type
         if attention_input_type == AttentionInputType.context_only:
             start_idx = 0
@@ -192,7 +217,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             start_idx = 0
             end_idx = metadata.num_tokens
 
-        sparse_args = forward_args.sparse_runtime_params
+        sparse_args = replace(forward_args.sparse_runtime_params)
         sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]
@@ -205,6 +230,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             self.sparse_attention_config.window_size
             + metadata.max_compressed_indices[self.compress_ratio]
         )
+        return replace(forward_args, sparse_runtime_params=sparse_args)
 
     def forward(
         self,
@@ -221,7 +247,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if forward_args.attention_sinks is None:
                 forward_args = replace(forward_args, attention_sinks=attn_sink.data)
 
-        self._prepare_sparse_forward_args(metadata, forward_args)
+        forward_args = self._prepare_sparse_forward_args(metadata, forward_args)
         return super().forward(q, k, v, metadata, forward_args=forward_args)
 
     def _unit_scale(self, like: torch.Tensor) -> torch.Tensor:
@@ -399,16 +425,15 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             # the caching allocator can reuse the storage in stream order.
             metadata.nvfp4_compress_fp8_scratch = None
             if attention_input_type == AttentionInputType.generation_only:
-                scratch = torch.empty(
-                    (*compressed_indices.shape, self.head_dim),
-                    dtype=torch.float8_e4m3fn,
-                    device=global_indices.device,
+                num_scratch_rows = compressed_indices.numel()
+                scratch = _alloc_nvfp4_compress_fp8_scratch(
+                    num_scratch_rows, self.head_dim, global_indices.device
                 )
                 torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
                     data_pool,
                     scale_pool,
                     compressed_indices,
-                    scratch,
+                    scratch[:num_scratch_rows].view(*compressed_indices.shape, self.head_dim),
                     self._nvfp4_compress_scale_quant_orig,
                     kv_cache_manager.nvfp4_residual_dim,
                     num_pool_tokens,
@@ -437,10 +462,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     compressed_indices.shape[1],
                     min(max_compressed_kv_tokens, compressed_indices.numel()),
                 )
-                scratch = torch.empty(
-                    (scratch_capacity, 1, self.head_dim),
-                    dtype=torch.float8_e4m3fn,
-                    device=global_indices.device,
+                scratch = _alloc_nvfp4_compress_fp8_scratch(
+                    scratch_capacity, self.head_dim, global_indices.device
                 )
                 if max_compressed_kv_tokens > 0:
                     torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather_direct(
@@ -450,7 +473,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         req_id.contiguous(),
                         compressed_kv_lengths,
                         compressed_indices,
-                        scratch,
+                        scratch[:scratch_capacity].unsqueeze(1),
                         self._nvfp4_compress_scale_quant_orig,
                         kv_cache_manager.nvfp4_residual_dim,
                         max_compressed_kv_tokens,

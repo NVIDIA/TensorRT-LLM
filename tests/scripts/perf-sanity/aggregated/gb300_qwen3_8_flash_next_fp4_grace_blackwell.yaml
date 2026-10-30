@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3.8-Flash-Next NVFP4 on one GB300 GPU, served by modeling_v2
+# (`modeling_v2: require`, the qwen3_8_flash_next_nvfp4__sm_103__tp1 target), the
+# default implementation for Qwen3.8-Flash-Next in perf sanity: TP1, MTP3,
+# TRTLLM MoE, bf16 recurrent state, breakable prefill CUDA graphs, 8k/1k at
+# concurrency 1 and 256. Acceptance is not pinned, so d_al tracks MTP acceptance.
+#
+# kv_cache_config.dtype is `auto` (bf16) for now. The recipe's NVFP4 KV cache
+# works on main but its prefill is not fast yet (see #20276): every 8k prompt
+# takes ~6.6 s to prefill, so con256 would not finish in a stage. Switch to
+# `nvfp4` once the NVFP4 KV fast path (#20937) is on main.
+# enable_block_reuse is kept from the recipe; main disables reuse for this
+# hybrid model until kv_cache_config.mamba_state_config sets a snapshot policy.
+metadata:
+  model_name: qwen3.8_flash_next_fp4
+  supported_gpus:
+  - GB300
+hardware:
+  gpus_per_node: 1
+server_configs:
+- name: qwen3_8_flash_next_fp4_mv2_tp1_mtp3_8k1k
+  server_env_var: TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1
+  model_name: qwen3.8_flash_next_fp4
+  tensor_parallel_size: 1
+  moe_expert_parallel_size: 1
+  pipeline_parallel_size: 1
+  trust_remote_code: true
+  modeling_v2: require
+  max_batch_size: 256
+  max_seq_len: 10240
+  max_num_tokens: 16384
+  enable_chunked_prefill: true
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.6
+    enable_block_reuse: true
+    mamba_ssm_cache_dtype: bfloat16
+    dtype: auto
+  cuda_graph_config:
+    max_batch_size: 256
+    enable_padding: true
+  prefill_cuda_graph_backend: breakable
+  prefill_capture_num_tokens: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048,
+    2304, 2560, 2816, 3072, 4096, 6144, 8192, 10240, 12288, 14336, 16384]
+  speculative_config:
+    decoding_type: MTP
+    max_draft_len: 3
+  moe_config:
+    backend: TRTLLM
+  client_configs:
+  - name: con1_iter10_8k1k
+    concurrency: 1
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    backend: openai
+  - name: con256_iter10_8k1k
+    concurrency: 256
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    backend: openai

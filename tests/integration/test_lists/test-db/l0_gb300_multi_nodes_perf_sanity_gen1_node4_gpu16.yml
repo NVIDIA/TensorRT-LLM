@@ -16,13 +16,5 @@ l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16:
   tests:
   # deepseek-v4-pro-fp4 8k1k con666
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] TIMEOUT (30)
-  # kimi-k3-nvfp4 dspark agentx, helix CP16 gen worker
-  # Only gen_only_no_context: the DWDP16 ctx side the e2e and ctx_only lanes
-  # need cannot start until Kimi K3 MoE supports DWDP.
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_kimi-k3-fp4-dspark_agentx_con220_ctx16_dwdp16_gen1_helix16_bs128_dspark6_ccb-NIXL] TIMEOUT (105)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_kimi-k3-fp4-dspark_agentx_con88_ctx16_dwdp16_gen1_helix16_bs32_dspark6_ccb-NIXL] TIMEOUT (100)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_kimi-k3-fp4-dspark_agentx_con63_ctx16_dwdp16_gen3_helix16_bs4_dspark7_ccb-NIXL] TIMEOUT (95)
-  # deepseek-v4-pro-dspark agentx con1456, DEP16 gen worker
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (100)
-  # deepseek-v4.1-flash-fp4 dspark agentx con1579, DEP16 gen worker
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (60)
+  # kimi-k3-fp4 dspark 160k1k con32, helix CP16 gen worker
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_kimi-k3-fp4-dspark_160k1k_con32_ctx16_dwdp16_gen1_helix16_bs32_dspark6_ccb-NIXL] TIMEOUT (30)

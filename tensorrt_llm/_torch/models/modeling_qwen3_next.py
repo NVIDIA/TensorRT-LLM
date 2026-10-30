@@ -40,7 +40,7 @@ from tensorrt_llm._torch.moe.fused_shared_expert import \
     fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
@@ -64,7 +64,8 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+from .modeling_utils import (DecoderModel, EagerFusionConfig,
+                             moe_experts_quant_config, register_auto_model)
 
 
 def _fused_norm_weight(norm: RMSNorm) -> torch.Tensor:
@@ -111,7 +112,20 @@ def _precompute_fused_norm_weights(module: nn.Module) -> None:
             w = getattr(norm, "weight", None)
             if w is None:
                 continue
-            norm._fused_norm_weight = (w.float() + 1.0).to(w.dtype)
+            fused = (w.float() + 1.0).to(w.dtype)
+            cached = getattr(norm, "_fused_norm_weight", None)
+            if (cached is not None and cached.shape == fused.shape
+                    and cached.dtype == fused.dtype
+                    and cached.device == fused.device):
+                # In-place update keeps the buffer address stable: captured
+                # CUDA graphs bake this tensor's pointer into the fused-AR
+                # kernel args, and post_load_weights re-runs on RL weight
+                # refit (rlhf_utils.update_weights) without re-capturing
+                # graphs -- rebinding would leave replays reading freed
+                # memory.
+                cached.copy_(fused)
+            else:
+                norm._fused_norm_weight = fused
 
 
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
@@ -261,18 +275,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
                                if config.model_type == "qwen3_5_moe_text" else
                                MoEWeightLoadingMode.VANILLA)
-        # For MIXED_PRECISION checkpoints (e.g. ModelOpt), the experts' real
-        # quant algo lives in the per-layer quant_config_dict keyed by TRT-LLM
-        # module name. Pass it as override_quant_config so the backend resolves
-        # the correct quant method (e.g. NVFP4) at construction, instead of
-        # inheriting the unquantized MIXED_PRECISION global and relying on
-        # apply_layerwise_quant_config (which rebinds the ConfigurableMoE
-        # wrapper but not its delegated backend).
         expert_quant_config = None
-        quant_config_dict = getattr(model_config, "quant_config_dict", None)
-        if quant_config_dict and layer_idx is not None:
-            expert_quant_config = quant_config_dict.get(
-                f"model.layers.{layer_idx}.mlp.experts")
+        if layer_idx is not None:
+            expert_quant_config = moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.mlp.experts")
         moe_model_config = model_config
         if _experts_excluded_from_quant(model_config, layer_idx):
             # These experts end up bf16 whatever the per-layer entry says, so
@@ -344,8 +350,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-        if self.enable_attention_dp and self.mapping.tp_size > 1 and get_sm_version(
-        ) == 120:
+        if self.enable_attention_dp and self.mapping.tp_size > 1 and is_sm_120f(
+        ):
             use_dp_padding = True
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
@@ -1123,6 +1129,9 @@ class Qwen3NextModel(DecoderModel):
 @register_auto_model("Qwen3NextForCausalLM")
 class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                                                        Qwen3NextConfig]):
+    # load_weights below only pre-processes the dict and delegates to the
+    # generic loader, which tolerates a torch.compile wrapper in the tree.
+    load_weights_strips_compile_wrapper = True
 
     def __init__(
         self,
