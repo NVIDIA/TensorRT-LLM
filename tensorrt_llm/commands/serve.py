@@ -2721,6 +2721,37 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
+    with_spec = {
+        cfg.type
+        for cfg in disagg_cfg.server_configs
+        if cfg.other_args.get("speculative_config")
+    }
+    attention_parallel_configs = {(cfg.other_args.get("tensor_parallel_size",
+                                                      1),
+                                   cfg.other_args.get("enable_attention_dp",
+                                                      False))
+                                  for cfg in disagg_cfg.server_configs}
+    shared_draft_kv_supported = True
+    for cfg in disagg_cfg.server_configs:
+        spec = cfg.other_args.get("speculative_config") or {}
+        kv_cache = cfg.other_args.get("kv_cache_config") or {}
+        if (spec.get("decoding_type") != "DFlash"
+                or spec.get("attention_backend") != "TRTLLM"
+                or spec.get("draft_len_schedule") is not None
+                or spec.get("max_concurrency") is not None
+                or cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM"
+                or cfg.other_args.get("pipeline_parallel_size", 1) != 1
+                or cfg.other_args.get("context_parallel_size", 1) != 1
+                or cfg.other_args.get("kv_cache_compression_config") is not None
+                or str(kv_cache.get("dtype",
+                                    "auto")).lower().startswith("mixed_")
+                or kv_cache.get("tokens_per_block", 32) not in (16, 32, 64)):
+            shared_draft_kv_supported = False
+            break
+    os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = (
+        "1"
+        if with_spec == {"ctx", "gen"} and len(attention_parallel_configs) == 1
+        and shared_draft_kv_supported else "0")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

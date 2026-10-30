@@ -180,6 +180,14 @@ class PeerRegistrar:
             peer_ri.page_table,
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
+        if self._ri.num_draft_layers != peer_ri.num_draft_layers:
+            # The layer-count tolerance below would transfer only the target
+            # layers and leave the drafter's prompt KV unset on the receiver.
+            raise ValueError(
+                "PeerRegistrar: unified draft KV layer count differs "
+                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
+                "both peers must use the same speculative decoding KV cache layout."
+            )
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
