@@ -14,9 +14,9 @@ import pytest
 import torch
 
 __extra_import_path__ = ["."]
+from _precision import true_fp32_matmul  # noqa: E402
 from _validating import validating  # noqa: E402
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner as moe,
 )

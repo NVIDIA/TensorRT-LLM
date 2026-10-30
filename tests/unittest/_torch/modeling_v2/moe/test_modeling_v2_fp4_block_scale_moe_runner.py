@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterator
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell, true_fp32_matmul
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     Fp4BlockScaleMoeRunner,
 )
@@ -46,6 +46,7 @@ from _fp4_moe_test_utils import (  # noqa: E402
     _unpack_activation,
     many_expert_layer,  # noqa: E402,F401 — fixture by name
 )
+from _precision import true_fp32_matmul  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — needs the path declared above
 
 assert torch.cuda.is_available(), "fp4_block_scale_moe_runner requires a CUDA device"
@@ -1124,7 +1125,10 @@ def test_many_experts_top10_geometry(many_expert_layer):  # noqa: F811
         assert len(out) == 1, len(out)
         y = out[0]
         assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, y.shape
-        exp = moe.reference(x, ids, wts, ref["up"], ref["gate"], ref["down"], g2).to(torch.bfloat16)
+        with true_fp32_matmul():
+            exp = moe.reference(x, ids, wts, ref["up"], ref["gate"], ref["down"], g2).to(
+                torch.bfloat16
+            )
         _compare(y, exp)
         top = _dev(y, exp)  # after the loop: the largest token count's numbers
         worst = tuple(max(a, b) for a, b in zip(worst, top))
@@ -1149,7 +1153,10 @@ def test_many_experts_top10_geometry(many_expert_layer):  # noqa: F811
             output1_scale_gate_scalar=sg,
             output2_scale_scalar=s2,
         )[0]
-        exp = moe.reference(x, ids, wts, ref["up"], ref["gate"], ref["down"], g2).to(torch.bfloat16)
+        with true_fp32_matmul():
+            exp = moe.reference(x, ids, wts, ref["up"], ref["gate"], ref["down"], g2).to(
+                torch.bfloat16
+            )
         _compare(y, exp)
         uniform = tuple(max(a, b) for a, b in zip(uniform, _dev(y, exp)))
 
@@ -1975,17 +1982,18 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     win_ref = ref if n == num_experts else _window_ref(ref, off, n)
 
     # 1. The entry's reference against this file's, on identical inputs.
-    entry_ref = moe.reference(
-        x,
-        ids,
-        wts,
-        win_ref["up"],
-        win_ref["gate"],
-        win_ref["down"],
-        g2,
-        local_expert_offset=off,
-        local_num_experts=n,
-    )
+    with true_fp32_matmul():
+        entry_ref = moe.reference(
+            x,
+            ids,
+            wts,
+            win_ref["up"],
+            win_ref["gate"],
+            win_ref["down"],
+            g2,
+            local_expert_offset=off,
+            local_num_experts=n,
+        )
     local_ref = _ref_moe(x, ids, wts, win_ref, g2, offset=off, num_local=n)
     torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
 

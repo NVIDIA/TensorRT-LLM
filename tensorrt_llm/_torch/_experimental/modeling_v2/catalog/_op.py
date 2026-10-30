@@ -46,7 +46,6 @@ from __future__ import annotations
 import contextlib
 import enum
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -54,20 +53,32 @@ import torch
 
 
 @contextlib.contextmanager
-def true_fp32_matmul() -> Iterator[None]:
-    """Use IEEE FP32 CUDA matmuls within the scope and restore the prior policy.
+def true_fp32_matmul():
+    """Make torch's fp32 matmul actually fp32 for the duration.
 
-    Reference GEMMs need full FP32 precision to bound the kernel's error.
-    Precision is process-global, so callers must keep this scope separate
-    from concurrent computations that require a different policy.
+    torch 2.12 defaults ``matmul.fp32_precision`` to ``tf32`` and
+    ``allow_tf32`` to True on this hardware, so a plain ``a.float() @
+    b.float()`` is a *TF32* product -- ~1e-3 relative, which is 30x the error
+    of the ops being tested. Left alone the reference is the inaccurate side of
+    the comparison and the entry fails against a correct kernel. Measured: with
+    TF32 off the op is bit-identical to torch and both sit 1.9e-5 from a
+    float64 product; with TF32 on the reference alone moves by 0.035.
+
+    Both switches have to move. Setting only ``allow_tf32`` leaves
+    ``fp32_precision`` at ``tf32`` and the product is still TF32 -- which is
+    exactly the failure this docstring is here to stop someone rediscovering.
     """
-    matmul = torch.backends.cuda.matmul
-    previous = matmul.fp32_precision
+    prev_allow = torch.backends.cuda.matmul.allow_tf32
+    prev_prec = getattr(torch.backends.cuda.matmul, "fp32_precision", None)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    if prev_prec is not None:
+        torch.backends.cuda.matmul.fp32_precision = "ieee"
     try:
-        matmul.fp32_precision = "ieee"
         yield
     finally:
-        matmul.fp32_precision = previous
+        torch.backends.cuda.matmul.allow_tf32 = prev_allow
+        if prev_prec is not None:
+            torch.backends.cuda.matmul.fp32_precision = prev_prec
 
 
 class Arch(str, enum.Enum):

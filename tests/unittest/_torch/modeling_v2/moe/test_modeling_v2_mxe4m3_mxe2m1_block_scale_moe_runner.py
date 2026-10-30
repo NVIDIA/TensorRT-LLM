@@ -8,7 +8,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell, true_fp32_matmul
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
     Mxe4m3Mxe2m1BlockScaleMoeRunner,
 )
@@ -18,6 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_blo
 
 __extra_import_path__ = [".."]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
+from _precision import true_fp32_matmul  # noqa: E402
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
@@ -1845,19 +1846,20 @@ def test_certified_cells(cell):
         entry = dict(topk_ids=ids, topk_weights=wts)
 
     # 1. The entry's reference against this file's, on identical inputs.
-    entry_ref = moe.reference(
-        xv,
-        ids,
-        wts,
-        sub_ref["up"],
-        sub_ref["gate"],
-        sub_ref["down"],
-        alpha=alpha,
-        beta=beta,
-        clamp_limit=limit,
-        local_expert_offset=off,
-        local_num_experts=n,
-    )
+    with true_fp32_matmul():
+        entry_ref = moe.reference(
+            xv,
+            ids,
+            wts,
+            sub_ref["up"],
+            sub_ref["gate"],
+            sub_ref["down"],
+            alpha=alpha,
+            beta=beta,
+            clamp_limit=limit,
+            local_expert_offset=off,
+            local_num_experts=n,
+        )
     local_ref = _ref_moe(xv, ids, wts, sub_ref, alpha, beta, limit, offset=off, num_local=n)
     torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
 

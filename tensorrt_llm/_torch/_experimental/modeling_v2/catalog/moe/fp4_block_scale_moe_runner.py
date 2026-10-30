@@ -11,12 +11,7 @@ from typing import Optional, Tuple
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: NVFP4 block size: one e4m3 scale per 16 elements along K.
 SF_VEC_SIZE = 16
@@ -247,7 +242,6 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             use_dp=use_dp,
         )
 
-    @true_fp32_matmul()
     def reference(
         self,
         hidden_states: torch.Tensor,

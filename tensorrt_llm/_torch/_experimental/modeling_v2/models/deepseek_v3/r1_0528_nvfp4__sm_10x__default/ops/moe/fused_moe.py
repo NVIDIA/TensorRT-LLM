@@ -15,12 +15,7 @@ from typing import List, Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
 def _r1(experts_local: int, inter: int, ep_size: int, tp_size: int, **rest) -> dict:
@@ -258,7 +253,6 @@ class FusedMoe(OpWrapper):
                 "bits into an output_dtype buffer and silently gives wrong values"
             )
 
-    @true_fp32_matmul()
     def reference(
         self,
         input: torch.Tensor,

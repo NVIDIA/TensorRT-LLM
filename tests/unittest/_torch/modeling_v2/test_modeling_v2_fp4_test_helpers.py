@@ -38,7 +38,9 @@ def helpers(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     def precision_scope() -> Iterator[None]:
         yield
 
-    sys.modules[_CATALOG + "._op"].true_fp32_matmul = precision_scope
+    precision = ModuleType("_precision")
+    precision.true_fp32_matmul = precision_scope
+    monkeypatch.setitem(sys.modules, "_precision", precision)
     sys.modules[_CATALOG + ".moe.fp4_block_scale_moe_runner"].fp4_block_scale_moe_runner = object()
 
     torch = ModuleType("torch")

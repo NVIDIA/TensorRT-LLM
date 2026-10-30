@@ -28,6 +28,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 __extra_import_path__ = ["../../../.."]
 import _fp4_moe_test_utils as H  # noqa: E402
 from _fp4_moe_test_utils import many_expert_layer  # noqa: E402,F401 — fixture by name
+from _precision import true_fp32_matmul  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "fp4_block_scale_moe_renorm_routed requires a CUDA device"
@@ -81,7 +82,8 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     assert differing == 0, f"{differing} of {spec['tokens']} rows differ from the composition"
 
     # 2. Its own reference, through the pre-routed entry's gate.
-    exp = op.reference(logits, x, spec["top_k"], ref["up"], ref["gate"], ref["down"], g2)
+    with true_fp32_matmul():
+        exp = op.reference(logits, x, spec["top_k"], ref["up"], ref["gate"], ref["down"], g2)
     H._compare(y, exp.to(torch.bfloat16))
 
 
