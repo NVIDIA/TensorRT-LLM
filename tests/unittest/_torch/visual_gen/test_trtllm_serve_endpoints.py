@@ -3553,23 +3553,40 @@ async def test_video_omni_inputs(endpoint, transport, omni_generator, omni_refer
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["image_reference", "video_reference", "audio_reference"])
-async def test_video_omni_repeated_upload_limits(field, omni_generator, omni_references):
-    """Repeated uploads count toward the model's slot limit, never last-wins."""
+@pytest.mark.parametrize("endpoint", ["/v1/videos/sync", "/v1/videos"])
+async def test_video_omni_repeated_upload_limits(
+    field, endpoint, omni_generator, omni_references, monkeypatch
+):
+    """Reject excessive counts before materializing any reference payload."""
+
+    def reject_materialization(_ref):
+        pytest.fail("An over-limit request must not read reference payloads")
+
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.visual_gen_utils._reference_transport", reject_materialization
+    )
     limit = omni_generator.executor.ref_slot_specs[field].roles[0].max
     files = list(omni_references.items()) + [(field, omni_references[field])] * limit
     async with _create_async_client(omni_generator) as client:
-        resp = await client.post("/v1/videos", data={"prompt": "All modalities"}, files=files)
+        resp = await client.post(endpoint, data={"prompt": "All modalities"}, files=files)
     assert resp.status_code == 400, resp.text
     assert field in resp.json()["message"]
     assert omni_generator.last_inputs is None
 
 
 @pytest.mark.asyncio
-async def test_video_omni_unsupported_audio(omni_references):
+@pytest.mark.parametrize("endpoint", ["/v1/videos/sync", "/v1/videos"])
+async def test_video_omni_unsupported_audio(endpoint, omni_references, monkeypatch):
+    def reject_materialization(_ref):
+        pytest.fail("An unsupported slot must be rejected before reading any reference payload")
+
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.visual_gen_utils._reference_transport", reject_materialization
+    )
     generator = MockVisualGen(video_output=_make_dummy_video_tensor())
     async with _create_async_client(generator) as client:
         resp = await client.post(
-            "/v1/videos", data={"prompt": "All modalities"}, files=list(omni_references.items())
+            endpoint, data={"prompt": "All modalities"}, files=list(omni_references.items())
         )
     assert resp.status_code == 400, resp.text
     assert "audio_reference" in resp.json()["message"]

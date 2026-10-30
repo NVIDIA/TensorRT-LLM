@@ -435,7 +435,12 @@ under the same field, preserving their order within that modality.
 
 For MiniMax H3, start the server with the converted H3 checkpoint and
 `--visual_gen_args examples/visual_gen/configs/minimax-h3-ref2va-bf16-1gpu.yaml`
-to select Ref2VA (the checkpoint must include `transformer_ref/`). Then submit:
+to select Ref2VA (the checkpoint must include `transformer_ref/`). Video and audio
+references require PyAV (`av`) in the serving runtime. Audio sample-rate conversion
+also requires a `torchaudio` version compatible with the installed PyTorch.
+Alternatively, use FFmpeg to resample both audio references and video soundtracks
+to H3's 32 kHz input rate before uploading. MP4 output requires FFmpeg as described
+in the prerequisites above. Then submit:
 
 ```bash
 curl -X POST "http://localhost:8000/v1/videos" \
