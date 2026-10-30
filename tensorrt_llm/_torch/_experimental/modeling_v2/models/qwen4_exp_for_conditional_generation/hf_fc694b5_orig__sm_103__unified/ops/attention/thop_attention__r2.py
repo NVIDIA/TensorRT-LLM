@@ -377,6 +377,10 @@ class ThopAttention(OpWrapper):
     3.8-4.3 -- this gate cannot tell the kernel from that rival there, so a
     longer fp8 decode history is not certified by this entry.
 
+    Source: the native `AttentionOp` (`thop.run_context` / `thop.run_generation`)
+    in the installed libraries. Context FMHA kernels are compiled into them;
+    the trtllm-gen generation kernels are compiled at run time for the device,
+    and every generation cell here ran that path on sm_103 (fmhaSm103aKernel_*).
     Generation kernels JIT through NVRTC and find their headers with `pip show
     tensorrt_llm`: a `pip` on PATH that cannot see the install fails every
     generation call, and the first failure poisons the process ("Jitify fatal
