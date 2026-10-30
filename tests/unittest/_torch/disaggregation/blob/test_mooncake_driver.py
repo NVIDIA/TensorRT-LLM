@@ -409,6 +409,20 @@ def test_a_cancel_ends_only_the_rows_no_worker_took() -> None:
     assert bench.driver.drain(WAIT_S) is True
 
 
+def test_a_put_holds_its_slot_until_its_scatter_returns() -> None:
+    bench = Bench()
+    bench.fill_sources("put", "A")
+    gate = bench.fake.block(PUT_RANGES)
+    op = bench.driver.put(bench.rows("A"))
+    try:
+        assert gate.entered.wait(WAIT_S)
+        assert not bench.driver.access_ended(op)  # the scatter reads the slot itself
+    finally:
+        gate.release.set()
+    results, access_ended = bench.settle(op)
+    assert summary(results) == [("ready", None)] and access_ended
+
+
 def test_drain_cancels_the_rows_no_worker_took() -> None:
     bench = Bench(workers=1, bytes_per_call=SLOT)
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb")
