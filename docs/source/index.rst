@@ -78,6 +78,7 @@ Welcome to TensorRT LLM's Documentation!
    features/overlap-scheduler.md
    features/paged-attention-ifb-scheduler.md
    features/parallel-strategy.md
+   features/mpi-idle-notification.rst
    features/quantization.md
    features/sampling.md
    features/additional-outputs.md

@@ -97,6 +97,8 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             hard_kill_on_rank_crash, propagate_hard_kill,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
+from .idle_notification_runtime import (IdleNotificationRuntime,
+                                        prepare_idle_notification)
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
@@ -1336,6 +1338,7 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
         self._broadcast_mpi_comm = None
+        self._idle_notification_runtime: IdleNotificationRuntime | None = None
         # Idle-time MPI progress pump for the sample-state relay thread, built
         # by start_worker(); see pp_utils.make_mpi_progress_pump. The stop
         # Event retires the pump and the quiesced Event acknowledges that the
@@ -1679,7 +1682,12 @@ class PyExecutor:
             # saving incomplete results that would be overwritten anyway
             enable_profiler = bool(os.environ.get(
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
-            with host_profiler_context(enable=enable_profiler), \
+            notification_runtime = getattr(self, "_idle_notification_runtime", None)
+            notification = (notification_runtime.worker(self)
+                            if notification_runtime is not None
+                            else nullcontext())
+            with notification, \
+                 host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
         except Exception as e:
@@ -1822,6 +1830,7 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
+                self._idle_notification_runtime = prepare_idle_notification(self)
                 # Model/KV-cache/transceiver construction can create threads
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
@@ -7268,6 +7277,8 @@ class PyExecutor:
         else:
             timeout = datetime.timedelta(0)
 
+        idle_fetch = None
+        notification_enabled = getattr(self, "_idle_notification_runtime", None) is not None
         # Fetch requests from rank 0
         new_requests = []
         if self.dist.rank == 0 and not control_pending:
@@ -7278,8 +7289,16 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
-                new_requests.extend(
-                    self.executor_request_queue.get_from_request_queue(timeout))
+                if notification_enabled and timeout is None:
+                    # Defer the complete original fetch, including its one
+                    # batch deadline. A timeout=0 "probe" still waits for a
+                    # batch and would introduce a second deadline on an empty
+                    # queue. Followers park before either queue wait instead.
+                    def idle_fetch() -> list[RequestQueueItem]:
+                        return self.executor_request_queue.get_from_request_queue(None)
+                else:
+                    new_requests.extend(
+                        self.executor_request_queue.get_from_request_queue(timeout))
 
         if connector is not None and not self.enable_attention_dp and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()
@@ -7305,8 +7324,12 @@ class PyExecutor:
         # The transport choice must be identical on every rank, so `idle` has
         # to be too: it follows the all-rank live-request count and the
         # replicated waiting queue.
-        new_requests, py_request_objects = self.request_broadcaster.broadcast(
-            new_requests, prefer_cpu=idle)
+        if notification_enabled:
+            new_requests, py_request_objects = self.request_broadcaster.broadcast(
+                new_requests, prefer_cpu=idle, idle_fetch=idle_fetch)
+        else:
+            new_requests, py_request_objects = self.request_broadcaster.broadcast(
+                new_requests, prefer_cpu=idle)
         if isinstance(waiting_queue, GenAdmissionWaitingQueue):
             if self._gen_admission.needs_clock:
                 waiting_queue.set_now(self.request_broadcaster.rank0_now,
