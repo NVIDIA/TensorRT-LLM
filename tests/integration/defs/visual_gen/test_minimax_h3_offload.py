@@ -56,7 +56,6 @@ def test_minimax_h3_offload_memory_and_parity(tmp_path: Path) -> None:
             model=checkpoint,
             cpu_offload_config={"enable": offload},
             cuda_graph_config={"enable": False},
-            torch_compile_config={"enable": False},
             attention_config={"backend": "VANILLA"},
         )
         pipeline = None

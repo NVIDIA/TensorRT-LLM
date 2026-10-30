@@ -1529,6 +1529,86 @@ def test_ref2va_image_bytes() -> None:
     assert refs[0].image.getpixel((0, 0)) == (255, 0, 0)
 
 
+def test_ref2va_groups_vae_stages_preserving_reference_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3 import ref2va
+
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._device = torch.device("cpu")
+    pipeline._cuda_graph_runners = {}
+    pipeline.pipeline_config = SimpleNamespace(
+        cpu_offload_config=SimpleNamespace(enable=True, stages=None, pin_memory=False)
+    )
+    pipeline.text_encoder = None
+    pipeline.transformer = torch.nn.Linear(1, 1)
+    pipeline.transformer.config = SimpleNamespace(patch_size=(1, 1))
+    pipeline.vae = torch.nn.Linear(1, 1)
+    pipeline.vae.spatial_compression_ratio = 8
+    pipeline.audio_vae = torch.nn.Linear(1, 1)
+    pipeline.audio_vae.config = SimpleNamespace(
+        sampling_rate=32000, latent_channels=2, latents_mean=[0.0, 0.0], latents_std=[1.0, 1.0]
+    )
+    pipeline.processor = pipeline.tokenizer = None
+    pipeline.offloader = PipelineOffloader(pipeline)
+    pipeline.initialize_offload_pipeline()
+    manager = pipeline.offloader.offload_pipeline.manager
+    stage = manager.stage
+    transitions = []
+    visual_order, audio_order = [], []
+
+    def record_stage(name: str) -> None:
+        if manager.active_stage_name != name:
+            transitions.append(name)
+        stage(name)
+
+    def encode_visual(pixels: torch.Tensor) -> torch.Tensor:
+        with pipeline.offloader.context_if_requested("vae"):
+            assert manager.active_stage_name == "vae"
+            value = float(pixels[0, 0, 0, 0, 0].item())
+            visual_order.append(value)
+            return torch.full((1, 2, 1, 2, 2), value)
+
+    def encode_audio(audio: torch.Tensor, return_dict: bool) -> tuple:
+        assert manager.active_stage_name == "audio_vae"
+        value = audio[0, 0, 0].item()
+        audio_order.append(value)
+        return (SimpleNamespace(mode=lambda: torch.full((1, 2, 3), value)),)
+
+    monkeypatch.setattr(manager, "stage", record_stage)
+    pipeline._encode_visual_condition = encode_visual
+    pipeline.audio_vae.encode = encode_audio
+    pipeline._encode_reference_text_tokens = lambda ids, vision: torch.ones(1, 2, 4)
+    pipeline._prepare_condition_rows = lambda latents, generator: torch.cat(latents)
+    monkeypatch.setattr(ref2va, "normalize_references", lambda refs, *args: refs)
+    monkeypatch.setattr(ref2va, "_gather_vision_features", lambda *args: ({}, [], [], []))
+    monkeypatch.setattr(ref2va, "_build_presentation", lambda *args: ([1, 2], [0, 0]))
+    layouts = []
+    monkeypatch.setattr(ref2va, "build_reference_sequence", lambda *args: layouts.append(args))
+    references = [
+        SimpleNamespace(
+            kind="video",
+            has_audio=True,
+            frames=torch.full((4, 16, 16, 3), value, dtype=torch.uint8).numpy(),
+            audio=torch.full((2, 4), float(value)),
+        )
+        for value in (2, 1)
+    ]
+    try:
+        _, _, visual, audio = ref2va.prepare_references(
+            pipeline, references, "prompt", 128, 128, 124, torch.Generator()
+        )
+        assert transitions == ["vae", "audio_vae"]
+        assert visual_order == audio_order == [2, 1]
+        torch.testing.assert_close(visual[:, 0, 0, 0, 0], torch.tensor([2.0, 1.0]))
+        torch.testing.assert_close(audio, torch.tensor([[2.0, 2.0]] * 3 + [[1.0, 1.0]] * 3))
+        assert layouts[0][1] == [("video", True), ("video", True)]
+        assert layouts[0][2:4] == ([(1, 2, 2), (1, 2, 2)], [3, 3])
+    finally:
+        pipeline.offloader.cleanup()
+
+
 def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import MiniMaxH3PackedSequence
 

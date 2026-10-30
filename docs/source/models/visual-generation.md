@@ -395,10 +395,6 @@ Skip Softmax and SOL share the `disabled_until_timestep` schedule that keeps the
 
 CPU offloading stages move selected Wan, Cosmos3 T2V, and MiniMax-H3 pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
 
-MiniMax-H3 stages its text encoder, transformer, video VAE, and audio VAE separately.
-Offloading trades host memory and CPU-to-GPU transfers for lower GPU memory use;
-it cannot be combined with CUDA graphs or MiniMax-H3 sleep/wake.
-
 ### Multi-GPU Parallelism
 
 Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
