@@ -31,6 +31,7 @@ import torch
 import tqdm
 from mpi4py import MPI as _MPI
 
+from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
@@ -396,7 +397,7 @@ class HfWeightLoader(BaseWeightLoader):
         """
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
         if not weight_files:
-            raise RuntimeError(f"No safetensors files in {checkpoint_dir}.")
+            raise ModelLoadError(f"No safetensors files in {checkpoint_dir}.")
         # Same sharded-vs-consolidated selection as the eager path below:
         # when both flavors are present, keep only the requested one.
         filtered_weight_files = [
@@ -959,7 +960,7 @@ class HfWeightLoader(BaseWeightLoader):
                     weight_files, self._load_bin_or_path_file,
                     "Loading bin weights in parallel"))
 
-        raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
+        raise ModelLoadError(f"No weight files found in {checkpoint_dir}.")
 
     def _prefetch_and_load(
             self,

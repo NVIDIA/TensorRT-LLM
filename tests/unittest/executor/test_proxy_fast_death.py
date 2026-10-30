@@ -23,6 +23,13 @@ from unittest.mock import Mock as _Mock
 
 import pytest
 
+from tensorrt_llm._startup_errors import (
+    StartupErrorInfo,
+    classify_startup_error,
+    is_worker_startup_error,
+    log_startup_error,
+    wrap_worker_startup_error,
+)
 from tensorrt_llm.executor import EngineDeadError
 from tensorrt_llm.executor import proxy as proxy_module
 from tensorrt_llm.executor import worker as worker_module
@@ -316,6 +323,59 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         )
 
     assert events == [("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)]
+
+
+def test_non_leader_worker_raises_its_classified_error(monkeypatch):
+    """A non-leader has no status queue, so it reports through its MPI future."""
+
+    class _FakeComm:
+        def barrier(self):
+            pass
+
+        def allgather(self, captured_identity):
+            return [captured_identity]
+
+    class _OomWorker:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("CUDA Runtime API error: cudaErrorMemoryAllocation")
+
+    monkeypatch.setattr(worker_module, "mpi_comm", lambda: _FakeComm())
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 1)
+    monkeypatch.setattr(worker_module, "capture_worker_process_identity", lambda rank: None)
+    monkeypatch.setattr(worker_module, "set_mpi_session_cpp", lambda comm: None)
+
+    with pytest.raises(RuntimeError, match="^Executor worker returned error on rank 1: ") as e:
+        worker_module.worker_main(
+            worker_queues=_Mock(frontend_result_queue_addrs=None),
+            log_level=worker_module.logger.level,
+            worker_cls=_OomWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+        )
+
+    assert is_worker_startup_error(e.value)
+    assert classify_startup_error(e.value).category == "resource"
+
+
+def test_non_leader_classified_error_during_init_is_raised_as_is():
+    info = StartupErrorInfo(
+        "resource",
+        "RuntimeError: cudaErrorMemoryAllocation",
+        "Lower it.",
+        "executor_creation/model",
+        1,
+    )
+    error = wrap_worker_startup_error("Executor worker returned error", info)
+    proxy = _proxy_awaiting_worker_init(owns_session=True, future_exception=error)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        proxy._start_executor_workers({})
+
+    assert excinfo.value is error
+    assert str(error).startswith(
+        "Executor worker returned error on rank 1 during executor_creation/model"
+    )
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    assert proxy._engine_dead is True
 
 
 def test_result_step_raises_on_engine_dead():
@@ -972,6 +1032,35 @@ def test_non_ready_status_during_init_aborts_then_marks_dead():
     assert called.index("shutdown_abort") < called.index("release_exit_joins")
     # Pending work fails fast on this path too.
     assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_non_ready_status_reports_worker_rank_stage_and_root_cause():
+    """The raised error names the rank, stage and root cause the worker classified.
+
+    Pickling drops the worker exception's cause chain and traceback, so the
+    worker sends its classification along and the proxy error carries it.
+    """
+    err = KeyError("lm_head.weight")
+    info = StartupErrorInfo(
+        "model_load",
+        "KeyError: 'lm_head.weight'",
+        "Check the checkpoint.",
+        "executor_creation/model",
+        0,
+    )
+    proxy = _proxy_awaiting_worker_init(owns_session=True, ready_status=(err, "trace", info))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        proxy._start_executor_workers({})
+
+    assert str(excinfo.value) == (
+        "Executor worker returned error on rank 0 during executor_creation/model: "
+        "[model_load] KeyError: 'lm_head.weight'"
+    )
+    assert excinfo.value.__cause__ is err
+    assert classify_startup_error(excinfo.value) == info
+    # The hint was logged before the abort, which can end the process.
+    assert log_startup_error(excinfo.value, "LLM initialization failed") is None
 
 
 def test_non_ready_status_during_init_does_not_abort_borrowed_session():

@@ -336,6 +336,8 @@ deployment, and not linked to users. The data we collect includes:
 - Disaggregated serving metadata (role and deployment ID)
 - Process-local LLM lifecycle counts (initialization attempts, successful and active instances, peak concurrency, and initialization failures)
 - Bounded terminal status for instrumented processes (known exit code or signal, termination category, lifecycle phase, component, and reporting source)
+- For a failed startup, its error category: one of `config_input`, `resource`, `unsupported`, `model_load`, `runtime_init`, or `other`, computed locally from the exception
+- The number of consecutive failed starts of the same launch, as a coarse bucket (0, 1, 2, 3, 10, 30, 100, 300, or 1000 and more), and whether that local count was available
 - Selected LLM API configuration values: parallelism, dtype, KV cache, scheduler, CUDA graph, and compile settings
 - Capture diagnostics for that payload: a schema checksum (for provenance), the count of captured fields, and whether any free-form value was skipped
 
@@ -343,6 +345,14 @@ Telemetry is automatically disabled in CI and test environments.
 
 If LLM startup fails, an initial report can still include the available environment
 and sanitized configuration information, marked as partial context.
+
+To count consecutive failed starts, TensorRT-LLM keeps one small file per launch
+under `~/.cache/tensorrt_llm/usage/` (or `$XDG_CACHE_HOME/tensorrt_llm/usage/`,
+or the directory in `TRTLLM_USAGE_STATE_DIR`). The file holds only the count and
+the time of the last failure. Its name is a local hash of the TensorRT-LLM
+version, command line, launcher rank, visible GPUs, and TensorRT-LLM
+process-role variables; none of these values is sent. The file is never read or
+written when telemetry is disabled.
 
 ### Opting Out of Telemetry Data Collection
 
@@ -354,8 +364,8 @@ To disable telemetry data collection, use any of the following methods:
 - **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
 
 CLI terminal telemetry may report that an argument or YAML configuration was
-invalid. The terminal event records only categorical termination and lifecycle
-metadata, never the raw argument or YAML text. Other telemetry events collect
+invalid. The terminal event records only categorical termination, lifecycle, and
+error-category metadata, never the raw argument or YAML text. Other telemetry events collect
 the selected, sanitized configuration fields listed above. The
 environment-variable, file-based, and CLI-flag opt-outs are all applied before
 CLI and YAML validation.

@@ -20,6 +20,7 @@ from typing import Any
 import torch
 from transformers import PretrainedConfig, WhisperConfig
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
@@ -204,7 +205,7 @@ def _remap_mistral_quantization_args(config: dict) -> dict:
                 "activation_scheme": "dynamic" if is_dynamic else "static",
             }
         else:
-            raise ValueError(f"Found unknown quantization='{quantization}' in config")
+            raise UnsupportedError(f"Found unknown quantization='{quantization}' in config")
 
     return config
 

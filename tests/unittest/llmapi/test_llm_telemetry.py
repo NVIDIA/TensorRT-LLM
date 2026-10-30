@@ -31,6 +31,7 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm import MultimodalEncoder
+from tensorrt_llm._errors import ConfigInputError, ResourceError
 from tensorrt_llm.llmapi import KvCacheConfig, llm_args
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.usage import usage_lib
@@ -42,8 +43,9 @@ _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 
 @pytest.fixture
-def enable_telemetry(monkeypatch):
+def enable_telemetry(monkeypatch, tmp_path):
     """Enable telemetry for lifecycle tests in this sibling test package."""
+    monkeypatch.setenv("TRTLLM_USAGE_STATE_DIR", str(tmp_path / "usage-state"))
     monkeypatch.delenv("TRTLLM_NO_USAGE_STATS", raising=False)
     monkeypatch.delenv("DO_NOT_TRACK", raising=False)
     monkeypatch.delenv("TELEMETRY_DISABLED", raising=False)
@@ -128,6 +130,33 @@ class TestProcessLifecycleCounters:
         assert snapshot["llmInstancesCreated"] == 0
         assert usage_lib._REPORTER_STARTED is False
         assert snapshot["activeLlmInstances"] == 0
+
+    @pytest.mark.parametrize(
+        ("error", "category"),
+        [
+            (ConfigInputError("bad argument"), "config_input"),
+            (ResourceError("not enough GPUs"), "resource"),
+            (ValueError("expected test failure"), "other"),
+        ],
+    )
+    def test_initialization_failure_records_its_category(self, enable_telemetry, error, category):
+        """The failed attempt's category is kept until an LLM initializes."""
+        with (
+            patch.object(BaseLLM, "__init__", side_effect=error),
+            patch.object(BaseLLM, "_start_usage_reporting"),
+            pytest.raises(type(error)),
+        ):
+            LLM_torch(model="unused")
+        assert usage_lib._SESSION.snapshot()["errorCategory"] == category
+
+        with (
+            patch.object(BaseLLM, "__init__", return_value=None),
+            patch.object(BaseLLM, "_start_usage_reporting"),
+        ):
+            llm = LLM_torch(model="unused")
+        assert usage_lib._SESSION.snapshot()["errorCategory"] == ""
+        with patch.object(BaseLLM, "_shutdown_resources"):
+            llm.shutdown()
 
     def test_failure_before_base_constructor_is_counted(self, enable_telemetry):
         """The public LLM boundary includes subclass argument validation."""

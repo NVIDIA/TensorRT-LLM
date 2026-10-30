@@ -29,6 +29,7 @@ import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
+from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
@@ -701,7 +702,7 @@ class ModelConfig(Generic[TConfig]):
                         kv_quant_rhs :=
                         quant_config.kv_cache_quant_algo) is not None:
                 if kv_quant_lhs != kv_quant_rhs:
-                    raise RuntimeError(
+                    raise ModelLoadError(
                         f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
                         f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
                     )

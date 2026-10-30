@@ -1,13 +1,15 @@
 # TRT-LLM Telemetry Schema Reference
 
-Schema version: **0.7** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
+Schema version: **0.8** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
 
 ## Overview
 
 TRT-LLM collects anonymous, session-level deployment telemetry to understand
 how the library is used in production (GPU types, parallelism configs, model
 architectures). No PII, model weights, prompts, outputs, model paths, tokenizer
-paths, or raw free-form configuration strings are collected.
+paths, or raw free-form configuration strings are collected. The only state kept
+across sessions is a local count of consecutive failed starts of the same launch;
+see [Startup state](#startup-state).
 
 **Opt-out** (any one of these disables telemetry):
 - `TRTLLM_NO_USAGE_STATS=1`
@@ -31,7 +33,7 @@ these top-level fields in Kibana alongside the event parameters.
 | `clientType` | string | Always `"Native"`. |
 | `clientVer` | string | TRT-LLM version, e.g. `"1.3.0rc9"`. |
 | `eventProtocol` | string | Always `"1.6"`. |
-| `eventSchemaVer` | string | Schema version, currently `"0.7"`. |
+| `eventSchemaVer` | string | Schema version, currently `"0.8"`. |
 | `eventSysVer` | string | Always `"trtllm-telemetry/1.0"`. |
 | `sessionId` | string | Unique hex UUID per telemetry session. Use this to correlate initial, heartbeat, and terminal events. |
 | `sentTs` | string | ISO 8601 UTC timestamp of when the payload was sent. |
@@ -153,6 +155,19 @@ heartbeat, and the terminal report. Cumulative counters saturate at uint32 max;
 | `maxConcurrentLlmInstances` | PositiveInt | Maximum active objects observed in the process session. |
 | `llmInitializationFailures` | PositiveInt | Initialization attempts that raised a handled Python exception. |
 
+#### Startup state fields
+
+Present on the initial report and the terminal report; see
+[Startup state](#startup-state).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `priorStartupFailures` | PositiveInt | Consecutive failed starts of the same launch before this session, as a bucket lower bound: `0`, `1`, `2`, `3`, `10`, `30`, `100`, `300`, or `1000`. |
+| `startupStateStatus` | enum | `persisted` if the local count was read, `new` if it was missing or corrupt, `unavailable` if it could not be read or written in time, or `""` if it was not consulted. |
+
+A partial initial report carries the values of its failed start. Count
+successful starts only from initial reports with `llmInstancesCreated >= 1`.
+
 ### `trtllm_heartbeat`
 
 Sent periodically (default: every 600s) to track session duration until process
@@ -184,6 +199,9 @@ outcome. Missing terminal events remain unknown; they are not confirmed crashes.
 | `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |
 | `disaggRole` | ShortString | Disaggregated role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy `ctx0`/`gen0`), or empty when unavailable/not applicable. |
 | `deploymentId` | ShortString | Optional shared disaggregated deployment ID. |
+| `errorCategory` | enum | Category of the startup failure that ended the session, or `""` if the session did not fail during startup. See [Error category values](#error-category-values). |
+| `priorStartupFailures` | PositiveInt | See [Startup state fields](#startup-state-fields). |
+| `startupStateStatus` | enum | See [Startup state fields](#startup-state-fields). |
 
 Every terminal report also contains the five aggregate LLM lifecycle counters
 above. Delivery is best-effort and waits no more than 0.5 seconds; the local
@@ -194,13 +212,81 @@ normalized to shell-style `exitCode=137` with `signalNumber=9`.
 
 Terminal fields are deliberately bounded and categorical. Exception messages,
 stack traces, commands, paths, model identifiers, and configuration text are
-not collected.
+not collected. `errorCategory` is computed locally from the exception; only the
+category value is sent.
 
 V1 signal coverage is boundary-specific. The generic CLI boundary observes
 Ctrl+C/SIGINT, while Uvicorn serving and explicitly instrumented disaggregated
 boundaries observe both SIGINT and SIGTERM. A default SIGTERM delivered to
 another CLI, such as `trtllm-bench` or `trtllm-eval`, may terminate the process
 before it can send a terminal report.
+
+#### Error category values
+
+`errorCategory` uses the categories of `tensorrt_llm/_errors.py`. TRT-LLM raise
+sites declare them; other errors are classified by exception type, error code,
+and a fixed list of message phrases.
+
+| Value | Meaning | Examples |
+|-------|---------|----------|
+| `config_input` | The user's input or setup is wrong. | Invalid CLI option, config file, or key; model path not found; no Hugging Face token or license not accepted |
+| `resource` | A required resource is missing or exhausted. | No usable GPU, fewer GPUs than ranks, GPU out of memory, port in use, disk full |
+| `unsupported` | The product does not support the request. | Unregistered model architecture, GPU too old for the quantization format |
+| `model_load` | The model files are broken or incompatible. | Missing or mismatched weights, corrupted checkpoint |
+| `runtime_init` | Bringing up the runtime failed during startup. | Worker process exited during startup, MPI or NCCL initialization, kernel compilation |
+| `other` | Not attributable to the categories above. | Errors without a declared category, including internal errors; unrecognized third-party errors; exceptions from user code |
+
+The category is set only when the session ends during startup (before any LLM
+instance was created and before serving) with an exception, or when an LLM API
+process exits after a failed `LLM()`. It is `""` for clean exits, signals,
+timeouts, failures after startup, and child failures observed by a supervisor,
+because the child reports its own. Executor workers classify their own failure
+and pass the result to the reporting process. VisualGen sessions do not set it;
+a `trtllm-serve` VisualGen launch that fails before the command has determined
+that it serves VisualGen, such as on a CLI usage error, is reported like an LLM
+launch.
+
+#### Startup state
+
+The reporting process keeps a local count of consecutive failed starts of the
+same launch, so that dashboards can recognize restart loops without any
+identifier. Each report carries the count it found, as a bucket.
+
+- **Launch**: a local hash of the TensorRT-LLM version, command line,
+  `CUDA_VISIBLE_DEVICES`, `NVIDIA_VISIBLE_DEVICES`, launcher rank, and
+  TensorRT-LLM process-role variables. Instances that differ in any of these keep
+  separate counts, and an upgrade starts a new count; copies of the same launch on
+  hosts that share the state directory share one count. None of these values is
+  sent.
+- **File**: `startup-<hash>.json` under `TRTLLM_USAGE_STATE_DIR`, else
+  `$XDG_CACHE_HOME/tensorrt_llm/usage/`, else `~/.cache/tensorrt_llm/usage/`,
+  holding only `{"v": 1, "streak": <count>, "last_failure": <unix seconds>}`.
+  The directory is created with mode 0700 and the file with mode 0600; writes
+  replace the file atomically. Files not updated for 30 days are removed when a
+  new one is created.
+- **Rules**: a failed start (an exception or worker failure during startup, or
+  an LLM API exit after a failed `LLM()`) adds one; creating an LLM instance or
+  reaching serving resets the count to 0; other outcomes, such as signals, leave
+  it unchanged. A count whose last failure is more than 24 hours old is reported
+  as 0. Successful CLI probes such as `--help` do not touch the file.
+- **When**: only in the process that sends telemetry, after the opt-out
+  decision, and at most once per process: on success in the background reporter,
+  otherwise when the terminal report is built. Either way the file I/O runs on a
+  helper thread, and the report waits for it at most 0.1 seconds (on the exit
+  path, out of its 0.5-second bound); if it has not finished, the report is sent
+  with `priorStartupFailures` `0` and `startupStateStatus` `unavailable`. It is
+  never read or written when telemetry is disabled; after a late opt-out in the
+  same process, no new read or write starts. VisualGen sessions do not consult
+  it (`""`).
+- **Limits**: starts killed without any report (for example by SIGKILL) are not
+  counted. Restarts that lose the file, such as container restarts without a
+  persistent home directory, report `new`; Kubernetes users can point
+  `TRTLLM_USAGE_STATE_DIR` at an `emptyDir` volume. Processes that never create
+  an LLM or reach serving, such as `disaggregated_mpi_worker` leaders, rely on
+  the 24-hour expiry.
+
+Records from clients before schema 0.8 have none of these fields. Treat them as
+not collected, separate from `""`, `other`, and `0`.
 
 ## Type Reference
 
@@ -309,6 +395,7 @@ over time.
 | `TRTLLM_USAGE_STATS_SERVER` | `https://events.gfe.nvidia.com/v1.1/events/json` | Override the GXT endpoint URL. Use for staging. |
 | `TRTLLM_USAGE_HEARTBEAT_INTERVAL` | `600` | Heartbeat interval in seconds. |
 | `TRTLLM_USAGE_FORCE_ENABLED` | `0` | Set to `1` to force-enable telemetry in CI/test environments. |
+| `TRTLLM_USAGE_STATE_DIR` | `~/.cache/tensorrt_llm/usage` | Directory of the local consecutive startup failure count. See [Startup state](#startup-state). |
 | `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`). |
 | `TRTLLM_DISAGG_DEPLOYMENT_ID` | unset | Shared deployment ID across disaggregated workers. |
 

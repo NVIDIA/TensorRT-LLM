@@ -17,6 +17,7 @@ from typing import Optional
 
 from strenum import StrEnum
 
+from .._errors import UnsupportedError
 from .._utils import BaseEnumMeta
 
 
@@ -49,6 +50,15 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     NVFP4_AWQ = auto()
     NVFP4_ARC = auto()
     NO_QUANT = auto()
+
+    @classmethod
+    def _missing_(cls, value):
+        # An unknown name, e.g. from a checkpoint quantized with a newer format.
+        # UnsupportedError is a ValueError, which Enum raises by default.
+        raise UnsupportedError(
+            f"{value!r} is not a valid {cls.__qualname__}",
+            hint="Upgrade TensorRT-LLM, or use a quantization format that this "
+            "version supports.")
 
 
 QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})

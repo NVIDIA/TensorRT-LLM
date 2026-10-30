@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.peft.lora.validation import has_moe_lora_targets
 from tensorrt_llm._torch.utils import ActivationType
@@ -624,7 +625,7 @@ def resolve_moe_impl(
     location = "" if layer_idx is None else f" [layer_idx={layer_idx}]"
 
     if report.degraded and not allow_degradation:
-        raise ValueError(
+        raise UnsupportedError(
             f"MoE backend {requested} was requested with degradation disallowed "
             f"but cannot serve this layer{location}. {report.describe()}"
             f" Each candidate's reason: {report.describe_rejections()}"
@@ -666,7 +667,7 @@ def impl_class_for(report: MoEResolutionReport) -> MoEImplClass:
     if report.winner is None:
         # describe() prints reason codes only. With nothing left to run, the
         # operator needs the details too -- that is all the error can offer.
-        raise ValueError(
+        raise UnsupportedError(
             f"no MoE implementation can serve this layer. {report.describe()}"
             f" Each candidate's reason: {report.describe_rejections()}"
         )

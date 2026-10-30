@@ -256,6 +256,13 @@ def test_startup_failure_context_e2e(failure, capture_server, monkeypatch, enabl
     ]
     for event in payload["events"]:
         _assert_event_matches_sms_schema(event)
+    terminal = payload["events"][1]["parameters"]
+    assert terminal["errorCategory"] == (
+        "config_input" if failure == "config_validation" else "other"
+    )
+    for event in payload["events"]:
+        assert event["parameters"]["priorStartupFailures"] == 0
+        assert event["parameters"]["startupStateStatus"] == "new"
     params = payload["events"][0]["parameters"]
     meta = json.loads(params["llmApiConfigMetaJson"])
     assert meta["report_context"] == "pre_initialization_exit"
@@ -392,7 +399,7 @@ class TestE2ECapture:
         assert set(features.keys()) == expected_keys
 
         # Schema version
-        assert payload["eventSchemaVer"] == "0.7"
+        assert payload["eventSchemaVer"] == "0.8"
 
         # Disagg fields present (may be empty strings)
         assert "disaggRole" in params
@@ -405,7 +412,7 @@ class TestE2ECapture:
         # heartbeat must contain the current counter snapshot for the same
         # process-scoped telemetry session.
         assert heartbeat_payload["sessionId"] == payload["sessionId"]
-        assert heartbeat_payload["eventSchemaVer"] == "0.7"
+        assert heartbeat_payload["eventSchemaVer"] == "0.8"
         heartbeat = heartbeat_payload["events"][0]
         assert heartbeat["name"] == "trtllm_heartbeat"
         _assert_lifecycle_snapshot(
@@ -444,7 +451,7 @@ class TestE2ECapture:
         payload = CaptureHandler.captured_payloads[0]
         event = payload["events"][0]
         params = event["parameters"]
-        assert payload["eventSchemaVer"] == "0.7"
+        assert payload["eventSchemaVer"] == "0.8"
         _assert_lifecycle_snapshot(
             params,
             active_instances=1,
@@ -504,7 +511,7 @@ with LLM(
         initial_payload = _wait_for_event("trtllm_initial_report", timeout=5)
         exit_payload = _wait_for_event("trtllm_exit_report", timeout=5)
         assert exit_payload["sessionId"] == initial_payload["sessionId"]
-        assert exit_payload["eventSchemaVer"] == "0.7"
+        assert exit_payload["eventSchemaVer"] == "0.8"
 
         terminal_events = [
             payload
@@ -520,6 +527,11 @@ with LLM(
         assert params["signalNumber"] == 0
         assert params["terminationKind"] == "unknown"
         assert params["lifecyclePhase"] == "serving"
+        assert params["errorCategory"] == ""
+        initial_params = initial_payload["events"][0]["parameters"]
+        for reported in (initial_params, params):
+            assert reported["priorStartupFailures"] == 0
+            assert reported["startupStateStatus"] == "new"
         assert params["component"] == "llm"
         assert params["reportingSource"] == "self"
         _assert_lifecycle_snapshot(

@@ -17,6 +17,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._errors import (ConfigInputError, ModelLoadError,
+                                  UnsupportedError)
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
 from tensorrt_llm.models.convert_utils import split_matrix_tp
@@ -1447,16 +1449,17 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = get_registered_model_class(model_config.architectures[0])
     else:
-        raise RuntimeError("Model architecture is not provided.")
+        raise ModelLoadError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]
         if arch in _GEMMA4_ARCHITECTURES:
-            raise RuntimeError(
+            raise ConfigInputError(
                 f"Gemma4 model support requires transformers>=5.5.0, "
                 f"please upgrade: pip install 'transformers>=5.5.0' "
-                f"(architecture: {arch}).")
-        raise RuntimeError(f"Unknown model architecture: {arch}")
+                f"(architecture: {arch}).",
+                reason="import")
+        raise UnsupportedError(f"Unknown model architecture: {arch}")
     return cls, model_config.architectures[0]
 
 

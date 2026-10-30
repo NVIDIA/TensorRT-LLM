@@ -22,6 +22,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._errors import ResourceError, UnsupportedError
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
@@ -680,7 +681,7 @@ def get_indexer_mqa_logits_workspace_reserve(kv_cache_memory: int,
     if kv_cache_memory <= 0 or workspace_memory <= 0:
         return 0
     if workspace_memory >= kv_cache_memory:
-        raise ValueError(
+        raise ResourceError(
             f"The DeepSeek-V4 Indexer MQA-logits workspace ({workspace_memory} bytes) "
             f"needs the whole KV cache budget ({kv_cache_memory} bytes). Lower "
             "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET or max_num_tokens, or raise "
@@ -2707,7 +2708,7 @@ class KvCacheCreator:
         When the split is *infeasible* (the combined fixed cost exhausts the
         budget while either manager has a per-token cost, or exceeds it)
         the shortfall is fatal: both managers need their fixed state resident in
-        GPU memory, so the run would OOM. It raises ``ValueError`` rather than
+        GPU memory, so the run would OOM. It raises ``ResourceError`` rather than
         silently producing an unusable config. A defensive degrade-to-zero path
         for non-GPU budgets remains so the draft never silently inherits the full
         budget and double-allocates it.
@@ -2750,7 +2751,7 @@ class KvCacheCreator:
                 # fatal: both managers need their fixed state resident in GPU
                 # memory, so the run would OOM. Fail fast with actionable
                 # guidance rather than producing an unusable zero-budget draft.
-                raise ValueError(
+                raise ResourceError(
                     f"KV cache GPU budget ({total_budget / GB:.2f} GiB) is "
                     f"insufficient after the combined fixed cost "
                     f"({intercept_total / GB:.2f} GiB, e.g. SWA or mamba state) "
@@ -3830,11 +3831,11 @@ def validate_kv_cache_compression_compatibility(
     """Reject unsupported KV-cache compression feature combinations."""
     if config.algorithm == "quantization_for_cold_page":
         if config.quant == "nvfp4" and not is_sm_100f():
-            raise RuntimeError(
+            raise UnsupportedError(
                 "NVFP4 cold-page quantization requires an SM100-family device "
                 "(SM100, SM103 or SM107).")
     elif config.algorithm == "triattention" and not is_sm_100f():
-        raise RuntimeError(
+        raise UnsupportedError(
             "TriAttention requires an SM100-family device (SM100 or SM103).")
 
     if kv_cache_config.enable_block_reuse and not config.supports_block_reuse():
