@@ -86,6 +86,7 @@ def test_connector_retention_request_validation(
 ) -> None:
     executor = object.__new__(PyExecutor)
     executor._is_kv_manager_v2 = use_v2
+    executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
     executor.kv_connector_manager = (
         None if connector_mode is None else Mock(capacity_only=connector_mode == "capacity")
     )

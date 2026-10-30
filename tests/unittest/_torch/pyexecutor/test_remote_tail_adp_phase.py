@@ -32,11 +32,13 @@ pytestmark = pytest.mark.cpu_only
 
 def _make_executor() -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.enable_attention_dp = True
     executor.inflight_req_ids = set()
     executor._remote_tail_phase = RemoteTailPhase.NONE
     executor._last_remote_tail_phase = RemoteTailPhase.DECODE
     executor.model_engine = SimpleNamespace(
-        cuda_graph_runner=SimpleNamespace(padding_dummy_requests={0: object()})
+        _dspark_confidence_enabled=False,
+        cuda_graph_runner=SimpleNamespace(padding_dummy_requests={0: object()}),
     )
     executor.scheduler = Mock()
     executor.scheduler.is_request_in_schedulable_state.side_effect = (
@@ -346,7 +348,7 @@ def test_queue_requires_execution_rows_and_some_uncancelled_semantic_work(
 ) -> None:
     executor = _make_executor()
     executor._enable_remote_tail_adp = True
-    executor.dist = Mock()
+    executor.dist = Mock(tp_size=2)
     executor.dist.tp_allgather_int64.return_value = torch.tensor(sizes)
     batch = ScheduledRequests()
     batch.attention_dp_phase = RemoteTailPhase.DECODE
@@ -364,7 +366,7 @@ def test_queue_reports_lost_execution_reservation_collectively(
 ) -> None:
     executor = _make_executor()
     executor._enable_remote_tail_adp = True
-    executor.dist = Mock()
+    executor.dist = Mock(tp_size=2)
     if local_reservation_lost:
         executor.model_engine.cuda_graph_runner.padding_dummy_requests.clear()
     executor.dist.tp_allgather_int64.return_value = torch.tensor([[1, 0], [-1, 2]])
@@ -390,6 +392,7 @@ def test_rebalance_reserves_execution_row_before_resuming_real_requests(
     executor.active_requests = [real]
     runner = Mock()
     runner.padding_dummy_requests = {0: dummy}
+    runner.secondary_padding_dummy_requests = {}
     executor.model_engine.cuda_graph_runner = runner
     manager = Mock()
     executor.kv_cache_manager = manager

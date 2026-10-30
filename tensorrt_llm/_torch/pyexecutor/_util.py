@@ -3487,8 +3487,9 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
-        manager_extra_kwargs["num_reserved_index_slots"] = (
-            _get_num_reserved_index_slots(spec_config, estimating_kv_cache))
+        if getattr(spec_config, "enable_confidence_scheduling", False):
+            manager_extra_kwargs["num_reserved_index_slots"] = (
+                _get_num_reserved_index_slots(spec_config, estimating_kv_cache))
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
