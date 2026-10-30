@@ -762,6 +762,10 @@ def _run_test_for_backend(
                     max_total_draft_tokens=generation_seq_len_q - 1,
                 )
                 attn_metadata.prepare()
+                # The executor refreshes device-side metadata after prepare() on
+                # every step; the CuTe DSL paged-MQA atom split reads its
+                # expanded schedule from this refresh.
+                attn_metadata.on_update_kv_lens()
             for layer_idx in range(num_layers):
                 print(f"---- step {step} layer {layer_idx} start ----")
                 if step == 0:
