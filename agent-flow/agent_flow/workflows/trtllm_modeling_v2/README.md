@@ -84,32 +84,15 @@ planner's next turn; `--now` wakes it, for what must change before that.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    the operator handles cluster allocations and session renewal.
-5. **Tune optionally:** tuning is background work for what the onboarding's workers leave, and
-   never holds the onboarding back. It starts once the core's required checks have passed (the
-   features' and variants' checks go on beside it; delivery still owes them), or runs on its own
-   (`trtllm-modeling-v2 tune`). Its spool jobs queue below every job of the onboarding and never
-   rise above them while they wait; it reserves none of the run's devices; its turns take at most
-   two agent slots while the onboarding has work open. The onboarding's verdict (delivered,
-   escalated, ...) closes the run when it comes; a campaign still running goes on past it as the
-   tune stage, and ends in `state.tune["verdict"]`, never in the run's verdict; a process that
-   stops meanwhile resumes it with the same command, or `tune`. It measures one baseline, with no
-   smoke, stock reference or repeat, then starts the campaign. Tuner
-   proposals run in parallel; verification and keeps serialize. A micro-bench speedup is projected
-   to end-to-end through the share of the step its kernels take, its outputs held roughly to the
-   control's, and a win keeps at once. Every few keeps a checkpoint measures end-to-end, the first
-   output token's distribution and the target's suite, and a failure rolls those keeps back; the
-   accuracy benchmark runs once, on the final tree. Perf points default to concurrency 1/32/128,
-   an attention-DP member's to the high point. The speed of light comes from independent
-   analyses (config formulas, the code, a profile), reconciled: what they dispute is ruled on
-   once, by choosing among them, or stays unknown. Every finished attempt, failed or not, reaches
-   the later requests with the stage's verdict and the turn's findings (`tune/attempts.md`), and
-   a loss the code can fix goes back to its turn once. Results stay on a separate best branch, with `tune/summary.md`,
-   `perf_ledger.jsonl` and `UNMERGED_OPTIMIZATIONS.md`; they are not merged into delivery automatically.
-
-Parallel candidate measurement remains a planned change. Disaggregation is proven by the
-tree's own disaggregated-serving accuracy test for the target (`accuracy.disagg.test`), run as CI
-runs it; the flow deploys nothing of its own. Engine attestation still needs
-an internal rank hook where public APIs provide no resolved facts.
+5. **Tune optionally:** background work for the performance the onboarding's workers leave; it
+   never holds the onboarding back (its jobs queue below the onboarding's, it reserves none of the
+   run's devices, it takes at most two agent slots while onboarding work is open, and no onboarding
+   verdict waits for it). It starts once the core's required checks pass, or on its own
+   (`trtllm-modeling-v2 tune`): one baseline, parallel candidates kept one at a time, a checkpoint
+   every few keeps that rolls them back on a loss, and the accuracy benchmark once on the final
+   tree. Results stay on a separate best branch with `tune/summary.md`; nothing merges into
+   delivery, and the outcome is `state.tune["verdict"]`. `tune/stage.py` and `tune/campaign.py`
+   describe the policy.
 
 ## Code map
 
@@ -127,25 +110,3 @@ an internal rank hook where public APIs provide no resolved facts.
 | `infra/compute/`, `infra/monitor/` | Execution, sessions, scheduler and provenance; status and heartbeat |
 | `infra/git.py`, `infra/files.py` | Shared Git/worktree operations and atomic file I/O |
 | `tune/`, `tune/harness/` | Campaign, measurement and keep policy; standalone benchmark programs |
-
-
-For a native disaggregated test spanning multiple nodes, set
-`accuracy.disagg.nodes` and declare a gate session with at least that many nodes.
-`accuracy.disagg.devices` is the GPU count per node. The session spool reserves
-whole nodes of one allocation and runs one pytest process on each, exposing
-`MV2FLOW_JOB_NODE_RANK`, `MV2FLOW_JOB_HOSTS`, and `MV2FLOW_JOB_NODES` for the
-native test's role placement. Every node must write a fresh passing JUnit report
-and exit successfully; missing, skipped, or failed parts reject the gate. Engine
-TP/EP/attention-DP mappings remain the native test's explicit contract.
-
-`accuracy.timeout` bounds a complete benchmark command (default four hours).
-Set it and `accuracy.disagg.timeout` below the compute allocation's remaining
-lifetime, including loading and teardown margin. These time limits do not
-change the evaluator's sample count or request protocol.
-
-For GSM8K, `--log_samples` also gets a unique `--output_path` below that gate's
-work directory unless the task explicitly supplies one. The saved lm-eval JSON
-retains prompts, responses, labels and both scoring filters for independent audit.
-
-The same GSM8K runs also save inference text and token IDs under `inference/`
-so prompt/output token counts can be audited; an explicit `--output_dir` is preserved.

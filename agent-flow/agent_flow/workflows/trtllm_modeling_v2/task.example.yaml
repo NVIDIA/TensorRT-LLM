@@ -187,6 +187,10 @@ accuracy:
   # In benchmark points; read only under `floor.rule: tolerance`. Default 5.0.
   tolerance: 5.0
 
+  # Seconds one complete benchmark command may take (default 14400, four hours). Preflight refuses
+  # a timeout longer than a gates session's time limit: leave room in it for loading and teardown.
+  # timeout: 14400
+
   # The sample count for the SE where the eval's output and `--num_samples` do not say it and the
   # benchmark's is not known (gsm8k, mmlu, mmmu, gpqa_*): a count, or per unit.
   # samples: {default: 1319, multimodal: 900}
@@ -217,7 +221,10 @@ accuracy:
   # disagg:
   #   test: tests/integration/defs/accuracy/test_disaggregated_serving.py::TestMyModel::test_auto_dtype
   #   env: {LLM_MODELS_ROOT: /path/to/models}   # what the test reads
-  #   devices: 4                   # default: two engines at the member's width, at most a node
+  #   devices: 4                   # per node; default: two engines at the member's width, at most a node
+  #   nodes: 1                     # default; N > 1 runs one pytest per node of a gates session of N
+  #                                # nodes (MV2FLOW_JOB_NODE_RANK/HOSTS/NODES); every node's report must pass
+  #   tests: []                    # more node ids, each run as a job of its own
   #   timeout: 7200                # default, seconds
 
   # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration per prompt

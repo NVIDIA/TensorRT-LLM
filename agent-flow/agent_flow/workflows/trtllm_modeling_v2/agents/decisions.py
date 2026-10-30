@@ -47,8 +47,9 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "shared code outside the entry, handed back as soon as it is measured with the "
             "`engine_defect` block",
             f"{_TO_PLANNER}. Commits that change only the entry's own files are integrated "
-            "as they stand, the rest stay on the task's branch for its next attempt; for an "
-            "`engine_defect` the orchestrator adds the task that fixes it",
+            "as they stand, the rest stay on the task's branch for its next attempt; an "
+            "`engine_defect` goes to the planner, which plans its fix and retries this task once "
+            "the fix lands",
             False,
         ),
         Decision(

@@ -109,8 +109,8 @@ engine_defect:
   proposal: the fix, in a sentence or two
 ```
 
-The orchestrator adds a task that fixes it, and this task is retried once the
-fix lands. Leave the remaining cells to the re-certification that follows the
+The planner gets the report, plans the task that fixes it, and retries this
+task once the fix lands. Leave the remaining cells to the re-certification that follows the
 fix.
 
 A `MACRO` lists its constituents, the better replacement it names (a fused

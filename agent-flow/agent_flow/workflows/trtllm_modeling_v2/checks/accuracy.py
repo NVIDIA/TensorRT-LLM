@@ -83,6 +83,7 @@ def eval_command(
     if accuracy.get("dataset_path"):
         parts.append(shlex.quote(f"--dataset_path={accuracy['dataset_path']}"))
     arguments = [str(arg) for arg in resolve_per_unit(accuracy, "benchmark_args", unit) or ()]
+    # Logged samples and the inference text stay under the gate's directory, for an audit.
     if benchmark == "gsm8k" and "--log_samples" in arguments:
         output = None
         for index, argument in enumerate(arguments):
