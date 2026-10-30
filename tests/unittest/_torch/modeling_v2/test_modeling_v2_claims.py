@@ -485,12 +485,17 @@ def test_every_unit_test_is_in_a_test_list():
 _PHASE_FIELDS = ("num_contexts", "num_ctx_tokens")
 
 
+# Families whose targets run the built-in model's forward as their generic path and classify steps inside it,
+# rather than splitting into PrefillTarget / DecodeTarget.
+_GENERIC_PATH_FAMILIES = frozenset({"kimi_k3_vl", "glm5_next"})
+
+
 def _core_modules() -> list[Path]:
     return [
         target_dir / "modeling.py"
         for arch in _ARCHS
         for target_dir, _ in _routed_targets(arch)
-        if target_dir.parent.name != "kimi_k3_vl"
+        if target_dir.parent.name not in _GENERIC_PATH_FAMILIES
     ]
 
 
