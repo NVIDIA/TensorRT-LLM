@@ -936,8 +936,9 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if not images and not video_datas:
             # Text-only fast path: identical to the tokenizer and no
             # multimodal payload, so the tower is never touched.
-            input_ids = self._tokenizer(text_prompt, return_tensors="pt").input_ids
-            return input_ids[0].to(torch.int32).tolist(), None
+            # A Python list straight from the tokenizer: a tensor round trip costs
+            # milliseconds on long prompts.
+            return self._tokenizer(text_prompt).input_ids, None
 
         # Media loaders may deliver pre-rescaled float tensors (the server
         # default) instead of PIL / uint8; tell the HF processor not to

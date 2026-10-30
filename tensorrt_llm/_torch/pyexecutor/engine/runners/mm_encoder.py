@@ -30,7 +30,6 @@ class MultimodalEncoderRunner(NoKVCacheRunner):
         inputs: dict[str, Any],
         scheduled_requests: ScheduledRequests,
         *,
-        gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
         """Forward step for multimodal encoder only mode - returns mm_embeddings instead of logits."""  # noqa: E501

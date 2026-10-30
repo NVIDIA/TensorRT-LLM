@@ -33,20 +33,23 @@ if TYPE_CHECKING:
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .sparse.dsa.metadata import TokenMajorGenView
 
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
+                                 maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
+from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fp4_mla import (can_fuse_fp4_mla_q_quant, populate_helix_spec_buffers,
-                      scatter_fp4_mla_kv_cache)
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
+                      populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
@@ -1707,16 +1710,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             runtime_draft_len + 1)
 
     def is_sm_version_trtllm_gen_kernel(self, sm):
-        return not (sm < 100 or sm in [120, 121])
+        return is_sm_100f(sm)
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
+    # FMHA library classes this instance tries before the registry's libraries.
+    prepended_fmha_lib_classes: tuple = ()
 
     @staticmethod
     def is_sm_version_trtllm_gen_kernel(sm):
-        return not (sm < 100 or sm in [120, 121])
+        return is_sm_100f(sm)
 
     def __init__(
         self,
@@ -1766,8 +1771,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.is_mla_enable = mla_params is not None
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
-                and get_sm_version() in (120, 121)
-                and self.kv_cache_dtype != "fp8_ds_mla"):
+                and is_sm_120f() and self.kv_cache_dtype != "fp8_ds_mla"):
             raise ValueError(
                 "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
                 "kv_cache_config.dtype='fp8_ds_mla'.")
@@ -1915,9 +1919,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return CSA2TrtllmAttention.runtime_workspace_bytes_per_token(
                 model_config, mapping)
 
-        fp8_context_mla = (quant_config is not None
-                           and quant_config.quant_mode.has_fp8_kv_cache()
-                           and get_sm_version() in (90, 100, 103, 107, 120))
+        has_fp4_kv_cache = (quant_mode is not None and getattr(
+            quant_mode, "has_fp4_kv_cache", lambda: False)())
+        # Dense FP4 MLA attends the current chunk and every cached-prefix
+        # partition through the FP8 context kernel, even though the
+        # model-wide cache quantization is NVFP4.
+        nvfp4_uses_fp8_context = (has_fp4_kv_cache and
+                                  model_config.sparse_attention_config is None)
+        if has_fp4_kv_cache and is_kimi_k3(config):
+            # Kimi K3 with an NVFP4 KV cache keeps FP8 fallback MLA layers,
+            # which stage the same context buffers as an all-FP8 model when
+            # this pipeline stage holds one of them.
+            fp8_fallback_layers = get_kimi_k3_fp8_kv_layer_ids(
+                config, nvfp4_enabled=True, mapping=mapping)
+            if fp8_fallback_layers and fp8_fallback_layers.intersection(
+                    mapping.pp_layers(config.num_hidden_layers)):
+                nvfp4_uses_fp8_context = True
+        sm_version = get_sm_version()
+        fp8_context_mla = (quant_mode is not None
+                           and (quant_mode.has_fp8_kv_cache()
+                                or nvfp4_uses_fp8_context)
+                           and (sm_version == 90 or is_sm_100f(sm_version)
+                                or is_sm_120f(sm_version)))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
@@ -1929,12 +1952,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
         #     so those layers still run dense MLA. The workspace is shared, so one dense layer forces the
         #     reserve.
-        #   * SM 100 / 103 / 107 -- mUseTllmGen is `sm >= 100 && sm != 120 && sm != 121`.
+        #   * SM 100 family -- where mUseTllmGen is true.
         #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
         # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
-                      and get_sm_version() in (100, 103, 107))
+                      and is_sm_100f())
         short_seq_mha_enabled = int(
             os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled
@@ -2695,6 +2718,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
+        if self.uses_fp4_mla_attention:
+            return load_fp4_mla_chunked_kv_cache(
+                metadata,
+                self.layer_idx,
+                num_ctx_cached_tokens=num_ctx_cached_tokens,
+                cu_chunked_seq_len=cu_chunked_seq_len,
+                chunked_global_offset=chunked_global_offset,
+                chunked_max_seq_len=chunked_max_seq_len,
+                out_dtype=out_dtype,
+                kv_lora_rank=self.mla_params.kv_lora_rank,
+                qk_rope_head_dim=self.mla_params.qk_rope_head_dim,
+            )
+
         if metadata.max_ctx_cached_token_len == 0:
             empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
                                    dtype=out_dtype,
@@ -2726,6 +2762,70 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.quant_mode,
         )
         return output_kv, output_k_pe
+
+    def append_fp4_mla_context_cache(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> None:
+        """Apply Q/K RoPE and append one context chunk to FP4 MLA V2 storage."""
+        if not self.uses_fp4_mla_attention or self.mla_params is None:
+            raise RuntimeError(
+                "FP4 MLA context append requires dense FP4 MLA attention.")
+        if (metadata.fp4_mla_state is None
+                or metadata.fp4_mla_state.positions is None):
+            raise RuntimeError(
+                "FP4 MLA context append requires token positions.")
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache[:metadata.num_ctx_tokens],
+            self.layer_idx,
+            token_offset=0,
+            phase="context",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.mla_params.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_context=q,
+            q_nope_head_dim=self.mla_params.qk_nope_head_dim,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "Fused FP4 MLA context scatter did not update the HP pool.")
+
+    def forward_fp4_mla_context_partition(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+        *,
+        kv_lens_cuda: torch.Tensor,
+        kv_lens_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one explicit-KV chunked-prefill partition of dense FP4 MLA.
+
+        The partition attends through the FP8 MLA context kernel. Returns the
+        attention output of the partition.
+        """
+        for fmha in self._fmha_manager.fmha_libs:
+            if isinstance(fmha, Fp4MlaFmha):
+                output = fmha.forward_context_partition(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    kv_lens_cuda=kv_lens_cuda,
+                    kv_lens_cpu=kv_lens_cpu,
+                )
+                if isinstance(output, tuple):
+                    output = output[0]
+                return output
+        raise RuntimeError(
+            "Dense FP4 MLA FMHA is unavailable for chunked prefill.")
 
     def mla_rope_append_paged_kv_assign_q(
         self,
