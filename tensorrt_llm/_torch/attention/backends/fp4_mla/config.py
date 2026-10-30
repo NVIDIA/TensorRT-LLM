@@ -130,6 +130,11 @@ def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
 
 
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
+# four-CTA-cluster (4x) decode (fp4_mla_cutedsl_4x.py): the four-CTA-cluster variant of the FP4 MLA decode kernel (256 packed
+# [token, head] rows of one request per cluster, two CTA pairs splitting the KV tiles and exchanging P over
+# DSMEM; same FP4 operands as the two-CTA packed kernel). Opt-in sub-selection of the cutedsl backend for even-q
+# MTP shapes (see fp4_mla_cutedsl_4x_host.envelope_reason_static). Default off.
+FP4_MLA_CUTEDSL_4X_ENV = "TRTLLM_FP4_MLA_CUTEDSL_4X"
 # Packed decode: each request owns a 128-row-padded block of [query token, head]
 # Q rows, the kernel splits KV across grid.z tasks and reads per-row causal
 # bounds, so no Q padding/copies, no Q replication, and Helix stays split.
@@ -137,6 +142,11 @@ _FP4_MLA_PACKED_MAX_M = 1024
 _FP4_MLA_PACKED_MAX_SPLITS = 16
 _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT = 2
 _FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
+
+
+def _fp4_mla_cutedsl_4x_enabled() -> bool:
+    """Whether the 4x kernel may replace the packed 2x decode inside its envelope (default off)."""
+    return _env_enabled_default(FP4_MLA_CUTEDSL_4X_ENV, False)
 
 
 def _fp4_mla_packed_q_enabled() -> bool:

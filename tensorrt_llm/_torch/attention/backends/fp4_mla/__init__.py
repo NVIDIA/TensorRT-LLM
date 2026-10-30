@@ -57,11 +57,13 @@ from .config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
 )
+from .config import FP4_MLA_CUTEDSL_4X_ENV as FP4_MLA_CUTEDSL_4X_ENV
 from .config import _ceil_div as _ceil_div
 from .config import _cutedsl_backend_available as _cutedsl_backend_available
 from .config import _env_enabled_default as _env_enabled_default
 from .config import _env_int as _env_int
 from .config import _fp4_mla_attention_backend as _fp4_mla_attention_backend
+from .config import _fp4_mla_cutedsl_4x_enabled as _fp4_mla_cutedsl_4x_enabled
 from .config import (
     _fp4_mla_cutedsl_fused_v_transpose_enabled as _fp4_mla_cutedsl_fused_v_transpose_enabled,
 )
@@ -73,6 +75,9 @@ from .decode import _cutedsl_pad_q_and_sf_kernel as _cutedsl_pad_q_and_sf_kernel
 from .decode import _cutedsl_swizzled_sf_offset as _cutedsl_swizzled_sf_offset
 from .decode import _run_triton_attention_decode as _run_triton_attention_decode
 from .decode import run_fp4_mla_attention_decode
+from .decode_4x import _fp4_mla_4x_split_buffers as _fp4_mla_4x_split_buffers
+from .decode_4x import _fp4_mla_cutedsl_4x_reason as _fp4_mla_cutedsl_4x_reason
+from .decode_4x import _run_cutedsl_4x_decode as _run_cutedsl_4x_decode
 from .layout import _ensure_workspace_tensor as _ensure_workspace_tensor
 from .layout import _get_fp4_mla_global_scale as _get_fp4_mla_global_scale
 from .layout import _get_fp4_mla_hp_pool_layout as _get_fp4_mla_hp_pool_layout
@@ -152,6 +157,7 @@ __all__ = [
     "FP4_MLA_KV_GLOBAL_SCALE",
     "FP4_MLA_KV_STATIC_AMAX",
     "FP4_MLA_K_RESIDUAL_DIM",
+    "FP4_MLA_CUTEDSL_4X_ENV",
     "FP4_MLA_PACKED_Q_ENV",
     "FP4_MLA_P_GLOBAL_SCALE",
     "FP4_MLA_Q1_PREFIX_BLOCK_DIM",
