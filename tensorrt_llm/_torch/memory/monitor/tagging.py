@@ -40,6 +40,15 @@ shape how:
   :func:`start_tagging_window` for the numbers; recording is confined to
   startup and stopped before the startup report is built.
 
+The label is per thread (measured: an allocation made by a worker thread
+while the main thread held a tag carried none). Startup steps hand work to
+thread pools -- weight loading, for one -- so each tag's time window is kept
+too, and an allocation event that carries no label but falls inside a window
+takes the innermost window's label. Trace events carry wall-clock
+``time_us``, the same clock as ``time.time()`` (measured). Memory a
+background thread allocates while a step runs is therefore named after that
+step; an explicit label and a claimed module still take precedence.
+
 Tags survive a ``torch.cuda.MemPool``, including the pluggable-allocator
 pool behind ``virtual_memory.scope`` (measured). They do not survive a
 process-wide non-native backend such as ``cudaMallocAsync``, where the
@@ -57,6 +66,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import itertools
+import time
 import weakref
 from dataclasses import dataclass, field
 
@@ -151,13 +161,44 @@ def tag(name: str):
         yield
         return
 
+    start_us = time.time() * 1e6
     try:
         yield
     finally:
+        _windows.append((start_us, time.time() * 1e6, name))
         try:
             memory._set_memory_metadata(previous)
         except Exception:  # noqa: BLE001
             logger.debug("memory monitor: could not restore the previous tag")
+
+
+#: ``(start_us, end_us, label)`` of every tag applied in the current window.
+_windows: list[tuple[float, float, str]] = []
+
+
+def _window_lookup(windows):
+    """Map a timestamp to the innermost window containing it, or ``None``.
+
+    Flattened once into sorted boundaries, so each lookup is a bisection.
+    Windows nest (a tag inside a tag), never partially overlap, so the
+    innermost is the one that started last.
+    """
+    if not windows:
+        return lambda _t: None
+    bounds = sorted({t for start, end, _ in windows for t in (start, end)})
+    labels = []
+    for left, right in itertools.pairwise(bounds):
+        middle = (left + right) / 2
+        inside = [w for w in windows if w[0] <= middle < w[1]]
+        labels.append(max(inside)[2] if inside else None)
+
+    def lookup(t):
+        position = bisect.bisect_right(bounds, t) - 1
+        if 0 <= position < len(labels):
+            return labels[position]
+        return None
+
+    return lookup
 
 
 def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
@@ -175,6 +216,7 @@ def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
         return False
     try:
         torch.cuda.memory._record_memory_history(context=None, max_entries=max_entries)
+        _windows.clear()
     except Exception:  # noqa: BLE001
         logger.debug("memory monitor: could not start history recording")
         return False
@@ -222,6 +264,7 @@ def freeze_tag_map() -> TagSnapshot:
         return TagSnapshot(supported=False)
 
     owners: dict[int, str] = {}
+    window_label = _window_lookup(list(_windows))
     for device_trace in snapshot.get("device_traces") or []:
         if len(device_trace) >= _DEFAULT_MAX_ENTRIES:
             # The ring buffer kept only the latest events; blocks allocated
@@ -237,6 +280,8 @@ def freeze_tag_map() -> TagSnapshot:
                 continue
             if action in _ALLOC_ACTIONS:
                 label = event.get("user_metadata") or ""
+                if not label and event.get("time_us") is not None:
+                    label = window_label(event["time_us"]) or ""
                 if label:
                     owners[address] = label
                 else:
@@ -368,14 +413,11 @@ def claim_module_memory(module, label: str) -> bool:
     """Attribute ``module``'s parameters and buffers to ``label``.
 
     Needs no history recording and does no work beyond taking a weak
-    reference; the storages are resolved when a report is built. Returns
-    whether the claim was recorded -- ``False`` when the monitor is off,
-    which is the point: a load with the monitor disabled pays nothing.
+    reference; the storages are resolved when a report is built. Recorded
+    whether or not the monitor is on, so a report asked for later
+    (``LLM.get_memory_report``) still names the weights; holding a weak
+    reference costs nothing. Returns whether the claim was recorded.
     """
-    from . import enabled
-
-    if not enabled():
-        return False
     try:
         reference = weakref.ref(module)
     except TypeError:
