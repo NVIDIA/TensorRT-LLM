@@ -441,10 +441,19 @@ UcxConnectionManager::UcxConnectionManager()
                     auto ret = mZmqRepSocket.recv(message);
                     TLLM_CHECK_WITH_INFO(ret, "mZmqRepSocket.recv failed");
                     std::string recvMessage(static_cast<char*>(message.data()), message.size());
+                    bool const isMultipart = message.more();
+                    while (message.more())
+                    {
+                        zmq::message_t nextFrame;
+                        ret = mZmqRepSocket.recv(nextFrame);
+                        TLLM_CHECK_WITH_INFO(ret, "mZmqRepSocket.recv failed while draining multipart message");
+                        message.swap(nextFrame);
+                    }
                     std::istringstream is(recvMessage);
                     UcxCmMessage ucxCmessage(UcxCmMessage::MessageType::STOP, std::nullopt);
                     try
                     {
+                        TLLM_CHECK_WITH_INFO(!isMultipart, "Multipart UCX connection messages are not supported");
                         ucxCmessage = UcxCmMessage::deserialize(is);
                         TLLM_CHECK_WITH_INFO(ucxCmessage.mType == UcxCmMessage::MessageType::STOP
                                 || (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS
