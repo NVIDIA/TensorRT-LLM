@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import (
     HfWeightMapper,
     convert_compressed_tensors_nvfp4_weights,
@@ -38,6 +40,102 @@ def test_duplicate_kv_bias_preserves_head_boundaries(duplicate_kv) -> None:
 
     expected_bias = torch.tensor([10, 11, 10, 11, 20, 21, 20, 21])
     torch.testing.assert_close(duplicated_bias, expected_bias)
+
+
+class _PerLayerConfig:
+    """Stands in for a heterogeneous transformers config.
+
+    Like ``transformers.PreTrainedConfig`` with a ``per_layer_config``, reading
+    an attribute listed in ``per_layer_attributes`` on the global config raises
+    a ``RuntimeError``, which ``hasattr`` and ``getattr`` defaults do not catch.
+    """
+
+    def __init__(self, per_layer_attributes: set[str], **attrs) -> None:
+        self.per_layer_attributes = per_layer_attributes
+        self.__dict__.update(attrs)
+
+    def __getattribute__(self, name: str):
+        if name in object.__getattribute__(self, "per_layer_attributes"):
+            raise RuntimeError(f"'{name}' is a per-layer attribute")
+        return object.__getattribute__(self, name)
+
+
+def _hf_mapper_with_config(config) -> HfWeightMapper:
+    mapper = HfWeightMapper()
+    mapper._model = SimpleNamespace(config=config)
+    return mapper
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        (SimpleNamespace(num_attention_heads=8, num_key_value_heads=2), 2),
+        (SimpleNamespace(num_attention_heads=8, num_key_value_heads=None), 8),
+        (SimpleNamespace(num_attention_heads=8), 8),
+        (
+            _PerLayerConfig({"num_attention_heads"}, num_attention_heads=8, num_key_value_heads=2),
+            2,
+        ),
+    ],
+    ids=["gqa", "kv_heads_none", "mha", "per_layer_query_heads"],
+)
+def test_num_kv_heads_reads_global_config(config, expected) -> None:
+    assert _hf_mapper_with_config(config)._num_kv_heads == expected
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        _PerLayerConfig(
+            {"head_dim", "num_key_value_heads"}, num_attention_heads=8, num_key_value_heads=2
+        ),
+        _PerLayerConfig({"num_attention_heads"}, num_attention_heads=8, num_key_value_heads=None),
+    ],
+    ids=["per_layer_kv_heads", "per_layer_heads_without_kv_heads"],
+)
+def test_num_kv_heads_rejects_per_layer_kv_heads(config) -> None:
+    mapper = _hf_mapper_with_config(config)
+
+    with pytest.raises(NotImplementedError, match="per layer"):
+        mapper._num_kv_heads
+
+
+def test_gemma4_mapper_duplicates_kv_per_layer_without_global_kv_heads() -> None:
+    hidden_size, tp_size = 4, 4
+    # Same k_proj shape, different geometry: the sliding layer has two KV heads
+    # of dim 4, the full-attention layer one KV head of dim 8.
+    layers = [
+        SimpleNamespace(self_attn=SimpleNamespace(head_dim=4)),
+        SimpleNamespace(self_attn=SimpleNamespace(head_dim=8)),
+    ]
+    mapper = Gemma4HfWeightMapper()
+    mapper._model = SimpleNamespace(
+        config=_PerLayerConfig(
+            {"head_dim", "num_key_value_heads"}, num_attention_heads=8, num_key_value_heads=2
+        ),
+        model=SimpleNamespace(layers=layers),
+    )
+    mapper._tp_size = tp_size
+    mapper.map_weights()
+    module = SimpleNamespace(quant_method=None, quant_config=None)
+    k_weight = torch.arange(8 * hidden_size, dtype=torch.float32).reshape(8, hidden_size)
+    weights = {
+        f"model.layers.{layer_idx}.self_attn.k_proj.weight": k_weight for layer_idx in range(2)
+    }
+
+    for layer_idx, num_kv_heads in ((0, 2), (1, 1)):
+        q_weights, k_weights, v_weights = mapper.apply_callbacks(
+            module, "qkv_proj", ["model", "layers", str(layer_idx), "self_attn"], weights
+        )
+
+        expected = (
+            k_weight.reshape(num_kv_heads, -1, hidden_size)
+            .repeat_interleave(tp_size // num_kv_heads, dim=0)
+            .reshape(-1, hidden_size)
+        )
+        torch.testing.assert_close(k_weights["weight"], expected)
+        assert q_weights == {}
+        assert v_weights == {}
 
 
 class _LazySlice:

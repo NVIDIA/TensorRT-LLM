@@ -195,10 +195,21 @@ class HfWeightMapper(BaseWeightMapper):
     @property
     def _num_kv_heads(self) -> int:
         config = self.model.config
-        if hasattr(config, 'num_key_value_heads'
-                   ) and config.num_key_value_heads is not None:
-            return config.num_key_value_heads
-        return config.num_attention_heads
+        # A heterogeneous transformers config lists the attributes that vary
+        # per layer, and reading one of them on the global config raises.
+        per_layer_attributes = getattr(config, 'per_layer_attributes',
+                                       None) or set()
+        name = 'num_key_value_heads'
+        if name not in per_layer_attributes and getattr(config, name,
+                                                        None) is None:
+            name = 'num_attention_heads'
+        if name in per_layer_attributes:
+            raise NotImplementedError(
+                f"{type(config).__name__} sets {name} per layer, so one "
+                f"KV-head count cannot duplicate the KV weights of every "
+                f"layer. {type(self).__name__} must duplicate them per layer, "
+                f"as Gemma4HfWeightMapper.apply_callbacks does.")
+        return getattr(config, name)
 
     def _duplicate_kv_weights(
             self, module: nn.Module, new_name: str,

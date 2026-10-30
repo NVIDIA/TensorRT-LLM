@@ -49,9 +49,10 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         """Thread-safe override that inlines ``_duplicate_kv_weights`` with
         per-layer ``head_dim``.
 
-        Gemma4 uses per-layer head_dim (256 for sliding, 512 for full).  The
-        base class's single ``self._head_dim`` miscomputes ``num_kv_heads``
-        for full-attention layers under TP>1, and the weight mapper is
+        Gemma4 uses per-layer head_dim (256 for sliding, 512 for full) and,
+        on K=V models, per-layer KV-head counts.  The base class's single
+        ``self._num_kv_heads`` cannot describe both layer types under TP>1,
+        and the weight mapper is
         called concurrently from a ``ThreadPoolExecutor`` so stashing the
         value on ``self`` would race across threads.  Instead, compute the
         correct head_dim locally here and pass it through a per-call
