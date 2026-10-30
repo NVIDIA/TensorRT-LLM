@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
@@ -1187,19 +1188,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Inputs for on_update_kv_lens: each query token's (request row, offset
         # in request). Pinned and non-blocking so the copies do not synchronize
         # the stream. The slots themselves come from msa_block_table above.
-        qo_long = qo_lens_cpu.to(torch.long)
-        batch_row_cpu = torch.repeat_interleave(
-            torch.arange(batch_size, dtype=torch.int32), qo_long
-        )
-        starts = torch.cumsum(qo_long, 0) - qo_long
-        intra_cpu = (
-            torch.arange(total_new_tokens, dtype=torch.int64)
-            - torch.repeat_interleave(starts, qo_long)
-        ).to(torch.int32)
+        # Host arithmetic on a batch-sized vector runs in numpy: torch CPU ops
+        # (repeat_interleave above all) cost far more in dispatch and OpenMP
+        # fork/join than the arithmetic itself, and this runs every step.
+        qo_np = qo_lens_cpu.numpy().astype(np.int64, copy=False)
+        batch_row_np = np.repeat(np.arange(batch_size, dtype=np.int32), qo_np)
+        starts_np = np.cumsum(qo_np) - qo_np
+        intra_np = (
+            np.arange(total_new_tokens, dtype=np.int64) - np.repeat(starts_np, qo_np)
+        ).astype(np.int32)
         self.msa_q_batch_row[:total_new_tokens].copy_(
-            maybe_pin_memory(batch_row_cpu), non_blocking=True
+            maybe_pin_memory(torch.from_numpy(batch_row_np)), non_blocking=True
         )
-        self.msa_q_intra[:total_new_tokens].copy_(maybe_pin_memory(intra_cpu), non_blocking=True)
+        self.msa_q_intra[:total_new_tokens].copy_(
+            maybe_pin_memory(torch.from_numpy(intra_np)), non_blocking=True
+        )
         # The staged lens are the upper bound on_update_kv_lens clamps to: the
         # same attended lengths msa_seq_lens_cuda was just filled from, kept
         # apart so the clamp stays fixed however often the hook runs.

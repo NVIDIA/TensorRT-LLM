@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
@@ -1099,9 +1100,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         The rows are written through a numpy view of a single zero-filled,
         pinned result, so the attention metadata builders ship it to the device
-        in one asynchronous copy.
+        in one asynchronous copy. Each row is copied from the request's pool-0
+        page-index buffer as an array: the buffer spans the whole
+        ``max_seq_len`` capacity, so going through the per-element Python
+        lists of :meth:`get_batch_cache_indices` costs host time on every
+        decode step in proportion to ``max_seq_len``, not to the live context.
         """
-        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+        block_ids_per_seq = [
+            np.asarray(self.kv_cache_map[req_id].get_base_page_indices(0)) for req_id in request_ids
+        ]
         batch = len(block_ids_per_seq)
         max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
         padded_tensor = torch.zeros(
