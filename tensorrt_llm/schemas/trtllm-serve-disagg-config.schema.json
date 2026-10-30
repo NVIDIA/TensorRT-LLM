@@ -573,6 +573,22 @@
           "title": "Algorithm",
           "type": "string"
         },
+        "mixed_precision_first_n": {
+          "default": 0,
+          "description": "Number of leading tokens per sequence whose KV stays at the active-cache precision in the cold tiers instead of NVFP4. The KV cache manager keeps these tokens in a retained-token layer group, as the mixed-precision KV cache does, and migrates that group unchanged. Retention follows the cache page granularity. Requires KV cache manager V2.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision First N",
+          "type": "integer"
+        },
+        "mixed_precision_last_n": {
+          "default": 0,
+          "description": "Number of most recent tokens per sequence whose KV stays at the active-cache precision in the cold tiers instead of NVFP4; see mixed_precision_first_n.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision Last N",
+          "type": "integer"
+        },
         "nvfp4_residual_dim": {
           "default": 64,
           "description": "64 (default): use two independently scaled FP4 components for the 64 DeepSeek-V4 target cold-page RoPE values: a main component and its residual. 0: use a single NVFP4 component. Only 0 and 64 are supported. Ignored for other models, draft caches, and when skip_rope_quantization preserves the original RoPE precision.",

@@ -616,6 +616,56 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("layout", ("HND", "NHD"))
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float8_e4m3fn))
+def test_native_history_pool_paged_conversion(dtype, layout):
+    """Cold-page mixed precision keeps the history pool at the runtime dtype: both directions copy."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision KV conversion requires Blackwell")
+    from tensorrt_llm._torch.attention.kernels.blackwell import mixed_precision_kv as kernels
+
+    low_dtype = {
+        torch.float16: DataType.HALF,
+        torch.bfloat16: DataType.BF16,
+        torch.float8_e4m3fn: DataType.FP8,
+    }[dtype]
+    width = 64
+    row_bytes = width * dtype.itemsize
+    assert kernels.get_mixed_precision_kv_row_bytes(low_dtype, width) == row_bytes
+    values = torch.linspace(-6, 6, 192 * 4 * width, device="cuda").view(192, 2, 2, width).to(dtype)
+    pool = values.view(3, 64, 2, 2, width).transpose(1, 2).contiguous()
+    low = torch.full((3, 2, 128, 2, row_bytes), 23, dtype=torch.uint8, device="cuda")
+    high = torch.zeros((3, 2, 128, 2, width), dtype=dtype, device="cuda")
+    tables = torch.tensor([[[2, 0]], [[1, -1]]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([[0], [130]], dtype=torch.int32, device="cuda")
+    rows = values.view(torch.uint8).view(192, 2, 2, row_bytes)
+    expected_low, expected_high = low.clone(), high.clone()
+    for page, count in enumerate((128, 2)):
+        expected_low[(2, 0)[page], :, :count] = rows[128 * page : 128 * page + count].transpose(
+            0, 1
+        )
+    expected_high[1] = values[:128].transpose(0, 1)
+    pools = tuple(t.transpose(2, 3) if layout == "HND" else t for t in (pool, low, high))
+    kernels.convert_mixed_precision_kv(
+        True, 130, *pools, tables, lengths, layout, low_dtype=low_dtype
+    )
+    # Complete records: the history pool holds the native bytes, padding keeps its sentinel.
+    for actual, expected in ((low, expected_low), (high, expected_high)):
+        torch.testing.assert_close(
+            actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+        )
+    # Reading back restores every written token bit for bit; positions past the length stay zero.
+    pool.copy_(torch.zeros_like(pool))
+    lengths[0].fill_(130)
+    kernels.convert_mixed_precision_kv(
+        False, 192, *pools, tables, lengths, layout, low_dtype=low_dtype
+    )
+    expected = values.clone()
+    expected[130:] = 0
+    actual = pool.transpose(1, 2).reshape_as(values)
+    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
+
+
 @pytest.mark.cpu_only
 def test_conversion_kernel_imports_pinned_flashinfer_symbols():
     """The kernel relies on internal FlashInfer modules; a bump that drops them fails here."""

@@ -3,6 +3,7 @@
 """GPU tests for mixed-precision KV allocation, pool sizing, reuse and transfer."""
 
 from contextlib import closing
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -66,6 +67,32 @@ def make_manager():
     yield create
     for manager in reversed(managers):
         manager.shutdown()
+
+
+class _ColdPageProvider:
+    """Cold-page codec provider stand-in: the manager reads only its retained window."""
+
+    config = SimpleNamespace(algorithm="quantization_for_cold_page")
+
+    def __init__(self, first_n=1, last_n=65):
+        self.retained_token_window = (first_n, last_n)
+        self.calls = []
+
+    def create_cold_page_codec(self, cache_config, **kwargs):
+        self.calls.append(dict(cache_config=cache_config, **kwargs))
+        return None
+
+
+def cold_page_config(**overrides):
+    """A reuse-enabled plain-dtype config; the retained window comes from the provider."""
+    options = dict(
+        max_tokens=65536,
+        enable_block_reuse=True,
+        block_reuse_config={"policy": "per_request"},
+        pool_ratio=[5 / 6, 1 / 6],
+    )
+    options.update(overrides)
+    return KvCacheConfig(**options)
 
 
 def pool_pages(manager, layer_idx=0):
@@ -274,6 +301,42 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
     )
     assert source.tolist() == [4, 7]
     assert destination.tolist() == [2, 6]
+
+
+@pytest.mark.parametrize("dtype", (DataType.FP8, DataType.BF16, DataType.HALF))
+def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
+    """first/last-N from the cold-page codec adds the retained group; the history pool stays native."""
+    provider = _ColdPageProvider()
+    manager = make_manager(
+        config=cold_page_config(), dtype=dtype, cold_page_codec_provider=provider
+    )
+    assert manager.low_precision_dtype == dtype
+    assert (manager.first_n, manager.last_n) == (1, 65)
+    assert manager.high_layers == {0: 1}
+    # The retained layer is left to the codec provider, which keeps it out of its codec.
+    assert [call["retained_layers"] for call in provider.calls] == [(1,)]
+    element_size = 1 if dtype == DataType.FP8 else 2
+    low = manager.get_buffers(0, "NHD", mixed_precision_pool="low")
+    high = manager.get_buffers(0, "NHD", mixed_precision_pool="high")
+    assert low.dtype == torch.uint8 and low.shape[1:] == (2, 128, 2, 64 * element_size)
+    assert high.dtype == binding_to_torch_dtype(dtype) and high.shape[1:] == (2, 128, 2, 64)
+    # Native bytes per token: the cold-page codec sees an ordinary KV layer.
+    assert manager.get_layer_bytes_per_token(0, Role.KEY) == 2 * 64 * element_size
+    config = manager.kv_cache_manager_py_config
+    assert config.initial_pool_ratio == pytest.approx([5 / 6, 1 / 6])
+    assert (config.layers[1].num_sink_tokens, config.layers[1].sliding_window_size) == (1, 66)
+    assert [buffer.size for buffer in config.layers[1].buffers] == [
+        buffer.size for buffer in config.layers[0].buffers
+    ]
+
+
+def test_cold_page_window_skips_the_codec_while_estimating(make_manager):
+    provider = _ColdPageProvider(first_n=0, last_n=65)
+    manager = make_manager(
+        config=cold_page_config(), cold_page_codec_provider=provider, is_estimating_kv_cache=True
+    )
+    assert manager.high_layers == {0: 1}
+    assert provider.calls == []
 
 
 def test_mixed_precision_rejects_custom_managers():

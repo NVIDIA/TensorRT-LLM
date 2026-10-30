@@ -3883,7 +3883,9 @@ def create_kv_cache_compression_manager(
         if config.quant != "nvfp4":
             raise NotImplementedError(
                 f"Unsupported cold-page quantization format {config.quant!r}")
-        if estimating_kv_cache:
+        # A retained-token layer group must exist in the estimation run so its
+        # attention staging copy is profiled with the other activation memory.
+        if estimating_kv_cache and config.retained_token_window is None:
             return None
         quant_config = model_engine.model.model_config.quant_config
         if (quant_config is not None and getattr(

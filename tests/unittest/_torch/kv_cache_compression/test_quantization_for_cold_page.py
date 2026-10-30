@@ -3,6 +3,8 @@
 """Control-plane tests for NVFP4 cold-page compression."""
 
 import json
+from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1312,36 +1314,37 @@ def test_qwen35_mtp3_resolves_to_supported_one_model_mode() -> None:
         )
 
 
+def _build_cold_creator(
+    compression_config: ColdPageQuantizationCompressionConfig,
+    *,
+    estimating: bool = False,
+    skip_est: bool = False,
+    active_kv_quant: object | None = None,
+) -> tuple[dict, util_mod.KvCacheCreator]:
+    creator = object.__new__(util_mod.KvCacheCreator)
+    creator._skip_est = skip_est
+    creator._max_seq_len = 1024
+    creator._kv_cache_config = SimpleNamespace(
+        host_cache_size=None,
+        disk_cache_size=None,
+        enable_block_reuse=False,
+    )
+    creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)
+    creator._model_engine = _factory_model_engine(active_kv_quant=active_kv_quant)
+    creator._kv_connector_manager = None
+    creator._fp8_ctx_mla_kv_len_cap = None
+    creator._is_encoder_decoder = MagicMock(return_value=False)
+    creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
+    creator._create_kv_cache_manager = MagicMock(return_value=SimpleNamespace())
+    creator.configure_kv_cache_capacity = MagicMock()
+    resources = {}
+    creator.build_managers(resources, estimating_kv_cache=estimating)
+    return resources, creator
+
+
 def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -> None:
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
-
-    def build(
-        *,
-        estimating: bool = False,
-        skip_est: bool = False,
-        active_kv_quant: object | None = None,
-    ) -> tuple[dict, util_mod.KvCacheCreator]:
-        creator = object.__new__(util_mod.KvCacheCreator)
-        creator._skip_est = skip_est
-        creator._max_seq_len = 1024
-        creator._kv_cache_config = SimpleNamespace(
-            host_cache_size=None,
-            disk_cache_size=None,
-            enable_block_reuse=False,
-        )
-        creator._llm_args = SimpleNamespace(
-            kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
-        )
-        creator._model_engine = _factory_model_engine(active_kv_quant=active_kv_quant)
-        creator._kv_connector_manager = None
-        creator._fp8_ctx_mla_kv_len_cap = None
-        creator._is_encoder_decoder = MagicMock(return_value=False)
-        creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
-        creator._create_kv_cache_manager = MagicMock(return_value=SimpleNamespace())
-        creator.configure_kv_cache_capacity = MagicMock()
-        resources = {}
-        creator.build_managers(resources, estimating_kv_cache=estimating)
-        return resources, creator
+    build = partial(_build_cold_creator, ColdPageQuantizationCompressionConfig())
 
     resources, creator = build()
     manager = creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
@@ -1369,6 +1372,51 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
         active_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"] is None
     )
     log.assert_called_once()
+
+
+def test_retained_window_keeps_the_cold_manager_during_estimation(monkeypatch) -> None:
+    """The estimation KVCM needs the window to build the retained-token layer group."""
+    monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
+    config = ColdPageQuantizationCompressionConfig(mixed_precision_last_n=64)
+    _, creator = _build_cold_creator(config, estimating=True)
+    provider = creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
+    assert isinstance(provider, Nvfp4ColdPageQuantizationCompression)
+    assert provider.retained_token_window == (0, 64)
+    assert not provider.uses_iteration_lifecycle
+
+
+def test_retained_token_window_comes_from_the_config() -> None:
+    assert _manager().retained_token_window is None
+    config = ColdPageQuantizationCompressionConfig(mixed_precision_first_n=64)
+    provider = Nvfp4ColdPageQuantizationCompression(
+        config, pretrained_config=SimpleNamespace(model_type="qwen3")
+    )
+    assert provider.retained_token_window == (64, 0)
+    assert config.retained_token_window == (64, 0)
+    assert ColdPageQuantizationCompressionConfig().retained_token_window is None
+
+
+def test_retained_layers_stay_out_of_the_codec() -> None:
+    """Retained-token layers are not provider-owned, so the native codec migrates them unchanged."""
+
+    @dataclass
+    class _Config:
+        tokens_per_block: int
+        layers: tuple
+
+    cache_config = _Config(64, _cache_config((0, "attn"), (1, "attn"), (2, "attn")).layers)
+    native, _ = _native()
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager().create_cold_page_codec(
+            cache_config,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0, 1),
+            num_kv_heads_per_layer=(1, 1),
+            head_dim_per_layer=(16, 16),
+            retained_layers=(2,),
+        )
+    assert _codec_state(native).layer_ids == (0, 1)
+    assert sorted(layout.layer_id for layout in _layouts(native)) == [0, 1]
 
 
 # --- skip_rope_quantization ---------------------------------------------------------------------
