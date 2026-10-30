@@ -32,7 +32,7 @@ Collection stub (``--l0`` / ``--qa`` / ``--waive``):
   not be compiled and no ``tensorrt_llm`` wheel is downloaded. The stub fabricates
   the compiled modules on demand; its ``_EXPLICIT`` table is only for symbols
   whose real *value* is consumed at import time. Full local builds will not catch
-  stub gaps — watch Jenkins Check Test List. Pre-commit still runs only
+  stub gaps — watch the Check Test List CI check. Pre-commit still runs only
   ``--validate`` / waive duplicate checks (no stubbed ``--co``).
 
 Note:
@@ -911,18 +911,6 @@ def compute_parity(
 # =============================================================================
 
 
-def _get_trt_test_db_version() -> str:
-    """Read TRT_TEST_DB_VERSION from jenkins/ci_versions.properties."""
-    props_file = Path(
-        __file__).resolve().parent.parent / "jenkins" / "ci_versions.properties"
-    with open(props_file) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("TRT_TEST_DB_VERSION="):
-                return line.split("=", 1)[1]
-    raise RuntimeError(f"TRT_TEST_DB_VERSION not found in {props_file}")
-
-
 def install_python_dependencies(llm_src: str) -> None:
     """Install collection dependencies without TRT-LLM binaries."""
     subprocess.run(
@@ -930,20 +918,28 @@ def install_python_dependencies(llm_src: str) -> None:
         cwd=llm_src,
         check=True,
     )
-    trt_test_db_ver = _get_trt_test_db_version()
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--extra-index-url",
-            "https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple",
-            "--ignore-installed",
-            f"trt-test-db=={trt_test_db_ver}",
-        ],
-        check=True,
-    )
+
+
+def list_test_db_names(test_db_path: str) -> list[str]:
+    """Return every test entry in test-db/*.yml, across all stages and conditions.
+
+    Perf lists other than perf_sanity are skipped: their tests are generated
+    dynamically.
+    """
+    # Imported here so --validate runs without PyYAML (pre-commit uses system python).
+    import yaml
+
+    names = set()
+    for path in glob.glob(os.path.join(test_db_path, "*.yml")):
+        base = os.path.basename(path)
+        if "perf" in base and "perf_sanity" not in base:
+            continue
+        with open(path) as f:
+            for blocks in (yaml.safe_load(f) or {}).values():
+                if isinstance(blocks, list):
+                    for block in blocks:
+                        names.update(str(t) for t in block.get("tests") or [])
+    return sorted(names)
 
 
 def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
@@ -956,7 +952,7 @@ def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
         "TRT_LLM_NO_LIB_INIT": "1",
         # Override any caller LLM_MODELS_ROOT. Collection only interpolates the
         # path into class-body constants; an empty directory keeps the models
-        # NFS share off the Check Test List pod.
+        # NFS share off the collection host.
         "LLM_MODELS_ROOT": models_root,
     }
 
@@ -989,25 +985,9 @@ def verify_l0_test_lists(llm_src):
     test_db_path = f"{llm_src}/tests/integration/test_lists/test-db"
     test_list = f"{llm_src}/l0_test.txt"
 
-    # Remove dynamically generated perf tests
-    # Exclude perf_sanity tests from being removed since they are different and statically defined
-    for file_path in glob.glob(os.path.join(test_db_path, "*perf*")):
-        if "perf_sanity" not in os.path.basename(file_path):
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
-    subprocess.run(
-        f"trt-test-db -d {test_db_path} --test-names --output {test_list}",
-        shell=True,
-        check=True)
-
     # Remove the duplicated test names
     cleaned_lines = set()
-    with open(test_list, "r") as f:
-        lines = f.readlines()
-
-    for line in lines:
+    for line in list_test_db_names(test_db_path):
         # Remove markers and rest of the line if present
         cleaned_line = line.strip()
 
