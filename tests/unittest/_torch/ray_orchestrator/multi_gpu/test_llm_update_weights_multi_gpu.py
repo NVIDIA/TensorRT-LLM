@@ -81,7 +81,7 @@ def _run_multi_gpu_update_weights(
     tokenizer_dir: Optional[str] = None,
     warm_before_update: bool = False,
     generate_fn: Callable = run_generate,
-    threshold: float = 0.85,
+    threshold: float = 0.9,
 ) -> None:
     """Run the shared warm/update/finalize/reference-comparison workflow."""
     if prompts_texts is None:
@@ -1330,6 +1330,8 @@ def _run_qwen35_mxfp8_update(
         prompts_texts=["Hello, my name is", "The future of AI is"],
         warm_before_update=True,
         generate_fn=_mxfp8_generate_with_stats,
+        # The engine also quantizes activations to MXFP8; the BF16 reference does not.
+        threshold=0.85,
     )
 
 
