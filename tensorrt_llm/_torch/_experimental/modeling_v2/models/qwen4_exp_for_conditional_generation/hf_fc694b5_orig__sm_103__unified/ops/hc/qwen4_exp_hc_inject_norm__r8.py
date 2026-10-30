@@ -781,12 +781,16 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: rows, inject (True), moe (False: shared + gate_logits [T, 1] too), fold
-    # (0: top-k of the finalize folded in), drop (False: some slots -1). The
-    # checkpoint's geometry throughout: hc_count 4, hidden 2560, bf16, contiguous rows.
-    # Four cells: the forward reaches four distinct launches -- the Triton kernel's
+    # (0: top-k of the finalize folded in), drop (False: some slots -1), site
+    # ("trunk": the norm weight a trunk site's; "stack_final": the stack-final mixer's).
+    # The checkpoint's geometry throughout: hc_count 4, hidden 2560, bf16, contiguous rows.
+    # The first four reach the tp1 target's four distinct launches -- the Triton kernel's
     # eight-warp form (decode), its two-warp form (prefill, here with the combine),
     # the CuTe fold kernel (decode MoE sites; the -1 slots ride it) and the norm-only
-    # variant -- none of which another covers.
+    # variant -- none of which another covers. The rest are the unified target's: one
+    # form at every row count, its MoE sites the combine over the routed rows already
+    # finalized and reduced across ranks (no fold), so the Triton kernel with the
+    # combine at decode sizes, and every form from 1 row up to max_num_tokens.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="checkpoint 4x2560 bf16, inject, decode batch 128 (eight-warp form)",
@@ -804,6 +808,42 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
             why="norm only (no inject: stack start / after PLE), decode 128",
             spec=dict(rows=128, inject=False),
         ),
+        Cell(
+            why="1 row, attention site: inject of the reduced block output, eight-warp form",
+            spec=dict(rows=1, moe=False, inject=True),
+        ),
+        Cell(
+            why="1 row, MoE site: combine over the reduced routed rows, no fold",
+            spec=dict(rows=1, moe=True, inject=True),
+        ),
+        Cell(
+            why="32 rows, MoE site: combine over the reduced routed rows, no fold",
+            spec=dict(rows=32, moe=True, inject=True),
+        ),
+        Cell(
+            why="128 rows, MoE site: combine without the fold (the con-128 decode batch)",
+            spec=dict(rows=128, moe=True, inject=True),
+        ),
+        Cell(
+            why="1024 rows, attention site: two-warp form (an MTP-7 verify of 128 requests)",
+            spec=dict(rows=1024, moe=False, inject=True),
+        ),
+        Cell(
+            why="8192 rows, MoE site: combine, two-warp form (max_num_tokens)",
+            spec=dict(rows=8192, moe=True, inject=True),
+        ),
+        Cell(
+            why="1 row, stack-final site: last MoE combine, the final mixer's norm weight",
+            spec=dict(rows=1, moe=True, inject=True, site="stack_final"),
+        ),
+        Cell(
+            why="1 row, norm only: the stack's first site at decode",
+            spec=dict(rows=1, moe=False, inject=False),
+        ),
+        Cell(
+            why="8192 rows, norm only: the stack's first site at max_num_tokens (two-warp)",
+            spec=dict(rows=8192, moe=False, inject=False),
+        ),
     )
 
     note = """
@@ -817,6 +857,15 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     which keeps the unfused combine, and those also `topk_weights` /
     `topk_rows`: the runner's finalize folded in). The MTP layer and the PLE
     block keep the unfused ops.
+
+    In the unified (tp4 / tep4 / dep4) target HC is replicated and runs on the
+    rank's own rows, one form at every row count (1 to max_num_tokens 8192, an
+    MTP-7 verify 1024): the attention site injects the block output after its
+    all-reduce (none at dep4); the MoE site passes the routed rows already
+    finalized and all-reduced / reduce-scattered with this rank's replicated
+    shared expert output and gate logit -- the combine, never the fold; the
+    last layer's MoE site normalizes with the stack-final mixer's weight
+    (`hyper_connection_mixer.hc_norm`); the stack's first site is norm only.
 
     Preconditions: 2-D operands, last-dim stride 1 (row strides free); the
     width divisible by `hc_count`; `inject` `[T, hc_count]`, `block_out` and
@@ -859,15 +908,32 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     16 rotating sites, us: 128 rows 7.00 -> 5.97, 64 rows 6.63 -> 5.25, 8 rows
     3.59 -> 3.09; it releases dependents at its start as the Triton kernel does.
 
-    Certified: bf16, the checkpoint's 4 x 2560: the injection at 128 rows
-    (eight-warp form), the combine at 16384 rows (two-warp form), the combine
-    with the fold (three slots -1) at 128 rows (CuTe kernel), norm-only at 128
-    rows; the CuTe fold bitwise the Triton kernel at 511 rows.
+    Certified on sm_103 (GB300), bf16, the checkpoint's 4 x 2560, PDL trigger
+    on (the default): the Triton kernel and the CuTe fold kernel are JIT-
+    compiled at first call for the running GPU, and the cells ran that path.
+      tp1: the injection at 128 rows (eight-warp form), the combine at 16384
+        rows (two-warp form), the combine with the fold (three slots -1) at 128
+        rows (CuTe kernel), norm-only at 128 rows; the CuTe fold bitwise the
+        Triton kernel at 511 rows.
+      unified: the injection at 1 row (eight-warp) and 1024 rows (two-warp);
+        the combine without the fold at 1, 32 and 128 rows (eight-warp) and
+        8192 rows (two-warp); the combine at 1 row under the stack-final
+        weight (RMS 3.1, -0.37 to 12.4, so `1 + w` up to 13.4); norm-only at 1
+        and 8192 rows (two-warp).
+    Measured against the float64 reference rounded once: the decode cells (1,
+    32 rows) bitwise or one ulp on 4 of 327680 `normed` elements; at 128 rows
+    one `hc_out` element and 5 `normed` elements of 1310720 differ; at 1024
+    rows `hc_out` bitwise, 74 of 10485760 `normed` one ulp; norm-only at 8192
+    rows 602 of 83886080 one ulp. The combine at 8192 / 16384 rows moves 131 /
+    192 `hc_out` elements, each inside one ulp of `hc_out` plus one ulp of the
+    combine times `|inject|` (worst 0.95 of that band; up to 31 ulp of a
+    near-zero residual), and `normed` within one ulp of the norm of the
+    stored `hc_out`. Relative L2 at most 1.8e-5, cosine 1.0 (9 digits) on both
+    outputs at every cell.
 
     Not certified: hc_count other than 4, hidden other than 2560, float16
     operands, a flat `[T]` gate, row strides other than the width, zero rows,
-    the injection without the combine at prefill sizes, the combine without the
-    fold at decode sizes, CUDA-graph replay (the kernels take them; no cell
+    TRTLLM_ENABLE_PDL=0, CUDA-graph replay (the kernels take them; no cell
     drives them).
 
     Hard limits: row offsets are int64 (`program_id(0)` widened); the grid is

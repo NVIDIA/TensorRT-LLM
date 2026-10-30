@@ -5,7 +5,8 @@
 Cells are gated at one ulp of the activation dtype against the float64
 reference; the MoE-combine cells widen the residual's band by the combine's own
 rounding (see `_compare_moe`). Beyond them: the CuTe fold kernel bitwise the
-Triton kernel at the last row count before the switch, and the slot-map guard.
+Triton kernel at the last row count before the switch, the slot-map guard, and
+the guard against a combine with nothing to inject into.
 """
 
 import sys
@@ -33,6 +34,12 @@ EPS = 1e-6
 # This checkpoint's grouped-norm weight statistics (layer-0 hyper-connection norm).
 GAMMA_RMS = 0.477
 GAMMA_ABSMAX = 6.625
+# The stack-final mixer's norm weight (`hyper_connection_mixer.hc_norm.weight`), which the
+# last layer's MoE site normalizes with: RMS 3.106, from -0.367 to 12.375, nearly all
+# positive -- so `1 + w` scales the normed stream by up to 13.4.
+FINAL_GAMMA_RMS = 3.106
+FINAL_GAMMA_MIN = -0.367
+FINAL_GAMMA_MAX = 12.375
 
 
 def _ulp_ratio(out: torch.Tensor, ref: torch.Tensor) -> float:
@@ -115,8 +122,13 @@ def _build(spec, seed):
     width = hc_count * hidden
     g = torch.Generator(device=DEV).manual_seed(seed)
     hyper_input = (torch.randn(rows, width, generator=g, device=DEV) * 3.0).to(dtype)
-    gamma = torch.randn(width, generator=g, device=DEV) * GAMMA_RMS
-    gamma[0], gamma[width // 2] = GAMMA_ABSMAX, -GAMMA_ABSMAX
+    if spec.get("site", "trunk") == "stack_final":
+        gamma = torch.randn(width, generator=g, device=DEV).abs() * FINAL_GAMMA_RMS
+        gamma = gamma.clamp(max=FINAL_GAMMA_MAX)
+        gamma[0], gamma[width // 2] = FINAL_GAMMA_MAX, FINAL_GAMMA_MIN
+    else:
+        gamma = torch.randn(width, generator=g, device=DEV) * GAMMA_RMS
+        gamma[0], gamma[width // 2] = GAMMA_ABSMAX, -GAMMA_ABSMAX
     gamma = gamma.to(dtype)
     block_out = inject = shared = gate_logits = None
     if spec.get("inject", True):
@@ -178,6 +190,20 @@ def test_guard_refuses_an_int64_slot_map() -> None:
     fold = _build(dict(rows=4, moe=True, fold=10), seed=9)
     with validating(op), pytest.raises(AssertionError, match="int32"):
         op(*fold[:9], fold[9].long())
+
+
+def test_guard_refuses_a_combine_without_injection() -> None:
+    """`shared` / `gate_logits` with no `block_out` / `inject` is the combine with nothing to
+    inject into: the kernel reads the combine only inside the injection, so unguarded it
+    returns the norm alone and drops the MoE block without a word. `is_valid` refuses it."""
+    norm_only = _build(dict(rows=1, moe=False, inject=False), seed=11)
+    moe = _build(dict(rows=1, moe=True, inject=True), seed=11)
+    args = (*norm_only[:6], moe[6], moe[7])
+    hc, normed = op(*args)
+    assert hc is args[0], "the combine was dropped: hc_out is hyper_input itself"
+    assert torch.equal(normed, op(*norm_only)[1]), "the result is the norm alone"
+    with validating(op), pytest.raises(AssertionError, match="the combine needs block_out"):
+        op(*args)
 
 
 def test_fold_cute_is_the_triton_kernel_bitwise(monkeypatch) -> None:
