@@ -530,3 +530,19 @@ def test_nvfp4_target_with_bf16_draft_needs_a_hosting_manager() -> None:
     assert not compatible(
         target, (2, 128, DataType.BF16, False), nvfp4_target_with_other_draft=True
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_m3_shares_draft_kv_by_default(monkeypatch, is_disagg: bool) -> None:
+    """Unset, the switch shares a hosting manager's draft KV; a plain V2 manager stays opt-in."""
+    monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
+    assert _dspark_creator(is_disagg=is_disagg)._should_unify_dflash_kv_cache()
+    creator = _dspark_creator(is_disagg=is_disagg)
+    creator._kv_cache_manager_cls = KVCacheManagerV2
+    creator._tokens_per_block = 64  # A plain V2 drafter page the TRTLLM context kernel reads.
+    creator._model_engine.model.model_config.quant_config = SimpleNamespace(
+        quant_mode=QuantMode.from_quant_algo()
+    )
+    assert creator._dflash_unify_blocker() is None
+    assert creator._should_unify_dflash_kv_cache() is not is_disagg
