@@ -32,7 +32,6 @@ def context_logits_heads(
 
     if (
         is_spec_decode
-        or mapping.tp_size != 1
         or mapping.cp_size != 1
         or mapping.enable_attention_dp
         or not mapping.is_last_pp_rank()
@@ -83,10 +82,10 @@ def store_context_logits(
 
 
 class ContextLogitsWorkspace:
-    """Resident output buffers for a dense, unsharded LM head.
+    """Resident projection, TP gather and FP32 conversion buffers.
 
-    The output and FP32 conversion storage survive optional allocation failure.
-    They are initialized during decoder warmup, before KV capacity estimation.
+    Warmup initializes the buffers and collectives before KV capacity estimation.
+    Every TP rank agrees on capacity before entering a chunk's all-gather.
     """
 
     MIN_ROWS = 32
@@ -96,46 +95,113 @@ class ContextLogitsWorkspace:
         self.dtype = head.output_dtype or head.weight.dtype
         self.device = head.weight.device
         self.vocab_size = head.num_embeddings
-        self.resident = self._allocate(self.MIN_ROWS)
-        # Initialize the GEMM backend before requests can consume GPU headroom.
-        hidden = torch.zeros(
-            (self.MIN_ROWS, head.weight.shape[1]), dtype=head.weight.dtype, device=self.device
-        )
+        self.local_vocab_size = head.weight.shape[0]
+        self.tp_size = head.tp_size
+        self.mapping = head.mapping
+        if self.tp_size > 1:
+            self._vote = torch.empty(1, dtype=torch.int64, device=self.device)
+            self._votes = torch.empty(self.tp_size, dtype=torch.int64, device=self.device)
+        resident = hidden = None
+        try:
+            resident = self._allocate(self.MIN_ROWS)
+            hidden = torch.zeros(
+                (self.MIN_ROWS, head.weight.shape[1]), dtype=head.weight.dtype, device=self.device
+            )
+        except torch.OutOfMemoryError:
+            pass
+        self.require_all(resident is not None and hidden is not None, "context-logits warmup")
+        assert resident is not None and hidden is not None
+        self.resident = resident
+        # Initialize GEMM and collective backends before serving consumes headroom.
         with torch.inference_mode():
             self.project(head, hidden, self.resident)
 
-    def _allocate(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
-        output = torch.empty((rows, self.vocab_size), dtype=self.dtype, device=self.device)
+    def _allgather(self, source: torch.Tensor, destination: torch.Tensor) -> None:
+        from tensorrt_llm._utils import mpi_disabled
+
+        group_name = self.mapping.tp_group_name if mpi_disabled() else None
+        torch.ops.trtllm.allgather_into_tensor(
+            source, destination, self.mapping.tp_group, group_name
+        )
+
+    def _min_capacity(self, capacity: int) -> int:
+        if self.tp_size == 1:
+            return capacity
+        self._vote.fill_(capacity)
+        self._allgather(self._vote, self._votes)
+        return min(self._votes.cpu().tolist())
+
+    def require_all(self, succeeded: bool, operation: str) -> None:
+        """Report local allocation failure on every TP rank before the next gather."""
+        if not self._min_capacity(int(succeeded)):
+            raise torch.OutOfMemoryError(f"Insufficient memory for {operation} on a TP rank")
+
+    def _allocate(self, rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        local = torch.empty((rows, self.local_vocab_size), dtype=self.dtype, device=self.device)
+        gathered = (
+            local
+            if self.tp_size == 1
+            else torch.empty(
+                (self.tp_size * rows, self.local_vocab_size), dtype=self.dtype, device=self.device
+            )
+        )
         converted = (
-            output
-            if self.dtype == torch.float32
+            local
+            if self.tp_size == 1 and self.dtype == torch.float32
             else torch.empty((rows, self.vocab_size), dtype=torch.float32, device=self.device)
         )
-        return output, converted
+        return local, gathered, converted
 
-    def acquire(self, rows: int, *, host_storage: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        """Try larger output buffers without releasing the resident fallback."""
-        if host_storage:
+    def acquire(
+        self, rows: int, *, host_storage: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Agree on the smallest successful capacity, including CPU-storage fallback."""
+        buffers = self.resident
+        if not host_storage:
+            for _ in range(self.MAX_ALLOCATION_ATTEMPTS):
+                if rows <= self.MIN_ROWS:
+                    break
+                try:
+                    buffers = self._allocate(rows)
+                    break
+                except torch.OutOfMemoryError:
+                    rows = max(self.MIN_ROWS, rows // 2)
+        capacity = self._min_capacity(buffers[0].shape[0])
+        if capacity == self.MIN_ROWS:
             return self.resident
-        for _ in range(self.MAX_ALLOCATION_ATTEMPTS):
-            if rows <= self.MIN_ROWS:
-                break
-            try:
-                return self._allocate(rows)
-            except torch.OutOfMemoryError:
-                rows = max(self.MIN_ROWS, rows // 2)
-        return self.resident
+        local, gathered, converted = buffers
+        return local[:capacity], gathered[: self.tp_size * capacity], converted[:capacity]
 
     def project(
-        self, head: LMHead, hidden: torch.Tensor, buffers: tuple[torch.Tensor, torch.Tensor]
+        self,
+        head: LMHead,
+        hidden: torch.Tensor,
+        buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """Write [rows, vocab] logits into caller-owned reusable storage."""
+        """Gather vocabulary shards into owned scratch without allocating a full output."""
         rows = hidden.shape[0]
-        output, converted = (buffer[:rows] for buffer in buffers)
+        local, gathered, converted = buffers
+        local = local[:rows]
+        converted = converted[:rows]
         kwargs = {} if self.dtype == head.weight.dtype else {"out_dtype": self.dtype}
-        torch.mm(hidden, head.weight.t(), out=output, **kwargs)
-        if converted is not output and self.dtype != torch.float32:
-            converted.copy_(output)
+        succeeded = False
+        try:
+            torch.mm(hidden, head.weight.t(), out=local, **kwargs)
+            succeeded = True
+        except torch.OutOfMemoryError:
+            pass
+        self.require_all(succeeded, "context-logits GEMM")
+        if self.tp_size > 1:
+            gathered = gathered[: self.tp_size * rows]
+            self._allgather(local, gathered)
+            shards = gathered.view(self.tp_size, rows, self.local_vocab_size)
+            for rank in range(self.tp_size):
+                begin = rank * self.local_vocab_size
+                end = min(begin + self.local_vocab_size, self.vocab_size)
+                if end > begin:
+                    converted[:, begin:end].copy_(shards[rank, :, : end - begin])
+        elif self.dtype != torch.float32:
+            converted.copy_(local)
         return converted
 
 
@@ -177,11 +243,17 @@ class ContextLogitsPlan:
             raise ValueError("Context logits input does not match scheduled token rows")
         # Own the sampling rows before result storage can consume the remaining
         # headroom. No view of a reusable projection buffer escapes this call.
-        sampling = torch.empty(
-            (len(contexts) + generation_rows, head.num_embeddings),
-            dtype=torch.float32,
-            device=hidden.device,
-        )
+        sampling = None
+        try:
+            sampling = torch.empty(
+                (len(contexts) + generation_rows, head.num_embeddings),
+                dtype=torch.float32,
+                device=hidden.device,
+            )
+        except torch.OutOfMemoryError:
+            pass
+        workspace.require_all(sampling is not None, "context-logits sampling rows")
+        assert sampling is not None
         for request in contexts:
             if request.py_return_context_logits and (
                 request.py_context_logits_explicit or request.py_prompt_logprobs is None

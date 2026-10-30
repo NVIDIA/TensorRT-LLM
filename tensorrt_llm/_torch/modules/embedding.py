@@ -162,15 +162,19 @@ class LMHead(Linear):
 
     @property
     def supports_context_logits_workspace(self) -> bool:
-        """Whether this head supports dense single-rank output-buffer projection."""
-        return (not self.has_any_quant and self.tp_size == 1
+        """Whether dense projection can assemble the complete vocabulary in bounded buffers."""
+        supported_sharding = (self.tp_size == 1
+                              or (self.tp_mode == TensorParallelMode.COLUMN
+                                  and self.gather_output
+                                  and self.gather_output_sizes is None))
+        return (not self.has_any_quant and supported_sharding
                 and self.lora is None
                 and self._locality_domain_weight_shards is None
                 and self.weight.device.type == "cuda" and self.weight.dtype
                 in (torch.float16, torch.bfloat16, torch.float32))
 
     def prepare_context_logits_workspace(self) -> None:
-        """Reserve and warm the dense single-rank context projection fallback."""
+        """Reserve and warm projection, vocabulary-gather and conversion buffers."""
         if self.context_logits_workspace is None and self.supports_context_logits_workspace:
             self.context_logits_workspace = ContextLogitsWorkspace(self)
 

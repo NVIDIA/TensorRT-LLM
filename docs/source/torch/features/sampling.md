@@ -27,10 +27,11 @@ When using speculative decoders such as MTP or Eagle-3 the subset of sampling op
 for every prompt position. The returned tensor can be large: an 8192-token prompt
 with a 131072-token vocabulary requires 4 GiB of FP32 result storage.
 
-For ordinary, non-speculative decoding with a dense, single-rank LM head and the
-standard logits processor, decoder warmup reserves and initializes a 32-row
-projection workspace before KV capacity estimation. The context-output path
-prepares request storage before projecting hidden states. It first attempts GPU
+For ordinary, non-speculative decoding with a dense LM head and the standard
+logits processor, decoder warmup reserves and initializes a 32-row projection
+workspace before KV capacity estimation. Both single-rank heads and uniformly
+vocabulary-sharded tensor-parallel heads with gathered outputs are supported.
+The context-output path prepares request storage before projecting hidden states. It first attempts GPU
 storage and falls back to CPU storage if that allocation raises a CUDA OOM.
 Consequently, callers must support either device for returned context logits.
 CPU storage still requires enough host memory for the full result.
@@ -42,6 +43,17 @@ the resident workspace directly. Copies from reusable GPU scratch to CPU storage
 complete before that scratch is overwritten. Mixed batches project all context
 rows only for requests that need them; other requests retain their final row.
 
+For tensor parallelism, each rank reserves local projection, all-gather receive,
+and full-vocabulary FP32 conversion buffers. All ranks agree on the smallest
+successful chunk capacity before projecting, so allocation failure or CPU result
+storage on one rank cannot change the collective sequence independently. The
+all-gather writes directly into the reserved receive buffer; vocabulary assembly
+and padding removal copy into the conversion buffer without allocating a second
+gathered output. Allocation failures for required sampling rows and GEMM failures
+are reported on all TP ranks before the next logits collective. These failures
+abort the operation; they do not trigger an independent per-rank retry. TP
+capacity and failure agreement introduces additional synchronization.
+
 Requests that only specify `prompt_logprobs` retain the requested probabilities
 and token IDs rather than a full context-logits tensor. Projection chunks are
 reduced as they are produced. The legacy projection path uses the same probability
@@ -51,12 +63,14 @@ until the first generated token is known. Context probability postprocessing is
 also chunked when consuming complete CPU or GPU logits; a GPU reduction allocation
 failure falls back to CPU for that chunk.
 
-The bounded projection path does not apply to tensor/context/attention-data
-parallel execution, speculative decoding, quantized or LoRA LM heads, locality
-partitioned heads, Gemma4 softcapping, or custom/model-specific logits processors.
+The bounded projection path does not apply to context/attention-data parallel
+execution, ROW-parallel or unevenly sharded LM heads, speculative decoding,
+quantized or LoRA LM heads, locality partitioned heads, Gemma4 softcapping,
+Cohere2 scaling, or custom/model-specific logits processors.
 Unsupported configurations do not reserve the projection workspace. These paths
 retain their existing projection and CUDA graph selection behavior. Eager
-execution is required only when the bounded projection plan is active. The workspace bounds projection output and dtype
-conversion storage; it does not guarantee that model activations, sampling
-outputs, or unrelated runtime allocations fit. Ordinary generation without
+execution is required only when the bounded projection plan is active. The
+workspace bounds projection, gather-output and dtype-conversion storage; it does
+not guarantee that model activations, sampling outputs, or unrelated runtime
+allocations fit. Ordinary generation without
 context outputs continues to use the existing LM-head path.
