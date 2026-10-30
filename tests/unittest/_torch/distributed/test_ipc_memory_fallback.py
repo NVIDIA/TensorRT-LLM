@@ -49,7 +49,7 @@ def _has_allreduce_op() -> bool:
     """Whether the trtllm custom ops are registered in this build."""
     try:
         return torch.ops.trtllm.allreduce is not None
-    except Exception:
+    except (AttributeError, RuntimeError):
         return False
 
 
@@ -65,6 +65,7 @@ TP_SIZE = 2
 class FakeCudaError(IntEnum):
     cudaSuccess = 0
     cudaErrorInvalidValue = 1
+    cudaErrorMemoryAllocation = 2
     cudaErrorInvalidDevice = 101
     cudaErrorPeerAccessUnsupported = 217
     cudaErrorInvalidResourceHandle = 400
@@ -87,21 +88,27 @@ class FakeCudart:
         self,
         get_handle_error=FakeCudaError.cudaSuccess,
         open_handle_error=FakeCudaError.cudaSuccess,
+        malloc_error=FakeCudaError.cudaSuccess,
+        memset_error=FakeCudaError.cudaSuccess,
     ):
         self.get_handle_error = get_handle_error
         self.open_handle_error = open_handle_error
+        self.malloc_error = malloc_error
+        self.memset_error = memset_error
         self.next_ptr = 0x1000
         self.allocated = set()
         self.opened = set()
         self.open_calls = []
 
     def cudaMalloc(self, size):
+        if self.malloc_error != FakeCudaError.cudaSuccess:
+            return self.malloc_error, 0
         self.next_ptr += size
         self.allocated.add(self.next_ptr)
         return FakeCudaError.cudaSuccess, self.next_ptr
 
     def cudaMemset(self, ptr, value, size):
-        return (FakeCudaError.cudaSuccess,)
+        return (self.memset_error,)
 
     def cudaFree(self, ptr):
         self.allocated.discard(ptr)
@@ -317,6 +324,29 @@ def test_mixed_errors_raise(mapping):
         FakeDist(TP_SIZE, peer_open_error=FakeCudaError.cudaErrorInvalidResourceHandle),
         "cudaIpcOpenMemHandle failed",
     )
+
+
+@pytest.mark.parametrize(
+    "cudart_kwargs",
+    [
+        {"malloc_error": FakeCudaError.cudaErrorMemoryAllocation},
+        {"memset_error": FakeCudaError.cudaErrorInvalidValue},
+    ],
+    ids=["malloc", "memset"],
+)
+def test_alloc_error_raises(mapping, cudart_kwargs):
+    # Allocation failures are genuine errors, not a missing IPC capability, so they
+    # keep raising instead of falling back to NCCL, before any collective runs.
+    cudart = FakeCudart(**cudart_kwargs)
+    dist = FakeDist(TP_SIZE)
+    cudart_patch, dist_patch = _patched(cudart, dist)
+
+    with cudart_patch, dist_patch:
+        with pytest.raises(RuntimeError, match="CUDA Runtime API error"):
+            IpcMemory(mapping, 1 << 20, True)
+
+    assert dist.calls == 0
+    assert cudart.open_calls == []
 
 
 def test_ipc_not_requested(mapping):
