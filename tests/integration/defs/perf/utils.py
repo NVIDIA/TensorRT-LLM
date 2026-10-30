@@ -22,6 +22,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -464,7 +465,9 @@ class PerfServeScriptTestCmds:
             return
         print_error(f"--- trtllm-serve stdout/stderr (last up to 200 lines, "
                     f"64 KiB); full log: {self._server_log_path} ---")
-        print("\n".join(tail.splitlines()[-200:]) or "<empty>")
+        tail = "\n".join(tail.splitlines()[-200:]) or "<empty>"
+        encoding = sys.stdout.encoding or "utf-8"
+        print(tail.encode(encoding, errors="backslashreplace").decode(encoding))
         print_error("--- end trtllm-serve log ---")
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
@@ -714,6 +717,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
                     outputs[cmd_idx] = buf.getvalue()
             else:
                 print_info(f"Reusing cached logs for command index {cmd_idx}.")
+
+        except pytest.fail.Exception:
+            # pytest-timeout raises this BaseException during server startup.
+            if isinstance(commands, PerfServeScriptTestCmds):
+                commands.print_server_log_tail()
+            raise
 
         except InvalidGPUMonitoringResultError as e:
             # Mark result state as invalid when GPU monitoring result is invalid.
