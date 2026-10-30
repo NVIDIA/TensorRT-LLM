@@ -1474,6 +1474,10 @@ void KvCacheManager::tryUpdateTargetRatios()
     int avgHistoryLength = static_cast<int>(std::round(std::sqrt(mAvgSqrHistoryLength.value())));
     int avgBeamWidth = std::max(1, static_cast<int>(std::round(mAvgBeamWidth.value())));
     int avgPromptLength = std::max(0, static_cast<int>(std::round(mAvgPromptLength.value())));
+    if (avgCapacity > 0 || avgReusedLength > 0)
+    {
+        ++mTargetRatioGeneration;
+    }
     if (avgCapacity > 0)
     {
         auto const lifeCycleRatio = mStorage->ratioFromLength(
@@ -1551,6 +1555,9 @@ bool KvCacheManager::needAdjustment() const
     auto const apiLock = lockShared();
     if (mNumSampledKvCaches < mConfig.poolRebalance.minSampledKvCaches)
         return false;
+    // One attempt per target: wait until the target has been recomputed since the last adjust().
+    if (mAdjustedTargetRatioGeneration == mTargetRatioGeneration)
+        return false;
     double now = nowSeconds();
     if (now - mLastAdjustmentTime < mConfig.poolRebalance.cooldownSecs)
         return false;
@@ -1574,6 +1581,7 @@ void KvCacheManager::adjust()
             _adjustLevel(level, getQuota(level));
     }
     mLastAdjustmentTime = nowSeconds();
+    mAdjustedTargetRatioGeneration = mTargetRatioGeneration;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
