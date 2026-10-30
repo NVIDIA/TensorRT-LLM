@@ -894,6 +894,24 @@ def test_draft_forward_swaps_in_draft_staging():
 
 
 @pytest.mark.cpu_only
+def test_gather_pool_rows_for_generation_copies_pairs():
+    """A plain pool's selected rows land at their pair index; unselected pairs stay -1."""
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
+        gather_pool_rows_for_generation,
+    )
+
+    pool_rows = torch.arange(10, dtype=torch.float32).view(10, 1, 1).expand(10, 1, 4).contiguous()
+    topk_global = torch.tensor([[3, -1], [0, 9]], dtype=torch.int32)
+    scratch = torch.full((2, 2, 4), -7.0)
+    compact = torch.zeros((2, 2), dtype=torch.int32)
+    gather_pool_rows_for_generation(pool_rows, topk_global, scratch, compact)
+    assert compact.tolist() == [[0, -1], [2, 3]]
+    assert scratch[0, 0].tolist() == [3.0] * 4
+    assert scratch[1, 0].tolist() == [0.0] * 4
+    assert scratch[1, 1].tolist() == [9.0] * 4
+
+
+@pytest.mark.cpu_only
 def test_retained_compressed_row_mask_drops_pages_the_twin_released():
     """DeepSeek-V4: the second native scatter only writes rows whose page the twin holds."""
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (

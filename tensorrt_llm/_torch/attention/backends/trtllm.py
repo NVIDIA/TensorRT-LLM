@@ -2858,7 +2858,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            None,  # kv_scale_orig_quant
+            # An FP8 pool quantizes with the per-tensor scale; NVFP4 uses its block scales.
+            self.kv_scale_orig_quant if self.has_fp8_kv_cache else None,
             0,  # residual_dim
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,

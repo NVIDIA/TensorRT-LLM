@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Retained-token rows for sparse MLA backends whose history lives in a native NVFP4 pool.
+"""Retained-token rows for the sparse MLA backends.
 
 The KV append also writes each token's row into the manager's retained-token twin layer;
-after the backend's top-k gather, the rows the twin still holds replace the dequantized
-rows in its FP8 scratch. Twin page table: page >= 0 means retained.
+after the backend's top-k gather, the rows the twin still holds replace the gathered rows
+in its scratch. With a native NVFP4 pool the gather dequantizes into an FP8 scratch; with a
+plain FP8/BF16 pool (cold-page retained tokens) the selected rows are copied into a scratch
+of the pool's dtype, so the overlay and the attention read the same compact layout.
+Twin page table: page >= 0 means retained.
 """
 
 from typing import Optional
@@ -410,3 +413,81 @@ def overlay_retained_rows(
         ROW_WIDTH=row_width,
         BLOCK_SIZE=_block_size(row_width),
     )
+
+
+# One FMHA KV tile: the sparse context kernel may prefetch one tile past the last selected row.
+_FMHA_KV_TILE_ROWS = 128
+
+
+def gather_pool_rows_for_generation(
+    pool_rows: torch.Tensor,
+    topk_indices_global: torch.Tensor,
+    scratch: torch.Tensor,
+    compact_indices: torch.Tensor,
+) -> None:
+    """Plain pool, generation: copy each (query, k) selected row into the scratch row of its pair.
+
+    ``pool_rows``: ``[tokens, 1, row]`` view of the pool; ``topk_indices_global``: global pool
+    rows per pair (-1 = none); ``scratch``: ``[rows, topk, row]``; ``compact_indices``:
+    ``[rows, topk]`` int32, receives the scratch row of each pair (-1 stays -1).
+    """
+    num_rows, topk = topk_indices_global.shape
+    pairs = num_rows * topk
+    flat = topk_indices_global.reshape(-1)
+    valid = flat >= 0
+    torch.index_select(
+        pool_rows,
+        0,
+        torch.where(valid, flat, torch.zeros_like(flat)),
+        out=scratch.view(pairs, 1, -1),
+    )
+    pair_ids = torch.arange(pairs, device=flat.device, dtype=torch.int32)
+    compact_indices.copy_(
+        torch.where(valid, pair_ids, torch.full_like(pair_ids, -1)).view(num_rows, topk)
+    )
+
+
+def gather_pool_rows_for_context(
+    metadata, local_layer_idx: int, topk_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plain pool, context: stage every context request's KV rows contiguously.
+
+    Row ``cu_kv[request] + position`` of the scratch holds that token, so a pair's compact
+    index is its selected position plus its request's offset. Returns ``(scratch, compact)``.
+    """
+    metadata._ensure_pool_view_cached()
+    pool_rows = metadata._cached_pool_view
+    num_contexts = metadata.num_contexts
+    total = int(metadata.num_ctx_mla_kv_tokens)
+    if total <= 0:
+        raise RuntimeError("DSA context has no active KV tokens")
+    device = topk_indices.device
+    cu_kv = metadata.ctx_kv_indptr[: num_contexts + 1]
+    kv_lens = cu_kv[1:] - cu_kv[:-1]
+    max_kv = int(kv_lens.max().item())
+    positions = torch.arange(max_kv, device=device, dtype=torch.int32).expand(num_contexts, max_kv)
+    valid = positions < kv_lens.unsqueeze(1)
+    positions = torch.where(valid, positions, torch.full_like(positions, -1)).contiguous()
+    page_index_scale, layer_offset = metadata.kv_cache_manager.get_primary_pool_page_index_params(
+        local_layer_idx
+    )
+    # The same index conversion the top-k uses, applied to every position of every request.
+    rows = torch.ops.trtllm.convert_req_index_to_global(
+        torch.arange(num_contexts, device=device, dtype=torch.int32),
+        metadata._cached_block_table_ctx,
+        positions,
+        metadata._cached_tokens_per_block,
+        max_kv,
+        page_index_scale * metadata._cached_tokens_per_block,
+        layer_offset,
+    )
+    scratch = torch.empty(
+        (total + _FMHA_KV_TILE_ROWS, 1, pool_rows.shape[-1]), dtype=pool_rows.dtype, device=device
+    )
+    torch.index_select(pool_rows, 0, rows[valid], out=scratch[:total])
+    scratch[total:].zero_()
+    offsets = cu_kv[:-1][metadata._cached_req_idx_ctx.long()].to(torch.int32).unsqueeze(1)
+    compact = torch.where(
+        topk_indices >= 0, topk_indices + offsets, torch.full_like(topk_indices, -1)
+    )
+    return scratch, compact.contiguous()
