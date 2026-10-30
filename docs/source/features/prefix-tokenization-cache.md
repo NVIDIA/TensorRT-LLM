@@ -72,6 +72,30 @@ feature you turned on.
   fallbacks, and its occupancy, so a cache that is enabled but never hitting is
   visible in the server log.
 
+## Multiple serving frontends
+
+Use a single serving frontend (`num_serve_frontends: 1`, the default) when you
+enable the cache for multi-turn traffic.
+
+The cache lives in the memory of one frontend process and is not shared
+between processes. With `num_serve_frontends: K`, the K frontend processes
+share the serving port through `SO_REUSEPORT`, and the kernel assigns each new
+TCP connection to one of them without looking at the request. A client that
+opens a new connection per request, as many benchmark clients do, therefore
+sends each turn of a conversation to an arbitrary frontend. That frontend
+usually has not seen the conversation's previous turn, so the prompt is
+tokenized in full.
+
+On an agentic multi-turn trace with prompts of about 160k tokens on average,
+at one session, the p90 time spent in the frontend was 453 ms with 8
+frontends and 166 ms with one. Decode throughput per user was the same up to
+32 concurrent sessions, because at that concurrency the frontend is not the
+bottleneck.
+
+Multiple frontends help when a single Python frontend cannot keep up, typically
+at high request rates with short prompts. That is not the workload this cache
+targets.
+
 ## Measured effect
 
 An A/B on GLM-5.2 (GB300, disaggregated, matched pair, 3600 s, ~29.6k requests
