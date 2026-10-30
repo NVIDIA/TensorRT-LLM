@@ -3267,6 +3267,8 @@ def test_deepseek_finish_completes_a_call_from_the_last_delta(
     assert [
         (name, json.loads(arguments)) for name, arguments in streamed.values()
     ] == [(call.name, json.loads(call.parameters)) for call in whole.calls]
+    assert [call["arguments"] for call in parser.prev_tool_call_arr
+            ] == [json.loads(call.parameters) for call in whole.calls]
 
 
 @pytest.mark.parametrize(
@@ -3480,11 +3482,12 @@ def test_deepseek_v31_two_calls_stream_at_any_chunk_size(
         f"<｜tool▁call▁begin｜>{name}<｜tool▁sep｜>\n{args}\n<｜tool▁call▁end｜>"
         for name, args in calls) + "<｜tool▁calls▁end｜>")
     parser = DeepSeekV31Parser()
-    names, arguments = [], {}
+    names, arguments, content = [], {}, ""
 
     for i in range(0, len(text), chunk_size):
         result = parser.parse_streaming_increment(text[i:i + chunk_size],
                                                   sample_tools)
+        content += result.normal_text
         for call in result.calls:
             if call.name:
                 names.append(call.name)
@@ -3492,6 +3495,7 @@ def test_deepseek_v31_two_calls_stream_at_any_chunk_size(
                                           call.parameters)
 
     assert names == [name for name, _ in calls]
+    assert content == ""
     assert arguments == {i: args for i, (_, args) in enumerate(calls)}
     assert [call["arguments"] for call in parser.prev_tool_call_arr
             ] == [json.loads(args) for _, args in calls]

@@ -64,6 +64,7 @@ class DeepSeekV31Parser(BaseToolParser):
         # Buffer index from which a tool separator could still appear. Text
         # before it was already searched.
         self._sep_search_start = 0
+        self._pending_call_end = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -98,6 +99,7 @@ class DeepSeekV31Parser(BaseToolParser):
         argument_diff = func_args[len(self._last_arguments) :]
         self._last_arguments = func_args
         self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = json.loads(func_args)
         return StreamingParseResult(
             calls=[ToolCallItem(tool_index=self.current_tool_id, parameters=argument_diff)]
         )
@@ -136,6 +138,17 @@ class DeepSeekV31Parser(BaseToolParser):
         self._buffer += new_text
         current_text = self._buffer
 
+        if self._pending_call_end:
+            pending = current_text.lstrip()
+            if not pending or (len(pending) < len(_TOOL_CALL_END)
+                               and _TOOL_CALL_END.startswith(pending)):
+                self._buffer = pending
+                return StreamingParseResult()
+            if pending.startswith(_TOOL_CALL_END):
+                self._buffer = pending[len(_TOOL_CALL_END) :]
+                current_text = self._buffer
+            self._pending_call_end = False
+
         # Check if we have a tool call (either the start token or individual tool call)
         start_tokens = [self.bot_token, "<｜tool▁call▁begin｜>"]
         start_indices = [idx for idx in map(current_text.find, start_tokens) if idx != -1]
@@ -143,7 +156,8 @@ class DeepSeekV31Parser(BaseToolParser):
 
         if not has_tool_call:
             if any(
-                self._ends_with_partial_token(current_text, b_token) for b_token in start_tokens
+                self._ends_with_partial_token(current_text, token)
+                for token in (*start_tokens, self.eot_token, _TOOL_CALL_END)
             ):
                 return StreamingParseResult()
             normal_text = current_text
@@ -250,6 +264,7 @@ class DeepSeekV31Parser(BaseToolParser):
                             self._buffer = current_text[partial_match.end(3) :]
                         else:
                             self._buffer = ""
+                        self._pending_call_end = not bool(is_tool_end)
 
                         result = StreamingParseResult(normal_text=normal_text, calls=calls)
                         self.current_tool_id += 1
@@ -339,6 +354,7 @@ class DeepSeekV31Parser(BaseToolParser):
                 self._buffer = current_text[end_idx + len(_TOOL_CALL_END) :]
             else:
                 self._buffer = current_text[partial_end:]
+            self._pending_call_end = end_idx == -1
             self._sep_search_start = 0
             self._args_start = -1
 

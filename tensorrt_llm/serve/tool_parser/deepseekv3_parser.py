@@ -98,6 +98,7 @@ class DeepSeekV3Parser(BaseToolParser):
         argument_diff = func_args[len(self._last_arguments) :]
         self._last_arguments = func_args
         self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = json.loads(func_args)
         return StreamingParseResult(
             calls=[ToolCallItem(tool_index=self.current_tool_id, parameters=argument_diff)]
         )
