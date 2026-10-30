@@ -611,6 +611,23 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
+    def _buffer_page_range(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> tuple[int, int]:
+        """Rows [first, last) of get_buffers(layer_idx, attn_type) that lie in its pool's current window.
+
+        The view extends to get_page_index_upper_bound, which under copy-based rebalancing is the arena end,
+        so it covers every pool of the arena; this is the part its own pool owns.
+        """
+        layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
+        data_role = attn_type.role
+        first, last = self.impl.get_page_index_range(layer_id, data_role)
+        if _get_index_mode(attn_type) == PageIndexMode.PER_LAYER:
+            # The same shift get_buffers applies to the upper bound.
+            converter = self.impl.get_page_index_converter(layer_id, data_role)
+            if converter.layer_offset is not None:
+                first += converter.layer_offset * converter.expansion
+                last += converter.layer_offset * converter.expansion
+        return first, last
+
     def get_compress_scale_buffers(self, layer_idx: int) -> torch.Tensor:
         """Return E4M3 per-16 scales for an NVFP4 COMPRESS layer."""
         if not self._use_nvfp4_compress:
@@ -2267,34 +2284,44 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             [False], dtype=torch.bool, device=torch.cuda.current_device()
         )
         buffers_handled = set()
+        zeroed = []  # (buffer, guard key) of every buffer zeroed
 
         # Handle each attention buffer from start to end to traverse the whole
         # KV cache. Multiple attention buffers can now share one cache layer.
         for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
-            buffers = [((layer_id, attn.role), self.get_buffers(layer, attn))]
+            # Only the rows in the buffer's pool window: under copy-based rebalancing the view
+            # reaches the arena end, and scanning it whole per buffer reads the arena once per
+            # buffer (minutes at startup).
+            first, last = self._buffer_page_range(layer, attn)
+            buffers = [((layer_id, attn.role), self.get_buffers(layer, attn), first, last)]
             if self._use_nvfp4_compress and attn == DeepseekV4AttentionType.COMPRESS:
                 buffers.append(
                     (
                         (layer_id, COMPRESS_BLOCK_SCALE_ROLE),
                         self.get_compress_scale_buffers(layer),
+                        *self.impl.get_page_index_range(layer_id, COMPRESS_BLOCK_SCALE_ROLE),
                     )
                 )
-            for buffer_key, buffer in buffers:
+            for buffer_key, buffer, first, last in buffers:
                 if buffer_key in buffers_handled:
                     continue
-                if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+                if scan_kv_buffer_for_invalid_values(buffer[first:last], has_invalid_values):
                     some_checks_unavailable = True
                 if fill_with_zero:
-                    buffer.zero_()
-                    # Warmup scrubs the cache with fill_with_zero before inference;
-                    # restore this buffer's guard-page sentinel so the startup
-                    # warning does not claim a guard that was just wiped (mirrors
-                    # the base check_invalid_values_in_kv_cache). The guard key is
-                    # this buffer's (layer_id, role) identity == buffer_key.
-                    guard_page = self._guard_page_by_layer.get(buffer_key)
-                    if guard_page is not None and self._guard_page_value is not None:
-                        _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
+                    buffer[first:last].zero_()
+                    zeroed.append((buffer, buffer_key))
                 buffers_handled.add(buffer_key)
+        # Warmup scrubs the cache with fill_with_zero before inference; restore
+        # every guard-page sentinel once all buffers are zeroed, so the startup
+        # warning does not claim a guard that was just wiped (mirrors the base
+        # check_invalid_values_in_kv_cache). Buffers of one pool share its rows, so
+        # zeroing a later buffer would wipe an earlier one's sentinel. The guard key
+        # is the buffer's (layer_id, role) identity.
+        if self._guard_page_value is not None:
+            for buffer, buffer_key in zeroed:
+                guard_page = self._guard_page_by_layer.get(buffer_key)
+                if guard_page is not None:
+                    _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
         torch.cuda.synchronize()
 
         if some_checks_unavailable:

@@ -670,6 +670,22 @@ size_t KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) co
         * static_cast<size_t>(attr.expansion);
 }
 
+std::pair<size_t, size_t> KvCacheManager::getPageIndexRange(LayerId layerId, DataRole role) const
+{
+    auto const apiLock = lockShared();
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    PoolGroupIndex const pg = mStorage->getPoolGroupIndex(attr.lifeCycleId);
+    SlotWindow const window = mStorage->hotPoolWindows().at(pg).at(attr.poolIndex);
+    // As in getPageIndexUpperBound: slot s starts at page s * perSlot - lead of a view rooted at the buffer.
+    size_t const perSlot = exactDiv(mStorage->slotSize(pg).at(attr.poolIndex), attr.size);
+    size_t const lead = exactDiv(attr.offset, attr.size);
+    auto const page = [&](auto slot) { return toSizeT(slot) * perSlot; };
+    size_t const first = page(window.begin) > lead ? page(window.begin) - lead : 0;
+    size_t const last = page(window.end) - lead;
+    auto const expansion = static_cast<size_t>(attr.expansion);
+    return {first * expansion, last * expansion};
+}
+
 std::optional<std::vector<int32_t>> KvCacheManager::getPageIndexBindings(LayerId layerId, DataRole role) const
 {
     auto const apiLock = lockShared();

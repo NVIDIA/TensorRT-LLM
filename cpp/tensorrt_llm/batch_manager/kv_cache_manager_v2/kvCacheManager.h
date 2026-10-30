@@ -216,6 +216,11 @@ public:
 
     int getPageStride(LayerId layerId, DataRole role) const;
     size_t getPageIndexUpperBound(LayerId layerId, DataRole role) const;
+    //! Page indices [first, second) of a view over the buffer (rooted at its base address, as for
+    //! getPageIndexUpperBound) that lie in its pool's current window. Without copy-based rebalancing that is
+    //! [0, getPageIndexUpperBound()); in an arena the upper bound is the arena end, and this is the part the
+    //! pool owns now.
+    std::pair<size_t, size_t> getPageIndexRange(LayerId layerId, DataRole role) const;
 
     //! Whether this buffer was declared sparse, i.e. whether its pages are host memory
     //! read through the sparse GPU cache rather than device memory read directly.
