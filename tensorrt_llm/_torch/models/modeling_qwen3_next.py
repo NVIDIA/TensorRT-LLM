@@ -41,7 +41,7 @@ from tensorrt_llm._torch.moe.fused_shared_expert import \
     fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
-from tensorrt_llm._utils import get_sm_version, is_sm_120f
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_120f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
@@ -76,9 +76,6 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig,
                              moe_experts_quant_config, register_auto_model)
 
-# The architecture the Qwen3.5 attention / GDN / draft decode paths are
-# validated on.
-_DECODE_KERNELS_SM = 103
 # Most rows of the MTP fc all-reduce fused with the input RMSNorm.
 _FC_FUSED_NORM_MAX_TOKENS = 1024
 
@@ -91,8 +88,8 @@ def _is_qwen3_5(model_config: ModelConfig) -> bool:
 
 def _uses_decode_kernels(model_config: ModelConfig) -> bool:
     """Whether the Qwen3.5 attention / GDN / draft decode paths are built:
-    a Qwen3.5 checkpoint on _DECODE_KERNELS_SM."""
-    return _is_qwen3_5(model_config) and get_sm_version() == _DECODE_KERNELS_SM
+    a Qwen3.5 checkpoint on SM 10.0 / 10.3."""
+    return _is_qwen3_5(model_config) and is_blackwell_datacenter()
 
 
 def _fused_norm_weight(norm: RMSNorm) -> torch.Tensor:

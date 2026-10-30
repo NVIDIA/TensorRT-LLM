@@ -246,6 +246,8 @@ l0_b200:
   - unittest/_torch/modules/test_swiglu_2in.py
   - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/test_low_m_gemm.py
+  - unittest/_torch/modules/test_low_m_mma_gemm.py
+  - unittest/_torch/moe/test_moe_decode_front.py
   - unittest/_torch/modules/test_embedding_lookup.py
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
   - unittest/_torch/modules/mamba

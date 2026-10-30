@@ -28,7 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_blackwell_datacenter
 
 from ....autotuner import (
     AutoTuner,
@@ -845,12 +845,12 @@ def front_eligible(moe, x: torch.Tensor, max_tokens: int) -> bool:
     """Whether ``moe`` and ``x`` take the decode front: a ConfigurableMoE over a TRTLLM-gen NVFP4 leaf that
     takes prerouted routing, without communication, load balancer or DWDP, Renormalize routing over
     ``KERNEL_NUM_EXPERTS`` experts with top-k ``KERNEL_TOP_K``, a 2-D BF16 ``x`` of 1..``max_tokens`` rows, on
-    SM 10.3 (the architecture the front is validated on)."""
+    SM 10.0 / 10.3."""
     from ..configurable_moe import ConfigurableMoE
     from ..routing import RoutingMethodType
     from .fp4_block_scale import TRTLLMGenFp4BlockScaleBase
 
-    if not isinstance(moe, ConfigurableMoE) or get_sm_version() != 103:
+    if not isinstance(moe, ConfigurableMoE) or not is_blackwell_datacenter():
         return False
     backend = moe.backend
     if (

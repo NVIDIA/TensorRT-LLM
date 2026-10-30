@@ -38,8 +38,9 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 pytestmark = [
     pytest.mark.threadleak(enabled=False),
     pytest.mark.skipif(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-        reason="the kernels are enabled on SM103",
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+        reason="the kernels are enabled on SM100/SM103",
     ),
 ]
 

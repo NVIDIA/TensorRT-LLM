@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.modules import low_m_mma_gemm as L
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="needs SM103",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="needs SM100/SM103",
 )
 
 

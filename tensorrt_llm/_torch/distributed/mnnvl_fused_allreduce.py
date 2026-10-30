@@ -33,7 +33,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_blackwell_datacenter
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
@@ -277,10 +277,10 @@ class MnnvlAllReduceNorm:
     @staticmethod
     def is_supported(mapping, dtype: torch.dtype, hidden_size: int) -> bool:
         """BF16, TP 2 / 4 / 8 / 16 without attention DP, hidden sizes the slot kernel's 8 CTAs per token split
-        into whole warps; SM 10.3 (the architecture the kernels are validated on)."""
+        into whole warps; SM 10.0 / 10.3."""
         return (
             IS_CUTLASS_DSL_AVAILABLE
-            and get_sm_version() == 103
+            and is_blackwell_datacenter()
             and dtype == torch.bfloat16
             and mapping.tp_size in (2, 4, 8, 16)
             and not mapping.enable_attention_dp

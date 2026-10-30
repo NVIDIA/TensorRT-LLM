@@ -251,11 +251,18 @@ def test_pre_moe_allreduce_runs_in_mixer_output_projection() -> None:
 
 @pytest.mark.parametrize(
     "model_type,sm,enabled",
-    [("qwen3_5_moe", 103, True), ("qwen3_next", 103, False), ("qwen3_5_moe", 100, False)],
+    [
+        ("qwen3_5_moe", 103, True),
+        ("qwen3_5_moe", 100, True),
+        ("qwen3_next", 103, False),
+        ("qwen3_5_moe", 107, False),
+        ("qwen3_5_moe", 90, False),
+    ],
 )
-def test_attention_takes_the_gqa_decode_kernel_on_qwen3_5_sm103_only(
+def test_attention_takes_the_gqa_decode_kernel_on_qwen3_5_sm100_and_sm103(
     monkeypatch, model_type, sm, enabled
 ) -> None:
+    from tensorrt_llm import _utils
     from tensorrt_llm._torch.models import modeling_qwen3_next
     from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3Attention
 
@@ -265,7 +272,7 @@ def test_attention_takes_the_gqa_decode_kernel_on_qwen3_5_sm103_only(
         nn.Module.__init__(self)
         built.update(kwargs)
 
-    monkeypatch.setattr(modeling_qwen3_next, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(_utils, "get_sm_version", lambda: sm)
     monkeypatch.setattr(Qwen3Attention, "__init__", record_init)
     config = SimpleNamespace(
         pretrained_config=SimpleNamespace(model_type=model_type),

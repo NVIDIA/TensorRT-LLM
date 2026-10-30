@@ -27,8 +27,8 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_front as df
 E, K, H = 512, 10, 4096
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="needs SM103",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="needs SM100/SM103",
 )
 
 # The low-M BF16 router tactic for [E, H] (one tile per CTA, no split-K), shared by both small-M fronts.

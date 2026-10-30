@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 
+from ..._utils import is_blackwell_datacenter
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
 
@@ -25,12 +26,8 @@ MAX_M = 32
 
 @functools.lru_cache(maxsize=None)
 def warp_mma_supported() -> bool:
-    """SM 10.3, the architecture the kernel is validated on."""
-    return (
-        IS_CUTLASS_DSL_AVAILABLE
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability() == (10, 3)
-    )
+    """SM 10.0 / 10.3 with the CuTe DSL."""
+    return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and is_blackwell_datacenter()
 
 
 @functools.lru_cache(maxsize=None)
