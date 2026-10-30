@@ -1321,6 +1321,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
+    def _mla_cached_kv_partition_tokens(self) -> Optional[int]:
+        """Cached tokens attended per MLA context partition, or None if unpartitioned.
+
+        Chunked prefill splits the cached prefix by its buffer size. FP4 MLA
+        also attends a prefix claimed by block reuse in partitions read back
+        from FP4 storage; each partition must fit the FP8 context scratch,
+        which holds ``max_num_tokens`` tokens per chunked-prefill buffer.
+        """
+        features = self.runtime_features
+        if features.chunked_prefill:
+            return features.chunk_size * features.chunked_prefill_buffer_batch_size
+        if self.fp4_mla_state is not None:
+            return int(self.max_num_tokens)
+        return None
+
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
@@ -1330,15 +1345,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         merge_op_tensor: torch.Tensor,
         max_chunk_len_per_loop: list[int],
         chunked_loop_num: int,
+        total_chunk_size: Optional[int] = None,
     ) -> None:
         """
         Pre-process the MLA layer for chunked prefill.
         This method is called before the forward pass to prepare the MLA layer for chunked prefill.
+        Each loop attends at most ``total_chunk_size`` cached tokens summed over the
+        context requests; it defaults to the chunked-prefill buffer size.
         """
         num_contexts = self.num_contexts
-        chunk_size = self.runtime_features.chunk_size
-        chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-        total_chunk_size = chunk_size * chunk_batch_size
+        if total_chunk_size is None:
+            chunk_size = self.runtime_features.chunk_size
+            chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
+            total_chunk_size = chunk_size * chunk_batch_size
         remain_buffer_len = total_chunk_size
         current_batch_idx = 0
         max_chunk_len_per_loop.clear()
@@ -1405,10 +1424,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
             # determine the number of loop
             # currently we assume that the chunk size is the same as the max_num_tokens
-            if self.runtime_features.chunked_prefill:
-                chunk_size = self.runtime_features.chunk_size
-                chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-                total_chunk_size = chunk_size * chunk_batch_size
+            total_chunk_size = self._mla_cached_kv_partition_tokens()
+            if total_chunk_size is not None:
                 self.chunked_loop_num = math.ceil(self.num_ctx_cached_tokens /
                                                   total_chunk_size)
                 self.chunked_seq_len = torch.zeros(
@@ -1460,7 +1477,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cu_chunked_seq_len=self.host_cu_chunked_seq_len,
                     merge_op_tensor=self.host_merge_op_tensor,
                     max_chunk_len_per_loop=self.max_chunk_len_per_loop,
-                    chunked_loop_num=self.chunked_loop_num)
+                    chunked_loop_num=self.chunked_loop_num,
+                    total_chunk_size=total_chunk_size)
                 self.chunked_seq_len.copy_(self.host_chunked_seq_len,
                                            non_blocking=True)
                 self.cu_chunked_seq_len.copy_(self.host_cu_chunked_seq_len,

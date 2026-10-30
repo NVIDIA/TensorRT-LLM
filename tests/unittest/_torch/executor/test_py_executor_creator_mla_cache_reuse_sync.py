@@ -531,7 +531,7 @@ def test_fp4_mla_rejects_unaligned_chunk_unit() -> None:
 
 @pytest.mark.parametrize(
     ("is_hybrid", "enable_chunked_prefill", "supported"),
-    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+    [(True, True, True), (True, False, False), (False, True, True), (False, False, True)],
 )
 def test_fp4_mla_block_reuse_blocker(
     monkeypatch: pytest.MonkeyPatch,
@@ -546,9 +546,7 @@ def test_fp4_mla_block_reuse_blocker(
     )
 
     assert (blocker is None) == supported
-    if not is_hybrid:
-        assert "hybrid linear-attention" in blocker
-    elif not enable_chunked_prefill:
+    if not supported:
         assert "enable_chunked_prefill" in blocker
 
 
@@ -572,21 +570,30 @@ def test_hybrid_fp4_mla_keeps_block_reuse_with_chunked_prefill(monkeypatch, sm_v
     assert ctx_chunk_configs == [(ContextChunkingPolicy.FORCE_CHUNK, 128)]
 
 
-@pytest.mark.parametrize(
-    ("is_hybrid", "enable_chunked_prefill"),
-    [(True, False), (False, True), (False, False)],
-    ids=["hybrid_without_chunked_prefill", "dense", "dense_without_chunked_prefill"],
-)
-def test_fp4_mla_disables_unsupported_block_reuse(
-    monkeypatch, is_hybrid: bool, enable_chunked_prefill: bool
-):
+@pytest.mark.parametrize("enable_chunked_prefill", [True, False])
+def test_dense_fp4_mla_keeps_block_reuse(monkeypatch, enable_chunked_prefill: bool):
+    kv_cache_reuse, runtime_cache_reuse, runtime_chunked_prefill = _run_create_py_executor(
+        monkeypatch,
+        sm_version=107,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        enable_chunked_prefill=enable_chunked_prefill,
+    )
+
+    # Dense FP4 MLA claims whole blocks and attends the cached prefix
+    # through context partitions, with or without chunked prefill.
+    assert kv_cache_reuse is True
+    assert runtime_cache_reuse is True
+    assert runtime_chunked_prefill is enable_chunked_prefill
+
+
+def test_hybrid_fp4_mla_disables_block_reuse_without_chunked_prefill(monkeypatch):
     ctx_chunk_configs = []
     kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
         monkeypatch,
         sm_version=107,
         kv_cache_quant_algo=QuantAlgo.NVFP4,
-        enable_chunked_prefill=enable_chunked_prefill,
-        is_hybrid_linear_model=is_hybrid,
+        enable_chunked_prefill=False,
+        is_hybrid_linear_model=True,
         ctx_chunk_configs=ctx_chunk_configs,
     )
 

@@ -3432,3 +3432,476 @@ def test_fp4_mla_v_repack_generation_csr_crosses_page_boundary() -> None:
     assert torch.equal(actual, expected)
     assert torch.all(actual[_V_REPACK_HEAD_DIM : 2 * _V_REPACK_HEAD_DIM] == sentinel)
     assert torch.all(actual[3 * _V_REPACK_HEAD_DIM : 4 * _V_REPACK_HEAD_DIM] == sentinel)
+
+
+# Cached-context prefill: block reuse and chunked prefill.
+
+_CACHED_CONTEXT_NUM_HEADS = 16
+_CACHED_CONTEXT_KV_LORA_RANK = 512
+_CACHED_CONTEXT_QK_NOPE_HEAD_DIM = 128
+_CACHED_CONTEXT_QK_ROPE_HEAD_DIM = 64
+_CACHED_CONTEXT_V_HEAD_DIM = 128
+
+
+class _MlaContextStub:
+    """The MLA module state that the FP4 MLA cached-context path reads."""
+
+    forward_context_with_chunked_prefill_fp4 = MLA.forward_context_with_chunked_prefill_fp4
+
+    def __init__(self, mha, kv_b_weight: torch.Tensor) -> None:
+        self.mha = mha
+        self.num_heads_tp = _CACHED_CONTEXT_NUM_HEADS
+        self.num_context_heads = _CACHED_CONTEXT_NUM_HEADS
+        self.kv_lora_rank = _CACHED_CONTEXT_KV_LORA_RANK
+        self.qk_nope_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM
+        self.qk_rope_head_dim = _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+        self.qk_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+        self.v_head_dim = _CACHED_CONTEXT_V_HEAD_DIM
+        self.out_scale = None
+        self.kv_b_weight = kv_b_weight
+
+    def _project_context_kv(self, compressed_kv: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(compressed_kv, self.kv_b_weight)
+
+
+def _fp4_mla_rope_table(max_positions: int) -> torch.Tensor:
+    """RoPE table in the FP4 MLA kernel layout with a distinct angle per position."""
+    pairs = _CACHED_CONTEXT_QK_ROPE_HEAD_DIM // 2
+    positions = torch.arange(max_positions, dtype=torch.float64)[:, None]
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(pairs, dtype=torch.float64) / pairs))
+    angles = positions * inv_freq[None, :]
+    table = torch.zeros(max_positions, _CACHED_CONTEXT_QK_ROPE_HEAD_DIM, 2, dtype=torch.float64)
+    table[:, :pairs, 0] = torch.cos(angles)
+    table[:, :pairs, 1] = torch.sin(angles)
+    return table.to(device="cuda", dtype=torch.float32).contiguous()
+
+
+def _apply_fp4_mla_rope_reference(
+    values: torch.Tensor, positions: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    """Rotate interleaved RoPE pairs of ``values[..., rope_dim]`` at ``positions``."""
+    pairs = values.shape[-1] // 2
+    rows = table[positions.long()][:, :pairs]
+    while rows.ndim < values.ndim + 1:
+        rows = rows.unsqueeze(1)
+    cos = rows[..., 0]
+    sin = rows[..., 1]
+    even = values[..., 0::2].float()
+    odd = values[..., 1::2].float()
+    return torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1).flatten(-2)
+
+
+def _make_fp4_mla_context_attention(max_positions: int):
+    from tensorrt_llm._torch.attention.backends.interface import (
+        MLAParams,
+        PositionalEmbeddingParams,
+        RopeParams,
+    )
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+    from tensorrt_llm.functional import PositionEmbeddingType
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    attention = TrtllmAttention(
+        layer_idx=0,
+        num_heads=_CACHED_CONTEXT_NUM_HEADS,
+        head_dim=_CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+        num_kv_heads=_CACHED_CONTEXT_NUM_HEADS,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        q_scaling=1.0,
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gptj,
+            rope=RopeParams(
+                dim=_CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+                max_positions=max_positions,
+                duplicate_data=True,
+            ),
+            is_neox=False,
+        ),
+        mla_params=MLAParams(
+            q_lora_rank=1536,
+            kv_lora_rank=_CACHED_CONTEXT_KV_LORA_RANK,
+            qk_rope_head_dim=_CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+            qk_nope_head_dim=_CACHED_CONTEXT_QK_NOPE_HEAD_DIM,
+            v_head_dim=_CACHED_CONTEXT_V_HEAD_DIM,
+            predicted_tokens_per_seq=1,
+        ),
+    )
+    assert attention.uses_fp4_mla_attention
+    # A distinct angle per position makes a wrong token offset visible.
+    attention.rotary_cos_sin = _fp4_mla_rope_table(max_positions)
+    return attention
+
+
+def _make_fp4_mla_context_metadata(
+    kv_cache_manager: Fp4MlaKVCacheManagerV2,
+    *,
+    request_ids: list[int],
+    cached_lens: list[int],
+    new_lens: list[int],
+    max_num_tokens: int,
+    enable_block_reuse: bool,
+    chunked_prefill: bool,
+):
+    from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=len(request_ids),
+        max_num_tokens=max_num_tokens,
+        kv_cache_manager=kv_cache_manager,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        enable_context_mla_with_cached_kv=True,
+        runtime_features=AttentionRuntimeFeatures(
+            chunked_prefill=chunked_prefill,
+            cache_reuse=enable_block_reuse,
+            chunk_size=max_num_tokens,
+            # One buffer per partition keeps the cached prefix split across loops.
+            chunked_prefill_buffer_batch_size=1,
+        ),
+        seq_lens=torch.tensor(new_lens, dtype=torch.int),
+        num_contexts=len(request_ids),
+        request_ids=request_ids,
+        prompt_lens=[cached + new for cached, new in zip(cached_lens, new_lens)],
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached_lens),
+    )
+    metadata.prepare()
+    return metadata
+
+
+def _fp4_mla_cached_context_reference(
+    metadata,
+    *,
+    q: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_b_weight: torch.Tensor,
+    cached_lens: list[int],
+    new_lens: list[int],
+) -> torch.Tensor:
+    """Attend rotated context queries over the dequantized FP4 prefix and the BF16 tokens."""
+    num_heads = _CACHED_CONTEXT_NUM_HEADS
+    qk_nope = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM
+    qk_head_dim = qk_nope + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    head_dim = _CACHED_CONTEXT_KV_LORA_RANK + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    weight = kv_b_weight.float()
+    outputs = []
+    token_start = 0
+    for seq_idx, (cached_len, new_len) in enumerate(zip(cached_lens, new_lens)):
+        rows = slice(token_start, token_start + new_len)
+        token_start += new_len
+        latent_rows = [torch.cat((compressed_kv[rows].float(), k_pe[rows].float()), dim=-1)]
+        if cached_len > 0:
+            prefix = _materialize_reference_cache_tokens(
+                metadata,
+                layer_idx=0,
+                batch_indices=torch.full((cached_len,), seq_idx, dtype=torch.int32),
+                positions=torch.arange(cached_len, dtype=torch.int32),
+                head_dim=head_dim,
+                include_k_residual=True,
+            )
+            latent_rows.insert(0, prefix.float())
+        latent = torch.cat(latent_rows, dim=0)
+        # kv_b_proj rows hold every head's K-nope block, then every head's V block.
+        kv = latent[:, :_CACHED_CONTEXT_KV_LORA_RANK] @ weight.t()
+        k = torch.cat(
+            (
+                kv[:, : num_heads * qk_nope].view(-1, num_heads, qk_nope),
+                latent[:, None, _CACHED_CONTEXT_KV_LORA_RANK:].expand(-1, num_heads, -1),
+            ),
+            dim=-1,
+        )
+        v = kv[:, num_heads * qk_nope :].view(-1, num_heads, _CACHED_CONTEXT_V_HEAD_DIM)
+        query = q[rows].float().view(new_len, num_heads, qk_head_dim)
+        scores = torch.einsum("qhd,khd->hqk", query, k) / qk_head_dim**0.5
+        key_positions = torch.arange(cached_len + new_len, device=q.device)
+        query_positions = cached_len + torch.arange(new_len, device=q.device)
+        mask = key_positions[None, :] > query_positions[:, None]
+        scores = scores.masked_fill(mask[None], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("hqk,khd->qhd", probs, v).reshape(new_len, -1))
+    return torch.cat(outputs, dim=0)
+
+
+def _assert_rows_close(actual: torch.Tensor, expected: torch.Tensor, *, what: str) -> None:
+    actual = actual.float().reshape(actual.shape[0], -1)
+    expected = expected.float().reshape(expected.shape[0], -1)
+    expected_norms = torch.linalg.vector_norm(expected, dim=1)
+    relative_l2 = torch.linalg.vector_norm(actual - expected, dim=1) / expected_norms
+    cosine = torch.sum(actual * expected, dim=1) / (
+        torch.linalg.vector_norm(actual, dim=1) * expected_norms
+    )
+    assert bool(torch.all(expected_norms > 1e-3).item())
+    max_relative_l2 = float(relative_l2.max().item())
+    min_cosine = float(cosine.min().item())
+    assert max_relative_l2 < 0.1, f"{what}: relative L2 error {max_relative_l2} is too large"
+    assert min_cosine > 0.995, f"{what}: cosine similarity {min_cosine} is too small"
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    ("enable_block_reuse", "chunked_prefill"),
+    [(True, False), (False, True), (True, True)],
+    ids=["reuse", "chunked-prefill", "reuse-chunked-prefill"],
+)
+def test_fp4_mla_cached_context_matches_reference(
+    monkeypatch,
+    enable_block_reuse: bool,
+    chunked_prefill: bool,
+) -> None:
+    """A context step over a cached FP4 prefix matches a dequantized reference.
+
+    The prefix is written by an earlier context step. The cached step attends
+    it in several partitions, with or without chunked prefill, appends its own
+    tokens at their absolute positions, and leaves the decode sidecars that
+    its K payload implies.
+    """
+    import tensorrt_llm._torch.attention.mla as mla_module
+
+    _reset_triton_allocator()
+    monkeypatch.setattr(mla_module, "maybe_compiled_cat", torch.cat)
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    torch.manual_seed(2026)
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    num_heads = _CACHED_CONTEXT_NUM_HEADS
+    kv_lora_rank = _CACHED_CONTEXT_KV_LORA_RANK
+    qk_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    head_dim = kv_lora_rank + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    # Request 0 has a prefix read back in two partitions and new tokens that
+    # end mid-tile, request 1 has no cached prefix, and request 2's new tokens
+    # end on a block boundary.
+    cached_lens = [384, 0, 256]
+    new_lens = [100, 50, 128]
+    total_lens = [cached + new for cached, new in zip(cached_lens, new_lens)]
+    request_ids = list(range(len(cached_lens)))
+    max_num_tokens = 320
+    max_seq_len = 4 * page_size
+    num_pages = sum((total + page_size) // page_size + 1 for total in total_lens)
+    kv_cache_manager = _create_fp4_mla_v2_manager(
+        max_tokens=num_pages * page_size,
+        max_seq_len=max_seq_len,
+        max_batch_size=len(cached_lens),
+        enable_block_reuse=enable_block_reuse,
+    )
+    try:
+        kv_cache_manager.add_dummy_requests(request_ids, total_lens)
+        for pool in kv_cache_manager._iter_fp4_mla_physical_pool_views():
+            pool.view(torch.uint8).zero_()
+        attention = _make_fp4_mla_context_attention(max_seq_len)
+        kv_b_weight = (
+            torch.randn(
+                num_heads * (_CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_V_HEAD_DIM),
+                kv_lora_rank,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * kv_lora_rank**-0.5
+        )
+        mla = _MlaContextStub(attention, kv_b_weight)
+
+        # An earlier context step writes the prefixes.
+        prefix_ids = [idx for idx, cached in enumerate(cached_lens) if cached > 0]
+        prefix_lens = [cached_lens[idx] for idx in prefix_ids]
+        prefix_metadata = _make_fp4_mla_context_metadata(
+            kv_cache_manager,
+            request_ids=prefix_ids,
+            cached_lens=[0] * len(prefix_ids),
+            new_lens=prefix_lens,
+            max_num_tokens=sum(prefix_lens),
+            enable_block_reuse=enable_block_reuse,
+            chunked_prefill=chunked_prefill,
+        )
+        prefix_latent = (
+            torch.randn(sum(prefix_lens), head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        prefix_q = torch.randn(
+            sum(prefix_lens), num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        attention.append_fp4_mla_context_cache(prefix_q, prefix_latent, prefix_metadata)
+        torch.cuda.synchronize()
+
+        metadata = _make_fp4_mla_context_metadata(
+            kv_cache_manager,
+            request_ids=request_ids,
+            cached_lens=cached_lens,
+            new_lens=new_lens,
+            max_num_tokens=max_num_tokens,
+            enable_block_reuse=enable_block_reuse,
+            chunked_prefill=chunked_prefill,
+        )
+        assert attention.has_cached_kv_for_mla_context(metadata)
+        # Both features split the 640 cached tokens into partitions of at
+        # most max_num_tokens, the FP8 context scratch of one buffer.
+        assert metadata.chunked_loop_num == 2
+
+        num_tokens = sum(new_lens)
+        latent = (
+            torch.randn(num_tokens, head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        compressed_kv = latent[:, :kv_lora_rank].clone()
+        q = torch.randn(num_tokens, num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda")
+        original_q = q.clone()
+        original_k_pe = latent[:, kv_lora_rank:].clone()
+        output = torch.empty(
+            num_tokens, num_heads * _CACHED_CONTEXT_V_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        mla.forward_context_with_chunked_prefill_fp4(q, compressed_kv, latent, metadata, output)
+        torch.cuda.synchronize()
+
+        # Q and the current K rotate at their absolute positions.
+        positions = torch.cat(
+            [
+                torch.arange(cached, cached + new, dtype=torch.int32, device="cuda")
+                for cached, new in zip(cached_lens, new_lens)
+            ]
+        )
+        table = attention.rotary_cos_sin
+        q_view = q.view(num_tokens, num_heads, qk_head_dim)
+        expected_q_pe = _apply_fp4_mla_rope_reference(
+            original_q.view(num_tokens, num_heads, qk_head_dim)[
+                ..., _CACHED_CONTEXT_QK_NOPE_HEAD_DIM:
+            ],
+            positions,
+            table,
+        )
+        torch.testing.assert_close(
+            q_view[..., _CACHED_CONTEXT_QK_NOPE_HEAD_DIM:].float(),
+            expected_q_pe,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        expected_k_pe = _apply_fp4_mla_rope_reference(original_k_pe, positions, table)
+        torch.testing.assert_close(
+            latent[:, kv_lora_rank:].float(), expected_k_pe, atol=2e-2, rtol=2e-2
+        )
+
+        # The current tokens are appended after their cached prefix.
+        batch_indices = torch.cat(
+            [
+                torch.full((new,), seq_idx, dtype=torch.int32, device="cuda")
+                for seq_idx, new in enumerate(new_lens)
+            ]
+        )
+        appended = _materialize_reference_cache_tokens(
+            metadata,
+            layer_idx=0,
+            batch_indices=batch_indices,
+            positions=positions,
+            head_dim=head_dim,
+            include_k_residual=True,
+        )
+        torch.testing.assert_close(appended, latent.float(), rtol=0.25, atol=0.2)
+
+        reference = _fp4_mla_cached_context_reference(
+            metadata,
+            q=q,
+            compressed_kv=compressed_kv,
+            k_pe=latent[:, kv_lora_rank:],
+            kv_b_weight=kv_b_weight,
+            cached_lens=cached_lens,
+            new_lens=new_lens,
+        )
+        _assert_rows_close(output, reference, what="FP4 MLA cached-context output")
+
+        # Every page, the prefix pages written by the earlier step included,
+        # carries the V scales and packed V that its K payload implies.
+        v_scale = kv_cache_manager.get_mla_v_scale_pool_base()
+        v_packed = kv_cache_manager.get_mla_v_packed_pool_base()
+        assert v_packed is not None
+        expected_v_scale = v_scale.clone()
+        expected_v_packed = v_packed.clone()
+        v_scale.zero_()
+        v_packed.zero_()
+        kv_cache_manager.rebuild_disagg_imported_cache(
+            [
+                SimpleNamespace(py_request_id=request_id, prompt_len=total)
+                for request_id, total in zip(request_ids, total_lens)
+            ]
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(v_scale, expected_v_scale)
+        assert torch.equal(v_packed, expected_v_packed)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
+)
+def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch) -> None:
+    """Reuse claims only whole blocks, even for one-model draft lookahead."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    manager = _create_fp4_mla_v2_manager(
+        max_tokens=16 * page_size,
+        max_seq_len=4 * page_size,
+        max_batch_size=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
+        enable_block_reuse=True,
+    )
+
+    def make_request(request_id: int, tokens: list[int]) -> LlmRequest:
+        request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=tokens,
+            sampling_config=SamplingParams()._get_sampling_config(),
+            is_streaming=False,
+        )
+        request.paged_kv_block_ids = []
+        return request
+
+    def run_context(request: LlmRequest) -> int:
+        assert manager.prepare_context(request)
+        reused = request.context_current_position
+        assert manager.resize_context(request, request.prompt_len - reused)
+        request.context_current_position = request.prompt_len
+        manager.try_commit_blocks(request)
+        return reused
+
+    try:
+        # The HP ring is request-private, so it never cuts a prefix match short.
+        hp_layers = [
+            layer
+            for layer in manager.kv_cache_manager_py_config.layers
+            if layer.layer_id in manager._hp_manager_layer_ids
+        ]
+        assert hp_layers
+        assert all(layer.reuse_policy == AttentionReusePolicy.PRIVATE for layer in hp_layers)
+        assert manager.reuse_match_backoff == 0
+
+        prompt = list(range(1000, 1000 + 3 * page_size + 40))
+        first = make_request(1, prompt)
+        assert run_context(first) == 0
+        first_pages = manager.get_batch_cache_indices([1], layer_idx=0)[0]
+        manager.free_resources(first)
+
+        # The shared prefix ends inside the fourth block. Only whole blocks
+        # are claimed, so the context restarts on a fresh FP4 tile.
+        second = make_request(2, prompt[: 3 * page_size + 20] + [7] * 30)
+        assert run_context(second) == 3 * page_size
+        second_pages = manager.get_batch_cache_indices([2], layer_idx=0)[0]
+        assert second_pages[:3] == first_pages[:3]
+        manager.free_resources(second)
+
+        # The final prompt token is always recomputed, so an exact block
+        # multiple reuses one block less.
+        third = make_request(3, prompt[: 2 * page_size])
+        assert run_context(third) == page_size
+        manager.free_resources(third)
+    finally:
+        manager.shutdown()

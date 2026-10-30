@@ -19,6 +19,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
+    AttentionReusePolicy,
     BufferConfig,
     DataRole,
     KVCacheManagerConfig,
@@ -94,7 +95,13 @@ class Fp4MlaV2CacheLayoutPolicy:
     storing BF16 values for the full sequence.
 
     ``Fp4MlaKVCacheManagerV2`` applies this policy directly for pure MLA
-    models. Hybrid linear-attention managers compose the same policy with
+    models. Its block reuse claims only whole ``tokens_per_block`` prefixes,
+    so a reused request starts its context on a fresh 16-token quantization
+    tile and never reads the HP ring of the shared prefix. Its HP lifecycle is
+    therefore request-private: it does not constrain prefix matching, and the
+    radix tree retains only the full-history FP4 pages.
+
+    Hybrid linear-attention managers compose the same policy with
     their SSM lifecycle and forward only attention-layout operations here.
     Such a manager keeps its own disaggregation declarations and merges the
     policy's attention roles into them (``DISAGG_ROLE_MAPPER_KINDS``,
@@ -116,6 +123,13 @@ class Fp4MlaV2CacheLayoutPolicy:
     # Set by configure_manager: a disaggregated context worker keeps neither
     # V scales nor packed V (see is_fp4_mla_context_only_cache).
     fp4_mla_context_only_cache: bool = False
+    # A one-model draft layer at position i reads prompt token i + 1, and the
+    # generic reuse-match backoff recomputes that many tokens past a matched
+    # block boundary. The resulting context start is not tile aligned, which
+    # FP4 MLA cannot append to, so FP4 MLA claims whole blocks instead. The
+    # draft KV of the last reused position may then come from a different
+    # continuation, which affects draft acceptance only.
+    _supports_reuse_match_backoff = False
 
     def __init__(self, *args, **kwargs) -> None:
         kv_cache_config = args[0] if args else kwargs.get("kv_cache_config")
@@ -506,6 +520,14 @@ class Fp4MlaV2CacheLayoutPolicy:
         }
         self._fp4_mla_compact_to_local = fp4_local_layers
         self._cache_manager_layer_ids = [LayerId(i) for i in fp4_local_layers]
+        # The pure MLA manager resumes a reused prefix only on a block
+        # boundary, where no HP ring content is needed. A hybrid manager
+        # composing this policy keeps the HP ring with its recurrent snapshots.
+        hp_reuse_policy = (
+            AttentionReusePolicy.PRIVATE
+            if isinstance(self, Fp4MlaV2CacheLayoutPolicy)
+            else AttentionReusePolicy.REQUIRED
+        )
         self._hp_manager_layer_ids = []
         for local_layer in fp4_local_layers:
             layer_id = LayerId(len(cache_layers))
@@ -521,6 +543,7 @@ class Fp4MlaV2CacheLayoutPolicy:
                     ],
                     sliding_window_size=self._fp4_mla_hp_pool_size,
                     num_sink_tokens=None,
+                    reuse_policy=hp_reuse_policy,
                 )
             )
         return replace(config, layers=cache_layers)
@@ -1119,6 +1142,23 @@ class Fp4MlaV2CacheLayoutPolicy:
         if kv_cache_config.avg_seq_len is not None:
             return kv_cache_config.avg_seq_len
         return min(self.max_seq_len, _FP4_MLA_DEFAULT_TYPICAL_SEQ_LEN)
+
+    def _context_reuse_tokens(self, req: "LlmRequest", reuse_limit: Optional[int] = None):
+        """Restrict prefix matching to whole blocks of the recomputed prompt.
+
+        The radix tree can also hold a request's trailing partial block, and an
+        exact match of that block would end the reused prefix inside a 16-token
+        quantization tile. Capping the lookup at the last block boundary before
+        the final prompt token keeps every claimed prefix block aligned, so the
+        first context token always starts a fresh FP4 tile.
+        """
+        num_tokens = len(self._reuse_token_source(req))
+        aligned_limit = max(num_tokens - 1, 0) // self.tokens_per_block * self.tokens_per_block
+        if reuse_limit is not None:
+            aligned_limit = min(
+                aligned_limit, reuse_limit // self.tokens_per_block * self.tokens_per_block
+            )
+        return KVCacheManagerV2._context_reuse_tokens(self, req, aligned_limit)
 
     def get_cache_bytes_per_token(self) -> int:
         sizes, _ = self._get_runtime_cache_size_layer_components()

@@ -554,13 +554,16 @@ The FMHA package is split by role:
   attends every partition through `Fp4MlaFmha.forward_context_partition`;
   non-final chunks must cover whole 16-token FP4 tiles, which the scheduler
   keeps by rounding them to the 128-token chunk unit. A prefix reused from
-  the block cache is attended the same way, so FP4 MLA block reuse requires
-  chunked prefill; the cached-KV path (`forward_context_with_cached_kv`)
-  rejects FP4 MLA layers. Reuse must also resume on a full FP4 tile, which
-  holds for hybrid linear-attention models (reuse ends on a recurrent-state
-  snapshot that the hybrid manager aligns to a cache block) but not for dense
-  FP4 MLA, whose reuse match can back off into a tile by the one-model
-  draft's prompt lookahead; dense FP4 MLA therefore keeps block reuse off.
+  the block cache is attended the same way, with or without chunked prefill;
+  without it, each partition holds up to `max_num_tokens` cached tokens, the
+  size of the FP8 context scratch. The cached-KV path
+  (`forward_context_with_cached_kv`) rejects FP4 MLA layers. Reuse must also
+  resume on a full FP4 tile. Hybrid linear-attention models resume on a
+  recurrent-state snapshot that the hybrid manager aligns to a cache block,
+  and keep block reuse tied to chunked prefill. The dense manager claims
+  whole cache blocks only, without the reuse-match backoff of one-model
+  drafts, and keeps its HP ring request-private
+  (`AttentionReusePolicy.PRIVATE`), so the ring never cuts a match short.
   Disaggregated serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
