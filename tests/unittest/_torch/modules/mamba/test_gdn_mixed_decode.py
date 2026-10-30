@@ -4,12 +4,14 @@
 
 from collections.abc import Iterator
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.mamba import gdn_mixer
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+from tensorrt_llm._utils import is_sm_100f
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 
@@ -33,27 +35,31 @@ def _make_layer() -> Qwen3NextGatedDeltaNet:
     return layer
 
 
-@pytest.fixture(params=["flashinfer", "triton"])
+@pytest.fixture(params=["flashinfer", "triton", "flashinfer_workspace"])
 def prefill_backend(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[None]:
-    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+) -> Iterator[str]:
+    use_flashinfer = request.param != "triton"
+    # Deterministic mode splits decode from prefill; a state workspace does so in any mode.
     monkeypatch.setenv(
-        "TLLM_USE_FLASHINFER_GDN_PREFILL", "1" if request.param == "flashinfer" else "0"
+        "FORCE_DETERMINISTIC", "0" if request.param == "flashinfer_workspace" else "1"
     )
-    if request.param == "flashinfer" and not gdn_mixer._use_flashinfer_gdn_prefill():
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1" if use_flashinfer else "0")
+    if use_flashinfer and not gdn_mixer._use_flashinfer_gdn_prefill():
         pytest.skip("FlashInfer GDN prefill is unavailable on this GPU")
     gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
-    yield
+    yield request.param
     gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
 
 
 @pytest.mark.parametrize("prefill_lengths", [(1,), (127,), (128,), (129,), (7, 129)])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("preallocated", [False, True])
-@pytest.mark.usefixtures("prefill_backend")
 def test_mixed_decode_matches_decode_only(
-    prefill_lengths: tuple[int, ...], state_dtype: torch.dtype, preallocated: bool
+    prefill_backend: str,
+    prefill_lengths: tuple[int, ...],
+    state_dtype: torch.dtype,
+    preallocated: bool,
 ) -> None:
     torch.manual_seed(42)
     layer = _make_layer()
@@ -92,6 +98,14 @@ def test_mixed_decode_matches_decode_only(
         "num_prefill": num_prefills,
         "num_decodes": num_decodes,
     }
+    if prefill_backend == "flashinfer_workspace":
+        # One-sequence scratch, as on SM90/SM120: two prefills run in groups and
+        # decode never stages its state there.
+        workspace_dtype = state_dtype if is_sm_100f() else torch.float32
+        common["state_workspace"] = tuple(
+            torch.empty(1, 8, 128, 128, device="cuda", dtype=workspace_dtype) for _ in range(2)
+        )
+        common["cu_seqlens_cpu"] = torch.tensor([0, *prefill_lengths]).cumsum(0)
 
     expected_conv, expected_state = conv.clone(), state.clone()
     expected_qkv = projected.clone()[:, :2048]
@@ -128,7 +142,13 @@ def test_mixed_decode_matches_decode_only(
         else None
     )
     actual_conv, actual_state = conv.clone(), state.clone()
-    actual = layer.forward_extend(actual_conv, actual_state, output=output, **common)
+    with patch.object(
+        gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
+    ) as prefill_call:
+        actual = layer.forward_extend(actual_conv, actual_state, output=output, **common)
+    # Only the prefill requests go through the prefill kernel.
+    assert prefill_call.call_count == 1
+    assert prefill_call.call_args.kwargs["cu_seqlens"].shape[0] == num_prefills + 1
 
     torch.testing.assert_close(actual[:, prefill_length:], expected_decode, rtol=0, atol=0)
     torch.testing.assert_close(
