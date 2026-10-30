@@ -3008,6 +3008,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                               local_shared_w2_scale_tensors,
                                               module.tmp_shared_weight_scale_2)
 
+    # Whether the checkpoint carries the NVFP4 global scales (weight_scale_2
+    # and input_scale).
+    checkpoint_has_global_scales = True
+
     # Whether this backend's kernel consumes the gate and up global weight
     # scales as two separate scalars. trtllm-gen does
     # (``output1_scale_gate_scalar`` for the gate half,
@@ -3205,10 +3209,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Step 4: Finalize shared weight alphas if needed
         if hasattr(module, 'tmp_shared_weight_scale_2'):
-            # One entry per host-staged expert. A checkpoint without
-            # weight_scale_2 (an MXFP4 checkpoint served as NVFP4_PLUS) has no
-            # tmp entries and keeps alphas of 1.
-            num_shared = len(module.layer_load_balancer.get_load_expert_ids())
+            # One entry per host-staged expert. A checkpoint without global
+            # scales (an MXFP4 checkpoint served as NVFP4_PLUS) has no
+            # weight_scale_2 entries and keeps alphas of 1.
+            if self.checkpoint_has_global_scales:
+                num_shared = len(module.tmp_shared_weight_scale_2)
+            else:
+                num_shared = len(
+                    module.layer_load_balancer.get_load_expert_ids())
             shared_fc31_alpha = torch.ones(
                 (num_shared, ) + module.fc31_alpha.data.shape[1:],
                 dtype=module.fc31_alpha.data.dtype,
@@ -3932,6 +3940,23 @@ class NVFP4PlusCuteDslFusedMoEMethod(NVFP4CuteDslFusedMoEMethod):
     """
 
     scaling_vector_size = NVFP4_PLUS_SF_VEC_SIZE
+    checkpoint_has_global_scales = False
+    # Scales an MXFP4 checkpoint never has. The kernels apply no global scale
+    # and no AWQ pre-quant scale, so serving a checkpoint with them would
+    # silently drop them.
+    unsupported_scale_suffixes = ("input_scale", "weight_scale_2",
+                                  "pre_quant_scale")
+
+    def load_quant_scales(self, module: torch.nn.Module, weights: Dict) -> None:
+        unsupported = sorted(key for key in weights
+                             if key.endswith(self.unsupported_scale_suffixes))
+        if unsupported:
+            raise ValueError(
+                "NVFP4_PLUS loads MXFP4 checkpoints, which have no "
+                "input_scale, weight_scale_2 or pre_quant_scale, but this "
+                f"checkpoint has {', '.join(unsupported[:3])}"
+                f"{' ...' if len(unsupported) > 3 else ''}")
+        super().load_quant_scales(module, weights)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self,
@@ -3939,7 +3964,7 @@ class NVFP4PlusCuteDslFusedMoEMethod(NVFP4CuteDslFusedMoEMethod):
             w1_weight_scale: torch.Tensor,
             w3_weight_scale: torch.Tensor,
             dst_w3_w1_weight_scale: torch.Tensor,
-            expert_idx: int = -1):
+            expert_idx: int = -1) -> None:
         super().load_expert_w3_w1_weight_scale_nvfp4(
             module,
             None if w1_weight_scale is None else e8m0_to_ue5m3(w1_weight_scale),
@@ -3947,9 +3972,9 @@ class NVFP4PlusCuteDslFusedMoEMethod(NVFP4CuteDslFusedMoEMethod):
             dst_w3_w1_weight_scale,
             expert_idx=expert_idx)
 
-    def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
-                                          w2_weight_scale: torch.Tensor,
-                                          dst_w2_weight_scale: torch.Tensor):
+    def load_expert_w2_weight_scale_nvfp4(
+            self, module: torch.nn.Module, w2_weight_scale: torch.Tensor,
+            dst_w2_weight_scale: torch.Tensor) -> None:
         super().load_expert_w2_weight_scale_nvfp4(
             module, e8m0_to_ue5m3(w2_weight_scale), dst_w2_weight_scale)
 

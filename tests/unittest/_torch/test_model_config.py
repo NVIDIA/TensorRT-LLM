@@ -18,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization.modelopt_config import read_modelopt_quant_config
 
 pytestmark = pytest.mark.cpu_only
 
@@ -258,17 +259,20 @@ def test_deepseek_v4_base_checkpoint_detection(
     assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
 
 
-@pytest.mark.parametrize("moe_backend", ["CUTEDSL", "AUTO", "TRTLLM"])
-def test_override_quant_algo_selects_nvfp4_plus_for_mxfp4(
-    monkeypatch: pytest.MonkeyPatch, moe_backend: str
-) -> None:
-    """The override holds for any backend name; resolve_moe_impl decides who can serve it.
+def test_nvfp4_plus_override_selects_only_the_cutedsl_moe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under the override AUTO resolves to CUTEDSL, while another explicit backend
+    and a checkpoint that names NVFP4_PLUS are rejected as the config loads.
 
-    The config pre-pass in load_config_and_apply_defaults resolves AUTO without
-    the requested backend, so the config phase must not reject a backend here.
+    The config pre-pass in load_config_and_apply_defaults reads the checkpoint
+    without the requested backend, so AUTO must pass get_mxfp4_quant_algo.
     """
     monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "NVFP4_PLUS")
-    assert ModelConfig.get_mxfp4_quant_algo(moe_backend) == QuantAlgo.NVFP4_PLUS
+    assert ModelConfig.resolve_moe_backend("AUTO", "DeepseekV4ForCausalLM") == "CUTEDSL"
+    assert ModelConfig.get_mxfp4_quant_algo("AUTO") == QuantAlgo.NVFP4_PLUS
+    with pytest.raises(ValueError, match="moe_config.backend: CUTEDSL"):
+        ModelConfig.get_mxfp4_quant_algo("TRTLLM")
+    with pytest.raises(ValueError, match="OVERRIDE_QUANT_ALGO=NVFP4_PLUS"):
+        read_modelopt_quant_config({"quantization": {"quant_algo": "NVFP4_PLUS"}})
 
 
 def test_deepseek_v4_mxfp4_experts_take_the_nvfp4_plus_override(

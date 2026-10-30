@@ -65,6 +65,31 @@ This configures an active NVFP4 KV cache on the GPU. To keep the active GPU KV
 cache in its normal runtime type and use NVFP4 only while Pages reside in Host
 or Disk storage, see [KV Cache Compression](kv-cache-compression.md).
 
+#### NVFP4_PLUS MoE from MXFP4 Checkpoints
+
+On Rubin (SM107), the routed experts of an MXFP4 checkpoint can run as NVFP4_PLUS:
+E2M1 values with one UE5M3 scale per 32 values and no FP32 global scale. The E2M1
+weights load unchanged, every E8M0 scale becomes the UE5M3 scale of the same power
+of two, and the expert activations are quantized to the same format, so both MoE
+GEMMs run in FP4 without requantizing the checkpoint.
+
+Set `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` and use the CuteDSL MoE backend. Under this
+override, `moe_config.backend: AUTO` selects `CUTEDSL`, and any other backend is
+rejected.
+
+```bash
+OVERRIDE_QUANT_ALGO=NVFP4_PLUS trtllm-serve <MXFP4 checkpoint> --config config.yaml
+```
+
+```yaml
+moe_config:
+  backend: CUTEDSL
+```
+
+NVFP4_PLUS supports bias-free SwiGLU experts, such as the routed experts of
+DeepSeek-V4. It needs `hidden_size` to be a multiple of 256 and the per-rank MoE
+intermediate size to be a multiple of 128.
+
 
 ### Offline Quantization with ModelOpt
 

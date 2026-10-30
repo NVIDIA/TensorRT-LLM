@@ -470,6 +470,10 @@ def nvfp4_fc1_row_alignment_rejection(
 
     ``W4A16_NVFP4`` is answered too: its weights go through the same CUTLASS
     NVFP4 loader, and the op then splits the dequantized buffer the same way.
+
+    ``NVFP4_PLUS`` needs 256 rows: with one scale per 32 values, the FC2 input
+    (``intermediate_size_per_partition`` wide) has whole 4-column scale tiles
+    only when that width is a multiple of 128.
     """
     from tensorrt_llm._torch.utils import is_gated_activation
 
@@ -486,13 +490,14 @@ def nvfp4_fc1_row_alignment_rejection(
     if p.intermediate_size % tp_size != 0:
         # Uneven shards are a different concern; do not answer for them.
         return None
+    row_alignment = 256 if p.identity_quant == "nvfp4_plus" else 128
     fc1_rows_full = p.intermediate_size * 2
     fc1_rows = fc1_rows_full // tp_size
-    if fc1_rows % 128 == 0:
+    if fc1_rows % row_alignment == 0:
         return None
-    if fc1_rows_full % 128 == 0:
+    if fc1_rows_full % row_alignment == 0:
         hint = (
-            f"moe_tp_size must divide {fc1_rows_full // 128}; raise "
+            f"moe_tp_size must divide {fc1_rows_full // row_alignment}; raise "
             f"moe_expert_parallel_size to shrink moe_tp_size, which "
             f"non-ULYSSES CP multiplies by cp_size"
         )
@@ -501,7 +506,7 @@ def nvfp4_fc1_row_alignment_rejection(
     return MoEEligibility.no(
         MoERejectReason.SHAPE_UNALIGNED,
         f"{p.quant} MoE requires gated FC1 rows "
-        f"(2 * intermediate_size_per_partition) to be a multiple of 128, but "
+        f"(2 * intermediate_size_per_partition) to be a multiple of {row_alignment}, but "
         f"moe_tp_size={tp_size} gives {fc1_rows}. {hint}.",
     )
 

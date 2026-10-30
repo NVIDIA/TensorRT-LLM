@@ -313,6 +313,7 @@ l0_cpu:
   - unittest/models/test_quant_config_utils.py
   - unittest/others
   - unittest/quantization/test_mode.py
+  - unittest/quantization/test_nvfp4_plus_format.py
   - unittest/scaffolding
   - unittest/scripts
   - unittest/tools

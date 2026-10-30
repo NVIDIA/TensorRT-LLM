@@ -754,6 +754,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 1, max_active // 2)
         return max_active
 
+    def _rubin_sf_dtype_key(sf_dtype: Type[cutlass.Numeric]) -> tuple[str, ...]:
+        """The part of a Rubin MoE runner's unique_id that names its scale dtype.
+
+        E4M3 (NVFP4) adds nothing, so NVFP4 keeps the AutoTuner cache keys it
+        had before the runners took ``sf_dtype``.
+        """
+        if sf_dtype is cutlass.Float8E4M3FN:
+            return ()
+        return (sf_dtype.__name__, )
+
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
@@ -15827,8 +15837,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.situ_beta,
                     self.situ_linear_beta,
                     self.swiglu_limit,
-                    self.sf_dtype.__name__,
-                )
+                ) + _rubin_sf_dtype_key(self.sf_dtype)
 
             def get_valid_tactics(
                 self,
@@ -17321,8 +17330,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.tile_size,
                     self.output_dtype,
                     self.scaling_vector_size,
-                    self.sf_dtype.__name__,
-                )
+                ) + _rubin_sf_dtype_key(self.sf_dtype)
 
             @staticmethod
             def _is_n_tiling_compatible(n: int, mma_n: int,
