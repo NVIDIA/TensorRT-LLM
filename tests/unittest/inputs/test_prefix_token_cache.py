@@ -82,7 +82,7 @@ _PREAMBLE = "the cabinet had inner thread. " * 4
 
 
 def _cache(**overrides: int) -> PrefixTokenCache:
-    config = dict(max_entries=64, overlap=4, resync=2, min_chars=_MIN_CHARS)
+    config = dict(max_entries=64, overlap=4, resync=2, min_chars=_MIN_CHARS, checkpoint_tokens=8)
     return PrefixTokenCache(PrefixTokenCacheConfig(**{**config, **overrides}))
 
 
@@ -129,6 +129,24 @@ def test_resync_failure_falls_back_to_full_tokenization() -> None:
     assert cache.resync_failures > 0
 
 
+@pytest.mark.parametrize("tokenizer", [_MergeTokenizer(), _UnsyncableTokenizer()])
+def test_rewritten_history_is_identical_to_full_tokenization(tokenizer: Any) -> None:
+    """A turn that rewrites the end of the history splices from the common prefix."""
+    cache = _cache()
+    turns = _turns(8)
+    for i, prompt in enumerate(turns):
+        assert cache.encode(tokenizer, prompt) == tokenizer(prompt)["input_ids"]
+        # Trim the last message and append a different one, as agents do.
+        rewritten = prompt[: len(prompt) - 20] + f"rewritten tail {i} there. "
+        assert cache.encode(tokenizer, rewritten) == tokenizer(rewritten)["input_ids"]
+    if isinstance(tokenizer, _MergeTokenizer):
+        assert cache.divergent_hits >= len(turns)
+        # The rewritten branch does not evict the history it diverged from.
+        assert any(entry.text == turns[-1] for entry in cache._entries.values())
+    else:
+        assert cache.divergent_hits == 0 and cache.resync_failures > 0
+
+
 def test_short_prompts_are_tokenized_but_not_cached() -> None:
     tokenizer, cache = _MergeTokenizer(), _cache()
     prompt = "the cab"
@@ -160,13 +178,14 @@ def test_conversations_sharing_a_long_preamble_find_their_own_entry() -> None:
     for prompt in turns.values():
         cache.encode(tokenizer, prompt)
     assert len(cache._buckets) == 1
+    hits_before = cache.hits
     for i, prompt in turns.items():
         # The next turn keeps the previous prompt, generation suffix included.
         extended = prompt + f"reply to {i}.<|user|>\nmore from {i}.{suffix}"
         found = cache._lookup(extended)
         assert found is not None and found[1].text == prompt
         assert cache.encode(tokenizer, extended) == tokenizer(extended)["input_ids"]
-    assert cache.hits == 16 and cache.resync_failures == 0
+    assert cache.hits - hits_before == 16 and cache.resync_failures == 0
 
 
 def test_eviction_bounds_entry_count() -> None:

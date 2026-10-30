@@ -583,6 +583,19 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
 
 
+def test_executor_request_to_llm_request_copies_input_tokens_as_array() -> None:
+    tokens = np.arange(1000, 1000 + 4099, dtype=np.int32)
+    executor_request = trtllm.Request(tokens, max_tokens=4)
+
+    array = executor_request.get_input_token_ids_array()
+    assert array.dtype == np.int32 and array.tolist() == tokens.tolist()
+    llm_request = executor_request_to_llm_request(
+        7, executor_request, child_req_ids=[], exclude_last_generation_logits=False
+    )
+    assert llm_request.get_tokens(0) == tokens.tolist()
+    assert llm_request.prompt_len == len(tokens)
+
+
 def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:
     executor_request = trtllm.Request(
         input_token_ids=[1, 2, 3],
