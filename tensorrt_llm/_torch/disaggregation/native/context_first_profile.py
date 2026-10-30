@@ -3,8 +3,8 @@
 """Eligibility checks for direct, no-retry BF16 context-first retirement.
 
 Matching images, effective cache dtypes and configuration on every participant
-remain deployment invariants. Rank metadata validates topology and byte layout;
-it is not a version or dtype negotiation protocol.
+remain deployment invariants. Rank metadata checks ownership activation, topology
+and byte layout; it is not a version or dtype negotiation protocol.
 """
 
 from __future__ import annotations
@@ -124,7 +124,6 @@ def supports_context_first_bf16(
         and config.kv_transfer_timeout_ms is not None
         and config.kv_transfer_timeout_ms > 0
         and config.kv_cache_bounce_size_mb == 0
-        and not config.agent_bounce_buffer_enable
         and not config.enable_pipelined_transfer
         and not use_pure_python_transfer_agent()
         and os.getenv("TRTLLM_NIXL_KVCACHE_BACKEND", "UCX") == "UCX"
@@ -153,8 +152,10 @@ def validate_context_first_peer(local: RankInfo, peer: RankInfo) -> None:
         peer: Metadata obtained through the existing rank-discovery protocol.
 
     Raises:
-        ValueError: Topology or effective K/V layout is outside the symmetric profile.
+        ValueError: Ownership is inactive or topology/K/V layout is outside the profile.
     """
+    if local.context_first_ownership is not True or peer.context_first_ownership is not True:
+        raise ValueError("context-first retirement requires ownership-enabled peers")
     for info in (local, peer):
         attention = info.attention
         if (

@@ -775,17 +775,21 @@ def test_transfer_worker_mp(ctx_tp, ctx_pp, gen_tp, gen_pp, monkeypatch):
 
 @pytest.mark.gpu4
 @pytest.mark.timeout(180)
-def test_context_first_bf16_owned_transfer_tp2(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Transfer both BF16 K/V pools on four GPUs and settle the native session owners.
+@pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
+def test_context_first_bf16_owned_transfer(monkeypatch: pytest.MonkeyPatch, tp_size: int) -> None:
+    """Transfer both BF16 K/V pools and settle native owners on symmetric TP1/TP2.
 
     This covers real manager/NIXL transfer, not executor MPI failure containment.
 
     Args:
         monkeypatch: Isolates the no-retry/direct-transfer environment for spawned ranks.
+        tp_size: Tensor-parallel ranks in each endpoint.
     """
     if torch.cuda.device_count() < 4:
         pytest.skip("context-first TP2 ownership qualification requires four GPUs")
     monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", "1")
+    monkeypatch.setenv("TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE", "0")
     monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
     monkeypatch.setenv("TRTLLM_USE_PY_NIXL_KVCACHE", "0")
     monkeypatch.setenv("TRTLLM_NIXL_KVCACHE_BACKEND", "UCX")
@@ -795,5 +799,10 @@ def test_context_first_bf16_owned_transfer_tp2(monkeypatch: pytest.MonkeyPatch) 
         if name.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "I_MPI_", "HYDRA_", "MPI_")):
             monkeypatch.delenv(name)
     run_transfer_worker_mp(
-        ctx_tp=2, ctx_pp=1, gen_tp=2, gen_pp=1, max_port_retries=1, context_first_ownership=True
+        ctx_tp=tp_size,
+        ctx_pp=1,
+        gen_tp=tp_size,
+        gen_pp=1,
+        max_port_retries=1,
+        context_first_ownership=True,
     )

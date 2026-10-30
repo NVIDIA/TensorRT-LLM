@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -75,6 +76,7 @@ def _rank_info(tp_size: int = 2) -> RankInfo:
         transfer_engine_info=b"",
         attention=AttentionInfo(2, 16, 128, 2, False, False),
         page_table=_page_table(),
+        context_first_ownership=True,
     )
 
 
@@ -118,6 +120,26 @@ def test_context_first_profile_accepts_symmetric_tp(
     profile.validate_context_first_peer(local, RankInfo.from_bytes(local.to_bytes()))
 
 
+@pytest.mark.parametrize("active", [False, True])
+def test_context_first_ownership_metadata_round_trip(active: bool) -> None:
+    """Inactive endpoints keep the legacy wire shape; active ones advertise protection."""
+    local = replace(_rank_info(), context_first_ownership=active)
+    data = local.to_bytes()
+    assert ("context_first_ownership" in msgpack.unpackb(data, strict_map_key=False)) is active
+    assert RankInfo.from_bytes(data).context_first_ownership is active
+
+
+@pytest.mark.parametrize("local_active,peer_active", [(True, False), (False, True), (False, False)])
+def test_context_first_peer_rejects_inactive_ownership(
+    local_active: bool, peer_active: bool
+) -> None:
+    """Matching layout alone cannot qualify an endpoint with ownership inactive."""
+    local = replace(_rank_info(), context_first_ownership=local_active)
+    peer = replace(_rank_info(), context_first_ownership=peer_active)
+    with pytest.raises(ValueError, match="ownership-enabled peers"):
+        profile.validate_context_first_peer(local, RankInfo.from_bytes(peer.to_bytes()))
+
+
 @pytest.mark.parametrize(
     "name,value",
     [
@@ -152,7 +174,6 @@ def test_context_first_profile_rejects_unqualified_environment(
         (2, "transceiver_runtime", "CPP"),
         (2, "kv_transfer_timeout_ms", None),
         (2, "kv_cache_bounce_size_mb", 256),
-        (2, "agent_bounce_buffer_enable", True),
         (2, "enable_pipelined_transfer", True),
     ],
 )
@@ -166,6 +187,23 @@ def test_context_first_profile_rejects_unqualified_local_settings(
     """Each configuration guard independently excludes an unsupported path."""
     monkeypatch.setattr(local_profile[target], attribute, value)
     assert not profile.supports_context_first_bf16(*local_profile)
+
+
+@pytest.mark.parametrize("bounce_mb,eligible", [(0, True), (256, False)])
+def test_context_first_profile_uses_bounce_capacity_not_deprecated_flag(
+    local_profile: tuple[Mapping, KVCacheManagerV2, CacheTransceiverConfig],
+    bounce_mb: int,
+    eligible: bool,
+) -> None:
+    """The ignored legacy flag neither enables bounce nor permits a nonzero arena."""
+    mapping, manager, _ = local_profile
+    config = CacheTransceiverConfig(
+        backend="NIXL",
+        transceiver_runtime="PYTHON",
+        kv_cache_bounce_size_mb=bounce_mb,
+        agent_bounce_buffer_enable=True,
+    )
+    assert profile.supports_context_first_bf16(mapping, manager, config) is eligible
 
 
 def test_context_first_profile_checks_effective_layer_dtypes(
