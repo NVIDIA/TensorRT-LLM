@@ -427,7 +427,12 @@ def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool, lengths: l
 @_REQUIRES_SM100
 def test_trtllm_padding_requires_explicit_opt_in() -> None:
     """Existing callers retain dense behavior unless they opt into prefix masking."""
-    attention = visual_trtllm.TrtllmAttention(num_heads=2, head_dim=128, dtype=torch.bfloat16)
+    attention = visual_trtllm.TrtllmAttention(
+        num_heads=2,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        attention_metadata_state=create_attention_metadata_state(),
+    )
     q, k, v = [torch.randn(2, 8, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
     mask = torch.zeros(2, 8, device="cuda", dtype=torch.bool)
     attention._forward_padded_self_attention = Mock(side_effect=AssertionError("not opted in"))
