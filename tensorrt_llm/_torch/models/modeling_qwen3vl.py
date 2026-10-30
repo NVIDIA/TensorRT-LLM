@@ -1882,6 +1882,8 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     ),
 )
 class Qwen3VLModel(Qwen3VLModelBase):
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
+
     supports_encoder_cache = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):

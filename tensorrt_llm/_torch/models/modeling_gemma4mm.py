@@ -920,7 +920,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
 
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
-        "audio": frozenset(),
+        "audio": frozenset(),  # Chunked local attention with relative-position bias.
     }
 
     supports_encoder_cache = True
@@ -1313,6 +1313,10 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     - Support for image_position_ids (2D patch coordinates)
     - mm_token_type_ids-based bidirectional masking
     """
+
+    # fmt: off
+    supported_encoder_attention_backends = Gemma4MultimodalModelBase.supported_encoder_attention_backends
+    # fmt: on
 
     build_mtp_draft_model_from_config = True
     supports_mm_encoder_item_scheduling = True

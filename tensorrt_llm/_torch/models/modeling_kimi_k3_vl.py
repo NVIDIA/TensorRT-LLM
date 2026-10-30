@@ -461,6 +461,10 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     backbone classes).
     """
 
+    # fmt: off
+    supported_encoder_attention_backends = KimiK25ForConditionalGeneration.supported_encoder_attention_backends
+    # fmt: on
+
     _VISION_MODEL_CLS = KimiK3VisionModel
     mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
 

@@ -2634,6 +2634,8 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 
+    supported_encoder_attention_backends = Qwen2VLModelBase.supported_encoder_attention_backends
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
         kwargs['vision_model_class'] = Qwen2_5_VisionModel

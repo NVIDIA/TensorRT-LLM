@@ -50,18 +50,48 @@ llm = LLM(
 
 Omitted entries preserve the model's existing encoder defaults, including inheritance from `attn_backend` where applicable. An encoder override leaves the language model's backend unchanged. Backend availability and supported tensor shapes still depend on the installed kernels and hardware; floating-point differences between backends are expected.
 
-| Encoder | Supported values | Default when omitted |
+The table covers every registered multimodal model implementation; model aliases share the same declaration. Image/video share `vision`, and `audio` names a separate encoder. "Not supported" means this option cannot change that encoder's attention backend; it does not mean the model or modality is unsupported. Gemma 4 Unified uses encoder-free projections, and Mllama's vision input is not implemented. The CPU registry test checks this table against each model's explicit `supported_encoder_attention_backends` declaration.
+
+<!-- encoder-attention-backends:start -->
+| Model | Logical encoder | Supported backends |
 | --- | --- | --- |
-| Qwen2.5-VL, Qwen3-VL / Qwen3.5-VL vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | Existing `attn_backend` |
-| Gemma 4 vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | `TRTLLM` |
-| Kimi K2.5 / K3, MiniCPM-V 4.6, Step 3.7 vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | Existing `attn_backend` |
-| Mistral3 / Pixtral vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | `TRTLLM` |
-| Nemotron multimodal vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | `FLASHINFER` |
-| GLM5-Next vision | `TRTLLM` | Existing `attn_backend` |
+| `Cosmos3EdgeModel` | `vision` | Not supported |
+| `Cosmos3Model` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `DeepseekV41ForConditionalGeneration` | `vision` | Not supported |
+| `Exaone4_5_ForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Gemma3VLM` | `vision` | Not supported |
+| `Gemma4ForConditionalGeneration` | `audio` | Not supported |
+| `Gemma4ForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Gemma4UnifiedForConditionalGeneration` | None (encoder-free) | Not supported |
+| `Glm5NextVLM` | `vision` | `TRTLLM` |
+| `HCXVisionForCausalLM` | `vision` | Not supported |
+| `KimiK25ForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `KimiK3ForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Llama4ForConditionalGeneration` | `vision` | Not supported |
+| `LlavaNextModel` | `vision` | Not supported |
+| `MiniCPMV4_6Model` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `MiniMaxM3VLForConditionalGeneration` | `vision` | Not supported |
+| `Mistral3VLM` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `MllamaForConditionalGeneration` | `vision` | Not supported |
+| `NemotronHMultimodalModel` | `audio` | Not supported |
+| `NemotronHMultimodalModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Phi4MMForCausalLM` | `audio` | Not supported |
+| `Phi4MMForCausalLM` | `vision` | Not supported |
+| `Qwen2VLModel` | `vision` | Not supported |
+| `Qwen2_5_VLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen3MoeVLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen3VLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen3_5MoeVLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen3_5VLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen4ExpForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Step3p7VLForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `VilaModel` | `vision` | Not supported |
+| `WhisperForConditionalGeneration` | `audio` | Not supported |
+<!-- encoder-attention-backends:end -->
 
 For MiniCPM-V 4.6, the selection applies to its TensorRT-LLM attention layers; its fixed window-merger attention is unchanged.
 
-Only the declared encoders using TensorRT-LLM's `Attention` support this setting. Qwen2-VL's Hugging Face vision encoder, VILA's Hugging Face CLIP/SigLIP towers, Phi-4-multimodal's Hugging Face encoder, Parakeet audio, Gemma 4 audio, and MiniMax M3 / DeepSeek V4.1 vision keep their fixed attention implementations. Overrides for these encoders fail during initialization, even if the requested value is `VANILLA`. Gemma 4 Unified has no configurable attention encoder. Unknown encoder names and unsupported backends also fail during initialization; Hugging Face `attn_implementation` names are not accepted.
+Supported entries use TensorRT-LLM's `Attention` and apply encoder overrides explicitly. Other encoders keep their fixed implementation, including Hugging Face attention, direct SDPA, and custom attention paths. Overrides for entries marked "Not supported" fail during initialization, even if the requested value is `VANILLA`. Unknown encoder names and unsupported backends also fail during initialization; Hugging Face `attn_implementation` names are not accepted.
 
 ## Model Support Matrix
 
