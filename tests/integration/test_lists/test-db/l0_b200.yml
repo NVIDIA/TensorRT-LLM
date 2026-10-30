@@ -122,7 +122,7 @@ l0_b200:
   #   the only Blackwell stage that does.
   # - The other files ignored here have their own entries below.
   - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
-  - unittest/_torch/executor/kv_cache/test_mixed_precision_kv_cache.py
+  - unittest/_torch/pyexecutor/kv_cache/test_mixed_precision_kv_cache.py
   # Keep cold-JIT MSA coverage out of the 90-minute attention aggregate.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
@@ -312,9 +312,9 @@ l0_b200:
   # One-model speculative decoding step-copy kernels and the engine's decode
   # step that runs them (SM 100 / SM 103; they skip on other GPUs).
   - unittest/_torch/kernels/test_spec_step_copies.py
-  - unittest/_torch/executor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
   - unittest/_torch/speculative/test_fused_accept.py
-  - unittest/_torch/executor/test_steady_spec_prepare.py
+  - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
   - unittest/_torch/modules/test_mxfp8_draft_head.py
   # Shared fused_qk_norm_rope cells used by the K3 drafter.
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
@@ -340,6 +340,11 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
+  # Muse Spark Open: the decoder's GPU module tests and the tower load; the
+  # remaining Muse files are cpu_only and run in l0_cpu.
+  - unittest/_torch/modeling/test_modeling_musespark_open.py
+  - unittest/_torch/modeling/test_musespark_open_moe_tp.py
+  - unittest/_torch/modeling/test_musespark_open_tower_load.py
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
@@ -347,8 +352,8 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
-  - unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_retains_configured_number_of_conversation_turns
-  - unittest/_torch/executor/kv_cache/test_kvcm2_integration.py::test_helix_retention_uses_rank_local_ranges
+  - unittest/_torch/pyexecutor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_retains_configured_number_of_conversation_turns
+  - unittest/_torch/pyexecutor/kv_cache/test_kvcm2_integration.py::test_helix_retention_uses_rank_local_ranges
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_capacity_only_connector_accepts_multigroup_retention[kv_cache_manager_v2]
