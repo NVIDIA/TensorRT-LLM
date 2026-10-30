@@ -39,6 +39,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
@@ -83,6 +84,7 @@ def test_from_model_config_requires_one_artifact_source() -> None:
         PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+        QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     ],
 )
 def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:
@@ -221,6 +223,56 @@ def test_parallel_size_mismatch_flags_global():
     result = a.matches(b)
     assert not result.matched
     assert "parallel_fingerprint" in result.mismatched_fields
+
+
+def _moe_finalize_config(*, disable_finalize_fusion: bool) -> FakeModelConfig:
+    config = FakeModelConfig()
+    config.moe_disable_finalize_fusion = disable_finalize_fusion
+    return config
+
+
+@pytest.mark.parametrize(
+    "config_a, config_b, mismatched_field",
+    [
+        pytest.param(
+            FakeModelConfig(mapping=FakeMapping(tp_size=2, moe_tp_size=2, moe_ep_size=1)),
+            FakeModelConfig(mapping=FakeMapping(tp_size=2, moe_tp_size=1, moe_ep_size=2)),
+            "parallel_fingerprint",
+            id="moe-tp-vs-moe-ep",
+        ),
+        pytest.param(
+            FakeModelConfig(
+                mapping=FakeMapping(tp_size=2, moe_tp_size=1, moe_ep_size=1, moe_cluster_size=1)
+            ),
+            FakeModelConfig(
+                mapping=FakeMapping(tp_size=2, moe_tp_size=1, moe_ep_size=1, moe_cluster_size=2)
+            ),
+            "parallel_fingerprint",
+            id="moe-cluster",
+        ),
+        pytest.param(
+            FakeModelConfig(moe_backend="CUTLASS"),
+            FakeModelConfig(moe_backend="TRTLLM"),
+            "backend_fingerprint",
+            id="moe-backend",
+        ),
+        pytest.param(
+            _moe_finalize_config(disable_finalize_fusion=False),
+            _moe_finalize_config(disable_finalize_fusion=True),
+            "backend_fingerprint",
+            id="moe-finalize-fusion",
+        ),
+    ],
+)
+def test_moe_partition_backend_and_finalize_mismatches_flag_global(
+    config_a: FakeModelConfig,
+    config_b: FakeModelConfig,
+    mismatched_field: str,
+) -> None:
+    result = identity_from(config_a).matches(identity_from(config_b))
+
+    assert not result.matched
+    assert mismatched_field in result.mismatched_fields
 
 
 def test_shard_mismatch_only():

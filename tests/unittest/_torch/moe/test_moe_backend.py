@@ -1524,6 +1524,41 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
     assert configurable_moe._weights_transformed is False
 
 
+@pytest.mark.cpu_only
+def test_moe_weight_owner_declares_transform_guard_before_load():
+    """A staged receiver can mark a never-loaded expert-weight owner transformed.
+
+    Post-transform receivers install already transformed expert bytes without
+    calling `load_weights()`. `ModelLoader._mark_weights_transformed` only marks
+    modules that carry the guard, so it must exist from construction on the
+    backend that sits behind the `_weights_removed` `ConfigurableMoE` wrapper.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    assert MoEWeightOwnerMixin._weights_transformed is False
+    # `__new__` rather than the constructor: the guard is a class-level
+    # declaration and needs no mapping, kernels, or weights.
+    backend = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
+    torch.nn.Module.__init__(backend)
+    backend.quant_method = SimpleNamespace(transform_weights=MagicMock())
+    assert backend._weights_transformed is False
+
+    wrapper = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(wrapper)
+    wrapper._weights_removed = True
+    wrapper.backend = backend
+    model = torch.nn.Module()
+    model.experts = wrapper
+
+    ModelLoader._mark_weights_transformed(model)
+
+    assert backend._weights_transformed is True
+    assert wrapper._weights_transformed is False
+    ModelLoader._walk_transform(model)
+    backend.quant_method.transform_weights.assert_not_called()
+
+
 def test_moe_nvfp4_activation_quantization_capability():
     assert NVFP4FusedMoEMethod.quantizes_nvfp4_activations
     assert not W4A16NVFP4CutlassFusedMoEMethod.quantizes_nvfp4_activations

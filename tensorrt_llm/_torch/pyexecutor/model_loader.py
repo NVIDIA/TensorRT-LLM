@@ -22,7 +22,8 @@ from tensorrt_llm._torch.weight_sharing import (
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
@@ -110,6 +111,24 @@ _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
 _MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     sliding_windows=frozenset({"none"}),
+)
+# MoE profiles pin the configured MoE backend and the routed-expert partition.
+# The routed-expert layout differs per MoE implementation, so the pinned
+# backend and quantization must name exactly one: `CUTLASS` with unquantized
+# weights is the `trtllm.cutlass.grouped_gemm.none` leaf, which
+# `test_moe_profile_backend_literals_realize_one_implementation` checks. With
+# TP <= 2, MoE TP x MoE EP x MoE cluster == TP admits only the pure MoE-TP and
+# MoE-EP partitions; wider TP needs a joint partition constraint.
+_MX_BF16_CUTLASS_MOE_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    moe_backends=frozenset({"CUTLASS"}),
+    moe_tp_sizes=frozenset({1, 2}),
+    moe_ep_sizes=frozenset({1, 2}),
+    moe_cluster_sizes=frozenset({1}),
+)
+_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_CUTLASS_MOE_RUNTIME_CONSTRAINTS,
+    rope_fusion=frozenset({False}),
 )
 
 
@@ -832,6 +851,19 @@ class ModelLoader:
             transform_abi_id=PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3-moe-for-causal-lm-bf16-cutlass-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_moe",
+                "Qwen3MoeForCausalLM"),
+            architecture="Qwen3MoeForCausalLM",
+            model_type="qwen3_moe",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
         ),
     ))
 
@@ -1752,6 +1784,15 @@ class ModelLoader:
         if getattr(locality_domain_policy, "enabled", False):
             enabled_features.add(
                 PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
+        # The realized balancer, not the configured one, decides the expert
+        # slot layout: MoE layers create it only when EPLB actually applies.
+        if any(
+                getattr(module, "layer_load_balancer", None) is not None
+                for module in model.modules()):
+            enabled_features.add(PostTransformFeature.MOE_LOAD_BALANCER)
+        mapping = getattr(model.model_config, "mapping", None)
+        if getattr(mapping, "dwdp_enabled", False) is True:
+            enabled_features.add(PostTransformFeature.DWDP)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
@@ -1806,11 +1847,22 @@ class ModelLoader:
                 if not weights_preloaded:
                     unsupported_runtime_dimensions = ",".join(
                         sorted(qualification.unsupported_runtime_dimensions))
+                    unsupported_features = ",".join(
+                        sorted(
+                            feature.value
+                            for feature in qualification.unsupported_features))
+                    # A runtime mismatch ends qualification before features
+                    # are checked, so print only the details it reports.
+                    runtime_detail = (", unsupported_runtime_dimensions="
+                                      f"{unsupported_runtime_dimensions}"
+                                      if unsupported_runtime_dimensions else "")
+                    feature_detail = (
+                        f", unsupported_features={unsupported_features}"
+                        if unsupported_features else "")
                     logger.info("Skipping MX post-transform publish for "
                                 f"{type(model).__name__}: qualification "
-                                f"reason={qualification.reason.value}, "
-                                "unsupported_runtime_dimensions="
-                                f"{unsupported_runtime_dimensions or 'none'}.")
+                                f"reason={qualification.reason.value}"
+                                f"{runtime_detail}{feature_detail}.")
                 return
             kwargs["source_identity"] = self._source_identity
         checkpoint_loader.post_load_publish(model, **kwargs)

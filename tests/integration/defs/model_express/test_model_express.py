@@ -37,6 +37,7 @@ from defs.model_express.mx_harness import (
     donor_session,
     load_payload,
     log_tail,
+    moe_worker_args,
     mx_metadata_ports,
     report_timings,
     require_mx_environment,
@@ -148,6 +149,40 @@ _MX_CASES = (
         id="phi3-bf16-tp2",
         marks=pytest.mark.skip_less_device(4),
     ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_MOE_MODEL",
+            default_model_subdir="Qwen3/Qwen3-30B-A3B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-moe-tp1",
+            tp_size=1,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="qwen3-moe-bf16-tp1",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_MOE_MODEL",
+            default_model_subdir="Qwen3/Qwen3-30B-A3B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-moe-tp2",
+            tp_size=2,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="qwen3-moe-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_MOE_MODEL",
+            default_model_subdir="Qwen3/Qwen3-30B-A3B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-moe-tp2-ep2",
+            tp_size=2,
+            moe_ep_size=2,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="qwen3-moe-bf16-tp2-ep2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
 )
 
 
@@ -188,6 +223,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                 model_path=donor_snapshot,
                 tp_size=case.tp_size,
                 output_path=layout.output("baseline"),
+                extra_args=moe_worker_args(case),
             ),
             worker_environment(
                 receiver_gpu_ids, layout.transfer_logs("baseline"), layout.manifest_dir
@@ -206,6 +242,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                 ready_file=layout.donor_ready,
                 stop_file=layout.donor_stop,
                 max_serve_seconds=timeout_s + 120,
+                extra_args=moe_worker_args(case),
             ),
             environment=worker_environment(
                 donor_gpu_ids,
@@ -225,6 +262,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                     tp_size=case.tp_size,
                     output_path=layout.output("receiver"),
                     mx_url=mx_url,
+                    extra_args=moe_worker_args(case),
                 ),
                 worker_environment(
                     receiver_gpu_ids,

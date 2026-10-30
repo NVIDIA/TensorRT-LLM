@@ -112,7 +112,13 @@ class MxE2ECase:
     `final_manifest_exempt_patterns` lists `fnmatch` patterns of tensor names
     whose final-tier digest may legitimately differ between roles (never a
     numeric tolerance, never at the transfer tier). Every pattern needs a code
-    comment explaining why; the qualified BF16 dense families use none.
+    comment explaining why; no current row uses any.
+
+    `moe_ep_size` selects the MoE expert-parallel size of a MoE row; MoE TP
+    takes the rest of TP. `moe_disable_finalize_fusion` disables the CUTLASS
+    MoE FC2+finalize fusion in every role, because the fused finalize is not
+    deterministic for top-k greater than 2 and the roles must produce
+    identical greedy tokens.
     """
 
     model_env: str
@@ -120,6 +126,8 @@ class MxE2ECase:
     repository_cache_prefix: str
     tp_size: int
     final_manifest_exempt_patterns: tuple[str, ...] = ()
+    moe_ep_size: int = 1
+    moe_disable_finalize_fusion: bool = False
 
 
 @dataclass(frozen=True)
@@ -351,6 +359,16 @@ def worker_command(
         command.extend(("--max-serve-seconds", str(max_serve_seconds)))
     command.extend(extra_args)
     return command
+
+
+def moe_worker_args(case: MxE2ECase) -> tuple[str, ...]:
+    """Worker flags that apply a row's MoE settings identically to every role."""
+    args: list[str] = []
+    if case.moe_ep_size != 1:
+        args.extend(("--moe-ep-size", str(case.moe_ep_size)))
+    if case.moe_disable_finalize_fusion:
+        args.append("--moe-disable-finalize-fusion")
+    return tuple(args)
 
 
 def mx_metadata_ports(tp_size: int) -> tuple[int, int]:
@@ -863,6 +881,7 @@ __all__ = [
     "donor_session",
     "load_payload",
     "log_tail",
+    "moe_worker_args",
     "mx_metadata_ports",
     "qualification_required",
     "report_timings",
