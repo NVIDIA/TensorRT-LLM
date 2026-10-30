@@ -8,7 +8,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ssm.causal_conv1d_update__r29 import (  # noqa: E501
-    ENGINE_SLOTS,
+    CKPT_DIM,
+    CKPT_X_STRIDE,
+    RANK_DIM,
+    RANK_X_STRIDE,
+    _decode_conv_ok,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ssm.causal_conv1d_update__r29 import (  # noqa: E501
     causal_conv1d_update as op,
@@ -41,23 +45,29 @@ def _compare(
 PAD_SLOT_ID = -1
 #: Rows of prefill ahead of the decode rows in the in_proj output.
 _PREFILL_ROWS = 37
-#: Columns past q|k|v in the target's one GDN input-projection output: z | a | b.
-_IN_PROJ_TAIL = 6144 + 2 * 48
 
 
 def _build(spec, seed):
-    """`__call__`'s arguments for one spec, plus the buffers x and the pool view."""
+    """`__call__`'s arguments for one spec, plus the buffers x and the pool view.
+
+    x is the first `dim` columns of the decode rows of a `[rows, x_row_stride]`
+    projection output (its z | a | b columns past them); the pool is the last
+    layer's view of a `[slots, pool_layers, dim, 3]` page, as the V2 manager
+    coalesces the GDN layers' conv states inside each slot.
+    """
     g = torch.Generator(device="cuda").manual_seed(seed)
     dim, batch, layers = spec["dim"], spec["batch"], spec.get("pool_layers", 1)
+    row_stride = spec.get("x_row_stride", CKPT_X_STRIDE)
 
     def randn(*shape):
         return torch.randn(*shape, generator=g, device="cuda").to(torch.bfloat16)
 
-    buf = randn(_PREFILL_ROWS + batch, dim + _IN_PROJ_TAIL)
+    buf = randn(_PREFILL_ROWS + batch, row_stride)
     x = buf[_PREFILL_ROWS:, :dim]
-    assert x.stride() == (dim + _IN_PROJ_TAIL, 1)
+    assert x.stride() == (row_stride, 1)
     pool_buf = randn(spec["pool_slots"], layers, dim, 3)
     conv_state = pool_buf[:, layers - 1]
+    assert conv_state.stride() == (layers * dim * 3, 3, 1)
     weight = randn(dim, 4)
     slots = spec["slots"]
     if slots == "random":
@@ -93,11 +103,50 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     returned, state = _run(args, extras)
     assert torch.equal(args[2], weight), "weight is read-only"
     _compare((returned, state), ref)
-    if cell.spec["pool_slots"] == ENGINE_SLOTS:
-        # Non-vacuity for the large pool: every named slot moved.
-        for slot in cell.spec["slots"]:
-            if slot != PAD_SLOT_ID:
-                assert not torch.equal(state[slot], args[1][slot]), slot
+    # Non-vacuity: every slot the batch named moved (the whole-pool gate above
+    # holds every other slot, and every pad row, unchanged).
+    for slot in args[6].tolist():
+        if slot != PAD_SLOT_ID:
+            assert not torch.equal(state[slot], args[1][slot]), slot
+
+
+def test_which_kernel_each_member_runs() -> None:
+    """The path the note states each member's cells certify: a tp4/tep4 rank's 2560
+    channels never reach the CuTe kernel (2560 is not a multiple of 1024), so its 128-row
+    cells certify the TRT-LLM kernel; a dep4 rank's 10240 do from 64 rows."""
+    for dim, row_stride, expect in (
+        (RANK_DIM, RANK_X_STRIDE, False),
+        (CKPT_DIM, CKPT_X_STRIDE, True),
+    ):
+        spec = dict(dim=dim, x_row_stride=row_stride, batch=128, pool_slots=256, slots="random")
+        args = _build(spec, seed=dim)[0]
+        assert _decode_conv_ok(*args[:7]) is expect, (dim, expect)
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [c for c in op.CELLS if c.spec["batch"] == 128 and c.spec.get("pool_layers", 1) > 1],
+    ids=lambda c: c.why[:44],
+)
+def test_graph_replay_at_the_decode_call_site(cell) -> None:
+    """Captured once, replayed after x and the pool are refilled: the decode step's
+    path under CUDA graphs, for each member's widest captured batch (the TRT-LLM kernel
+    at 2560 channels, the CuTe kernel at 10240)."""
+    seed = zlib.crc32(cell.why.encode())
+    args, extras = _build(cell.spec, seed=seed)
+    op(*args)  # warm-up: compiles the CuTe kernel where the shape reaches it
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(*args)
+    g = torch.Generator(device="cuda").manual_seed(seed + 1)
+    for name in ("buf", "pool_buf"):
+        t = extras[name]
+        t.copy_(torch.randn(t.shape, generator=g, device="cuda").to(t.dtype))
+    ref = op.reference(*args)
+    graph.replay()
+    torch.cuda.synchronize()
+    _compare((args[0], args[1]), ref)
 
 
 def test_op_rejects_metadata_violations_loudly() -> None:
