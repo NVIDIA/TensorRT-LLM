@@ -1642,7 +1642,10 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                   or module.disable_deep_gemm)) or is_sm_120f()
         use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
             module, "use_indexer_q_cutedsl_fusion", False))
-        if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
+        # Consumers that read UE8M0 scales from the FP32 K128 layout (e.g. the
+        # fused shared FC12 kernel) ask for the rounding alone.
+        round_to_ue8m0 = getattr(module, "round_block_scales_to_ue8m0", False)
+        if use_deep_gemm_layout or use_indexer_q_cutedsl_layout or round_to_ue8m0:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
 
@@ -1688,6 +1691,15 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             if get_sm_version() != 107:
                 module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange.for_weight(
                     *weight.shape)
+        elif round_to_ue8m0:
+            # Same FP32 K128 layout; the rounded tensors may live on another device.
+            replace_parameter_and_save_metadata(
+                module, "weight", nn.Parameter(weight, requires_grad=False),
+                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(
+                module, "weight_scale",
+                nn.Parameter(weight_scale, requires_grad=False),
+                module.rebuild_tensor_metadata)
 
 
 class NVFP4LinearMethod(LinearMethodBase):

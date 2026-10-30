@@ -267,6 +267,16 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     # image, when present) can be split across chunks safely.
     mm_bidirectional_blocks = False
 
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        modalities = super().supported_modalities
+        config = getattr(self, "config", None)
+        if getattr(config, "vision_config", None) is None:
+            modalities -= {"image", "video"}
+        if getattr(config, "audio_config", None) is None:
+            modalities -= {"audio"}
+        return modalities
+
     def __init__(
         self,
         model_path: str,

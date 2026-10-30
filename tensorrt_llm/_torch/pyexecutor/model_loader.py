@@ -56,7 +56,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
-from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
@@ -262,22 +262,24 @@ def validate_fp4_mla_config(model_config: ModelConfig,
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
         return
     if not supports_fp4_mla_attention(model_config):
-        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend; "
-                         "hybrid linear attention is not supported.")
-    if model_config.mapping.cp_size != 1:
-        raise ValueError("FP4 MLA does not support context parallelism.")
+        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend.")
+    mapping = model_config.mapping
+    if mapping.cp_size != 1 and not mapping.has_cp_helix():
+        raise ValueError(
+            "FP4 MLA supports context parallelism only through Helix.")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
-    if llm_args.enable_chunked_prefill:
-        raise ValueError(
-            "FP4 MLA does not support chunked prefill or cached context; "
-            "set enable_chunked_prefill=False.")
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
-        # HP/V-scale side pools are not switched by draft_kv_cache_context.
-        # Set this before models and workers consult the shared predicate.
-        spec_config._allow_separate_draft_kv_cache = False
+        spec_dec_mode = spec_config.spec_dec_mode
+        # A standalone drafter (DFlash, DSpark) keeps its layers in its own
+        # BF16 draft pool, outside the FP4 MLA layout. Without that pool it
+        # falls back to a context arena that is dense in max_seq_len.
+        if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
+            # HP/V-scale side pools are not switched by draft_kv_cache_context.
+            # Set this before models and workers consult the shared predicate.
+            spec_config._allow_separate_draft_kv_cache = False
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -1068,7 +1070,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
+    ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -1593,7 +1595,7 @@ class ModelLoader:
                 # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
                 # follow-up, drop the validator gate AFTER moving these calls
                 # into the pool scope.
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()

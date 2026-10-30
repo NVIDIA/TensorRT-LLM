@@ -52,6 +52,7 @@ import json
 import math
 import os
 import socket
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -658,6 +659,7 @@ class PerfMetricsJsonlWriter:
         self._path: Optional[Path] = None
         self.dropped_records = 0
         self._write_error_count = 0
+        self._unexpected_error_counts: dict[str, int] = {}
 
     async def start(self) -> None:
         if self._output_dir is None or self._task is not None:
@@ -705,6 +707,13 @@ class PerfMetricsJsonlWriter:
             self._task = None
 
     async def _run(self) -> None:
+        """Drain queued records into the JSONL file until ``close()`` stops the writer.
+
+        This task is the queue's only consumer: if an exception ended it, ``submit()`` would
+        keep accepting records that are never written. A record or batch that fails for an
+        unexpected reason is therefore dropped and logged, and the loop goes on.
+        ``asyncio.CancelledError`` is not an ``Exception``, so ``close()`` can still cancel it.
+        """
         stop = False
         while not stop:
             item = await self._queue.get()
@@ -731,6 +740,8 @@ class PerfMetricsJsonlWriter:
                     self.dropped_records += 1
                     if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
                         logger.warning("Dropped malformed performance metrics record: %s", error)
+                except Exception as error:
+                    self._drop_after_unexpected_error(1, "serialize", error)
             if not serialized:
                 continue
             try:
@@ -741,6 +752,27 @@ class PerfMetricsJsonlWriter:
                 self._write_error_count += 1
                 if self._write_error_count == 1:
                     logger.warning("Failed to write performance metrics JSONL: %s", error)
+            except Exception as error:
+                self._drop_after_unexpected_error(len(serialized), "write", error)
+
+    def _drop_after_unexpected_error(self, num_records: int, stage: str, error: Exception) -> None:
+        """Count records lost to an unexpected exception and log it, rate-limited.
+
+        Each stage has its own rate limit so its first failure is always logged.
+        The message carries the traceback, which shows where serializing or writing failed.
+        """
+        self.dropped_records += num_records
+        count = self._unexpected_error_counts.get(stage, 0) + 1
+        self._unexpected_error_counts[stage] = count
+        if count == 1 or count % 1000 == 0:
+            logger.error(
+                "Dropped %d performance metrics record(s) that failed to %s (%s: %s)\n%s",
+                num_records,
+                stage,
+                type(error).__name__,
+                error,
+                "".join(traceback.format_exception(error)).rstrip(),
+            )
 
     def _write(self, data: str) -> None:
         if self._path is not None:

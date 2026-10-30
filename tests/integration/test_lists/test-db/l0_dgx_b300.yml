@@ -25,7 +25,7 @@ l0_dgx_b300:
   # this 4-GPU stage runs only multi_gpu/, whose cases need >= 2 GPUs;
   # test_helix_zero_kv.py runs in this list's pre_merge block instead.
   - unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py
-  - unittest/_torch/executor
+  - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
