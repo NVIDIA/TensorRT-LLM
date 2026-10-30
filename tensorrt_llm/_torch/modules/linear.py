@@ -3473,6 +3473,55 @@ def _mxfp8_cutlass_op_available() -> bool:
                    ) and torch.cuda.get_device_capability()[0] >= 10
 
 
+# TRTLLM_MXFP8_CUBLASLT_MIN_M=<rows> (opt-in, unset = off): run eager
+# MXFP8 x MXFP8 GEMMs with at least that many rows on cuBLASLt's block-scaled
+# MXFP8 kernel (torch._scaled_mm with the same E4M3 operands and swizzled
+# UE8M0 scales) instead of the native CUTLASS op. cuBLASLt accumulates in FP32
+# without split-K, so the result is bitwise identical. Measured on GB300 at
+# prefill row counts, the native op's untuned generic config ran at ~30% of
+# FP8 peak against cuBLASLt's 60-70%.
+_MXFP8_CUBLASLT_MIN_M = int(
+    os.environ.get("TRTLLM_MXFP8_CUBLASLT_MIN_M", "0") or 0)
+_MXFP8_CUBLASLT_STATE = {"ok": None}
+
+
+def _cublaslt_mxfp8_gemm(act_e4m3: torch.Tensor, act_sf: torch.Tensor,
+                         weight: torch.Tensor, weight_scale: torch.Tensor,
+                         out_dtype: torch.dtype) -> Optional[torch.Tensor]:
+    """cuBLASLt MXFP8 GEMM for a large eager row count, or None to use native."""
+    ok = _MXFP8_CUBLASLT_STATE["ok"]
+    if ok is False:
+        return None
+    e8m0 = torch.float8_e8m0fnu
+    if ok is None:
+        # First eligible call (startup warmup, outside any graph capture):
+        # probe once and fall back to the native op for good if unsupported.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        try:
+            out = torch._scaled_mm(act_e4m3,
+                                   weight.t(),
+                                   act_sf.view(e8m0),
+                                   weight_scale.view(e8m0),
+                                   out_dtype=out_dtype)
+        except (RuntimeError, AttributeError, TypeError) as error:
+            _MXFP8_CUBLASLT_STATE["ok"] = False
+            logger.warning(f"cuBLASLt MXFP8 GEMM unavailable ({error}); "
+                           "keeping the native MXFP8 GEMM")
+            return None
+        _MXFP8_CUBLASLT_STATE["ok"] = True
+        logger.info(f"TRTLLM_MXFP8_CUBLASLT_MIN_M={_MXFP8_CUBLASLT_MIN_M}: "
+                    f"eager MXFP8 GEMMs with at least that many rows run on "
+                    f"cuBLASLt (first M={act_e4m3.shape[0]} "
+                    f"N={weight.shape[0]} K={weight.shape[1]})")
+        return out
+    return torch._scaled_mm(act_e4m3,
+                            weight.t(),
+                            act_sf.view(e8m0),
+                            weight_scale.view(e8m0),
+                            out_dtype=out_dtype)
+
+
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
@@ -3712,17 +3761,29 @@ class MXFP8LinearMethod(LinearMethodBase):
                         module.dtype,
                     )
                 else:
-                    gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
-                            if self.needs_native_autotune else
-                            torch.ops.trtllm.mxfp8_mxfp8_gemm)
-                    output = gemm(
-                        act_e4m3,
-                        act_sf,
-                        module.weight,
-                        module.weight_scale,
-                        module._mxfp8_alpha,
-                        module.dtype,
-                    )
+                    output = None
+                    if (_MXFP8_CUBLASLT_MIN_M > 0
+                            and not self.needs_native_autotune
+                            and not is_torch_compiling()
+                            and act_e4m3.shape[0] >= _MXFP8_CUBLASLT_MIN_M and
+                            module.dtype in (torch.bfloat16, torch.float16)):
+                        # _mxfp8_alpha is always 1, which cuBLASLt applies.
+                        output = _cublaslt_mxfp8_gemm(act_e4m3, act_sf,
+                                                      module.weight,
+                                                      module.weight_scale,
+                                                      module.dtype)
+                    if output is None:
+                        gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                                if self.needs_native_autotune else
+                                torch.ops.trtllm.mxfp8_mxfp8_gemm)
+                        output = gemm(
+                            act_e4m3,
+                            act_sf,
+                            module.weight,
+                            module.weight_scale,
+                            module._mxfp8_alpha,
+                            module.dtype,
+                        )
             if bias is not None:
                 output = output + bias
         else:
