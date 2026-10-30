@@ -12,7 +12,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 
-from .._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 #: routing_method_type values for which the kernel never reads routing_bias:
 #: 0 Default, 1 Renormalize, 4 RenormalizeNaive, 6 SigmoidRenorm. Observed on
@@ -285,6 +285,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
             use_dp=use_dp,
         )
 
+    @true_fp32_matmul()
     def reference(
         self,
         hidden_states: torch.Tensor,

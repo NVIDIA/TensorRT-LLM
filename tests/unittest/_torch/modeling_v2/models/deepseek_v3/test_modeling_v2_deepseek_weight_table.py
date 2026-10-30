@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-__extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
+__extra_import_path__ = ["../../.."]  # noqa: F841 -- repo's file-scoped import hook
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
     weights as W,

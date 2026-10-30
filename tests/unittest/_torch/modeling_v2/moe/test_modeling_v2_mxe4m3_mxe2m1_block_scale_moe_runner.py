@@ -8,7 +8,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell, true_fp32_matmul
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
     Mxe4m3Mxe2m1BlockScaleMoeRunner,
 )
@@ -23,9 +23,6 @@ from _validating import validating  # noqa: E402 — needs the path declared abo
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
 
 DEV = "cuda"
-# The reference GEMMs must be true fp32; TF32 would leave the reference with
-# 10 mantissa bits, coarser than the bf16 output it is meant to bound.
-torch.backends.cuda.matmul.allow_tf32 = False
 
 # Relative distance between neighbouring bf16 values (1 + 2^-7 stored mantissa
 # bits -> one ulp is 2^-8 of the binade top).
@@ -391,6 +388,7 @@ def _q_intermediate(act: torch.Tensor, recipe: str | None = None) -> torch.Tenso
     return (q * scale).reshape(rows, cols)
 
 
+@true_fp32_matmul()
 def _ref_moe(
     x_valid,
     ids,
@@ -782,8 +780,9 @@ def test_intermediate_is_mxfp8_quantized():
             gemm1_clamp_limit=limit,
         ).float()
 
-        up = xv @ _dequant(up_c[0], up_s[0]).t()
-        gate = xv @ _dequant(gt_c[0], gt_s[0]).t()
+        with true_fp32_matmul():
+            up = xv @ _dequant(up_c[0], up_s[0]).t()
+            gate = xv @ _dequant(gt_c[0], gt_s[0]).t()
         act = (
             (up.clamp(-7.0, 7.0) + 1.0)
             * gate.clamp(max=7.0)

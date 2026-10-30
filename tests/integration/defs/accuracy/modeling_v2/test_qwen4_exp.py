@@ -59,6 +59,7 @@ from ..accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
+from ._env import scoped_env_overrides
 
 # The target is certified on sm_103 only.
 skip_not_sm103 = pytest.mark.skipif(
@@ -68,17 +69,6 @@ skip_not_sm103 = pytest.mark.skipif(
 # Check the target's step contract on the first forward, against metadata the
 # engine prepared; the flag has to reach the worker rank.
 _VALIDATE = {MODELING_V2_VALIDATE_ENV: "1"}
-
-
-def _require_target(monkeypatch: pytest.MonkeyPatch, **env: str) -> dict:
-    """``LLM(...)`` kwargs that build the target, with ``env`` on the ranks.
-
-    ``LLM`` applies ``env_overrides`` to this process and never restores it, so
-    ``monkeypatch`` sets it too, keeping it from leaking into later tests.
-    """
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-    return dict(modeling_v2="require", env_overrides=dict(env))
 
 
 def _target_core(llm: LLM):
@@ -533,20 +523,24 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         assert "red" in answer and "right" in answer, answer
 
     @skip_not_sm103
-    def test_gsm8k(self, mocker, monkeypatch):
+    def test_gsm8k(self, mocker):
         """The text model without speculation, against the gsm8k anchor."""
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
 
-        with LLM(
-            self.MODEL_PATH,
-            **self.ENGINE,
-            **_require_target(monkeypatch, **_VALIDATE),
-        ) as llm:
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                **self.ENGINE,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_not_sm103
-    def test_mtp1_gsm8k_mmmu_and_video(self, mocker, monkeypatch):
+    def test_mtp1_gsm8k_mmmu_and_video(self, mocker):
         """gsm8k with its acceptance-length floor, MMMU and synthetic videos on one MTP engine.
 
         - gsm8k against the MTP row of references/gsm8k.yaml. A miscomputed draft layer only
@@ -560,19 +554,23 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         ``max_seq_len`` is raised for the video checks' oversized image.
         """
         engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_MULTIMODAL, max_seq_len=16384)
-        with LLM(
-            self.MODEL_PATH,
-            speculative_config=self.MTP1,
-            enable_iter_perf_stats=True,
-            **engine,
-            **_require_target(monkeypatch, **_VALIDATE),
-        ) as llm:
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP1,
+                enable_iter_perf_stats=True,
+                **engine,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
             self._gsm8k_and_acceptance(mocker, llm, self.ACCEPTANCE_KEY, "mtp1")
             self._mmmu(llm)
             self._video_checks(llm)
 
     @skip_not_sm103
-    def test_mtp3_cutedsl_fp8_kv_bf16_state(self, mocker, monkeypatch):
+    def test_mtp3_cutedsl_fp8_kv_bf16_state(self, mocker):
         """gsm8k and 3k-6k-token pass keys with three drafts over the opt-in choices.
 
         One engine runs gsm8k with an acceptance-length floor, then the pass keys. The trunk's
@@ -592,13 +590,17 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             kv_cache_config=self.KV_CACHE_FP8_BF16_STATE,
             sparse_attention_config=QSASparseAttentionConfig(index_share_for_mtp_iteration=False),
         )
-        with LLM(
-            self.MODEL_PATH,
-            speculative_config=self.MTP3,
-            enable_iter_perf_stats=True,
-            **engine,
-            **_require_target(monkeypatch, **_VALIDATE),
-        ) as llm:
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                enable_iter_perf_stats=True,
+                **engine,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
             self._gsm8k_and_acceptance(mocker, llm, self.ACCEPTANCE_KEY_OPT_IN, "mtp3 opt-in")
             self._passkeys(
                 llm,
@@ -632,12 +634,16 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
                 index_share_for_mtp_iteration=index_share
             ),
         )
-        with LLM(
-            self.MODEL_PATH,
-            speculative_config=speculative_config,
-            **engine,
-            **_require_target(monkeypatch, **_VALIDATE),
-        ) as llm:
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=speculative_config,
+                **engine,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
             assert _target_core(llm).mtp_index_share == index_share
             self._passkeys(llm, lengths, speculative_config.max_draft_len, key, label)
         assert not replays, replays
@@ -707,12 +713,16 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         answering = SamplingParams(max_tokens=384, temperature=0)
 
         def run(engine):
-            with LLM(
-                self.MODEL_PATH,
-                speculative_config=self.MTP3,
-                **engine,
-                **_require_target(monkeypatch, **_VALIDATE),
-            ) as llm:
+            with (
+                scoped_env_overrides(_VALIDATE) as rank_env,
+                LLM(
+                    self.MODEL_PATH,
+                    speculative_config=self.MTP3,
+                    **engine,
+                    modeling_v2="require",
+                    env_overrides=rank_env,
+                ) as llm,
+            ):
                 single = [
                     llm.generate({"prompt_token_ids": document[:n]}, greedy, use_tqdm=False)
                     .outputs[0]

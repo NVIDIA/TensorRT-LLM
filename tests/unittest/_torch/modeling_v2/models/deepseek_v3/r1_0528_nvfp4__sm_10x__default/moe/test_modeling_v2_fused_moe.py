@@ -23,9 +23,6 @@ from _validating import ULP, validating  # noqa: E402 — needs the path declare
 assert torch.cuda.is_available(), "fused_moe requires a CUDA device"
 
 DEV = "cuda"
-# The reference GEMMs must be true fp32; TF32 would leave the reference with
-# 10 mantissa bits, coarser than the bf16 output it is meant to bound.
-torch.backends.cuda.matmul.allow_tf32 = False
 
 
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:

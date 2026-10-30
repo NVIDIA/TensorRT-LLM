@@ -75,22 +75,31 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
   - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_reference_precision.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_fp4_test_helpers.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
   # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_step.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mnnvl_workspace.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_decode_worker.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_capture_view.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_ctx_rows_start.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_draft_block_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_drafter_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_spec_worker_gate.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3/test_modeling_v2_deepseek_default_shards.py
+  - unittest/_torch/modeling_v2/models/gpt_oss/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_multimodal_embeds.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_moe_scalars.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_validate_request.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_pool_contract.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_kv_quant.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_thop_attention_calls.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_weight_table.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_multimodal_embeds.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_moe_scalars.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_validate_request.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_pool_contract.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_kv_quant.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_thop_attention_calls.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_weight_table.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
