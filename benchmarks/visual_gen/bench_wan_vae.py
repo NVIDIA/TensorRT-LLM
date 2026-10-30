@@ -518,24 +518,163 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _relaunch_under_torchrun(world_size: int) -> None:
+    """Re-execute this script under torchrun with ``world_size`` ranks; forwards the exit code."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nnodes=1",
+        f"--nproc-per-node={world_size}",
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+    ]
+    sys.exit(subprocess.call(cmd))
+
+
+def _load_state_dict(args: argparse.Namespace) -> dict[str, torch.Tensor]:
+    """The checkpoint's weights, or the seeded random reference weights."""
+    if args.checkpoint:
+        from safetensors.torch import load_file
+
+        return load_file(str(Path(args.checkpoint) / "diffusion_pytorch_model.safetensors"))
+    return _reference_state_dict(args.seed)
+
+
+def _build_inputs(
+    args: argparse.Namespace, shape_name: str, state_dict: dict[str, torch.Tensor], dtype
+) -> dict[str, torch.Tensor]:
+    """The ``{"decode": latents, "encode": pixels}`` inputs of one shape, in ``dtype``.
+
+    Real frames when a video or image is given (the decode input is then the fp32 native
+    model's encoding of them), else seeded random tensors.
+    """
+    T, H, W = SHAPES[shape_name]
+    if args.video or args.image:
+        pixels = _real_pixels(args.video, args.image, T, H, W)
+        model = _build("native", state_dict, torch.float32, {})
+        with torch.inference_mode():
+            latents = model.encode(pixels.float(), return_dict=False)[0].mode()
+        del model
+        torch.cuda.empty_cache()
+        return {"decode": latents.to(dtype), "encode": pixels.to(dtype)}
+    gen = torch.Generator(device="cuda").manual_seed(args.seed)
+    return {
+        "decode": torch.randn(_latent_shape(T, H, W), generator=gen, device="cuda").to(dtype),
+        "encode": (torch.rand(_pixel_shape(T, H, W), generator=gen, device="cuda") * 2 - 1).to(
+            dtype
+        ),
+    }
+
+
+def _fp32_reference(
+    state_dict: dict[str, torch.Tensor], op: str, inp: torch.Tensor, decode_chunk: int
+) -> torch.Tensor:
+    """The native model's fp32 output for ``op`` on ``inp``, on the CPU."""
+    model = _build("native", state_dict, torch.float32, {})
+    with torch.inference_mode():
+        reference = _make_op(model, op, inp.float(), decode_chunk)().float().cpu()
+    del model
+    torch.cuda.empty_cache()
+    return reference
+
+
+def _run_backend(
+    backend: str,
+    *,
+    args: argparse.Namespace,
+    state_dict: dict[str, torch.Tensor],
+    dtype,
+    winovae_opts: dict[str, Any],
+    parallel,
+    shape_name: str,
+    op: str,
+    inp: torch.Tensor,
+    decode_chunk: int,
+    reference: torch.Tensor | None,
+    native_out: torch.Tensor | None,
+) -> tuple[dict[str, Any], torch.Tensor | None]:
+    """Build ``backend``, run ``op`` once for accuracy (unless skipped), time it, print one line.
+
+    Returns ``(result row, the output on the CPU or None when accuracy was skipped)``.
+    """
+    t_start = time.time()
+    model = _build(backend, state_dict, dtype, winovae_opts if backend == "winovae" else {})
+    if parallel is not None:
+        model = parallel(model)
+    run_fn = _make_op(model, op, inp, decode_chunk)
+
+    row: dict[str, Any] = {
+        "backend": backend,
+        "shape": shape_name,
+        "op": op,
+        "input_shape": list(inp.shape),
+        "decode_chunk": decode_chunk,
+    }
+    if parallel is not None:
+        torch.distributed.barrier()
+    out_cpu: torch.Tensor | None = None
+    if not args.skip_accuracy:
+        torch.cuda.reset_peak_memory_stats()
+        with torch.inference_mode():
+            out = run_fn()
+        torch.cuda.synchronize()
+        row["peak_alloc_gb"] = torch.cuda.max_memory_allocated() / 2**30
+        row["output_shape"] = list(out.shape)
+        out_cpu = out.float().cpu()
+        if reference is not None:
+            row["vs_ref_fp32"] = _metrics(out_cpu, reference)
+        if backend != "native" and native_out is not None:
+            row["vs_native"] = _metrics(out_cpu, native_out)
+        del out
+
+    row["timing"] = _time_cupti(run_fn, args.warmup, args.iters, use_graph=not args.no_graph)
+    if args.span_diffs and op == "decode" and inp.shape[2] >= 1 + 2 * decode_chunk:
+        frames = [1, 1 + decode_chunk, 1 + 2 * decode_chunk]
+        timed = [
+            _clip_span(model, inp, n, decode_chunk, args.warmup, args.iters, not args.no_graph)
+            for n in frames
+        ]
+        spans = [t for t, _ in timed]
+        row["span_diffs"] = {
+            "chunk_latent_frames": decode_chunk,
+            "latent_frames": frames,
+            "span_ms": spans,
+            "graph": [g for _, g in timed],
+            "diff_ms": [spans[1] - spans[0], spans[2] - spans[1]],
+        }
+        print(
+            "    whole-clip decode spans for "
+            + ", ".join(f"{n} latent frames: {t:.2f} ms" for n, t in zip(frames, spans))
+            + f"; differences {spans[1] - spans[0]:.2f} / {spans[2] - spans[1]:.2f} ms",
+            flush=True,
+        )
+    row["setup_s"] = time.time() - t_start
+
+    t = row["timing"]
+    acc = row.get("vs_ref_fp32", {})
+    print(
+        f"  {backend:9s} graph={str(t['graph']):5s} "
+        f"span med {t['span']['median_us'] / 1e3:9.2f} ms "
+        f"p90 {t['span']['p90_us'] / 1e3:9.2f} ms  "
+        f"wall med {t['wall']['median_us'] / 1e3:9.2f} ms  "
+        f"kernels/iter {t['kernels_per_iter']:.0f}  "
+        + (f"rel_l2 {acc['rel_l2']:.3e} max_abs {acc['max_abs']:.3e}" if acc else ""),
+        flush=True,
+    )
+    del model, run_fn
+    torch.cuda.empty_cache()
+    return row, out_cpu
+
+
 def main() -> None:
     args = _parse_args()
     global TOP_KERNELS
     TOP_KERNELS = args.top_kernels
 
     if args.world_size > 1 and "RANK" not in os.environ:
-        # Launch the ranks under torchrun; this process only forwards the exit code.
-        cmd = [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nnodes=1",
-            f"--nproc-per-node={args.world_size}",
-            str(Path(__file__).resolve()),
-            *sys.argv[1:],
-        ]
-        sys.exit(subprocess.call(cmd))
+        _relaunch_under_torchrun(args.world_size)
     dist_rank, parallel = _init_parallel(args.world_size, args.split_dim)
 
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
@@ -581,13 +720,9 @@ def main() -> None:
     }
     print(json.dumps(meta, indent=1))
 
+    state_dict = _load_state_dict(args)
     if args.checkpoint:
-        from safetensors.torch import load_file
-
-        state_dict = load_file(str(Path(args.checkpoint) / "diffusion_pytorch_model.safetensors"))
         meta["checkpoint"] = args.checkpoint
-    else:
-        state_dict = _reference_state_dict(args.seed)
     use_reference = not args.skip_accuracy and args.ref_dtype != "none"
     if args.video or args.image:
         if not use_reference:
@@ -598,25 +733,7 @@ def main() -> None:
     results: list[dict[str, Any]] = []
 
     for shape_name in shapes:
-        T, H, W = SHAPES[shape_name]
-        gen = torch.Generator(device="cuda").manual_seed(args.seed)
-        if args.video or args.image:
-            pixels = _real_pixels(args.video, args.image, T, H, W)
-            model = _build("native", state_dict, torch.float32, {})
-            with torch.inference_mode():
-                latents = model.encode(pixels.float(), return_dict=False)[0].mode()
-            del model
-            torch.cuda.empty_cache()
-            inputs = {"decode": latents.to(dtype), "encode": pixels.to(dtype)}
-        else:
-            inputs = {
-                "decode": torch.randn(_latent_shape(T, H, W), generator=gen, device="cuda").to(
-                    dtype
-                ),
-                "encode": (
-                    torch.rand(_pixel_shape(T, H, W), generator=gen, device="cuda") * 2 - 1
-                ).to(dtype),
-            }
+        inputs = _build_inputs(args, shape_name, state_dict, dtype)
         decode_chunk = args.decode_chunk or SHAPE_DECODE_CHUNK.get(shape_name, 1)
         for op in ops:
             if op not in inputs:
@@ -626,91 +743,28 @@ def main() -> None:
                 f"\n=== {shape_name} {op} input={tuple(inp.shape)} chunk={decode_chunk} ===",
                 flush=True,
             )
-
-            reference: torch.Tensor | None = None
+            reference = (
+                _fp32_reference(state_dict, op, inp, decode_chunk) if use_reference else None
+            )
             native_out: torch.Tensor | None = None
-            if use_reference:
-                model = _build("native", state_dict, torch.float32, {})
-                with torch.inference_mode():
-                    reference = _make_op(model, op, inp.float(), decode_chunk)().float().cpu()
-                del model
-                torch.cuda.empty_cache()
-
             for backend in backends:
-                t_start = time.time()
-                model = _build(
-                    backend, state_dict, dtype, winovae_opts if backend == "winovae" else {}
+                row, out_cpu = _run_backend(
+                    backend,
+                    args=args,
+                    state_dict=state_dict,
+                    dtype=dtype,
+                    winovae_opts=winovae_opts,
+                    parallel=parallel,
+                    shape_name=shape_name,
+                    op=op,
+                    inp=inp,
+                    decode_chunk=decode_chunk,
+                    reference=reference,
+                    native_out=native_out,
                 )
-                if parallel is not None:
-                    model = parallel(model)
-                run_fn = _make_op(model, op, inp, decode_chunk)
-
-                row: dict[str, Any] = {
-                    "backend": backend,
-                    "shape": shape_name,
-                    "op": op,
-                    "input_shape": list(inp.shape),
-                    "decode_chunk": decode_chunk,
-                }
-                if parallel is not None:
-                    torch.distributed.barrier()
-                if not args.skip_accuracy:
-                    torch.cuda.reset_peak_memory_stats()
-                    with torch.inference_mode():
-                        out = run_fn()
-                    torch.cuda.synchronize()
-                    row["peak_alloc_gb"] = torch.cuda.max_memory_allocated() / 2**30
-                    row["output_shape"] = list(out.shape)
-                    out_cpu = out.float().cpu()
-                    if reference is not None:
-                        row["vs_ref_fp32"] = _metrics(out_cpu, reference)
-                    if backend == "native":
-                        native_out = out_cpu
-                    elif native_out is not None:
-                        row["vs_native"] = _metrics(out_cpu, native_out)
-                    del out
-
-                row["timing"] = _time_cupti(
-                    run_fn, args.warmup, args.iters, use_graph=not args.no_graph
-                )
-                if args.span_diffs and op == "decode" and inp.shape[2] >= 1 + 2 * decode_chunk:
-                    frames = [1, 1 + decode_chunk, 1 + 2 * decode_chunk]
-                    timed = [
-                        _clip_span(
-                            model, inp, n, decode_chunk, args.warmup, args.iters, not args.no_graph
-                        )
-                        for n in frames
-                    ]
-                    spans = [t for t, _ in timed]
-                    row["span_diffs"] = {
-                        "chunk_latent_frames": decode_chunk,
-                        "latent_frames": frames,
-                        "span_ms": spans,
-                        "graph": [g for _, g in timed],
-                        "diff_ms": [spans[1] - spans[0], spans[2] - spans[1]],
-                    }
-                    print(
-                        "    whole-clip decode spans for "
-                        + ", ".join(f"{n} latent frames: {t:.2f} ms" for n, t in zip(frames, spans))
-                        + f"; differences {spans[1] - spans[0]:.2f} / {spans[2] - spans[1]:.2f} ms",
-                        flush=True,
-                    )
-                row["setup_s"] = time.time() - t_start
+                if backend == "native":
+                    native_out = out_cpu
                 results.append(row)
-
-                t = row["timing"]
-                acc = row.get("vs_ref_fp32", {})
-                print(
-                    f"  {backend:9s} graph={str(t['graph']):5s} "
-                    f"span med {t['span']['median_us'] / 1e3:9.2f} ms "
-                    f"p90 {t['span']['p90_us'] / 1e3:9.2f} ms  "
-                    f"wall med {t['wall']['median_us'] / 1e3:9.2f} ms  "
-                    f"kernels/iter {t['kernels_per_iter']:.0f}  "
-                    + (f"rel_l2 {acc['rel_l2']:.3e} max_abs {acc['max_abs']:.3e}" if acc else ""),
-                    flush=True,
-                )
-                del model, run_fn
-                torch.cuda.empty_cache()
             del reference, native_out
         del inputs
         torch.cuda.empty_cache()

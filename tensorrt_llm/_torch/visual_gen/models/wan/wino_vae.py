@@ -1381,8 +1381,9 @@ class WinoVaeResample(nn.Module):
         batch_size: int,
         frames: int,
         shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None,
-    ) -> torch.Tensor:
-        """2x2 conv on the low-res grid, then the phase gather (+ DupUp3D shortcut)."""
+    ) -> "torch.Tensor | PendingAdd":
+        """2x2 conv on the low-res grid, then the phase gather (+ DupUp3D shortcut); with
+        ``fused_upsample_norm`` the gather is left to the next norm kernel as a ``PendingAdd``."""
         packed, packed_bias = self._packed_weights()
         cout = packed.shape[0] // 4
         use_cuda = x_4d.dtype in (torch.bfloat16, torch.float16) and (
@@ -1451,10 +1452,13 @@ class WinoVaeResample(nn.Module):
         feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
         shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None = None,
-    ) -> torch.Tensor:
-        """``shortcut`` = (residual, DupUp3D module, first_chunk): when given, the fused
-        upsample adds the expanded shortcut while writing and the caller skips its add."""
-        batch_size, channels, frames, height, width = x.size()
+    ) -> "torch.Tensor | PendingAdd":
+        """Resample ``x`` ``[B, C, T, H, W]``: the upsample3d time step with its causal cache,
+        then the spatial step, then (downsample3d) the temporal downsample continuation.
+        ``shortcut`` = (residual, DupUp3D module, first_chunk): when given, the fused upsample
+        adds the expanded shortcut while writing and the caller skips its add. The fused
+        upsample may return a ``PendingAdd`` whose gather the next norm kernel performs."""
+        batch_size, channels, _, height, width = x.size()
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
         if shortcut is not None and not (
@@ -1463,76 +1467,89 @@ class WinoVaeResample(nn.Module):
             raise ValueError("shortcut is only consumed by the fused upsample path")
 
         if self.mode == "upsample3d" and feat_cache is not None and feat_idx is not None:
-            idx = feat_idx[0]
-            if feat_cache[idx] is None:
-                feat_cache[idx] = "Rep"
-                feat_idx[0] += 1
-            else:
-                cache_x = x[:, :, -CACHE_T:, :, :]
-                if (
-                    cache_x.shape[2] < 2
-                    and feat_cache[idx] is not None
-                    and feat_cache[idx] != "Rep"
-                ):
-                    cache_x = torch.cat(
-                        [
-                            _to_device_if_needed(
-                                feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
-                            ),
-                            cache_x,
-                        ],
-                        dim=2,
-                    )
-                if cache_x.shape[2] < 2 and feat_cache[idx] == "Rep":
-                    cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
-                fuse_interleave = (
-                    cuda_frame_ops_available()
-                    and batch_size == 1
-                    and x.dtype == torch.bfloat16
-                    and x.is_cuda
-                )
-                self.time_conv.defer_bias = fuse_interleave
-                if feat_cache[idx] == "Rep":
-                    x = self.time_conv(x)
-                else:
-                    x = self.time_conv(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
-
-                if fuse_interleave:
-                    # Interleave the two channel halves along time and add the time conv's bias.
-                    u = frames_view(_channels_last_3d_if_needed(x))
-                    x = frames_to_video(interleave_bias_cuda(u, self.time_conv.bias), height, width)
-                else:
-                    x = x.reshape(batch_size, 2, channels, frames, height, width)
-                    x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-                    x = x.reshape(batch_size, channels, frames * 2, height, width)
+            x = self._temporal_upsample(x, feat_cache, feat_idx)
 
         frames = x.shape[2]
         x_4d = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
-        x = _channels_last_2d_if_needed(x_4d)
+        x_4d = _channels_last_2d_if_needed(x_4d)
         if self.options.fused_upsample and self.mode.startswith("upsample"):
-            return self._fused_upsample(x, batch_size, frames, shortcut)
+            return self._fused_upsample(x_4d, batch_size, frames, shortcut)
+        y = self._spatial_resample(x_4d, batch_size)
+        return self._after_resample(y, batch_size, frames, feat_cache, feat_idx)
+
+    def _temporal_upsample(
+        self, x: torch.Tensor, feat_cache: list[CacheEntry], feat_idx: list[int]
+    ) -> torch.Tensor:
+        """The upsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one).
+        First chunk: records the ``"Rep"`` sentinel and returns ``x`` unchanged (its frames are
+        repeated by the caller's layout). Later chunks: the time conv runs against the cached
+        frame (zero history right after the sentinel), the chunk's last frames become the next
+        cache entry, and the two channel halves are interleaved along time with the conv bias:
+        ``[B, C, T, H, W] -> [B, C, 2T, H, W]``."""
+        batch_size, channels, frames, height, width = x.size()
+        idx = feat_idx[0]
+        if feat_cache[idx] is None:
+            feat_cache[idx] = "Rep"
+            feat_idx[0] += 1
+            return x
+
+        cache_x = x[:, :, -CACHE_T:, :, :]
+        if cache_x.shape[2] < 2 and feat_cache[idx] != "Rep":
+            cache_x = torch.cat(
+                [
+                    _to_device_if_needed(
+                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
+                    ),
+                    cache_x,
+                ],
+                dim=2,
+            )
+        if cache_x.shape[2] < 2 and feat_cache[idx] == "Rep":
+            cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
+        fuse_interleave = (
+            cuda_frame_ops_available()
+            and batch_size == 1
+            and x.dtype == torch.bfloat16
+            and x.is_cuda
+        )
+        self.time_conv.defer_bias = fuse_interleave
+        if feat_cache[idx] == "Rep":
+            x = self.time_conv(x)
+        else:
+            x = self.time_conv(x, feat_cache[idx])
+        feat_cache[idx] = cache_x
+        feat_idx[0] += 1
+
+        if fuse_interleave:
+            # Interleave the two channel halves along time and add the time conv's bias.
+            u = frames_view(_channels_last_3d_if_needed(x))
+            return frames_to_video(interleave_bias_cuda(u, self.time_conv.bias), height, width)
+        x = x.reshape(batch_size, 2, channels, frames, height, width)
+        x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+        return x.reshape(batch_size, channels, frames * 2, height, width)
+
+    def _spatial_resample(self, x_4d: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """The eager spatial step on frames ``[B*T, C, H, W]``: the stride-2 downsample conv
+        after its zero pad (the shard's pad under sharding), or the nearest-2x upsample and
+        3x3 conv (with exchanged halo lines under sharding)."""
         if self.mode.startswith("downsample"):
             padded = (
-                self.resample[0](x)
+                self.resample[0](x_4d)
                 if self.shard is None
-                else self.shard.pad_for_downsample(_channels_last_2d_if_needed(x))
+                else self.shard.pad_for_downsample(_channels_last_2d_if_needed(x_4d))
             )
-            x = self._downsample_conv(padded, batch_size)
-        elif self.shard is not None and self.mode.startswith("upsample"):
-            up = _channels_last_2d_if_needed(self.resample[0](x))
+            return self._downsample_conv(padded, batch_size)
+        if self.shard is not None:
+            up = _channels_last_2d_if_needed(self.resample[0](x_4d))
             conv = self.resample[1]
-            x = F.conv2d(
+            return F.conv2d(
                 self.shard.pad_frames(up),
                 conv.weight,
                 conv.bias,
                 conv.stride,
                 self.shard.conv_padding(conv.padding),
             )
-        else:
-            x = self.resample(x)
-        return self._after_resample(x, batch_size, frames, feat_cache, feat_idx)
+        return self.resample(x_4d)
 
     def _defer_downsample_bias(self, x: torch.Tensor, batch_size: int) -> bool:
         conv = self.resample[1]
