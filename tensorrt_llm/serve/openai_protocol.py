@@ -1126,6 +1126,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
     prompt_ignore_length: Optional[int] = 0
+    # Match Codex CLI's string-map contract; widen only for a client that needs
+    # other value types, even though the metadata is otherwise ignored.
     client_metadata: Optional[Dict[str, str]] = Field(
         default=None,
         description=("Not an OpenAI field: opaque per-request metadata that "
