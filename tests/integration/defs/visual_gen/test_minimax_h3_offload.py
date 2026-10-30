@@ -116,4 +116,4 @@ def test_minimax_h3_offload_memory_and_parity(tmp_path: Path) -> None:
     assert measurements["lpips"] < 0.01
     torch.testing.assert_close(offload_audio, baseline_audio, rtol=1e-4, atol=1e-5)
     for phase in ("load_sampled_peak_allocated_bytes", "inference_peak_allocated_bytes"):
-        assert measurements["offload"][phase] < measurements["baseline"][phase] - 1024**3
+        assert measurements["offload"][phase] < measurements["baseline"][phase] - 50 * 1024**3
