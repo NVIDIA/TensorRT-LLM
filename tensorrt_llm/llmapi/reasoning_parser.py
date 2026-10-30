@@ -566,6 +566,76 @@ class PoolsideV1ReasoningParser(DeepSeekV4ReasoningParser):
                 chat_template_kwargs=chat_template_kwargs)
 
 
+@register_reasoning_parser("xing4_0")
+class Xing4_0ReasoningParser(BaseReasoningParser):
+    """Reasoning parser for Xing4.0 models."""
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        kwargs = chat_template_kwargs or {}
+        value = kwargs.get("enable_thinking", kwargs.get("thinking"))
+        thinking_enabled = True if value is None else bool(value)
+
+        if thinking_enabled:
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=True,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        else:
+            self._parser = IdentityReasoningParser(
+                chat_template_kwargs=chat_template_kwargs, )
+        # Streaming state for a possible leading ``<think>`` marker: hold
+        # text back until it can no longer grow into the marker, mirroring
+        # the leading-tag strip in :meth:`parse`.
+        self._thinking_enabled = thinking_enabled
+        self._lead_buffer = ""
+        self._lead_pending = True
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        if text.startswith(self.reasoning_start):
+            text = text[len(self.reasoning_start):]
+        return self._parser.parse(text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        if self._lead_pending:
+            self._lead_buffer += delta_text
+            if self.reasoning_start.startswith(self._lead_buffer):
+                # Could still grow into a leading ``<think>`` marker.
+                return ReasoningParserResult()
+            self._lead_pending = False
+            text, self._lead_buffer = self._lead_buffer, ""
+            if text.startswith(self.reasoning_start):
+                text = text[len(self.reasoning_start):]
+                if not text:
+                    return ReasoningParserResult()
+            return self._parser.parse_delta(text)
+        return self._parser.parse_delta(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        if self._lead_pending:
+            # Stream ended while the leading text could still have grown
+            # into ``<think>``. A complete marker is a delimiter and is
+            # dropped; an incomplete fragment is ordinary output attributed
+            # to the block it was withheld in.
+            self._lead_pending = False
+            text, self._lead_buffer = self._lead_buffer, ""
+            if text.startswith(self.reasoning_start):
+                text = text[len(self.reasoning_start):]
+            if not text:
+                return ReasoningParserResult()
+            if self._thinking_enabled:
+                return ReasoningParserResult(reasoning_content=text)
+            return ReasoningParserResult(content=text)
+        return self._parser.finish()
+
+
 @register_reasoning_parser("minimax_m3")
 class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for MiniMax-M3.
@@ -708,6 +778,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
+    "xing4_0": "xing4_0",
     "laguna": "poolside_v1",
     "deepseek_v4": "deepseek_v4",
     "deepseek_v41": "deepseek_v41",
