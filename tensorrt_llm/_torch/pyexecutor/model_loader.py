@@ -22,6 +22,7 @@ from tensorrt_llm._torch.weight_sharing import (
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
@@ -43,13 +44,14 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
-from .._experimental.modeling_v2 import modeling_v2_resolve
+from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
@@ -110,6 +112,14 @@ _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
 _MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     sliding_windows=frozenset({"none"}),
+)
+# Qwen3.5 vision-language roots realize interleaved M-RoPE (`rope_type`
+# `mrope`), applied by the fused QK-norm/RoPE kernel rather than the
+# attention op.
+_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    rope_types=frozenset({"mrope"}),
+    rope_fusion=frozenset({False}),
 )
 
 
@@ -833,6 +843,19 @@ class ModelLoader:
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
+        PostTransformProfile(
+            profile_id="qwen3_5-for-conditional-generation-bf16-complete-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_5",
+                "Qwen3_5VLModel"),
+            architecture="Qwen3_5ForConditionalGeneration",
+            model_type="qwen3_5",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+            runtime_constraints=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS,
+        ),
     ))
 
     @classmethod
@@ -1476,9 +1499,9 @@ class ModelLoader:
                         #      compatibility check (GMS has no disk fallback).
                         #   4. `materialize_module`: zero-copy bind GMS
                         #      pool storage onto the model parameters.
-                        #   5. Per-module `cache_derived_state`: recompute
-                        #      Python-side state from real, materialized
-                        #      tensors without re-running one-shot transforms.
+                        #   5. Mark materialized weights as transformed, then
+                        #      recompute Python-side derived state without
+                        #      re-running one-shot transforms.
                         #   6. `post_load_publish`: apply the format-specific
                         #      receiver publication policy.
                         with timing_metric(
@@ -1496,6 +1519,7 @@ class ModelLoader:
                             self._check_gms_source_identity(gms_backend)
 
                             gms_backend.materialize_module(model)
+                            self._mark_weights_transformed(model)
                             self._walk_cache_state(model)
 
                             self._post_load_publish(
@@ -1733,6 +1757,42 @@ class ModelLoader:
                 torch.cuda.synchronize()
 
     @classmethod
+    def _post_transform_transfer_scope(
+            cls, model: torch.nn.Module) -> PostTransformTransferScope:
+        """Return the model component that an MX transfer of `model` carries.
+
+        MX transfers every parameter of the constructed root. A text-only root
+        is the target model. A registered multimodal root is the complete model
+        when it owns parameters outside its language model (a local multimodal
+        encoder), and only the language model otherwise, as with
+        `disable_mm_encoder` or multimodal encoder/prefill disaggregation.
+        Roots without a registered profile keep the target-model scope without
+        querying `language_model`; qualification rejects them by root class.
+        """
+        if not isinstance(model, MultimodalModelMixin):
+            return PostTransformTransferScope.TARGET_MODEL
+        root_model_class = type(model)
+        if not any(
+                profile.root_model_class.matches(root_model_class)
+                for profile in cls._post_transform_profile_registry().profiles):
+            return PostTransformTransferScope.TARGET_MODEL
+        try:
+            language_model = getattr(model, "language_model", None)
+        except NotImplementedError:
+            language_model = None
+        if not isinstance(language_model, torch.nn.Module):
+            return PostTransformTransferScope.TARGET_MODEL
+        language_model_parameters = {
+            id(parameter)
+            for parameter in language_model.parameters()
+        }
+        if any(
+                id(parameter) not in language_model_parameters
+                for parameter in model.parameters()):
+            return PostTransformTransferScope.COMPLETE_MODEL
+        return PostTransformTransferScope.LANGUAGE_MODEL
+
+    @classmethod
     def _qualify_post_transform_profile(
             cls,
             model: DecoderModelForCausalLM,
@@ -1757,7 +1817,7 @@ class ModelLoader:
             model_type=config_identity.model_type,
             speculative_mode=speculative_mode,
             protocol_version=cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            transfer_scope=cls._post_transform_transfer_scope(model),
             enabled_features=frozenset(enabled_features),
             runtime_config=PostTransformRuntimeConfig.from_model_config(
                 model.model_config, model=model),
@@ -2096,7 +2156,7 @@ class ModelLoader:
         # modeling_v2 target reads the arguments as the engine will run with
         # them and never overrides those defaults.
         config = replace(config,
-                         modeling_v2_target=modeling_v2_resolve(
+                         modeling_v2_target=modeling_v2_resolve_on_all_ranks(
                              config, self.llm_args))
 
         if uses_mtp_head_checkpoint(self.spec_config):

@@ -18,15 +18,19 @@
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/math.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <array>
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
@@ -144,6 +148,11 @@ KvCache::~KvCache()
             // waiting on the GIL to run a Python callback. Drop the GIL first if we happen to
             // hold it.
             OptionalGilRelease const gilRelease;
+            // Before close(), so a Batch never holds a row pointing at a half-torn cache.
+            if (mBatch != nullptr)
+            {
+                mBatch->_detach(*this);
+            }
             close();
         });
 }
@@ -194,21 +203,20 @@ std::vector<Priority> KvCache::getPagePriorities(LayerGroupId layerGroupId, Beam
     {
         throw std::out_of_range("Beam index is outside the request's beam width");
     }
-    if (layerGroupId.value() < 0 || LifeCycleId{layerGroupId.value()} >= mManager->storage().numLifeCycles())
+    if (layerGroupId.value() < 0 || layerGroupId >= mManager->storage().numLifeCycles())
     {
         throw std::out_of_range("Layer group is outside the configured life cycles");
     }
     std::vector<Priority> result;
     result.reserve(mBlocks.stdSize());
-    bool const isSsm
-        = std::holds_alternative<SsmLifeCycle>(mManager->storage().getLifeCycle(LifeCycleId{layerGroupId.value()}));
+    bool const isSsm = std::holds_alternative<SsmLifeCycle>(mManager->storage().getLifeCycle(layerGroupId));
     for (auto const& block : mBlocks)
     {
         // Shared prompt blocks keep only beam 0; writable tails have a row per beam.
         auto const pageBeamIndex = block.pages.size() == BeamIndex{1} ? kDefaultBeamIndex : beamIndex;
         auto const* page = blockPageGetPage(block.pages[pageBeamIndex].at(layerGroupId)).get();
         if (isSsm && block.treeBlock)
-            page = block.treeBlock->getPage(LifeCycleId{layerGroupId.value()});
+            page = block.treeBlock->getPage(layerGroupId);
         // Preserve ordinals, including absent pages, just like getAggregatedPageIndices(validOnly=false).
         result.push_back(page ? page->priority() : kPriorityDefault);
     }
@@ -419,115 +427,14 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
     return blockPageGetPage(blockPage);
 }
 
-CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
+std::optional<int> KvCache::maxInputLength() const
 {
-    bool const readOnly = page.isCommitted()
-        || (ordinal != kBadBlockOrdinal && ordinal < BlockOrdinal{mHistoryLength / mTokensPerBlock});
-    return mIsDecoding && readOnly ? page.queryLockLevel() : kHotLevel;
-}
-
-void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength)
-{
-    TLLM_CHECK_DEBUG(range.end <= BlockOrdinal{historyLength / mTokensPerBlock});
-    if (mHasDeferredSparseOffload)
-    {
-        range = {0, historyLength / mTokensPerBlock};
-    }
-    bool deferred = false;
-    std::vector<SharedPtr<Page>> pages;
-    for (auto const& [lcId, lc] : mManager->lifeCycles())
-    {
-        auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-        if (!attn || !attn->isSparse)
-            continue;
-        if (range.end > mBlocks.size())
-            throw std::invalid_argument("Sparse history must already have allocated pages");
-        for (BlockOrdinal ord = range.beg; ord < range.end; ++ord)
-        {
-            for (BeamIndex bi{0}; bi < mBlocks[ord].pages.size(); ++bi)
-            {
-                auto page = _page(ord, bi, lcId);
-                TLLM_CHECK_DEBUG(page && page->status() == PageStatus::LOCKED);
-                if (page->cacheLevel == kSparseHistoryLevel)
-                    continue;
-                auto const lock = page->holder.lock()->uniqLock.lock();
-                bool needsGpu = false;
-                for (auto const& owner : lock->owners())
-                {
-                    int const ownerHistory = owner.kvCache == this ? historyLength : owner.kvCache->historyLength();
-                    if ((owner.kvCache != this && !owner.kvCache->isDecoding())
-                        || owner.ordinal >= BlockOrdinal{ownerHistory / owner.kvCache->tokensPerBlock()})
-                    {
-                        needsGpu = true;
-                        break;
-                    }
-                }
-                if (needsGpu)
-                {
-                    deferred = true;
-                    continue;
-                }
-                pages.push_back(std::move(page));
-            }
-        }
-    }
-    // Preserve retry work if allocation or copy submission fails.
-    mHasDeferredSparseOffload = true;
-    if (!pages.empty())
-    {
-        int const oldHistoryLength = mHistoryLength;
-        auto restoreHistory = FuncGuard([&]() { mHistoryLength = oldHistoryLength; });
-        mHistoryLength = historyLength;
-        offloadSparsePages(pages);
-    }
-    mHasDeferredSparseOffload = deferred;
-}
-
-void KvCache::_publishHistoryLength(int historyLength)
-{
-    if (mIsDecoding && historyLength / mTokensPerBlock != mHistoryLength / mTokensPerBlock)
-        onPageStorageChanged();
-    mHistoryLength = historyLength;
-}
-
-bool KvCache::enterDecode()
-{
-    KVCM2_API_GUARD();
-    auto const apiLock = mManager->lockExclusive();
-    if (!isActive())
-        throw LogicError("Decode admission requires an active request");
-    if (mIsDecoding && !mHasDeferredSparseOffload)
-        return true;
-    try
-    {
-        _offloadSparseHistory({0, mHistoryLength / mTokensPerBlock}, mHistoryLength);
-    }
-    catch (OutOfPagesError const&)
-    {
-        return false;
-    }
-    if (!mIsDecoding)
-    {
-        mIsDecoding = true;
-        onPageStorageChanged();
-    }
-    return true;
-}
-
-void KvCache::offloadSparsePages(std::vector<SharedPtr<Page>> const& pages)
-{
-    KVCM2_API_GUARD();
-    auto const apiLock = mManager->lockExclusive();
-    if (!isActive())
-    {
-        throw LogicError("Sparse history offload requires an active request");
-    }
-    MigrationRecorder const migrationRecorder
-        = [this](std::vector<SharedPtr<Page>> const& sources, std::vector<Slot> const& slots, CacheLevel srcLevel,
-              CacheLevel dstLevel) { _recordMigratedSlots(sources, slots, srcLevel, dstLevel); };
-    DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& dropped, CacheLevel level)
-    { _recordDroppedPages(dropped, level); };
-    storageManager()->offloadSparsePages(*this, pages, migrationRecorder, dropRecorder);
+    // One token, not the reservation's spare width. A sparse request contributes exactly one
+    // query token per step, because the fetch resolves one selection per request while an
+    // attention kernel indexes its selection per query token; the two agree only at one
+    // token each. Prefill and speculative decoding break that and are out of scope, so the
+    // bound is a property of the supported shape rather than of how wide a cache is.
+    return mManager->hasSparseCache() ? std::optional<int>{1} : std::nullopt;
 }
 
 void KvCache::activate()
@@ -537,7 +444,8 @@ void KvCache::activate()
 
     mFinishEvent.reset();
 
-    // Prefill restores GPU storage; decode can retain cold sparse history on host.
+    // Residency is a property of the life cycle: every page of a sparse buffer locks at the
+    // host tier, written or not, and reaches the kernels through the per-request cache.
     auto activePages = _activePages();
     std::vector<BatchedLockTarget> targets;
     targets.reserve(activePages.size());
@@ -555,14 +463,7 @@ void KvCache::activate()
         }
         auto& holder = std::get<SharedPtr<PageHolder>>(*bp);
         TLLM_CHECK_DEBUG(holder);
-        // A reused partial block is only a copy source. resume() replaces it with a private GPU
-        // page before execution, so another owner's host lock need not be moved.
-        bool const partialCopySource = mNeverResumed && ap.ordinal != kBadBlockOrdinal
-            && numCommittedTokens() % mTokensPerBlock != 0
-            && ap.ordinal == BlockOrdinal{numCommittedTokens() / mTokensPerBlock};
-        CacheLevel const level
-            = partialCopySource ? holder->page->queryLockLevel() : _lockLevel(*holder->page, ap.ordinal);
-        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId, level});
+        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId});
     }
 
     {
@@ -581,26 +482,24 @@ void KvCache::activate()
     }
 }
 
-bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding,
-    std::optional<std::vector<LifeCycleId>> optionalReuseGroups)
+bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<LifeCycleId>> optionalReuseGroups)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
+    if (mBatch != nullptr)
+    {
+        throw LogicError("A KvCache in a Batch cannot be resumed; remove it from the Batch first");
+    }
 
     // Set stream first (mirrors Python: self.cuda_stream = cuda_stream).
     if (stream.has_value())
     {
-        setCudaStream(*stream);
+        _setCudaStream(*stream);
     }
     TLLM_CHECK_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
     auto const apiLock = mManager->lockExclusive();
-    bool const oldIsDecoding = mIsDecoding;
-    if (mIsDecoding && isDecoding == false)
-        throw std::invalid_argument("Cannot return a decoding cache to prefill");
-    auto restorePhase = FuncGuard([&]() { mIsDecoding = oldIsDecoding; });
-    mIsDecoding = isDecoding.value_or(mIsDecoding);
     if (mNeverResumed)
     {
         _selectOptionalGroups(optionalReuseGroups.value_or(std::vector<LifeCycleId>{}));
@@ -645,25 +544,6 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     // Pre-allocate GPU slots for deferred copies (partial blocks + SSM) and scratch slots
     // before locking, so we never end up in a state where pages are locked but we can't allocate.
     TypedVec<LifeCycleId, std::optional<Slot>> deferredSlots(numLc);
-    bool deferredCopiesStarted = false;
-    auto releaseDeferredSlots = FuncGuard(
-        [&]()
-        {
-            std::optional<CachedCudaEvent> completion;
-            for (LifeCycleId lc{0}; lc < numLc; ++lc)
-            {
-                if (deferredSlots[lc].has_value() && deferredSlots[lc]->hasValidSlot())
-                {
-                    if (deferredCopiesStarted)
-                    {
-                        if (!completion)
-                            completion.emplace(reinterpret_cast<CudaStream>(cudaStream()));
-                        deferredSlots[lc]->readyEvent = *completion;
-                    }
-                    storageMgr.releaseSlot(lc, kHotLevel, std::move(*deferredSlots[lc]));
-                }
-            }
-        });
     TypedVec<LifeCycleId, std::vector<BlockOrdinal>> privateOrdinals(numLc);
     TypedVec<LifeCycleId, std::vector<Slot>> privateSlots(numLc);
     auto releasePrivateSlots = FuncGuard(
@@ -724,11 +604,10 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         numSlotsNeeded[lc] += scratchDeltaCounts[lc];
     }
 
-    // Only allocate if any slots are needed.
-    bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
-    if (anyNeeded)
+    bool const anyResident
+        = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
     {
-        TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots;
+        TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots(numLc);
         try
         {
             MigrationRecorder const migrationRecorder
@@ -736,7 +615,10 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
                       CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
             DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
             { _recordDroppedPages(pages, cacheLevel); };
-            tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
+            if (anyResident)
+            {
+                tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
+            }
         }
         catch (OutOfPagesError const&)
         {
@@ -764,13 +646,13 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
                     deferredSlots[lc] = std::move(tmpSlots[lc].back());
                     tmpSlots[lc].pop_back();
                 }
+
                 // Remaining slots are scratch slots.
                 auto& scratchSlots = mScratchSlots[lc];
                 scratchSlots.reserve(scratchSlots.size() + tmpSlots[lc].size());
                 for (auto& slot : tmpSlots[lc])
                 {
-                    scratchSlots.emplace_back(std::move(slot), *this, lc,
-                        /*skipWait=*/true);
+                    scratchSlots.emplaceBack(std::move(slot), *this, lc, /*skipWait=*/true);
                     scratchReadyEvents.push_back(scratchSlots.back().slot().readyEvent.handle());
                 }
             }
@@ -788,12 +670,15 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     }
     catch (OutOfPagesError const&)
     {
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+        {
+            if (deferredSlots[lc].has_value())
+                storageMgr.releaseSlot(lc, kHotLevel, std::move(*deferredSlots[lc]));
+        }
         // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
         // a recordEventScope, matching Python behavior.
         return false;
     }
-    mStatus = Status::ACTIVE;
-    auto rollbackActivation = FuncGuard([&]() { _deactivate(); });
 
     // Private recovery pages have no reusable source. Their contents are
     // initialized by the caller before inference, after all allocations succeed.
@@ -873,7 +758,6 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             copiedSources[lcIdx] = lock->page();
 
             CacheLevel const sourceLevel = lock->page()->cacheLevel;
-            deferredCopiesStarted = true;
             storageMgr.copySlotData(lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
@@ -960,27 +844,15 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     mOptionalCandidates.clear();
     // Deferred copies survive a failed decode admission and must not be repeated on retry.
     mPartialCopyRetentionHolds.clear();
+    // A new cache is SUSPENDED until this resume() activates it, so only one that had
+    // already resumed counts as a preemption recovery.
+    bool const firstActivation = mNeverResumed;
     mNeverResumed = false;
-    if (mIsDecoding)
-    {
-        try
-        {
-            _offloadSparseHistory({0, mHistoryLength / mTokensPerBlock}, mHistoryLength);
-        }
-        catch (OutOfPagesError const&)
-        {
-            return false;
-        }
-        onPageStorageChanged();
-    }
-    rollbackActivation.cancel();
-    restorePhase.cancel();
-    // Only a previously admitted request counts as a preemption recovery.
-    if (mHasResumed && _shouldRecordStats())
+    mStatus = Status::ACTIVE;
+    if (!firstActivation && _shouldRecordStats())
     {
         mManager->recordRequestResumed();
     }
-    mHasResumed = true;
     return true;
 }
 
@@ -1003,12 +875,11 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
-        CacheLevel const destination = std::max(target, _lockLevel(*page, activePage.ordinal));
-        if (page->cacheLevel < destination || !seen.insert(page.get()).second)
+        if (page->cacheLevel < target || !seen.insert(page.get()).second)
         {
             continue;
         }
-        pagesByDestination.at(destination).push_back(std::move(page));
+        pagesByDestination.at(target).push_back(std::move(page));
     }
 
     try
@@ -1039,21 +910,17 @@ bool KvCache::prefetch(CacheLevel target)
 void KvCache::suspend()
 {
     KVCM2_API_GUARD();
+    // A member is removed from its Batch before it suspends; see the declaration.
+    if (mBatch != nullptr)
+    {
+        throw LogicError("A KvCache in a Batch cannot be suspended; remove it from the Batch first");
+    }
     auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     mOptionalCandidates.clear();
     TLLM_CHECK_DEBUG(_checkSanity());
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
-    _deactivate();
-    if (_shouldRecordStats())
-    {
-        mManager->recordRequestSuspended();
-    }
-}
-
-void KvCache::_deactivate()
-{
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
     for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
         for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
@@ -1079,11 +946,13 @@ void KvCache::_deactivate()
         }
         // Free scratch slots inside scope — unlock() needs finishEvent().
         // Mirrors Python: _free_scratch_slots() inside `with self._record_event()`.
-        _freeScratchSlots();
+        _freeReservedGpuSlots();
     }
     mStatus = Status::SUSPENDED;
-    mHasDeferredSparseOffload = false;
-    onPageStorageChanged();
+    if (_shouldRecordStats())
+    {
+        mManager->recordRequestSuspended();
+    }
 }
 
 void KvCache::close()
@@ -1098,6 +967,12 @@ void KvCache::close()
     TLLM_CHECK_DEBUG(_checkSanity());
     if (mStatus == Status::CLOSED)
         return;
+    // Clearing the blocks below writes the staged row of a seated member; the destructor
+    // detaches first, so close() never arrives here seated.
+    if (mBatch != nullptr)
+    {
+        throw LogicError("A KvCache in a Batch cannot be closed; remove it from the Batch first");
+    }
 
     mOptionalCandidates.clear();
     discardPendingStats();
@@ -1129,14 +1004,7 @@ void KvCache::close()
         auto scope = recordEventScope();
         _clearBlocks();
     }
-    if (mPageStorageBatch != nullptr)
-    {
-        mPageStorageBatch->remove(*this);
-    }
     mStatus = Status::CLOSED;
-    mHasDeferredSparseOffload = false;
-    mPageStorageRow.reset();
-    onPageStorageChanged();
     mManager->unregisterKvCache(this);
 }
 
@@ -1378,7 +1246,7 @@ void KvCache::_clearBlocks()
     // Drop last block first (mirrors Python: while self._blocks: self._blocks.pop()).
     while (!mBlocks.empty())
         mBlocks.pop_back();
-    _freeScratchSlots();
+    _freeReservedGpuSlots();
     // Clear SSM blocks.
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     if (ssmLcId.has_value())
@@ -1640,11 +1508,46 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         throw std::invalid_argument("History length cannot be decreased");
     if (newCap < newHist)
         throw std::invalid_argument("History length cannot exceed capacity");
-    if (mIsDecoding && newHist > mCapacity)
+
+    // A block must be in its host page before it can be selected, and selectable means
+    // below the watermark. The write-back is the Batch's, so this only checks that one has
+    // covered the move.
+    //
+    // Only a unit that was in flight has its one copy in a cell, and in flight means below
+    // the capacity this resize starts from -- so a request arriving with a history, whose
+    // units reached their host pages directly, crosses nothing and needs no flush. That is
+    // also what lets a cache be seeded before it joins a Batch.
+    if (newHist > mHistoryLength)
     {
-        for (auto const& [lcId, lc] : mManager->lifeCycles())
-            if (auto const* attn = std::get_if<AttnLifeCycle>(&lc); attn && attn->isSparse)
-                throw std::invalid_argument("Sparse decode history cannot include unallocated input tokens");
+        bool crosses = false;
+        for (LifeCycleId lc{0}; mBatch != nullptr && lc < mManager->numLifeCycles() && !crosses; ++lc)
+        {
+            if (mManager->sparseCacheMaxUnits(lc) == 0)
+            {
+                continue;
+            }
+            int const unitTokens = mTokensPerBlock / mManager->sparseCacheUnitsPerPage(lc);
+            crosses = std::min(newHist, mCapacity) / unitTokens > mHistoryLength / unitTokens;
+        }
+        if (crosses)
+        {
+            // Not equality: a step may resize a row more than once, and a row whose growth
+            // failed rolls back to a history below the one flushed for it.
+            int const flushed = mBatch != nullptr ? mBatch->flushedHistory(*mBatchRow) : 0;
+            TLLM_CHECK_WITH_INFO(newHist <= flushed,
+                "A sparse KvCache cannot advance history past what has been written back; call "
+                "Batch::flushSparseUnits() with the new history first");
+        }
+    }
+
+    // Blocks above the watermark are in flight: their data lives only in sparse cache cells,
+    // so the gap cannot exceed what the reservation can pin. The host-side counterpart of
+    // the resolve kernel's in-flight overflow report.
+    if (newCap != newHist)
+    {
+        auto const bound = maxInputLength();
+        TLLM_CHECK_WITH_INFO(!bound.has_value() || newCap - newHist <= *bound,
+            "capacity - history_length exceeds what the sparse cache can hold in flight");
     }
 
     // Scratch reuse: enforce constraint.
@@ -1660,21 +1563,12 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     }
 
     bool const recordGenerationAllocStats = mGenerationAllocReady && newCap > mCapacity;
-    if (!enableScratch && divUp(newCap, mTokensPerBlock) == divUp(mCapacity, mTokensPerBlock))
+    if (!enableScratch && _canShortcutCapacity(newCap) && _canShortcutHistoryLength(newHist))
     {
-        try
-        {
-            if (_shortcutSetHistoryLength(newHist))
-            {
-                mCapacity = newCap;
-                _refreshGenerationAllocReady();
-                return true;
-            }
-        }
-        catch (OutOfPagesError const&)
-        {
-            return false;
-        }
+        mCapacity = newCap;
+        mHistoryLength = newHist;
+        _refreshGenerationAllocReady();
+        return true;
     }
 
     BlockOrdinal oldNumBlocks{divUp(mCapacity, mTokensPerBlock)};
@@ -1697,32 +1591,15 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     auto backupHolders = _unlockStaleBlocks(newHist);
 
-    // Compute scratch deltas.
-    auto [excessScratchSlots, deltaScratchSlots, scratchRanges] = _takeExcessScratchSlots(newCap, newHist);
-    auto restoreLocks = FuncGuard(
-        [&]()
-        {
-            _recoverExcessScratchSlots(excessScratchSlots);
-            _lockHeldBlocks(backupHolders);
-        });
-
     if (newNumBlocks < oldNumBlocks)
     {
         TLLM_CHECK_DEBUG_WITH_INFO(!hasScratchSlots(), "Cannot shrink while scratch slots exist");
-        try
-        {
-            if (mIsDecoding)
-                _offloadSparseHistory({mHistoryLength / mTokensPerBlock, newHist / mTokensPerBlock}, newHist);
-        }
-        catch (OutOfPagesError const&)
-        {
-            return false;
-        }
-        restoreLocks.cancel();
         _subtractPendingAllocationRange(newNumBlocks, oldNumBlocks);
         auto scope = recordEventScope();
         _decreaseCapacity(newNumBlocks);
     }
+
+    auto [excessScratchSlots, deltaScratchSlots, scratchRanges] = _takeExcessScratchSlots(newCap, newHist);
 
     if (newNumBlocks >= oldNumBlocks)
     {
@@ -1785,6 +1662,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             }
             catch (OutOfPagesError const&)
             {
+                _recoverExcessScratchSlots(excessScratchSlots);
+                _lockHeldBlocks(backupHolders);
                 return false;
             }
         }
@@ -1792,27 +1671,6 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         {
             newSlots.resize(numLc);
         }
-
-        // Reserve GPU growth before demoting history. A failed allocation or copy submission must
-        // leave the old capacity, watermark, and page ownership usable for a retry.
-        auto releaseNewSlots = FuncGuard(
-            [&]()
-            {
-                for (LifeCycleId lc{0}; lc < numLc; ++lc)
-                    for (auto& slot : newSlots[lc])
-                        mManager->storage().releaseSlot(lc, kHotLevel, std::move(slot));
-            });
-        try
-        {
-            if (mIsDecoding)
-                _offloadSparseHistory({mHistoryLength / mTokensPerBlock, newHist / mTokensPerBlock}, newHist);
-        }
-        catch (OutOfPagesError const&)
-        {
-            return false;
-        }
-        releaseNewSlots.cancel();
-        restoreLocks.cancel();
 
         // Wait on newly allocated slots.
         {
@@ -1869,7 +1727,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             {
                 auto slot = std::move(slots[lc].back());
                 slots[lc].pop_back();
-                mScratchSlots[lc].emplace_back(std::move(slot), *this, lc, /*skipWait=*/true);
+                mScratchSlots[lc].emplaceBack(std::move(slot), *this, lc, /*skipWait=*/true);
             }
         }
 
@@ -1943,7 +1801,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         backup.holder->page->claimRetention(std::nullopt, std::nullopt);
     }
     mCapacity = newCap;
-    _publishHistoryLength(newHist);
+    mHistoryLength = newHist;
     _refreshGenerationAllocReady();
     TLLM_CHECK_DEBUG(_checkSanity());
     return true;
@@ -1963,13 +1821,21 @@ void KvCache::setCapacity(int cap)
 
 void KvCache::setHistoryLength(int hist)
 {
-    if (!resize(std::nullopt, hist))
-        throw OutOfPagesError("Not enough pages to advance history");
+    bool success = resize(std::nullopt, hist);
+    TLLM_CHECK(success);
+    (void) success;
 }
 
-bool KvCache::_shortcutSetHistoryLength(int newHist)
+bool KvCache::_canShortcutCapacity(int newCap) const
 {
-    if (newHist == mHistoryLength && !mHasDeferredSparseOffload)
+    if (newCap == mCapacity)
+        return true;
+    return divUp(newCap, mTokensPerBlock) == divUp(mCapacity, mTokensPerBlock);
+}
+
+bool KvCache::_canShortcutHistoryLength(int newHist) const
+{
+    if (newHist == mHistoryLength)
         return true;
     // Check if stale range changes for any lifecycle.
     for (auto [lcId, lc] : mManager->lifeCycles())
@@ -1996,9 +1862,6 @@ bool KvCache::_shortcutSetHistoryLength(int newHist)
         if (changed)
             return false;
     }
-    if (mIsDecoding)
-        _offloadSparseHistory({mHistoryLength / mTokensPerBlock, newHist / mTokensPerBlock}, newHist);
-    _publishHistoryLength(newHist);
     return true;
 }
 
@@ -2258,7 +2121,7 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
                 }
                 TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
                 auto holder = blockPageGetPage(bp)->hold();
-                ret.push_back({ord, bi, lcIdx, holder, holder->page->cacheLevel});
+                ret.push_back({ord, bi, lcIdx, holder});
                 bp = holdForCommit ? BlockPage{std::move(holder)} : BlockPage{std::monostate{}};
             }
         }
@@ -2271,7 +2134,7 @@ void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
     std::vector<BatchedLockTarget> targets;
     targets.reserve(backup.size());
     for (auto const& b : backup)
-        targets.push_back({b.holder->page, b.beamIdx, b.ordinal, b.lcId, b.cacheLevel});
+        targets.push_back({b.holder->page, b.beamIdx, b.ordinal, b.lcId});
 
     auto locks = batchedLockPages(*this, targets);
     for (size_t i = 0; i < locks.size(); ++i)
@@ -2400,16 +2263,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         // Existing block: rebase — reuse existing block's committed pages.
         // Mirrors Python's `elif tree_block.is_full and allow_seq_rebasing and is_full` path.
         std::vector<BatchedLockTarget> reuseTasks;
-        std::vector<LifeCycleId> missingPages;
-        std::vector<std::pair<LifeCycleId, BlockPage>> originalPages;
-        std::vector<StaleBackup> originalLocks;
-        auto restorePages = FuncGuard(
-            [&]()
-            {
-                for (auto& [lc, bp] : originalPages)
-                    sb.pages[kDefaultBeamIndex][lc] = std::move(bp);
-                _lockHeldBlocks(originalLocks);
-            });
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (ssmLcId.has_value() && lc == *ssmLcId)
@@ -2432,7 +2285,40 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             bool isLocked = std::holds_alternative<SharedPageLock>(bp);
             if (existingPage == nullptr)
             {
-                missingPages.push_back(lc);
+                // Existing page gone — put our uncommitted page into the tree block.
+                if (auto* lock = std::get_if<SharedPageLock>(&bp))
+                {
+                    auto up = dynamicPointerCast<UncommittedPage>(lock->page());
+                    if (up)
+                    {
+                        bp = std::monostate{};
+                        auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens);
+                        if (newBlock->eventSink)
+                        {
+                            newBlock->eventSink->addStoredLifeCycle(*newBlock, lc);
+                        }
+                        bp = isLocked
+                            ? BlockPage{committed->lock(*this, kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc)}
+                            : BlockPage{committed->hold()};
+                    }
+                }
+                else if (auto* holder = std::get_if<SharedPtr<PageHolder>>(&bp))
+                {
+                    if (*holder)
+                    {
+                        auto up = dynamicPointerCast<UncommittedPage>((*holder)->page);
+                        if (up)
+                        {
+                            bp = std::monostate{};
+                            auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens);
+                            if (newBlock->eventSink)
+                            {
+                                newBlock->eventSink->addStoredLifeCycle(*newBlock, lc);
+                            }
+                            bp = committed->hold();
+                        }
+                    }
+                }
             }
             else
             {
@@ -2440,14 +2326,10 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                 if (isLocked)
                 {
                     auto holder = blockPageGetPage(bp)->hold();
-                    originalLocks.push_back(
-                        {BlockOrdinal{ord}, kDefaultBeamIndex, lc, holder, holder->page->cacheLevel});
                     bp = std::move(holder);
                 }
-                originalPages.emplace_back(lc, std::move(bp));
-                bp = std::monostate{};
-                reuseTasks.push_back({existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord),
-                    lc, _lockLevel(*existingPage, static_cast<BlockOrdinal>(ord))});
+                reuseTasks.push_back(
+                    {existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc});
             }
         }
         if (!reuseTasks.empty())
@@ -2458,24 +2340,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                 LifeCycleId lc = reuseTasks[ri].lifeCycle;
                 sb.pages[kDefaultBeamIndex][lc] = std::move(locks[ri]);
             }
-            if (mIsDecoding)
-                _offloadSparseHistory({ord, ord + 1}, mHistoryLength);
-        }
-        restorePages.cancel();
-        // Publish missing lifecycle pages only after migrations and offload can no longer fail.
-        for (LifeCycleId lc : missingPages)
-        {
-            auto& bp = sb.pages[kDefaultBeamIndex][lc];
-            auto up = dynamicPointerCast<UncommittedPage>(blockPageGetPage(bp));
-            if (!up)
-                continue;
-            bool const isLocked = std::holds_alternative<SharedPageLock>(bp);
-            bp = std::monostate{};
-            auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens);
-            if (newBlock->eventSink)
-                newBlock->eventSink->addStoredLifeCycle(*newBlock, lc);
-            bp = isLocked ? BlockPage{committed->lock(*this, kDefaultBeamIndex, BlockOrdinal{ord}, lc)}
-                          : BlockPage{committed->hold()};
         }
         // Don't clear SSM storage on rebase — the existing block may have a valid snapshot.
         sb.treeBlock = newBlock;
@@ -2562,8 +2426,7 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
 
     bool const commitMinSnapshot = mManager->commitMinSnapshot();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
-    int const oldNumCommittedTokens = numCommittedTokens();
-    int const numCommitted = oldNumCommittedTokens + static_cast<int>(tokens.size());
+    int const numCommitted = static_cast<int>(mCommittedTokens.size()) + static_cast<int>(tokens.size());
     if (commitMinSnapshot)
     {
         if (mHistoryLength != static_cast<int>(mCommittedTokens.size()) && mHistoryLength != numCommitted)
@@ -2591,14 +2454,6 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
     bool const hasNewFullBlocks = newNumFullBlocks > numCommittedBlocksBefore;
     if (hasNewFullBlocks || hasPartialSnapshot)
     {
-        // Keep successfully published blocks, but do not retain newly appended tokens for a block
-        // whose rebase failed. Otherwise close() would retry that failed rebase during teardown.
-        auto restoreTokens = FuncGuard(
-            [&]()
-            {
-                int const publishedTokens = std::min(numCommitted, mNumCommittedBlocks * mTokensPerBlock);
-                mCommittedTokens.resize(std::max(oldNumCommittedTokens, publishedTokens));
-            });
         // Block whose end is the last committed token — where the SSM snapshot lives.
         int const ssmSnapshotOrdinal = (numCommitted - 1) / mTokensPerBlock;
         // Wrapped in recordEventScope() so SharedPageLock::unlock() shares one finish
@@ -2625,7 +2480,6 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
                 _snapshotPartialBlockToTree(partialOrdinal, /*commitSsm=*/ssmLcId.has_value());
             }
         }
-        restoreTokens.cancel();
     }
 
     if (isEnd && mCommitState != CommitState::USER_STOP)
@@ -2770,8 +2624,8 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
         BlockOrdinal windowStart;
         if (auto const* attn = std::get_if<AttnLifeCycle>(&lc))
         {
-            // Full-attention and sparse history may still be needed by later turns.
-            if (attn->isSparse || !attn->windowSize.has_value())
+            // Full-attention blocks may still be needed by later turns.
+            if (!attn->windowSize.has_value())
                 continue;
             auto const staleRange = _getStaleRange(numCommittedTokens(), lc);
             windowStart = std::min(staleRange.end, end);
@@ -3287,14 +3141,7 @@ bool KvCache::_checkSanity() const
                 }
                 else
                 {
-                    if (mStatus == Status::ACTIVE)
-                    {
-                        TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
-                    }
-                    else
-                    {
-                        TLLM_CHECK_DEBUG(std::holds_alternative<SharedPtr<PageHolder>>(bp));
-                    }
+                    TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
                     auto page = blockPageGetPage(bp);
                     TLLM_CHECK_DEBUG(dynamicPointerCast<UncommittedPage>(page) != nullptr);
                 }
@@ -3308,128 +3155,6 @@ bool KvCache::_checkSanity() const
 // ---------------------------------------------------------------------------
 // Page index tables
 // ---------------------------------------------------------------------------
-
-void PageStorageSnapshot::waitReady(CudaStream stream) const
-{
-    for (auto const& event : mReadyEvents)
-        event.waitInStream(stream);
-}
-
-void KvCache::onPageStorageChanged() noexcept
-{
-    ++mPageStorageVersion;
-    mPageStorageDirty = true;
-    if (mPageStorageBatch != nullptr)
-    {
-        mPageStorageBatch->markDirty(*mPageStorageRow);
-    }
-}
-
-uint64_t KvCache::pageStorageVersion() const
-{
-    auto const apiLock = mManager->lockShared();
-    return mPageStorageVersion;
-}
-
-bool KvCache::pageStorageDirty() const
-{
-    auto const apiLock = mManager->lockShared();
-    return mPageStorageDirty;
-}
-
-bool KvCache::acknowledgePageStorage(uint64_t version)
-{
-    KVCM2_API_GUARD();
-    auto const apiLock = mManager->lockExclusive();
-    if (version != mPageStorageVersion)
-        return false;
-    mPageStorageDirty = false;
-    return true;
-}
-
-void KvCache::bindPageStorageRow(std::optional<int> row)
-{
-    KVCM2_API_GUARD();
-    auto const apiLock = mManager->lockExclusive();
-    if (mPageStorageBatch != nullptr)
-    {
-        throw LogicError("Use Batch membership APIs to change a batched request's row");
-    }
-    if (row && (*row < 0 || mStatus == Status::CLOSED))
-        throw LogicError("Page storage rows must be nonnegative and bound to a live request");
-    mPageStorageRow = row;
-    onPageStorageChanged();
-}
-
-std::optional<int> KvCache::pageStorageRow() const
-{
-    auto const apiLock = mManager->lockShared();
-    return mPageStorageRow;
-}
-
-PageStorageSnapshot KvCache::getPageStorageSnapshot(LayerGroupId lgId, BeamIndex beamIdx) const
-{
-    // Page::status() temporarily acquires a holder with non-atomic reference counts.
-    auto const apiLock = mManager->lockExclusive();
-    auto const& buf = mBasePageIndices.at(beamIdx).at(lgId);
-    PageStorageSnapshot snapshot;
-    snapshot.mVersion = mPageStorageVersion;
-    snapshot.mRow = mPageStorageRow;
-    auto const numBlocks = mBlocks.stdSize();
-    if (numBlocks != 0)
-    {
-        std::visit([&](auto const& indices)
-            { snapshot.mBasePageIndices.assign(indices.data(), indices.data() + numBlocks); },
-            buf);
-    }
-    snapshot.mCacheLevels.resize(numBlocks);
-    if (!isActive())
-    {
-        // Held pages may be evicted or relocated; only active locks expose usable slot indices.
-        std::fill(snapshot.mBasePageIndices.begin(), snapshot.mBasePageIndices.end(), kBadPageIndex.value());
-        return snapshot;
-    }
-
-    auto const* attn = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[lgId]);
-    int const completeSparseHistory = mIsDecoding && attn && attn->isSparse ? mHistoryLength / mTokensPerBlock : 0;
-    snapshot.mReadyEvents.reserve(numBlocks);
-    for (BlockOrdinal ord{0}; ord < mBlocks.size(); ++ord)
-    {
-        auto const& pages = mBlocks[ord].pages;
-        if (beamIdx >= pages.size())
-        {
-            continue;
-        }
-        int const index = snapshot.mBasePageIndices[toSizeT(ord)];
-        auto const& page = blockPageGetPage(pages.at(beamIdx).at(lgId));
-        // The scalar count exposes only the contiguous host prefix, stopping at any deferred GPU page.
-        if (ord.value() == snapshot.mEligibleHistoryBlocks && ord.value() < completeSparseHistory && page
-            && index != kBadPageIndex.value() && page->cacheLevel == kSparseHistoryLevel)
-        {
-            TLLM_CHECK_WITH_INFO(page->status() == PageStatus::LOCKED && page->hasValidSlot()
-                    && index == slotIdToPageIndexValue(page->slotId()),
-                "Eligible sparse history must have a locked host mapping");
-            ++snapshot.mEligibleHistoryBlocks;
-        }
-        if (index == kBadPageIndex.value())
-            continue;
-        // Dense SWA scratch indices refer to GPU slots without a Page object.
-        snapshot.mCacheLevels[toSizeT(ord)] = page ? page->cacheLevel : kHotLevel;
-        if (page)
-            snapshot.mReadyEvents.push_back(page->readyEvent);
-    }
-    return snapshot;
-}
-
-void KvCache::recordPageStorageRead(CudaStream stream)
-{
-    KVCM2_API_GUARD();
-    auto const apiLock = mManager->lockExclusive();
-    if (!isActive())
-        throw LogicError("Page storage reads must finish submission before the request is deactivated");
-    CachedCudaEvent completion(stream);
-    completion.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
-}
 
 void KvCache::_checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const
 {
@@ -3450,8 +3175,6 @@ void KvCache::_checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const
 
 void KvCache::_resizePageIndexBuffers(BlockOrdinal newNumBlocks)
 {
-    // External buffers keep their full allocation; the number of published entries still changes.
-    onPageStorageChanged();
     for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
     {
         for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
@@ -3489,8 +3212,24 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
 {
     if (ord == kBadBlockOrdinal)
         return kBadPageIndex.value(); // SSM pages use BAD_BLOCK_ORDINAL
+    // Every page-index write in the package arrives here, from SharedPageLock acquiring or
+    // releasing. For a seated member the buffer below is the Batch's pinned staging row, so
+    // writing while a publish still reads it uploads a torn table -- one that can pair one
+    // request's residency with another's lease. Checked here rather than at each public
+    // entry point because this is the one place they all funnel through, so a page-touching
+    // API added later is covered without being enumerated.
+    //
+    // Gated on the package's cached gDebug rather than TLLM_CHECK_DEBUG_WITH_INFO, whose
+    // gate is an out-of-line call into another TU. This runs once per page per life cycle.
+    if (TLLM_UNLIKELY(gDebug))
+    {
+        TLLM_CHECK_WITH_INFO(mBatch == nullptr || !mBatch->_publishInFlight(),
+            "A publish is still reading the staged page indices of Batch row %d; call Batch::waitPublished() before "
+            "an operation that locks or unlocks a seated member's pages",
+            mBatchRow.value_or(kNoBatchRow).value());
+    }
     auto& buf = mBasePageIndices[bi][lc];
-    int const old = std::visit(
+    return std::visit(
         [&](auto& b) -> int
         {
             using T = std::decay_t<decltype(b)>;
@@ -3510,9 +3249,6 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
             }
         },
         buf);
-    if (old != value)
-        onPageStorageChanged();
-    return old;
 }
 
 Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx) const
@@ -3563,7 +3299,13 @@ std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex 
 
 void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len)
 {
-    auto const apiLock = mManager->lockExclusive();
+    if (mBatch != nullptr)
+    {
+        throw LogicError(
+            "setBasePageIndexBuf: this KvCache is a Batch member, so its page index buffer is the Batch's row; "
+            "remove it from the Batch first");
+    }
+
     auto& slot = mBasePageIndices[beamIdx][lgId];
     BlockOrdinal const numBlocks = mBlocks.size();
 
@@ -3576,7 +3318,6 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
             auto const n = std::min(toSizeT(numBlocks), static_cast<size_t>(ext->len));
             std::vector<int> vec(ext->ptr, ext->ptr + n);
             slot = std::move(vec);
-            onPageStorageChanged();
         }
         // If already a vector, nothing to do.
         return;
@@ -3605,7 +3346,6 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
     std::copy(oldData, oldData + copyLen, buf);
     std::fill(buf + copyLen, buf + len, kBadPageIndex.value());
     slot = Span<int>{buf, len};
-    onPageStorageChanged();
 }
 
 int KvCache::getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx) const
@@ -3636,12 +3376,12 @@ bool KvCache::isSwaScratchReuseEnabled() const noexcept
     return mEnableSwaScratchReuse;
 }
 
-bool KvCache::supportsIndexMode(PageIndexMode mode) const
+bool KvCache::supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const
 {
     switch (mode)
     {
     case PageIndexMode::PER_LAYER: return true;
-    case PageIndexMode::SHARED: return !hasScratchSlots();
+    case PageIndexMode::SHARED: return mScratchSlots.at(lcId).empty();
     }
     return false;
 }
@@ -3674,20 +3414,116 @@ int KvCache::_swaScratchMaxRewindLen() const
     return cfg->maxRewindLen;
 }
 
-std::optional<ScratchDesc> KvCache::getScratchDesc(LayerGroupId lgId) const
+void ScratchSlots::_mirrorBack()
 {
-    // Lock-free: scratch slots are exclusively owned by this KvCache and defrag-cased page movement
-    // happens only when all KvCache instances are suspended, which means mScratchSlots is empty.
-    TLLM_CHECK_WITH_INFO(isActive(), "getScratchDesc() requires an ACTIVE KvCache");
-    auto const& lc = mManager->lifeCycles().getLifeCycle(lgId);
-    auto sr = _getScratchRange(lc);
-    if (!sr)
-        return std::nullopt;
-    std::vector<int> slotIds;
-    slotIds.reserve(mScratchSlots[lgId].size());
-    for (auto const& lock : mScratchSlots[lgId])
-        slotIds.push_back(slotIdToPageIndexValue(lock.slot().slotId()));
-    return ScratchDesc{sr, std::move(slotIds)};
+    auto const index = mSlots.size() - 1;
+    auto const value = slotIdToPageIndexValue(mSlots.back().slot().slotId());
+    std::visit(
+        [&](auto& buf)
+        {
+            using T = std::decay_t<decltype(buf)>;
+            if constexpr (std::is_same_v<T, std::vector<int32_t>>)
+            {
+                if (buf.size() <= index)
+                {
+                    buf.resize(index + 1, kBadPageIndex.value());
+                }
+            }
+            TLLM_CHECK_WITH_INFO(index < static_cast<size_t>(buf.size()),
+                "Scratch slot count %zu exceeds the %zu the batch staged for this life cycle", index + 1,
+                static_cast<size_t>(buf.size()));
+            buf[index] = value;
+        },
+        mIndices);
+}
+
+void ScratchSlots::_mirrorSentinel(size_t from, std::optional<size_t> to)
+{
+    auto const mirror = std::visit(
+        [](auto& buf) {
+            return Span<int32_t>{buf.data(), static_cast<int32_t>(buf.size())};
+        },
+        mIndices);
+    auto const end = to.value_or(static_cast<size_t>(mirror.len));
+    TLLM_CHECK_DEBUG_WITH_INFO(from <= end && end <= static_cast<size_t>(mirror.len),
+        "Scratch mirror range [%zu, %zu) outruns its %d entries", from, end, mirror.len);
+    std::fill(mirror.ptr + from, mirror.ptr + end, kBadPageIndex.value());
+}
+
+ScratchSlotLock ScratchSlots::popBack()
+{
+    ScratchSlotLock lock = std::move(mSlots.back());
+    mSlots.pop_back();
+    _mirrorSentinel(mSlots.size(), mSlots.size() + 1);
+    return lock;
+}
+
+void ScratchSlots::unlockAndClear()
+{
+    for (auto& lock : mSlots)
+    {
+        lock.unlock();
+    }
+    // The mirror already reads sentinel past the live count.
+    auto const live = mSlots.size();
+    mSlots.clear();
+    _mirrorSentinel(0, live);
+}
+
+void ScratchSlots::setBuf(int32_t* buf, int len)
+{
+    auto const live = indices();
+    if (buf == nullptr || len == 0)
+    {
+        std::vector<int32_t> owned(mSlots.size(), kBadPageIndex.value());
+        std::copy(live.data(), live.data() + live.len, owned.begin());
+        mIndices = std::move(owned);
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(static_cast<size_t>(len) >= mSlots.size(),
+        "setScratchSlotBuf: buffer of %d is shorter than the %zu live scratch slots", len, mSlots.size());
+    std::vector<int32_t> seed(live.data(), live.data() + live.len);
+    std::fill(buf, buf + len, kBadPageIndex.value());
+    std::ranges::copy(seed, buf);
+    mIndices = Span<int32_t>{buf, len};
+}
+
+Span<int const> ScratchSlots::indices() const
+{
+    auto const result = std::visit(
+        [this](auto const& buf) -> Span<int const> {
+            return {buf.data(), static_cast<int32_t>(mSlots.size())};
+        },
+        mIndices);
+    if (TLLM_UNLIKELY(gDebug))
+    {
+        for (size_t i = 0; i < mSlots.size(); ++i)
+        {
+            TLLM_CHECK(result[static_cast<int>(i)] == slotIdToPageIndexValue(mSlots[i].slot().slotId()));
+        }
+    }
+    return result;
+}
+
+HalfOpenRange<BlockOrdinal> KvCache::getSwaScratchRange(LayerGroupId lgId) const
+{
+    // Lock-free: scratch slots are exclusively owned by this KvCache, and defrag-caused page
+    // movement happens only when every KvCache is suspended, which means mScratchSlots is empty.
+    TLLM_CHECK_WITH_INFO(isActive(), "getSwaScratchRange() requires an ACTIVE KvCache");
+    return _getScratchRange(mManager->lifeCycles().getLifeCycle(lgId));
+}
+
+Span<int const> KvCache::getScratchSlots(LayerGroupId lgId) const
+{
+    return mScratchSlots[lgId].indices();
+}
+
+void KvCache::setScratchSlotBuf(LayerGroupId lgId, int32_t* buf, int len)
+{
+    TLLM_CHECK_WITH_INFO(mBatch == nullptr,
+        "setScratchSlotBuf: this KvCache is a Batch member, so its scratch slots are the Batch's row; "
+        "remove it from the Batch first");
+    mScratchSlots[lgId].setBuf(buf, len);
 }
 
 void KvCache::setEnableSwaScratchReuse(bool enable)
@@ -3764,8 +3600,7 @@ KvCache::DeltaScratchSlots KvCache::_takeExcessScratchSlots(int capacity, int hi
         {
             for (int i = 0; i < -delta; ++i)
             {
-                result.excess[lcIdx].push_back(std::move(mScratchSlots[lcIdx].back()));
-                mScratchSlots[lcIdx].pop_back();
+                result.excess[lcIdx].push_back(mScratchSlots[lcIdx].popBack());
             }
         }
     }
@@ -3778,19 +3613,17 @@ void KvCache::_recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<Scrat
     {
         for (auto& lock : excess[lcId])
         {
-            mScratchSlots[lcId].push_back(std::move(lock));
+            mScratchSlots[lcId].emplaceBack(std::move(lock));
         }
         excess[lcId].clear();
     }
 }
 
-void KvCache::_freeScratchSlots()
+void KvCache::_freeReservedGpuSlots()
 {
     for (auto& lcSlots : mScratchSlots)
     {
-        for (auto& lock : lcSlots)
-            lock.unlock();
-        lcSlots.clear();
+        lcSlots.unlockAndClear();
     }
 }
 

@@ -2015,6 +2015,20 @@ class AttentionDpConfig(StrictBaseModel):
     batching_wait_iters: int = Field(
         default=10,
         description="The number of iterations to wait for batching.")
+    enable_kv_balanced_admission: bool = Field(
+        default=False,
+        description=
+        "Admit generation-only requests by per-rank KV load. When True and "
+        "the first 32 queued requests are all generation-only requests "
+        "without an attention_dp_rank, the attention DP router chooses which "
+        "of them to admit and which rank takes each, keeping the largest "
+        "per-rank request count and KV token count low, instead of admitting "
+        "them in queue order. Request priorities are respected, and a request "
+        "passed over in 64 admitting rounds is admitted next. Useful on "
+        "disaggregated generation workers. Has no effect with "
+        "kv_cache_routing_conversation_affinity, or with "
+        "enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+        status="prototype")
     enable_kv_cache_aware_routing: bool = Field(
         default=False,
         description="Enable internal KV cache-aware routing for attention DP. "
@@ -2729,6 +2743,23 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="Pool topology for the 'mooncake-store' connector. When "
         "set, trtllm-serve provisions the pool during bringup instead of "
         "requiring MOONCAKE_CONFIG_PATH from an external script.")
+
+    transfer_timeout_sec: float = Field(
+        default=600.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Deadline in seconds for an outstanding ADP KV connector "
+        "transfer. Checked at polling gates; cannot interrupt blocking callbacks. "
+        "Expiration fails all ADP owners and requires process restart. Unused without attention DP."
+    )
+    control_grace_sec: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Grace period in seconds for pending ADP KV connector "
+        "transfers after cancellation or shutdown. Can only shorten the "
+        "existing transfer deadline. Expiration fails all ADP owners and requires process restart. "
+        "Unused without attention DP.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
@@ -5687,7 +5718,7 @@ class DwdpConfig(StrictBaseModel):
     Each worker holds a subset of experts locally and asynchronously prefetches
     the remaining experts from peer workers via CUDA VMM + MNNVL fabric
     handles (composite virtual-address layout with zero-copy local mapping and
-    double-buffered P2P remote regions), enabling fully asynchronous execution
+    P2P remote prefetch slots), enabling fully asynchronous execution
     across ranks without synchronization barriers.
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
@@ -5709,6 +5740,14 @@ class DwdpConfig(StrictBaseModel):
         "Enable limited-contention prefetch optimization. Uses batched "
         "memcpy with round-robin slice ordering across peers and a 2 MiB "
         "slice granularity to reduce NVLink contention.")
+    num_prefetch_slots: int = Field(
+        default=2,
+        ge=2,
+        description=
+        "The number of expert prefetch buffer slots. Each slot holds the "
+        "remote experts of one MoE layer; more slots let the prefetch run "
+        "further ahead of the MoE compute, at the cost of device memory that "
+        "is then not available to the KV cache.")
 
 
 class BaseLlmArgs(StrictBaseModel):
