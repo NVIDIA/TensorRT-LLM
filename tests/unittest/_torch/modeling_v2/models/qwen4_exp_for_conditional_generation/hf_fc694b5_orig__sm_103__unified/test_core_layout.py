@@ -262,8 +262,11 @@ def test_a_spread_fc1_input_scale_is_refused() -> None:
 
 @pytest.mark.parametrize(
     "layout, spec_config, missing",
-    [(_TEP4, MTPDecodingConfig(max_draft_len=3), "MTP draft layer")],
-    ids=["mtp"],
+    [
+        (_DEP4, MTPDecodingConfig(max_draft_len=3), "MTP under attention DP"),
+        (_TP4, MTPDecodingConfig(max_draft_len=3), "split by intermediate"),
+    ],
+    ids=["mtp-dep4", "mtp-tp4"],
 )
 def test_what_this_core_does_not_assemble_is_refused_at_construction(
     layout, spec_config, missing
@@ -388,3 +391,64 @@ def test_the_attention_dp_round_trip_returns_this_ranks_rows_through_every_windo
 def nn_pad(x: torch.Tensor, rows: int) -> torch.Tensor:
     """`x` with zero rows appended up to `rows`."""
     return torch.cat([x, x.new_zeros(rows - x.shape[0], x.shape[1])], 0)
+
+
+@pytest.mark.parametrize("max_draft_len", [1, 3, 7])
+def test_mtp_widens_the_verify_step_and_keys_the_draft_layer_after_the_trunk(
+    max_draft_len,
+) -> None:
+    """A verify step carries `max_draft_len + 1` rows a generation request; the draft layer is
+    global layer 48, the index every KV manager maps it at and the weight table keys it at.
+    Without speculation the MTP module is not declared."""
+    core = _core(0, _TEP4, MTPDecodingConfig(max_draft_len=max_draft_len))
+    assert core.mtp_enabled and core.max_verify_rows == max_draft_len + 1
+    assert core.mtp_layer_idx == NUM_LAYERS
+    assert core.mtp_theta == core.theta == 1e7
+    assert core.spec_rollback is not None
+    assert any(k.startswith(f"l{NUM_LAYERS}_mtp_") for k in core.w)
+    plain = _core(0, _TEP4)
+    assert not plain.mtp_enabled and plain.max_verify_rows == 1 and plain.spec_rollback is None
+    assert not any("_mtp_" in k for k in plain.w)
+
+
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_a_tep4_rank_holds_its_share_of_the_draft_layer(rank) -> None:
+    """The draft layer's attention is cut like a trunk attention layer's: six q heads (their
+    q and interleaved gate rows), one KV head and the o_proj columns of the six heads; its
+    QSA indexer, front end, router, shared expert and mixers are whole. Its FP8 experts are
+    the rank's window `[128r, 128r + 128)` over the TP group, FP8 128x128 block scales."""
+    core = _core(rank, _TEP4, MTPDecodingConfig(max_draft_len=3))
+    p = f"l{NUM_LAYERS}_mtp_"
+    w = core.w
+    assert tuple(w[f"{p}q_w"].shape) == (2 * 1536, 2560)
+    assert tuple(w[f"{p}k_w"].shape) == tuple(w[f"{p}v_w"].shape) == (256, 2560)
+    assert tuple(w[f"{p}o_w"].shape) == (2560, 1536)
+    assert tuple(w[f"{p}idx_w"].shape) == (640, 2560)
+    assert tuple(w[f"{p}fc_e"].shape) == tuple(w[f"{p}fc_h"].shape) == (2560, 2560)
+    assert tuple(w[f"{p}pre_h_norm"].shape) == (4 * 2560,)
+    assert tuple(w[f"{p}router"].shape) == (512, 2560)
+    assert tuple(w[f"{p}sh_gu"].shape) == (2 * 640 + 8, 2560)
+    assert (core.mtp_local_experts, core.mtp_expert_offset) == (128, 128 * rank)
+    assert tuple(w[f"{p}fc1_w"].shape) == (128, 2 * 640, 2560)
+    assert w[f"{p}fc1_w"].dtype == torch.float8_e4m3fn
+    assert tuple(w[f"{p}fc1_s"].shape) == (128, 2 * 640 // 128, 2560 // 128)
+    assert tuple(w[f"{p}fc2_w"].shape) == (128, 2560, 640)
+    assert tuple(w[f"{p}fc2_s"].shape) == (128, 2560 // 128, 640 // 128)
+
+
+def test_the_draft_layer_views_split_the_fused_shared_expert() -> None:
+    """`_mtp_views` reads the shared expert's gate|up rows and its gate-logit row out of the
+    one `[gate | up | gate logit | pad]` operand as column-major GEMM operands, and the grouped
+    norms as one slice a stream."""
+    core = _core(0, _TEP4, MTPDecodingConfig(max_draft_len=3))
+    with torch.device("cpu"):
+        for key, t in core.w.items():
+            core.w[key] = torch.nn.Parameter(
+                torch.empty(t.shape, dtype=t.dtype, device="cpu"), requires_grad=False
+            )
+    M_ = M._mtp_views(core)
+    assert tuple(M_.sh_gu.shape) == (2560, 1280) and M_.sh_gu.stride() == (1, 2560)
+    assert tuple(M_.sh_gate.shape) == (2560, 1) and M_.sh_gate.stride() == (1, 2560)
+    assert tuple(M_.q.shape) == (2560, 3072) and M_.q.stride() == (1, 2560)
+    assert len(M_.pre_h_norm) == len(M_.ahc_norm) == len(M_.fhc_norm) == 4
+    assert all(tuple(s.shape) == (2560,) for s in M_.mhc_norm)

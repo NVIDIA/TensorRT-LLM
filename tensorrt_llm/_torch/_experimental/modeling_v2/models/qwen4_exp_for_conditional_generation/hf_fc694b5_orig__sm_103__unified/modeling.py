@@ -70,9 +70,33 @@ output and zeroes rows `[n:]`.
 (`weights._host_resident_empty`), one copy per rank; `TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD=0`
 makes it device-resident. Output is identical.
 
-Not assembled here: the one-model MTP draft layer and its verify-step recurrence (the
-target refuses a `speculative_config` at construction), the vision tower (a request carrying
-media is refused at admission). Each refusal names what is missing.
+**One-model MTP-Eagle.** With a `speculative_config` the core also holds the checkpoint's MTP
+module (`MTPLayer`), replayed `max_draft_len` times by the engine's spec worker, and the trunk
+runs every generation request's `max_draft_len + 1` verify rows:
+
+* The draft layer is one more full-attention QSA layer, cut like a trunk attention layer (this
+  rank's q heads, its KV head, the replicated indexer), over the manager the draft step is
+  handed: under attention TP that is a separate draft KV cache, whose K/V, index and position
+  pages hold the draft layer alone (`_bind_draft_cache_manager`). Its front end, router,
+  shared expert and hyper-connections are replicated; its FP8 block-scale experts run as this
+  rank's window of `num_experts / tp_size` experts (`fp8_block_scale_moe_runner`'s window), and
+  the o_proj and expert partials are completed by the same plain sum as the trunk's.
+* A verify step's Gated-DeltaNet rows take the multi-token conv with per-step window snapshots
+  and the stock Triton cached replay over the bf16 pool, which commits a full history in the
+  kernel below `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests and leaves it to the
+  manager's all-layer commit from there on, exactly as the stock layer hands it work items.
+* What a verify row writes that the runtime does not roll back -- the PLE n-gram history and
+  conv state, every attention layer's QSA index-K plane and the shared position plane -- is
+  staged during the forward and rewritten to the accepted prefix by `SpeculativeRollback`,
+  which the spec worker calls after its draft loop.
+* IndexShare (`index_share_for_mtp_iteration`) runs the draft indexer once per draft loop:
+  the draft-extend step captures each request's selection and the later draft steps rebuild
+  theirs from it (`qsa_mtp_reuse_topk`).
+
+Not assembled here: the legacy per-step recurrent verify (`TRTLLM_USE_GDN_REPLAY=0`), the
+vision tower (a request carrying media is refused at admission), and MTP under attention DP
+(dep4) or with the routed experts split by intermediate (tp4): the draft layer is cut for
+attention TP with whole experts only. Each refusal names what is missing.
 
 Integration facts this file depends on:
 
@@ -108,17 +132,25 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import pool as _pool
 from . import weights as _weights
+from .ops.activation.flashinfer_silu_and_mul__r44 import flashinfer_silu_and_mul
+from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
+    fused_sigmoid_mul_inplace as mtp_fused_sigmoid_mul_inplace,
+)
 from .ops.activation.fused_sigmoid_mul_inplace__r17 import fused_sigmoid_mul_inplace
 from .ops.activation.silu_and_mul_rows__r35 import silu_and_mul_rows
 from .ops.attention.flashinfer_top_k_ragged_transform__select import (
     flashinfer_top_k_ragged_transform,
 )
+from .ops.attention.fused_qk_norm_rope__mtp import fused_qk_norm_rope as mtp_fused_qk_norm_rope
 from .ops.attention.fused_qk_norm_rope__r3 import fused_qk_norm_rope
 from .ops.attention.qsa_expand_block_indices__r21 import qsa_expand_block_indices
+from .ops.attention.qsa_mtp_reuse_topk__r43 import qsa_mtp_reuse_topk
 from .ops.attention.qsa_paged_index_scores__r20 import qsa_paged_index_scores
 from .ops.attention.qsa_paged_index_store__r18 import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store__r25 import qsa_paged_kv_store
@@ -127,25 +159,40 @@ from .ops.attention.qsa_paged_sparse_gqa__r26 import qsa_paged_sparse_gqa
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4__r38 import qsa_paged_sparse_gqa_nvfp4
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_decode__r39 import qsa_paged_sparse_gqa_nvfp4_decode
 from .ops.attention.qsa_prefill_compress__r19 import qsa_prefill_compress
+from .ops.attention.qsa_rollback_planes__r47 import plane_table as _plane_table
+from .ops.attention.qsa_rollback_planes__r47 import qsa_rollback_gather, qsa_rollback_restore
 from .ops.attention.qsa_topk_expand_decode__r22 import qsa_topk_expand_decode
 from .ops.attention.qsa_topk_expand_decode__r22 import supports as _topk_expand_supports
+from .ops.attention.spec_rollback_commit__r48 import spec_rollback_commit, spec_rollback_stage
 from .ops.attention.thop_attention__r2 import QM_FP8_KV_CACHE, QM_NVFP4_KV_CACHE, thop_attention
 from .ops.comm.allgather__r6 import allgather
 from .ops.comm.allreduce__r5 import NONE as _SUM_ONLY
 from .ops.comm.allreduce__r5 import allreduce, allreduce_group_args
 from .ops.comm.reducescatter__r7 import reducescatter
+from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
 from .ops.gemm.cublas_mm__r1 import cublas_mm
+from .ops.hc.qwen4_exp_gated_residual__r42 import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_hc_inject_norm__r8 import qwen4_exp_hc_inject_norm
 from .ops.hc.qwen4_exp_hc_lowrank_act__r9 import qwen4_exp_hc_lowrank_act
 from .ops.hc.qwen4_exp_hc_up_gate_mean__r10 import qwen4_exp_hc_up_gate_mean
+from .ops.hc.qwen4_exp_post_inject__r11 import qwen4_exp_post_inject
 from .ops.moe.fp4_block_scale_moe_runner__r4 import MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS
 from .ops.moe.fp4_block_scale_moe_runner__r4 import fp4_block_scale_moe_runner
+from .ops.moe.fp8_block_scale_moe_runner__r40 import fp8_block_scale_moe_runner
+from .ops.moe.fused_sigmoid_gate_mul_add__r12 import fused_sigmoid_gate_mul_add
 from .ops.moe.renorm_moe_routing_op__r34 import renorm_moe_routing_op
+from .ops.norm.flashinfer_gemma_rmsnorm__r36 import flashinfer_gemma_rmsnorm
 from .ops.norm.rms_norm_gated_token_major__r30 import rms_norm_gated_token_major
 from .ops.ple.ple_gate_conv_inject_norm__r16 import ple_gate_conv_inject_norm
 from .ops.ple.ple_ngram_embed__r15 import ple_ngram_embed
+from .ops.quantization.fp8_quantize_1x128__r41 import fp8_quantize_1x128
+from .ops.ssm.causal_conv1d_triton_update__r45 import causal_conv1d_triton_update
 from .ops.ssm.causal_conv1d_update__r29 import causal_conv1d_update
+from .ops.ssm.cu_seqlens_from_seq_lens__r33 import cu_seqlens_from_seq_lens
 from .ops.ssm.flashinfer_chunk_gated_delta_rule__r28 import flashinfer_chunk_gated_delta_rule
+from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update__r46 import (
+    fused_recurrent_gated_delta_rule_cached_replay_update,
+)
 from .ops.ssm.gdn_decode_rows_gated_norm__r32 import gdn_decode_rows, gdn_decode_rows_gated_norm
 from .ops.ssm.gdn_prefill_conv_post__r27 import gdn_prefill_conv_post
 
@@ -251,6 +298,8 @@ _QSA_POSITION_AXES = _pool.QSA_POSITION_AXES
 _QSA_MROPE_SECTION = None
 # The canonical selection: above the k-th score, then the highest-index (most recent) ties.
 _TIE_BREAK_LARGE = int(TopKTieBreak.LARGE)
+# The draft experts' activation scales are fp32, not the UE8M0 power-of-two form.
+_MTP_MOE_USE_UE8M0 = False
 
 _PLE_HOST_OFFLOAD_ENV = "TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD"
 _PLE_HOST_OFFLOAD_OFF = frozenset({"0", "false", "no", "off"})
@@ -297,12 +346,39 @@ def _moe_layer_scalars(w, i: int, start: int, count: int) -> dict[str, torch.Ten
     )
 
 
+class _Replay(NamedTuple):
+    """The GDN cached replay's history buffers and bookkeeping of one manager."""
+
+    old: dict  # GDN layer -> (old_x, old_B, old_dt, old_dA_cumsum)
+    cache_buf_idx: torch.Tensor  # [slots] int32: the history half each slot writes next
+    prev_num_accepted: torch.Tensor  # [slots] int32: tokens pending since the checkpoint
+    history: int  # rows a history half holds
+    width: int  # the one verify width a step may carry per generation request
+
+
 class _Bound(NamedTuple):
-    """What the core reads off one KV cache manager: the manager, and this rank's pool views
-    (`pool.RankPools`). Valid only for that manager."""
+    """What the core reads off one KV cache manager: the manager, this rank's pool views
+    (`pool.RankPools`) and, under MTP, the verify step's runtime-owned buffers: the per-step
+    conv windows (`int_conv`, by GDN layer), the rows `update_mamba_states` promotes them
+    from (`int_idx`) and the cached replay. Valid only for that manager."""
 
     cm: object
     pools: _pool.RankPools
+    int_idx: torch.Tensor | None = None
+    int_conv: dict | None = None
+    replay: _Replay | None = None
+
+
+class _DraftBound(NamedTuple):
+    """The draft layer's planes in the manager its draft step is handed: its QSA index plane,
+    that manager's position plane, its paged K/V and, under IndexShare, its row of the
+    metadata's shared selection buffers."""
+
+    cm: object
+    index_cache: torch.Tensor
+    position_cache: torch.Tensor
+    kv: _pool.KvPlanes
+    share_slot: int | None
 
 
 class Qwen4ExpUnifiedModelingV2(DecoderModel):
@@ -331,13 +407,24 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self.dp_size = mapping.tp_size if mapping.enable_attention_dp else 1
         self.dp_rank = mapping.tp_rank
         self.dp_group = list(mapping.tp_group)
+        # One-model MTP-Eagle (routing admits no other speculation): the checkpoint's one MTP
+        # module, built only when the engine asked for speculation.
         spec_config = getattr(model_config, "spec_config", None)
-        if spec_config is not None:
+        self.mtp_enabled = spec_config is not None
+        if self.mtp_enabled and mapping.enable_attention_dp:
             raise NotImplementedError(
-                "speculative decoding: the one-model MTP draft layer and its verify step are "
-                "not assembled in this target yet"
+                "MTP under attention DP (dep4): the draft layer's attention-DP MoE round trip "
+                "and per-rank draft batch are not assembled in this target yet"
             )
-        self.mtp_enabled = False
+        if self.mtp_enabled and mapping.moe_tp_size != 1:
+            raise NotImplementedError(
+                f"MTP with routed experts split by intermediate (moe_tp_size "
+                f"{mapping.moe_tp_size}, tp4): the draft layer's FP8 block-scale experts are "
+                "cut by whole experts only in this target"
+            )
+        # Rows per generation request of the widest verify step (`max_draft_len + 1`); 1
+        # without MTP.
+        self.max_verify_rows = spec_config.max_draft_len + 1 if self.mtp_enabled else 1
 
         self.num_layers = cfg.num_hidden_layers
         self.hidden = cfg.hidden_size
@@ -406,11 +493,25 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             f"this forward branches at {self.dense_threshold}: the runner captures its short "
             "decode graph family at the engine's number"
         )
+        # IndexShare for the MTP draft loop (`index_share_for_mtp_iteration`), as the engine
+        # resolved it: the same lowering sizes the metadata's shared selection buffers.
+        self.mtp_index_share = bool(qsa_params.mtp_index_share)
         self.index_width = (self.index_heads + self.index_kv_heads) * self.index_head_dim
         # The index query's `[q | k | v]` scratch for its norm + rope; the spare head is the
         # v slot the op needs but never reads.
         self.index_scratch_width = self.index_width + self.index_head_dim
         self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
+
+        # ---- the MTP module ------------------------------------------------
+        # Global layer index of the draft layer (the KV managers map it there, and the
+        # weight table keys it there); its rope base is its own block's, else the trunk's.
+        self.mtp_layer_idx = self.num_layers
+        mtp_block = getattr(cfg, "mtp", None)
+        self.mtp_theta = (
+            float(mtp_block.get("rope_theta", self.theta))
+            if isinstance(mtp_block, dict)
+            else self.theta
+        )
 
         # ---- gated deltanet ----------------------------------------------
         self.head_k_dim = cfg.linear_key_head_dim
@@ -495,6 +596,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         # The runner's `intermediate_size`: each held expert's intermediate as stored, this
         # rank's slice zero-padded at tp4 (`weights.EXPERT_INTER_ALIGN`), whole otherwise.
         self.expert_inter = d.expert_inter
+        # The draft layer's FP8 experts: this rank's window over the whole TP group.
+        self.mtp_local_experts = d.mtp_local_experts
+        self.mtp_expert_offset = d.mtp_expert_offset
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -522,6 +626,16 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self._binds = 0
         # Set by `begin_step`, cleared by `forward`.
         self._step_begun = False
+        # MTP module operands (`_mtp_views`) and its index rope table; None with speculation
+        # off.
+        self._mtp: "_MtpWeights | None" = None
+        self._mtp_cos_sin: torch.Tensor | None = None
+        # The verify step's side-cache rollback, registered with the spec worker.
+        self.spec_rollback: SpeculativeRollback | None = (
+            SpeculativeRollback() if self.mtp_enabled else None
+        )
+        # The draft layer's own bind, keyed on the manager its draft step sees.
+        self._draft_bound: _DraftBound | None = None
 
     # ---------------------------------------------------------------- load ---
 
@@ -582,6 +696,15 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         )
         assert table_rows % self.ngram_vocab_divisor == 0, (table_rows, self.ngram_vocab_divisor)
         self._cos_sin = self._index_rope_table(self.theta, device)
+        if self.mtp_enabled:
+            # The draft layer's index plane rotates at the module's own rope base, like its
+            # attention rope.
+            self._mtp_cos_sin = (
+                self._cos_sin
+                if self.mtp_theta == self.theta
+                else self._index_rope_table(self.mtp_theta, device)
+            )
+            self._mtp = _mtp_views(self)
         if self.quant_mode in (QM_FP8_KV_CACHE, QM_NVFP4_KV_CACHE):
             # Built here, not at construction: that runs under meta init.
             scales = 3 if self.quant_mode == QM_NVFP4_KV_CACHE else 1
@@ -794,7 +917,140 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             f"{rank_pools.ple_state[0].shape[0]} PLE slots (bind {self._binds})",
             flush=True,
         )
-        self._bound = _Bound(cm, rank_pools)
+        bound = _Bound(cm, rank_pools)
+        if self.spec_rollback is not None:
+            self.spec_rollback.set_index_planes(
+                [rank_pools.index_cache[i] for i in self.attn_layers]
+            )
+        if self.mtp_enabled:
+            bound = bound._replace(**self._bind_step_buffers(cm, g, mm, rank_pools))
+        self._bound = bound
+
+    def _bind_step_buffers(self, cm, g: _pool.PoolGeometry, mm, pools: _pool.RankPools) -> dict:
+        """The verify step's runtime-owned buffers of one manager: every verify row's conv
+        window goes to a per-step buffer that `update_mamba_states` promotes from, and the
+        recurrent state is the cached replay (a checkpoint per slot plus a compact history of
+        the tokens accepted since it). Returns the `_Bound` fields it adds."""
+        _pool.require(
+            cm,
+            ("is_speculative", "mamba_layer_cache", "get_replay_state_update_metadata"),
+            "binds the verify step's per-step state buffers and replay metadata",
+        )
+        assert cm.is_speculative(), (
+            f"the KV cache manager {type(cm).__name__} reports is_speculative() False, so it "
+            "allocated none of the per-step state buffers the verify path writes"
+        )
+        layer_caches = {i: cm.mamba_layer_cache(i) for i in self.gdn_layers}
+        int_conv = {i: cache.intermediate_conv_window for i, cache in layer_caches.items()}
+        int_idx = getattr(cm, "intermediate_state_indices", None)
+        g0 = self.gdn_layers[0]
+        _pool.check_step_buffers(g, int_conv[g0], pools.conv[g0], int_idx)
+        meta = cm.get_replay_state_update_metadata()
+        if meta is None:
+            raise NotImplementedError(
+                "the KV cache manager runs the legacy per-step recurrent verify path "
+                "(TRTLLM_USE_GDN_REPLAY=0), which this target does not assemble; leave "
+                "TRTLLM_USE_GDN_REPLAY unset for the cached replay"
+            )
+        assert not getattr(cm, "use_gdn_flashinfer_ring_replay", False), (
+            "the manager laid its replay history out for the FlashInfer ring kernel; this "
+            "target runs the double-buffered Triton cached replay"
+        )
+        assert layer_caches[g0].intermediate_ssm is None, (
+            "the cache manager runs the cached-replay verify path and also allocated a "
+            "per-step recurrent buffer; the runtime allocates one or the other"
+        )
+        ssm0 = pools.ssm[g0]
+        history, width = meta.replay_history_size, meta.replay_step_width
+        _pool.check_replay_state(
+            history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0
+        )
+        old = {}
+        for i, cache in layer_caches.items():
+            old[i] = (cache.old_x, cache.old_B, cache.old_dt, cache.old_dA_cumsum)
+            _pool.check_replay_history(g, i, history, ssm0.shape[0], *old[i][:3])
+        replay = _Replay(old, meta.cache_buf_idx, meta.prev_num_accepted_tokens, history, width)
+        return dict(int_idx=int_idx, int_conv=int_conv, replay=replay)
+
+    def _bind_draft_cache_manager(self, md) -> None:
+        """Bind the draft layer to the manager its draft step sees: its own index plane, that
+        manager's position plane and its paged K/V.
+
+        Under attention TP that is the separate draft KV cache the worker swaps in for the
+        draft loop, whose pools hold the draft layer's pages and none of the trunk's;
+        otherwise the trunk's manager, which maps the draft layer as well. Keyed on the
+        manager like `_bind_cache_manager`, and never first bound under capture: the runner
+        runs every captured batch shape eagerly first."""
+        cm = md.kv_cache_manager
+        assert not torch.cuda.is_current_stream_capturing(), (
+            f"the draft layer is not bound to KV cache manager {type(cm).__name__} (first use, "
+            "or the manager changed since its last bind) and CUDA graph capture is active"
+        )
+        _pool.require(
+            cm,
+            ("get_index_k_buffer", "get_qsa_position_buffer", "get_buffers", "layer_offsets"),
+            "reads the draft layer's QSA index plane, position plane and paged K/V",
+        )
+        g = _pool.pool_geometry(
+            self.model_config.pretrained_config,
+            self.mapping,
+            tokens_per_block=md.tokens_per_block,
+            kv_cache_quant_algo=self.kv_cache_quant_algo,
+            dtype=self.w["embed"].dtype,
+        )
+        layer = self.mtp_layer_idx
+        index_cache = cm.get_index_k_buffer(layer)
+        position_cache = cm.get_qsa_position_buffer()
+        _pool.check_position_plane(g, position_cache)
+        kv = _pool.kv_planes(cm, g, layer, index_cache)
+        share_slot = None
+        if self.mtp_index_share:
+            # The metadata sizes its shared selection buffers from the same resolved knob,
+            # one row per sparse layer of whichever manager is bound.
+            assert md.sparse_metadata_params.mtp_index_share, (
+                "this target resolved IndexShare on but the engine's QSA metadata did not"
+            )
+            slots = cm.qsa_shared_topk_slots
+            _pool.check_shared_selection(md.qsa_shared_topk_indices, slots, layer, self.block_topk)
+            share_slot = slots[layer]
+        print(
+            f"modeling_v2 unified qwen4_exp: rank {self.mapping.rank} binds the draft layer to "
+            f"{type(cm).__name__} ({'the trunk manager' if cm is self._bound.cm else 'separate'}"
+            f"): {kv.k.shape[0]} K/V pages, {index_cache.shape[0]} QSA index pages"
+            f"{'' if share_slot is None else f', IndexShare slot {share_slot}'}",
+            flush=True,
+        )
+        self._draft_bound = _DraftBound(cm, index_cache, position_cache, kv, share_slot)
+
+    def _draft_step_bind(self, md) -> tuple[_DraftBound, int]:
+        """The draft layer's bind for this draft step's manager, and the layer's pool offset
+        in it (what `thop_attention` addresses), checked on every call: the worker swaps the
+        manager and the page tables in for the draft loop, and a page table still decoding
+        the trunk's offsets would read and write another pool's pages."""
+        cm = md.kv_cache_manager
+        assert cm is not None, "a paged KV cache is required"
+        offsets = cm.layer_offsets
+        assert self.mtp_layer_idx in offsets, (
+            f"the MTP module's attention is global layer index {self.mtp_layer_idx}, which the "
+            f"cache manager {type(cm).__name__} does not map (it maps {len(offsets)} layers); "
+            "the engine allocated no KV layer for the draft module"
+        )
+        layer_idx = offsets[self.mtp_layer_idx]
+        window = cm.max_attention_window_vec[layer_idx]
+        assert window is None or window == md.max_seq_len, (
+            f"the MTP layer's pool window is {window!r} but this call passes max_seq_len "
+            f"{md.max_seq_len} as the attention window; a sliding window is not implemented"
+        )
+        if self._draft_bound is None or cm is not self._draft_bound.cm:
+            self._bind_draft_cache_manager(md)
+        assert cm is self._bound.cm or md.qsa_block_table is getattr(
+            md, "qsa_draft_block_table", None
+        ), (
+            "the draft step is bound to a separate draft KV cache manager but qsa_block_table "
+            "is not that manager's table: the engine's QSA metadata did not swap its page "
+            "table for the draft forward"
+        )
+        return self._draft_bound, layer_idx
 
     # -------------------------------------------------------------- forward ---
 
@@ -831,12 +1087,18 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             "this target computes its token embedding itself; an engine-supplied "
             "inputs_embeds is not implemented"
         )
-        assert spec_metadata is None, "speculative decoding is not assembled in this target"
+        # `spec_metadata` is present exactly when drafting. One-model MTP-Eagle captures no
+        # trunk layer, so the trunk owes no capture hook.
+        assert (spec_metadata is not None) == self.mtp_enabled, (
+            f"spec_metadata {'arrived' if spec_metadata is not None else 'is absent'} but the "
+            f"model was built with mtp_enabled={self.mtp_enabled}; the draft path and the "
+            "weights it loads are decided at construction"
+        )
         if self._bound is None or attn_metadata.kv_cache_manager is not self._bound.cm:
             self._bind_cache_manager(attn_metadata, position_ids)
         target = self._select_target(attn_metadata)
         if target is self._prefill:
-            target.prepare(attn_metadata, input_ids, position_ids, vision)
+            target.prepare(attn_metadata, input_ids, position_ids, vision, spec_metadata)
         else:
             assert vision is None, "a generation-only step carries vision rows"
         self._step_begun = True
@@ -852,7 +1114,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
     ):
         """Run the step `begin_step` prepared on the target it chose. Under a breakable
         prefill CUDA graph this is the body the engine captures; nothing here may read the
-        step from the host."""
+        step from the host. Returns the logits input, or under speculation the decode
+        target's `(final, hc)` pair and the prefill target's one packed tensor
+        (`split_spec_output`)."""
         assert self._step_begun, (
             "the shell calls begin_step before every forward; this forward has no prepared step"
         )
@@ -860,6 +1124,17 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         return self._select_target(attn_metadata).forward(
             attn_metadata, input_ids=input_ids, position_ids=position_ids, **kwargs
         )
+
+    def split_spec_output(self, output) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(final, hc)` out of what `forward` returned under speculation: `final` is the
+        `[T, hidden]` mix `lm_head` reads and `hc` the `[T, hc_count * hidden]` stream the
+        MTP module reads. The decode target returns the pair; the prefill target returns one
+        `[T, hidden + stream]` tensor (a breakable prefill graph's body returns one tensor),
+        of which the two are column views."""
+        if isinstance(output, tuple):
+            return output
+        final, hc = torch.split(output, [self.hidden, self.stream], -1)
+        return final, hc
 
 
 # --------------------------------------------------------------- weight views ---
@@ -998,7 +1273,403 @@ def _stack_views(core: Qwen4ExpUnifiedModelingV2) -> _StackWeights:
     )
 
 
+class _MtpWeights(NamedTuple):
+    """The MTP module's weights at this rank's share (keyed at its layer index,
+    `num_hidden_layers`), as the views the ops read: GEMM operands are `.t()` views and
+    grouped-norm weights their per-stream slices."""
+
+    pre_e_norm: torch.Tensor
+    pre_h_norm: tuple
+    fc_e: torch.Tensor
+    fc_h: torch.Tensor
+    ahc_norm: tuple
+    ahc_down: torch.Tensor
+    ahc_up: torch.Tensor
+    ahc_inject: torch.Tensor
+    mhc_norm: tuple
+    mhc_down: torch.Tensor
+    mhc_up: torch.Tensor
+    mhc_inject: torch.Tensor
+    q: torch.Tensor  # [hidden, 2 * q_width]: per head its q, then its output gate
+    k: torch.Tensor
+    v: torch.Tensor
+    o: torch.Tensor
+    q_norm: torch.Tensor
+    k_norm: torch.Tensor
+    idx: torch.Tensor
+    idx_qn: torch.Tensor
+    idx_kn: torch.Tensor
+    router: torch.Tensor
+    fc1_w: torch.Tensor
+    fc1_s: torch.Tensor
+    fc2_w: torch.Tensor
+    fc2_s: torch.Tensor
+    sh_gu: torch.Tensor
+    sh_dn: torch.Tensor
+    sh_gate: torch.Tensor
+    fhc_norm: tuple
+    fhc_down: torch.Tensor
+    fhc_up: torch.Tensor
+
+
+def _mtp_views(core: Qwen4ExpUnifiedModelingV2) -> _MtpWeights:
+    w = core.w
+    p = f"l{core.mtp_layer_idx}_mtp_"
+
+    def slices(key: str) -> tuple:
+        return tuple(torch.split(w[key], core.hidden, dim=0))
+
+    shared = 2 * core.shared_inter
+    return _MtpWeights(
+        pre_e_norm=w[f"{p}pre_e_norm"],
+        pre_h_norm=slices(f"{p}pre_h_norm"),
+        fc_e=w[f"{p}fc_e"].t(),
+        fc_h=w[f"{p}fc_h"].t(),
+        ahc_norm=slices(f"{p}ahc_norm"),
+        ahc_down=w[f"{p}ahc_down"],
+        ahc_up=w[f"{p}ahc_up"],
+        ahc_inject=w[f"{p}ahc_inject"],
+        mhc_norm=slices(f"{p}mhc_norm"),
+        mhc_down=w[f"{p}mhc_down"],
+        mhc_up=w[f"{p}mhc_up"],
+        mhc_inject=w[f"{p}mhc_inject"],
+        q=w[f"{p}q_w"].t(),
+        k=w[f"{p}k_w"].t(),
+        v=w[f"{p}v_w"].t(),
+        o=w[f"{p}o_w"].t(),
+        q_norm=w[f"{p}q_norm"],
+        k_norm=w[f"{p}k_norm"],
+        idx=w[f"{p}idx_w"].t(),
+        idx_qn=w[f"{p}idx_qn"],
+        idx_kn=w[f"{p}idx_kn"],
+        router=w[f"{p}router"].t(),
+        fc1_w=w[f"{p}fc1_w"],
+        fc1_s=w[f"{p}fc1_s"],
+        fc2_w=w[f"{p}fc2_w"],
+        fc2_s=w[f"{p}fc2_s"],
+        # The shared expert's gate|up rows, and its per-token gate logit row, of the one
+        # `[gate | up | gate logit | pad]` operand (`weights._cat_rows`).
+        sh_gu=w[f"{p}sh_gu"][:shared].t(),
+        sh_dn=w[f"{p}sh_dn"].t(),
+        sh_gate=w[f"{p}sh_gu"][shared : shared + 1].t(),
+        fhc_norm=slices(f"{p}fhc_norm"),
+        fhc_down=w[f"{p}fhc_down"],
+        fhc_up=w[f"{p}fhc_up"],
+    )
+
+
 # ------------------------------------------------------------ shared blocks ---
+
+
+def _grouped_norm(core, x: torch.Tensor, weights: tuple) -> torch.Tensor:
+    """`Qwen4ExpTextRMSNorm(group_size=hidden)` of the `[T, stream]` residual `x`: an
+    independent Gemma RMS norm per `hidden`-wide stream (a column slice at the stream's row
+    stride), concatenated back."""
+    parts = torch.split(x, [core.hidden] * core.hc_count, 1)
+    return torch.cat(
+        [flashinfer_gemma_rmsnorm(part, w, core.eps) for w, part in zip(weights, parts)], 1
+    )
+
+
+def _verify_rows(core, md, spec_metadata, num_seqs: int, num_rows: int) -> tuple[int, bool]:
+    """`(p, is_verify)` of a step's generation part: `num_rows` rows over `num_seqs`
+    generation sequences, `p` per sequence -- 1 without speculation, else
+    `runtime_draft_len + 1`. Host ints of the metadata, constants of a captured step."""
+    p = num_rows // num_seqs if num_seqs else 1
+    assert p * num_seqs == num_rows, (
+        f"{num_rows} generation rows do not divide over {num_seqs} generation sequences; a "
+        "ragged per-sequence draft length can be expressed neither to the attention call nor "
+        "to the multi-token recurrence"
+    )
+    assert core.mtp_enabled or p == 1, (
+        f"{num_rows} generation rows over {num_seqs} generation sequences with speculation "
+        "off; the base path implements one query token per generation sequence"
+    )
+    if spec_metadata is not None and num_seqs > 0:
+        declared = spec_metadata.runtime_draft_len + 1
+        assert p == declared, (
+            f"the batch carries {p} query rows per generation sequence but the worker's "
+            f"runtime_draft_len says {declared}; the per-step conv snapshots and the replay "
+            "history are sized from the second and written from the first"
+        )
+        _pool.check_verify_width(p)
+        _pool.check_replay_width(core._bound.replay, p)
+    return p, spec_metadata is not None and num_seqs > 0 and p > 1
+
+
+def _verify_state(core, mm, num_decodes: int) -> tuple:
+    """What a verify step's `_gdn_verify` reads besides the layer: the rows
+    `update_mamba_states` promotes the conv windows from, and the replay's work items. Work
+    items go to the kernel from `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests on, and the
+    kernel leaves the history commit to the manager's all-layer commit exactly when the
+    manager runs one after the step -- the stock Gated-DeltaNet layer's two conditions."""
+    assert core._bound.int_idx is not None, "the cache-manager bind has not run"
+    int_idx = core._bound.int_idx[:num_decodes]
+    partitioned = num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+    all_layer = partitioned and bool(
+        getattr(core._bound.cm, "use_gdn_cached_replay_all_layer_commit", False)
+    )
+    work_items = mm.replay_work_items[:num_decodes] if partitioned else None
+    n_writes = mm.replay_n_writes if partitioned else None
+    return int_idx, work_items, n_writes, all_layer
+
+
+def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify) -> torch.Tensor:
+    """The recurrent half of a verify step: `n` generation sequences of `p` rows, written so
+    that the accepted prefix, unknown until the sampler has run, can be kept.
+
+    The conv writes each row's window to the runtime's per-step buffer
+    (`update_mamba_states` promotes the accepted one) besides advancing the pool; the cached
+    replay rebuilds each slot's state from its checkpoint and pending history, runs the `p`
+    rows and appends them to the history, so rejected rows cost nothing to undo. `mq` is the
+    `[n * p, conv_dim]` q|k|v column view of the input projection, `a` and `b` its raw gate
+    columns (contiguous): the kernel applies `A_log`, `dt_bias` and the q/k L2 norm itself.
+    Returns `[1, n * p, num_v_heads, head_v_dim]`."""
+    int_idx, work_items, n_writes, all_layer = verify
+    pools = core._bound.pools
+    replay = core._bound.replay
+    # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major.
+    x3 = torch.transpose(torch.reshape(mq, [n, p, core.conv_dim]), 1, 2)
+    conv_out = causal_conv1d_triton_update(
+        x=x3,
+        conv_state=pools.conv[i],
+        weight=L.conv_w,
+        bias=None,
+        activation="silu",
+        conv_state_indices=si_d,
+        pad_slot_id=_PAD_SLOT_ID,
+        # Snapshots, not the accepted-token roll.
+        num_accepted_tokens=None,
+        intermediate_conv_window=core._bound.int_conv[i],
+        intermediate_state_indices=int_idx,
+        launch_dependent_kernels=False,
+    )
+    # Back to token-major: one contiguous copy, which the kernel reads q/k/v from directly.
+    mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
+    old_x, old_B, old_dt, old_dA = replay.old[i]
+    qv, kv, vv = torch.split(mq_out, [core.key_dim, core.key_dim, core.value_dim], 1)
+    out = fused_recurrent_gated_delta_rule_cached_replay_update(
+        q=torch.reshape(qv, [n, p, core.num_k_heads, core.head_k_dim]),
+        k=torch.reshape(kv, [n, p, core.num_k_heads, core.head_k_dim]),
+        v=torch.reshape(vv, [n, p, core.num_v_heads, core.head_v_dim]),
+        g=torch.reshape(a, [n, p, core.num_v_heads]),
+        beta=torch.reshape(b, [n, p, core.num_v_heads]),
+        ssm_states=pools.ssm[i],
+        state_indices=si_d,
+        old_u=old_x,
+        old_k=old_B,
+        old_G=old_dt,
+        old_beta=old_dA,
+        cache_buf_idx=replay.cache_buf_idx,
+        prev_num_accepted_tokens=replay.prev_num_accepted,
+        history_size=replay.history,
+        scale=None,
+        use_qk_l2norm_in_kernel=True,
+        A_log=L.a_log,
+        dt_bias=L.dt_bias,
+        launch_with_pdl=False,
+        replay_work_items=work_items,
+        n_writes=n_writes,
+        block_v=None,
+        num_warps=None,
+        use_l2_state_cache=None,
+        use_l2_streaming_inputs=None,
+        use_l2_shared_inputs=None,
+        main_num_stages=None,
+        packed_qkv=mq_out,
+        use_all_layer_commit=all_layer,
+        output=None,
+    )
+    return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
+
+
+def _draft_positions(position_ids: torch.Tensor) -> tuple:
+    """`(pos3, pos, coords)` of a draft step's mRoPE positions (`[3, 1, N]` from the trunk,
+    `[3, N]` from the worker's later steps): a fresh contiguous int32 `[3, N]` copy, its
+    coordinate-0 row (the index rope's) and the `[N, 3]` transpose the position plane
+    stores."""
+    assert position_ids.shape[0] == _QSA_POSITION_AXES, (
+        f"expected the mRoPE position layout with {_QSA_POSITION_AXES} coordinate rows, got "
+        f"{tuple(position_ids.shape)}"
+    )
+    pos3 = _copy_positions(position_ids)
+    return pos3, pos3[0], torch.transpose(pos3, 0, 1)
+
+
+def _mtp_front(core, M: _MtpWeights, embed_tokens, input_ids, hidden_states) -> tuple:
+    """The draft layer's front end and its attention-side hyper-connection. `fc_embedding`
+    over the next token's normalized embedding is added to every stream of `fc_hidden`
+    (one `[hidden, hidden]` matrix applied to each normalized stream of the trunk's
+    residual); then the gated mixer. Returns `(x, mixed, inject)`: the layer's residual,
+    the mixed attention input and its injection weights."""
+    rows = hidden_states.shape[0]
+    e = nn.functional.embedding(input_ids, embed_tokens)
+    x_e = mtp_cublas_mm(flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps), M.fc_e)
+    h_n = _grouped_norm(core, hidden_states, M.pre_h_norm)
+    x_h = torch.reshape(
+        mtp_cublas_mm(torch.reshape(h_n, [rows * core.hc_count, core.hidden]), M.fc_h),
+        [rows, core.stream],
+    )
+    x = torch.add(x_h, torch.cat([x_e] * core.hc_count, -1))
+    mixed, inject = qwen4_exp_gated_residual(
+        _grouped_norm(core, x, M.ahc_norm), M.ahc_down, M.ahc_up, M.ahc_inject, core.hc_count
+    )
+    return x, mixed, inject
+
+
+def _mtp_qkv(core, M: _MtpWeights, mixed, pos3) -> tuple:
+    """The draft layer's q (with its interleaved output gate), k and v projections at this
+    rank's heads, packed into one compact `[T, qkv_width]` row and normalized and rotated in
+    place at the module's rope base. Returns `(qkv, gate, k, v)`: `gate` is the
+    `[T, heads_q, head_dim]` gate half of the q projection, `k` and v` views of `qkv`."""
+    rows = mixed.shape[0]
+    qg = mtp_cublas_mm(mixed, M.q)
+    qkv = torch.empty([rows, core.qkv_width], dtype=mixed.dtype, device=mixed.device)
+    q_dst, k_dst, v_dst = torch.split(
+        torch.reshape(qkv, [rows, core.heads_q + 2 * core.heads_kv, core.head_dim]),
+        [core.heads_q, core.heads_kv, core.heads_kv],
+        1,
+    )
+    q_src, gate = torch.split(
+        torch.reshape(qg, [rows, core.heads_q, 2 * core.head_dim]),
+        [core.head_dim, core.head_dim],
+        2,
+    )
+    q_dst.copy_(q_src)
+    k_dst.copy_(torch.reshape(mtp_cublas_mm(mixed, M.k), [rows, core.heads_kv, core.head_dim]))
+    v_dst.copy_(torch.reshape(mtp_cublas_mm(mixed, M.v), [rows, core.heads_kv, core.head_dim]))
+    mtp_fused_qk_norm_rope(
+        qkv,
+        num_heads_q=core.heads_q,
+        num_heads_k=core.heads_kv,
+        num_heads_v=core.heads_kv,
+        head_dim=core.head_dim,
+        rotary_dim=core.rotary_dim,
+        eps=core.eps,
+        q_weight=M.q_norm,
+        k_weight=M.k_norm,
+        base=core.mtp_theta,
+        is_neox=True,
+        position_ids=pos3,
+        is_qk_norm=True,
+        use_gemma=True,
+        use_mrope=True,
+        mrope_section1=core.mrope_section1,
+        mrope_section2=core.mrope_section2,
+    )
+    return qkv, gate, k_dst, v_dst
+
+
+def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> torch.Tensor:
+    """The draft layer's QSA index branch over its own planes, as a trunk attention layer
+    runs it: the raw key stored before anything normalizes it, the query's norm and rotation
+    (coordinate 0 alone, at the module's rope base), then the compression of every group this
+    step completes. Returns the normalized, rotated index query."""
+    req_idx, logical, block_table, tokens_per_block, pos, coords = qsa
+    rows = mixed.shape[0]
+    qk_index = mtp_cublas_mm(mixed, M.idx)
+    token_k = torch.split(
+        torch.reshape(qk_index, [rows, core.index_heads + core.index_kv_heads, -1]),
+        [core.index_heads, core.index_kv_heads],
+        1,
+    )[1]
+    qsa_paged_index_store(
+        token_k,
+        coords,
+        draft.index_cache,
+        draft.position_cache,
+        req_idx,
+        logical,
+        block_table,
+        tokens_per_block,
+    )
+    index_scratch = torch.empty(
+        [rows, core.index_scratch_width], dtype=mixed.dtype, device=mixed.device
+    )
+    index_scratch[:, : core.index_width].copy_(qk_index)
+    fused_qk_norm_rope(
+        index_scratch,
+        num_heads_q=core.index_heads,
+        num_heads_k=core.index_kv_heads,
+        num_heads_v=core.index_kv_heads,
+        head_dim=core.index_head_dim,
+        rotary_dim=core.rotary_dim,
+        eps=core.eps,
+        q_weight=M.idx_qn,
+        k_weight=M.idx_kn,
+        base=core.mtp_theta,
+        is_neox=True,
+        position_ids=pos,
+        is_qk_norm=True,
+        use_gemma=True,
+        use_mrope=False,
+        mrope_section1=0,
+        mrope_section2=0,
+    )
+    qsa_prefill_compress(
+        logical_positions=logical,
+        request_indices=req_idx,
+        block_table=block_table,
+        index_cache=draft.index_cache,
+        position_cache=draft.position_cache,
+        k_norm_weight=M.idx_kn,
+        cos_sin=core._mtp_cos_sin,
+        eps=core.eps,
+        tokens_per_block=tokens_per_block,
+        compress_ratio=core.compress_ratio,
+        mrope_section=_QSA_MROPE_SECTION,
+    )
+    return _index_query(core, index_scratch)
+
+
+def _mtp_moe_block(core, M: _MtpWeights, x) -> torch.Tensor:
+    """The draft layer's MoE: renormalized top-k over the whole routing space, the FP8
+    block-scale routed experts over this rank's window (1x128 activation scales, pre-routed;
+    the window partials summed over the TP group), and the replicated bf16 shared expert
+    gated by its own sigmoid logit. The activation scales come back transposed
+    `[hidden / 128, tokens]` and go straight to the runner."""
+    logits = mtp_cublas_mm(x, M.router)
+    topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=x.dtype)
+    xq, xsf = fp8_quantize_1x128(x, use_ue8m0=_MTP_MOE_USE_UE8M0)
+    routed = fp8_block_scale_moe_runner(
+        routing_logits=None,
+        routing_bias=None,
+        hidden_states=xq,
+        hidden_states_scale=xsf,
+        gemm1_weights=M.fc1_w,
+        gemm1_weights_scale=M.fc1_s,
+        gemm2_weights=M.fc2_w,
+        gemm2_weights_scale=M.fc2_s,
+        num_experts=core.num_experts,
+        top_k=core.topk,
+        num_fused_shared_experts=None,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=core.moe_inter,
+        local_expert_offset=core.mtp_expert_offset,
+        local_num_experts=core.mtp_local_experts,
+        routed_scaling_factor=None,
+        routing_method_type=_ROUTING_METHOD_RENORM,
+        topk_weights=topk_w,
+        topk_ids=topk_ids,
+        act_type=_ACT_TYPE_SWIGLU,
+        gemm1_clamp_limit=None,
+    )
+    routed = core.tp_sum(routed)
+    shared = mtp_cublas_mm(flashinfer_silu_and_mul(mtp_cublas_mm(x, M.sh_gu)), M.sh_dn)
+    gate_logits = mtp_cublas_mm(x, M.sh_gate)
+    return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+
+
+def _mtp_tail(core, M: _MtpWeights, x, attn, inject) -> torch.Tensor:
+    """The draft layer after its attention core: the gated output projection's partial summed
+    over the TP group and injected, the MoE-side hyper-connection, the MoE and its injection.
+    `attn` is the `[T, q_width]` gated attention output."""
+    x = qwen4_exp_post_inject(x, core.tp_sum(mtp_cublas_mm(attn, M.o)), inject)
+    mixed, inject = qwen4_exp_gated_residual(
+        _grouped_norm(core, x, M.mhc_norm), M.mhc_down, M.mhc_up, M.mhc_inject, core.hc_count
+    )
+    return qwen4_exp_post_inject(x, _mtp_moe_block(core, M, mixed), inject)
 
 
 def _hc_mixer(core, normed, first, up, with_inject):
@@ -1423,6 +2094,8 @@ class _PrefillStep(NamedTuple):
     ple: tuple
     qsa: tuple
     vision: tuple | None
+    # A verify step: the generation rows' side-cache writes are staged for the rollback.
+    stage: bool = False
 
 
 class PrefillTarget:
@@ -1479,7 +2152,9 @@ class PrefillTarget:
 
         The index plane advances on every step, including below the threshold, so a request
         growing past it finds its prefix compressed; above it the main K/V append becomes
-        this layer's own call."""
+        this layer's own call. On a verify step the generation rows' index slots (and, on
+        the first attention layer, their position slots) are staged for `SpeculativeRollback`
+        before the store and the compression overwrite them."""
         core = self.core
         L = self._layers[i]
         step = self._step
@@ -1502,6 +2177,10 @@ class PrefillTarget:
         # sparse GQA reads its query heads from it.
         qkv = proj_qkv[:num_tokens]
         qkv.copy_(proj[:, : core.qkv_width])
+        if step.stage:
+            core.spec_rollback.stage_index(
+                core._bound.pools.index_cache[i], core._bound.pools.position_cache
+            )
         _index_plane(core, proj, i, L, (req_idx, logical, block_table, tokens_per_block, coords))
 
         if sparse:
@@ -1593,7 +2272,10 @@ class PrefillTarget:
         FlashInfer's chunked recurrence, and a mixed step's one-token generation rows the
         decode step's conv and recurrence. A context sequence carrying nothing starts from
         zeros without its pool slots being cleared: the conv pass reads no carried window for
-        it, and the recurrence (`has_initial_state`) gathers zeros for it."""
+        it, and the recurrence (`has_initial_state`) gathers zeros for it.
+
+        On a verify step the generation rows are draft chains of unknown accepted length:
+        they take `_gdn_verify` (per-step conv windows and the cached replay) instead."""
         core = self.core
         L = self._layers[i]
         step = self._step
@@ -1609,13 +2291,55 @@ class PrefillTarget:
             qsl_all,
             qsl_long,
             qsl_long_p,
+            num_decodes,
+            gen_p,
+            verify,
         ) = step.gdn
         num_tokens = step.num_tokens
         pools = core._bound.pools
         ssm_states = pools.ssm[i]
         mixed_qkv, _, a, b = torch.split(proj[:num_tokens], core.in_proj_split, 1)
 
-        if num_decode_tokens > 0:
+        if verify is not None:
+            mq_p, mq_d = torch.split(mixed_qkv, [num_prefill_tokens, num_decode_tokens], 0)
+            a_p, a_d = torch.split(a, [num_prefill_tokens, num_decode_tokens], 0)
+            b_p, b_d = torch.split(b, [num_prefill_tokens, num_decode_tokens], 0)
+            # The context rows as on a step without verify rows.
+            q, k, v, g, beta = self._gdn_prefill_prep(mq_p, a_p, b_p, L, i, qsl_p, si_p, hi_p)
+            flashinfer_chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=None,
+                initial_state=ssm_states,
+                initial_state_indices=si_p,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=qsl_long_p,
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=out[:, :num_prefill_tokens],
+                state_workspace=None,
+                has_initial_state=hi_p,
+                linear_gate=True,
+            )
+            out[:, num_prefill_tokens:num_tokens].copy_(
+                _gdn_verify(
+                    core,
+                    mq_d,
+                    a_d.contiguous(),
+                    b_d.contiguous(),
+                    i,
+                    L,
+                    si_d,
+                    num_decodes,
+                    gen_p,
+                    verify,
+                )
+            )
+        elif num_decode_tokens > 0:
             mq_p, mq_d = torch.split(mixed_qkv, [num_prefill_tokens, num_decode_tokens], 0)
             a_p, b_p = a[:num_prefill_tokens], b[:num_prefill_tokens]
             q, k, v, g, beta = self._gdn_prefill_prep(mq_p, a_p, b_p, L, i, qsl_p, si_p, hi_p)
@@ -1743,13 +2467,21 @@ class PrefillTarget:
         rows gather fp8 vectors from one table (`ple_ngram_embed`); the key/value projections,
         the gate, a dilated depthwise short conv over a paged state, the residual add and the
         next site's grouped norm are `ple_gate_conv_inject_norm`. A sequence carrying nothing
-        is seeded with `eos_token_id`."""
+        is seeded with `eos_token_id`.
+
+        On a verify step the generation rows' pre-step pool rows and ids are staged before
+        the first launch publishes, and the conv input the fused launch writes out after it,
+        for `SpeculativeRollback` to rewrite both pools to the accepted prefix."""
         core = self.core
         S = self._stack
         step = self._step
         conv_states, ngram_pool, si_all, carry_all, qsl = step.ple
         num_tokens = step.num_tokens
         next_norm = self._layers[core.ple_layer].ahc_norm
+        conv_input = None
+        if step.stage:
+            core.spec_rollback.stage_ple_verify(ngram_pool, conv_states, step.input_ids)
+            conv_input = torch.empty_like(hc[:num_tokens])
         ngram = ple_ngram_embed(
             step.input_ids,
             ngram_pool,
@@ -1783,9 +2515,11 @@ class PrefillTarget:
             _PAD_SLOT_ID,
             num_tokens,
             carry_all,
-            conv_input=None,
+            conv_input=conv_input,
             out=(hc_out[:num_tokens], normed_out[:num_tokens]),
         )
+        if step.stage:
+            core.spec_rollback.stage_ple_conv_input(conv_input)
         hc_out[num_tokens:].zero_()
         normed_out[num_tokens:].zero_()
 
@@ -1806,6 +2540,7 @@ class PrefillTarget:
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
         vision: tuple | None,
+        spec_metadata=None,
     ) -> None:
         """Everything this step reads from the host, kept for the forward's breaks as one
         `_PrefillStep`: the contract check, the attention op's per-step arguments and the
@@ -1840,12 +2575,9 @@ class PrefillTarget:
         num_decodes = batch - num_prefills
         num_prefill_tokens = md.num_ctx_tokens
         num_decode_tokens = num_tokens - num_prefill_tokens
-        assert num_decode_tokens == num_decodes, (
-            f"{num_decode_tokens} generation rows over {num_decodes} generation sequences "
-            "with speculation off; the base path implements one query token per generation "
-            "sequence"
-        )
-        attn_args["predicted_tokens_per_seq"] = 1
+        # Rows per generation sequence: 1 without speculation, else `runtime_draft_len + 1`.
+        gen_p, is_verify = _verify_rows(core, md, spec_metadata, num_decodes, num_decode_tokens)
+        attn_args["predicted_tokens_per_seq"] = gen_p
 
         si_all = mm.state_indices[:batch]
         hi_all = mm.has_initial_states[:batch]
@@ -1873,13 +2605,24 @@ class PrefillTarget:
             qsl_all,
             qsl_long,
             qsl_long_p,
+            num_decodes,
+            gen_p,
+            _verify_state(core, mm, num_decodes) if is_verify else None,
         )
 
         # PLE carry flags must cover the whole batch, but `has_initial_states` is filled for
         # the context prefix only; every generation sequence carries, so pad with True.
         ple_carry = nn.functional.pad(hi_p, [0, num_decodes], mode="constant", value=1.0)
+        # Under speculation `query_start_loc_long` has one row per generation sequence, so
+        # with `gen_p > 1` both PLE stateful calls would be mis-segmented: rebuilt from
+        # `seq_lens_cuda`, which holds the true counts during the trunk forward.
+        ple_qsl = (
+            qsl_long
+            if gen_p == 1
+            else cu_seqlens_from_seq_lens(md.seq_lens_cuda[:batch], torch.int64)
+        )
         pools = core._bound.pools
-        ple_state = (pools.ple_state[0], pools.ple_state[1], si_all, ple_carry, qsl_long)
+        ple_state = (pools.ple_state[0], pools.ple_state[1], si_all, ple_carry, ple_qsl)
 
         # Dense/sparse decision once per forward, from a host-side metadata read: a
         # per-capture constant.
@@ -1899,6 +2642,26 @@ class PrefillTarget:
             coords[:num_tokens],
             sparse,
         )
+
+        # A verify step's generation rows write the PLE pools and the QSA side caches for
+        # every draft row, accepted or not; `SpeculativeRollback` keeps what its commit needs
+        # to undo the rejected ones. Reopened on every forward, so a step whose commit never
+        # ran leaves nothing for the next one. Context rows are never staged.
+        rollback = core.spec_rollback
+        if rollback is not None:
+            rollback.discard()
+        if is_verify:
+            rollback.begin(
+                num_contexts=num_prefills,
+                prefix_tokens=num_prefill_tokens,
+                num_gens=num_decodes,
+                rows_per_gen=gen_p,
+                slots=si_d,
+                request_indices=md.qsa_req_idx_per_token[num_prefill_tokens:num_tokens],
+                logical_positions=md.qsa_logical_positions[num_prefill_tokens:num_tokens],
+                block_table=md.qsa_block_table,
+                tokens_per_block=md.tokens_per_block,
+            )
         self._step = _PrefillStep(
             num_tokens=num_tokens,
             physical_tokens=physical_tokens,
@@ -1909,6 +2672,7 @@ class PrefillTarget:
             ple=ple_state,
             qsa=qsa,
             vision=vision,
+            stage=is_verify,
         )
 
     def forward(
@@ -1985,7 +2749,167 @@ class PrefillTarget:
             del routed, gate_logits, shared
         # The stack-final mixer with no injection weight is the final norm.
         final, _ = _hc_mixer(core, normed, S.fhc_first, S.fhc_up, False)
-        return final
+        if not core.mtp_enabled:
+            return final
+        # `lm_head` reads the `[T, hidden]` mix; the MTP module reads the `[T, stream]` stream
+        # it was collapsed from. They leave packed in one tensor, because a breakable prefill
+        # graph's body returns one tensor (`split_spec_output`).
+        return torch.cat([final, hc], -1)
+
+    # ------------------------------------------------------------- the draft ---
+
+    def _capture_selection(self, md, topk_indices, visible_blocks) -> None:
+        """IndexShare: stash, per request, the selection of the row the draft loop continues
+        from, with that row's complete-group count, in the draft layer's row of the shared
+        buffers: a context request's last row of this chunk, and a generation request's last
+        accepted row (`num_accepted - 1` past its first)."""
+        batch = md.num_seqs
+        assert md.qsa_mtp_num_accepted is not None, (
+            "IndexShare needs the worker's accepted counts to pick each request's capture row; "
+            "the draft loop did not supply them"
+        )
+        seq_lens = md.seq_lens_cuda[:batch].to(torch.int64)
+        starts = torch.cumsum(seq_lens, 0) - seq_lens
+        accepted = md.qsa_mtp_num_accepted[:batch].to(torch.int64)
+        offsets = torch.minimum(torch.clamp(accepted - 1, min=0), seq_lens - 1)
+        offsets[: md.num_contexts] = seq_lens[: md.num_contexts] - 1
+        rows = starts + offsets
+        slot = self.core._draft_bound.share_slot
+        md.qsa_shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
+        md.qsa_shared_topk_visible_blocks[slot, :batch].copy_(
+            torch.index_select(visible_blocks, 0, rows)
+        )
+        # Host-side readiness, recorded in program order.
+        md.qsa_shared_topk_captured_slots.add(slot)
+
+    def mtp_forward(
+        self,
+        embed_tokens: torch.Tensor,
+        all_rank_num_tokens,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        """One draft step whose metadata still carries context rows: the draft loop's first
+        (draft-extend) step of a batch with context rows, eager. Every row runs the whole
+        draft layer; the worker gathers one row per request from the result.
+
+        The draft layer's attention is the trunk prefill target's: the context rows score
+        as query tiles and bound their sparse scan by their positions, the generation rows
+        (`p` a request) score row by row. `all_rank_num_tokens` is accepted and unused."""
+        core = self.core
+        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+        assert core._bound is not None, "the trunk's cache-manager bind has not run"
+        md = attn_metadata
+        rows = hidden_states.shape[0]
+        assert input_ids.shape[0] == rows and hidden_states.shape[1] == core.stream, (
+            f"the draft step got {input_ids.shape[0]} token ids and {tuple(hidden_states.shape)} "
+            f"hidden states; the MTP module reads one {core.stream}-wide stream row per token"
+        )
+        # Projected on every call: the worker rewrites `attn_metadata` in place between
+        # draft steps.
+        step = self.step_args(md)
+        num_ctx = md.num_ctx_tokens
+        gen_seqs = md.num_seqs - md.num_contexts
+        p, _ = _verify_rows(core, md, None, gen_seqs, rows - num_ctx)
+        step["predicted_tokens_per_seq"] = p
+        draft, layer_idx = core._draft_step_bind(md)
+        assert rows == md.num_tokens, (
+            f"the draft step carries {rows} rows for a batch its metadata describes as "
+            f"{md.num_tokens} tokens; the QSA row mapping covers the second"
+        )
+        # The trunk's dense/sparse decision from the same host buffer: every draft step of
+        # one engine forward takes the branch its trunk took.
+        batch = md.num_seqs
+        sparse = batch > 0 and int(md.kv_lens_runtime[:batch].max()) > core.dense_threshold
+        # IndexShare: the only draft step with context rows is the loop's first, which always
+        # runs the indexer and, with sharing on, captures the selection the later steps reuse.
+        share = core.mtp_index_share and md.qsa_in_mtp_draft_loop
+        assert not (share and md.qsa_indexer_skip_topk), (
+            "the worker asked a draft step with context rows to reuse a selection"
+        )
+        pos3, pos, coords = _draft_positions(position_ids)
+        M = core._mtp
+        req_idx = md.qsa_req_idx_per_token[:rows]
+        logical = md.qsa_logical_positions[:rows]
+        block_table = md.qsa_block_table
+        tokens_per_block = md.tokens_per_block
+
+        x, mixed, inject = _mtp_front(core, M, embed_tokens, input_ids, hidden_states)
+        qkv, gate, k_dst, v_dst = _mtp_qkv(core, M, mixed, pos3)
+        q_index = _mtp_index_branch(
+            core, M, mixed, draft, (req_idx, logical, block_table, tokens_per_block, pos, coords)
+        )
+        if sparse:
+            kv = draft.kv
+            _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
+            topk_indices = md.qsa_topk_indices[:rows]
+            visible_blocks = md.qsa_visible_blocks[:rows]
+            seq_lens_q = md.qsa_sequence_lengths[:rows]
+            row_starts = md.qsa_topk_row_starts[:rows]
+            parts = [(0, num_ctx, True)]
+            if num_ctx < rows:
+                parts.append((num_ctx, rows, False))
+            selected = torch.empty(
+                [rows, core.token_topk + core.compress_ratio - 1],
+                dtype=torch.int32,
+                device=qkv.device,
+            )
+            for lo, hi, context_rows in parts:
+                scores = qsa_paged_index_scores(
+                    q=q_index[lo:hi],
+                    index_cache=draft.index_cache,
+                    block_table=block_table,
+                    query_positions=logical[lo:hi],
+                    request_indices=req_idx[lo:hi],
+                    tokens_per_block=tokens_per_block,
+                    compress_ratio=core.compress_ratio,
+                    only_visible_blocks=True,
+                    context_rows=context_rows,
+                )
+                _selection(
+                    core,
+                    scores,
+                    visible_blocks[lo:hi],
+                    logical[lo:hi],
+                    seq_lens_q[lo:hi],
+                    topk_indices[lo:hi],
+                    row_starts[lo:hi],
+                    selected[lo:hi],
+                )
+            if share:
+                self._capture_selection(md, topk_indices, visible_blocks)
+            attn = torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device)
+            for lo, hi, context_rows in parts:
+                out = _sparse_gqa(
+                    core,
+                    kv,
+                    _packed_q(core, qkv)[lo:hi],
+                    block_table,
+                    selected[lo:hi],
+                    req_idx[lo:hi],
+                    tokens_per_block,
+                    logical[lo:hi] if context_rows else None,
+                )
+                attn[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
+        else:
+            attn = thop_attention(
+                q=qkv,
+                output=torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device),
+                local_layer_idx=layer_idx,
+                num_heads=core.heads_q,
+                num_kv_heads=core.heads_kv,
+                head_size=core.head_dim,
+                quant_mode=core.quant_mode,
+                kv_scale_orig_quant=core.kv_scale_orig_quant,
+                kv_scale_quant_orig=core.kv_scale_quant_orig,
+                **step,
+                **_CALL_CONSTANTS,
+            )
+        mtp_fused_sigmoid_mul_inplace(attn, gate)
+        return _mtp_tail(core, M, x, attn, inject)
 
 
 # ------------------------------------------------------------------- decode ---
@@ -2019,7 +2943,7 @@ class DecodeTarget:
 
     # --------------------------------------------------------------- blocks ---
 
-    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step):
+    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage):
         """One gated GQA layer plus its QSA index branch for a generation-only batch, at this
         rank's heads.
 
@@ -2028,7 +2952,9 @@ class DecodeTarget:
         op and the sparse GQA's query heads, the sparse K/V append reads k and v as views of
         it, and the index branch reads the raw key from it. The index plane is maintained on
         every step, at both ends of the threshold; above it the dense core is replaced and the
-        main K/V append becomes this layer's own call."""
+        main K/V append becomes this layer's own call. A verify step's rows (`stage`) come
+        `predicted_tokens_per_seq` a request, each scored and attended on its own, and their
+        index slots are staged for `SpeculativeRollback` before the store."""
         core = self.core
         (
             req_idx,
@@ -2051,6 +2977,10 @@ class DecodeTarget:
         )
         _, k_dst, v_dst = _attn_in_heads(core, proj)
         _attention_rope(core, proj, index_scratch, L, pos3, pos)
+        if stage:
+            core.spec_rollback.stage_index(
+                core._bound.pools.index_cache[i], core._bound.pools.position_cache
+            )
         _index_plane(core, proj, i, L, (req_idx, logical, block_table, tokens_per_block, coords))
         # The packed `[q | k | v]` as one compact copy: the dense op reads it flat, and the
         # sparse GQA reads its query heads from it.
@@ -2113,16 +3043,35 @@ class DecodeTarget:
         fused_sigmoid_mul_inplace(out, gate)
         return core.tp_sum(cublas_mm(out, L.o))
 
-    def _gdn_block(self, x, i, L, si_all) -> torch.Tensor:
+    def _gdn_block(self, x, i, L, si_all, verify, gen_p) -> torch.Tensor:
         """One Gated-DeltaNet layer over a generation-only batch, one token per sequence, at
         this rank's heads: one GEMM for all four input projections (q|k|v, z, a and b are
         column views of its output), the conv step over the q|k|v columns in place, then the
         recurrence and the gated norm as one streaming launch that computes each (row,
         v-head) on its own, so over a bf16 pool a row's output and state do not depend on its
-        batch. The output projection's per-rank partial is summed over the TP group."""
+        batch. The output projection's per-rank partial is summed over the TP group.
+
+        A verify step (`verify`, `gen_p` rows a sequence) takes `_gdn_verify` and the gated
+        norm epilogue instead."""
         core = self.core
         pools = core._bound.pools
         proj = cublas_mm(x, L.in_proj)
+        if verify is not None:
+            mixed_qkv, z, a, b = torch.split(proj, core.in_proj_split, 1)
+            num_tokens = x.shape[0]
+            out = _gdn_verify(
+                core,
+                mixed_qkv,
+                a.contiguous(),
+                b.contiguous(),
+                i,
+                L,
+                si_all,
+                num_tokens // gen_p,
+                gen_p,
+                verify,
+            )
+            return self._gdn_epilogue(out, z, L, num_tokens)
         mixed_qkv = torch.split(proj, core.in_proj_split, 1)[0]
         causal_conv1d_update(
             x=mixed_qkv,
@@ -2149,14 +3098,34 @@ class DecodeTarget:
         )
         return core.tp_sum(cublas_mm(o, L.out))
 
-    def _ple_block(self, hc, input_ids, ple_state, next_norm) -> tuple:
+    def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:
+        """A verify step's gated RMS norm (sigmoid gate, plain non-gemma weight) and the
+        output projection, whose per-rank partial is summed over the TP group."""
+        core = self.core
+        o = rms_norm_gated_token_major(
+            torch.reshape(out, [-1, core.head_v_dim]),
+            torch.reshape(z, [num_tokens, core.num_v_heads, core.head_v_dim]),
+            weight=L.gnorm,
+            eps=core.eps,
+            fp8_scale=None,
+            gate_activation="sigmoid",
+        )
+        o = torch.reshape(o, [num_tokens, core.value_dim])
+        return core.tp_sum(cublas_mm(o, L.out))
+
+    def _ple_block(self, hc, input_ids, ple_state, next_norm, stage) -> tuple:
         """The n-gram side path on its decoder layer, added into the stream and normalized
         for the layer's attention-side site. Returns `(hc, normed)`. The same steps as the
-        prefill target's `_ple_block`; every generation sequence carries its history by
-        construction, so no carry flags are passed."""
+        prefill target's `_ple_block`, over up to `rows` rows a sequence; every generation
+        sequence carries its history by construction, so no carry flags are passed. A verify
+        step (`stage`) stages what `SpeculativeRollback` rewrites the two pools from: both
+        pools' pre-step rows before either launch publishes, and the conv input the second
+        launch writes out."""
         core = self.core
         S = self._stack
-        conv_states, ngram_pool, si_all, qsl = ple_state
+        conv_states, ngram_pool, si_all, qsl, rows = ple_state
+        if stage:
+            core.spec_rollback.stage_ple_verify(ngram_pool, conv_states, input_ids)
         ngram = ple_ngram_embed(
             input_ids,
             ngram_pool,
@@ -2169,9 +3138,10 @@ class DecodeTarget:
             S.ple_vocab,
             S.ple_offs,
             core.eos_token_id,
-            1,
+            rows,
         )
-        return ple_gate_conv_inject_norm(
+        conv_input = torch.empty_like(hc) if stage else None
+        out = ple_gate_conv_inject_norm(
             hc,
             cublas_mm(ngram, S.ple_key),
             cublas_mm(ngram, S.ple_val),
@@ -2188,8 +3158,12 @@ class DecodeTarget:
             _PLE_CLAMP_MIN,
             core.ple_dilation,
             _PAD_SLOT_ID,
-            1,
+            rows,
+            conv_input=conv_input,
         )
+        if stage:
+            core.spec_rollback.stage_ple_conv_input(conv_input)
+        return out
 
     # -------------------------------------------------------------- forward ---
 
@@ -2204,6 +3178,7 @@ class DecodeTarget:
         md = attn_metadata
         self._check_step_contract(md)
         step = self.step_args(md)
+        spec_metadata = kwargs.get("spec_metadata")
         mm = md.mamba_metadata
         pos3 = _copy_positions(position_ids)
         pos = pos3[0]
@@ -2215,18 +3190,48 @@ class DecodeTarget:
         dev = h.device
         batch = md.num_seqs
         # Decode CUDA graphs pad with real dummy requests, so they are in the metadata.
-        assert num_tokens == md.num_tokens == batch, (
-            f"the engine handed {num_tokens} activation rows for a generation batch of "
-            f"{batch} sequences its metadata describes as {md.num_tokens} tokens; the base "
-            "path implements one query token per generation sequence"
+        assert num_tokens == md.num_tokens, (
+            f"the engine handed {num_tokens} activation rows for a generation batch its "
+            f"metadata describes as {md.num_tokens} tokens"
         )
         step["predicted_tokens_per_seq"] = 1
         # Zero rows under a decode CUDA graph, which pads every attention-DP rank to the
         # captured batch.
         pad_rows = core._dp_pad_rows(md, num_tokens)
+        # Rows per generation sequence: 1 without speculation, else `runtime_draft_len + 1`.
+        gen_p, is_verify = _verify_rows(core, md, spec_metadata, batch, num_tokens)
+        step["predicted_tokens_per_seq"] = gen_p
         si_all = mm.state_indices[:batch]
+        verify = _verify_state(core, mm, batch) if is_verify else None
         pools = core._bound.pools
-        ple_state = (pools.ple_state[0], pools.ple_state[1], si_all, mm.query_start_loc_long)
+        # Under speculation `query_start_loc_long` has one row per generation sequence: with
+        # `gen_p > 1` the PLE segmentation is rebuilt from `seq_lens_cuda`.
+        ple_qsl = (
+            mm.query_start_loc_long
+            if gen_p == 1
+            else cu_seqlens_from_seq_lens(md.seq_lens_cuda[:batch], torch.int64)
+        )
+        ple_state = (pools.ple_state[0], pools.ple_state[1], si_all, ple_qsl, gen_p)
+
+        # Staging for the speculative rollback (see PrefillTarget.prepare); every row here is
+        # a generation row. A captured step stages and commits the PLE pools in one launch
+        # each.
+        rollback = core.spec_rollback
+        if rollback is not None:
+            rollback.discard()
+        if is_verify:
+            rollback.begin(
+                num_contexts=0,
+                prefix_tokens=0,
+                num_gens=batch,
+                rows_per_gen=gen_p,
+                slots=si_all,
+                request_indices=md.qsa_req_idx_per_token[:num_tokens],
+                logical_positions=md.qsa_logical_positions[:num_tokens],
+                block_table=md.qsa_block_table,
+                tokens_per_block=md.tokens_per_block,
+                fused=md.is_cuda_graph,
+            )
 
         # Dense/sparse decision once per forward, from a host-side metadata read: a
         # per-capture constant matching the engine's short/long decode graph families.
@@ -2259,14 +3264,14 @@ class DecodeTarget:
         _, normed = qwen4_exp_hc_inject_norm(hc, None, None, layers[0].ahc_norm, core.eps, hc_count)
         for i, L in enumerate(layers):
             if i == core.ple_layer:
-                hc, normed = self._ple_block(hc, input_ids, ple_state, L.ahc_norm)
+                hc, normed = self._ple_block(hc, input_ids, ple_state, L.ahc_norm, is_verify)
             mixed, inject = _hc_mixer(core, normed, L.ahc_first, L.ahc_up, True)
             if core.is_attn[i]:
                 block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step
+                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, is_verify
                 )
             else:
-                block_out = self._gdn_block(mixed, i, L, si_all)
+                block_out = self._gdn_block(mixed, i, L, si_all, verify, gen_p)
             hc, normed = qwen4_exp_hc_inject_norm(
                 hc, block_out, inject, L.mhc_norm, core.eps, hc_count
             )
@@ -2279,7 +3284,463 @@ class DecodeTarget:
             del routed, gate_logits, shared
         # The stack-final mixer with no injection weight: its mix *is* the final norm.
         final, _ = _hc_mixer(core, normed, S.fhc_first, S.fhc_up, False)
-        return final
+        if spec_metadata is None:
+            return final
+        # `lm_head` reads the `[T, hidden]` mix; the MTP module reads the `[T, stream]` stream
+        # it was collapsed from.
+        return final, hc
+
+    # ------------------------------------------------------------- the draft ---
+
+    def _capture_selection(self, md, topk_indices, visible_blocks, batch, p) -> None:
+        """IndexShare: stash, per request, the selection of its last accepted draft-extend
+        row with that row's complete-group count, in the draft layer's row of the shared
+        buffers. Every request carries `p` rows here, and the worker continues the draft loop
+        from row `num_accepted - 1` of each (the golden token counts as accepted)."""
+        assert md.qsa_mtp_num_accepted is not None, (
+            "IndexShare needs the worker's accepted counts to pick each request's capture row; "
+            "the draft loop did not supply them"
+        )
+        accepted = md.qsa_mtp_num_accepted[:batch].to(torch.int64)
+        rows = torch.arange(batch, dtype=torch.int64, device=topk_indices.device) * p
+        rows = rows + torch.clamp(accepted - 1, min=0, max=p - 1)
+        slot = self.core._draft_bound.share_slot
+        md.qsa_shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
+        md.qsa_shared_topk_visible_blocks[slot, :batch].copy_(
+            torch.index_select(visible_blocks, 0, rows)
+        )
+        # Host-side readiness, recorded in program order: under capture this runs while the
+        # graph is recorded, so a graph holds the reuse only after the capture it reads.
+        md.qsa_shared_topk_captured_slots.add(slot)
+
+    def mtp_forward(
+        self,
+        embed_tokens: torch.Tensor,
+        all_rank_num_tokens,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        """One draft step over generation rows only: every draft step past the first in an
+        engine forward (one row a request), and the first (`p` rows a request) when the
+        batch had no context. Inside the captured decode graph when the trunk step is.
+
+        Under IndexShare the loop's draft-extend step (`p` rows) runs the draft indexer and
+        captures each request's selection; every draft decode step after it skips the index
+        branch and rebuilds its selection from that capture with `qsa_mtp_reuse_topk`, which
+        appends the groups completed since (the expansion adds the incomplete tail, so the
+        tokens drafted since stay visible). What a skipped step would have written to the
+        index plane sits at or past the newly committed length, and the next engine step's
+        draft-extend rewrites it before anything reads it. `all_rank_num_tokens` is accepted
+        and unused."""
+        core = self.core
+        assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+        assert core._bound is not None, "the trunk's cache-manager bind has not run"
+        md = attn_metadata
+        rows = hidden_states.shape[0]
+        assert input_ids.shape[0] == rows and hidden_states.shape[1] == core.stream, (
+            f"the draft step got {input_ids.shape[0]} token ids and {tuple(hidden_states.shape)} "
+            f"hidden states; the MTP module reads one {core.stream}-wide stream row per token"
+        )
+        # Projected on every call: the worker rewrites `attn_metadata` in place between
+        # draft steps.
+        step = self.step_args(md)
+        gen_seqs = md.num_seqs
+        p, _ = _verify_rows(core, md, None, gen_seqs, rows)
+        step["predicted_tokens_per_seq"] = p
+        draft, layer_idx = core._draft_step_bind(md)
+        assert rows == md.num_tokens, (
+            f"the draft step carries {rows} rows for a batch its metadata describes as "
+            f"{md.num_tokens} tokens; the QSA row mapping covers the second"
+        )
+        # The trunk's dense/sparse decision from the same host buffer: the worker advances
+        # only the device KV lengths through the draft loop, so every draft step of one engine
+        # forward takes the branch its trunk took, in the graph family the runner chose.
+        sparse = gen_seqs > 0 and int(md.kv_lens_runtime[:gen_seqs].max()) > core.dense_threshold
+        share = core.mtp_index_share and md.qsa_in_mtp_draft_loop
+        reuse = share and md.qsa_indexer_skip_topk
+        assert not share or reuse == (p == 1), (
+            f"the worker's reuse flag ({md.qsa_indexer_skip_topk}) disagrees with the step's "
+            f"shape ({p} rows per request): only the draft decode steps after the draft-extend "
+            "step reuse its selection"
+        )
+        pos3, pos, coords = _draft_positions(position_ids)
+        M = core._mtp
+        req_idx = md.qsa_req_idx_per_token[:rows]
+        logical = md.qsa_logical_positions[:rows]
+        block_table = md.qsa_block_table
+        tokens_per_block = md.tokens_per_block
+
+        x, mixed, inject = _mtp_front(core, M, embed_tokens, input_ids, hidden_states)
+        qkv, gate, k_dst, v_dst = _mtp_qkv(core, M, mixed, pos3)
+        q_index = None
+        if not reuse:
+            q_index = _mtp_index_branch(
+                core,
+                M,
+                mixed,
+                draft,
+                (req_idx, logical, block_table, tokens_per_block, pos, coords),
+            )
+        if sparse:
+            kv = draft.kv
+            _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
+            topk_indices = md.qsa_topk_indices[:rows]
+            visible_blocks = md.qsa_visible_blocks[:rows]
+            seq_lens_q = md.qsa_sequence_lengths[:rows]
+            selected = torch.empty(
+                [rows, core.token_topk + core.compress_ratio - 1],
+                dtype=torch.int32,
+                device=qkv.device,
+            )
+            if reuse:
+                slot = draft.share_slot
+                assert slot in md.qsa_shared_topk_captured_slots, (
+                    "a draft decode step would reuse a selection that no draft-extend step of "
+                    "this loop captured"
+                )
+                qsa_mtp_reuse_topk(
+                    shared_indices=md.qsa_shared_topk_indices[slot],
+                    shared_visible_blocks=md.qsa_shared_topk_visible_blocks[slot],
+                    request_indices=req_idx,
+                    visible_blocks=visible_blocks,
+                    output=topk_indices,
+                )
+                selected.copy_(
+                    qsa_expand_block_indices(
+                        topk_indices,
+                        logical,
+                        seq_lens_q,
+                        compress_ratio=core.compress_ratio,
+                        token_topk=core.token_topk,
+                    )
+                )
+            else:
+                scores = qsa_paged_index_scores(
+                    q=q_index,
+                    index_cache=draft.index_cache,
+                    block_table=block_table,
+                    query_positions=logical,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    compress_ratio=core.compress_ratio,
+                    only_visible_blocks=True,
+                    context_rows=False,
+                )
+                _selection(
+                    core,
+                    scores,
+                    visible_blocks,
+                    logical,
+                    seq_lens_q,
+                    topk_indices,
+                    md.qsa_topk_row_starts[:rows],
+                    selected,
+                )
+                if share:
+                    self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
+            attn = torch.reshape(
+                _sparse_gqa(
+                    core,
+                    kv,
+                    _packed_q(core, qkv),
+                    block_table,
+                    selected,
+                    req_idx,
+                    tokens_per_block,
+                    None,
+                ),
+                [rows, core.q_width],
+            )
+        else:
+            attn = thop_attention(
+                q=qkv,
+                output=torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device),
+                local_layer_idx=layer_idx,
+                num_heads=core.heads_q,
+                num_kv_heads=core.heads_kv,
+                head_size=core.head_dim,
+                quant_mode=core.quant_mode,
+                kv_scale_orig_quant=core.kv_scale_orig_quant,
+                kv_scale_quant_orig=core.kv_scale_quant_orig,
+                **step,
+                **_CALL_CONSTANTS,
+            )
+        mtp_fused_sigmoid_mul_inplace(attn, gate)
+        return _mtp_tail(core, M, x, attn, inject)
+
+
+# ------------------------------------------------------------ the MTP module ---
+
+
+class MTPLayer:
+    """The checkpoint's MTP module, replayed once per draft step by the spec worker: one more
+    decoder layer (two hyper-connections, gated GQA over its own QSA indexer, a 512-expert
+    FP8 MoE) behind a two-branch front end (`fc_embedding` over the next token's embedding,
+    `fc_hidden` over the trunk's residual per stream). It returns the residual un-collapsed;
+    `shared_head` owns the module's mixer. The step runs on the targets (`mtp_forward`),
+    routed by the phase each call's metadata shows: the worker rewrites `attn_metadata`
+    between draft steps, so one engine step's draft calls cross from prefill to decode.
+
+    Not an `nn.Module`: the weights live in the core's `ParameterDict`, and a second
+    registration would break the weight load's both-directions coverage."""
+
+    def __init__(self, core: Qwen4ExpUnifiedModelingV2, logits_processor) -> None:
+        self.core = core
+        self.logits_processor = logits_processor
+
+    def __call__(self, *args, **kwargs) -> torch.Tensor:
+        return self.forward(*args, **kwargs)
+
+    def shared_head(self, hidden_states, lm_head, attn_metadata, return_context_logits):
+        """The module's own head: its stack-final hyper-connection mixer (a gated mixer with
+        its own parameters, not a plain RMS norm) over the grouped norm, then the trunk's
+        `lm_head` through the shell's logits processor (vocab-parallel and gathered under
+        attention TP)."""
+        core = self.core
+        M = core._mtp
+        final, _ = qwen4_exp_gated_residual(
+            _grouped_norm(core, hidden_states, M.fhc_norm),
+            M.fhc_down,
+            M.fhc_up,
+            None,
+            core.hc_count,
+        )
+        return self.logits_processor.forward(final, lm_head, attn_metadata, return_context_logits)
+
+    def forward(
+        self,
+        embed_tokens: torch.Tensor,
+        all_rank_num_tokens,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.core._select_target(attn_metadata).mtp_forward(
+            embed_tokens,
+            all_rank_num_tokens,
+            input_ids,
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            **kwargs,
+        )
+
+
+class DraftModel:
+    """The container the spec worker reaches the drafter through: `mtp_layers` (`[0]`,
+    MTP-Eagle replays one layer), `embed_tokens` and `lm_head`. `embed_tokens` resolves
+    through the core on every read: this container is built while parameters are meta
+    tensors, and materialization replaces the tensor objects."""
+
+    def __init__(self, core: Qwen4ExpUnifiedModelingV2, lm_head, logits_processor) -> None:
+        self.core = core
+        self.mtp_layers = [MTPLayer(core, logits_processor)]
+        self.lm_head = lm_head
+
+    @property
+    def embed_tokens(self) -> torch.Tensor:
+        return self.core.w["embed"]
+
+
+class SpeculativeRollback:
+    """The target's auxiliary speculative-state handler: it undoes what a verify step's
+    rejected draft rows wrote into the side-cache planes the runtime's own state promotion
+    does not cover: the PLE n-gram id history and dilated-conv state, each attention layer's
+    QSA index-K plane and the shared QSA position plane. The Gated-DeltaNet state is not
+    here: the runtime promotes it.
+
+    For a generation request that accepted `a` rows (golden token included, `1 <= a <= p`)
+    the commit rewrites the n-gram pool row to the id window of row `a - 1` minus its oldest
+    id, the conv pool row to columns `[a, a + state_len)` of `[pre-step state | conv input of
+    the request's p rows]`, and every index-K and position slot written by a row of ordinal
+    `>= a` to its pre-verify contents.
+
+    The targets stage during the forward (`begin`, then `stage_ple_verify` before the fused PLE
+    launches and `stage_ple_conv_input` after them, and `stage_index` before each attention
+    layer's store) and the spec worker calls `commit_speculative_states` after its draft loop,
+    inside the same model forward. Everything staged is allocated by the forward and consumed
+    by that forward's commit, so a captured graph holds both ends. A step opened with `fused`
+    (the decode target's captured steps) stages the PLE pools with one `spec_rollback_stage`
+    launch and commits with one `spec_rollback_commit` launch."""
+
+    def __init__(self) -> None:
+        self._pending: dict | None = None
+        # (base addresses, page strides, plane count) of every attention layer's index-K
+        # plane, once the cache manager is bound.
+        self._planes: tuple | None = None
+
+    def set_index_planes(self, planes: list) -> None:
+        """Bind the attention layers' index-K planes (static for the manager's lifetime)."""
+        ptrs, strides = _plane_table(planes)
+        self._planes = (ptrs, strides, len(planes))
+
+    # ------------------------------------------------------------- staging ---
+
+    def discard(self) -> None:
+        """Drop whatever an earlier forward staged."""
+        self._pending = None
+
+    def begin(
+        self,
+        *,
+        num_contexts: int,
+        prefix_tokens: int,
+        num_gens: int,
+        rows_per_gen: int,
+        slots: torch.Tensor,
+        request_indices: torch.Tensor,
+        logical_positions: torch.Tensor,
+        block_table: torch.Tensor,
+        tokens_per_block: int,
+        fused: bool = False,
+    ) -> None:
+        """Open a verify step's staging. The generation rows follow the `prefix_tokens`
+        context rows as `num_gens` runs of `rows_per_gen`, so row `s * p + t` is ordinal `t`
+        of generation request `s`. `slots` are those requests' recurrent slots;
+        `request_indices` and `logical_positions` the generation rows' own. Each row's QSA
+        slot is resolved here, as `qsa_paged_index_store` resolves it, and every index plane's
+        slots are gathered before the trunk writes any of them."""
+        n, p = num_gens, rows_per_gen
+        assert n > 0 and p > 1, (
+            f"a verify step stages generation requests carrying drafts; got {n} requests of "
+            f"{p} rows"
+        )
+        assert logical_positions.shape[0] == n * p, (
+            f"{n} generation requests of {p} rows are {n * p} rows; got "
+            f"{logical_positions.shape[0]} positions"
+        )
+        assert self._planes is not None, "the attention layers' index planes are not bound"
+        positions = logical_positions.to(torch.long)
+        pages = block_table[request_indices.to(torch.long), positions // tokens_per_block]
+        pages = pages.to(torch.long)
+        within = positions % tokens_per_block
+        ptrs, strides, count = self._planes
+        self._pending = dict(
+            num_contexts=num_contexts,
+            prefix=prefix_tokens,
+            n=n,
+            p=p,
+            slots=slots.to(torch.long),
+            pages=pages,
+            within=within,
+            staged_layers=0,
+            position=None,
+            index_all=qsa_rollback_gather(ptrs, strides, pages, within, count),
+            fused=fused,
+            ngram_stream=None,
+        )
+
+    def stage_ple_verify(
+        self, ngram_pool: torch.Tensor, conv_pool: torch.Tensor, input_ids: torch.Tensor
+    ) -> None:
+        """A verify step's PLE staging, before either pool is written: both pools, the
+        generation slots' pre-step conv rows, and the n-gram candidates rebuilt from the slots'
+        pre-step id history and the rows' ids. Row `t`'s history after the step is the last
+        `context` ids of `[history | ids of rows 0..t]`."""
+        pending = self._pending
+        prefix, n, p = pending["prefix"], pending["n"], pending["p"]
+        slots = pending["slots"]
+        pending["ngram_pool"] = ngram_pool
+        pending["conv_pool"] = conv_pool
+        if pending["fused"]:
+            pending["ngram_stream"], pending["conv_prev"] = spec_rollback_stage(
+                ngram_pool, conv_pool, slots, input_ids[prefix : prefix + n * p], p
+            )
+            return
+        pending["conv_prev"] = conv_pool[slots]
+        context = ngram_pool.shape[1]
+        ids = torch.reshape(input_ids[prefix : prefix + n * p], [n, p]).to(ngram_pool.dtype)
+        stream = torch.cat([ngram_pool[slots], ids], 1)
+        # Window k of the unfold is the history after k rows.
+        pending["ngram_candidates"] = stream.unfold(1, context, 1)[:, 1:]
+
+    def stage_ple_conv_input(self, conv_input: torch.Tensor) -> None:
+        """The generation rows' conv input (`[T, C]`, token-major), as the fused PLE launch
+        wrote it into a buffer the forward allocated for this staging alone. A mixed batch's
+        rows are copied out, so its context prefix is not kept alive through the draft loop."""
+        pending = self._pending
+        prefix, n, p = pending["prefix"], pending["n"], pending["p"]
+        conv_x = torch.reshape(conv_input[prefix:], [n, p, -1])
+        pending["conv_x"] = conv_x.clone() if prefix else conv_x
+
+    def stage_index(self, index_cache: torch.Tensor, position_cache: torch.Tensor) -> None:
+        """Before an attention layer's index store: on the step's first attention layer (the
+        first to write the shared plane) the generation rows' position slots. The index-K
+        slots of every layer were gathered when the step was opened."""
+        pending = self._pending
+        if pending["position"] is None:
+            pages, within = pending["pages"], pending["within"]
+            pending["position"] = (position_cache, position_cache[pages, within])
+        pending["staged_layers"] += 1
+
+    # -------------------------------------------------------------- commit ---
+
+    def commit_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        """Rewrite the staged planes to the accepted prefix. Called by the spec worker."""
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        n, p = pending["n"], pending["p"]
+        assert num_contexts == pending["num_contexts"], (
+            f"the worker commits with {num_contexts} context requests and the forward staged "
+            f"{pending['num_contexts']}"
+        )
+        assert state_indices.shape[0] == num_contexts + n, (
+            f"the worker hands {state_indices.shape[0]} slots for a batch the forward staged "
+            f"as {num_contexts} + {n} requests"
+        )
+        assert pending.get("conv_x") is not None and pending["staged_layers"] > 0, (
+            "a verify step staged neither its PLE rows nor any attention layer; the forward "
+            "did not run the staging it opened"
+        )
+        ptrs, strides, _ = self._planes
+        position, position_old = pending["position"]
+        pages, within = pending["pages"], pending["within"]
+        if pending["fused"]:
+            spec_rollback_commit(
+                num_accepted_tokens[num_contexts : num_contexts + n],
+                state_indices[num_contexts:],
+                pending["ngram_pool"],
+                pending["ngram_stream"],
+                pending["conv_pool"],
+                pending["conv_prev"],
+                pending["conv_x"],
+                position,
+                position_old,
+                pages,
+                within,
+                ptrs,
+                strides,
+                pending["index_all"],
+            )
+            return
+        accepted = num_accepted_tokens[num_contexts : num_contexts + n].to(torch.long)
+        slots = state_indices[num_contexts:].to(torch.long)
+        rows = torch.arange(n, device=accepted.device)
+        ngram_pool, conv_pool = pending["ngram_pool"], pending["conv_pool"]
+        state_len = conv_pool.shape[-1]
+        ngram_pool[slots] = pending["ngram_candidates"][rows, accepted - 1]
+        # [n, C, state_len + p]; window k of the unfold is the state after k tokens.
+        history = torch.cat([pending["conv_prev"], torch.transpose(pending["conv_x"], 1, 2)], 2)
+        conv_pool[slots] = history.unfold(2, state_len, 1)[rows, :, accepted]
+        # [n * p]: True at every ordinal the sampler rejected.
+        rejected = torch.reshape(
+            torch.arange(p, device=accepted.device).unsqueeze(0) >= accepted.unsqueeze(1), [-1]
+        )
+        qsa_rollback_restore(ptrs, strides, pages, within, rejected, pending["index_all"])
+        position[pages, within] = torch.where(
+            rejected[:, None], position_old, position[pages, within]
+        )
 
 
 # -------------------------------------------------------------------- shell ---
@@ -2327,7 +3788,32 @@ class ModelingV2HfFc694b5OrigSm103Unified(
         assert self.lm_head.weight.dtype == torch.bfloat16, (
             f"expected a bf16 lm_head; the shell built {self.lm_head.weight.dtype}"
         )
+        # No separate draft checkpoint: the MTP module's weights are the target's own.
         self.draft_config = None
+        # The speculative branch, built only when `speculative_config` asked for it.
+        self.spec_config = getattr(model_config, "spec_config", None)
+        self.draft_model = None
+        self.spec_worker = None
+        if self.spec_config is not None:
+            self.draft_model = DraftModel(self.model, self.lm_head, self.logits_processor)
+            # Must match what the resource manager decided: left at `get_spec_worker`'s
+            # default, the draft step would be handed a manager that maps no draft layer.
+            self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(self.spec_config)
+            self.spec_worker = get_spec_worker(
+                self.spec_config,
+                model_config,
+                model_config.mapping,
+                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+            )
+            assert self.spec_worker is not None, (
+                f"the engine resolved no spec worker for spec_dec_mode "
+                f"{self.spec_config.spec_dec_mode!r}"
+            )
+            self.spec_worker.set_draft_model(self.draft_model)
+            # The PLE pools and the QSA side caches are written per verify row and nothing the
+            # runtime owns rolls them back; the worker calls this after its draft loop, inside
+            # the same forward.
+            self.spec_worker.register_auxiliary_state_handler(self.model.spec_rollback)
         # Media placeholder ids for the executor; built lazily (`__init__` runs under meta
         # init).
         self._mm_token_ids_value = (self.model.image_token_id, self.model.video_token_id)
@@ -2368,7 +3854,12 @@ class ModelingV2HfFc694b5OrigSm103Unified(
         **kwargs,
     ):
         """One engine step: the core's `begin_step`, then the base forward with every
-        argument it was handed (`resource_manager` stays in `**kwargs`)."""
+        argument it was handed (`resource_manager` stays in `**kwargs`).
+
+        With a spec worker the shell owns the logits gather (one-model modes gather the rows
+        the sampler verifies, `spec_metadata.gather_ids`) and hands the worker the trunk's
+        ungathered stream rows, which the MTP module reads; `position_ids` goes in the
+        engine's layout."""
         self.model.begin_step(
             attn_metadata,
             input_ids,
@@ -2378,15 +3869,54 @@ class ModelingV2HfFc694b5OrigSm103Unified(
             spec_metadata=spec_metadata,
             vision=None,
         )
-        return super().forward(
+        if self.spec_worker is None:
+            assert spec_metadata is None, (
+                "spec_metadata arrived without a spec worker; this engine was built without a "
+                "speculative_config"
+            )
+            return super().forward(
+                attn_metadata,
+                input_ids,
+                position_ids,
+                inputs_embeds,
+                return_context_logits,
+                spec_metadata,
+                lora_params,
+                **kwargs,
+            )
+        assert spec_metadata is not None, "the spec worker is built but no spec_metadata came"
+        final, hc = self.model.split_spec_output(
+            self.model(
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                lora_params=lora_params,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
+        )
+        logits = self.logits_processor.forward(
+            nn.functional.embedding(spec_metadata.gather_ids, final),
+            self.lm_head,
             attn_metadata,
-            input_ids,
-            position_ids,
-            inputs_embeds,
-            return_context_logits,
-            spec_metadata,
-            lora_params,
-            **kwargs,
+            True,
+        )
+        # A prefill CUDA graph pads the step's rows; the worker reshapes generation rows per
+        # request, so it takes the batch's own.
+        if attn_metadata.padded_num_tokens is not None:
+            n = attn_metadata.num_tokens
+            input_ids, hc = input_ids[:n], hc[:n]
+            position_ids = position_ids[..., :n]
+        return self.spec_worker(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hc,
+            logits=logits,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=self.draft_model,
+            resource_manager=kwargs.get("resource_manager"),
         )
 
     def load_weights(self, weights, *args, **kwargs):
