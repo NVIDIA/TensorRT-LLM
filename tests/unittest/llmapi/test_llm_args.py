@@ -5757,6 +5757,7 @@ class TestDSparkConfidenceScheduling:
     def _environment(**overrides):
         values = dict(
             cuda_graph_config=SimpleNamespace(enable_padding=True),
+            moe_config=SimpleNamespace(load_balancer=None),
             speculative_config=SimpleNamespace(
                 draft_is_embedded_in_target=True),
             guided_decoding_backend=None,
@@ -5802,6 +5803,14 @@ class TestDSparkConfidenceScheduling:
             }, "context_parallel_size=1"),
             (
                 {
+                    "moe_config":
+                    SimpleNamespace(load_balancer=SimpleNamespace(
+                        mode="per_layer_dynamic"))
+                },
+                "per-layer dynamic EPLB",
+            ),
+            (
+                {
                     "sparse_attention_config":
                     SimpleNamespace(
                         enable_heuristic_topk=True,
@@ -5819,6 +5828,9 @@ class TestDSparkConfidenceScheduling:
         with pytest.raises(ValueError, match=message):
             TorchLlmArgs._validate_dspark_confidence_environment(environment)
 
-    def test_confidence_environment_accepts_padded_cuda_graphs(self):
+    @pytest.mark.parametrize("mode", [None, "standard"])
+    def test_confidence_environment_accepts_padded_cuda_graphs(self, mode):
+        load_balancer = None if mode is None else SimpleNamespace(mode=mode)
         TorchLlmArgs._validate_dspark_confidence_environment(
-            self._environment())
+            self._environment(moe_config=SimpleNamespace(
+                load_balancer=load_balancer)))

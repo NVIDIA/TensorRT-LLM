@@ -7476,6 +7476,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 "size and reserves tokens for the padding rows; without padding "
                 "those rows never appear, so the step's token total misses its "
                 "captured bucket and falls out of graph replay.")
+        if getattr(self.moe_config.load_balancer, "mode",
+                   None) == "per_layer_dynamic":
+            raise ValueError(
+                "DSpark confidence scheduling does not support per-layer dynamic "
+                "EPLB because it disables the required CUDA graphs.")
 
         sparse_attention_config = self.sparse_attention_config
         if sparse_attention_config is not None:
