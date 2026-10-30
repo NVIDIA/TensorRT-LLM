@@ -2228,6 +2228,15 @@ class TestQwen38FlashNextNvfp4ModelingV2(LlmapiAccuracyTestHarness):
     # What every rank of both engines prints once it has bound the cache manager's pools.
     TARGET_BIND_LINE = "modeling_v2 unified qwen4_exp: rank"
 
+    WORKER_ENV = {
+        # The target checks its step contract on its first forward.
+        "TRTLLM_MODELING_V2_VALIDATE": "1",
+        # Each worker spawns its second rank over MPI; in a container running as root that
+        # needs what the CI image's environment sets (docker/Dockerfile.multi).
+        "PRTE_ALLOW_RUN_AS_ROOT": "1",
+        "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+    }
+
     @pytest.mark.skipif(
         get_sm_version() != 103,
         reason="the modeling_v2 target is certified on sm_103 only")
@@ -2291,16 +2300,7 @@ class TestQwen38FlashNextNvfp4ModelingV2(LlmapiAccuracyTestHarness):
                 gen_server_config,
                 self.MODEL_PATH,
                 max_workers=128,
-                extra_env=
-            {
-                # The target checks its step contract on its first forward.
-                "TRTLLM_MODELING_V2_VALIDATE": "1",
-                # Each worker spawns its second rank over MPI; in a container running
-                # as root that needs what the CI image's environment sets
-                # (docker/Dockerfile.multi).
-                "PRTE_ALLOW_RUN_AS_ROOT": "1",
-                "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
-            },
+                extra_env=self.WORKER_ENV,
                 assert_worker_log_contains=self.TARGET_BIND_LINE,
         ) as llm:
             # The served quantization the reference is keyed by; the launcher reads
