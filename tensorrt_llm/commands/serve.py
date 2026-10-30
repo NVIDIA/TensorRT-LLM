@@ -488,6 +488,34 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+def _reserve_multi_frontend_port(host: str, port: int,
+                                 family: socket.AddressFamily) -> socket.socket:
+    """Refuse a port another server uses; return a lock to hold while serving.
+
+    SO_REUSEPORT would let a second server of the same user join the port. A
+    plain bind catches any listener (SO_REUSEADDR ignores TIME_WAIT), and an
+    abstract Unix socket named after the port catches a launcher that has not
+    started listening yet.
+    """
+    lock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        lock.bind(f"\0trtllm-serve-{os.geteuid()}-{port}")
+    except OSError as e:
+        lock.close()
+        raise RuntimeError(f"Port {port} is already reserved by another "
+                           f"multi-frontend trtllm-serve: {e}") from e
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, port))
+    except OSError as e:
+        lock.close()
+        raise RuntimeError(
+            f"Failed to bind socket to {host}:{port}: {e}. "
+            f"Port holder(s): {_diagnose_port_in_use(port)}") from e
+    return lock
+
+
 @contextlib.contextmanager
 def _provision_kv_cache_pool(llm_args: dict,
                              owns_engine: bool = True) -> Iterator[None]:
@@ -558,6 +586,38 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
             f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
 
 
+def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
+                                         port: int, grpc: bool,
+                                         report_addr: Optional[str],
+                                         enable_sleep_mode: bool) -> None:
+    """Fall back to one frontend where the default count cannot run.
+
+    An explicit count (CLI, --config YAML or --set) is left alone, so the
+    guard that owns the conflict still rejects it.
+    """
+    num_frontends = llm_args.get("num_serve_frontends", 1)
+    if requested or num_frontends <= 1:
+        return
+    if grpc:
+        # OpenEngine supports several frontends, but only when asked to.
+        reason = "--grpc"
+    elif port == 0 or report_addr:
+        reason = "--port 0 / --report_addr"
+    elif llm_args.get("orchestrator_type") is not None:
+        reason = f"orchestrator_type={llm_args['orchestrator_type']!r}"
+    elif llm_args.get("enable_resource_governor"):
+        reason = "enable_resource_governor"
+    elif enable_sleep_mode:
+        reason = "--enable_sleep_mode"
+    else:
+        return
+    logger.info(
+        f"num_serve_frontends defaults to {num_frontends} for the OpenAI HTTP "
+        f"server only; running 1 frontend because of {reason}. Pass "
+        "--num_serve_frontends explicitly to override.")
+    llm_args["num_serve_frontends"] = 1
+
+
 def launch_server(
         host: str,
         port: int,
@@ -622,14 +682,17 @@ def launch_server(
             logger.warning(
                 "num_serve_frontends > 1: stateful Responses API storage "
                 "(store/previous_response_id) is disabled; the per-frontend "
-                "in-memory store cannot be shared across frontends.")
+                "in-memory store cannot be shared across frontends. Pass "
+                "--num_serve_frontends 1 to keep it.")
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
-    with socket.socket(address_family, socket.SOCK_STREAM) as s:
+    port_lock = (_reserve_multi_frontend_port(host, port, address_family)
+                 if multi_frontend.is_launcher else contextlib.nullcontext())
+    with port_lock, socket.socket(address_family, socket.SOCK_STREAM) as s:
         # port == 0 lets the kernel pick the port; the caller then needs a way
         # to learn it, either by service discovery or by report_addr.
         assert port > 0 or disagg_cluster_config is not None or report_addr, (
@@ -1122,11 +1185,14 @@ def launch_visual_gen_server(
 @stability_option(
     "--num_serve_frontends",
     type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
-    default=1,
+    # LlmArgs keeps 1: only trtllm-serve spawns frontends.
+    default=8,
     help="Number of HTTP or OpenEngine frontend processes serving one "
     "executor; values > 1 share the serving port via "
-    "SO_REUSEPORT (classic IPC executor path only).",
-    status="prototype")
+    "SO_REUSEPORT (classic IPC executor path only). Without an explicit "
+    "value, --grpc and configurations that support a single frontend only "
+    "use 1 and log why.",
+    status="beta")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,
@@ -1595,6 +1661,15 @@ def serve(
         llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
         if enable_sleep_mode and llm_args.get("sleep_config") is None:
             llm_args["sleep_config"] = SleepConfig()
+
+        _resolve_default_num_serve_frontends(
+            llm_args,
+            requested=("num_serve_frontends" in explicit_cli_keys
+                       or "num_serve_frontends" in llm_args_extra_dict),
+            port=port,
+            grpc=grpc,
+            report_addr=report_addr,
+            enable_sleep_mode=enable_sleep_mode)
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
         # Preserve requested settings for failures before entering the LLM constructor.

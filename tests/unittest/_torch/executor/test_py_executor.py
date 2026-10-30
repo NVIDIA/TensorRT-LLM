@@ -111,12 +111,24 @@ def _run_forward_step(executor, batch, new_tensors=None):
     ("shutdown_method", "releases_model_owned_graphs"),
     [
         ("shutdown", True),
-        ("shutdown_for_kv_cache_estimation", False),
+        ("release_resources", False),
     ],
 )
 def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_graphs: bool) -> None:
     engine = Mock()
     executor = object.__new__(PyExecutor)
+    executor._closed = False
+    executor._resources_released = False
+    executor.worker_started = True
+    executor.kv_cache_transceiver = None
+    executor.pending_encoder_steps = []
+    executor.active_requests = []
+    executor.responses = {}
+    executor.result_wait_queues = {}
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor.request_accumulated = []
+    executor.control_requests = []
     executor.executor_request_queue = Mock()
     executor.enable_attention_dp = False
     executor._kv_connector_failed = False

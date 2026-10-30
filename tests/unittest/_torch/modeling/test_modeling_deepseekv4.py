@@ -606,7 +606,7 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     monkeypatch.setattr(
         DeepseekV4TrtllmAttention,
         "_prepare_sparse_forward_args",
-        lambda self, metadata, forward_args: None,
+        lambda self, metadata, forward_args: forward_args,
     )
     attn = object.__new__(DeepseekV4TrtllmAttention)
     sink = torch.ones(4, dtype=torch.float32)

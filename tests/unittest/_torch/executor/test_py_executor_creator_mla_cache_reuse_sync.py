@@ -112,6 +112,13 @@ class _DummyPyExecutor:
         self.peft_cache_config = peft_cache_config
         self.execution_stream = execution_stream
         self.started = False
+        self.closed = False
+
+    def shutdown(self):
+        self.closed = True
+
+    def rebind_resources(self, resources):
+        self.resource_manager = resources
 
     def start_worker(self):
         """Mark executor as started."""
@@ -361,24 +368,37 @@ def _run_create_py_executor(
 
     monkeypatch.setattr(py_executor_creator, "ModelEngine", _create_model_engine)
 
+    created_executors = []
+
     def _create_py_executor_instance(**kwargs):
         if ctx_chunk_configs is not None:
             ctx_chunk_configs.append(kwargs["ctx_chunk_config"])
-        return _DummyPyExecutor(
+        executor = _DummyPyExecutor(
             resources=kwargs["resources"],
             model_engine=kwargs["model_engine"],
             peft_cache_config=kwargs["peft_cache_config"],
             execution_stream=kwargs["execution_stream"],
         )
+        created_executors.append(executor)
+        return executor
+
+    def _create_py_executor_resources(**kwargs):
+        if ctx_chunk_configs is not None:
+            ctx_chunk_configs.append(kwargs["ctx_chunk_config"])
+        return _DummyResourceManager(kwargs["resources"])
 
     monkeypatch.setattr(
         py_executor_creator, "create_py_executor_instance", _create_py_executor_instance
+    )
+    monkeypatch.setattr(
+        py_executor_creator, "create_py_executor_resources", _create_py_executor_resources
     )
 
     py_executor = py_executor_creator.create_py_executor(
         llm_args=llm_args,
         checkpoint_dir=None,
     )
+    assert created_executors == [py_executor]
     kv_cache_manager = py_executor.resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER
     )
@@ -829,3 +849,43 @@ def test_startup_allocation_phases(monkeypatch, estimate):
         assert allocation_phases == ["final_kv_cache_allocation", "final_executor_creation"]
     assert phases[-1] == "executor_start_worker"
     assert timers[0].depth == 0
+
+
+@pytest.mark.parametrize("failure_stage", ["profiling", "allocation", "rebind"])
+def test_failed_resource_transition_closes_executor(monkeypatch, failure_stage):
+    executors = []
+
+    class FailingCacheCreator(_DummyKvCacheCreator):
+        def try_prepare_estimation(self):
+            return True
+
+        def configure_kv_cache_capacity(self, executor):
+            executors.append(executor)
+            if failure_stage == "profiling":
+                raise RuntimeError("startup failure")
+
+        def teardown_managers(self, resources):
+            resources.pop(ResourceManagerType.KV_CACHE_MANAGER)
+
+        def build_managers(self, resources, estimating_kv_cache):
+            if not estimating_kv_cache and failure_stage == "allocation":
+                raise RuntimeError("startup failure")
+            super().build_managers(resources, estimating_kv_cache)
+
+    if failure_stage == "rebind":
+
+        def fail_rebind(self, resources):
+            raise RuntimeError("startup failure")
+
+        monkeypatch.setattr(_DummyPyExecutor, "rebind_resources", fail_rebind)
+
+    with pytest.raises(RuntimeError, match="startup failure"):
+        _run_create_py_executor(
+            monkeypatch,
+            sm_version=100,
+            kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+            kv_cache_creator_cls=FailingCacheCreator,
+        )
+    assert len(executors) == 1
+    assert executors[0].closed
+    assert not executors[0].started
