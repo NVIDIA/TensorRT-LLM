@@ -5,8 +5,9 @@ of the context rows, read token-major straight off the input projection, with
 the SiLU, the q/k split and L2 norm, the v copy and the decay/beta gates fused
 in, and each sequence's conv window published to the paged pool.
 
-Tier 6 (CuTe DSL written for this target) for the conv pass, Tier 5 (Triton)
-for the gates and the window publish. The three-call
+The conv pass is CuTe DSL, the gates and the window publish Triton, all three
+written for the Qwen3.8-Flash-Next tp1 target (its `ops/ssm/gdn_prefill_conv_post`)
+and reused here unchanged, at this target's per-rank geometries. The three-call
 composition it replaces -- `extract_transpose_prefill_slice` (token-major ->
 channel-major copy), `causal_conv1d_fwd` (channel-major conv, in place) and
 `fused_gdn_post_conv` (split + norm + gates) -- moves the `[T, 10240]`
@@ -40,6 +41,19 @@ CONV_WIDTH = 4
 #: Largest conv-pool slot count the cache manager was seen to allocate for this
 #: checkpoint (the `causal_conv1d_fwd` entry's ENGINE_SLOTS).
 ENGINE_SLOTS = 461
+#: One tp4/tep4 rank's share: the heads split four ways, its own `[q|k|v|z|a|b]`
+#: input projection 2560 + 1536 + 2 * 12 = 4120 wide.
+RANK4_K_HEADS, RANK4_V_HEADS = NUM_K_HEADS // 4, NUM_V_HEADS // 4
+RANK4_IN_PROJ_WIDTH = (2 * RANK4_K_HEADS + 2 * RANK4_V_HEADS) * HEAD_K_DIM + 2 * RANK4_V_HEADS
+#: Conv-pool slots the stock engine bound per rank at core's config (n-gram table
+#: host-resident): 1874 at tep4, 850 at dep4. tp4 has no engine to count it; its
+#: rank holds tep4's GDN state, so tep4's count bounds it.
+TEP4_SLOTS, DEP4_SLOTS = 1874, 850
+TP4_SLOTS = TEP4_SLOTS
+#: The stock manager's conv page: one slot holds all 36 GDN layers' `[C, 3]` states,
+#: so a layer's view has slot stride `36 * C * 3` and the last layer sits `35 * C * 3`
+#: elements into the page.
+PAGE_GDN_LAYERS = 36
 A_LOG_RANGE = (-5.5625, 3.5625)
 DT_BIAS_RANGE = (-8.9375, 19.25)
 SOFTPLUS_THRESHOLD = 20.0
@@ -749,6 +763,24 @@ def _engine_slots(num_seqs: int) -> tuple[int, ...]:
     return slots
 
 
+def _rank_cell(rank4: bool, lengths, initial, pool_slots, slots, linear_gate) -> dict:
+    """A rank's call: tp4/tep4 (`rank4`, 4 k / 12 v heads over its 4120-wide projection) or
+    dep4 (all 16 / 48 heads, 16480), over the stock conv page at `pool_slots`."""
+    heads = (RANK4_K_HEADS, RANK4_V_HEADS) if rank4 else (NUM_K_HEADS, NUM_V_HEADS)
+    return dict(
+        num_k_heads=heads[0],
+        num_v_heads=heads[1],
+        head_dim=HEAD_K_DIM,
+        x_row_stride=RANK4_IN_PROJ_WIDTH if rank4 else IN_PROJ_WIDTH,
+        lengths=lengths,
+        initial=initial,
+        pool_slots=pool_slots,
+        page_layers=PAGE_GDN_LAYERS,
+        slots=slots,
+        linear_gate=linear_gate,
+    )
+
+
 class GdnPrefillConvPost(OpWrapper):
     """Causal conv + SiLU of the context rows, then the GDN q/k/v/g/beta.
 
@@ -786,7 +818,10 @@ class GdnPrefillConvPost(OpWrapper):
     # spec: lengths; slots (pool rows used, None -> _engine_slots); pool_slots;
     # initial; layout "in_proj" (x and a/b column views of one [T, 16480]
     # buffer, the target's call) | "rows" (x/a/b the first rows of a longer
-    # projection, as a mixed step's context half), extra_rows.
+    # projection, as a mixed step's context half), extra_rows. A rank's cell
+    # (`_rank_cell`) also names num_k_heads, num_v_heads, head_dim, x_row_stride
+    # (its own projection's width) and page_layers (the pool is the last layer's
+    # view of the stock page); without them, the tp1 geometry over a two-layer buffer.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="target call, engine 461-slot pool: 37+1+128 tokens at slots 460, 0, 230",
@@ -824,6 +859,40 @@ class GdnPrefillConvPost(OpWrapper):
                 initial=tuple(i % 3 != 0 for i in range(128)),
             ),
         ),
+        Cell(
+            why="tep4 rank, 4/12 heads at stride 4120: fresh 8192-token context, last of 1874 slots",
+            spec=_rank_cell(True, (8192,), (False,), TEP4_SLOTS, (TEP4_SLOTS - 1,), True),
+        ),
+        Cell(
+            why="tep4 rank: 37+1+128 tokens, carry/fresh/carry, slots 1873, 0, 937 of 1874",
+            spec=_rank_cell(
+                True,
+                (37, 1, 128),
+                (True, False, True),
+                TEP4_SLOTS,
+                (TEP4_SLOTS - 1, 0, TEP4_SLOTS // 2),
+                False,
+            ),
+        ),
+        Cell(
+            why="tp4 rank (tep4's 4/12 heads and 1874-slot bound): fresh 8192 tokens at slot 0",
+            spec=_rank_cell(True, (8192,), (False,), TP4_SLOTS, (0,), True),
+        ),
+        Cell(
+            why="dep4 rank, 16/48 heads: two 512-token chunks, the first carrying, 850 slots",
+            spec=_rank_cell(
+                False,
+                (512, 512),
+                (True, False),
+                DEP4_SLOTS,
+                (DEP4_SLOTS - 1, DEP4_SLOTS // 2),
+                True,
+            ),
+        ),
+        Cell(
+            why="dep4 rank at max_num_tokens: one carrying 8192-token chunk, last of 850 slots",
+            spec=_rank_cell(False, (8192,), (True,), DEP4_SLOTS, (DEP4_SLOTS - 1,), True),
+        ),
     )
 
     note = """
@@ -844,8 +913,22 @@ class GdnPrefillConvPost(OpWrapper):
     the factor FlashInfer's kernel takes, bitwise the `torch.exp` the chunk
     op would otherwise launch.
 
+    This target (tp4, tep4, dep4) makes the same call per rank, from its
+    prefill GDN core: a tp4 or tep4 rank over its own `[T, 4120]` projection
+    (4 key / 12 value heads, conv dim 2560: its conv weight rows, its
+    `A_log`/`dt_bias` entries and its conv pool are the rank's shares), a dep4
+    rank over the whole `[T, 16480]` projection. The pool is the layer's view
+    of the stock manager's conv page, measured (`get_conv_states` at tp4,
+    tep4 and dep4 ranks, core config): one slot holds all 36 GDN layers'
+    `[C, 3]` states, so the view has strides `(36 * C * 3, 3, 1)` --
+    (276480, 3, 1) at C 2560, (1105920, 3, 1) at C 10240 -- and layer `i`
+    starts `i * C * 3` elements into the page. The target's forward does
+    not call this variant yet; the rank cells mirror tp1's call at the
+    rank's widths.
+
     Three launches. The conv pass (CuTe DSL, `_ConvPassKernel`): grid
-    `80 heads x cdiv(T, 64)`, 128 threads; a CTA copies its 67-row tile
+    `heads x cdiv(T, 64)` (80 heads at tp1 and dep4, 20 on a tp4/tep4
+    rank), 128 threads; a CTA copies its 67-row tile
     (3 history rows) of the head's 128 channels into shared memory with
     16-byte `cp.async`, then a thread slides the width-4 window over 16
     tokens of 4 channels, each element converted once; each thread finds its
@@ -879,6 +962,22 @@ class GdnPrefillConvPost(OpWrapper):
     64 tokens, some shorter than the window); and the target's call with
     `linear_gate` (3000 + 8192 + 5000 tokens, the middle one fresh).
 
+    Certified per rank, over the stock conv page's last-layer view at the
+    slot counts the stock engine bound at core's config (`TEP4_SLOTS` 1874,
+    `DEP4_SLOTS` 850; `TP4_SLOTS` is tep4's by bound), each also checked to
+    leave the page's other 35 layers untouched:
+      - 4 / 12 heads, stride 4120 (a tp4/tep4 rank, its own compile): a
+        fresh 8192-token context at the last slot and at slot 0 (with
+        `linear_gate`); 37 + 1 + 128 tokens carrying / fresh / carrying at
+        slots 1873, 0 and 937 (without).
+      - 16 / 48 heads, stride 16480 (a dep4 rank): two 512-token chunks, the
+        first carrying, at slots 849 and 425; one carrying 8192-token chunk
+        (max_num_tokens) at slot 849; both with `linear_gate`.
+    Against the reference at these cells: q/k/v differ by one bf16 ulp on
+    1.2e-5 to 1.3e-4 of elements (largest 1.6e-2, on v near 4), within
+    torch's default bf16 band; g and beta inside the fp32 band; conv pool
+    bitwise.
+
     A `pad_slot_id` context reads no carry and publishes nothing; its outputs
     are computed from a zero window (the unfused conv leaves those columns
     unconvolved instead -- nothing consumes either). The engine gives every
@@ -897,14 +996,30 @@ class GdnPrefillConvPost(OpWrapper):
     Not checked: `cache_indices` within the pool and distinct;
     `query_start_loc` non-decreasing and ending at `T`.
 
-    Not certified: fp16/fp32 activations, other head geometries, bias, a row
-    stride of `x` other than the projection's 16480 (the conv pass compiles one
-    kernel per row stride), zero-token contexts, `a + dt_bias` past the softplus
-    threshold on every head.
+    Compiled at first call, per `(num_k_heads, num_v_heads, head_k_dim, row
+    stride of x)` (`_CONV_PASS`): the conv pass by CuTe DSL (TVM-FFI entry,
+    `--opt-level 2`), the gates and publish by Triton. The cells ran both JIT
+    paths on sm_103 (GB300).
+
+    Not certified: fp16/fp32 activations; head geometries other than 16 / 48
+    and 4 / 12; bias; a row stride of `x` other than the projections' 16480
+    and 4120 (the conv pass compiles one kernel per row stride); zero-token
+    contexts; `a + dt_bias` past the softplus threshold on every head; pools
+    larger than the stock engine's core-config counts above (the dep4 kv_fp8,
+    kv_nvfp4, chunked and reuse variants and the MTP members were not
+    counted); tp4's own pool (never booted).
 
     Hard limits
       element offsets  64-bit for the rows of x and the outputs; weight and
         pool strides int32 (refused from 2^31)  not probed beyond 8192 tokens.
+      pool slot  the conv pass reads a carried column at
+        `slot * stride(0) + c * stride(1) + w * stride(2)` in int32 (its CuTe
+        pool layout has Int32 strides); the publish is 64-bit. On the stock
+        page that bounds the slot index at 1941 for 16 / 48 heads (stride
+        1105920) and 7767 for 4 / 12 (stride 276480). Measured at 16 / 48:
+        slot 1941 bitwise the reference, slot 1942 an illegal memory access
+        (loud, so not an `is_valid` guard). The core-config counts (850, 1874)
+        sit well inside; a pool past 1942 slots at dep4 is not.
     """
 
     def __call__(
