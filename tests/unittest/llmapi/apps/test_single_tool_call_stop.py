@@ -121,23 +121,41 @@ def test_the_stops_follow_the_request_stops_it_keeps_in_the_output():
     assert sampling_params.stop == ["END", *V41_STOPS]
 
 
-def test_the_stop_matches_the_tokens_the_model_writes():
+@pytest.mark.parametrize(
+    "model_name, tool_parser",
+    [
+        ("DeepSeek-V3.2-hf", "deepseek_v32"),
+        ("DeepSeek-V4-Flash", "deepseek_v4"),
+        ("DeepSeek-V4-Pro", "deepseek_v4"),
+        ("DeepSeek-V4.1-Flash", "deepseek_v41"),
+    ],
+)
+def test_the_stop_matches_the_tokens_the_model_writes(model_name, tool_parser):
     """Stops match token ids, and '>' plus the newline after it are one token.
 
-    So in the encoder's layout of DeepSeek-V4.1 tool calls the stop with the
+    So in each encoder's layout of DeepSeek tool calls the stop with the
     newline matches once per call, and the bare closing tag never does.
     """
     root = llm_models_root()
-    tokenizer_file = None if root is None else root / "DeepSeek-V4.1-Flash" / "tokenizer.json"
+    tokenizer_file = None if root is None else root / model_name / "tokenizer.json"
     if tokenizer_file is None or not tokenizer_file.is_file():
-        pytest.skip("DeepSeek-V4.1-Flash is not under LLM_MODELS_ROOT")
+        pytest.skip(f"{model_name} is not under LLM_MODELS_ROOT")
     from transformers import PreTrainedTokenizerFast
 
-    from tensorrt_llm.tokenizer.deepseek_v41 import encode_messages
+    from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+    from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
+    from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
+
+    tokenizer_class = {
+        "deepseek_v32": DeepseekV32Tokenizer,
+        "deepseek_v4": DeepseekV4Tokenizer,
+        "deepseek_v41": DeepseekV41Tokenizer,
+    }[tool_parser]
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_file))
     # The ids the engine matches: SamplingParams tokenizes its stop strings.
-    sampling_params = SamplingParams(stop=list(_single_tool_call_stops("deepseek_v41")))
+    stops = _single_tool_call_stops(tool_parser)
+    sampling_params = SamplingParams(stop=list(stops))
     sampling_params._setup(tokenizer, None, None)
     with_newline, bare = sampling_params._get_stop_words()
 
@@ -149,19 +167,20 @@ def test_the_stop_matches_the_tokens_the_model_writes():
         }
         for index, (name, arguments) in enumerate([("exec", {"cmd": "ls"}), ("wait", {"s": 2})])
     ]
-    prompt = encode_messages(
+    prompt = tokenizer_class(tokenizer).apply_chat_template(
         [
             {"role": "user", "content": "List the files, then wait."},
             {"role": "assistant", "content": "", "tool_calls": calls},
         ],
-        thinking_mode="chat",
+        thinking=False,
+        tokenize=False,
     )
     ids = tokenizer.encode(prompt, add_special_tokens=False)
 
     def matches(word):
         return sum(ids[i : i + len(word)] == word for i in range(len(ids)))
 
-    assert prompt.count(V41_STOPS[0]) == 2
+    assert prompt.count(stops[0]) == 2
     assert matches(with_newline) == 2
     assert matches(bare) == 0
 
@@ -319,20 +338,35 @@ def test_a_stop_the_request_lists_itself_keeps_its_stop_reason(monkeypatch, serv
     assert seen["postproc_args"].single_call_stops == V41_STOPS[1:]
 
 
-def test_anthropic_disable_parallel_tool_use_configures_the_stop(monkeypatch, server_logger):
-    server, seen = _chat_server(monkeypatch, "deepseek_v41")
+@pytest.mark.parametrize(
+    "tool_parser, stop_sequences, enforced",
+    [
+        ("deepseek_v41", [], True),
+        ("deepseek_v41", ["END"], False),
+        ("qwen3", [], False),
+        (None, [], False),
+    ],
+    ids=["supported", "own_stops_dropped", "format_without_stop", "no_tool_parser"],
+)
+def test_anthropic_disable_parallel_tool_use_configures_the_stop_when_possible(
+    monkeypatch, server_logger, tool_parser, stop_sequences, enforced
+):
+    server, seen = _chat_server(monkeypatch, tool_parser)
     request = AnthropicMessagesRequest(
         model=MODEL,
         max_tokens=64,
         messages=[{"role": "user", "content": "weather?"}],
         tools=[{"name": "get_weather", "input_schema": {"type": "object"}}],
         tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+        stop_sequences=stop_sequences,
     )
     response = asyncio.run(server.anthropic_messages(request, _raw_request()))
 
     assert response.status_code == 200, response.body
-    assert seen["sampling_params"].stop == list(V41_STOPS)
-    assert seen["postproc_args"].single_call_stops == V41_STOPS
+    assert seen["sampling_params"].stop == (list(V41_STOPS) if enforced else stop_sequences)
+    assert seen["sampling_params"].include_stop_str_in_output is enforced
+    assert seen["postproc_args"].single_call_stops == (V41_STOPS if enforced else ())
+    assert _warned(server_logger, "chat_parallel_tool_calls_unenforced") is not enforced
 
 
 # ---------------------------------------------------------------------------
