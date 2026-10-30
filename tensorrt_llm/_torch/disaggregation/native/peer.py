@@ -23,7 +23,7 @@ from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     BufferRuns,
     check_compatible,
     fan,
@@ -32,8 +32,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import 
     merge_runs,
     sent_bytes,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import PageLayout
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import ManagerLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 
 # (layer group index, pool index within the layer group's pool group)
 LGPoolKey = Tuple[int, int]
@@ -312,6 +312,6 @@ def _layout_of(page_table: Optional[ManagerLayout]) -> PageLayout:
     if page_table is None:
         raise ValueError(
             "PeerRegistrar: a rank info carries no page table; build it from the manager "
-            "(CacheLayoutAdapter.page_table)"
+            "(KVCacheManagerV2.get_page_table)"
         )
     return page_table.page_layout

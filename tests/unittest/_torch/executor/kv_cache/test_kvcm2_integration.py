@@ -2767,27 +2767,22 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     assert cold_group.stats.secondary_peak_evictable_num_blocks == 5
 
 
-def test_buffer_tensors_default_to_head_major():
+def test_page_buffer_tensors_default_to_head_major():
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import CacheLayoutAdapter
-    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import head_major
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-
-    class TwoOfFourHeads(CacheLayoutAdapter):
-        def kv_heads(self, layer):
-            return 2, 4
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major
 
     manager = object.__new__(KVCacheManagerV2)
     manager.mapping = SimpleNamespace(tp_size=2, tp_rank=0)
-    layout = TwoOfFourHeads(manager)
+    manager._page_kv_heads = lambda layer: (2, 4)
 
     # K/V default to the TRTLLM head-major layout, split by head over TP. An index-key side cache
     # spreads as its manager says (DSA and MiniMax M3 replicate it, a split one would not), so the
     # base declares none.
-    assert layout.buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
+    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
     with pytest.raises(ValueError, match="does not declare how its bytes spread"):
-        layout.buffer_tensors(0, Role.INDEX_KEY, 128, 16, False)
+        manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False)
 
 
 def test_disagg_request_rules_default_to_the_whole_prompt():
@@ -2796,20 +2791,17 @@ def test_disagg_request_rules_default_to_the_whole_prompt():
     after an import."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
-
     manager = object.__new__(KVCacheManagerV2)
     manager.kv_cache_map = {}
     manager.kv_cache_manager_py_config = SimpleNamespace(layers=[])
     request = SimpleNamespace(prompt_len=37, py_request_id=1)
-    layout = adapter_for(manager)
-    assert layout.transfer_length(request) == 37
-    assert layout.untransferred_buffers(request) == frozenset()
-    assert layout.sends_first_tokens(request)
-    assert layout.state_slot(request, 0) is None
-    assert not layout.model_has_recurrent_state
-    assert layout.pipelined_transfer_blocker() is None
-    assert layout.rebuild_imported([request]) is None
+    assert manager.disagg_transfer_length(request) == 37
+    assert manager.disagg_untransferred_buffers(request) == frozenset()
+    assert manager.disagg_sends_first_tokens(request)
+    assert manager.disagg_state_slot(request, 0) is None
+    assert not manager.model_has_recurrent_state
+    assert manager.disagg_pipelined_transfer_blocker() is None
+    assert manager.rebuild_disagg_imported_cache([request]) is None
 
 
 def _index_mapper_capacity_for(

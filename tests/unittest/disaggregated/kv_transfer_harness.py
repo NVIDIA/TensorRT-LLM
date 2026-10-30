@@ -38,7 +38,6 @@ import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -325,8 +324,8 @@ def assert_declared_layouts_reshard(
 
     Every context data-parallel group's layouts must fill every generation rank's pages.
     """
-    ctx = [adapter_for(m).page_table().page_layout for m in ctx_managers]
-    gen = [adapter_for(m).page_table().page_layout for m in gen_managers]
+    ctx = [m.get_page_table().page_layout for m in ctx_managers]
+    gen = [m.get_page_table().page_layout for m in gen_managers]
     for dp_rank in sorted({page.topology.dp_rank for page in ctx}):
         assert_layouts_reshard([page for page in ctx if page.topology.dp_rank == dp_rank], gen)
 
@@ -440,11 +439,10 @@ def run_kv_transfer_test(
         # (add_new_token changes is_first_context_chunk).
         #
         # Gen ranks take the disagg-gen-init path: prepare_disagg_gen_init
-        # sizes the cache for the full prompt and pre-declares as history
-        # the prompt tokens the layout adapter says a transfer brings,
-        # matching what the V2 scheduler's _try_schedule_disagg_gen_init
-        # does in production so the transceiver's TRANS_COMPLETE contract
-        # check is satisfied.
+        # sizes the cache for the full prompt and pre-declares
+        # history_length=prompt_len, matching what the V2 scheduler's
+        # _try_schedule_disagg_gen_init does in production so the
+        # transceiver's TRANS_COMPLETE contract check is satisfied.
         # Ctx ranks take the regular prefill path (prepare_context +
         # resize_context).
         gen_batches: Dict[int, ScheduledRequests] = {}
@@ -453,9 +451,8 @@ def run_kv_transfer_test(
             if reqs:
                 batch = ScheduledRequests()
                 batch.context_requests_last_chunk = reqs
-                layout = adapter_for(gen_managers[rank])
                 for req in reqs:
-                    gen_managers[rank].prepare_disagg_gen_init(req, layout.transfer_length(req))
+                    gen_managers[rank].prepare_disagg_gen_init(req)
                 gen_batches[rank] = batch
 
         ctx_batches: Dict[int, ScheduledRequests] = {}

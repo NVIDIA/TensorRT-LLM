@@ -27,7 +27,7 @@ from layout_test_utils import manager_layout
 
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
     LayerGroupDesc,
     PageLayout,

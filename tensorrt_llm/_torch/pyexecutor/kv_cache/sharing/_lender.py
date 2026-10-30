@@ -35,7 +35,7 @@ from cuda.bindings import runtime as cudart
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
-from ..cache_layout.page_layout import PageLayout
+from ..page_layout import PageLayout
 from . import _manager, _ranges
 from ._fetch_ledger import _FetchLedger
 from ._identity import Identity

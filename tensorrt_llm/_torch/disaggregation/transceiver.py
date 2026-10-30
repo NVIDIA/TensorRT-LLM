@@ -59,10 +59,6 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 from tensorrt_llm._torch.disaggregation.resource.utils import get_cache_kinds
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import (
-    CacheLayoutAdapter,
-    adapter_for,
-)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -257,8 +253,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._shutdown_complete = False
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
-        # What the manager's pages hold and what a transfer of a request moves.
-        self._layout: CacheLayoutAdapter = adapter_for(kv_cache_manager)
         self._mapping = mapping
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         if self.kv_transfer_timeout_ms is None:
@@ -533,14 +527,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         slot.
 
         How much of the prompt moves, which buffers the receiver rebuilds instead and which slot
-        holds the recurrent state are the manager's layout adapter's to say (``self._layout``).
+        holds the recurrent state are the cache manager's to say (its ``disagg_*`` methods).
         """
         adapter = self._reuse_adapter
-        layout = self._layout
+        manager = self._kv_cache_manager
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         kinds = get_cache_kinds(self._page_table)
-        transfer_len = layout.transfer_length(req)
+        transfer_len = manager.disagg_transfer_length(req)
         prompt_blocks = (transfer_len + tpb - 1) // tpb
 
         is_gen_only = req.is_generation_only_request
@@ -553,10 +547,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         groups = []
         for idx, kind in enumerate(kinds):
             if kind == CacheKind.STATE:
-                slot = layout.state_slot(req, idx)
+                slot = manager.disagg_state_slot(req, idx)
                 if slot is None:
                     raise RuntimeError(
-                        f"request {req.py_request_id}: the layout adapter names no slot of layer "
+                        f"request {req.py_request_id}: the cache manager names no slot of layer "
                         f"group {idx}'s recurrent state, which would then not move"
                     )
                 group = np.array([slot], dtype=np.int64)
@@ -573,7 +567,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             kind_per_layer_group=kinds,
             token_range=TokenRange(start=0, end=transfer_len),
             is_last=True,
-            excluded_buffers=layout.untransferred_buffers(req),
+            excluded_buffers=manager.disagg_untransferred_buffers(req),
         )
 
     @staticmethod
@@ -971,7 +965,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = get_unique_rid(req)
         assert rid is not None
         if self._need_aux_transfer(req):
-            session.pack_aux(req, with_tokens=self._layout.sends_first_tokens(req))
+            session.pack_aux(req, with_tokens=self._kv_cache_manager.disagg_sends_first_tokens(req))
             session.send_aux()
         req.context_phase_params = ContextPhaseParams(
             first_gen_tokens=[],
@@ -1472,7 +1466,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         fill-phase).
 
         """
-        prompt_len = self._layout.transfer_length(req)
+        prompt_len = self._kv_cache_manager.disagg_transfer_length(req)
         if not prompt_len or prompt_len <= 0:
             return
         history = self._kv_cache_manager.get_history_length(req)
@@ -1584,17 +1578,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"only cp_size == 1 or helix CP is supported"
             )
         # Under Helix only a rank's whole slice of the prompt stands for the whole prompt, so a
-        # manager whose adapter may move a part of it names no history the receiver could record.
+        # manager that may move a part of it, by its class or on itself, names no history the
+        # receiver could record.
+        transfer_length = getattr(self._kv_cache_manager, "disagg_transfer_length", None)
         if (
             self._mapping.cp_size != 1
             and self._mapping.has_cp_helix()
-            and type(self._layout).transfer_length is not CacheLayoutAdapter.transfer_length
+            and transfer_length is not None
+            and getattr(transfer_length, "__func__", None)
+            is not KVCacheManagerV2.disagg_transfer_length
         ):
             raise ValueError(
                 "KvCacheTransceiverV2: _check_compatible: "
                 f"{type(self._kv_cache_manager).__name__} may transfer part of a prompt "
-                f"({type(self._layout).__name__}.transfer_length), which Helix context "
-                "parallelism does not support"
+                "(disagg_transfer_length), which Helix context parallelism does not support"
             )
 
     def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:
@@ -1611,7 +1608,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"the Python bounce buffer (kv_cache_bounce_size_mb="
                 f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
             )
-        manager_blocker = self._layout.pipelined_transfer_blocker()
+        manager_blocker = self._kv_cache_manager.disagg_pipelined_transfer_blocker()
         if manager_blocker is not None:
             blockers.append(manager_blocker)
         # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees

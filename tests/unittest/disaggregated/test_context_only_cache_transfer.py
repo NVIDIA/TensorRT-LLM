@@ -18,8 +18,7 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import map_buffers
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -80,8 +79,7 @@ def _request(request_id: int, length: int, source: bool) -> LlmRequest:
 def _slice(manager: CSA2CacheManager, request: LlmRequest):
     transceiver = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
-    transceiver._layout = adapter_for(manager)
-    transceiver._page_table = transceiver._layout.page_table()
+    transceiver._page_table = manager.get_page_table()
     transceiver._reuse_adapter = create_cache_reuse_adapter(manager)
     return transceiver._create_chunk(request)
 
@@ -124,10 +122,7 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         assert source.prepare_context(source_request)
         # A zero-prefix request computes the full prompt but transfers no KV.
         assert source.resize_context(source_request, prefix or length)
-        # The prompt tokens the transfer brings, as the V2 scheduler passes them.
-        assert target.prepare_disagg_gen_init(
-            target_request, adapter_for(target).transfer_length(target_request)
-        )
+        assert target.prepare_disagg_gen_init(target_request)
         source._stream.synchronize()
         target._stream.synchronize()
         for layer, role, buffers, pages in _physical_pages(source, source_request):

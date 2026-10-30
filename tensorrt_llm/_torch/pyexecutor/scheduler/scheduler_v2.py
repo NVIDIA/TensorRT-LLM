@@ -843,12 +843,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Cache-transceiver mode disables the separate one-model draft manager,
         # so disagg generation init has no paired-reuse path. Supporting one
         # would also require draft KV transfer and history_length=prompt_len.
-        # The manager imports the scheduler, so its layout adapter is imported here.
-        from ..kv_cache.cache_layout.adapter import adapter_for
-
-        layout = adapter_for(self.kv_cache_manager)
-        transfer_length = None if layout is None else layout.transfer_length(req)
-        if not self.kv_cache_manager.prepare_disagg_gen_init(req, transfer_length):
+        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0

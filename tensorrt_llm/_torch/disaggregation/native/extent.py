@@ -77,7 +77,7 @@ class Chunk:
 
     excluded_buffers: FrozenSet[Tuple[int, str]] = frozenset()
     """Buffers, as (global layer id, role), this transfer leaves for the receiver to rebuild
-    (``CacheLayoutAdapter.untransferred_buffers``)."""
+    (``KVCacheManagerV2.disagg_untransferred_buffers``)."""
 
     def __post_init__(self):
         if len(self.kind_per_layer_group) != len(self.block_ids_per_layer_groups):

@@ -450,7 +450,7 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
                 f"model layer {model}'s {role} buffers are transferred by one rank only, as a "
                 "cache attached by what a pipeline stage holds or a role one peer lacks is; only "
                 "a rank rebuilding them per request, as CSA2's replay does "
-                "(CacheLayoutAdapter.request_rebuilt_roles), may hold them alone"
+                "(_page_request_rebuilt_roles), may hold them alone"
             )
     if paged and a.tokens_per_page != b.tokens_per_page:
         problems.append(f"pages of {a.tokens_per_page} tokens against {b.tokens_per_page}")

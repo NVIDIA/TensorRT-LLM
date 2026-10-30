@@ -11,6 +11,7 @@ import torch
 
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_bf16_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.logger import logger
@@ -26,6 +27,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from .config import (
@@ -210,10 +212,19 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_mla_v_packed_pool_base",
             "get_mla_v_packed_page_offset",
             "get_fp4_mla_hp_pool",
+            "rebuild_disagg_imported_cache",
+            "_model_layers_and_tails",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
         )
-        for method_name in method_names:
+        # Every page-table hook the policy declares, so that one it adds is never left to the
+        # manager's default.
+        page_hooks = tuple(
+            name
+            for name in vars(Fp4MlaV2CacheLayoutPolicy)
+            if name.startswith(("_page_", "disagg_"))
+        )
+        for method_name in method_names + page_hooks:
             method = getattr(Fp4MlaV2CacheLayoutPolicy, method_name)
             setattr(manager, method_name, MethodType(method, manager))
 
@@ -923,6 +934,68 @@ class Fp4MlaV2CacheLayoutPolicy:
                 * self.head_dim_per_layer[self._fp4_mla_compact_to_local[0]],
             ),
         ).permute(1, 0, 2, 3)
+
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> tuple[Tensor, ...]:
+        """Latents token-major by head, as the FP4 MLA kernels write them; the high-precision
+        tail alike on every rank."""
+        if role == Role.MLA_HP_TAIL:
+            return replicated(size)
+        return self._page_head_split(layer_id, size, tokens, state, token_major_=True)
+
+    def _page_derived_roles(self) -> frozenset[str]:
+        """V scales and packed V derive from K and K scales; the generation worker rebuilds them
+        locally in rebuild_disagg_imported_cache."""
+        return frozenset((str(Role.MLA_V_SCALE), str(Role.MLA_V_PACKED)))
+
+    def rebuild_disagg_imported_cache(self, requests: Iterable["LlmRequest"]) -> None:
+        """Rebuild the derived V sidecars of requests whose prompt KV was imported."""
+        from .v_cache import rebuild_fp4_mla_disagg_imported_cache
+
+        requests = list(requests)
+        rebuild_fp4_mla_disagg_imported_cache(
+            self,
+            [request.py_request_id for request in requests],
+            [request.prompt_len for request in requests],
+        )
+
+    def _model_layers_and_tails(self, layer_group_id: int) -> list[tuple[int, bool]]:
+        """Per internal layer of the layer group, its model layer and whether it holds that
+        layer's high-precision tail."""
+        local_layer_ids = list(self.impl.layer_grouping[layer_group_id])
+        cache_local = {
+            int(layer_id): self._fp4_mla_compact_to_local[compact_layer]
+            for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids)
+        }
+        cache_local.update(
+            {int(layer_id): int(layer_id) for layer_id in self._bf16_mla_manager_layer_ids}
+        )
+        hp_local = {
+            int(layer_id): self._fp4_mla_compact_to_local[compact_layer]
+            for compact_layer, layer_id in enumerate(self._hp_manager_layer_ids)
+        }
+        result = []
+        for layer_id in local_layer_ids:
+            internal_layer = int(layer_id)
+            if internal_layer in cache_local:
+                result.append((int(self.pp_layers[cache_local[internal_layer]]), False))
+            elif internal_layer in hp_local:
+                result.append((int(self.pp_layers[hp_local[internal_layer]]), True))
+            else:
+                raise ValueError(f"Unknown FP4 MLA V2 internal layer {internal_layer}.")
+        return result
+
+    def _page_layer_ids(self) -> dict[int, tuple[int, int]]:
+        """A model layer's cache and its high-precision tail are two internal layers: global
+        layers ``2 * m`` and ``2 * m + 1``, both of model layer ``m``."""
+        layer_ids = {}
+        for layer_group_id, layers in enumerate(self.impl.layer_grouping):
+            for layer, (model_layer, tail) in zip(
+                layers, self._model_layers_and_tails(layer_group_id)
+            ):
+                layer_ids[int(layer)] = (2 * model_layer + int(tail), model_layer)
+        return layer_ids
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[list[int], list[Optional[int]]]:
         fp4_local_layers = self._fp4_mla_local_layer_indices()

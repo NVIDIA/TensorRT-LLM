@@ -46,7 +46,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
@@ -995,7 +994,7 @@ def test_fp4_mla_disagg_import_rebuild_matches_context_cache_update(
         v_scale.zero_()
         if v_packed is not None:
             v_packed.zero_()
-        adapter_for(manager).rebuild_imported(
+        manager.rebuild_disagg_imported_cache(
             [
                 SimpleNamespace(py_request_id=request_id, prompt_len=seq_len)
                 for request_id, seq_len in enumerate(seq_lens)

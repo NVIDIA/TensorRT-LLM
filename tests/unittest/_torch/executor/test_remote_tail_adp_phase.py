@@ -212,8 +212,7 @@ def test_frozen_phase_filters_before_kv_work_and_keeps_transfer_admission(
     assert result.context_requests == expected_contexts
     assert result.generation_requests == expected_generations
     assert result.fitting_disagg_gen_init_requests == [transfer]
-    # A stand-in manager has no layout adapter to name a transfer length: the whole prompt.
-    manager.prepare_disagg_gen_init.assert_called_once_with(transfer, None)
+    manager.prepare_disagg_gen_init.assert_called_once_with(transfer)
     deferred = [late_context, late_generation]
     if not expected_contexts:
         deferred.append(context)

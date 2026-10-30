@@ -22,7 +22,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from ..cache_layout.page_layout import ShardDesc
+from ..page_layout import ShardDesc
 from ._layout import canonical_order
 
 KEY_FORMAT_VERSION = 2

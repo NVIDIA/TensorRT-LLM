@@ -61,7 +61,6 @@ from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
@@ -412,11 +411,9 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     transceiver._kv_cache_manager = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         num_extra_kv_tokens=0,
-    )
-    transceiver._layout = SimpleNamespace(
-        transfer_length=lambda req: req.prompt_len,
-        untransferred_buffers=lambda req: frozenset(),
-        state_slot=lambda req, layer_group: None,
+        disagg_transfer_length=lambda req: req.prompt_len,
+        disagg_untransferred_buffers=lambda req: frozenset(),
+        disagg_state_slot=lambda req, layer_group: None,
     )
     transceiver._send_reqs = {}
 
@@ -607,7 +604,7 @@ def create_transfer_worker_setup(
         )
         # V2: Initialize pools using page_table
         random_seed = 0 if is_mla else None
-        page_table = adapter_for(ctx_kv_cache_manager).page_table()
+        page_table = ctx_kv_cache_manager.get_page_table()
 
         # Collect unique pools (deduplicate by base address)
         unique_pools = {}  # base address -> pool_bytes
@@ -690,7 +687,7 @@ def create_transfer_worker_setup(
             vocab_size=vocab_size,
         )
         # Initialize gen pool to zeros to verify transfer correctness
-        gen_page_table = adapter_for(gen_kv_cache_manager).page_table()
+        gen_page_table = gen_kv_cache_manager.get_page_table()
         gen_unique_pools = {}
         for pools in gen_page_table.device_pools.values():
             for pool_desc in pools:

@@ -543,7 +543,7 @@ The FMHA package is split by role:
   serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
-  (`CacheLayoutAdapter.rebuild_imported`).
+  (`rebuild_disagg_imported_cache`).
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through

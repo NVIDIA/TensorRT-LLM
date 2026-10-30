@@ -26,11 +26,8 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 
-from ..cache_layout.page_layout import BufferDesc, PageLayout, replicated
-from ..cache_layout.page_table import (  # noqa: F401  DevicePool: the lender's pools
-    DevicePool,
-    ManagerLayout,
-)
+from ..page_layout import BufferDesc, PageLayout, replicated
+from ..page_table import DevicePool, ManagerLayout  # noqa: F401  DevicePool: the lender's pools
 
 if TYPE_CHECKING:
     from ..kv_cache_manager_v2 import KVCacheManagerV2
@@ -182,11 +179,10 @@ def layout_id(layout: PageLayout) -> bytes:
 
 
 def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
-    """The manager's page table (``CacheLayoutAdapter.page_table``), as a lender reads it: buffers
-    the importer rebuilds after a native import travel too, since lending invokes no rebuild."""
-    from ..cache_layout.adapter import adapter_for
-
-    table = adapter_for(manager).page_table()
+    """The page table the manager builds (``KVCacheManagerV2.get_page_table``), as a lender
+    reads it: buffers the manager rebuilds after a native import travel too, since lending invokes
+    no rebuild."""
+    table = manager.get_page_table()
     layout = table.page_layout
     if not layout.rebuilds_untransferred:
         return table

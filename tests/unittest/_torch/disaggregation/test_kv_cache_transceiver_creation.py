@@ -30,11 +30,6 @@ from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as transceiv
 from tensorrt_llm._torch.disaggregation.native.rank_info import manager_page_table
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout import adapter as layout_adapter
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import (
-    CacheLayoutAdapter,
-    adapter_for,
-)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
@@ -73,27 +68,13 @@ def test_python_runtime_rejects_non_helix_cp_at_creation() -> None:
         )
 
 
-def test_python_runtime_refuses_a_partial_transfer_under_helix(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_python_runtime_refuses_a_partial_transfer_under_helix() -> None:
     """Under Helix a transfer moves each rank's whole slice of the prompt, which stands for the
-    whole prompt; a manager whose layout adapter may move part of it is refused at creation, not
-    per request."""
-
-    class MovesPartAdapter(CacheLayoutAdapter):
-        def transfer_length(self, request):
-            return 1
+    whole prompt; a manager that may move part of it is refused at creation, not per request."""
 
     class MovesPart(KVCacheManagerV2):
-        pass
-
-    class MovesPartPolicy:
-        pass
-
-    for cls in (MovesPart, MovesPartPolicy):
-        monkeypatch.setitem(
-            layout_adapter._ADAPTERS, f"{cls.__module__}.{cls.__qualname__}", MovesPartAdapter
-        )
+        def disagg_transfer_length(self, request):
+            return 1
 
     # What the constructor reads before its compatibility check.
     config = SimpleNamespace(
@@ -107,16 +88,14 @@ def test_python_runtime_refuses_a_partial_transfer_under_helix(
 
     with pytest.raises(ValueError, match="may transfer part of a prompt"):
         KvCacheTransceiverV2(mapping, Mock(), object.__new__(MovesPart), config)
-    # An adapter chosen for the manager itself, by the layout policy installed on it, counts as
-    # one of its class.
+    # An override bound on the manager itself counts as one on its class.
     manager = object.__new__(KVCacheManagerV2)
-    manager._attention_cache_layout_policy = MovesPartPolicy
+    manager.disagg_transfer_length = lambda request: 1
     with pytest.raises(ValueError, match="may transfer part of a prompt"):
         KvCacheTransceiverV2(mapping, Mock(), manager, config)
-    # The whole prompt the base manager's adapter moves passes.
-    manager = object.__new__(KVCacheManagerV2)
+    # The whole prompt the base manager moves passes.
     KvCacheTransceiverV2._check_compatible(
-        SimpleNamespace(_mapping=mapping, _kv_cache_manager=manager, _layout=adapter_for(manager))
+        SimpleNamespace(_mapping=mapping, _kv_cache_manager=object.__new__(KVCacheManagerV2))
     )
 
 

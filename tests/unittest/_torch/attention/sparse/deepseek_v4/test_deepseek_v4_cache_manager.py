@@ -36,7 +36,6 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_q
     Nvfp4ColdPageQuantizationCompression,
 )
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -1922,7 +1921,7 @@ class TestDeepseekV4CacheManager:
         )
 
         try:
-            page_table = adapter_for(cache_manager).page_table()
+            page_table = cache_manager.get_page_table()
             transferred = [b for b in page_table.page_layout.buffers if b.transferred]
             assert transferred
             for buffer in transferred:

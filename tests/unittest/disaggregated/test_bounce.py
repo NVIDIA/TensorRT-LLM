@@ -42,11 +42,8 @@ try:
 except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
     _HAVE_TRANSPORT = False
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import (
-    map_buffers,
-    sent_bytes,
-)
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers, sent_bytes
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
     LayerGroupDesc,
     PageLayout,
@@ -55,7 +52,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
     head_major,
     sectioned,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import ManagerLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 
 _MIB = 1024 * 1024
 

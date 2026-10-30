@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _fill_kv_pages,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1477,6 +1478,24 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # The generic layers in the base config are replaced by
         # _build_cache_config, so their buffer sizes are only placeholders.
         return 1
+
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> Tuple[Tensor, ...]:
+        """The cache of each attention type and the compressed cache's block scales hold MLA
+        latents of one KV head, which every tensor rank holds: split by head as the base manager
+        splits K/V. The padding pages never move (``_page_untransferred_roles``)."""
+        if role == COMPRESS_BLOCK_SCALE_ROLE or role in _ATTENTION_TYPE_ROLES:
+            return self._page_head_split(layer_id, size, tokens, state)
+        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
+
+    def _page_untransferred_roles(self) -> frozenset[str]:
+        """Storage-only NVFP4 alignment pages, which hold no state a peer needs."""
+        return frozenset(str(role) for role in self._disagg_ignored_roles)
+
+    def _page_quant_mode(self) -> Optional[str]:
+        """``"fp8_ds_mla"`` for FP8 pages carrying their own scales."""
+        return "fp8_ds_mla" if self.use_fp8_ds_mla else super()._page_quant_mode()
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """

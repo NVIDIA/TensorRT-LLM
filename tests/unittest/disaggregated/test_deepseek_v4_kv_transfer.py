@@ -45,7 +45,6 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
     get_transferred_pool_indices,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -146,7 +145,7 @@ def _init_pool_data(
     initialized_devices = set()
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
-        page_table = adapter_for(mgr).page_table()
+        page_table = mgr.get_page_table()
 
         # Collect unique pools (deduplicate by base address)
         unique_pools: Dict[int, int] = {}

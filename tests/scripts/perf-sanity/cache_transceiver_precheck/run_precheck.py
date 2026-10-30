@@ -243,7 +243,6 @@ def load_internal_apis():
     from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
     from tensorrt_llm._torch.pyexecutor.config_utils import resolve_cache_transceiver_config
     from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
-    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import (
         LlmRequest,
@@ -277,7 +276,6 @@ def load_internal_apis():
         HangDetector=HangDetector,
         KVCacheManager=KVCacheManager,
         KVCacheManagerV2=KVCacheManagerV2,
-        adapter_for=adapter_for,
         create_kv_cache_transceiver=create_kv_cache_transceiver,
         LlmRequest=LlmRequest,
         LlmRequestState=LlmRequestState,
@@ -549,11 +547,7 @@ def add_sequence(kvm, req, prompt_len, use_v2):
     """Allocate KV blocks (mirrors the cache_transceiver_test harness)."""
     if use_v2:
         if req.is_disagg_generation_init_state:
-            # As the V2 scheduler does: the history is the prompt tokens the transfer brings,
-            # which the manager's layout adapter names.
-            layout = load_internal_apis().adapter_for(kvm)
-            transfer_length = None if layout is None else layout.transfer_length(req)
-            ok = kvm.prepare_disagg_gen_init(req, transfer_length)
+            ok = kvm.prepare_disagg_gen_init(req)
         else:
             ok = kvm.prepare_context(req) and kvm.resize_context(req, prompt_len)
         if not ok:

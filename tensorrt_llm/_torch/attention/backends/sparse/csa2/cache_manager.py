@@ -23,6 +23,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _estimate_swa_cache_size,
     _fill_kv_pages,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -1094,6 +1095,42 @@ class CSA2CacheManager(KVCacheManagerV2):
             )
             for size, window in zip(sizes, windows)
         )
+
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> tuple[Tensor, ...]:
+        """Every CSA2 cache holds the same bytes on every rank."""
+        return replicated(size)
+
+    def disagg_transfer_length(self, request) -> int:
+        """Under remote-tail replay the generation worker recomputes the prompt from the remote
+        tail's start, so the transfer moves the pages before it."""
+        start = getattr(request, "py_csa2_remote_tail_start", None)
+        return request.prompt_len if start is None else start
+
+    def _page_request_rebuilt_roles(self) -> frozenset[str]:
+        """Under bounded replay on generation the generation worker rebuilds the sliding-window
+        caches past a request's split, which a context-only worker keeps none of."""
+        if getattr(self, "bounded_replay_on_generation", False):
+            return frozenset({str(CSA2CacheRole.SWA.role)})
+        return frozenset()
+
+    def disagg_untransferred_buffers(self, request) -> frozenset[tuple[int, str]]:
+        """Under remote-tail replay the generation worker rebuilds the sliding-window caches of the
+        decoder and draft layers (model layers from the split on), so the transfer leaves them."""
+        split = getattr(request, "py_csa2_remote_tail_split", None)
+        if split is None:
+            return frozenset()
+        global_of = {lid: ids[0] for lid, ids in self._page_layer_ids().items()}
+        return frozenset(
+            (global_of[int(layer_id)], str(role))
+            for (layer_id, role), (model_layer, _ratio, cache_role) in self._physical_roles.items()
+            if cache_role == CSA2CacheRole.SWA and model_layer >= split
+        )
+
+    def disagg_sends_first_tokens(self, request) -> bool:
+        """A remote-tail source sends no first tokens: the destination generates them."""
+        return getattr(request, "py_csa2_remote_tail_mode", None) != "source"
 
     def _fill_fresh_kv_pages(self, request_id: int) -> None:
         """Fill actual CSA2 buffers without treating model IDs as physical IDs.

@@ -23,7 +23,6 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     ALL_ARRIVED,
     LeaseView,
@@ -389,12 +388,10 @@ def generate(mgr, request, token=7):
     mgr.update_resources(batch)
 
 
-def receiving(kit, mgr, request_id, tokens, prepare=False, transfer_length=None, **attributes):
-    """A generation-init request of ``tokens`` with ``attributes``, admitted to receive the prompt
-    tokens a transfer of it brings, ``transfer_length`` or, as the scheduler admits it, those the
-    manager's adapter names, and the event a receive into it waits for: the admission's, or with
-    ``prepare`` one recorded after the preparation a hybrid manager's executor makes, which resets
-    its state slots."""
+def receiving(kit, mgr, request_id, tokens, prepare=False, **attributes):
+    """A generation-init request of ``tokens`` with ``attributes``, admitted to receive them, and
+    the event a receive into it waits for: the admission's, or with ``prepare`` one recorded after
+    the preparation a hybrid manager's executor makes, which resets its state slots."""
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestType
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
@@ -403,9 +400,7 @@ def receiving(kit, mgr, request_id, tokens, prepare=False, transfer_length=None,
     )
     for name, value in attributes.items():
         setattr(request, name, value)
-    if transfer_length is None:
-        transfer_length = adapter_for(mgr).transfer_length(request)
-    assert mgr.prepare_disagg_gen_init(request, transfer_length)
+    assert mgr.prepare_disagg_gen_init(request)
     if not prepare:
         return request, mgr.take_disagg_receive_ready(request)
     batch = ScheduledRequests()
@@ -1775,9 +1770,7 @@ def test_a_receive_may_end_at_a_remote_tail_s_start_and_resumes_no_further(kit, 
     tail = 2 * TPB + 6
     with real_manager(enable_block_reuse=False) as mgr:
         lender = attach(mgr)
-        request, admitted = receiving(
-            kit, mgr, TARGET, PROMPT, transfer_length=tail, py_csa2_remote_tail_start=tail
-        )
+        request, admitted = receiving(kit, mgr, TARGET, PROMPT, py_csa2_remote_tail_start=tail)
         kv = kit.kv(mgr, request)
         assert kv.history_length == tail, f"the cache declares {kv.history_length} tokens"
         keywords = {**kit.DEVICE_ALL, "ready_event": admitted}
@@ -2785,7 +2778,7 @@ def test_a_state_group_s_regions_are_the_pools_native_names_and_its_row_the_stat
         lender = attach(mgr)
         assert kit.staging_regions(lender) == ()
         lg = state_group(mgr)
-        page_table = adapter_for(mgr).page_table()
+        page_table = mgr.get_page_table()
         native = page_table.page_layout.layer_groups[lg]
         assert native.kind == "state"
         pools = sorted(page_table.device_pools[native.pool_group], key=lambda p: int(p.base))
@@ -3233,7 +3226,7 @@ def test_a_csa2_receive_of_every_row_lends_each_group_what_native_receives(
         assert lease.failure is None, lease.failure
         view = kit.ready_view(lease, mgr)
         lent = {run.layer_group_index: run.page_ordinals.tolist() for run in view.groups}
-        groups = adapter_for(mgr).page_table().page_layout.layer_groups
+        groups = mgr.get_page_table().page_layout.layer_groups
         cached = _CacheReuseAdapterV2(mgr).get_cached_token_count_per_layer_group(
             target, len(groups)
         )
@@ -3282,7 +3275,7 @@ def test_a_csa2_remote_tail_source_lends_what_native_sends_once_its_context_is_c
         lent = {run.layer_group_index: run.page_ordinals.tolist() for run in view.groups}
         native = {
             lg: kept_page_ordinals(group.kept_window, tail, tpb)
-            for lg, group in enumerate(adapter_for(mgr).page_table().page_layout.layer_groups)
+            for lg, group in enumerate(mgr.get_page_table().page_layout.layer_groups)
         }
         assert lent == native, (lent, native)
         windowed = [

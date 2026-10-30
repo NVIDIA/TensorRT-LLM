@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -94,6 +95,14 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets
         }
+
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> tuple[Tensor, ...]:
+        """The indexer rows are as wide on every tensor rank and hold the same bytes."""
+        if role == Role.INDEX_KEY:
+            return replicated(size)
+        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
         index_bytes = (
