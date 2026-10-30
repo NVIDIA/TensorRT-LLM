@@ -220,6 +220,12 @@ class Distributed(ABC):
     # override ``broadcast_or_none`` with a single collective round.
     supports_single_round_broadcast = False
 
+    # Transports whose ranks are separate host processes and whose object
+    # collectives and point-to-point sends can carry shared-memory and CUDA
+    # IPC handles set this, so ranks on the sender's host can map request
+    # tensors instead of receiving copies (MPIDist).
+    supports_local_tensor_handles = False
+
     def broadcast_or_none(self, obj, root=0):
         """Broadcast ``obj`` from ``root``; ``None`` on the root means "nothing".
 
@@ -351,6 +357,14 @@ class Distributed(ABC):
                           dtype=np.int64)
 
 
+class SerializationError(RuntimeError):
+    """Raised on the root rank when a broadcast payload cannot be pickled.
+
+    The root raises this before any payload bytes leave the rank, after it has
+    told the other ranks to abort the broadcast.
+    """
+
+
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     """
     Safely broadcasts potentially large objects by splitting into fixed-size chunks,
@@ -388,7 +402,7 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
             # Signal failure to all ranks, then raise
             header[:] = (0, 0, 0)
             comm.Bcast([header, MPI.INT64_T], root=root)
-            raise RuntimeError(f"Serialization failed: {str(e)}") from e
+            raise SerializationError(f"Serialization failed: {str(e)}") from e
     else:
         serialized = None  # not used on non-root before Bcast
 
@@ -760,6 +774,7 @@ def safe_allgather(
 
 class MPIDist(Distributed):
     tp_comm: MPI.Comm
+    supports_local_tensor_handles = True
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
