@@ -1372,6 +1372,7 @@ class _Prefixes:
     mla_prepare_scheduler_buffers = TrtllmAttentionMetadata.mla_prepare_scheduler_buffers
     mla_prepare_ctx_cu_seqlens = TrtllmAttentionMetadata.mla_prepare_ctx_cu_seqlens
     _invalidate_mla_scheduler_buffers = TrtllmAttentionMetadata._invalidate_mla_scheduler_buffers
+    _fp4_mla_states = TrtllmAttentionMetadata._fp4_mla_states
     on_update_kv_lens = TrtllmAttentionMetadata.on_update_kv_lens
     update_for_spec_dec = TrtllmAttentionMetadata.update_for_spec_dec
 
