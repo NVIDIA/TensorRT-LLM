@@ -6073,21 +6073,28 @@ class KVCacheManagerV2(BaseResourceManager):
                 history = None
                 if not self._mirror_uses_draft_view:
                     if req.is_disagg_generation_init_state:
-                        # The transferred prompt KV is the target's only. The
-                        # drafter (DFlash/DSpark: the only separate draft pool a
-                        # disaggregated worker keeps) starts this request on a
-                        # fresh slot at context length 0 and addresses its own
-                        # writes and reads from there, so the mirror is sized in
-                        # those slot-local positions: no page for the prompt.
-                        capacity = draft_len + self.num_extra_kv_tokens
+                        # The transferred prompt KV is the target's only, so
+                        # the mirror holds no drafter K/V below the prompt end.
+                        # The mirror and the drafter share absolute positions:
+                        # the drafter (DFlash/DSpark, the only separate draft
+                        # pool a disaggregated worker keeps) seeds this
+                        # request's slot at the prompt end and reads nothing
+                        # below it (DFlashSpecMetadata.prepare). The whole
+                        # prompt is therefore history, which a sliding window
+                        # trims to its tail plus the generation headroom, and
+                        # which update_resources keeps advancing absolutely.
+                        history = max(
+                            kv_cache.history_length,
+                            req.context_current_position + req.context_chunk_size,
+                        )
                     elif kv_cache.capacity >= req.context_current_position:
                         # The chunk start is history for a mirror that already
                         # holds [0, chunk start): sliding-window layers keep
                         # pages only from history + 1 - window (AttnLifeCycle::
                         # getStaleRange), so the mirror holds its window plus
                         # the chunk in flight rather than the whole prompt so
-                        # far. A mirror first seen past position 0 is not one:
-                        # its drafter slot stores that chunk from 0.
+                        # far. A mirror first seen past position 0 is not one
+                        # and keeps its history, i.e. pages from 0.
                         history = max(kv_cache.history_length, req.context_current_position)
                 if not kv_cache.resize(capacity, history):
                     raise self._mirror_resize_error(req, "context", capacity)

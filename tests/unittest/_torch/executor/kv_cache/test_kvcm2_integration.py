@@ -44,7 +44,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -1851,10 +1851,10 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
         # reads position 0 with the whole prompt as its (last) chunk, and the
         # resize keeps the cache's history.
         pytest.param(True, False, 8192, 8192, 0, (10243, None), id="draft_view"),
-        # Disaggregated generation init: the drafter starts a fresh slot at
-        # context length 0, so the mirror holds no page for the transferred
-        # prompt (10240 tokens), only the draft headroom.
-        pytest.param(False, True, 0, 0, 0, (3, None), id="disagg_gen_init-target_view"),
+        # Disaggregated generation init: the mirror holds no drafter K/V for
+        # the transferred prompt (10240 tokens), so the whole prompt is
+        # history; the capacity stays absolute, as the drafter's positions.
+        pytest.param(False, True, 0, 0, 0, (10243, 10240), id="disagg_gen_init-target_view"),
         pytest.param(True, True, 0, 0, 0, (10243, None), id="disagg_gen_init-draft_view"),
     ],
 )
@@ -2292,8 +2292,8 @@ class _PoolBoundDFlashDraftModel:
     def _get_attention_mask_args(self, layer_idx: int) -> tuple:
         return True, (-1, -1)
 
-    def validate_block_attention_windows(self) -> None:
-        pass
+    def validate_block_attention_windows(self) -> frozenset:
+        return frozenset()
 
     def project_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states
@@ -2311,32 +2311,15 @@ class _PoolBoundDFlashDraftModel:
         return k, k.clone()
 
 
-def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A disaggregated generation worker receives a prompt far larger than its
-    sliding-window draft pool. The mirror must fit, and the drafter's first
-    generation step -- a fresh slot that stores the accepted tokens' context
-    K/V from position 0, then appends its block -- must write only pages its
-    own mirror holds, never one another request owns."""
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    torch.cuda.init()
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
-        lambda **kwargs: None,
-    )
-    num_layers, num_kv_heads, head_dim, hidden = 2, 1, 64, 8
-    window, prompt, occupant_prompt, max_draft_len = 256, 65536, 512, 3
+def _disagg_draft_fixture(
+    spec: DFlashDecodingConfig, prompt: int, occupant_prompt: int, window: int
+) -> tuple[KVCacheManagerV2, LlmRequest, LlmRequest]:
+    """A sliding-window draft pool with room for 8192 tokens (two layers, one
+    KV head of 64, bf16), an occupant that prefilled ``occupant_prompt``
+    tokens on it, and a request in disaggregated generation init whose
+    transferred prompt is ``prompt`` tokens."""
+    num_layers, num_kv_heads, head_dim = 2, 1, 64
     bytes_per_token = num_layers * 2 * num_kv_heads * head_dim * 2
-    spec = DFlashDecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model="draft",
-        attention_backend="TRTLLM",
-        mask_token_id=0,
-    )
-    # Room for 8192 tokens: the occupant and a windowed mirror fit, a mirror
-    # of the whole transferred prompt does not.
     draft = _small_spec_manager(
         spec,
         True,
@@ -2358,29 +2341,105 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
     occupant.context_chunk_size = occupant_prompt
     request = LlmRequest(
         request_id=2,
-        max_new_tokens=8,
+        max_new_tokens=64,
         input_tokens=[1] * prompt,
         sampling_config=SamplingConfig(1),
         is_streaming=False,
-        draft_tokens=[1] * max_draft_len,
+        draft_tokens=[1] * spec.max_draft_len,
     )
     request.state = LlmRequestState.DISAGG_GENERATION_INIT
+    return draft, occupant, request
+
+
+def _disagg_generation_step(draft: KVCacheManagerV2, request: LlmRequest) -> None:
+    """One executor generation step on the draft manager: grow the mirror,
+    then the post-forward update_resources (nothing accepted, one token)."""
+    batch = ScheduledRequests()
+    batch.generation_requests.append(request)
+    draft._prepare_draft_resources(batch)
+    request.py_num_accepted_draft_tokens = 0
+    request.py_rewind_len = 0
+    draft.update_resources(batch)
+    request.add_new_token(1, 0)
+
+
+def test_gen_init_draft_mirror_survives_generation_updates() -> None:
+    """A disaggregated generation worker's draft mirror for a prompt far
+    larger than its sliding-window pool fits at generation init and stays
+    consistent through generation steps, including update_resources, which
+    advances the history in absolute positions: the history follows the
+    request and the pages from the prompt end up to the capacity stay
+    backed."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=3, speculative_model="draft")
+    prompt, page = 65536, 32
+    draft, occupant, request = _disagg_draft_fixture(spec, prompt, 512, window=256)
+    try:
+        for req in (occupant, request):
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk.append(req)
+            draft._prepare_draft_resources(batch)
+        cache = draft.kv_cache_map[request.py_request_id]
+        # The context worker's first token arrives with the transferred KV.
+        request.add_new_token(1, 0)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        for _ in range(3):
+            _disagg_generation_step(draft, request)
+            assert cache.history_length == request.max_beam_num_tokens - 2
+            assert set(range(prompt // page, -(-cache.capacity // page))) <= _backed_ordinals(cache)
+        draft.free_resources(request)
+        draft.free_resources(occupant)
+    finally:
+        draft.shutdown()
+
+
+@pytest.mark.parametrize("slot_loss", [False, True], ids=["first_step", "slot_loss"])
+@pytest.mark.parametrize("reuse_addressable", [False, True], ids=["unpaired", "reuse_addressable"])
+def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
+    monkeypatch: pytest.MonkeyPatch, reuse_addressable: bool, slot_loss: bool
+) -> None:
+    """A disaggregated generation worker receives a prompt far larger than its
+    sliding-window draft pool, while another request owns the pool's low
+    pages. After generation steps (update_resources included), the drafter's
+    step -- DFlashSpecMetadata.prepare() assigning the request a fresh slot,
+    the context K/V store of the accepted tokens, the block decode's read and
+    its block append -- must address only pages the request's own mirror
+    holds. The slot is seeded on the page holding the request's absolute
+    position and reads only what it stored, whether or not the pool joins
+    block reuse, and again after the request loses its slot and comes back."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
+        lambda **kwargs: None,
+    )
+    num_layers, num_kv_heads, head_dim, hidden = 2, 1, 64, 8
+    window, prompt, occupant_prompt, max_draft_len = 256, 65536, 512, 3
+    spec = DFlashDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model="draft",
+        attention_backend="TRTLLM",
+        mask_token_id=0,
+    )
+    draft, occupant, request = _disagg_draft_fixture(spec, prompt, occupant_prompt, window)
     offsets = torch.zeros(
         (getattr(draft, "num_attention_op_pools", draft.num_pools), 2, 2, draft.max_blocks_per_seq),
         dtype=torch.int32,
         device="cuda",
     )
+    tokens_per_req = max_draft_len + 1
     try:
-        batch = ScheduledRequests()
-        batch.context_requests_last_chunk.append(occupant)
-        draft._prepare_draft_resources(batch)
-        batch = ScheduledRequests()
-        batch.context_requests_last_chunk.append(request)
-        draft._prepare_draft_resources(batch)
+        for req in (occupant, request):
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk.append(req)
+            draft._prepare_draft_resources(batch)
+        request.add_new_token(1, 0)
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
-        batch = ScheduledRequests()
-        batch.generation_requests.append(request)
-        draft._prepare_draft_resources(batch)
+        for _ in range(2):
+            _disagg_generation_step(draft, request)
 
         worker = DFlashWorker(spec, Mapping())
         draft_model = _PoolBoundDFlashDraftModel(num_layers, num_kv_heads, head_dim, hidden)
@@ -2401,11 +2460,46 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
             draft_kv_cache_manager=draft,
         )
         assert worker._ctx_block_tables is not None, "the drafter did not bind the draft pool"
+        worker._ctx_reuse_addressable = reuse_addressable
         # V2 hands out per-layer views over one interleaved pool: a table entry
         # names layer 0's slot of a page, and layer l of that page is slot
         # entry + l of the same dense view, so view 0 sees every layer's write.
         assert worker._ctx_block_divisor == draft.kv_factor
         pool = worker._ctx_kv_buf[0]
+        page = worker._ctx_page_size
+
+        spec_metadata = DFlashSpecMetadata(
+            max_num_requests=2, max_draft_len=max_draft_len, max_total_draft_tokens=max_draft_len
+        )
+        spec_metadata._dflash_worker = worker
+
+        def prepare(request_ids: list[int]) -> None:
+            """DFlashSpecMetadata.prepare() for a batch of generation rows at
+            their current positions."""
+            reqs = {request.py_request_id: request, occupant.py_request_id: occupant}
+            spec_metadata.request_ids = request_ids
+            spec_metadata.num_generations = len(request_ids)
+            spec_metadata.seq_lens = [tokens_per_req] * len(request_ids)
+            spec_metadata.host_position_ids = torch.tensor(
+                [
+                    reqs[rid].max_beam_num_tokens - 1 + offset
+                    for rid in request_ids
+                    for offset in range(tokens_per_req)
+                ],
+                dtype=torch.int32,
+            )
+            spec_metadata.prepare()
+
+        prepare([request.py_request_id])
+        if slot_loss:
+            # The request misses a batch (its slot is evicted), runs a step
+            # elsewhere in the meantime, and comes back on a fresh slot.
+            prepare([])
+            _disagg_generation_step(draft, request)
+            prepare([request.py_request_id])
+        batch = ScheduledRequests()
+        batch.generation_requests.append(request)
+        draft._prepare_draft_resources(batch)
 
         def own_slots(req: LlmRequest) -> set[int]:
             draft.copy_batch_block_offsets(offsets, [req.py_request_id], 1, 0, 1)
@@ -2422,16 +2516,10 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
         assert occupant_slots and request_slots
         assert not occupant_slots & request_slots
 
-        # As DFlashSpecMetadata.prepare() does for a new generation request.
-        slot = worker._assign_slot(request.py_request_id)
-        worker._rebuild_batch_to_slot([request.py_request_id])
-        assert worker._ctx_len_host[slot] == 0
         pool.fill_(7.0)
         before = pool.clone()
-
-        tokens_per_req = max_draft_len + 1
         captured = torch.randn(tokens_per_req, hidden, device="cuda")
-        spec_metadata = SimpleNamespace(
+        step_metadata = SimpleNamespace(
             hidden_size=hidden,
             runtime_draft_len=max_draft_len,
             captured_hidden_states=None,
@@ -2444,30 +2532,37 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
             accepted_tokens=torch.ones((1, tokens_per_req), dtype=torch.long, device="cuda"),
             num_accepted_tokens=torch.tensor([tokens_per_req], dtype=torch.int32, device="cuda"),
             attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
+            spec_metadata=step_metadata,
             draft_model=draft_model,
             total_target_tokens=tokens_per_req,
         )
-        # The block decode then appends the block's own K/V right after the
-        # context it reads, through the same table row.
-        num_ctx = int(inputs["num_ctx_per_req"][0])
-        assert num_ctx == tokens_per_req
-        block = worker._compute_block_size
-        block_kv = torch.full(
-            (block, num_layers, num_kv_heads, head_dim), 5.0, dtype=torch.bfloat16, device="cuda"
-        )
-        worker._store_context_kv_paged(
-            block_kv,
-            block_kv.clone(),
-            torch.zeros(block, dtype=torch.long, device="cuda"),
-            torch.arange(num_ctx, num_ctx + block, dtype=torch.long, device="cuda"),
-        )
         torch.cuda.synchronize()
-
         written = set((pool != before).flatten(1).any(dim=1).nonzero().flatten().tolist())
         assert written, "the drafter wrote nothing"
         assert not written & occupant_slots, "the drafter wrote another request's draft pages"
         assert written <= request_slots
+
+        # The block decode reads num_ctx positions and appends the block right
+        # after them, both through the table row it is handed.
+        num_ctx = int(inputs["num_ctx_per_req"][0])
+        read_row = inputs["ctx_page_table"][0].tolist()
+        block = worker._compute_block_size
+        addressed = {
+            read_row[pos // page] + layer
+            for pos in range(num_ctx + block)
+            for layer in range(num_layers)
+        }
+        assert addressed <= request_slots, "the block decode addresses another request's pages"
+
+        # The slot started empty on the page holding the request's absolute
+        # position, every page below it hidden, and reads exactly the context
+        # it stored this step.
+        base = (request.max_beam_num_tokens - 1) // page
+        slot = worker._req_to_slot[request.py_request_id]
+        assert worker._ctx_seed_page_aligned
+        assert worker._ctx_base_host[slot] == base
+        assert worker._ctx_len_host[slot] == base * page
+        assert num_ctx == tokens_per_req
         draft.free_resources(request)
         draft.free_resources(occupant)
     finally:
