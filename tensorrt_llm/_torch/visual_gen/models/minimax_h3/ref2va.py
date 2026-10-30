@@ -378,7 +378,7 @@ def prepare_references(
                 .permute(3, 0, 1, 2)[None]
             )
             visual_latents.append(pipeline._encode_visual_condition(pixels))
-    # Keep each VAE resident while encoding its references in presentation order.
+    # Keep each VAE on the GPU while encoding its references in presentation order.
     for reference in references:
         if reference.has_audio:
             with pipeline.offloader.context_if_requested("audio_vae"):

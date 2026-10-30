@@ -21,7 +21,7 @@ from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_minimax_h3_offload_memory_and_parity(tmp_path: Path) -> None:
     if torch.cuda.get_device_properties(0).total_memory < 140 * 1024**3:
-        pytest.skip("The resident H3 baseline requires at least 140 GiB of GPU memory")
+        pytest.skip("The H3 baseline requires at least 140 GiB of GPU memory")
     checkpoint = os.environ.get("MINIMAX_H3_CHECKPOINT") or get_checkpoint("MiniMax-H3")
     assert Path(checkpoint).is_dir(), f"MiniMax-H3 checkpoint not found: {checkpoint}"
     request = dict(
@@ -68,7 +68,7 @@ def test_minimax_h3_offload_memory_and_parity(tmp_path: Path) -> None:
             start = time.perf_counter()
             output = pipeline.forward(**request)
             torch.cuda.synchronize()
-            name = "offload" if offload else "resident"
+            name = "offload" if offload else "baseline"
             measurements[name] = {
                 "load_seconds": load_seconds,
                 "inference_seconds": time.perf_counter() - start,
@@ -101,12 +101,12 @@ def test_minimax_h3_offload_memory_and_parity(tmp_path: Path) -> None:
     import lpips
 
     metric = lpips.LPIPS(net="alex").eval()
-    resident_video, resident_audio = results["resident"]
+    baseline_video, baseline_audio = results["baseline"]
     offload_video, offload_audio = results["offload"]
     scores = []
     with torch.inference_mode():
-        for start in range(0, resident_video.shape[1], 8):
-            reference = resident_video[0, start : start + 8].permute(0, 3, 1, 2).float()
+        for start in range(0, baseline_video.shape[1], 8):
+            reference = baseline_video[0, start : start + 8].permute(0, 3, 1, 2).float()
             candidate = offload_video[0, start : start + 8].permute(0, 3, 1, 2).float()
             scores.append(metric(reference / 127.5 - 1, candidate / 127.5 - 1).flatten())
     measurements["lpips"] = torch.cat(scores).mean().item()
@@ -114,6 +114,6 @@ def test_minimax_h3_offload_memory_and_parity(tmp_path: Path) -> None:
     (tmp_path / "measurements.json").write_text(json.dumps(measurements, indent=2))
     print(json.dumps(measurements, indent=2), flush=True)
     assert measurements["lpips"] < 0.01
-    torch.testing.assert_close(offload_audio, resident_audio, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(offload_audio, baseline_audio, rtol=1e-4, atol=1e-5)
     for phase in ("load_sampled_peak_allocated_bytes", "inference_peak_allocated_bytes"):
-        assert measurements["offload"][phase] < measurements["resident"][phase] - 1024**3
+        assert measurements["offload"][phase] < measurements["baseline"][phase] - 1024**3
