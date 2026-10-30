@@ -31,7 +31,7 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 
 ## CI pipelines
 
-Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, the **post-merge pipeline** runs the same `jenkins/L0_MergeRequest.groovy` as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with `Post-Merge` in its name. In both pipelines, the test stages run in child jobs defined by `jenkins/L0_Test.groovy`, which maps each stage name to a test-db YAML file.
+Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, the **post-merge pipeline** runs the same `jenkins/L0_MergeRequest.groovy` as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with `Post-Merge` in its name, except that a stage matching `POST_MERGE_STAGE_BUILD_INTERVALS` in `jenkins/L0_Test.groovy` runs only once every N post-merge builds. In both pipelines, the test stages run in child jobs defined by `jenkins/L0_Test.groovy`, which maps each stage name to a test-db YAML file.
 
 `stage` tags live in the YAML files under `tests/integration/test_lists/test-db/`. Searching those files for `stage: pre_merge` shows exactly which tests the merge-request pipeline covers.
 
@@ -154,7 +154,11 @@ Post-merge pipelines and GitLab MR builds are exempt from this label check.
 ### Triggering Post-merge tests
 
 Full `/bot run --post-merge` runs require the `ci: post-merge approved` PR
-label because they can consume substantial shared GPU resources. The label is
+label because they can consume substantial shared GPU resources. Such a run
+adds the post-merge stages except the post-merge perf-sanity ones (stage names
+containing both `PerfSanity` and `Post-Merge`), which only the official
+post-merge pipeline runs; name one with `--stage-list` or `--extra-stage` to run
+it on a PR. The label is
 intended to be applied by an active member of the
 `NVIDIA/trt-llm-ci-approvers` GitHub team. A GitHub workflow validates the label
 actor and normally removes invalid approvals. This is a best-effort resource
