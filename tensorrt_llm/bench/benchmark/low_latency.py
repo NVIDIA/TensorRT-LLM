@@ -269,6 +269,7 @@ def latency_command(
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    exec_settings["iteration_log"] = options.iteration_log
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
     # Construct the runtime configuration dataclass.
