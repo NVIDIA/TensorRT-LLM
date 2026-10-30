@@ -410,6 +410,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
         layer_specs = kwargs.get("layer_specs")
+        if layer_specs is not None and any(
+            spec.owner is KVCacheLayerOwner.DRAFT and spec.dtype == DataType.NVFP4
+            for spec in layer_specs
+        ):
+            # Block scales here belong to the MSA sparse target layers only.
+            raise ValueError(f"{type(self).__name__} does not host NVFP4 draft layers.")
         if layer_specs is not None and kwargs.get("dtype") == DataType.NVFP4:
             # The hybrid layout of _build_cache_config as specs: FP8 on the dense target layers.
             kwargs["layer_specs"] = tuple(
@@ -1077,6 +1083,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         return layers_by_addr.index(int(layer_id))
 
+    def _draft_pool_ids(self) -> frozenset:
+        """Pools that hold the explicit draft layers."""
+        return frozenset(
+            self.layer_to_pool_mapping_dict[self.layer_offsets[layer]]
+            for layer in self.draft_layer_ids
+        )
+
     def _get_batch_cache_indices_by_pool_id(
         self,
         request_ids,
@@ -1102,7 +1115,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         ``BAD_PAGE_INDEX`` slots remain ``-1`` here because disaggregation's
         :class:`KVRegionExtractorV1` filters ``region_ids >= 0``.
         :meth:`get_block_ids_per_seq` maps them to zero for the attention
-        metadata's padded tensor.
+        metadata's padded tensor. Pools of explicit draft layers keep the
+        base conversion, matching their base :meth:`get_buffers` view.
 
         Args:
             request_ids: Request IDs whose page-index rows are returned.
@@ -1117,6 +1131,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kv_factor: Kept for compatibility with the base virtual method;
                 M3 returns raw slot IDs without KV aggregation.
         """
+        if self.layer_specs is not None and pool_id in self._draft_pool_ids():
+            # Draft layers keep the base get_buffers() view, so their indices take the base conversion.
+            return super()._get_batch_cache_indices_by_pool_id(
+                request_ids,
+                pool_id=pool_id,
+                is_kv_aggregate=is_kv_aggregate,
+                num_blocks_per_seq=num_blocks_per_seq,
+                index_scale=index_scale,
+                kv_factor=kv_factor,
+            )
         res = []
         for req_idx, req_id in enumerate(request_ids):
             kv_cache = self.kv_cache_map[req_id]

@@ -3922,8 +3922,18 @@ class KVCacheManagerV2(BaseResourceManager):
         as many tokens as the target. They need only every admissible sequence's window plus
         one context chunk, which is what the KV cache cost already charges for them.
         """
+        if self.max_num_tokens is None:
+            # Without a context-chunk bound the backend's split is the safe one.
+            return None
         owners = [spec.owner for spec in self.layer_specs]
-        keys = [(c.sliding_window_size, c.num_sink_tokens, c.reuse_policy) for c in layer_configs]
+        # Key layers as the backend groups them into lifecycles (sinks count in whole blocks).
+        life_cycles = [
+            AttnLifeCycle.make(
+                c.sliding_window_size, c.num_sink_tokens, tokens_per_block, c.reuse_policy
+            )
+            for c in layer_configs
+        ]
+        keys = [(lc.window_size, lc.num_sink_blocks, lc.reuse_policy) for lc in life_cycles]
         target_keys = {key for key, owner in zip(keys, owners) if owner is KVCacheLayerOwner.TARGET}
         draft_keys = {key for key, owner in zip(keys, owners) if owner is KVCacheLayerOwner.DRAFT}
         # Lifecycle ids follow first appearance, so the target's must come first.
@@ -3953,8 +3963,8 @@ class KVCacheManagerV2(BaseResourceManager):
             * self.mapping.pp_size
             * (2 if self.is_disagg or not self.mapping.has_pp() else 1)
         )
-        draft_bytes = window_bytes_per_sequence * num_sequences + sum(draft_sizes) * (
-            self.max_num_tokens or 0
+        draft_bytes = (
+            window_bytes_per_sequence * num_sequences + sum(draft_sizes) * self.max_num_tokens
         )
         bytes_per_block = {KVCacheLayerOwner.TARGET: 0, KVCacheLayerOwner.DRAFT: 0}
         for config, owner in zip(layer_configs, owners):

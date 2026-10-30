@@ -14,7 +14,9 @@
 # limitations under the License.
 """A standalone DSpark drafter's layers as explicit draft layer specs of the MiniMax-M3 manager."""
 
+from dataclasses import replace
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -40,8 +42,8 @@ HEADS = 2
 HEAD_DIM = 128
 
 
-def _specs() -> tuple:
-    """Target layers in the NVFP4 cache dtype, then a windowed BF16 drafter."""
+def _specs(draft_window: Optional[int] = DRAFT_WINDOW) -> tuple[KVCacheLayerSpec, ...]:
+    """Target layers in the NVFP4 cache dtype, then a BF16 drafter (windowed by default)."""
     scale_roles = (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
     target = [
         KVCacheLayerSpec(
@@ -62,14 +64,14 @@ def _specs() -> tuple:
             num_kv_heads=HEADS,
             head_dim=HEAD_DIM,
             buffer_roles=(Role.KEY, Role.VALUE),
-            sliding_window_size=DRAFT_WINDOW,
+            sliding_window_size=draft_window,
         )
         for layer in range(NUM_DRAFT)
     ]
     return tuple(target + draft)
 
 
-def _manager(layer_specs) -> MiniMaxM3KVCacheManagerV2:
+def _manager(layer_specs: Optional[tuple[KVCacheLayerSpec, ...]]) -> MiniMaxM3KVCacheManagerV2:
     """A hybrid NVFP4 MSA manager, with or without explicit draft layer specs."""
     return MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
@@ -147,12 +149,26 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
         unified.copy_batch_block_offsets(offsets, [7], 1, 1, 1)
         torch.cuda.synchronize()
         pool = int(unified.kv_cache_pool_mapping[unified.layer_offsets[NUM_TARGET], 0])
-        slots = [s for s in unified.get_batch_cache_indices([7], layer_idx=NUM_TARGET)[0] if s >= 0]
+        slots = [
+            s
+            for s in unified.get_batch_cache_indices([7], layer_idx=NUM_TARGET, raw_indices=True)[0]
+            if s >= 0
+        ]
         assert len(slots) == 2
         # The row the drafter reads holds the draft layer's K page of each slot, V right after it.
         scale = unified.get_layer_page_index_scale(NUM_TARGET)
         pages = [[slot * scale + plane for slot in slots] for plane in (0, 1)]
         assert offsets[pool, 0, :, : len(slots)].tolist() == pages
+        # Draft-layer indices address the base view's contiguous K/V rows, like the flat table.
+        rows = [page // 2 for page in pages[0]]
+        assert unified.get_batch_cache_indices([7], layer_idx=NUM_TARGET)[0][: len(slots)] == rows
+        flat = unified.get_batch_cache_indices_flat([7], [len(slots)], layer_idx=NUM_TARGET)
+        assert flat.tolist() == rows
+        # Target layers keep MiniMax's raw slot ids.
+        sparse_slots = unified.get_batch_cache_indices([7], layer_idx=3)[0]
+        assert (
+            sparse_slots == unified.get_batch_cache_indices([7], layer_idx=3, raw_indices=True)[0]
+        )
         unified.free_resources(request)
 
         # The draft lifecycle is sized by its window, not by its share of the bytes per token.
@@ -168,10 +184,35 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
         plain.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_nvfp4_draft_layers_are_rejected() -> None:
+    """Block scales belong to the sparse target layers, so an NVFP4 drafter cannot join."""
+    specs = _specs()
+    nvfp4_draft = replace(
+        specs[NUM_TARGET],
+        dtype=DataType.NVFP4,
+        buffer_roles=(Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE),
+    )
+    with pytest.raises(ValueError, match="does not host NVFP4 draft layers"):
+        _manager((*specs[:NUM_TARGET], nvfp4_draft, *specs[NUM_TARGET + 1 :]))
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("is_disagg", [False, True])
 def test_window_sized_draft_ratio(is_disagg: bool) -> None:
     """A windowed draft lifecycle gets its windows plus one chunk, not a bytes-per-token share."""
+
+    def _configs(specs: tuple[KVCacheLayerSpec, ...], target_sinks: Optional[int] = None) -> list:
+        return [
+            SimpleNamespace(
+                sliding_window_size=spec.sliding_window_size,
+                num_sink_tokens=target_sinks if spec.owner is KVCacheLayerOwner.TARGET else None,
+                reuse_policy=spec.reuse_policy,
+                buffers=[SimpleNamespace(size=spec.bytes_per_token() * 128)],
+            )
+            for spec in specs
+        ]
+
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_specs = _specs()[NUM_TARGET - 1 :]
     manager.max_batch_size = 2
@@ -179,15 +220,7 @@ def test_window_sized_draft_ratio(is_disagg: bool) -> None:
     manager.mapping = Mapping()
     manager.is_disagg = is_disagg
     manager._generation_kv_capacity_headroom = 1
-    configs = [
-        SimpleNamespace(
-            sliding_window_size=spec.sliding_window_size,
-            num_sink_tokens=None,
-            reuse_policy=spec.reuse_policy,
-            buffers=[SimpleNamespace(size=spec.bytes_per_token() * 128)],
-        )
-        for spec in manager.layer_specs
-    ]
+    configs = _configs(manager.layer_specs)
     draft_bytes_per_token = 2 * HEADS * HEAD_DIM * 2 * NUM_DRAFT
     # Four admissible sequences hold three pages of window each, plus one 256-token chunk.
     draft_bytes = (4 * 3 * 128 + 256) * draft_bytes_per_token
@@ -201,5 +234,18 @@ def test_window_sized_draft_ratio(is_disagg: bool) -> None:
     assert manager._windowed_draft_pool_ratio(configs, 1 << 20, 128)[1] == pytest.approx(
         token_share
     )
+    # Without a context-chunk bound the backend keeps its own split.
+    manager.max_num_tokens = None
+    assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128) is None
+    manager.max_num_tokens = 256
     # Without a windowed draft lifecycle the backend keeps its own split.
-    assert manager._windowed_draft_pool_ratio(configs[:1], 1 << 30, 128) is None
+    manager.layer_specs = _specs(draft_window=None)[NUM_TARGET - 1 :]
+    assert manager._windowed_draft_pool_ratio(_configs(manager.layer_specs), 1 << 30, 128) is None
+    # A target sharing the drafter's window shares its lifecycle too: sink tokens that round to
+    # no sink block do not make a second one.
+    manager.layer_specs = tuple(
+        replace(spec, sliding_window_size=DRAFT_WINDOW) for spec in _specs()[NUM_TARGET - 1 :]
+    )
+    assert (
+        manager._windowed_draft_pool_ratio(_configs(manager.layer_specs, 0), 1 << 30, 128) is None
+    )
