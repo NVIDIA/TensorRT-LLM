@@ -961,7 +961,8 @@ def _routed_experts(core, x, L: _LayerWeights) -> torch.Tensor:
                 routing_logits=None,
                 routing_bias=None,
                 hidden_states=xq[lo:hi],
-                hidden_states_scale=xsf[lo:hi].view(torch.float8_e4m3fn),
+                # The runner reads the chunk's linear block scales flat.
+                hidden_states_scale=torch.reshape(xsf[lo:hi], [-1]).view(torch.float8_e4m3fn),
                 gemm1_weights=L.fc1_w,
                 gemm1_weights_scale=L.fc1_s,
                 gemm1_bias=None,
