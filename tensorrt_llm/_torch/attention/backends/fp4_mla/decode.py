@@ -1090,9 +1090,10 @@ def run_fp4_mla_attention_decode(
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
 
     v_sf_pool = metadata.fp4_mla_state.v_scale_pool
-    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
-        torch.float8_e4m3fn
-    )
+    # The V-scale pool covers the compact layers from the state's v_layer_base on.
+    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[
+        local_layer - int(getattr(metadata.fp4_mla_state, "v_layer_base", 0))
+    ].view(torch.float8_e4m3fn)
     # The kv_lens runtime alias can lag at the decode anchor (seq_lens == 1) under
     # CUDA graph / one-engine MTP; recover the true total per sequence so the
     # per-query causal masking sees the full 1 + draft_len window (no-op when the

@@ -759,6 +759,35 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     return kv_lens_gen, gen_lens_gen, page_ids
 
 
+def _fp4_mla_layer_has_decode_views(kv_cache_manager: Any, local_layer: int) -> bool:
+    """Whether a compact FP4 MLA layer keeps V scales and packed V.
+
+    A disaggregated context worker keeps a single-copy cache without them,
+    except on one-model draft layers.
+    """
+    if getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is not True:
+        return True
+    has_views = getattr(kv_cache_manager, "fp4_mla_compact_layer_has_decode_views", None)
+    return callable(has_views) and bool(has_views(local_layer))
+
+
+def _fp4_mla_v_scale_pool_for_layer(
+    metadata: Any, local_layer: int, v_head_dim: int
+) -> torch.Tensor:
+    """V-scale pool view that the cache-update kernels index by compact layer.
+
+    The pool covers the compact layers from the state's ``v_layer_base`` on.
+    For a nonzero base, present this layer's scales at every layer index with
+    a zero layer stride, so that ``local_layer`` still addresses them.
+    """
+    pool = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+    v_layer_base = int(getattr(metadata.fp4_mla_state, "v_layer_base", 0))
+    if v_layer_base == 0:
+        return pool
+    num_layers = metadata.fp4_mla_state.hp_pool.shape[1]
+    return pool[local_layer - v_layer_base].unsqueeze(0).expand(num_layers, *pool.shape[1:])
+
+
 # Public cache update and decode entry points
 
 
@@ -859,12 +888,10 @@ def scatter_fp4_mla_kv_cache(
     if phase not in ("context", "generation"):
         raise ValueError("FP4 MLA scatter requires phase='context' or 'generation'.")
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
-    # A disaggregated context worker keeps a single-copy cache without the
-    # generation-only V scales and packed V.
-    context_only_cache = getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is True
-    if context_only_cache and phase != "context":
+    has_decode_views = _fp4_mla_layer_has_decode_views(kv_cache_manager, local_layer)
+    if not has_decode_views and phase != "context":
         raise RuntimeError("FP4 MLA context-only cache cannot execute generation.")
-    if not context_only_cache and getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
+    if has_decode_views and getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -886,9 +913,9 @@ def scatter_fp4_mla_kv_cache(
 
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
     v_sf = (
-        None
-        if context_only_cache
-        else get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+        _fp4_mla_v_scale_pool_for_layer(metadata, local_layer, v_head_dim)
+        if has_decode_views
+        else None
     )
     num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
     sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
@@ -945,7 +972,7 @@ def scatter_fp4_mla_kv_cache(
     v_packed_base = None
     v_page_offset = 0
     direct_v_packed_write = False
-    if cutedsl_backend and not fused_v_transpose and not context_only_cache:
+    if cutedsl_backend and not fused_v_transpose and has_decode_views:
         persistent_v_packed = _get_cutedsl_persistent_v_packed_cache(
             metadata,
             local_layer,
@@ -1070,12 +1097,7 @@ def scatter_fp4_mla_kv_cache(
     cutedsl_repack_kv_lens = None
     cutedsl_repack_generation_lens = None
     cutedsl_repack_max_touched_pages = 1
-    if (
-        cutedsl_backend
-        and not fused_v_transpose
-        and not direct_v_packed_write
-        and not context_only_cache
-    ):
+    if cutedsl_backend and not fused_v_transpose and not direct_v_packed_write and has_decode_views:
         if phase == "context":
             num_contexts = metadata.num_contexts
             cutedsl_v_pack_page_ids = metadata.fp4_mla_state.paged_kv_indices[
@@ -1112,7 +1134,7 @@ def scatter_fp4_mla_kv_cache(
             generation_lens=cutedsl_repack_generation_lens,
             max_touched_pages=cutedsl_repack_max_touched_pages,
         )
-    if context_only_cache:
+    if not has_decode_views:
         return hp_pool_updated
     _maybe_update_triton_v_packed_cache(
         metadata,

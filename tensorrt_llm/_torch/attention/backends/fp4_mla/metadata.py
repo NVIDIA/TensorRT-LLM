@@ -371,11 +371,11 @@ def populate_helix_spec_buffers(
     )
 
 
-def _fp4_mla_page_table_spec(kv_cache_manager: Any) -> Any:
+def _fp4_mla_page_table_spec(kv_cache_manager: Any, layer_idx: Optional[int] = None) -> Any:
     get_spec = getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)
     if not callable(get_spec):
         raise RuntimeError("FP4 MLA requires V2 cache-layout page metadata.")
-    spec = get_spec()
+    spec = get_spec() if layer_idx is None else get_spec(layer_idx)
     for field_name in (
         "cache_pool_id",
         "cache_page_index_scale",
@@ -505,7 +505,9 @@ def configure_fp4_mla_device_page_table(
     paged_kv_indptr = getattr(metadata.fp4_mla_state, "_paged_kv_indptr", None)
     paged_kv_indptr_decode = getattr(metadata.fp4_mla_state, "paged_kv_indptr_decode", None)
     max_page_capacity = int(getattr(kv_cache_manager, "max_blocks_per_seq", 0) or 0)
-    page_spec = _fp4_mla_page_table_spec(kv_cache_manager)
+    page_spec = _fp4_mla_page_table_spec(
+        kv_cache_manager, getattr(metadata.fp4_mla_state, "page_table_layer_idx", None)
+    )
     page_index_scale = int(page_spec.cache_page_index_scale)
 
     tensors = (block_offsets, page_ids, paged_kv_indptr, paged_kv_indptr_decode)
