@@ -431,9 +431,9 @@ class ModelEngine:
         self._nccl_window_tensor_scope_hooks = []
         # A forward without peers cannot allocate NCCL window leases. DWDP
         # peers are separate from the model-parallel communicator's world size.
-        window_scopes_enabled = (self.dist is not None
-                                 and (self.dist.world_size > 1
-                                      or self.mapping.dwdp_enabled))
+        window_scopes_enabled = self.dist is not None and (
+            self.dist.world_size > 1 or self.mapping.dwdp_enabled
+        )
 
         backend_num_streams = None
         try:
@@ -492,8 +492,9 @@ class ModelEngine:
             else:
                 set_torch_compiling(False)
                 if window_scopes_enabled:
-                    self._nccl_window_tensor_scope_hooks = (
-                        install_eager_nccl_window_tensor_scopes(self.model))
+                    self._nccl_window_tensor_scope_hooks = install_eager_nccl_window_tensor_scopes(
+                        self.model
+                    )
 
             # Capture local encoders after their metadata is sized and before
             # KV-cache estimation, so graph memory is included in the profile.
