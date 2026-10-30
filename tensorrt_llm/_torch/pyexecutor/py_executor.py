@@ -1682,10 +1682,10 @@ class PyExecutor:
             # saving incomplete results that would be overwritten anyway
             enable_profiler = bool(os.environ.get(
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
-            notification_runtime = getattr(self, "_idle_notification_runtime", None)
-            notification = (notification_runtime.worker(self)
-                            if notification_runtime is not None
-                            else nullcontext())
+            notification_runtime = getattr(self, "_idle_notification_runtime",
+                                           None)
+            notification = (notification_runtime.worker(self) if
+                            notification_runtime is not None else nullcontext())
             with notification, \
                  host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
@@ -1830,7 +1830,8 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
-                self._idle_notification_runtime = prepare_idle_notification(self)
+                self._idle_notification_runtime = prepare_idle_notification(
+                    self)
                 # Model/KV-cache/transceiver construction can create threads
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
@@ -7278,7 +7279,8 @@ class PyExecutor:
             timeout = datetime.timedelta(0)
 
         idle_fetch = None
-        notification_enabled = getattr(self, "_idle_notification_runtime", None) is not None
+        notification_enabled = getattr(self, "_idle_notification_runtime",
+                                       None) is not None
         # Fetch requests from rank 0
         new_requests = []
         if self.dist.rank == 0 and not control_pending:
@@ -7295,10 +7297,12 @@ class PyExecutor:
                     # batch and would introduce a second deadline on an empty
                     # queue. Followers park before either queue wait instead.
                     def idle_fetch() -> list[RequestQueueItem]:
-                        return self.executor_request_queue.get_from_request_queue(None)
+                        return self.executor_request_queue.get_from_request_queue(
+                            None)
                 else:
                     new_requests.extend(
-                        self.executor_request_queue.get_from_request_queue(timeout))
+                        self.executor_request_queue.get_from_request_queue(
+                            timeout))
 
         if connector is not None and not self.enable_attention_dp and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()
