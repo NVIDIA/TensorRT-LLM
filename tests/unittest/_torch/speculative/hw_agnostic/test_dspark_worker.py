@@ -43,12 +43,13 @@ NCAP = 3
 HC_MULT = 4
 
 
-def _make_metadata(max_num_requests=8, max_num_tokens=64, layers=(58, 59, 60)):
+def _make_metadata(max_num_requests=8, max_num_tokens=64, layers=(58, 59, 60), num_seq_slots=0):
     return DSparkSpecMetadata(
         max_draft_len=5,
         max_total_draft_tokens=5,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         max_num_requests=max_num_requests,
+        num_seq_slots=num_seq_slots,
         layers_to_capture=list(layers),
         hidden_size=HIDDEN,
         max_num_tokens=max_num_tokens,
@@ -223,6 +224,35 @@ def test_worker_rejects_mismatched_block_size():
         worker._lazy_init(draft_model, _make_metadata())
 
 
+def test_metadata_preserves_seq_slot_pool_in_graph_copy():
+    metadata = _make_metadata(max_num_requests=5)
+
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+
+    assert metadata.num_seq_slots == 5
+    assert graph_metadata.max_num_requests == 2
+    assert graph_metadata.num_seq_slots == 5
+
+
+@pytest.mark.parametrize("num_seq_slots", [4, 8], ids=["pool-eq-batch", "disagg-adp-2x-pool"])
+def test_worker_graph_bucket_uses_full_seq_slot_pool(num_seq_slots):
+    """A first _lazy_init on a small graph bucket must not shrink the slot pool."""
+    metadata = _make_metadata(max_num_requests=4, num_seq_slots=num_seq_slots)
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+    worker = _make_worker()
+
+    worker._lazy_init(_fake_draft_model(), graph_metadata)
+
+    assert graph_metadata.max_num_requests == 2 < graph_metadata.num_seq_slots
+    assert worker._ctx_len.shape == (num_seq_slots + 1,)
+    assert worker._batch_to_slot.shape == (num_seq_slots,)
+    assert worker._scratch_slot == num_seq_slots
+    live_slots = {worker._assign_slot(100 + i) for i in range(num_seq_slots)}
+    assert live_slots == set(range(num_seq_slots))
+    with pytest.raises(RuntimeError, match="no free progress slots"):
+        worker._assign_slot(999)
+
+
 def test_worker_slot_assignment_and_reset():
     worker = _make_worker()
     worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=4))
@@ -294,6 +324,7 @@ def test_seed_context_pages_preserves_state_across_prefill_chunks():
     draft_model = DraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=1,
+        num_seq_slots=1,
         request_ids=[100],
         get_hidden_states=lambda _num_tokens: torch.zeros(
             3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
@@ -599,7 +630,7 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     target rows by their runtime width rather than the configured K+1 width."""
     worker = _make_worker()
     draft_model = _RecordingDraftModel()
-    metadata = types.SimpleNamespace(max_num_requests=2)
+    metadata = types.SimpleNamespace(max_num_requests=2, num_seq_slots=2)
     worker._lazy_init(draft_model, metadata)
     manager = _bind_manager(worker, [1000, 1001])
     manager.kv_cache_map[1000].history_length = 4016
