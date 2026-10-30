@@ -111,7 +111,7 @@ def test_prepare_resets_only_evicted_slots():
     written = []
     write = worker._write_ctx_len
 
-    def record(updates, base_updates=None):
+    def record(updates: dict[int, int], base_updates: dict[int, int] | None = None) -> None:
         written.append(dict(updates))
         write(updates, base_updates)
 
