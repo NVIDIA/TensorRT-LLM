@@ -25,7 +25,7 @@ import dataclasses
 import math
 from collections.abc import Mapping
 from itertools import accumulate, groupby
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -61,7 +61,13 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     PreparedLlmInputs,
 )
-from .modeling_multimodal_utils import _MULTIMODAL_ENV_NAME, _is_mm_disagg
+from .modeling_multimodal_utils import (
+    _MULTIMODAL_ENV_NAME,
+    VisionNormalization,
+    _is_mm_disagg,
+    normalize_vision_pixels,
+    vision_normalization_from_processor,
+)
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 if TYPE_CHECKING:
@@ -682,8 +688,14 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def _get_vision_normalization(self, images, processor) -> VisionNormalization | None:
+        """Describe exact device normalization for RGB uint8 processor inputs."""
+        if not getattr(self, "_vision_gpu_normalize", False):
+            return None
+        return vision_normalization_from_processor(images, processor, self.dtype)
+
     @nvtx_range("[MM] preprocess")
-    def _preprocess(self, inputs):
+    def _preprocess(self, inputs, *, allow_device_normalize: bool = True):
         text_prompt = inputs.get("prompt")
         mm_data = inputs.get("multi_modal_data", {})
         allowed_keys = {"image", "audio", "video"}
@@ -703,6 +715,16 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         video_position_ids = None
         input_features = None
         input_features_mask = None
+        vision_normalizations: dict[str, VisionNormalization] = {}
+        device_normalize = (
+            allow_device_normalize
+            and not inputs.get("mm_processor_kwargs")
+            and sum(data is not None for data in (images, audios, videos)) == 1
+        )
+        if images is not None and device_normalize:
+            normalization = self._get_vision_normalization(images, self._image_processor)
+            if normalization is not None:
+                vision_normalizations["image"] = normalization
 
         # ---------------------------------------------------------------
         # Video pre-processing (manual path).
@@ -737,10 +759,19 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
 
             # VideoMediaIO already sampled these decoded frames. Keep the HF processor from
             # sampling them again; callers should control sampling with `media_io_kwargs`.
+            video_kwargs = {}
+            if device_normalize:
+                normalization = self._get_vision_normalization(
+                    [frame for frames in norm_videos for frame in frames], self._video_processor
+                )
+                if normalization is not None:
+                    vision_normalizations["video"] = normalization
+                    video_kwargs = {"do_rescale": False, "do_normalize": False}
             video_out = self._processor.video_processor(
                 videos=norm_videos,
                 do_sample_frames=False,
                 return_metadata=True,
+                **video_kwargs,
             )
             pixel_values_videos = video_out.get("pixel_values_videos")
             video_position_ids = video_out.get("video_position_ids")
@@ -781,6 +812,8 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             if images is not None:
                 proc_kwargs["images"] = images
                 proc_kwargs["do_rescale"] = do_rescale
+                if "image" in vision_normalizations:
+                    proc_kwargs.update(do_rescale=False, do_normalize=False)
             if audios is not None:
                 # ``load_audio`` returns ``(array, sampling_rate)`` tuples; the
                 # Gemma4 processor's feature extractor only wants the raw 1-D
@@ -803,9 +836,14 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                 return_tensors="pt",
             )["input_ids"]
             if images is not None and self._image_processor is not None:
-                img_out = self._image_processor(images=images, return_tensors="pt")
+                image_kwargs = (
+                    {"do_rescale": False, "do_normalize": False}
+                    if "image" in vision_normalizations
+                    else {}
+                )
+                img_out = self._image_processor(images=images, return_tensors="pt", **image_kwargs)
                 pixel_values = img_out.get("pixel_values")
-                if pixel_values is not None:
+                if pixel_values is not None and "image" not in vision_normalizations:
                     pixel_values = pixel_values.to(dtype=self.dtype)
                 image_position_ids = img_out.get("image_position_ids")
             if (
@@ -823,8 +861,14 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                 if input_features is not None:
                     input_features = input_features.to(dtype=self.dtype)
 
+        if any(
+            modality in vision_normalizations and pixels is not None and pixels.dtype != torch.uint8
+            for modality, pixels in (("image", pixel_values), ("video", pixel_values_videos))
+        ):
+            return self._preprocess(inputs, allow_device_normalize=False)
+
         # Cast video features to model dtype.
-        if pixel_values_videos is not None:
+        if pixel_values_videos is not None and "video" not in vision_normalizations:
             pixel_values_videos = pixel_values_videos.to(dtype=self.dtype)
         return (
             input_ids,
@@ -834,6 +878,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             input_features_mask,
             pixel_values_videos,
             video_position_ids,
+            vision_normalizations,
         )
 
     @torch.inference_mode()
@@ -850,10 +895,13 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             input_features_mask,
             pixel_values_videos,
             video_position_ids,
+            vision_normalizations,
         ) = self._preprocess(inputs)
         mm_inner: Dict = {}
         if pixel_values is not None:
             image_data: Dict = {"pixel_values": pixel_values}
+            if "image" in vision_normalizations:
+                image_data["vision_normalization"] = vision_normalizations["image"]
             if image_position_ids is not None:
                 image_data["image_position_ids"] = image_position_ids
                 # Per-image valid-patch count, captured CPU-side from the
@@ -888,6 +936,8 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             if vp is not None and vp.dim() == 4:
                 vp = vp.reshape(-1, vp.shape[-2], vp.shape[-1])
             video_data: Dict = {"pixel_values": v, "num_frames": num_frames}
+            if "video" in vision_normalizations:
+                video_data["vision_normalization"] = vision_normalizations["video"]
             if vp is not None:
                 video_data["image_position_ids"] = vp
                 # See image branch above: CPU-side per-frame valid-patch count
@@ -909,6 +959,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     """Shared multimodal encoder flow for Gemma4 conditional generation models."""
 
     supports_encoder_cache = True
+    supports_vision_gpu_normalize: ClassVar[bool] = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
     @classmethod
@@ -1074,8 +1125,16 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             image_data = multimodal_data.get("image", {})
             pixel_values = image_data.get("pixel_values")
             if pixel_values is not None:
-                pixel_values_list.append(pixel_values)
                 image_position_ids = image_data.get("image_position_ids")
+                if "vision_normalization" in image_data:
+                    pixel_values = normalize_vision_pixels(
+                        pixel_values.reshape(-1, 3, 1), image_data["vision_normalization"]
+                    ).reshape(pixel_values.shape)
+                    if image_position_ids is not None:
+                        pixel_values.masked_fill_(
+                            (image_position_ids == -1).all(dim=-1, keepdim=True), 0
+                        )
+                pixel_values_list.append(pixel_values)
                 if image_position_ids is not None:
                     image_position_ids_list.append(image_position_ids)
                 image_seq_lens = image_data.get("image_seq_lens")
@@ -1091,8 +1150,16 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             video_data = multimodal_data.get("video", {})
             video_pixel_values = video_data.get("pixel_values")
             if video_pixel_values is not None:
-                video_pixel_values_list.append(video_pixel_values)
                 video_position_ids = video_data.get("image_position_ids")
+                if "vision_normalization" in video_data:
+                    video_pixel_values = normalize_vision_pixels(
+                        video_pixel_values.reshape(-1, 3, 1), video_data["vision_normalization"]
+                    ).reshape(video_pixel_values.shape)
+                    if video_position_ids is not None:
+                        video_pixel_values.masked_fill_(
+                            (video_position_ids == -1).all(dim=-1, keepdim=True), 0
+                        )
+                video_pixel_values_list.append(video_pixel_values)
                 if video_position_ids is not None:
                     video_position_ids_list.append(video_position_ids)
                 video_seq_lens = video_data.get("image_seq_lens")
