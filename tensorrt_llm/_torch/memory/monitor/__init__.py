@@ -222,9 +222,12 @@ def _read_torch(device_index: int, segments: list | None = None) -> TorchReading
     from .pools import pool_usage
 
     pools = tuple(pool_usage(segments))
+    # A pool sleep mode has released is not resident; it is kept in
+    # ``pools`` so the report can say what is asleep.
+    resident = [p for p in pools if not p.released]
     return TorchReading(
-        reserved=sum(p.reserved for p in pools),
-        live=sum(p.allocated for p in pools),
+        reserved=sum(p.reserved for p in resident),
+        live=sum(p.allocated for p in resident),
         pools=pools,
     )
 

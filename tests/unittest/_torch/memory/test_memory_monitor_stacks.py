@@ -65,6 +65,26 @@ class TestSiteNames:
     def test_no_frames(self):
         assert stacks.site_of([]) is None
 
+    def test_users_own_code_beats_the_tensorrt_llm_frame_that_called_it(self):
+        # A logits processor holding memory: the processor is what to fix.
+        frames = [
+            {"filename": "/usr/lib/python3/site-packages/torch/_tensor.py", "name": "empty"},
+            {"filename": "/work/my_app/processors.py", "name": "__call__"},
+            {
+                "filename": "/x/site-packages/tensorrt_llm/_torch/pyexecutor/runner.py",
+                "name": "_apply_logits_processors",
+            },
+        ]
+        assert stacks.site_of(frames) == "my_app/processors.py:__call__"
+
+    def test_standard_library_is_not_user_code(self):
+        frames = [
+            {"filename": "/usr/lib/python3.12/functools.py", "name": "wrapper"},
+            {"filename": "/usr/lib/python3.12/threading.py", "name": "run"},
+            {"filename": "/repo/tensorrt_llm/_torch/modules/linear.py", "name": "forward"},
+        ]
+        assert stacks.site_of(frames) == "modules/linear.py:forward"
+
 
 class TestOffByDefault:
     def test_disabled_without_the_variable(self, monkeypatch):

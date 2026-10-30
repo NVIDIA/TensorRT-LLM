@@ -166,6 +166,7 @@ def render(
             add(
                 f"      {pool.label:<26s}{_gib(pool.reserved)} reserved, "
                 f"{pool.allocated / _GIB:.2f} GiB allocated"
+                + ("   <- released by sleep mode, not counted" if pool.released else "")
             )
     add(_line("component counters", frame.nontorch_known))
     residual_suffix = ""
@@ -185,8 +186,6 @@ def render(
     for entry in sorted(torch_entries, key=lambda e: -(e.size_bytes or 0)):
         add(_entry_line(entry))
     add(_entry_line(derived[Category.UNATTRIBUTED_LIVE]))
-    if Category.SLEEP_RELEASED in derived:
-        add(_entry_line(derived[Category.SLEEP_RELEASED]))
 
     component_entries = [
         e for e in frame.entries if e.placement is Placement.NON_TORCH and e.counts_toward_total
