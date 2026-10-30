@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from enum import IntFlag, auto
-from typing import Optional
+from typing import Dict, FrozenSet, Iterable, Optional, Tuple
 
 from strenum import StrEnum
 
@@ -500,3 +500,132 @@ class GroupwiseQuantAlgo:
     PRE_QUANT_SCALE = 4
     W4A8_ALPHA = 8
     INT8_WEIGHT = 16
+
+
+#: The Blackwell SM100 family, matching ``_utils.is_sm_100f``. The TRTLLM-Gen
+#: cubin drop is sm_100f (family-compatible) plus arch-specific sm_100a /
+#: sm_103a builds, so a family member without its own arch build -- SM107
+#: (Rubin), say -- still runs the family kernel. Enumerating only the
+#: architectures that happen to have their own build would reject the rest.
+SM100_FAMILY_SM_VERSIONS: Tuple[int, ...] = tuple(range(100, 110))
+
+#: SM architectures each FP4 quantization algorithm ships kernels for, keyed by
+#: :class:`QuantAlgo`. Union of what the backends accept -- TRTLLM-Gen serves
+#: the whole SM100 family, Cutlass the architectures in its own
+#: ``_QUANT_SUPPORT_TABLE`` -- because any one of them running is enough for
+#: the layer to build. An algorithm that is absent has no architecture
+#: restriction to fail fast on.
+#:
+#: ``W4A16_NVFP4`` is deliberately absent: its weights are dequantized to the
+#: activation dtype before the GEMM, so what finally runs is the
+#: high-precision kernel, which every supported architecture has.
+FP4_SUPPORTED_SM_VERSIONS: Dict[str, Tuple[int, ...]] = {
+    QuantAlgo.NVFP4:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    QuantAlgo.NVFP4_AWQ:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    QuantAlgo.NVFP4_ARC:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    QuantAlgo.W4A8_NVFP4_FP8:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    QuantAlgo.W4A8_MXFP4_FP8:
+    SM100_FAMILY_SM_VERSIONS,
+    QuantAlgo.W4A8_MXFP4_MXFP8:
+    SM100_FAMILY_SM_VERSIONS + (120, 121),
+    # Hopper through Cutlass and Triton, the SM100 family through TRTLLM-Gen.
+    QuantAlgo.W4A16_MXFP4: (90, ) + SM100_FAMILY_SM_VERSIONS,
+}
+
+#: Architectures the Marlin weight-only NVFP4 kernels reach, on top of the
+#: table above. Marlin dequantizes NVFP4 weights inside the GEMM, so it serves
+#: an NVFP4 checkpoint on Ada and Hopper -- but a caller opts into it, hence
+#: the ``marlin_available`` argument rather than a second unconditional entry.
+NVFP4_MARLIN_SM_VERSIONS: Tuple[int, ...] = tuple(range(89, 100))
+
+#: Algorithms whose weights the Marlin kernels can consume. ``NVFP4_ARC`` is
+#: absent because ``Linear.get_quant_method`` only swaps the exact
+#: ``NVFP4LinearMethod`` for the Marlin one, never its ARC subclass.
+_MARLIN_CAPABLE_QUANT_ALGOS: FrozenSet[str] = frozenset({
+    QuantAlgo.NVFP4,
+    QuantAlgo.NVFP4_AWQ,
+})
+
+
+def _format_sm_versions(sm_versions: Optional[Iterable[int]]) -> str:
+    """Name architectures for an error message, collapsing contiguous runs.
+
+    ``(100, 103, 120, 121)`` reads as ``"SM100, SM103, SM120, SM121"``, while
+    the eleven Marlin architectures collapse to ``"SM89-SM99"`` rather than
+    filling the message. A pair is spelled out; only three or more collapse,
+    since ``"SM120-SM121"`` is no shorter than naming both.
+    """
+    versions = sorted(set(sm_versions or ()))
+    if not versions:
+        return "no architecture"
+
+    runs = []
+    first = last = versions[0]
+    for version in versions[1:]:
+        if version == last + 1:
+            last = version
+            continue
+        runs.append((first, last))
+        first = last = version
+    runs.append((first, last))
+
+    parts = []
+    for low, high in runs:
+        if high - low >= 2:
+            parts.append(f"SM{low}-SM{high}")
+        else:
+            parts.extend(f"SM{version}" for version in range(low, high + 1))
+    return ", ".join(parts)
+
+
+def get_fp4_supported_sm_versions(
+        quant_algo: Optional[str],
+        marlin_available: bool = False) -> Optional[Tuple[int, ...]]:
+    """The SM architectures ``quant_algo`` runs on, or None when unrestricted.
+
+    ``marlin_available`` says the caller can reach the Marlin weight-only
+    kernels: the NVFP4 GEMM was given ``marlin`` among its allowed backends, or
+    the layer resolved to ``MarlinNVFP4LinearMethod``. Without it an NVFP4
+    checkpoint needs the FP4 tensor cores, and Ada/Hopper are out of range.
+    """
+    supported = FP4_SUPPORTED_SM_VERSIONS.get(quant_algo)
+    if supported is None:
+        return None
+    if marlin_available and quant_algo in _MARLIN_CAPABLE_QUANT_ALGOS:
+        return tuple(sorted(set(supported) | set(NVFP4_MARLIN_SM_VERSIONS)))
+    return supported
+
+
+def is_fp4_supported(sm: Optional[int],
+                     quant_algo: Optional[str],
+                     marlin_available: bool = False) -> bool:
+    """Whether GPU architecture ``sm`` can run ``quant_algo``.
+
+    An unknown architecture -- ``None``, or the ``-1`` that ``get_sm_version``
+    reports with no visible device -- is accepted: there is nothing to fail
+    fast on, and the kernel still refuses at launch.
+    """
+    if sm is None or sm < 0:
+        return True
+    supported = get_fp4_supported_sm_versions(quant_algo, marlin_available)
+    return supported is None or sm in supported
+
+
+def get_fp4_support_error_message(sm: Optional[int],
+                                  quant_algo: Optional[str],
+                                  marlin_available: bool = False) -> str:
+    """Why ``sm`` cannot run ``quant_algo``, naming what can run it instead."""
+    sm_str = f"SM{sm}" if sm is not None and sm >= 0 else "unknown GPU"
+    supported = get_fp4_supported_sm_versions(quant_algo, marlin_available)
+    message = (f"{quant_algo} is not supported on {sm_str}. Supported "
+               f"architectures: {_format_sm_versions(supported)}.")
+    if not marlin_available and quant_algo in _MARLIN_CAPABLE_QUANT_ALGOS:
+        message += (
+            f" {_format_sm_versions(NVFP4_MARLIN_SM_VERSIONS)} can run it "
+            "through the weight-only Marlin kernels instead; add 'marlin' to "
+            "nvfp4_gemm_config.allowed_backends to enable them.")
+    return message
