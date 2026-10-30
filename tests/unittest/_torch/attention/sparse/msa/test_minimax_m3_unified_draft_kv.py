@@ -185,6 +185,28 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+@pytest.mark.parametrize("draft_window", [DRAFT_WINDOW, None])
+def test_page_indices_follow_the_layer_owner(draft_window: Optional[int]) -> None:
+    """Target layers get raw slot ids and draft layers base view rows, even in one lifecycle."""
+    torch.cuda.init()
+    manager = _manager(_specs(draft_window))
+    try:
+        (request,) = manager.add_dummy_requests([7], token_nums=[200])
+        for layer in manager.pp_layers:
+            raw = manager.get_batch_cache_indices([7], layer_idx=layer, raw_indices=True)[0]
+            indices = manager.get_batch_cache_indices([7], layer_idx=layer)[0]
+            if layer in manager.draft_layer_ids:
+                scale = manager.get_layer_page_index_scale(layer)
+                expected = [s * scale // 2 if s >= 0 else s for s in raw]
+            else:
+                expected = raw
+            assert indices[: len(raw)] == expected, layer
+        manager.free_resources(request)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 def test_nvfp4_draft_layers_are_rejected() -> None:
     """Block scales belong to the sparse target layers, so an NVFP4 drafter cannot join."""
     specs = _specs()

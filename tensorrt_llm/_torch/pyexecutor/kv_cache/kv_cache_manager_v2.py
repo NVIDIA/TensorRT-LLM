@@ -3922,8 +3922,8 @@ class KVCacheManagerV2(BaseResourceManager):
         as many tokens as the target. They need only every admissible sequence's window plus
         one context chunk, which is what the KV cache cost already charges for them.
         """
-        if self.max_num_tokens is None:
-            # Without a context-chunk bound the backend's split is the safe one.
+        if self.max_num_tokens is None or gpu_quota <= 0:
+            # Without a context-chunk bound or a quota the backend's split is the safe one.
             return None
         owners = [spec.owner for spec in self.layer_specs]
         # Key layers as the backend groups them into lifecycles (sinks count in whole blocks).

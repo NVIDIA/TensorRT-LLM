@@ -29,7 +29,7 @@ Provides:
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -431,7 +431,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if self.dtype == DataType.NVFP4:
             dense_target_layers = [
                 layer
-                for layer in self.target_layer_ids
+                for layer in (
+                    self.target_layer_ids if self.layer_specs is not None else self.layer_offsets
+                )
                 if layer not in self.sparse_layer_ids and layer not in self._shared_draft_layer_ids
             ]
             logger.info(
@@ -587,11 +589,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return None
         return super()._get_block_scale_role(role_a, layer_id)
 
-    def get_draft_kv_cache_view(self) -> Optional["MiniMaxM3DraftKVCacheView"]:
+    def get_draft_kv_cache_view(
+        self,
+    ) -> Optional[Union["MiniMaxM3DraftKVCacheView", "MiniMaxM3KVCacheManagerV2"]]:
         """FP8/P128 view of the shared draft layer in a hybrid NVFP4 cache, or None.
 
         FP8/BF16 caches address the draft layer through this manager's own
-        attention-op pools instead.
+        attention-op pools instead. With explicit draft layer specs, this
+        manager itself is the draft view.
 
         Only meaningful on a target manager carrying appended one-model
         draft layers; built lazily so the manager's page tables exist. A
@@ -1083,11 +1088,35 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         return layers_by_addr.index(int(layer_id))
 
-    def _draft_pool_ids(self) -> frozenset:
-        """Pools that hold the explicit draft layers."""
-        return frozenset(
-            self.layer_to_pool_mapping_dict[self.layer_offsets[layer]]
-            for layer in self.draft_layer_ids
+    def get_batch_cache_indices(
+        self,
+        request_ids: List[int],
+        layer_idx: Optional[int] = None,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
+        *,
+        raw_indices: bool = False,
+    ) -> List[List[int]]:
+        """Return indices into a layer's :meth:`get_buffers` view.
+
+        Explicit draft layers keep the base view, so their indices take the base
+        conversion; every other layer gets raw slot ids.
+        """
+        if (
+            self.layer_specs is None
+            or layer_idx is None
+            or self.get_layer_owner(layer_idx) is not KVCacheLayerOwner.DRAFT
+        ):
+            return super().get_batch_cache_indices(
+                request_ids, layer_idx, num_blocks_per_seq, raw_indices=raw_indices
+            )
+        return KVCacheManagerV2._get_batch_cache_indices_by_pool_id(
+            self,
+            request_ids,
+            pool_id=self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]],
+            is_kv_aggregate=not raw_indices,
+            num_blocks_per_seq=num_blocks_per_seq,
+            index_scale=1 if raw_indices else self.get_layer_page_index_scale(layer_idx),
+            kv_factor=self.get_layer_kv_factor(layer_idx),
         )
 
     def _get_batch_cache_indices_by_pool_id(
@@ -1115,8 +1144,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         ``BAD_PAGE_INDEX`` slots remain ``-1`` here because disaggregation's
         :class:`KVRegionExtractorV1` filters ``region_ids >= 0``.
         :meth:`get_block_ids_per_seq` maps them to zero for the attention
-        metadata's padded tensor. Pools of explicit draft layers keep the
-        base conversion, matching their base :meth:`get_buffers` view.
+        metadata's padded tensor.
 
         Args:
             request_ids: Request IDs whose page-index rows are returned.
@@ -1131,16 +1159,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kv_factor: Kept for compatibility with the base virtual method;
                 M3 returns raw slot IDs without KV aggregation.
         """
-        if self.layer_specs is not None and pool_id in self._draft_pool_ids():
-            # Draft layers keep the base get_buffers() view, so their indices take the base conversion.
-            return super()._get_batch_cache_indices_by_pool_id(
-                request_ids,
-                pool_id=pool_id,
-                is_kv_aggregate=is_kv_aggregate,
-                num_blocks_per_seq=num_blocks_per_seq,
-                index_scale=index_scale,
-                kv_factor=kv_factor,
-            )
         res = []
         for req_idx, req_id in enumerate(request_ids):
             kv_cache = self.kv_cache_map[req_id]
