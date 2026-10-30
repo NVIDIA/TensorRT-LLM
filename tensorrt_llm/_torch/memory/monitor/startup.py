@@ -44,6 +44,7 @@ __all__ = [
     "MemoryPlan",
     "Reading",
     "RegionSample",
+    "first_use",
     "region",
     "residual_breakdown",
     "begin_stage",
@@ -114,6 +115,11 @@ class RegionSample:
 
 _stages: list[StageSample] = []
 _regions: list[RegionSample] = []
+#: Residual taken by regions nested in each open region, innermost last, so
+#: a region inside another is not counted twice.
+_open_regions: list[int] = []
+#: Names passed to :func:`first_use` so far.
+_used: set[str] = set()
 _first: Reading | None = None
 _active_stage: str | None = None
 _failed: StageSample | None = None
@@ -191,12 +197,33 @@ def region(name: str):
         yield
         return
     before = _reading()
+    _open_regions.append(0)
     try:
         yield
     finally:
+        nested = _open_regions.pop()
         after = _reading() if before is not None else None
         if after is not None:
-            _regions.append(RegionSample(name, _active_stage, after.residual - before.residual))
+            taken = after.residual - before.residual
+            _regions.append(RegionSample(name, _active_stage, taken - nested))
+            if _open_regions:
+                _open_regions[-1] += taken
+
+
+@contextlib.contextmanager
+def first_use(name: str):
+    """:func:`region`, for the first time this process enters ``name`` only.
+
+    For code whose library allocates lazily on first call -- NCCL connecting
+    a communicator's peers, for instance -- and is called too often to
+    measure every time.
+    """
+    if name in _used or not _on():
+        yield
+        return
+    _used.add(name)
+    with region(name):
+        yield
 
 
 def set_stage_advice(names: dict[str, str], advice: dict[str, str]) -> None:
@@ -265,6 +292,8 @@ def clear() -> None:
     global _failed, _plan, _first, _active_stage
     _stages.clear()
     _regions.clear()
+    _open_regions.clear()
+    _used.clear()
     _failed = None
     _plan = None
     _first = None
@@ -359,4 +388,10 @@ def residual_breakdown(current_residual: int) -> list[tuple[str, int]]:
         )
     remainder = current_residual - sum(size for _, size in parts)
     parts.append(("since startup" if remainder >= 0 else "released since startup", remainder))
-    return parts
+    # A region entered more than once -- one workspace per mapping, say --
+    # is one part; listing it twice would let a caller keying by name drop
+    # all but one.
+    merged: dict[str, int] = {}
+    for name, size in parts:
+        merged[name] = merged.get(name, 0) + size
+    return list(merged.items())

@@ -76,6 +76,11 @@ class Category(StrEnum):
     COMM_SYMM_MEM = "comm.symm_mem"
     COMM_DEEPEP = "comm.deepep"
     COMM_NVLS = "comm.nvls"
+    COMM_NCCL_WINDOW = "comm.nccl_window"
+    COMM_NCCL = "comm.nccl"
+    COMM_ULYSSES = "comm.ulysses"
+    NATIVE_WORKSPACE = "native.workspace"
+    EPLB = "eplb"
     DWDP_PAGES = "dwdp.pages"
     CPP_BUFFERS = "cpp_buffers"
 

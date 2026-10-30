@@ -33,13 +33,16 @@ from typing import Protocol, runtime_checkable
 from tensorrt_llm.logger import logger
 
 from ..schema import Category, Entry
-from .comm import McastAllReduceProvider, SymmMemProvider
+from .comm import McastAllReduceProvider, NcclWindowProvider, SymmMemProvider
 from .misc import DeepEpProvider, DwdpPagePoolProvider, MemoryCountersProvider
 from .mnnvl import MnnvlProvider
+from .native import NativeMemoryProvider
 
 __all__ = [
     "DeepEpProvider",
     "McastAllReduceProvider",
+    "NativeMemoryProvider",
+    "NcclWindowProvider",
     "SymmMemProvider",
     "clear_registered_providers",
     "DwdpPagePoolProvider",
@@ -97,6 +100,8 @@ def default_providers() -> list[MonitorProvider]:
         MnnvlProvider(),
         McastAllReduceProvider(),
         SymmMemProvider(),
+        NcclWindowProvider(),
+        NativeMemoryProvider(),
         DeepEpProvider(),
         DwdpPagePoolProvider(),
         MemoryCountersProvider(),

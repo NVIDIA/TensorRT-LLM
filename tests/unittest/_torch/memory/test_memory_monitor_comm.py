@@ -30,6 +30,7 @@ from tensorrt_llm._torch.memory.monitor.providers.comm import (
     SymmMemProvider,
 )
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
+from tensorrt_llm._torch.memory.monitor.summary import GROUP_OF, Group
 
 MB = 1 << 20
 
@@ -121,3 +122,20 @@ class TestMcastAllReduce:
 def test_both_are_in_the_default_set():
     kinds = {type(p) for p in default_providers()}
     assert SymmMemProvider in kinds and McastAllReduceProvider in kinds
+
+
+class TestNcclWindow:
+    def _provider(self, monkeypatch, usage):
+        from tensorrt_llm._torch.memory.monitor.providers.comm import NcclWindowProvider
+
+        monkeypatch.setattr(NcclWindowProvider, "_op", staticmethod(lambda: lambda _d: usage))
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        return NcclWindowProvider()
+
+    def test_pooled_buffers_count_whether_or_not_checked_out(self, monkeypatch):
+        (entry,) = self._provider(monkeypatch, [3, 96 * MB, 32 * MB]).collect()
+        assert entry.size_bytes == 96 * MB
+        assert GROUP_OF[entry.category] is Group.COMMUNICATION
+
+    def test_no_buffers_no_row(self, monkeypatch):
+        assert self._provider(monkeypatch, [0, 0, 0]).collect() == []

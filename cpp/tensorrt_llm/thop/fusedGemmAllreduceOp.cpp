@@ -17,6 +17,7 @@
 #include "cutlass_extensions/gemm_configs.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -168,6 +169,9 @@ public:
         if (handle == nullptr)
         {
             TLLM_LOG_DEBUG("Creating allreduce workspace for %s", key.toString().c_str());
+            // Multicast mappings are rounded to the multicast granularity and come with barrier buffers, so the
+            // memory taken is measured rather than computed.
+            auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
             handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, key.group);
             GemmAllReduceImplInterface::ProblemArgs tmpArgs;
             int maxN = 16384;
@@ -177,6 +181,7 @@ public:
                 .argLaunchConfig(runner->getSupportedLaunchConfigs()[0]);
             auto workspace = runner->getPersistentWorkspace(tmpArgs);
             workspace->allocate();
+            tensorrt_llm::common::recordNativeAllocationMeasured("gemm_allreduce_nvls", freeBefore);
             mWorkspaces[key] = workspace;
             mHandles[key] = handle;
         }

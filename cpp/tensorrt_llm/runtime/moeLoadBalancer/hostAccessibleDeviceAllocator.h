@@ -88,6 +88,9 @@ public:
     void memcpyToDevice(void* dst, void const* src, size_t size);
 
 private:
+    // Label under which an allocation is reported to the native memory ledger, by backing.
+    char const* nativeMemoryLabel(bool gdr) const;
+
     struct AllocationInfo
     {
         size_t size;
