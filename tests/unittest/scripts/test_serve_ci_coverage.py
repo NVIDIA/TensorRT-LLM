@@ -121,6 +121,38 @@ def test_load_data_rejects_duplicate_keys(mod, tmp_path):
         mod.load_data(tmp_path / "data.yml")
 
 
+@pytest.mark.parametrize(
+    "merge",
+    [
+        "{required: [{path: p/a.py, why: w}], required: []}",
+        "[{required: [{path: p/a.py, why: w}], required: []}]",
+        "{<<: {required: [{path: p/a.py, why: w}], required: []}}",
+    ],
+    ids=["mapping", "sequence", "nested"],
+)
+def test_load_data_rejects_duplicate_keys_in_merge_sources(mod, tmp_path, merge):
+    text = (
+        "version: 1\n"
+        "multi_gpu:\n"
+        f"  <<: {merge}\n"
+        "  file: t.groovy\n"
+        "  managed_prefix: p/\n"
+        "  forbidden: []\n"
+        "visual_gen: {file: r.py, tuples: []}\n"
+        "codeowners: {file: O, managed_prefixes: [], required: []}\n"
+    )
+    assert mod.validate_data(yaml.safe_load(text)) == []
+    _write(tmp_path, "data.yml", text)
+    with pytest.raises(mod.ParseError, match="found duplicate key 'required'"):
+        mod.load_data(tmp_path / "data.yml")
+
+
+def test_merge_sources_still_allow_explicit_overrides(mod):
+    assert yaml.load("<<: {required: [a]}\nrequired: []\n", Loader=mod._UniqueKeyLoader) == {
+        "required": []
+    }
+
+
 # --------------------------- parse_related_file_list ---------------------------
 
 

@@ -73,9 +73,10 @@ def validate_data(data: object) -> list[str]:
 
     def _req(mapping: dict, key: str, kind: type, where: str) -> object:
         value = mapping.get(key)
+        key_path = f"{where}.{key}" if where else key
         if not isinstance(value, kind):
             errors.append(
-                f"{DATA_FILE_HINT}: `{where}.{key}` must be a {kind.__name__}, got "
+                f"{DATA_FILE_HINT}: `{key_path}` must be a {kind.__name__}, got "
                 f"{type(value).__name__}"
             )
             return None
@@ -143,7 +144,16 @@ def validate_data(data: object) -> list[str]:
 class _UniqueKeyLoader(yaml.SafeLoader):
     """SafeLoader that rejects a repeated mapping key instead of keeping its last value."""
 
-    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict:
+    def __init__(self, stream: str) -> None:
+        super().__init__(stream)
+        self._checked_mappings: set[yaml.MappingNode] = set()
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        # SafeLoader recursively flattens merge sources before constructing them.
+        # Check their original keys once, allowing explicit overrides of merged keys.
+        if node in self._checked_mappings:
+            return
+        self._checked_mappings.add(node)
         seen: set[object] = set()
         for key_node, _ in node.value:
             # Merge keys and (unhashable) non-scalar keys are left to SafeLoader.
@@ -158,7 +168,7 @@ class _UniqueKeyLoader(yaml.SafeLoader):
                     key_node.start_mark,
                 )
             seen.add(key)
-        return super().construct_mapping(node, deep=deep)
+        super().flatten_mapping(node)
 
 
 def load_data(path: Path) -> dict:
@@ -383,7 +393,7 @@ def check_visual_gen(repo: Path, data: dict) -> list[str]:
                     "file. Add a prefix in the PR that creates the directory (for "
                     "`tensorrt_llm/serve/api/visual_gen/`, in the PR that adds the "
                     "VisualGen serving import-isolation tests). Approval: CBTS owners "
-                    "(@NVIDIA/trt-llm-devs, .github/CODEOWNERS:74)."
+                    "(@NVIDIA/trt-llm-devs, `/jenkins/scripts/cbts` in .github/CODEOWNERS)."
                 )
     return failures
 

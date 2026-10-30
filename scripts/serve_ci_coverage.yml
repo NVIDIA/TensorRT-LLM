@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Data for scripts/check_serve_ci_coverage.py: CI-coverage invariants of the
 # trtllm-serve refactor (epic TRTLLM-17056). Change it together with the files it
-# describes. See tensorrt_llm/serve/AGENTS.md.
+# describes.
 version: 1
 
 multi_gpu:
@@ -25,9 +25,9 @@ multi_gpu:
     - {path: tensorrt_llm/serve/app.py, why: "composition root"}
     - {path: tensorrt_llm/serve/disagg/, why: "the disaggregated serving package"}
   forbidden:
-    - {path: tensorrt_llm/serve/, why: "covers all of serve; every serve change would start the 31 multi-GPU stages"}
-    - {path: tensorrt_llm/serve/api/, why: "one entry per subpackage; a subtree entry drags unrelated code into the 31 multi-GPU stages"}
-    - {path: tensorrt_llm/serve/api/openai/, why: "one entry per subpackage; a subtree entry drags unrelated code into the 31 multi-GPU stages"}
+    - {path: tensorrt_llm/serve/, why: "covers all of serve; every serve change would start every multi-GPU stage"}
+    - {path: tensorrt_llm/serve/api/, why: "one entry per subpackage; a subtree entry drags unrelated code into every multi-GPU stage"}
+    - {path: tensorrt_llm/serve/api/openai/, why: "one entry per subpackage; a subtree entry drags unrelated code into every multi-GPU stage"}
     - {path: tensorrt_llm/serve/api/visual_gen/, why: "deliberately not added: no VisualGen serving test runs on a multi-GPU stage, and CBTS Tier 1 claims VisualGen-only PRs"}
 
 visual_gen:
