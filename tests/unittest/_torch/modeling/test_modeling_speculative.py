@@ -119,17 +119,11 @@ def test_draft_kv_cache_quant_algo_without_layer_settings(override: QuantAlgo | 
 @pytest.mark.parametrize("is_mtp", [False, True])
 def test_draft_kv_cache_quant_algo_mixed_precision_default(model_override, is_mtp) -> None:
     """The model's own draft override always wins; the mixed-precision default skips MTP heads."""
-    extra_attrs = {"mixed_precision_draft_kv_cache_quant_algo": QuantAlgo.NO_QUANT}
+    target = ModelConfig(quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4))
+    target.extra_attrs["mixed_precision_draft_kv_cache_quant_algo"] = QuantAlgo.NO_QUANT
     if model_override is not None:
-        extra_attrs["draft_kv_cache_quant_algo_override"] = model_override
-    target = SimpleNamespace(
-        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
-        extra_attrs=extra_attrs,
-    )
-    draft = SimpleNamespace(
-        quant_config=SimpleNamespace(kv_cache_quant_algo=None),
-        quant_config_dict=None,
-    )
+        target.extra_attrs["draft_kv_cache_quant_algo_override"] = model_override
+    draft = ModelConfig(quant_config=QuantConfig())
 
     _set_draft_kv_cache_quant_algo(draft, target, is_mtp=is_mtp)
 
