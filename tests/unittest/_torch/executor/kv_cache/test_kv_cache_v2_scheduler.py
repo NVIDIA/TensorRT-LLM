@@ -3148,6 +3148,24 @@ class TestDisagg:
         sched.schedule_request(reqs, set())
         assert called == [0, 1]
 
+    @pytest.mark.parametrize("has_adapter", [True, False])
+    def test_disagg_admits_the_prompt_the_layout_adapter_says_moves(self, monkeypatch, has_adapter):
+        """The scheduler hands prepare_disagg_gen_init the manager's layout adapter's
+        transfer_length, which a CSA2 remote-tail request sets short of the prompt; a manager
+        without an adapter admits the whole prompt (None)."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout import adapter
+
+        layout = Mock()
+        layout.transfer_length.return_value = 37
+        monkeypatch.setattr(adapter, "adapter_for", lambda manager: layout if has_adapter else None)
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        req = make_disagg_request(0)
+        sched.schedule_request([req], set())
+        mgr.prepare_disagg_gen_init.assert_called_once_with(req, 37 if has_adapter else None)
+        if has_adapter:
+            layout.transfer_length.assert_called_once_with(req)
+
     def test_disagg_exceeds_max_batch_size(self):
         """Disagg count can exceed max_batch_size since it bypasses budget."""
         mgr = make_kv_cache_manager()

@@ -440,10 +440,11 @@ def run_kv_transfer_test(
         # (add_new_token changes is_first_context_chunk).
         #
         # Gen ranks take the disagg-gen-init path: prepare_disagg_gen_init
-        # sizes the cache for the full prompt and pre-declares
-        # history_length=prompt_len, matching what the V2 scheduler's
-        # _try_schedule_disagg_gen_init does in production so the
-        # transceiver's TRANS_COMPLETE contract check is satisfied.
+        # sizes the cache for the full prompt and pre-declares as history
+        # the prompt tokens the layout adapter says a transfer brings,
+        # matching what the V2 scheduler's _try_schedule_disagg_gen_init
+        # does in production so the transceiver's TRANS_COMPLETE contract
+        # check is satisfied.
         # Ctx ranks take the regular prefill path (prepare_context +
         # resize_context).
         gen_batches: Dict[int, ScheduledRequests] = {}
@@ -452,8 +453,9 @@ def run_kv_transfer_test(
             if reqs:
                 batch = ScheduledRequests()
                 batch.context_requests_last_chunk = reqs
+                layout = adapter_for(gen_managers[rank])
                 for req in reqs:
-                    gen_managers[rank].prepare_disagg_gen_init(req)
+                    gen_managers[rank].prepare_disagg_gen_init(req, layout.transfer_length(req))
                 gen_batches[rank] = batch
 
         ctx_batches: Dict[int, ScheduledRequests] = {}

@@ -557,9 +557,9 @@ def _defined_by(cls: type, name: str) -> type:
 _PKG = "tensorrt_llm._torch"
 
 # Manager class (module.qualname) -> its adapter, as (module under ``adapters``, class name) or the
-# class itself. A manager takes the adapter of the first class of its MRO with an entry, after the
-# attention layout policy installed on it, if any; a manager none of whose classes has one has no
-# adapter.
+# class itself. A manager takes the adapter of the first class of its MRO with an entry; an attention
+# layout policy installed on a manager not deriving from it comes first. A manager none of whose
+# classes has one has no adapter.
 _ADAPTERS: dict[str, tuple[str, str] | type[CacheLayoutAdapter]] = {
     f"{_PKG}.pyexecutor.kv_cache.kv_cache_manager_v2.KVCacheManagerV2": CacheLayoutAdapter,
     f"{_PKG}.pyexecutor.kv_cache.mamba_cache_manager.MambaHybridCacheManagerV2": (
@@ -612,9 +612,13 @@ def adapter_class_for(manager_class: type) -> type[CacheLayoutAdapter] | None:
 
 
 def adapter_for(manager: object) -> CacheLayoutAdapter | None:
-    """The adapter of ``manager``: that of the attention layout policy installed on it, else that
-    of its class (``adapter_class_for``); None for a manager no adapter describes."""
+    """The adapter of ``manager``: that of the attention layout policy installed on it when the
+    manager does not derive from the policy, else that of its class (``adapter_class_for``), whose
+    MRO reaches the policy past any subclass registering its own; None for a manager no adapter
+    describes."""
     policy = getattr(manager, "_attention_cache_layout_policy", None)
+    if isinstance(policy, type) and isinstance(manager, policy):
+        policy = None
     for cls in (policy, type(manager)):
         if isinstance(cls, type):
             adapter = adapter_class_for(cls)
