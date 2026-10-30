@@ -9,6 +9,10 @@ Wraps the in-tree module callable
 (tier-2 sourcing: the recurrence has no op boundary). One launch of the vendored
 Triton kernel ``_cached_replay_kernel`` -- plain ``triton.jit``, no autotuner;
 the Python body picks the launch configuration from the shapes.
+
+This target's local variant (r46) of the tp1 target's entry of the same name: tp1's
+cells, plus a tp4/tep4 rank's 4 key / 12 value heads over the stock tep4 engine's bf16
+state page.
 """
 
 from __future__ import annotations
@@ -38,6 +42,14 @@ ENGINE_SLOTS = 461
 #: Layers per slot at which the last of `ENGINE_SLOTS` slots starts past 2^31 elements of
 #: the pool (`460 * L * 48 * 128 * 128 > 2**31` from L = 6).
 PAST_INT32_LAYERS = 8
+#: A tp4/tep4 rank's GDN heads: 16 key / 48 value split four ways.
+RANK_K_HEADS, RANK_V_HEADS = 4, 12
+#: The stock tep4 engine's recurrent-state slots a rank at core's config (bf16 state,
+#: host-resident PLE table): the final manager's `PLE state views bound ... [1874, ...]`.
+TEP4_SLOTS = 1874
+#: GDN layers whose states share one slot page in the stock manager (48 layers, every 4th
+#: full attention): the slot stride is 36 layers' `[HV, V, K]` states.
+PAGE_LAYERS = 36
 
 
 def _cell_spec(path, n, t, **spec) -> dict:
@@ -47,6 +59,25 @@ def _cell_spec(path, n, t, **spec) -> dict:
 def _bf16_cell(why, path, n, t, **spec) -> Cell:
     return Cell(
         why=f"bf16 state {why}", spec=_cell_spec(path, n, t, state_dtype=torch.bfloat16, **spec)
+    )
+
+
+def _tep4_cell(why, path, n, t, **spec) -> Cell:
+    """A tp4/tep4 rank's heads over the stock tep4 engine's bf16 state page."""
+    return Cell(
+        why=f"tep4 {why}",
+        spec=_cell_spec(
+            path,
+            n,
+            t,
+            state_dtype=torch.bfloat16,
+            H=RANK_K_HEADS,
+            HV=RANK_V_HEADS,
+            history_size=HISTORY_SIZE,
+            slots=TEP4_SLOTS,
+            page_layers=PAGE_LAYERS,
+            **spec,
+        ),
     )
 
 
@@ -112,14 +143,22 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     # zeroed history, as the manager leaves a slot after prefill), edge_slots
     # (rows 0 and n-1 on the pool's last and first slot), dup (rows given the
     # SAME slot, as CUDA-graph padding repeats one dummy slot; only the other
-    # rows and slots are held to the reference). Every cell passes `packed_qkv`,
+    # rows and slots are held to the reference), H / HV (key / value heads; tp1's
+    # 16 / 48 where absent), history_size (16, the only one certified), page_layers
+    # (the stock manager's coalesced page: the slot stride is that many layers'
+    # states, `slots` slots of it a reserved virtual range with memory mapped under
+    # the touched slots only, the cell's `layers` the top sub-pages; rows on
+    # both ends of the pool, then spread over it). Every cell passes `packed_qkv`,
     # separate raw `a`/`b` projections, no `output` and `launch_with_pdl=False`.
     #
-    # Four cells, one over the three-cell budget: the forward reaches two commit
-    # paths (in-kernel below 16 requests, all-layer from 16) at two checkpoint
-    # dtypes, and two edges no main-shape cell can carry -- CUDA-graph padding
-    # rows sharing one slot, and slot offsets past 2^31 elements at the engine's
-    # pool.
+    # tp1's four cells: the forward reaches two commit paths (in-kernel below 16
+    # requests, all-layer from 16) at two checkpoint dtypes, and two edges no
+    # main-shape cell can carry -- CUDA-graph padding rows sharing one slot, and slot
+    # offsets past 2^31 elements at the engine's pool. Then a tp4/tep4 rank's six
+    # (r46): the verify widths T = 2, 4, 8 (max_draft_len 1, 3, 7), both commit
+    # paths, and N = 128, where a bf16 state turns on the large-workload mapping of
+    # the replay and the commit; all at the tep4 engine's page, whose top slot sits
+    # 1.3e10 elements past the base.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="all_layer n=32 T=8 full accept: commit every second step",
@@ -150,6 +189,40 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
                 steps=3,
             ),
         ),
+        _tep4_cell(
+            "small n=1 T=4: the in-kernel commit of the page's last slot (1873)",
+            "small",
+            1,
+            4,
+            steps=8,
+        ),
+        _tep4_cell(
+            "all_layer n=16 T=4: the smallest partitioned batch", "all_layer", 16, 4, steps=6
+        ),
+        _tep4_cell(
+            "all_layer n=32 T=8: the widest verify below N=128", "all_layer", 32, 8, steps=6
+        ),
+        _tep4_cell(
+            "all_layer n=128 T=4: bf16 at N=128, the large-workload mapping",
+            "all_layer",
+            128,
+            4,
+            steps=4,
+        ),
+        _tep4_cell(
+            "all_layer n=128 T=2: the BT=2 token tile (max_draft_len 1)",
+            "all_layer",
+            128,
+            2,
+            steps=6,
+        ),
+        _tep4_cell(
+            "all_layer n=128 T=8: the envelope's largest verify, 128 x 8 rows",
+            "all_layer",
+            128,
+            8,
+            steps=4,
+        ),
     )
 
     note = """
@@ -176,6 +249,16 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     when it does commit twice -- both silent at the op and far off the exact
     recurrence one step later.
 
+    This target at tp4/tep4 (`DecodeTarget._gdn_verify -> _replay_verify`): a rank's
+    4 key / 12 value heads, q/k/v the `[N, T, 4|12, 128]` views of the post-conv
+    `[N*T, 2560]` rows, `g`/`beta` `[N, T, 12]`, and `ssm_states` the layer's view of the
+    stock manager's bf16 state page, `[slots, 12, 128, 128]` at a slot stride of 36
+    layers' states (7,077,888 elements): 1874 slots at the stock tep4 engine, whose top
+    slot sits 1.3e10 elements past the page's base. The history buffers are
+    `[slots, 2, 16, 12|4, 128]` (and `[slots, 2, 12, 16]` fp32); the manager's all-layer
+    commit stays on, so the call is partitioned from N = 16 exactly as above. At dep4 a
+    rank holds all 16 / 48 heads, tp1's geometry.
+
     Metadata consumed: `state_indices` (one slot per row), and per slot
     `prev_num_accepted_tokens` and `cache_buf_idx`. `replay_work_items` /
     `n_writes` are only checked (shape, dtype); the kernel never reads them, their
@@ -200,14 +283,17 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     * the conv state is not this op's: under replay the conv still writes its
       per-step window and the manager promotes it.
 
-    The launch is one V tile, `num_warps=4`, `num_stages=1`, grid `(1, N * 48)`: the
-    tuned mappings need HV = 2H or 4H and never engage at HV/H = 3. The checkpoint's dtype
-    is the kernel's `STATE_FP32` specialization and nothing else below N = 128: an fp32
-    checkpoint enters the history rebuild's tensor-core dots as a bf16 hi/lo pair, a bf16
-    one as stored, and every commit is computed in fp32 and rounded once to the pool's
-    dtype. From N = 128 a bf16 state alone also turns on the L2-streaming mapping
-    (`main_num_stages=3`, a 5-stage commit), which no cell drives. `FLA_USE_FAST_OPS=1` at
-    import switches the kernel's `exp` to the approximate one; the cells run with it unset.
+    The kernels are Triton, JIT-compiled on first call for the running device; the cells
+    ran that JIT path on sm_103. The launch is one V tile, `num_warps=4`, grid
+    `(1, N * HV)`: the tuned mappings need HV = 2H or 4H and never engage at HV/H = 3
+    (16 / 48 and 4 / 12 alike). The checkpoint's dtype is the kernel's `STATE_FP32`
+    specialization and nothing else below N = 128: an fp32 checkpoint enters the history
+    rebuild's tensor-core dots as a bf16 hi/lo pair, a bf16 one as stored, and every
+    commit is computed in fp32 and rounded once to the pool's dtype. From N = 128 a bf16
+    state alone also turns on the large-workload mapping (`.cg` loads of the state and
+    the inputs, `main_num_stages=3`, and a 5-stage all-layer commit); the tep4 N = 128
+    cells drive it. `FLA_USE_FAST_OPS=1` at import switches the kernel's `exp` to the
+    approximate one; the cells run with it unset.
 
     CUDA-graph replay on new data is bit for bit the eager call (the test captures
     N = 32 at T = 8 over an fp32 checkpoint, with the all-layer commit). The two commit
@@ -215,15 +301,28 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     certified against each other; each form the target calls is certified against the
     reference by the cells.
 
-    Certified: the all-layer commit over an fp32 checkpoint at N = 32, T = 8 and at
-    N = 16, T = 3 with 8 interleaved layers over the engine's 461-slot pool (the last
-    slot's offset past 2^31 elements); the in-kernel commit over a bf16 checkpoint at
-    N = 4, T = 8 and over an fp32 one at N = 8, T = 3 with three CUDA-graph padding rows
-    on one shared slot. T = 5..8 share one compiled token tile (`BT = next_pow2(T) = 8`);
-    the cells drive the BT = 4 and BT = 8 tiles, not BT = 2 (T = 2). At T = 8 and history
+    Certified at tp1's 16 / 48 heads: the all-layer commit over an fp32 checkpoint at
+    N = 32, T = 8 and at N = 16, T = 3 with 8 interleaved layers over the tp1 engine's
+    461-slot pool (the last slot's offset past 2^31 elements); the in-kernel commit over a
+    bf16 checkpoint at N = 4, T = 8 and over an fp32 one at N = 8, T = 3 with three
+    CUDA-graph padding rows on one shared slot. T = 5..8 share one compiled token tile
+    (`BT = next_pow2(T) = 8`); these cells drive the BT = 4 and BT = 8 tiles, not
+    BT = 2 (T = 2). At T = 8 and history
     16 a slot whose every draft is accepted appends rows 8..15 at `pnat + T == 16` without
     wrapping and wraps on the next step, so it commits every second step; the
     `accept="full"` cells drive that boundary (in-kernel and all-layer commit).
+
+    Certified at a tp4/tep4 rank's 4 / 12 heads over a bf16 checkpoint on the stock tep4
+    engine's 1874-slot page (r46), each cell several consecutive verify steps from warm
+    histories with random acceptance, rows on both ends of the pool: the in-kernel commit
+    at N = 1, T = 4 on the page's last slot; the all-layer commit at N = 16, T = 4,
+    N = 32, T = 8, and N = 128 at T = 2, 4 and 8 (the large-workload mapping, the BT = 2,
+    4 and 8 token tiles, and the envelope's largest verify, 128 x 8 rows). Measured on
+    GB300 against the test's gates (fractions of each gate): output elements <= 0.52 of
+    4 bf16 ulps of their token block and relative RMS <= 0.64 of 1.5 ulps; the bf16
+    checkpoint <= 0.84 of 2 ulps of its head's absmax; `old_u` <= 0.50 of 4 ulps; `old_G`
+    <= 0.08 of its gate. A reference with the key heads reversed (value heads 0..2 on key
+    head 3) is refused by the output gate.
 
     Loud refusals: work items without `use_all_layer_commit` (ValueError) and the
     reverse (ValueError); one of `replay_work_items` / `n_writes` alone
@@ -243,12 +342,20 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     harmless: the entry's input guard makes it contiguous.
 
     Not certified: pre-gated `g`/`beta` (`A_log=None`); `use_qk_l2norm_in_kernel=
-    False`; an `ssm_states` other than fp32 or bf16, or a bf16 one at N >= 128; HV/H other
-    than 3, K or V other than 128; T = 2, or T outside 2..8 (T = 9 raises: the kernel's
-    bare `assert T <= 8`), at either `ssm_states` dtype; `history_size` other than 16; `old_u` /
-    `old_k` other than bf16, `old_G` other than fp32; a `scale`; any launch-knob
-    override (`block_v`, `num_warps`, `use_l2_*`, `main_num_stages`); an output
-    dtype other than bf16; int64 `state_indices`; N above 32.
+    False`; an `ssm_states` other than fp32 or bf16; at 16 / 48 heads a bf16 one at
+    N >= 128, N above 32, T = 2, and any slot count but the cells' (dep4's own pool is not
+    driven); HV/H other than 3, K or V other than 128; T = 3, 5, 6 and 7 at 4 / 12 (they
+    share the BT = 4 and 8 tiles), T outside 2..8 (T = 9 raises: the kernel's bare
+    `assert T <= 8`); N above 128; `history_size` other than 16; `old_u` / `old_k`
+    other than bf16, `old_G` other than fp32; a `scale`; any launch-knob override
+    (`block_v`, `num_warps`, `use_l2_*`, `main_num_stages`); an output dtype other than
+    bf16; int64 `state_indices`; `g`/`beta` as strided column views of the input
+    projection (the cells pass them contiguous). At 4 / 12: the commit over the engine's
+    36 layers (the cells commit 2 sub-pages of the 36-layer page; a 36-layer history puts
+    `old_u`'s layer offsets past 2^31 elements, addressed in int64 by the commit's source
+    but not driven); a tp4 engine's slot count and the MTP engine's at tep4 (neither has
+    been measured; 1874 is the core tep4 engine's); CUDA-graph capture and padding rows
+    sharing a slot (both certified at 16 / 48 only).
     """
 
     def __call__(
