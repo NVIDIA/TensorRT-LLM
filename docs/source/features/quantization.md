@@ -87,7 +87,7 @@ moe_config:
 ```
 
 NVFP4_PLUS supports bias-free SwiGLU experts, such as the routed experts of
-DeepSeek-V4. It needs `hidden_size` to be a multiple of 256 and the per-rank MoE
+DeepSeek-V4. It needs `hidden_size` to be a multiple of 512 and the per-rank MoE
 intermediate size to be a multiple of 128.
 
 

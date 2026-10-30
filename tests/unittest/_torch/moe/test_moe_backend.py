@@ -5377,8 +5377,8 @@ def test_w4a16_nvfp4_fc1_row_alignment_gate(moe_tp_size, rejected):
         (4096, 2048, 16, False),
         # A 192-wide FC2 input has 6 scale columns, not whole 128x4 tiles.
         (4096, 1536, 8, True),
-        # 36-byte scale rows break the FC1 kernel's 8-byte scale gather.
-        (1152, 2048, 1, True),
+        # 72-byte scale rows are not whole 16-byte FC1 scale gathers.
+        (2304, 2048, 1, True),
     ],
     ids=["aligned", "intermediate_unaligned", "hidden_unaligned"],
 )
@@ -5386,7 +5386,7 @@ def test_nvfp4_plus_shape_alignment_gate(
     hidden_size: int, intermediate_size: int, moe_tp_size: int, rejected: bool
 ) -> None:
     """With one scale per 32 values, NVFP4_PLUS needs 256 FC1 rows per shard
-    and a hidden size that is a multiple of 256."""
+    and a hidden size that is a multiple of 512."""
     problem = dataclasses.replace(
         _nvfp4_problem(intermediate_size, "Swiglu"),
         quant=QuantAlgo.NVFP4_PLUS.value,

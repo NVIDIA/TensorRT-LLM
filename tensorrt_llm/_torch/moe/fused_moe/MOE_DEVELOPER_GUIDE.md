@@ -707,7 +707,7 @@ the loader rejects a checkpoint that has them. `OVERRIDE_QUANT_ALGO=NVFP4_PLUS`
 selects the format; a checkpoint's own quantization config cannot name it.
 Under the override `moe_config.backend: AUTO` resolves to `CUTEDSL`, and any
 other backend is rejected while the config loads. The leaf needs `hidden_size`
-to be a multiple of 256 (the FC1 kernel gathers each token's scales in 8-byte
+to be a multiple of 512 (the FC1 kernel gathers each token's scales in 16-byte
 copies) and `intermediate_size_per_partition` a multiple of 128 (FC2 reads its
 input scales in whole 128x4 tiles), and declines other shapes as
 `SHAPE_UNALIGNED`. It runs the Rubin NVFP4 grouped-GEMM kernels with UE5M3
