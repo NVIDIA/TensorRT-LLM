@@ -970,22 +970,29 @@ class Fp4MlaV2CacheLayoutPolicy:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if kv_layout != "NHD":
             raise ValueError("FP4 MLA V2 cache buffers support only NHD layout.")
+        # Every attention layer looks these views up once per forward step.
+        cache_key = ("cache_buffers", layer_idx)
+        cached = self._fp4_mla_view_cache.get(cache_key)
+        if cached is not None:
+            return cached
         local_layer = self.layer_offsets[layer_idx]
         compact_layer = self._fp4_mla_compact_layer_idx(local_layer)
         manager_layer = self._cache_manager_layer_ids[compact_layer]
         storage_head_dim = self._storage_head_dim(local_layer)
-        kv_cache = self._role_view(
-            manager_layer,
-            Role.KEY,
-            torch.int8,
-            (self.kv_factor, self.tokens_per_block, 1, storage_head_dim // 2),
-        ).view(torch.uint8)
+        with _persistent_cache_view_mode():
+            kv_cache = self._role_view(
+                manager_layer,
+                Role.KEY,
+                torch.int8,
+                (self.kv_factor, self.tokens_per_block, 1, storage_head_dim // 2),
+            ).view(torch.uint8)
         sf_cache = self._role_view(
             manager_layer,
             Role.KEY_BLOCK_SCALE,
             torch.uint8,
             (self.tokens_per_block, storage_head_dim // FP4_BLOCK_SIZE),
         )
+        self._fp4_mla_view_cache[cache_key] = (kv_cache, sf_cache)
         return kv_cache, sf_cache
 
     def get_fp4_mla_cache_pool_bases(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1185,6 +1192,10 @@ class Fp4MlaV2CacheLayoutPolicy:
     def get_mla_v_packed_pool(self, local_layer: int) -> Optional[torch.Tensor]:
         if self.mla_v_head_dim is None:
             return None
+        cache_key = ("v_packed_pool", local_layer)
+        cached = self._fp4_mla_view_cache.get(cache_key)
+        if cached is not None:
+            return cached
         self._require_fp4_mla_decode_views(local_layer)
         pool = self._role_view(
             self._cache_manager_layer_ids[local_layer],
@@ -1192,7 +1203,10 @@ class Fp4MlaV2CacheLayoutPolicy:
             torch.uint8,
             (self.mla_v_head_dim, self.tokens_per_block // 2),
         )
-        return pool.reshape(pool.shape[0] * pool.shape[1], pool.shape[2])
+        with _persistent_cache_view_mode():
+            pool = pool.reshape(pool.shape[0] * pool.shape[1], pool.shape[2])
+        self._fp4_mla_view_cache[cache_key] = pool
+        return pool
 
     def get_mla_v_packed_pool_base(self) -> Optional[torch.Tensor]:
         if self.mla_v_head_dim is None or not self._fp4_mla_v_layer_ids:
@@ -1206,9 +1220,15 @@ class Fp4MlaV2CacheLayoutPolicy:
         return pool.reshape(pool.shape[0] * pool.shape[1], pool.shape[2])
 
     def get_mla_v_packed_page_offset(self, local_layer: int) -> int:
+        cache_key = ("v_packed_page_offset", local_layer)
+        cached = self._fp4_mla_view_cache.get(cache_key)
+        if cached is not None:
+            return cached
         self._require_fp4_mla_decode_views(local_layer)
         layer_id = self._cache_manager_layer_ids[local_layer]
-        return int(self.impl.get_page_index_converter(layer_id, Role.MLA_V_PACKED).layer_offset)
+        offset = int(self.impl.get_page_index_converter(layer_id, Role.MLA_V_PACKED).layer_offset)
+        self._fp4_mla_view_cache[cache_key] = offset
+        return offset
 
     def get_fp4_mla_hp_pool(self) -> torch.Tensor:
         return self._all_layer_role_view(
