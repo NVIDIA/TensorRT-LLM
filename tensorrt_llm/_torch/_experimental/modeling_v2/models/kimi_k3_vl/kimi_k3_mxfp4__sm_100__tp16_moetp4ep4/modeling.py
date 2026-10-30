@@ -833,7 +833,9 @@ _K3_ROUTED_EXPERT_MODULE_PREFIXES = ("language_model.model.", "model.")
 _K3_DEFAULT_ROUTED_QUANT_ALGO = QuantAlgo.W4A8_MXFP4_MXFP8
 
 
-def _load_packed_mxfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
+def _load_packed_mxfp4_expert(
+    backend, base, expert_idx, local_slot_id, get_tensor, _get_optional_tensor
+) -> None:
     backend.quant_method.load_packed_mxfp4_expert(
         backend,
         global_expert_id=expert_idx,
@@ -857,6 +859,7 @@ class _K3ExpertCkptSpec(NamedTuple):
     loaded_slots_attr: str
     # Whether the layer is finalized after its experts load (the MXFP4 loaders write through).
     needs_layer_finalize: bool
+    optional_suffixes: Tuple[str, ...] = ()
 
 
 _K3_EXPERT_CKPT_SPECS = {
