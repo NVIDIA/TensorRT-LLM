@@ -13,20 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The one-launch TP exchanges (distributed/ll_exchange.py) against the same reduction over every rank's
-inputs: key max / gather and greedy argmax of TPKeyExchange, and TPGroupExchange's subgroup all-gather,
+inputs: key max / gather and greedy argmax of TPKeyExchange, its argmax and temperature sample of
+vocabulary-sharded logits (also through the spec worker), and TPGroupExchange's subgroup all-gather,
 eager and replayed from a CUDA graph (the epochs keep advancing across launches)."""
 
+import math
 import pickle
 import sys
 import traceback
+from types import SimpleNamespace
 
 import cloudpickle
 import pytest
 import torch
+from _torch.helpers import gumbel_max_reference
 from mpi4py import MPI
 
 import tensorrt_llm
-from tensorrt_llm._torch.distributed.ll_exchange import TPGroupExchange, TPKeyExchange
+from tensorrt_llm._torch.distributed.ll_exchange import (
+    TPGroupExchange,
+    TPKeyExchange,
+    unpack_argmax_tokens,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -105,6 +114,153 @@ def _key_exchange(tp):
         ex.close()
 
 
+SHARD = 1000  # vocabulary columns per rank
+
+
+def _argmax_logits(tp):
+    mapping, rank = _mapping(tp)
+    ex = TPKeyExchange.create(mapping, max_rows=64)
+    assert ex is not None, "no peer memory for the exchange"
+    try:
+        for dtype in (torch.bfloat16, torch.float32):
+            for m in (1, 6, 64, 300):
+                g = torch.Generator(device="cuda").manual_seed(m)
+                # Few distinct values: ties inside a shard, across shards and across the programs of a row.
+                full = torch.randint(-3, 3, (m, tp * SHARD), generator=g, device="cuda").to(dtype)
+                if m >= 6:
+                    full[0] = 0.0
+                    full[0, 3::SHARD] = 1.0  # one maximum per shard, all equal: token 3
+                    full[1, SHARD - 1] = full[1, 2 * SHARD - 1] = 50.0  # tied across two shards
+                    full[2] = -float("inf")
+                    full[3] = -1.0
+                    full[3, SHARD + 2] = 0.0
+                    full[3, 7] = -0.0  # equal to +0.0: token 7
+                    full[4, -1] = 50.0  # last token of the last shard
+                # This rank's columns of the full rows (row stride tp * SHARD).
+                local = full[:, rank * SHARD : (rank + 1) * SHARD]
+                expected = torch.argmax(full.float(), dim=-1).to(torch.int32)
+                if m >= 6:
+                    assert expected[:5].tolist() == [3, SHARD - 1, 0, 7, tp * SHARD - 1]
+                for split in (None, 1, 3, 32):
+                    keys = torch.empty(m, dtype=torch.int64, device="cuda")
+                    tokens = ex.argmax_logits(local, rank * SHARD, max_out=keys, split=split)
+                    torch.cuda.synchronize()
+                    assert torch.equal(tokens, expected), (dtype, m, split)
+                    assert torch.equal(unpack_argmax_tokens(keys), expected), (dtype, m, split)
+
+        # CUDA-graph replays with fresh logits copied into the captured buffer.
+        m = 24
+        local = torch.zeros((m, SHARD), dtype=torch.bfloat16, device="cuda")
+        ex.argmax_logits(local, rank * SHARD)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            tokens = ex.argmax_logits(local, rank * SHARD)
+        for step in range(3):
+            g = torch.Generator(device="cuda").manual_seed(100 + step)
+            full = torch.randint(-3, 3, (m, tp * SHARD), generator=g, device="cuda")
+            local.copy_(full[:, rank * SHARD : (rank + 1) * SHARD])
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(tokens, torch.argmax(full, dim=-1).to(torch.int32)), step
+    finally:
+        MPI.COMM_WORLD.barrier()
+        ex.close()
+
+
+def _single_shard_sample(full, temperatures, seed):
+    """The draw of one shard holding the whole vocabulary (the noise of a token does not depend on
+    the sharding)."""
+    return gumbel_max_reference(full, temperatures, seed, GREEDY_TEMPERATURE_THRESHOLD)
+
+
+def _chi_square(counts, probs, z=5.0):
+    """Pearson statistic of ``counts`` against ``probs`` (bins under 5 expected draws merged) and its
+    critical value at ``z`` standard deviations (Wilson-Hilferty; z = 5 rejects a correct sampler
+    with probability 3e-7)."""
+    expected = probs.double() * counts.sum()
+    big = expected >= 5
+    obs, exp = counts[big].double(), expected[big]
+    rest_obs, rest_exp = counts[~big].sum().double(), expected[~big].sum()
+    if rest_exp >= 5:
+        obs, exp = torch.cat([obs, rest_obs.view(1)]), torch.cat([exp, rest_exp.view(1)])
+    else:
+        obs[-1] += rest_obs
+        exp[-1] += rest_exp
+    stat = float(((obs - exp) ** 2 / exp).sum())
+    dof = obs.numel() - 1
+    crit = dof * (1 - 2 / (9 * dof) + z * math.sqrt(2 / (9 * dof))) ** 3
+    return stat, crit
+
+
+def _gumbel_sample(tp, base_seed=0):
+    from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+
+    mapping, rank = _mapping(tp)
+    ex = TPKeyExchange.create(mapping, max_rows=64)
+    assert ex is not None, "no peer memory for the exchange"
+    vocab, rows, groups = tp * SHARD, 512, 4
+    group_temps = torch.tensor([0.6, 1.0, 1.5, 0.5 * GREEDY_TEMPERATURE_THRESHOLD], device="cuda")
+    temps = group_temps.repeat_interleave(rows // groups)  # the last group stays greedy
+    g = torch.Generator(device="cuda").manual_seed(base_seed + 1)
+    dists = (torch.randn((groups, vocab), generator=g, device="cuda") * 3).to(torch.bfloat16)
+    full = dists.repeat_interleave(rows // groups, dim=0)
+    local = full[:, rank * SHARD : (rank + 1) * SHARD]
+    greedy = torch.argmax(full.float(), dim=-1).to(torch.int32)
+    try:
+        # Each row draws its own noise: the rows of a group are independent samples of its logits.
+        counts = torch.zeros((groups - 1, vocab), dtype=torch.int64, device="cuda")
+        seed = torch.zeros(1, dtype=torch.int64, device="cuda")
+        for step in range(32):
+            seed.fill_(base_seed * 1000 + step + 1)
+            tokens = ex.argmax_logits(
+                local,
+                rank * SHARD,
+                temperature=temps,
+                seed=seed,
+                greedy_threshold=GREEDY_TEMPERATURE_THRESHOLD,
+                split=3 if step % 2 else None,
+            )
+            assert torch.equal(tokens, _single_shard_sample(full, temps, seed)), step
+            for group in range(groups - 1):
+                counts[group] += torch.bincount(
+                    tokens.view(groups, -1)[group].long(), minlength=vocab
+                )
+        gathered = MPI.COMM_WORLD.allgather(tokens.cpu())
+        assert all(torch.equal(t, gathered[0]) for t in gathered)
+        assert torch.equal(tokens.view(groups, -1)[-1], greedy.view(groups, -1)[-1])
+        for group in range(groups - 1):
+            probs = torch.softmax(dists[group].float() / group_temps[group], dim=-1)
+            stat, crit = _chi_square(counts[group].cpu(), probs.cpu())
+            assert stat < crit, (float(group_temps[group]), stat, crit)
+
+        # Through the spec worker: every temperature-only batch advances its device seed.
+        class _Worker(SpecWorkerBase):
+            @property
+            def max_draft_len(self):
+                return 1
+
+            def _forward_impl(self, *args, **kwargs):
+                raise NotImplementedError
+
+        worker = _Worker(key_exchange=ex)
+        worker.mapping = mapping
+        worker.cache_derived_state()
+        md = SimpleNamespace(
+            is_all_greedy_sample=False, sharded_target_logits=True, temperatures=temps
+        )
+        for step in (1, 2):
+            tokens = worker._sample_tokens_for_batch(local, md, 0, rows)
+            assert int(worker._gumbel_seed) == step
+            assert torch.equal(tokens, _single_shard_sample(full, temps, worker._gumbel_seed))
+        md.is_all_greedy_sample = True
+        assert torch.equal(worker._sample_tokens_for_batch(local, md, 0, rows), greedy)
+        torch.cuda.synchronize()
+    finally:
+        MPI.COMM_WORLD.barrier()
+        ex.close()
+
+
 def _group_allgather(tp):
     mapping, rank = _mapping(tp)
     group_size = 2
@@ -137,7 +293,12 @@ def _worker(fn, tp):
     return True
 
 
-CASES = {"key_exchange": _key_exchange, "group_allgather": _group_allgather}
+CASES = {
+    "key_exchange": _key_exchange,
+    "argmax_logits": _argmax_logits,
+    "gumbel_sample": _gumbel_sample,
+    "group_allgather": _group_allgather,
+}
 
 
 @pytest.mark.parametrize("case", list(CASES))

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SpecMetadata._scan_one_model_sampling reuses its last result for an unchanged batch and rescans otherwise."""
+"""SpecMetadata._scan_one_model_sampling reuses its last result for an unchanged batch and rescans otherwise,
+and sets the temperature-only graph key bit only for batches the sharded Gumbel-max sampler can draw."""
 
 import types
 
@@ -13,15 +14,16 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _Req:
-    def __init__(self, rid, slot, temperature):
+    def __init__(self, rid, slot, temperature, **params):
         self.py_request_id, self.py_seq_slot, self.temperature = rid, slot, temperature
+        self.params = dict(top_k=20, top_p=0.9, min_p=None, seed=None) | params
         self.state = LlmRequestState.GENERATION_IN_PROGRESS
         self.reads = 0
 
     @property
     def sampling_config(self):
         self.reads += 1
-        return types.SimpleNamespace(temperature=self.temperature, top_k=20, top_p=0.9, min_p=None)
+        return types.SimpleNamespace(temperature=self.temperature, **self.params)
 
 
 def _metadata(**overrides):
@@ -99,3 +101,63 @@ def test_scan_cache_skips_warmup_dummies_and_ragged():
     requests[0].py_verify_len = 3
     _scan(ragged, requests)
     assert _rescanned(ragged, requests)
+
+
+_TEMPERATURE_ONLY = dict(top_k=None, top_p=None)
+
+
+def _temperature_only(requests):
+    metadata = _metadata(temperature_only_graphs=True)
+    _scan(metadata, requests)
+    first = metadata.temperature_only
+    metadata.temperature_only = None  # clobbered between scans: restored from the cache
+    _scan(metadata, requests)
+    assert metadata.temperature_only is first
+    return first
+
+
+@pytest.mark.parametrize(
+    "params,expected",
+    [
+        (_TEMPERATURE_ONLY, True),
+        (dict(top_k=0, top_p=1.0, min_p=0.0), True),  # filters given but disabled
+        (dict(top_k=20, top_p=None), False),
+        (dict(top_k=None, top_p=0.9), False),
+        (dict(_TEMPERATURE_ONLY, min_p=0.05), False),
+        (dict(_TEMPERATURE_ONLY, seed=7), False),
+        (dict(_TEMPERATURE_ONLY, seed=2**64 - 1), False),
+    ],
+)
+def test_temperature_only_takes_unfiltered_unseeded_sampled_rows(params, expected):
+    # Greedy rows stay greedy on the sharded path whatever their filters or seed.
+    greedy = [_Req(6, 0, 0.0, seed=3), _Req(7, 1, 0.7, top_k=1, top_p=None, seed=3)]
+    assert _temperature_only([_Req(5, 2, 0.7, **params), *greedy]) is expected
+    # One filtered or seeded sampled row keeps the whole batch on the stock sampler.
+    other = _Req(8, 3, 1.3, **_TEMPERATURE_ONLY)
+    assert _temperature_only([other, _Req(5, 2, 0.7, **params)]) is expected
+
+
+def test_temperature_only_min_p_alone_samples_off_the_sharded_path():
+    # No temperature, top-k or top-p, but an active min-p: a sampled row (temperature 1) with a filter.
+    assert _temperature_only([_Req(5, 2, None, top_k=None, top_p=None, min_p=0.1)]) is False
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(temperature_only_graphs=False),
+        dict(use_rejection_sampling=True),
+        dict(enable_penalty=True),
+        dict(group_all_greedy_sample=True),
+    ],
+)
+def test_temperature_only_batch_gates(overrides):
+    requests = [_Req(5, 2, 0.7, **_TEMPERATURE_ONLY)]
+    assert _temperature_only(requests) is True
+    metadata = _metadata(**(dict(temperature_only_graphs=True) | overrides))
+    _scan(metadata, requests)
+    assert metadata.temperature_only is False
+
+
+def test_temperature_only_needs_a_sampled_row():
+    assert _temperature_only([_Req(5, 2, 0.0), _Req(6, 0, 0.0, seed=3)]) is False
