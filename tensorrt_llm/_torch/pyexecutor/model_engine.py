@@ -33,6 +33,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.interface import AttentionMetadata, AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
+from ..autotuner import AutoTuner, NvMMHConfig
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
@@ -121,6 +122,31 @@ def _configure_deep_gemm_pdl() -> None:
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 
+def _configure_autotuner_nvmmh(llm_args: TorchLlmArgs) -> None:
+    """Install the engine's nvMatmulHeuristics policy on the process AutoTuner.
+
+    Runs before model construction because CuTe DSL runners may enumerate
+    tactics while modules are built. The policy is process-wide, so engines
+    that share a process should use the same config; target and draft engines
+    share the LLM args and therefore the policy.
+    """
+    # Partial test doubles of TorchLlmArgs may omit the field.
+    config = getattr(llm_args, "autotuner_nvmmh_config", None)
+    if config is not None:
+        from ..custom_ops import cutedsl_matmul_heuristics
+
+        if not cutedsl_matmul_heuristics.IS_NVMMH_AVAILABLE:
+            logger.warning_once(
+                "autotuner_nvmmh_config is set but nvMatmulHeuristics cannot "
+                "be imported; CuTe DSL GEMM/BMM runners tune their full "
+                "tactic space.",
+                key="autotuner_nvmmh_unavailable",
+            )
+    AutoTuner.get().nvmmh_config = (
+        None if config is None else NvMMHConfig(max_tactics=config.max_tactics)
+    )
+
+
 class ModelEngine:
     """Own model setup and coordinate runner execution and resource lifetimes."""
 
@@ -177,6 +203,7 @@ class ModelEngine:
         services derived from the arguments; capacity may still be unset.
         Returns the encoder token budget before any multimodal increase."""
         _configure_deep_gemm_pdl()
+        _configure_autotuner_nvmmh(llm_args)
 
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError("encode_only and mm_encoder_only are mutually exclusive.")

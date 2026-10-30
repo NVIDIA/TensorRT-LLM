@@ -45,6 +45,7 @@ l0_gb300:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
+  - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
   # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_fused_prefill_conv.py

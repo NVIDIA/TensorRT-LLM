@@ -347,6 +347,21 @@
       "title": "AutoDecodingConfig",
       "type": "object"
     },
+    "AutoTunerNvMMHConfig": {
+      "additionalProperties": false,
+      "description": "nvMatmulHeuristics (nvMMH) guidance for the CuTe DSL GEMM/BMM autotuner.\n\nCuTe DSL GEMM and BMM runners profile only the kernel configurations that\nnvMatmulHeuristics ranks highest for each problem shape, taking every\nfield it models (CTA tile, cluster shape, split-K, rasterization order and\nswizzle) as returned, instead of profiling their full tactic space.\n``max_tactics`` counts kernel configurations, not profiled tactics.",
+      "properties": {
+        "max_tactics": {
+          "default": 5,
+          "description": "Number of top-ranked nvMatmulHeuristics kernel configurations kept per GEMM/BMM shape. Each configuration expands into one tactic per combination of the knobs nvMatmulHeuristics does not model (e.g. SM107 prefetch, scheduler and mixed-cluster variants), so the number of profiled tactics can be several times max_tactics.",
+          "exclusiveMinimum": 0,
+          "title": "Max Tactics",
+          "type": "integer"
+        }
+      },
+      "title": "AutoTunerNvMMHConfig",
+      "type": "object"
+    },
     "BlockReuseConfig": {
       "additionalProperties": false,
       "description": "Configuration for KV cache block reuse policies.",
@@ -1697,6 +1712,19 @@
           },
           "title": "Attn Backend",
           "type": "string"
+        },
+        "autotuner_nvmmh_config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutoTunerNvMMHConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Use nvMatmulHeuristics to shrink the CuTe DSL GEMM/BMM autotuning search space to its top-ranked kernel configurations. None profiles every tactic.",
+          "status": "prototype"
         },
         "backend": {
           "const": "pytorch",
@@ -7990,6 +8018,19 @@
       },
       "title": "Attn Backend",
       "type": "string"
+    },
+    "autotuner_nvmmh_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AutoTunerNvMMHConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Use nvMatmulHeuristics to shrink the CuTe DSL GEMM/BMM autotuning search space to its top-ranked kernel configurations. None profiles every tactic.",
+      "status": "prototype"
     },
     "backend": {
       "const": "pytorch",

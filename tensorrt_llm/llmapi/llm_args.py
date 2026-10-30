@@ -2004,6 +2004,24 @@ class Nvfp4GemmConfig(StrictBaseModel):
         description="List of backends to consider for auto-selection.")
 
 
+class AutoTunerNvMMHConfig(StrictBaseModel):
+    """nvMatmulHeuristics (nvMMH) guidance for the CuTe DSL GEMM/BMM autotuner.
+
+    CuTe DSL GEMM and BMM runners profile only the kernel configurations that
+    nvMatmulHeuristics ranks highest for each problem shape, taking every
+    field it models (CTA tile, cluster shape, split-K, rasterization order and
+    swizzle) as returned, instead of profiling their full tactic space.
+    ``max_tactics`` counts kernel configurations, not profiled tactics.
+    """
+    max_tactics: PositiveInt = Field(
+        default=5,
+        description=
+        "Number of top-ranked nvMatmulHeuristics kernel configurations kept per GEMM/BMM shape. "
+        "Each configuration expands into one tactic per combination of the knobs nvMatmulHeuristics "
+        "does not model (e.g. SM107 prefetch, scheduler and mixed-cluster variants), so the number "
+        "of profiled tactics can be several times max_tactics.")
+
+
 class AttentionDpConfig(StrictBaseModel):
     """Configuration for attention DP."""
     enable_balance: bool = Field(default=False,
@@ -6828,6 +6846,12 @@ class TorchLlmArgs(BaseLlmArgs):
         default=True,
         description=
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
+        status="prototype")
+
+    autotuner_nvmmh_config: Optional[AutoTunerNvMMHConfig] = Field(
+        default=None,
+        description=
+        "Use nvMatmulHeuristics to shrink the CuTe DSL GEMM/BMM autotuning search space to its top-ranked kernel configurations. None profiles every tactic.",
         status="prototype")
 
     use_fine_grained_sync: bool = Field(

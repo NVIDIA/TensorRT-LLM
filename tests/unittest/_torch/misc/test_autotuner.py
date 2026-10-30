@@ -22,6 +22,7 @@ import re
 import statistics
 import sys
 import tempfile
+from types import SimpleNamespace
 from typing import Any, List
 
 import cloudpickle
@@ -33,9 +34,10 @@ import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
 from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            DynamicDim, DynamicTensorSpec,
-                                           FakeTensor, OptimizationProfile,
-                                           StaticDim, TunableRunner,
-                                           TuningConfig, autotune)
+                                           FakeTensor, NvMMHConfig,
+                                           OptimizationProfile, StaticDim,
+                                           TunableRunner, TuningConfig,
+                                           autotune)
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.utils import (deep_gemm_jit_warmup_buckets,
                                        get_power_of_2_num_tokens_buckets,
@@ -1514,12 +1516,13 @@ def test_single_pair_shortcut_failure_is_logged_as_inf(monkeypatch):
 
 
 def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
-    """End-to-end guard for the nvMatmulHeuristics tactic pruning.
+    """End-to-end guard for the nvMatmulHeuristics tactic generation.
 
     For one representative problem size, the tactic the AutoTuner selects when
-    nvMatmulHeuristics prunes the tile/cluster candidates must be no slower (up
-    to a small tolerance) than the tactic it selects from the full CuteDSL
-    NVFP4 tactic sweep. This validates that pruning does not cost performance.
+    ``AutoTuner.nvmmh_config`` builds the candidates from nvMatmulHeuristics'
+    top configurations must be no slower (up to a small tolerance) than the
+    tactic it selects from the full CuteDSL NVFP4 tactic sweep. This validates
+    that the nvMMH guidance does not cost performance.
 
     It additionally compares the heuristic-chosen CuteDSL kernel against the
     cuBLASLt NVFP4 GEMM on the same fp4 inputs: the CuteDSL kernel-only device
@@ -1528,9 +1531,9 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
     kernel's CTA tile / cluster shape, so that is not asserted.
 
     Note: the sweep and heuristic paths do NOT profile identical candidate sets
-    -- the heuristic path is a strict validated subset of the sweep -- so the
-    exact winning tactic can differ. Only the achieved runtime is a meaningful
-    invariant, hence the tolerance comparisons.
+    -- nvMMH may also pick rasterization orders or swizzles the sweep does not
+    enumerate -- so the exact winning tactic can differ. Only the achieved
+    runtime is a meaningful invariant, hence the tolerance comparisons.
 
     Blackwell only (SM100/SM103) and requires the nvMatmulHeuristics library;
     skipped otherwise.
@@ -1602,15 +1605,13 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
                 best_name, best_total, best_count = e.key, t, max(1, e.count)
         return best_name, best_total / best_count
 
-    # Full sweep: heuristics disabled.
-    monkeypatch.delenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", raising=False)
+    # Full sweep: no nvMMH guidance.
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(tuner, "nvmmh_config", None)
     sweep_tactic = _best_tactic()
 
-    # Pruned: nvMatmulHeuristics drives the (coupled) tile+cluster candidates.
-    # Pin MAX_TACTICS so the tolerance below is not affected by an env override.
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", "1")
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_FIELDS", "tile,cluster")
-    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS", "5")
+    # nvMatmulHeuristics builds the candidates from its top 5 configurations.
+    monkeypatch.setattr(tuner, "nvmmh_config", NvMMHConfig(max_tactics=5))
     heuristic_tactic = _best_tactic()
 
     # cuBLASLt runs its own heuristic auto-tuning; warm it under autotune().
@@ -1629,10 +1630,10 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         lambda: runner(inputs, tactic=heuristic_tactic))
     _, cublas_us = _dominant_kernel(_cublas_call)
 
-    # Pruning must not degrade the achieved kernel runtime beyond this tolerance.
-    # With the default MAX_TACTICS=5 the heuristic set includes the empirical
-    # best tile (its cluster ranking can still be slightly off, ~2-3% on square
-    # 4096), so a tight bound catches gross regressions while allowing that.
+    # The guidance must not degrade the achieved kernel runtime beyond this
+    # tolerance. With the default max_tactics=5 the nvMMH set includes the
+    # empirical best tile (its cluster ranking can still be slightly off, ~2-3%
+    # on square 4096), so a tight bound catches gross regressions.
     tolerance = 1.05
     assert heuristic_us <= sweep_us * tolerance, (
         f"heuristic-pruned tactic {heuristic_tactic} ({heuristic_us:.2f} us) is "
@@ -1649,6 +1650,352 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
         f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
         f">{cublas_tolerance:.2f}x slower than cuBLAS NVFP4 "
         f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
+
+
+def _nvmmh_problem(case, sm_version):
+    """(runner, inputs, run, reference) of one nvMMH-aware CuTe DSL runner of
+    this GPU, or None if it has none for the case; run(tactic) returns that
+    tactic's output."""
+    from _torch.helpers import per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0
+
+    import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+
+    torch.manual_seed(0)
+    bf16 = torch.bfloat16
+    rubin = sm_version == 107
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", dtype=bf16)
+
+    def into(runner, inputs):
+
+        def run(tactic):
+            inputs[-1].fill_(float("nan"))
+            runner(inputs, tactic=tactic)
+            return inputs[-1]
+
+        return run
+
+    def returned(runner, inputs):
+        return lambda tactic: runner(inputs, tactic=tactic)
+
+    if case in ("bf16_gemm", "bf16_gemm_fp32_out"):
+        # nvMMH splits K of the FP32-output router GEMM and tiles the
+        # BF16-output decode GEMM narrowly.
+        fp32_out = case == "bf16_gemm_fp32_out"
+        m, n, k = (64, 256, 7168) if fp32_out else (64, 2112, 7168)
+        c_dtype = torch.float32 if fp32_out else bf16
+        a, b = randn(m, k), randn(n, k)
+        runner_class = (ops.CuteDSLBf16RubinGemmRunner
+                        if rubin else ops.CuteDSLBf16BlackwellGemmRunner)
+        runner = runner_class(output_dtype=c_dtype)
+        inputs = [a, b, torch.empty(m, n, device="cuda", dtype=c_dtype)]
+        return runner, inputs, into(runner, inputs), a.float() @ b.float().t()
+    if case in ("bf16_bmm", "bf16_bmm_fp8_out"):
+        fp8_out = case == "bf16_bmm_fp8_out"
+        if fp8_out and rubin:
+            return None
+        batch, m, n, k = 8, 300, 256, 512
+        a, b = randn(batch, m, k), randn(batch, n, k)
+        if rubin:
+            runner = ops.CuteDSLBf16RubinBmmRunner()
+        elif fp8_out:
+            runner = ops.CuteDSLBf16BlackwellBmmFp8OutRunner()
+        else:
+            runner = ops.CuteDSLBf16BlackwellBmmRunner()
+        c_dtype = torch.float8_e4m3fn if fp8_out else bf16
+        inputs = [a, b, torch.empty(batch, m, n, device="cuda", dtype=c_dtype)]
+        reference = torch.bmm(a.float(), b.float().transpose(1, 2))
+        if fp8_out:
+            reference = reference.to(c_dtype).float()
+        return runner, inputs, into(runner, inputs), reference
+    if case == "fp8_gemm":
+        m, n, k = 64, 2048, 7168
+        a, b = randn(m, k) / k, randn(n, k) / k
+        a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+        b_fp8, b_sf = per_block_cast_to_fp8(b)
+        runner = (ops.CuteDSLFp8RubinGemmRunner()
+                  if rubin else ops.CuteDSLFp8BlackwellRunner())
+        inputs = [a_fp8, b_fp8, a_sf, b_sf]
+        reference = a.float() @ b.float().t()
+        return runner, inputs, returned(runner, inputs), reference
+    if case == "fp8_bmm":
+        # On SM100 nvMMH splits the 64 K tiles in 3 (unequal slices).
+        batch, m, n, k = 4, 64, 512, 8192
+        a, b = randn(m, batch, k) / k, randn(batch, n, k) / k
+        a_fp8, a_sf = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+        b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+        b_sf = torch.empty(batch,
+                           n // 128,
+                           k // 128,
+                           device="cuda",
+                           dtype=torch.float32)
+        for group in range(batch):
+            b_fp8[group], b_sf[group] = per_block_cast_to_fp8(b[group])
+        runner = (ops.CuteDSLFp8RubinBmmRunner()
+                  if rubin else ops.CuteDSLFp8BlackwellBmmRunner())
+        inputs = [
+            a_fp8, b_fp8, a_sf, b_sf,
+            torch.empty(batch, m, n, device="cuda", dtype=bf16)
+        ]
+        reference = torch.einsum("mgk,gnk->gmn", a.float(), b.float())
+        return runner, inputs, into(runner, inputs), reference
+    if case == "mxfp8_gemm":
+        if not rubin:
+            return None
+        # A DeepSeek-V4 decode projection; nvMMH splits its 56 K tiles.
+        m, n, k = 32, 2048, 7168
+        a, b = randn(m, k) / k, randn(n, k) / k
+        a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(a)
+        b_fp8, b_sf_k128 = per_block_cast_to_fp8_e8m0(b)
+        b_sf = fp8_utils.transform_k128_scales_to_cutedsl_mxfp8_layout(
+            b_sf_k128, mn=n, k=k)
+        alpha = ops._get_mxfp8_gemm_alpha(a.device)
+        runner = ops.CuteDSLMXFP8RubinLinear(output_dtype=bf16)
+        inputs = [a_fp8, b_fp8, a_sf, b_sf, alpha]
+        reference = a.float() @ b.float().t()
+        return runner, inputs, returned(runner, inputs), reference
+    assert case == "nvfp4_gemm"
+    # nvMMH splits the 64 K blocks in 2 and 3 on SM100.
+    m, n, k = 64, 2048, 16384
+    x, w = randn(m, k), randn(n, k)
+    x_scale = 2688 / x.abs().max().float()
+    w_scale = 2688 / w.abs().max().float()
+    x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(x, x_scale, 16, False)
+    w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w, w_scale, 16, False)
+    alpha = (1 / (x_scale * w_scale)).reshape(1)
+    inputs = [x_fp4, w_fp4, x_sf, w_sf, alpha]
+    runner = (ops.CuteDSLNVFP4RubinLinear(bf16)
+              if rubin else ops.CuteDSLNVFP4BlackwellRunner(bf16))
+    reference = torch.ops.trtllm.nvfp4_gemm_cutlass(*inputs, bf16).float()
+    return runner, inputs, returned(runner, inputs), reference
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "bf16_gemm",
+        "bf16_gemm_fp32_out",
+        "bf16_bmm",
+        "bf16_bmm_fp8_out",
+        "fp8_gemm",
+        "fp8_bmm",
+        "mxfp8_gemm",
+        "nvfp4_gemm",
+    ],
+)
+def test_nvmmh_tactics_compute_the_product(case, monkeypatch):
+    """Every nvMMH-guided tactic of the SM100/SM103 or SM107 CuTe DSL
+    GEMM/BMM runners is correct, including tiles, rasters and split-K
+    factors outside their full sweeps."""
+    from tensorrt_llm._torch.custom_ops import \
+        cutedsl_matmul_heuristics as nvmmh
+    from tensorrt_llm._torch.cute_dsl_utils import (
+        IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+    from tensorrt_llm._utils import get_sm_version
+
+    sm_version = get_sm_version()
+    if not IS_CUTLASS_DSL_AVAILABLE or sm_version not in (100, 103, 107):
+        pytest.skip("The test requires SM100/SM103/SM107 and CuTe DSL.")
+    if sm_version == 107 and not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("The test requires the SM107 CuTe DSL helpers.")
+    if not nvmmh.IS_NVMMH_AVAILABLE:
+        pytest.skip("nvMatmulHeuristics is not installed")
+    from _torch.helpers import calc_diff
+
+    problem = _nvmmh_problem(case, sm_version)
+    if problem is None:
+        pytest.skip(f"No nvMMH-aware {case} runner on SM{sm_version}.")
+    runner, inputs, run, reference = problem
+    selected = []
+    select_tactics = nvmmh.select_tactics
+
+    def recording_select_tactics(ranked, max_tactics):
+        selected.append(select_tactics(ranked, max_tactics))
+        return selected[-1]
+
+    monkeypatch.setattr(nvmmh, "select_tactics", recording_select_tactics)
+    monkeypatch.setattr(AutoTuner.get(), "nvmmh_config",
+                        NvMMHConfig(max_tactics=3))
+    tactics = runner.get_valid_tactics(inputs, None)
+    # The tactics come from nvMMH, not from the full-sweep fallback.
+    assert tactics and tactics == selected[-1]
+    # FP8 inputs are quantized from the BF16 reference operands.
+    max_diff = 1e-3 if case.startswith(("fp8", "mxfp8")) else 1e-4
+    for tactic in tactics:
+        output = run(tactic).float()
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all(), tactic
+        assert calc_diff(output, reference) < max_diff, tactic
+
+
+class _TacticSpaceRunner(TunableRunner):
+    """Runner whose tactic space key is set by the test."""
+
+    def __init__(self, space_key=None):
+        self.space_key = space_key
+
+    def unique_id(self):
+        return ()
+
+    def tactic_space_key(self):
+        return self.space_key
+
+    def get_valid_tactics(self, inputs: List[FakeTensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [0]
+
+    def forward(self,
+                /,
+                inputs: List[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        return inputs[0]
+
+
+_TACTIC_SPACE_SHAPES = (torch.Size([16, 64]), )
+
+
+def _tactic_space_cache_key(cache, runner):
+    return cache.get_cache_key("test_tactic_space", runner,
+                               _TACTIC_SPACE_SHAPES, TuningConfig())
+
+
+def test_tactic_space_key_extends_the_cache_key():
+    cache = autotuner.AutoTuner().profiling_cache
+    default = _tactic_space_cache_key(cache, _TacticSpaceRunner())
+    assert default == ("test_tactic_space", "_TacticSpaceRunner", "()",
+                       ((16, 64), ))
+    guided = _tactic_space_cache_key(cache, _TacticSpaceRunner(
+        ("nvmmh", "x", 3)))
+    assert guided == default + (("nvmmh", "x", 3), )
+    assert _tactic_space_cache_key(cache, _TacticSpaceRunner(
+        ("nvmmh", "x", 5))) != guided
+
+
+def test_search_cache_misses_across_tactic_spaces():
+    cache = autotuner.AutoTuner().profiling_cache
+    guided = _TacticSpaceRunner(("nvmmh", "x", 3))
+    cache.cache[_tactic_space_cache_key(cache, guided)] = (0, 7, 1.0)
+
+    def search(runner):
+        return cache.search_cache("test_tactic_space", [runner],
+                                  _TACTIC_SPACE_SHAPES, TuningConfig())
+
+    assert search(guided) == (True, 0, 7, 1.0)
+    assert not search(_TacticSpaceRunner())[0]
+    assert not search(_TacticSpaceRunner(("nvmmh", "x", 5)))[0]
+
+
+def test_tactic_space_key_survives_cache_save_and_load(tmp_path):
+    src = autotuner.AutoTuner().profiling_cache
+    key = _tactic_space_cache_key(src,
+                                  _TacticSpaceRunner(("nvmmh", "0.1.0.27", 3)))
+    src.cache[key] = (0, 7, 1.0)
+    path = str(tmp_path / "cache.json")
+    src.save_cache(path, rank=0)
+
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    assert dst.cache[key][1] == 7
+
+
+def test_nvmmh_tactic_space_key_follows_the_policy(monkeypatch):
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(ops.cutedsl_nvmmh, "IS_NVMMH_AVAILABLE", True)
+    monkeypatch.setattr(ops.cutedsl_nvmmh, "library_version", lambda: "x")
+    monkeypatch.setattr(tuner, "nvmmh_config", None)
+    assert ops._nvmmh_tactic_space_key() is None
+    monkeypatch.setattr(tuner, "nvmmh_config", NvMMHConfig(max_tactics=3))
+    assert ops._nvmmh_tactic_space_key() == ("nvmmh", "x", 3)
+    monkeypatch.setattr(ops.cutedsl_nvmmh, "IS_NVMMH_AVAILABLE", False)
+    assert ops._nvmmh_tactic_space_key() is None
+
+
+def test_nvfp4_unified_runner_keys_only_the_cutedsl_tactic_space(monkeypatch):
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops
+
+    monkeypatch.setattr(torch_custom_ops, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(torch_custom_ops,
+                        "_nvmmh_tactic_space_key",
+                        lambda: ("nvmmh", "x", 3),
+                        raising=False)
+    runner = torch_custom_ops.NVFP4GemmUnifiedRunner
+    assert runner(0, torch.bfloat16,
+                  ["cutlass", "cutedsl"]).tactic_space_key() == ("nvmmh", "x",
+                                                                 3)
+    assert runner(0, torch.bfloat16,
+                  ["cutlass", "cublaslt"]).tactic_space_key() is None
+
+
+def test_locality_domain_runner_forwards_the_tactic_space_key():
+    from tensorrt_llm._torch.locality_domain.autotune import \
+        LocalityDomainConcurrentTunableRunner
+
+    inner = _TacticSpaceRunner()
+    wrapper = LocalityDomainConcurrentTunableRunner(
+        inner, SimpleNamespace(num_partitions=2), 2, lambda *args: None)
+    assert wrapper.tactic_space_key() is None
+    inner.space_key = ("nvmmh", "x", 3)
+    assert wrapper.tactic_space_key() == ("nvmmh", "x", 3)
+
+
+def test_configure_autotuner_nvmmh_installs_the_engine_policy(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.model_engine import \
+        _configure_autotuner_nvmmh
+    from tensorrt_llm.llmapi.llm_args import AutoTunerNvMMHConfig
+
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(tuner, "nvmmh_config", None)
+    _configure_autotuner_nvmmh(
+        SimpleNamespace(autotuner_nvmmh_config=AutoTunerNvMMHConfig(
+            max_tactics=7)))
+    assert tuner.nvmmh_config == NvMMHConfig(max_tactics=7)
+    _configure_autotuner_nvmmh(SimpleNamespace(autotuner_nvmmh_config=None))
+    assert tuner.nvmmh_config is None
+
+
+def test_merge_nvmmh_rankings_picks_the_lowest_scoring_head():
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        _merge_nvmmh_rankings
+
+    def ranking(name, *scores):
+        return [(SimpleNamespace(score=score), f"{name}{i}")
+                for i, score in enumerate(scores)]
+
+    def merge(*rankings):
+        return [name for _, name in _merge_nvmmh_rankings(list(rankings))]
+
+    # Each ranking keeps its own order, even where it is not sorted by score.
+    assert merge(ranking("a", 1, 4, 2),
+                 ranking("b", 3, 5)) == ["a0", "b0", "a1", "a2", "b1"]
+    # Ties go to the earlier ranking.
+    assert merge(ranking("a", 1, 1), ranking("b", 1)) == ["a0", "a1", "b0"]
+    assert merge(ranking("a"), ranking("b", 2)) == ["b0"]
+    assert merge() == []
+
+
+def test_select_tactics_counts_configs_with_new_tactics():
+    from tensorrt_llm._torch.custom_ops.cutedsl_matmul_heuristics import \
+        select_tactics
+
+    ranked = [(None, ["a", "b"]), (None, ["b"]), (None, ["b", "c"]),
+              (None, ["d"])]
+    # The second config only repeats "b", so it is not counted.
+    assert select_tactics(ranked, 1) == ["a", "b"]
+    assert select_tactics(ranked, 2) == ["a", "b", "c"]
+    assert select_tactics(ranked, 10) == ["a", "b", "c", "d"]
+    assert select_tactics([], 3) == []
+
+
+@pytest.mark.parametrize("max_tactics", [True, 0, -1, "5", 2.0])
+def test_nvmmh_config_rejects_non_positive_integers(max_tactics):
+    with pytest.raises(ValueError, match="positive integer"):
+        NvMMHConfig(max_tactics=max_tactics)
 
 
 @pytest.mark.parametrize("distribution", ["random", "balanced"])
