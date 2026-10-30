@@ -419,6 +419,27 @@ class KvCacheTransceiver(ABC):
         """Return True when in-flight transfers can be cancelled safely."""
         return False
 
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        """Whether a context send is still waiting for its peer to ask for the data.
+
+        ``respond_and_send_async`` only posts the send; nothing is written until
+        the generation peer requests it, which can be long after the context
+        finished when the peer's request queues behind a full generation batch.
+        Runtimes that can observe that boundary report it here so the transfer
+        timeout measures the transfer rather than the peer's queueing delay.
+        The default keeps the timeout unchanged for runtimes that cannot.
+        """
+        return False
+
+    def context_transfer_peer_ready_time(self,
+                                         req: LlmRequest) -> Optional[float]:
+        """``time.monotonic()`` at which every peer rank had asked for this send.
+
+        The transfer timeout is measured from this moment when it is later than
+        the send itself. None when unknown, which keeps the timeout unchanged.
+        """
+        return None
+
     def has_poisoned_transfer_buffer(self) -> bool:
         """Return True when a cancelled transfer may have corrupted a shared buffer."""
         return False

@@ -316,6 +316,12 @@ class _LogicalOutcomes:
     def cancel(self, by_peer: bool) -> None:
         self._end(_LogicalOutcome(SessionStatus.CANCELLED, by_peer=by_peer))
 
+    @property
+    def failed(self) -> bool:
+        """Whether the first terminal decision was a failure; a later cancel does not change it."""
+        with self._lock:
+            return self._terminal is not None and self._terminal.status is SessionStatus.ERROR
+
     def _end(self, outcome: _LogicalOutcome) -> None:
         with self._lock:
             if self._retirement is not None:
@@ -548,6 +554,10 @@ class Sender(SenderBase):
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
     _STALE_REQ_INFO_TTL_S = 120.0
+    # How long a cleared TxSession's id is remembered. A generation peer can ask for its KV
+    # long after the context side gave up on it (its request may wait in the generation queue
+    # for minutes), so this outlives the stale-request-info TTL.
+    _RETIRED_SESSION_TTL_S = 600.0
 
     def __init__(
         self,
@@ -578,6 +588,11 @@ class Sender(SenderBase):
         # cancelled immutable ID until Sender teardown, not merely metadata TTL.
         self._pre_cancelled_rids: dict[int, bool] = {}
         self._pending_session_quiescence: dict[tuple[int, int], _SessionQuiescence] = {}
+        # unique_rid -> clear time, for sessions already cleared (completed, failed, cancelled or
+        # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
+        # parking it as an early generation-first request would leave the peer's receive
+        # unresolved for good. Protected by _sessions_lock.
+        self._retired_rids: dict[int, float] = {}
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -647,9 +662,9 @@ class Sender(SenderBase):
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
 
-        Called opportunistically from the listener thread when a new REQUEST_DATA
-        arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
-        entries that are never consumed; this sweep prevents unbounded growth.
+        Called from the executor's context-status poll. With gen-first ADP
+        broadcast, non-assigned DP ranks accumulate entries that are never
+        consumed; this sweep prevents unbounded growth.
 
         A context-first entry that no TxSession claimed within the TTL never will
         be (the session already ended, or the receiver names a request this rank
@@ -657,6 +672,13 @@ class Sender(SenderBase):
         waiting for data that will not arrive.
         """
         now = time.monotonic()
+        with self._sessions_lock:
+            # Oldest first (see clear_session), so only expired entries are visited.
+            while self._retired_rids:
+                rid, ts = next(iter(self._retired_rids.items()))
+                if now - ts <= self._RETIRED_SESSION_TTL_S:
+                    break
+                del self._retired_rids[rid]
         with self._peer_requests_lock:
             stale_rids = [
                 rid
@@ -682,8 +704,8 @@ class Sender(SenderBase):
         """Report FAILED for a context-first REQUEST_DATA that no TxSession claimed.
 
         This resolves the receiver's task, so its RxSession fails through the
-        normal transfer-failure path. The sweep runs on the executor and listener
-        threads, so the message goes through a worker queue.
+        normal transfer-failure path. The sweep runs on the executor thread, not
+        the listener's, so the message goes through a worker queue.
         """
         logger.warning(
             f"KV transfer request rid={info.unique_rid} from receiver "
@@ -701,6 +723,7 @@ class Sender(SenderBase):
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
             if self._enforce_physical_ownership and unique_rid in self._sessions:
                 raise RuntimeError("cannot replace an owned TxSession")
+            self._retired_rids.pop(unique_rid, None)
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 cancelled_by_peer = self._pre_cancelled_rids[unique_rid]
@@ -744,6 +767,9 @@ class Sender(SenderBase):
             expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
             if self._is_req_ready(unique_rid, expected_count):
                 with tx_session.lock:
+                    # The executor reads both without the lock, so publish the
+                    # time first: a ready session always carries its time.
+                    tx_session.peer_ready_time = time.monotonic()
                     tx_session.receiver_ready = True
         return
 
@@ -1775,12 +1801,38 @@ class Sender(SenderBase):
                 self._enforce_physical_ownership and info.unique_rid in self._pre_cancelled_rids
             )
             if session is None and not fenced:
-                self._save_peer_req_info(info)
-                return
+                # A retried generation request carries a fresh unique_rid, so the
+                # context-side id names the retired session as well.
+                retired = (
+                    info.unique_rid in self._retired_rids
+                    or info.sender_req_id in self._retired_rids
+                )
+                # The session it names may also still be live. Serving it would
+                # need every reply keyed by the receiver's id and could write the
+                # same pieces to two attempts, so it is refused rather than parked.
+                retry_of_live_session = (
+                    info.sender_req_id != info.unique_rid
+                    and self._get_session(info.sender_req_id) is not None
+                )
+                if not (retired or retry_of_live_session):
+                    self._save_peer_req_info(info)
+                    return
         if fenced:
             self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
             return
-        assert session is not None
+        if session is None:
+            # Nothing will ever be sent for this request; say so instead of leaving
+            # the peer's receive (and its KV pages) waiting forever. Typically the
+            # context side timed out waiting for it while the peer's request sat in
+            # its generation queue, or it is a retry of a request still in flight.
+            logger.warning(
+                f"_respond_with_kv: TxSession {info.sender_req_id} "
+                f"{'already retired' if retired else 'serves an earlier attempt'}; "
+                f"failing REQUEST_DATA for peer rid={info.unique_rid} "
+                f"rank={info.instance_rank}"
+            )
+            self._send_failed_result_to_receiver(info)
+            return
         with session.lock:
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
@@ -1940,6 +1992,8 @@ class Sender(SenderBase):
         if self._is_req_ready(req_info.unique_rid, expected_transfers):
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
+                # Time before flag, as in setup_session.
+                session.peer_ready_time = time.monotonic()
                 session.receiver_ready = True
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
@@ -1957,6 +2011,9 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if unique_rid in self._sessions:
                 del self._sessions[unique_rid]
+                # Re-insert so the dict stays ordered by clear time.
+                self._retired_rids.pop(unique_rid, None)
+                self._retired_rids[unique_rid] = time.monotonic()
         self._remove_req_info(unique_rid)
 
     def send_cancel_to_receivers(self, unique_rid: int) -> None:
@@ -2072,6 +2129,8 @@ class TxSession(TxSessionBase):
                 self._retirement.close()
             raise
         self.receiver_ready: bool = False
+        # time.monotonic() when receiver_ready turned True, i.e. every peer rank had asked.
+        self.peer_ready_time: Optional[float] = None
         self.kv_tasks = []
         self.aux_task = None
         self._reported_aux_peer_ranks: set[int] = set()
@@ -3303,6 +3362,10 @@ class RxSession(RxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
+        # When this failed receive started waiting on its remaining writers, and whether that
+        # wait has run out (see failed_receive_awaits_writers).
+        self._writer_wait_start: Optional[float] = None
+        self._writer_wait_expired = False
         self.transfer_start_time = None
         self.transfer_end_time = None
         self.kv_cache_size_bytes: int = 0
@@ -3986,14 +4049,51 @@ class RxSession(RxSessionBase):
 
         cancel_request() must return False while this is True.
         """
-        return not self.resources_drained()
+        return not self.resources_drained() or self.failed_receive_awaits_writers()
+
+    # A failed receive waits at most this many transfer timeouts for its remaining writers.
+    _WRITER_WAIT_TIMEOUT_MULTIPLIER = 2
+
+    def failed_receive_awaits_writers(self) -> bool:
+        """Whether this failed receive must stay open for writers that have not stopped.
+
+        Without physical ownership the first writer's FAILED fails the receive, while the
+        other writers it asked may still be writing into its pages, so retiring it then could
+        hand those pages to another request mid-write. A live writer ends with a result or a
+        CANCEL_SESSION, at the latest when its own context-side transfer deadline expires,
+        which comes before ``_WRITER_WAIT_TIMEOUT_MULTIPLIER`` transfer timeouts. A writer
+        still silent then is presumed gone (e.g. its process died), and the receive is let go
+        rather than pinning its pages and slot on a worker that may never act on its own
+        receive timeout. The hold covers cancellation too: a client abort or a timeout that
+        cancels the receive after it failed must not free it early either (``cancel_request``
+        refuses while ``has_transferring_tasks``). A receive cancelled before it failed is
+        not held. Polled from the executor thread.
+        """
+        if self._enforce_physical_ownership or not self._logical_outcomes.failed:
+            return False
+        if self._writer_wait_expired:
+            return False
+        if not any(task.reports_outstanding for task in self._kv_tasks):
+            return False
+        if self._timeout_s is None or self._timeout_s <= 0:
+            return True
+        now = time.monotonic()
+        if self._writer_wait_start is None:
+            self._writer_wait_start = now
+        waited_s = now - self._writer_wait_start
+        if waited_s <= self._timeout_s * self._WRITER_WAIT_TIMEOUT_MULTIPLIER:
+            return True
+        self._writer_wait_expired = True
+        logger.warning(
+            f"RxSession {self.disagg_request_id}: a writer has not reported {waited_s:.0f}s "
+            "after the receive failed; retiring it without that writer's result"
+        )
+        return False
 
     def _failed_wait_result(self) -> Optional[WaitResult]:
-        return (
-            WaitResult.FAILED
-            if not self._enforce_physical_ownership or self.resources_drained()
-            else None
-        )
+        if not self._enforce_physical_ownership:
+            return None if self.failed_receive_awaits_writers() else WaitResult.FAILED
+        return WaitResult.FAILED if self.resources_drained() else None
 
     def _completed_wait_result(self) -> Optional[WaitResult]:
         if getattr(self, "_retirement", None) is not None and not self.is_completed():
