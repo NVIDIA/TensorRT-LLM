@@ -4,10 +4,9 @@
 
 ``F.conv2d``/``F.conv3d`` pick an engine through cuDNN's legacy heuristics (or torch's
 benchmark mode over the legacy algorithm list). The graph API exposes every engine the
-heuristics rank; for the causal 3D convs of the VAE's encoder the best of them is 12-29%
-faster than torch's choice on GB200. This module builds one graph per (shape, dtype, layout),
-times every plan the heuristics offer on first use, keeps the fastest, and remembers the
-choice on disk so later processes skip the search.
+heuristics rank. This module builds one graph per (shape, dtype, layout), times every plan
+the heuristics offer on first use, keeps the fastest that produces a finite output, and
+remembers the choice on disk so later processes skip the search.
 
 Tensors are channels-last (``torch.channels_last`` / ``channels_last_3d``) bf16 or fp16;
 the bias (optional) is added in fp32 inside the graph and the output rounds once, like torch.

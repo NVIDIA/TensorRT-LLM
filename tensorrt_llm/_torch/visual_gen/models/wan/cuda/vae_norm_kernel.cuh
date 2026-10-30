@@ -31,7 +31,7 @@
 //
 // Numerics: fp32 throughout, one rounding per output unless REF (reference rounding), which
 // reproduces the eager bf16 rounding after every add, normalize, multiply and bias. The
-// order-2 bf16 slab arithmetic is bit-identical to the original F(2,3) kernel. Compiled at run
+// order-2 bf16 slab path adds no rounding beyond the F(2,3) arithmetic itself. Compiled at run
 // time per instantiation (jit_norm.py builds the launch); the tables live in vae_wino_tables.cuh.
 
 #pragma once
@@ -488,10 +488,12 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
         int64_t const pos = sourcePos(opos);
         int64_t const posSrc = IN_MAP ? inIndex(pos) : pos;
         int64_t const posOut = OUT_MAP ? outIndex(opos) : opos;
-        // The halo push: the neighbour this position's line also goes to (none for interior
-        // positions) and the line position's row inside that neighbour's frame 0.
-        void* haloBase = nullptr;
-        int64_t haloFrame = 0, haloComp = 0, haloRow = 0;
+        // The halo push: the neighbours this position's line also goes to (none for interior
+        // positions; both when the shard is a single line) and the line position's row inside
+        // each neighbour's frame 0.
+        void* haloBaseL = nullptr;
+        void* haloBaseR = nullptr;
+        int64_t haloRowL = 0, haloRowR = 0;
         if constexpr (HALO)
         {
             int const i = static_cast<int>(pos) / p.width;
@@ -501,17 +503,13 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
             int const n = p.haloAxis ? p.width : p.height;
             if (across == 0 && p.haloL != nullptr)
             {
-                haloBase = p.haloL;
-                haloFrame = p.haloFrameL;
-                haloComp = p.haloCompL;
-                haloRow = static_cast<int64_t>(along) * p.haloStepL;
+                haloBaseL = p.haloL;
+                haloRowL = static_cast<int64_t>(along) * p.haloStepL;
             }
-            else if (across == n - 1 && p.haloR != nullptr)
+            if (across == n - 1 && p.haloR != nullptr)
             {
-                haloBase = p.haloR;
-                haloFrame = p.haloFrameR;
-                haloComp = p.haloCompR;
-                haloRow = static_cast<int64_t>(along) * p.haloStepR;
+                haloBaseR = p.haloR;
+                haloRowR = static_cast<int64_t>(along) * p.haloStepR;
             }
         }
         if constexpr (PADDED)
@@ -815,10 +813,17 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                     storeVec(ySlot, k, yk);
                     if constexpr (HALO && !SLABS)
                     {
-                        if (haloBase != nullptr)
+                        if (haloBaseL != nullptr)
                         {
                             storeVec(
-                                gRowW(static_cast<T*>(haloBase), static_cast<int64_t>(t) * haloFrame + haloRow), k, yk);
+                                gRowW(static_cast<T*>(haloBaseL), static_cast<int64_t>(t) * p.haloFrameL + haloRowL), k,
+                                yk);
+                        }
+                        if (haloBaseR != nullptr)
+                        {
+                            storeVec(
+                                gRowW(static_cast<T*>(haloBaseR), static_cast<int64_t>(t) * p.haloFrameR + haloRowR), k,
+                                yk);
                         }
                     }
                     if constexpr (SLABS)
@@ -875,10 +880,16 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                                 storeVec(gRowW(ptrs.d + s * ptrs.compStride, drow), k, o);
                                 if constexpr (HALO)
                                 {
-                                    if (haloBase != nullptr)
+                                    if (haloBaseL != nullptr)
                                     {
-                                        storeVec(gRowW(static_cast<TD*>(haloBase) + s * haloComp,
-                                                     static_cast<int64_t>(t / R) * haloFrame + haloRow),
+                                        storeVec(gRowW(static_cast<TD*>(haloBaseL) + s * p.haloCompL,
+                                                     static_cast<int64_t>(t / R) * p.haloFrameL + haloRowL),
+                                            k, o);
+                                    }
+                                    if (haloBaseR != nullptr)
+                                    {
+                                        storeVec(gRowW(static_cast<TD*>(haloBaseR) + s * p.haloCompR,
+                                                     static_cast<int64_t>(t / R) * p.haloFrameR + haloRowR),
                                             k, o);
                                     }
                                 }

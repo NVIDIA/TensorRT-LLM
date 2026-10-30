@@ -320,3 +320,61 @@ def test_frame_buffer_grows_for_a_longer_chunk_in_a_new_clip() -> None:
     rel_l2 = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
     assert torch.isfinite(actual).all()
     assert rel_l2.item() < 2e-2, f"rel_l2={rel_l2.item():.3e}"
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="frame buffers and Winograd need the CUDA norm kernel")
+@pytest.mark.parametrize("ffc2d,frames,chunk", [(False, 9, 2), (True, 21, 3), (False, 17, 4)])
+def test_frame_buffer_to_winograd_chunk_transition(ffc2d: bool, frames: int, chunk: int) -> None:
+    """Odd-length chunks (the first one, a tail) run the frame-buffer convs, even-length chunks
+    the temporal Winograd convs; the history frames must carry over in both directions."""
+    native, fast = _pair(
+        WinoVaeOptions(
+            fused_norm=True, conv_slabs=True, winograd_temporal=True, first_frame_conv2d=ffc2d
+        )
+    )
+    assert fast.options.use_slabs and fast.options.use_winograd
+    _, latents = _inputs(frames)
+    with torch.inference_mode():
+        expected = native.decode(latents, return_dict=False)[0].float()
+        actual = fast.decode(latents, return_dict=False, temporal_chunk_size=chunk)[0].float()
+    rel_l2 = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
+    assert torch.isfinite(actual).all()
+    assert rel_l2.item() < 2e-2, f"rel_l2={rel_l2.item():.3e}"
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="the deferred bias needs the CUDA frame ops")
+def test_non_residual_encoder_keeps_downsample_bias() -> None:
+    """Without residual down blocks nothing consumes a deferred downsample bias, so the conv
+    must keep it."""
+    cfg = {**SMALL_CONFIG, "is_residual": False}
+    torch.manual_seed(0)
+    native = WanVAE(cfg)
+    fast = WinoVae(cfg, WinoVaeOptions(fused_norm=True, fused_residual=True, fused_bias=True))
+    fast.load_state_dict(native.state_dict(), strict=True)
+    native = native.to(DEVICE, DTYPE).eval()
+    fast = fast.to(DEVICE, DTYPE).eval()
+    pixels, _ = _inputs(9)
+    with torch.inference_mode():
+        expected = native.encode(pixels, return_dict=False)[0].mode().float()
+        actual = fast.encode(pixels, return_dict=False)[0].mode().float()
+    rel_l2 = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
+    assert rel_l2.item() < 2e-2, f"rel_l2={rel_l2.item():.3e}"
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="the dtype contract applies to the CUDA kernels")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_optimized_paths_reject_non_bf16(dtype: torch.dtype) -> None:
+    """The optimized kernels read and write bf16; any other dtype is refused up front instead
+    of being reinterpreted. The all-off model stays dtype-agnostic."""
+    _, fast = _pair(WinoVaeOptions(fused_norm=True, winograd_temporal=True))
+    fast = fast.to(dtype)
+    pixels, latents = _inputs(5)
+    with torch.inference_mode(), pytest.raises(TypeError, match="bf16"):
+        fast.decode(latents.to(dtype), return_dict=False)
+    with torch.inference_mode(), pytest.raises(TypeError, match="bf16"):
+        fast.encode(pixels.to(dtype), return_dict=False)
+    _, plain = _pair()
+    plain = plain.to(dtype)
+    with torch.inference_mode():
+        out = plain.decode(latents.to(dtype), return_dict=False)[0]
+    assert out.dtype is dtype

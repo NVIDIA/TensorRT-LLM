@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused kernels for WinoVae. Triton prototypes; each has an exact PyTorch fallback."""
+"""Kernel wrappers for WinoVae: the Triton norm prototypes and their eager references, the
+runtime-compiled CUDA norm kernels (:mod:`jit_norm`), the compiled ``trtllm::vae_*`` ops and
+the sm100 CuTe DSL pipeline. Each wrapper states its layout, dtype and shape preconditions;
+choosing a fallback when they do not hold is the caller's job (``can_*`` / ``*_available``
+predicates), not the wrapper's."""
 
 from __future__ import annotations
 
@@ -18,6 +22,8 @@ from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import (
     rms_norm_silu_rows,
     wino_norm_silu,
 )
+
+from .wino_tables import SPATIAL_WINO
 
 _NORM_EPS = 1e-12  # F.normalize default
 _MAX_TILE_ELEMENTS = 4096
@@ -92,8 +98,8 @@ def _rms_norm_silu_kernel(
     n = xf / denom[:, None]
     gamma = tl.load(gamma_ptr + cols, mask=col_ok, other=0.0)
     if REFERENCE_ROUNDING:
-        # Today's eager sequence: round to the activation dtype after normalize,
-        # after each multiply and after the bias add; SiLU in fp32 on that value.
+        # Reference rounding reproduces the eager chain: round to the activation dtype after
+        # normalize, after each multiply and after the bias add; SiLU in fp32 on that value.
         n = n.to(x.dtype).to(tl.float32)
         r = (n * scale).to(x.dtype).to(tl.float32)
         r = (r * gamma.to(tl.float32)).to(x.dtype).to(tl.float32)
@@ -121,7 +127,9 @@ def rms_norm_silu_cuda(
     silu: bool = True,
     out_geometry: FrameGeometry | None = None,
 ) -> torch.Tensor:
-    """The CUDA kernel (:mod:`jit_norm` in row mode); same contract as ``rms_norm_silu``.
+    """The CUDA kernel (:mod:`jit_norm` in row mode): RMSNorm over channels (+ SiLU) of a
+    channels-last bf16 CUDA tensor whose channel count is a multiple of 8
+    (``can_use_cuda_rms_norm_silu``); fp32 arithmetic, bf16 result of ``x``'s shape.
     ``silu=False`` returns the RMSNorm alone (plain form only: no bias, in_bias or out).
 
     ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
@@ -424,25 +432,10 @@ def winograd_weights(
     return [g.to(out_dtype).contiguous(memory_format=torch.channels_last) for g in gs]
 
 
-# Spatial filter transforms G of F(2x2, 3x3) (Lavin & Gray, points 0, +-1, inf) and F(4x4, 3x3)
-# (points 0, +-3/2, +-5/8, inf, shared with the sm100 path: the real point set with the
-# lowest fp16 rounding sensitivity, 1.7e-3 per conv against 2.5e-3 for (0, +-1, 2, -1/2, inf)),
-# applied in fp64 and rounded once. The matching B^T and A^T live in
+# Spatial filter transforms G of F(2x2, 3x3) and F(4x4, 3x3) (:mod:`wino_tables`, shared with
+# the sm100 path), applied in fp64 and rounded once. The matching B^T and A^T live in
 # cpp/tensorrt_llm/kernels/vaeWinoSpatialKernel.cu.
-_WINO_G = {
-    2: torch.tensor([[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]], dtype=torch.float64),
-    4: torch.tensor(
-        [
-            [256 / 225, 0, 0],
-            [128 / 1071, 64 / 357, 32 / 119],
-            [128 / 1071, -64 / 357, 32 / 119],
-            [-2048 / 2975, -256 / 595, -32 / 119],
-            [-2048 / 2975, 256 / 595, -32 / 119],
-            [0, 0, 1],
-        ],
-        dtype=torch.float64,
-    ),
-}
+_WINO_G = {tile: torch.tensor(SPATIAL_WINO[tile]["G"], dtype=torch.float64) for tile in (2, 4)}
 
 
 def winograd_spatial_weights(weight: torch.Tensor, tile: int = 2, order: int = 2) -> torch.Tensor:
@@ -611,8 +604,9 @@ def wino_spatial_conv_sm100(
 def wino_spatial_conv_cuda(
     d: torch.Tensor, u: torch.Tensor, height: int, width: int
 ) -> torch.Tensor:
-    """3x3 conv (padding 1) of the four slabs by their four filters as spatial Winograd:
-    ``D [4, pairs, H*W, Cin]`` -> ``M [4, pairs, H*W, Cout]`` (bias-free, fp32 accumulate).
+    """3x3 conv (padding 1) of each of the ``order + 2`` slabs (4 or 6) by its filter as
+    spatial Winograd: ``D [comps, pairs, H*W, Cin]`` (bf16 or fp16) -> ``M [comps, pairs, H*W,
+    Cout]`` in ``D``'s dtype (bias-free, fp32 accumulate).
     Input transform and output transform are CUDA kernels; the batched GEMMs are one cuBLAS
     call. The tile size (2 or 4) follows the filters ``u``."""
     comps, pairs, positions, cin = d.shape

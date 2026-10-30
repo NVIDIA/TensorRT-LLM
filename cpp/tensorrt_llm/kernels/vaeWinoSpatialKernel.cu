@@ -39,9 +39,7 @@ constexpr int kThreads = 256;
 using TS = __half;
 
 // Channels per thread: 4 (8-byte vectors) for m = 2; 2 (one bf16x2 / fp16x2 pair) for m = 4,
-// whose 6x6 window would otherwise not fit in registers (measured: 4 channels per thread
-// costs 175 registers and is no faster; 8 channels for m = 2 cost 165 registers, one block
-// per SM).
+// whose 6x6 window of fp32 values has to stay in registers.
 template <typename T, int M>
 struct Lanes
 {

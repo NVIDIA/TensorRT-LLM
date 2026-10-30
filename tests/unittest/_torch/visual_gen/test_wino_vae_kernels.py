@@ -104,7 +104,26 @@ from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa
     rms_norm_silu_cuda,
 )
 
-cuda_op = pytest.mark.skipif(not cuda_op_available(), reason="runtime compilation unavailable")
+
+def _built(available: bool, what: str) -> pytest.MarkDecorator:
+    """Gate for a first-party op or a declared dependency: on a CUDA machine it must be there
+    (a missing build fails the file at collection instead of skipping it green); without CUDA
+    the tests skip as hardware-gated."""
+    if torch.cuda.is_available() and not available:
+        pytest.fail(f"{what} unavailable on a CUDA machine", pytrace=False)
+    return pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel")
+
+
+def _require_sm100() -> None:
+    """Blackwell is a hardware gate (skip); the CuTe DSL import on Blackwell is not (fail)."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import sm100_wino_available
+
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("sm100 kernels need Blackwell")
+    assert sm100_wino_available(), "nvidia-cutlass-dsl (a declared requirement) does not import"
+
+
+cuda_op = _built(cuda_op_available(), "runtime compilation of the norm kernels (nvcc, cuda-python)")
 CUDA_CHANNELS = [c for c in CHANNELS if c % 8 == 0]  # 7 and 12 take the Triton/eager path
 
 
@@ -265,9 +284,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa
     upsample_gather_reference,
 )
 
-upsample_op = pytest.mark.skipif(
-    not cuda_upsample_available(), reason="trtllm::vae_upsample_gather not built"
-)
+upsample_op = _built(cuda_upsample_available(), "trtllm::vae_upsample_gather")
 
 
 def _eager_upsample(x4: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -542,8 +559,8 @@ from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa
 def test_upsample_norm_matches_gather_then_norm(
     mode: str, with_bias: bool, shortcut_spec: tuple[int, int, int, bool] | None
 ) -> None:
-    """The norm kernel forming the upsampled frames while reading (item 38) is bit-identical to
-    the gather kernel followed by the norm, in the row mode and the Winograd slab mode."""
+    """The norm kernel forming the upsampled frames while reading is bit-identical to the
+    gather kernel followed by the norm, in the row mode and the Winograd slab mode."""
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         frames_view,
         rms_norm_silu_cuda,
@@ -600,9 +617,7 @@ def test_upsample_norm_matches_gather_then_norm(
     assert torch.equal(d, d_want)
 
 
-frame_ops = pytest.mark.skipif(
-    not cuda_frame_ops_available(), reason="trtllm::vae_interleave_bias not built"
-)
+frame_ops = _built(cuda_frame_ops_available(), "trtllm::vae_interleave_bias")
 
 
 @cuda_op
@@ -683,9 +698,7 @@ def test_avg_down_add_matches_eager(
     ).to(bf)
     pad_t = (ft - frames % ft) % ft
     got = avg_down_add_cuda(
-        r.new_empty(0)
-        if False
-        else x.permute(0, 2, 3, 4, 1).reshape(x.shape[2], h // 2 * (w // 2), cout),
+        x.permute(0, 2, 3, 4, 1).reshape(x.shape[2], h // 2 * (w // 2), cout),
         r.permute(0, 2, 3, 4, 1).reshape(frames, h * w, cin),
         h // 2,
         w // 2,
@@ -719,9 +732,9 @@ def test_cuda_norm_without_activation(C: int, reference: bool) -> None:
 
 # --- spatial Winograd F(2x2, 3x3) transforms -------------------------------------------
 
-spatial_op = pytest.mark.skipif(
-    not (hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_spatial_in")),
-    reason="trtllm::vae_wino_spatial_in not built",
+spatial_op = _built(
+    hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_spatial_in"),
+    "trtllm::vae_wino_spatial_in",
 )
 _BT = torch.tensor([[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]], dtype=torch.float32)
 _AT = torch.tensor([[1, 1, 1, 0], [0, 1, -1, -1]], dtype=torch.float32)
@@ -762,9 +775,7 @@ def _ref_spatial_in(
     tiles = F.unfold(
         F.pad(
             x,
-            (1, th * tile + 1 - h, 1, tw * tile + 1 - w)
-            if False
-            else (1, tw * tile + 1 - w, 1, th * tile + 1 - h),
+            (1, tw * tile + 1 - w, 1, th * tile + 1 - h),
         ),
         kernel_size=a,
         stride=tile,
@@ -1013,13 +1024,11 @@ def test_spatial_winograd_sm100_matches_reference(
 ) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         sm100_spatial_filters,
-        sm100_wino_available,
         wino_spatial_conv_sm100,
         winograd_weights,
     )
 
-    if not sm100_wino_available():
-        pytest.skip("sm100 spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    _require_sm100()
     torch.manual_seed(3)
     cin, cout, h, w, pairs = cin_cout_hw_pairs
     weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
@@ -1044,13 +1053,11 @@ def test_spatial_winograd_sm100_matches_reference(
 def test_spatial_winograd_sm100_fp16_six_components() -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         sm100_spatial_filters,
-        sm100_wino_available,
         wino_spatial_conv_sm100,
         winograd_weights,
     )
 
-    if not sm100_wino_available():
-        pytest.skip("sm100 spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    _require_sm100()
     torch.manual_seed(6)
     cin, cout, h, w, pairs = 128, 256, 12, 16, 1
     weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
@@ -1091,10 +1098,8 @@ def test_spatial_winograd_sm100_in_xform_above_2_31_elements() -> None:
     """Frames whose stride (H*W*C = 1.06e9) puts the third frame past 2^31 elements and a V of
     7.2e9 elements: the transform's frame and tile coordinates must be 64-bit.  Checks the far
     corners of V against the definition.  Needs ~21 GiB of device memory."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import sm100_wino_available
 
-    if not sm100_wino_available():
-        pytest.skip("sm100 spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    _require_sm100()
     if torch.cuda.get_device_properties(0).total_memory < 40 * 2**30:
         pytest.skip("needs a 40 GiB GPU")
     import cuda.bindings.driver as cuda
@@ -1133,10 +1138,8 @@ def test_spatial_winograd_sm100_in_xform_above_2_31_elements() -> None:
 def test_spatial_winograd_sm100_out_xform_above_2_31_elements() -> None:
     """The output transform at the same frame geometry: y's third frame lies past 2^31
     elements; checks pixels of every frame against the definition.  Needs ~21 GiB."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import sm100_wino_available
 
-    if not sm100_wino_available():
-        pytest.skip("sm100 spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    _require_sm100()
     if torch.cuda.get_device_properties(0).total_memory < 40 * 2**30:
         pytest.skip("needs a 40 GiB GPU")
     import cuda.bindings.driver as cuda
@@ -1179,8 +1182,9 @@ def test_cudnn_frontend_conv3d_matches_torch(
         cudnn_frontend_available,
     )
 
-    if not cudnn_frontend_available():
-        pytest.skip("cudnn frontend not installed")
+    assert cudnn_frontend_available(), (
+        "nvidia-cudnn-frontend (a declared requirement) does not import"
+    )
     torch.manual_seed(1)
     xshape, cout, with_bias = shape
     cin = xshape[1]
@@ -1215,13 +1219,11 @@ def test_spatial_winograd_fused_matches_reference(
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         sm100_fused_eligible,
         sm100_fused_filters,
-        sm100_wino_available,
         wino_spatial_conv_fused,
         winograd_weights,
     )
 
-    if not sm100_wino_available():
-        pytest.skip("sm100 kernels need Blackwell and nvidia-cutlass-dsl")
+    _require_sm100()
     torch.manual_seed(5)
     cin, comps = cin_comps
     cout, h, w, pairs = 256, 16, 64, 2
@@ -1244,9 +1246,19 @@ def test_spatial_winograd_fused_matches_reference(
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
 
 
-frame_ops_op = pytest.mark.skipif(
-    not (hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_unpatchify_clamp")),
-    reason="trtllm::vae_unpatchify_clamp not built",
+def test_sm100_fused_needs_two_cin_chunks() -> None:
+    """The fused conv's MMA schedule peels a first and a last 32-channel chunk per pass, so
+    Cin = 32 (one chunk) is outside its contract and must fall to the unfused path."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import sm100_fused_eligible
+
+    assert not sm100_fused_eligible(32, 256, 8, 32)
+    assert sm100_fused_eligible(64, 256, 8, 32)
+    assert not sm100_fused_eligible(96, 128, 8, 32)
+
+
+frame_ops_op = _built(
+    hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_unpatchify_clamp"),
+    "trtllm::vae_unpatchify_clamp",
 )
 
 
@@ -1469,17 +1481,20 @@ def _untouched(buf: torch.Tensor, axis: str, line: int) -> bool:
 @pytest.mark.parametrize("C", [256, 48])
 @pytest.mark.parametrize("axis", ["h", "w"])
 @pytest.mark.parametrize("order", [2, 4])
-def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int) -> None:
+@pytest.mark.parametrize("one_line", [False, True])
+def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line: bool) -> None:
     """The kernel stores the border lines of its slab / row output into the neighbours'
     buffers (here: local stand-ins with their own layout) and nothing else; the host-side
-    copy writes the same lines."""
+    copy writes the same lines. ``one_line``: the shard is a single line along the split
+    axis, so the same line goes to both neighbours."""
     from dataclasses import replace
 
     from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import DirectFrames, push_border
 
     gen = torch.Generator(device="cuda").manual_seed(C + order)
-    H, W, T = 6, 10, 2 * order
+    T = 2 * order
+    H, W = (6, 10) if not one_line else (1, 10) if axis == "h" else (6, 1)
     P = H * W
     bf = torch.bfloat16
     rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731

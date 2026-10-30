@@ -420,7 +420,27 @@ def _parse_winovae_opts(text: str) -> dict[str, Any]:
     return opts
 
 
-def main() -> None:
+def _clip_span(
+    model: torch.nn.Module,
+    latents: torch.Tensor,
+    n_frames: int,
+    decode_chunk: int,
+    warmup: int,
+    iters: int,
+    use_graph: bool,
+) -> tuple[float, bool]:
+    """Median GPU span (ms) and graph flag of one whole-clip decode of ``n_frames`` latents.
+
+    Timed separately with its own warmup and capture attempt; the flag says whether the
+    timed iterations ran as a CUDA graph.
+    """
+    sub = latents[:, :, :n_frames].contiguous(memory_format=torch.channels_last_3d)
+    fn = _make_op(model, "decode", sub, decode_chunk)
+    t = _time_cupti(fn, warmup, iters, use_graph=use_graph)
+    return t["span"]["median_us"] / 1e3, bool(t["graph"])
+
+
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -466,10 +486,11 @@ def main() -> None:
         "otherwise)",
     )
     parser.add_argument(
-        "--step-latency",
+        "--span-diffs",
         action="store_true",
-        help="also time one steady-state streaming decode step: decode(1 + chunk latent frames) "
-        "minus decode(1), and the cold-start decode(1)",
+        help="also time whole-clip decodes of 1, 1 + chunk and 1 + 2 * chunk latent frames and "
+        "report the differences of their median GPU spans (each timed separately, with graph "
+        "capture attempted unless disabled; not a measurement of an incremental streaming step)",
     )
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument(
@@ -494,7 +515,11 @@ def main() -> None:
         choices=["height", "width"],
         help="shard dimension of the parallel VAE when --world-size > 1",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
     global TOP_KERNELS
     TOP_KERNELS = args.top_kernels
 
@@ -648,33 +673,26 @@ def main() -> None:
                 row["timing"] = _time_cupti(
                     run_fn, args.warmup, args.iters, use_graph=not args.no_graph
                 )
-                if args.step_latency and op == "decode" and inp.shape[2] >= 1 + 2 * decode_chunk:
-                    # Streaming step latency: the difference between decoding 1 + k*chunk and
-                    # 1 + (k-1)*chunk latent frames is one steady-state step (the clip-level
-                    # graph hides per-call costs, so this is the number a streaming consumer sees).
-                    def med(n: int, m: torch.nn.Module = model) -> float:
-                        sub = inp[:, :, :n].contiguous(memory_format=torch.channels_last_3d)
-                        fn = _make_op(m, op, sub, decode_chunk)
-                        return (
-                            _time_cupti(fn, args.warmup, args.iters, use_graph=not args.no_graph)[
-                                "span"
-                            ]["median_us"]
-                            / 1e3
+                if args.span_diffs and op == "decode" and inp.shape[2] >= 1 + 2 * decode_chunk:
+                    frames = [1, 1 + decode_chunk, 1 + 2 * decode_chunk]
+                    timed = [
+                        _clip_span(
+                            model, inp, n, decode_chunk, args.warmup, args.iters, not args.no_graph
                         )
-
-                    cold = med(1)
-                    one = med(1 + decode_chunk)
-                    two = med(1 + 2 * decode_chunk)
-                    row["step_latency"] = {
+                        for n in frames
+                    ]
+                    spans = [t for t, _ in timed]
+                    row["span_diffs"] = {
                         "chunk_latent_frames": decode_chunk,
-                        "cold_start_ms": cold,
-                        "step_ms": one - cold,
-                        "step_ms_check": two - one,
+                        "latent_frames": frames,
+                        "span_ms": spans,
+                        "graph": [g for _, g in timed],
+                        "diff_ms": [spans[1] - spans[0], spans[2] - spans[1]],
                     }
                     print(
-                        f"    step latency: cold start {cold:.2f} ms, steady step "
-                        f"({decode_chunk} latent frames) {one - cold:.2f} ms "
-                        f"(check {two - one:.2f} ms)",
+                        "    whole-clip decode spans for "
+                        + ", ".join(f"{n} latent frames: {t:.2f} ms" for n, t in zip(frames, spans))
+                        + f"; differences {spans[1] - spans[0]:.2f} / {spans[2] - spans[1]:.2f} ms",
                         flush=True,
                     )
                 row["setup_s"] = time.time() - t_start

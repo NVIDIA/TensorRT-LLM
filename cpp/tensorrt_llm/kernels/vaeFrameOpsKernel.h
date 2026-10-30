@@ -26,8 +26,10 @@ namespace kernels
 {
 
 // Elementwise frame operations of the Wan VAE, bf16, frames as [T, P, C] rows
-// (a batch-1 channels-last video), 16-byte vectors, one bf16 rounding per add in the
-// eager order so results match the PyTorch chain bit for bit.
+// (a batch-1 channels-last video), 16-byte vectors. Each operation states its own rounding
+// points below: the interleave and the plain shortcut add round once per add in the eager
+// order (bit for bit with the PyTorch chain); the AvgDown add with a deferred conv bias adds
+// x + bias in fp32 and rounds once with the mean (the eager chain would round x + bias first).
 
 // Upsample3d time interleave with the time conv's bias: u is [T, P, 2C] (the C -> 2C
 // time conv output, bias not applied), y is [2T, P, C] with

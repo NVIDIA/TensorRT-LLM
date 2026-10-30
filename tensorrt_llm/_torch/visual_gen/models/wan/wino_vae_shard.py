@@ -105,12 +105,13 @@ class Shard:
     """This rank's place in the spatial split and the exchanges it needs.
 
     ``axis``: "h" (ranks own consecutive row bands) or "w" (column bands). ``pg`` is the
-    process group of the VAE ranks (the attention gather); ``adj_groups[i]`` is the group of
-    ranks ``i`` and ``i + 1``, through which neighbours trade border lines with batched
-    point-to-point sends (measured 10% faster end to end than two-rank all-gathers: a 720p
-    decode exchanges ~2900 lines). ``halo``: "direct" (the producer kernels store the border
-    lines into the neighbours' symmetric-memory buffers; an error when the ranks cannot map
-    each other's memory), "nccl", or "auto" (direct when it can be set up, else NCCL).
+    process group of the VAE ranks: the attention gather and the border-line exchange (one
+    batched point-to-point send/receive to both neighbours, addressed by global rank) run on
+    it. ``adj_groups[i]`` is the group of ranks ``i`` and ``i + 1``; it only names the
+    neighbours (their global ranks are read from it). ``halo``: "direct" (the producer kernels
+    store the border lines into the neighbours' symmetric-memory buffers; an error when the
+    ranks cannot map each other's memory), "nccl", or "auto" (direct when it can be set up,
+    else NCCL).
     """
 
     def __init__(

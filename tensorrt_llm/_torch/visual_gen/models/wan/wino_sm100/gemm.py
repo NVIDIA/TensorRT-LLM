@@ -32,6 +32,16 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+"""Batched dense GEMM for the spatial Winograd products on Blackwell (sm100).
+
+``PersistentDenseGemmKernel`` computes ``C[M, N, L] = A[M, K, L] . B[N, K, L]`` for ``L``
+independent problems (one per Winograd transform point) with fp16 ``A`` / ``B``, fp32
+accumulation and fp16 or bf16 ``C``: TMA loads into shared memory, ``tcgen05.mma`` into tensor
+memory, warp-specialized load / MMA / epilogue roles on a static persistent tile schedule, and
+an optional programmatic-dependent-launch release so the following transform kernel can start
+early. ``can_implement`` states the shape, alignment and tile constraints.
+"""
+
 from typing import Literal, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -42,73 +52,6 @@ import cutlass.utils as utils
 from cutlass import testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-
-"""
-A high-performance persistent batched dense GEMM example for the NVIDIA Blackwell SM100 architecture
-using CUTE DSL.
-- Matrix A is MxKxL, L is batch dimension, A can be row-major("K") or column-major("M")
-- Matrix B is NxKxL, L is batch dimension, B can be row-major("N") or column-major("K")
-- Matrix C is MxNxL, L is batch dimension, C can be row-major("N") or column-major("M")
-
-This GEMM kernel supports the following features:
-    - Utilizes Tensor Memory Access (TMA) for efficient memory operations
-    - Utilizes Blackwell's tcgen05.mma for matrix multiply-accumulate (MMA) operations (including 2cta mma instructions)
-    - Implements TMA multicast with cluster to reduce L2 memory traffic
-    - Support persistent tile scheduling to better overlap memory load/store with mma between tiles
-    - Support warp specialization to avoid explicit pipelining between mainloop load and mma
-
-This GEMM works as follows:
-1. DMA warp: Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
-2. MMA warp: Perform matrix multiply-accumulate (MMA) operations using tcgen05.mma instruction.
-3. EPILOGUE warp:
-    - Load completed accumulator from tensor memory (TMEM) to registers (RMEM) using tcgen05.ld.
-    - Type convert C matrix to output type.
-    - Optionally store C matrix from registers (RMEM) to shared memory (SMEM) to global memory
-      (GMEM) with TMA operations, or directly from registers to global memory without TMA.
-    - Optionally accept an elementwise lambda function epilogue_op to apply to the output tensor:
-      e.g., relu can set epilogue_op = lambda x: cute.where(x > 0, x, cute.full_like(x, 0))
-
-SM100 tcgen05.mma instructions operate as follows:
-- Read matrix A from SMEM
-- Read matrix B from SMEM
-- Write accumulator to TMEM
-The accumulator in TMEM must then be loaded to registers before writing back to GMEM.
-
-Input arguments to this example is same as dense_gemm.py.
-
-.. code-block:: bash
-
-    python examples/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent.py                          \
-      --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                  \
-      --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
-      --mnkl 8192,8192,8192,1                                                   \
-      --use_tma_store --use_2cta_instrs
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent.py                     \
-      --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                 \
-      --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
-      --mnkl 8192,8192,8192,1                                                  \
-      --use_tma_store --use_2cta_instrs                                        \
-      --warmup_iterations 1 --iterations 10 --skip_ref_check
-
-
-Constraints are same as dense_gemm.py:
-* Supported input data types: fp16, bf16, tf32, int8, uint8, fp8 (e4m3fn, e5m2),
-  see detailed valid dtype combinations in below PersistentDenseGemmKernel class documentation
-* A/B tensor must have the same data type
-* Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
-* Mma tiler N must be 32-256, step 32
-* Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-* Cluster shape M must be multiple of 2 if use_2cta_instrs=True
-* The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
-  i.e, number of elements is a multiple of 4, 8, and 16 for TFloat32,
-  Float16/BFloat16, and Int8/Uint8/Float8, respectively.
-* OOB tiles are not allowed when TMA store is disabled
-"""
 
 
 def _compute_stages(
@@ -147,10 +90,8 @@ def _compute_stages(
              (ACC stages, A/B operand stages, C stages)
     :rtype: tuple[int, int, int]
     """
-    # Default ACC stages
     num_acc_stage = 2
 
-    # Default C stages
     num_c_stage = 2 if use_tma_store else 0
 
     # Calculate smem layout and size for one stage of A, B, and C with 1-stage
@@ -329,7 +270,6 @@ class PersistentDenseGemmKernel:
         - Computing A/B/C shared memory layout
         - Computing tensor memory allocation columns
         """
-        # Configure tiled mma
         tiled_mma = self._create_tiled_mma()
 
         # Compute mma/cluster/tile shapes
@@ -346,7 +286,6 @@ class PersistentDenseGemmKernel:
             self.mma_tiler[2],
         )
 
-        # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma.thr_id.shape,),
@@ -358,7 +297,6 @@ class PersistentDenseGemmKernel:
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
-        # Compute epilogue subtile
         if cutlass.const_expr(self.use_tma_store):
             self.epi_tile = utils.sm100.compute_epilogue_tile_shape(
                 self.cta_tile_shape_mnk,
@@ -419,18 +357,18 @@ class PersistentDenseGemmKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        """Execute the GEMM operation in steps:
-        - Setup static attributes before smem/grid/tma computation
-        - Setup TMA load/store atoms and tensors
-        - Compute grid size with regard to hardware constraints
-        - Define shared storage for kernel
-        - Launch the kernel synchronously
+        """Compute ``C[M, N, L] = A[M, K, L] . B[N, K, L]^T`` for the ``L`` batched problems,
+        launched on ``stream`` and returning before it completes. ``A`` and ``B`` share one
+        dtype (fp16 / bf16 / tf32 / int8 / fp8 per ``check_supported_dtypes``), ``C`` is
+        written in its own dtype after ``epilogue_op``; each tensor's contiguous dimension is
+        16-byte aligned and, without the TMA store, ``M`` and ``N`` are multiples of the CTA
+        tile; callers may use ``can_implement`` to check these constraints before compilation.
 
-        :param a: Input tensor A
+        :param a: Input tensor A, ``[M, K, L]``
         :type a: cute.Tensor
-        :param b: Input tensor B
+        :param b: Input tensor B, ``[N, K, L]``
         :type b: cute.Tensor
-        :param c: Output tensor C
+        :param c: Output tensor C, ``[M, N, L]``
         :type c: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
@@ -460,7 +398,6 @@ class PersistentDenseGemmKernel:
 
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
-        # Setup TMA load for A
         a_op = utils.sm100.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
@@ -473,7 +410,6 @@ class PersistentDenseGemmKernel:
             internal_type=(cutlass.TFloat32 if a.element_type is cutlass.Float32 else None),
         )
 
-        # Setup TMA load for B
         b_op = utils.sm100.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
@@ -490,7 +426,6 @@ class PersistentDenseGemmKernel:
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
-        # Setup TMA store for C
         tma_atom_c = None
         tma_tensor_c = None
         if cutlass.const_expr(self.use_tma_store):
@@ -499,7 +434,6 @@ class PersistentDenseGemmKernel:
                 cpasync.CopyBulkTensorTileS2GOp(), c, epi_smem_layout, self.epi_tile
             )
 
-        # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
             c,
             self.cta_tile_shape_mnk,
@@ -509,7 +443,7 @@ class PersistentDenseGemmKernel:
             max_active_clusters,
         )
 
-        # Launch the kernel synchronously
+        # Launch on the given stream (asynchronous).
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -534,7 +468,6 @@ class PersistentDenseGemmKernel:
         )
         return
 
-    # GPU device kernel
     @cute.kernel
     def kernel(
         self,
@@ -565,7 +498,6 @@ class PersistentDenseGemmKernel:
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
         #
-        # Prefetch tma desc
         #
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -578,13 +510,11 @@ class PersistentDenseGemmKernel:
         #
         # Setup cta/thread coordinates
         #
-        # Coords inside cluster
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-        # Coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
         #
@@ -762,7 +692,6 @@ class PersistentDenseGemmKernel:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         #
-        # Construct the scheduler
         #
         tile_sched = utils.StaticPersistentTileScheduler.create(
             tile_sched_params,
@@ -780,7 +709,6 @@ class PersistentDenseGemmKernel:
             # Persistent tile scheduling loop
             #
             while work_tile.is_valid_tile:
-                # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
@@ -801,7 +729,6 @@ class PersistentDenseGemmKernel:
                 peek_ab_empty_status = ab_producer.try_acquire()
 
                 #
-                # Tma load loop
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
@@ -859,7 +786,6 @@ class PersistentDenseGemmKernel:
             )
 
             while work_tile.is_valid_tile:
-                # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
@@ -965,7 +891,6 @@ class PersistentDenseGemmKernel:
                     num_stages=self.num_c_stage, producer_group=c_producer_group
                 )
             while work_tile.is_valid_tile:
-                # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
@@ -980,13 +905,6 @@ class PersistentDenseGemmKernel:
 
                 num_tiles_executed = tile_sched.num_tiles_executed
                 if cutlass.const_expr(self.use_tma_store):
-                    # {$nv-internal-release begin}
-                    # (EPI_TILE_M, EPI_TILE_N, STAGE)
-                    # sC = storage.sC.get_tensor(
-                    #     c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
-                    # )
-                    # {$nv-internal-release end}
-
                     acc_consumer_state = utils.gemm.sm100.epilogue_tma_store(
                         self,
                         tidx,
@@ -1257,7 +1175,6 @@ class PersistentDenseGemmKernel:
         :raises testing.CantImplementError: If the tensor alignment is invalid
         """
 
-        # TODO: move to utils
         def check_contiguous_16B_alignment(dtype, is_mode0_major, tensor_shape):
             major_mode_idx = 0 if is_mode0_major else 1
             num_major_elements = tensor_shape[major_mode_idx]
@@ -1296,10 +1213,8 @@ class PersistentDenseGemmKernel:
                 raise testing.CantImplementError(
                     f"Problem shape {m}, {n} must be divisible by cta tile shape {cta_tile_shape_mn} for non TMA store"
                 )
-            # {$nv-internal-release begin}
-            # Make sure the swizzle size divides the cta/cga count since non TMA epilouge don't support OOB tiles.
-            # {$nv-internal-release end}
-            # CTA swizzling improves the L2 cache utilization and reduces the number of cache misses.
+            # Without the TMA store there are no OOB tiles, so the swizzle size must divide the
+            # CTA / cluster counts. CTA swizzling improves L2 reuse.
             m_per_swizzle = (m // cta_tile_shape_mn[0]) // self.cluster_shape_mn[0]
             n_per_swizzle = (n // cta_tile_shape_mn[1]) // self.cluster_shape_mn[1]
             if (m_per_swizzle % self.swizzle_size != 0) or (n_per_swizzle % self.swizzle_size != 0):
@@ -1339,7 +1254,6 @@ class PersistentDenseGemmKernel:
         """
 
         try:
-            # Skip unsupported types
             self.check_supported_dtypes(a_dtype, b_dtype, c_dtype)
 
             # Skip invalid mma tile shape and cluster shape

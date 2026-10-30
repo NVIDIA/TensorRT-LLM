@@ -16,6 +16,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float16, Float32, Int32, Int64
 
+from tensorrt_llm._torch.visual_gen.models.wan.wino_tables import SPATIAL_WINO
+
 NT = 128  # threads per CTA for the transform kernels
 
 # Programmatic-dependent-launch flags for the transform kernels (bit set):
@@ -31,40 +33,7 @@ def _pdl_start(pdl):
         cute.arch.griddepcontrol_wait()
 
 
-WINO = {
-    2: dict(
-        BT=[[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]],
-        G=[[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]],
-        AT=[[1, 1, 1, 0], [0, 1, -1, -1]],
-    ),
-    # F(4,3) on points (0, +-3/2, +-5/8, inf): the real point set with the lowest fp16 rounding
-    # sensitivity (per-conv error 1.7e-3 against 2.5e-3 for (0, +-1, 2, -1/2, inf)); B^T and A^T
-    # are dyadic, so their products with bf16 / fp16 inputs are exact in fp32.
-    4: dict(
-        BT=[
-            [225 / 256, 0, -169 / 64, 0, 1, 0],
-            [0, -75 / 128, -25 / 64, 3 / 2, 1, 0],
-            [0, 75 / 128, -25 / 64, -3 / 2, 1, 0],
-            [0, -45 / 32, -9 / 4, 5 / 8, 1, 0],
-            [0, 45 / 32, -9 / 4, -5 / 8, 1, 0],
-            [0, 225 / 256, 0, -169 / 64, 0, 1],
-        ],
-        G=[
-            [256 / 225, 0, 0],
-            [128 / 1071, 64 / 357, 32 / 119],
-            [128 / 1071, -64 / 357, 32 / 119],
-            [-2048 / 2975, -256 / 595, -32 / 119],
-            [-2048 / 2975, 256 / 595, -32 / 119],
-            [0, 0, 1],
-        ],
-        AT=[
-            [1, 1, 1, 1, 1, 0],
-            [0, 3 / 2, -3 / 2, 5 / 8, -5 / 8, 0],
-            [0, 9 / 4, 9 / 4, 25 / 64, 25 / 64, 0],
-            [0, 27 / 8, -27 / 8, 125 / 512, -125 / 512, 1],
-        ],
-    ),
-}
+WINO = SPATIAL_WINO
 
 
 def _bt4(d):
@@ -98,11 +67,12 @@ def _at4(m):
 
 
 def _lin(mat, v):
+    """out[i] = sum_k mat[i][k] * v[k] with trace-time constant coefficients (the F(4,3)
+    input and output transforms take their hand-scheduled forms)."""
     if mat is WINO[4]["BT"]:
         return _bt4(v)
     if mat is WINO[4]["AT"]:
         return _at4(v)
-    """out[i] = sum_k mat[i][k] * v[k] with trace-time constant coefficients."""
     out = []
     for row in mat:
         acc = None
@@ -125,41 +95,6 @@ def _vec(mT, tile, coord):
     """Contiguous rank-1 view (last tile mode) of mT at vector coordinate `coord`."""
     v = cute.local_tile(mT, tile, coord)
     return v[tuple(0 for _ in range(len(tile) - 1)) + (None,)]
-
-
-# ---------------------------------------------------------------- weight transform
-@cute.jit
-def _w_body(
-    mWf: cute.Tensor,
-    mU: cute.Tensor,
-    L: Int32,
-    K: cutlass.Constexpr,
-    C: cutlass.Constexpr,
-    MH: cutlass.Constexpr,
-    MW: cutlass.Constexpr,
-    VEC: cutlass.Constexpr,
-):
-    Gh, Gw = WINO[MH]["G"], WINO[MW]["G"]
-    AW = MW + 2
-    CG = C // VEC
-    if L < K * CG:
-        cg = L % CG
-        co = L // CG
-        frag = cute.make_rmem_tensor((VEC * 9,), mWf.element_type)
-        cute.autovec_copy(_vec(mWf, (1, VEC * 9), (co, cg)), frag)
-        fv = cute.make_tensor(frag.iterator, cute.make_layout((VEC, 3, 3), stride=(9, 3, 1)))
-        g = [[fv[None, r, s].load().to(Float32) for s in range(3)] for r in range(3)]
-        gh = [_lin(Gh, [g[0][s], g[1][s], g[2][s]]) for s in range(3)]  # gh[s][i]
-        for i in cutlass.range_constexpr(MH + 2):
-            u = _lin(Gw, [gh[0][i], gh[1][i], gh[2][i]])
-            for j in cutlass.range_constexpr(AW):
-                of = cute.make_rmem_tensor((VEC,), Float16)
-                of.store(u[j].to(Float16))
-                cute.autovec_copy(of, _vec(mU, (1, 1, VEC), (i * AW + j, co, cg)))
-
-
-def _w_vec(MH, MW):
-    return 8 if (MH + 2) * (MW + 2) <= 16 else 4
 
 
 # ---------------------------------------------------------------- input transform
@@ -261,58 +196,6 @@ def in_xform(
     nblk = (T * (C // _in_vec(MH, MW)) + NT - 1) // NT
     _in_xform_kernel(mX, mV, N, H, W, C, MH, MW, PDL).launch(
         grid=[nblk, 1, 1], block=[NT, 1, 1], stream=stream, use_pdl=PDL != 0
-    )
-
-
-# ---------------------------------------------------------------- weight + first input chunk
-@cute.kernel
-def _wi_xform_kernel(
-    mWf: cute.Tensor,
-    mU: cute.Tensor,
-    mX: cute.Tensor,
-    mV: cute.Tensor,
-    K: cutlass.Constexpr,
-    N: cutlass.Constexpr,
-    H: cutlass.Constexpr,
-    W: cutlass.Constexpr,
-    C: cutlass.Constexpr,
-    MH: cutlass.Constexpr,
-    MW: cutlass.Constexpr,
-    NBW: cutlass.Constexpr,
-    PDL: cutlass.Constexpr,
-):
-    # The weight and input transforms are independent: CTAs [0, NBW) do weights, the rest do
-    # input tiles, so both streams of HBM traffic run concurrently in one grid.
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    _pdl_start(PDL)
-    if bidx < NBW:
-        _w_body(mWf, mU, bidx * NT + tidx, K, C, MH, MW, _w_vec(MH, MW))
-    else:
-        _in_body(mX, mV, (bidx - NBW) * NT + tidx, N, H, W, C, MH, MW, _in_vec(MH, MW))
-
-
-@cute.jit
-def wi_xform(
-    mWf: cute.Tensor,
-    mU: cute.Tensor,
-    mX: cute.Tensor,
-    mV: cute.Tensor,
-    K: cutlass.Constexpr,
-    N: cutlass.Constexpr,
-    H: cutlass.Constexpr,
-    W: cutlass.Constexpr,
-    C: cutlass.Constexpr,
-    MH: cutlass.Constexpr,
-    MW: cutlass.Constexpr,
-    PDL: cutlass.Constexpr,
-    stream: cuda.CUstream,
-):
-    T = N * ((H + MH - 1) // MH) * (W // MW)
-    nbw = (K * (C // _w_vec(MH, MW)) + NT - 1) // NT
-    nbi = (T * (C // _in_vec(MH, MW)) + NT - 1) // NT
-    _wi_xform_kernel(mWf, mU, mX, mV, K, N, H, W, C, MH, MW, nbw, PDL).launch(
-        grid=[nbw + nbi, 1, 1], block=[NT, 1, 1], stream=stream, use_pdl=PDL != 0
     )
 
 

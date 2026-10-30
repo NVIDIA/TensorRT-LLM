@@ -137,21 +137,6 @@ def _wino_item_p1(src: Int32, dst: Int32, in_half: bool, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _globaltimer(*, loc=None, ip=None):
-    return cutlass.Int64(
-        llvm.inline_asm(
-            T.i64(),
-            [],
-            "mov.u64 $0, %globaltimer;",
-            "=l",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def _bfly2(a0, a1, b0, b1, *, loc=None, ip=None):
     # (a, b) <- (a + b, a - b) on two fp32 lanes with packed f32x2 add/sub (sm_100)
     out = llvm.inline_asm(
@@ -174,21 +159,6 @@ def _bfly2(a0, a1, b0, b1, *, loc=None, ip=None):
         ip=ip,
     )
     return [cutlass.Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(4)]
-
-
-DBG = False  # per-role cycle instrumentation (diagnostic builds only)
-
-
-def _clk():
-    if DBG:
-        return cute.arch.clock64()
-    return cutlass.Int64(0)
-
-
-def _gtm():
-    if DBG:
-        return _globaltimer()
-    return cutlass.Int64(0)
 
 
 @dsl_user_op
@@ -236,7 +206,6 @@ class Wino23Conv:
         mX: cute.Tensor,
         mU: cute.Tensor,
         mY: cute.Tensor,
-        mD: cute.Tensor,
         stream: cuda.CUstream,
     ):
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -348,7 +317,6 @@ class Wino23Conv:
             raw_layout,
             epi_layout,
             u_bytes,
-            mD,
         ).launch(
             grid=(4, 1, self.nslots),
             block=(self.threads, 1, 1),
@@ -385,7 +353,6 @@ class Wino23Conv:
         raw_layout: cute.Layout,
         epi_layout: cute.Layout,
         u_bytes: cutlass.Constexpr,
-        mD: cute.Tensor,
     ):
         cdx, cdy, cdz = cute.arch.block_in_cluster_dim()
         if cdx == 4:
@@ -408,7 +375,6 @@ class Wino23Conv:
                 epi_layout,
                 u_bytes,
                 2,
-                mD,
             )
         else:
             self.body(
@@ -430,14 +396,7 @@ class Wino23Conv:
                 epi_layout,
                 u_bytes,
                 1,
-                mD,
             )
-
-    @cute.jit
-    def _dbg(self, mD, k: cutlass.Constexpr, v):
-        if cutlass.const_expr(DBG):
-            if cute.arch.lane_idx() == 0:
-                cute.arch.atomic_add((mD.iterator + k).llvm_ptr, v)
 
     @cute.jit
     def body(
@@ -460,7 +419,6 @@ class Wino23Conv:
         epi_layout: cute.Layout,
         u_bytes: cutlass.Constexpr,
         pairs: cutlass.Constexpr,
-        mD: cute.Tensor,
     ):
         in_half = self.in_dtype is cutlass.Float16
 
@@ -740,7 +698,6 @@ class Wino23Conv:
         if warp_idx == self.xtma_warp:
             cute.arch.setmaxregister_decrease(56)
             st = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, NUM_RAW_STAGE)
-            tw = cutlass.Int64(0)
             unit = cid
             while unit < self.nunit:
                 blk = unit * 4 + cta_rank
@@ -764,9 +721,7 @@ class Wino23Conv:
                 )
                 for pss in cutlass.range_constexpr(NPASS):
                     for kc in cutlass.range(nkc, unroll=1):
-                        q0 = _clk()
                         x_pipe.producer_acquire(st)
-                        tw += _clk() - q0
                         cute.copy(
                             tma_atom_x,
                             tXgX[(None, (kc + rot) % nkc)],
@@ -775,7 +730,6 @@ class Wino23Conv:
                         )
                         st.advance()
                 unit += nslots
-            self._dbg(mD, 21, tw)
             x_pipe.producer_tail(st)
 
         # =================== transform warps ===================
@@ -802,21 +756,12 @@ class Wino23Conv:
                 dst_off.append(m * (KC * 2) + ((c ^ ((m >> 1) & 3)) << 4))
             xst = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, NUM_RAW_STAGE)
             vst = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, NUM_V_STAGE)
-            tx = cutlass.Int64(0)
-            tv = cutlass.Int64(0)
-            tc = cutlass.Int64(0)
-            tt0 = _clk()
             unit = cid
             while unit < self.nunit:
                 for pss in cutlass.range_constexpr(NPASS):
                     for kc in cutlass.range(nkc, unroll=1):
-                        q0 = _clk()
                         x_pipe.consumer_wait(xst)
-                        q1 = _clk()
                         v_pipe.producer_acquire(vst)
-                        q2 = _clk()
-                        tx += q1 - q0
-                        tv += q2 - q1
                         rb = raw_base + xst.index * RAW_BYTES
                         vb = v_base + vst.index * VSTAGE_BYTES
                         for p in cutlass.range_constexpr(5):
@@ -825,7 +770,6 @@ class Wino23Conv:
                             else:
                                 _wino_item_p1(rb + src_off[p], vb + dst_off[p], in_half)
                         _fence_proxy_async_smem()
-                        tc += _clk() - q2
                         cute.arch.sync_warp()
                         x_pipe.consumer_release(xst)
                         with cute.arch.elect_one():
@@ -833,10 +777,6 @@ class Wino23Conv:
                         xst.advance()
                         vst.advance()
                 unit += nslots
-            self._dbg(mD, 10, tx)
-            self._dbg(mD, 11, tv)
-            self._dbg(mD, 12, tc)
-            self._dbg(mD, 13, _clk() - tt0)
 
         # =================== MMA warp ===================
         if warp_idx == self.mma_warp:
@@ -1174,11 +1114,6 @@ class Wino23Conv:
             with cute.arch.elect_one():
                 b_pipe.producer_commit(bpst)
             bpst.advance()
-            ea = cutlass.Int64(0)
-            eb = cutlass.Int64(0)
-            ec = cutlass.Int64(0)
-            ed = cutlass.Int64(0)
-            ee = cutlass.Int64(0)
             unit = cid
             while unit < self.nunit:
                 blk = unit * 4 + cta_rank
@@ -1186,13 +1121,10 @@ class Wino23Conv:
                 rem = blk - n * (hb * wb)
                 # ---- phase A: butterfly (A, B) <- (A + B, A - B) of this warp's Cout half, as
                 # soon as pass 0 has finished on that half ----
-                q0 = _clk()
                 if sh == 0:
                     p0lo_pipe.consumer_wait(lcst)
                 else:
                     p0hi_pipe.consumer_wait(hcst)
-                q1 = _clk()
-                ea += q1 - q0
                 for cc in cutlass.range_constexpr(NCO // EPI_COLS // 2):
                     ccg = sh * (NCO // EPI_COLS // 2) + cc
                     cute.copy(t2r, tTR[(None, None, None, 0, ccg, None)], rAB)
@@ -1216,13 +1148,9 @@ class Wino23Conv:
                         p0hi_pipe.consumer_release(hcst)
                 lcst.advance()
                 hcst.advance()
-                q2 = _clk()
-                eb += q2 - q1
                 # ---- phase B: drain y0 = A as soon as the last coord-0 MMAs are done (the
                 # tensor core is still on coord 3), then y1 = B after pass 1 ----
                 af_pipe.consumer_wait(afst)
-                q3 = _clk()
-                ec += q3 - q2
                 for cc in cutlass.range_constexpr(ND32):
                     cute.copy(d32, tD32[(None, None, None, 0, sh * ND32 + cc, 0)], rD32)
                     rY[2 * cc].store(rD32.load().to(self.out_dtype))
@@ -1242,8 +1170,6 @@ class Wino23Conv:
                 with cute.arch.elect_one():
                     b_pipe.producer_commit(bpst)
                 bpst.advance()
-                q4 = _clk()
-                ed += q4 - q3
                 # TMEM is free for the next block's MMAs; write the outputs from registers via a
                 # per-warp SMEM box and TMA stores (overlaps the next block's MMAs)
                 gYt = cute.local_tile(
@@ -1280,16 +1206,9 @@ class Wino23Conv:
                         if blk < nblk:
                             cute.copy(tma_atom_y, tYs, tYg[(None, ccg)])
                         cute.arch.cp_async_bulk_commit_group()
-                ee += _clk() - q4
                 unit += nslots
             if lane_e == 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
-            if warp_idx == 0:
-                self._dbg(mD, 30, ea)
-                self._dbg(mD, 31, eb)
-                self._dbg(mD, 32, ec)
-                self._dbg(mD, 33, ed)
-                self._dbg(mD, 34, ee)
             epi_all_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
@@ -1375,7 +1294,8 @@ def run_prepared(x, ut, y):
     ``[N, H, W, C]`` (bf16 or fp16 x, y in its own dtype); launches on the current torch stream."""
     n_img, h, w, cin = x.shape
     cout = ut.shape[0]
-    assert h % RC == 0 and w % (2 * WT) == 0 and cout == NCO and cin % KC == 0
+    # The MMA schedule peels a first and a last Cin chunk per pass: at least two chunks.
+    assert h % RC == 0 and w % (2 * WT) == 0 and cout == NCO and cin % KC == 0 and cin >= 2 * KC
     key = (n_img, h, w, cin, cout, x.dtype, y.dtype)
     if key not in _cache:
         nslots = utils.HardwareInfo().get_max_active_clusters(2) // 2
@@ -1386,11 +1306,10 @@ def run_prepared(x, ut, y):
             from_dlpack(x, assumed_align=16, enable_tvm_ffi=True),
             from_dlpack(ut, assumed_align=16, enable_tvm_ffi=True),
             from_dlpack(y, assumed_align=16, enable_tvm_ffi=True),
-            from_dlpack(y, assumed_align=16, enable_tvm_ffi=True),
             make_fake_stream(use_tvm_ffi_env_stream=True),  # the caller's torch stream
             options="--enable-tvm-ffi",
         )
-    _cache[key](x, ut, y, y)
+    _cache[key](x, ut, y)
 
 
 def run(x, weight, y):

@@ -24,7 +24,7 @@ benchmark compares against.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -95,107 +95,105 @@ from .wino_vae_kernels import (
 )
 from .wino_vae_shard import DirectFrames, Shard, push_border
 
+# One slot of the causal-conv cache list threaded through a chunked encode / decode: the
+# conv's history frames ``[B, C, 0..2, H, W]``; the conv itself when it keeps them in its
+# frame buffer (``WinoVaeCausalConv3d.slab_history`` hands them over); the ``"Rep"``
+# sentinel of the resampler's time conv; None before the first chunk.
+CacheEntry: TypeAlias = "torch.Tensor | WinoVaeCausalConv3d | Literal['Rep'] | None"
 
-@dataclass
+
+@dataclass(frozen=True)
 class WinoVaeOptions:
-    """Optimization switches. All off reproduces the native ``WanVAE`` exactly."""
+    """Optimization switches. All off reproduces the native ``WanVAE`` exactly.
 
-    # RMSNorm + SiLU in one kernel (checklist item 1). ``norm_mode`` picks the
-    # numerics: "fp32" keeps everything in fp32 until the store; "reference"
-    # reproduces the eager path's intermediate roundings for a bitwise-style gate.
+    Frozen: a model copies some values into its modules at construction and reads the rest
+    live, so the options are fixed for the model's lifetime. Build another model (with
+    ``dataclasses.replace`` for a variant) to run with different ones."""
+
+    # RMSNorm + SiLU in one kernel. ``norm_mode`` picks the numerics: "fp32" keeps
+    # everything in fp32 until the store; "reference" reproduces the eager path's
+    # intermediate roundings for a bitwise-style gate.
     fused_norm: bool = False
     norm_mode: str = "fp32"
     # "cuda": the runtime-compiled norm kernel (falls back to Triton when it cannot be
     # compiled or the shape is unsupported); "triton": the prototype kernel.
     norm_kernel: str = "cuda"
-    # Checklist item 2: a residual block hands its ``conv2 + residual`` add to the next
+    # A residual block hands its ``conv2 + residual`` add to the next
     # block's norm kernel instead of running it as a separate pass. Needs fused_norm and
     # the CUDA op; consumers that are not a norm materialize the add themselves.
     fused_residual: bool = False
-    # Checklist item 3: nearest-2x upsample + 3x3 conv as one 2x2 conv on the low-res
+    # Nearest-2x upsample + 3x3 conv as one 2x2 conv on the low-res
     # grid followed by a phase gather that also adds the DupUp3D shortcut.
     fused_upsample: bool = False
     # The upsample gather folded into the next block's norm kernel, which forms the upsampled
     # frames (phase gather + conv bias + DupUp3D shortcut) while reading and writes them as the
     # block input; the separate gather pass and its re-read go. Bit-identical to the two
-    # kernels. Off by default: on GB200 the fused producer is slower where the shortcut maps
-    # two elements per channel (the norm kernel is instruction-bound, not bandwidth-bound), so
-    # the saved bytes buy no time. Needs fused_upsample + fused_norm with the CUDA kernel;
-    # batch 1, unsharded.
+    # kernels. Needs fused_upsample + fused_norm with the CUDA kernel; batch 1, unsharded.
     fused_upsample_norm: bool = False
-    # Checklist item 4: a convolution runs without its bias and the consumer kernel adds
+    # A convolution runs without its bias and the consumer kernel adds
     # it (the fused norm, or the upsample gather). Needs fused_norm + fused_residual (the
     # bias rides on the same PendingAdd) and the CUDA op. In "fp32" norm mode a
     # channel-changing block merges its shortcut conv's bias into the same vector; in
     # "reference" mode that shortcut bias stays eager so the result is still bitwise.
     fused_bias: bool = False
-    # Checklist item 5 follow-ups. ``cudnn_benchmark``: "off" uses cuDNN's heuristics
-    # everywhere, "on" runs cudnn.benchmark for every conv, "auto" benchmarks the
-    # encoder and single-frame (image) decodes, where it measured faster, and keeps the
-    # heuristics for video decodes, where it measured slower.
+    # ``cudnn_benchmark``: "off" uses cuDNN's heuristics everywhere, "on" runs
+    # cudnn.benchmark for every conv, "auto" benchmarks the encoder and single-frame (image)
+    # decodes and keeps the heuristics for video decodes.
     cudnn_benchmark: str = "off"
     # ``conv_out_frame_split``: run the decoder's narrow conv_out (256 -> 12 channels) on
-    # at most this many input frames per call (0 = off); cuDNN picks a kernel ~10x slower
-    # for that shape once the input has more than three frames.
+    # at most this many input frames per call (0 = off); the outputs are concatenated.
     conv_out_frame_split: int = 0
-    # Checklist item 7: on a chunk with no causal history (the first chunk of a video,
+    # On a chunk with no causal history (the first chunk of a video,
     # every image) a 3x3x3 causal conv on one frame equals a 3x3 conv2d with the
     # current-frame weight slice; the two zero-history taps are skipped (cuDNN conv2d, or
     # spatial Winograd with ``winograd_spatial_first_frame``).
     first_frame_conv2d: bool = False
-    # Checklist item 8: temporal Winograd on the residual-block convs of chunks with an
+    # Temporal Winograd on the residual-block convs of chunks with an
     # even number (>= 2) of frames. The norm kernel emits the transformed frame slabs, the
     # conv runs as one 3x3 conv2d per slab, and the next norm kernel combines the results
     # while reading. Needs fused_norm with the CUDA op.
     winograd_temporal: bool = False
-    # Checklist item 42: the temporal order. 4 = F(4,3) where a call has a multiple of four
+    # The temporal order. 4 = F(4,3) where a call has a multiple of four
     # frames (six conv2d per four frames instead of eight, a quarter less slab traffic), on
     # the points (0, 1, -1, 2, -1/2, inf); calls with 2 mod 4 frames fall back to F(2,3).
     # 2 = F(2,3) everywhere. Order 4 needs fp16 slabs.
     winograd_temporal_order: int = 4
     # Storage type of the transformed slabs and the conv products between the norm kernels:
-    # "fp16" (three more mantissa bits; the F(4,3) error becomes negligible against the bf16
-    # output rounding and the F(2,3) error drops 15x) or "bf16".
+    # "fp16" (three more mantissa bits than bf16 for the transformed values; required by
+    # order 4) or "bf16".
     winograd_slab_dtype: str = "fp16"
-    # Checklist item 39: the convs still on cuDNN (the frame-buffer 3D convs, the direct 3D
-    # convs) go through the cuDNN graph API with the fastest of every engine plan the
-    # heuristics offer for the shape (timed once per shape, remembered on disk). Measured on
-    # GB200: the encoder's 160/320/640-channel levels 1.12-1.29x over torch's engine choice;
-    # end to end 480p encode 184 -> 177 ms, the rest within noise. The plan search runs once
-    # per new shape (seconds) and is remembered on disk. Off by default like every other
-    # option: the all-off model reproduces the native one bit for bit.
+    # The convs still on cuDNN (the frame-buffer 3D convs, the direct 3D convs) go through
+    # the cuDNN graph API with the fastest of every engine plan the heuristics offer for the
+    # shape. The plan search runs once per new shape (seconds) and is remembered on disk.
     cudnn_frontend: bool = False
-    # Checklist item 22: spatial Winograd F(2x2,3x3) on top of the temporal one. The four
-    # 3x3 conv2d calls become an input transform, 64 cuBLAS batched GEMMs and an output
-    # transform. Single-frame calls (the first frame of a clip, every image, and the
-    # one-frame chunks of a streaming decode at the low-resolution levels) run spatial
-    # Winograd alone: the three temporal taps are summed inside the GEMM (K = 3 * Cin), the
-    # zero-history first frame keeps one tap. It pays where cuDNN's implicit GEMM is weak
-    # (few output pixels per channel): "auto" uses it on the measured winners (see
-    # ``spatial_eligible``), "all" on every eligible conv (tests), "off" never.
+    # Spatial Winograd on top of the temporal one: each 3x3 conv2d of a slab becomes an input
+    # transform, one batched GEMM per transform point and an output transform. Single-frame
+    # calls (the first frame of a clip, every image, and the one-frame chunks of a streaming
+    # decode at the low-resolution levels) run spatial Winograd alone: the three temporal
+    # taps are summed inside the GEMM (K = 3 * Cin), the zero-history first frame keeps one
+    # tap. It pays where cuDNN's implicit GEMM is weak (few output pixels per channel):
+    # "auto" uses it on the layers listed in ``spatial_eligible``, "all" on every eligible
+    # conv (tests), "off" never.
     winograd_spatial: str = "off"
     # Spatial-Winograd kernel for the frame-pair path: "sm100" = the Blackwell CuTe DSL
     # F(4x4, 3x3) pipeline (Cin % 64 == 0, Cout % 256 == 0, width % 4 == 0; the portable path
-    # elsewhere), the fastest on every eligible layer measured on GB200; "cublas" = the
-    # portable path (transform kernels + cuBLAS batched GEMMs). Single-frame calls always use
-    # the portable path.
+    # elsewhere); "cublas" = the portable path (transform kernels + cuBLAS batched GEMMs).
+    # Single-frame calls always use the portable path.
     winograd_spatial_kernel: str = "sm100"
     # The fused F(2,3)-horizontal / direct-vertical conv for the 256-output-channel convs
     # under the "sm100" kernel; off = those convs stay on cuDNN.
     winograd_spatial_fused: bool = True
-    # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (1.8x fewer GEMM FLOPs
-    # and transformed bytes; fp16 storage keeps its error below the bf16 F2 path).
+    # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (fewer GEMM FLOPs
+    # and transformed bytes per output, larger transform coefficients).
     winograd_spatial_tile: int = 4
     # Tile for the single-frame calls with a causal history (spatial Winograd alone, the three
-    # taps summed in the GEMM). They replace a direct cuDNN conv3d, so F(2x2, 3x3), whose
-    # per-conv error matches direct bf16, keeps the model's accuracy; F(4x4, 3x3) is faster
-    # and ~3x noisier per conv (1.7e-3 vs 6e-4 relative, fp16 slabs).
+    # taps summed in the GEMM): 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (fewer multiplies per output,
+    # larger transform coefficients).
     winograd_spatial_single_tile: int = 2
     # Run the zero-history first frame (and every image) as spatial Winograd on the
-    # current-frame tap instead of cuDNN conv2d. Faster at the 1024-channel levels with
-    # ``winograd_spatial_tile = 4``, at ~2x the per-conv error of the conv2d it replaces.
+    # current-frame tap instead of cuDNN conv2d.
     winograd_spatial_first_frame: bool = False
-    # Checklist item 9: the convs that still run as 3D with a causal cache (one frame per
+    # The convs that still run as 3D with a causal cache (one frame per
     # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
     # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
     conv_slabs: bool = False
@@ -203,19 +201,17 @@ class WinoVaeOptions:
     # bias in the epilogue on the row view (no permute/contiguous copy), and the residual
     # add handed to the next block's norm as a PendingAdd.
     fused_attention: bool = False
-    # Checklist item 15: the encoder's conv_out (3x3x3) and quant_conv (1x1x1) have no
+    # The encoder's conv_out (3x3x3) and quant_conv (1x1x1) have no
     # activation between them, so quant_conv folds into conv_out's weights (composed in
     # fp32, rounded once); ``encode_mode`` then runs only the mean half of the folded conv.
     # Off in "reference" mode, where every rounding of the eager path is reproduced.
     fold_encoder_tail: bool = False
-    # Checklist item 20: pixel frames per encoder pass after the first one-frame pass. Must
-    # be a multiple of 4 so every pass ends at the same temporal-downsampler parity. Larger
-    # passes give the convs more rows and fewer launches: 720p encode 726 ms at 4 frames,
-    # 628 at 24 (flat beyond), 480p 224 -> 184; peak memory 9 -> 29 GB at 720p. From 8 frames
-    # up the deepest levels see frame pairs and take the Winograd pair path, which moves the
-    # encode error from 1.27e-2 to 1.35e-2 against the fp32 reference (decode's level).
+    # Pixel frames per encoder pass after the first one-frame pass. Must be a multiple of 4
+    # so every pass ends at the same temporal-downsampler parity. Larger passes give the
+    # convs more rows and fewer launches at the price of peak memory; from 8 frames up the
+    # deepest levels see frame pairs and take the Winograd pair path.
     encoder_chunk_frames: int = 24
-    # Checklist item 14: the decoder writes each chunk's unpatchified, clamped frames
+    # The decoder writes each chunk's unpatchified, clamped frames
     # straight into the preallocated output (one kernel per chunk) instead of
     # cat + unpatchify + clamp over the whole video. Needs the CUDA op; bf16, batch 1.
     fused_output: bool = False
@@ -392,11 +388,12 @@ class UpsampleInput:
 class PendingAdd:
     """``(a + bias) + b`` not yet computed: the next fused norm adds it while reading.
 
-    ``bias`` is a per-channel convolution bias the conv did not apply; ``b`` is a
-    residual. Either may be absent. When ``wino`` is set, ``a`` is None and the frames
-    are the temporal Winograd combine of the ``order + 2`` conv2d results ``wino`` (each
-    ``[groups, C, H, W]`` channels-last, bf16 or fp16): frame ``g*order + j`` is
-    ``sum_k AT[j][k] m_k`` (:data:`TEMPORAL_WINO`).
+    Exactly one source holds the frames: ``a`` (a tensor), ``wino`` (the temporal Winograd
+    combine of the ``order + 2`` conv2d results, each ``[groups, C, H, W]`` channels-last, bf16
+    or fp16: frame ``g*order + j`` is ``sum_k AT[j][k] m_k``, :data:`TEMPORAL_WINO`), or ``up``
+    (a packed upsample the consumer norm kernel gathers while reading). ``bias`` is a
+    per-channel convolution bias the conv did not apply; ``b`` is a residual; either may be
+    absent with ``a`` or ``wino``, neither may accompany ``up``.
     """
 
     a: torch.Tensor | None
@@ -408,6 +405,13 @@ class PendingAdd:
     # When set, ``a``, ``b``, ``bias`` and ``wino`` are None: the frames are an upsample not
     # yet gathered, formed by the consumer norm kernel while reading.
     up: UpsampleInput | None = None
+
+    def __post_init__(self) -> None:
+        sources = (self.a is not None) + (self.wino is not None) + (self.up is not None)
+        if sources != 1:
+            raise ValueError("PendingAdd needs exactly one of a, wino, up")
+        if self.up is not None and (self.b is not None or self.bias is not None):
+            raise ValueError("an upsample source carries its own bias and residual")
 
     @property
     def frames(self) -> int:
@@ -478,6 +482,13 @@ class PendingAdd:
         )
 
     def can_fuse(self) -> bool:
+        """Whether the CUDA kernels can consume this pending add directly (a bf16 tensor
+        source or a bf16 / fp16 Winograd-product source, batch 1, on CUDA): the consumer norm
+        adds it while reading
+        and ``materialize`` uses the combine kernel. An upsample source is handled by its own
+        path and answers False."""
+        if self.up is not None:
+            return False
         src = self.a if self.a is not None else self.wino[0]
         batch_one = (self.a is None or self.a.shape[0] == 1) and (
             self.b is None or self.b.shape[0] == 1
@@ -515,6 +526,12 @@ class WinoSlabs:
             _, _, h, w = self.d[0].shape
             return self.stacked.view(comps, groups, h, w, c)
         return self.stacked.view(comps, groups, self.geometry.rows, self.geometry.cols, c)
+
+
+def _cache_frames(entry: CacheEntry) -> torch.Tensor | Literal["Rep"] | None:
+    """A ``feat_cache`` entry as the history-frame tensor the eager and Winograd paths read:
+    a conv that left itself there (frame-buffer path) hands over its two history frames."""
+    return entry.slab_history() if isinstance(entry, WinoVaeCausalConv3d) else entry
 
 
 def _pending_like(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
@@ -798,7 +815,7 @@ class WinoVaeCausalConv3d(nn.Conv3d):
         self._slab_pos = 0
 
     def slab_begin(
-        self, cache_entry, frames: int, like: torch.Tensor, spatial: tuple[int, int]
+        self, cache_entry: CacheEntry, frames: int, like: torch.Tensor, spatial: tuple[int, int]
     ) -> torch.Tensor:
         """Start a chunk: reset on the first chunk, adopt a cache tensor left by the eager
         first-chunk path (the frame history), and return the writable window. ``spatial`` is
@@ -818,6 +835,17 @@ class WinoVaeCausalConv3d(nn.Conv3d):
     def slab_geometry(self) -> FrameGeometry | None:
         """Frame layout of the frame buffer (halo lines under sharding)."""
         return self._slab_geo
+
+    def slab_history(self) -> torch.Tensor | None:
+        """The frame buffer's two history frames as a logical channels-last ``[1, C, 2, H, W]``
+        tensor (the cache entry the other conv paths read), or ``None`` before the first chunk."""
+        if self._slab is None or self._slab_pos < 2:
+            return None
+        hist = self._slab[:, :, self._slab_pos - 2 : self._slab_pos]
+        geo = self._slab_geo
+        if geo is not None:
+            hist = hist[:, :, :, geo.row0 : geo.row0 + geo.height, geo.col0 : geo.col0 + geo.width]
+        return hist.contiguous(memory_format=torch.channels_last_3d)
 
     def slab_window(
         self, frames: int, like: torch.Tensor, spatial: tuple[int, int]
@@ -1014,8 +1042,8 @@ class WinoVaeCausalConv3d(nn.Conv3d):
         return cached[2]
 
     def _use_sm100_fused(self, height: int, width: int) -> bool:
-        """The fused F(2,3)-horizontal / direct-vertical conv for the 256-output-channel level:
-        1.3-1.5x over cuDNN per conv on GB200 with the multiplies cut, not rearranged."""
+        """The fused F(2,3)-horizontal / direct-vertical conv for the 256-output-channel level
+        (``sm100_fused_eligible`` states its shapes)."""
         return (
             self.winograd_spatial_kernel == "sm100"
             and self.winograd_spatial_fused
@@ -1043,10 +1071,9 @@ class WinoVaeCausalConv3d(nn.Conv3d):
             return False
         if self.winograd_spatial == "all":
             return True
-        # Measured winners on GB200: the sm100 F(4x4, 3x3) pipeline on every conv with at
-        # least 512 input channels (incl. 512 -> 256 at 360x640); the portable path with
-        # F(4x4, 3x3) on every 1024-channel layer and the 512-channel level up to 180x320,
-        # with F(2x2, 3x3) on the 1024-channel levels only.
+        # "auto" selection by kernel and tile: the sm100 F(4x4, 3x3) pipeline on convs with at
+        # least 512 input channels up to 360x640; the portable path with F(4x4, 3x3) from 512
+        # input channels up to 180x320, with F(2x2, 3x3) from 1024 input channels up to 90x160.
         if kernel == "sm100":
             return self.in_channels >= 512 and height * width <= 360 * 640
         if tile == 4:
@@ -1308,7 +1335,9 @@ class WinoVaeResample(nn.Module):
         self.options = options or WinoVaeOptions()
         self._packed: tuple[int, int, torch.Tensor, torch.Tensor | None] | None = None
         # Downsample conv bias left out of the conv (fused_bias): the time conv absorbs it
-        # (downsample3d) or the block's shortcut-add kernel adds it (downsample2d).
+        # (downsample3d) or the owning block's shortcut-add kernel adds it (downsample2d).
+        # Only a block that takes ``pending_bias`` may enable the deferral.
+        self.defer_bias_to_consumer = False
         self.pending_bias: torch.Tensor | None = None
         self._time_bias: tuple[int, int, int, int, torch.Tensor] | None = None
         self.shard: Shard | None = None
@@ -1419,7 +1448,7 @@ class WinoVaeResample(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
         shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None = None,
     ) -> torch.Tensor:
@@ -1508,7 +1537,8 @@ class WinoVaeResample(nn.Module):
     def _defer_downsample_bias(self, x: torch.Tensor, batch_size: int) -> bool:
         conv = self.resample[1]
         return (
-            self.options.fused_bias
+            self.defer_bias_to_consumer
+            and self.options.fused_bias
             and self.options.norm_mode != "reference"
             and conv.bias is not None
             and cuda_frame_ops_available()
@@ -1550,7 +1580,7 @@ class WinoVaeResample(nn.Module):
         self,
         x_4d: torch.Tensor,
         frames: int,
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
     ) -> torch.Tensor:
         """Downsample path on an input that already carries the zero row/column the
@@ -1568,7 +1598,7 @@ class WinoVaeResample(nn.Module):
         x: torch.Tensor,
         batch_size: int,
         frames: int,
-        feat_cache: list[torch.Tensor | str | None] | None,
+        feat_cache: list[CacheEntry] | None,
         feat_idx: list[int] | None,
     ) -> torch.Tensor:
         x_5d = x.reshape(batch_size, frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
@@ -1644,7 +1674,7 @@ class WinoVaeResidualBlock(nn.Module):
     def forward(
         self,
         x: "torch.Tensor | PendingAdd",
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
         *,
         defer_output_bias: bool = False,
@@ -1686,6 +1716,9 @@ class WinoVaeResidualBlock(nn.Module):
                 x, feat_cache, feat_idx, frames, defer, defer_out, return_input
             )
 
+        if feat_cache is not None and feat_idx is not None:
+            for i in (feat_idx[0], feat_idx[0] + 1):
+                feat_cache[i] = _cache_frames(feat_cache[i])
         if isinstance(x, PendingAdd):
             x, h = self.norm1.forward_silu_pending(x)
         else:
@@ -1718,7 +1751,7 @@ class WinoVaeResidualBlock(nn.Module):
     def _forward_slabs(
         self,
         x: "torch.Tensor | PendingAdd",
-        feat_cache: list[torch.Tensor | str | None],
+        feat_cache: list[CacheEntry],
         feat_idx: list[int],
         frames: int,
         defer: bool,
@@ -1767,13 +1800,14 @@ class WinoVaeResidualBlock(nn.Module):
     def _forward_winograd(
         self,
         x: "torch.Tensor | PendingAdd",
-        feat_cache: list[torch.Tensor | str | None],
+        feat_cache: list[CacheEntry],
         feat_idx: list[int],
         frames: int,
         return_input: bool,
     ) -> "PendingAdd | tuple[PendingAdd, torch.Tensor]":
         """Both convs as temporal Winograd. The caches hold the last two normalized
-        frames exactly as the eager path stores them; conv biases ride on the
+        frames exactly as the eager path stores them (a frame-buffer conv left by an
+        odd-length chunk hands over its history frames); conv biases ride on the
         PendingAdd and are added by the consumer kernel (free there)."""
         # norm1 -> slabs for conv1; the sum it writes is the block input (residual source).
         h, w = _pending_spatial(x)
@@ -1782,7 +1816,7 @@ class WinoVaeResidualBlock(nn.Module):
         idx = feat_idx[0]
         geo1, into1, direct1 = self.conv1.winograd_slabs(h, w, order, frames)
         s, cache1, slabs = self.norm1.forward_silu_wino(
-            x, feat_cache[idx], frames, geo1, slabs=into1
+            x, _cache_frames(feat_cache[idx]), frames, geo1, slabs=into1
         )
         feat_cache[idx] = cache1
         feat_idx[0] += 1
@@ -1808,7 +1842,7 @@ class WinoVaeResidualBlock(nn.Module):
         geo2, into2, direct2 = self.conv2.winograd_slabs(h, w, order, frames)
         _, cache2, slabs2 = self.norm2.forward_silu_wino(
             PendingAdd(None, None, self.conv1.bias, wino=m1, geometry=geo_m1),
-            feat_cache[idx],
+            _cache_frames(feat_cache[idx]),
             frames,
             geo2,
             slabs=into2,
@@ -1914,7 +1948,7 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
 def _run_resnets(
     resnets: nn.ModuleList,
     x: "torch.Tensor | PendingAdd",
-    feat_cache: list[torch.Tensor | str | None] | None,
+    feat_cache: list[CacheEntry] | None,
     feat_idx: list[int] | None,
     *,
     defer_last_bias: bool,
@@ -1966,7 +2000,7 @@ class WinoVaeMidBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
     ) -> torch.Tensor:
         # The fused attention block returns its residual add as a PendingAdd for the next
@@ -2005,11 +2039,12 @@ class WinoVaeResidualDownBlock(nn.Module):
         if down_flag:
             mode = "downsample3d" if temperal_downsample else "downsample2d"
             self.downsampler = WinoVaeResample(out_dim, mode=mode, options=options)
+            self.downsampler.defer_bias_to_consumer = True
 
     def forward(
         self,
         x: torch.Tensor,
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
     ) -> torch.Tensor:
         # The last block feeds the downsampler or the shortcut add, never a norm.
@@ -2119,15 +2154,15 @@ class WinoVaeEncoder3d(nn.Module):
         )
         self.norm_out = WinoVaeRMSNorm(out_dim, images=False, options=options)
         self.conv_out = WinoVaeCausalConv3d(out_dim, z_dim, 3, padding=1)
-        # A replacement for conv_out for the duration of one encode (the folded encoder
-        # tail); not a submodule, so the state dict is untouched.
+        # Temporary folded-tail submodule for one encode; assigned by WinoVae._encode_impl and
+        # cleared in its finally. It contributes no state-dict entries after that encode returns.
         self.conv_out_override: WinoVaeCausalConv3d | None = None
         self.gradient_checkpointing = False
 
     def forward(
         self,
         x: torch.Tensor,
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
     ) -> torch.Tensor:
         if feat_cache is not None and feat_idx is None:
@@ -2217,7 +2252,7 @@ class WinoVaeResidualUpBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
         first_chunk: bool = False,
     ) -> torch.Tensor:
@@ -2271,7 +2306,7 @@ class WinoVaeUpBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
         first_chunk: bool | None = None,
     ) -> torch.Tensor:
@@ -2352,7 +2387,7 @@ class WinoVaeDecoder3d(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
         first_chunk: bool = False,
     ) -> torch.Tensor:
@@ -2436,9 +2471,14 @@ class LazyDiagonalGaussianDistribution(DiagonalGaussianDistribution):
 class WinoVae(nn.Module):
     """Optimized Wan VAE; state-dict compatible with ``WanVAE`` and ``AutoencoderKLWan``.
 
+    On CUDA, any non-default ``WinoVaeOptions`` requires bf16 inputs and weights (the fused
+    kernels read and write bf16; ``encode`` / ``decode`` raise ``TypeError`` otherwise). The
+    default options, and any model on the CPU, run in any dtype like the native one.
+
     Beyond the ``AutoencoderKLWan`` interface: ``encode_mode(x)`` returns the posterior mean
-    directly, and ``fold_latent_affine(mean, std)`` folds the latent de-normalization into
-    ``post_quant_conv`` so ``decode`` takes the model's raw latents.
+    directly (needs ``fold_encoder_tail``), and ``fold_latent_affine(mean, std)`` folds the
+    latent de-normalization into ``post_quant_conv`` so ``decode`` takes the model's raw
+    latents.
     """
 
     def __init__(
@@ -2522,9 +2562,8 @@ class WinoVae(nn.Module):
         return next(self.parameters()).dtype
 
     def _benchmark_convs(self, *, frames: int, encoder: bool) -> bool:
-        """cuDNN autotuning per the options, except on a spatial shard, where it measured no
-        gain (two B300s, width split: 720p decode 766 ms either way, 480p 250 vs 251) and the
-        heuristics' choice has the merit of being the same in every process."""
+        """cuDNN autotuning per the options, except on a spatial shard, where the heuristics'
+        choice is the same in every process (autotuning could pick different engines per rank)."""
         return self.shard is None and self.options.benchmark_convs(encoder=encoder, frames=frames)
 
     def set_shard(self, shard: Shard | None) -> None:
@@ -2545,12 +2584,24 @@ class WinoVae(nn.Module):
             self.shard.begin_call()
         self._conv_num = self._cached_conv_counts["decoder"]
         self._conv_idx = [0]
-        self._feat_map: list[torch.Tensor | str | None] = [None] * self._conv_num
+        self._feat_map: list[CacheEntry] = [None] * self._conv_num
         self._enc_conv_num = self._cached_conv_counts["encoder"]
         self._enc_conv_idx = [0]
-        self._enc_feat_map: list[torch.Tensor | str | None] = [None] * self._enc_conv_num
+        self._enc_feat_map: list[CacheEntry] = [None] * self._enc_conv_num
+
+    def _check_dtype(self, x: torch.Tensor) -> None:
+        """The optimized CUDA paths are bf16 only (their kernels read and write bf16); the
+        all-off model, and any model on the CPU, is dtype-agnostic like the native one."""
+        if self.options == WinoVaeOptions() or not x.is_cuda:
+            return
+        if x.dtype is not torch.bfloat16 or self.dtype is not torch.bfloat16:
+            raise TypeError(
+                "WinoVae optimizations need bf16 inputs and weights; got input "
+                f"{x.dtype} and weights {self.dtype}. Use bf16 or the all-off WinoVaeOptions()."
+            )
 
     def _encode(self, x: torch.Tensor, *, mode_only: bool = False) -> torch.Tensor:
+        self._check_dtype(x)
         prev_benchmark = torch.backends.cudnn.benchmark
         torch.backends.cudnn.benchmark = self._benchmark_convs(encoder=True, frames=x.shape[2])
         try:
@@ -2667,8 +2718,10 @@ class WinoVae(nn.Module):
         return AutoencoderKLOutput(latent_dist=posterior)
 
     def encode_mode(self, x: torch.Tensor) -> torch.Tensor:
-        """The posterior mean ``[B, z, T', H', W']`` without computing the log-variance half:
-        the folded encoder tail runs only its first ``z`` output channels."""
+        """The posterior mean ``[B, z, T', H', W']`` of ``x`` without computing the
+        log-variance half. Needs ``fold_encoder_tail`` with ``norm_mode != "reference"``
+        (raises ``ValueError`` otherwise); ``encode(x).latent_dist.mode()`` is the general
+        form."""
         return self._encode(x, mode_only=True)
 
     def _decode(
@@ -2678,6 +2731,7 @@ class WinoVae(nn.Module):
         *,
         temporal_chunk_size: int = 1,
     ) -> DecoderOutput | tuple[torch.Tensor]:
+        self._check_dtype(z)
         _, _, num_frame, _, _ = z.shape
 
         self.clear_cache()
@@ -2690,10 +2744,12 @@ class WinoVae(nn.Module):
             torch.backends.cudnn.benchmark = prev_benchmark
 
     def fold_latent_affine(self, latents_mean: torch.Tensor, latents_std: torch.Tensor) -> None:
-        """Fold the latent de-normalization ``u = std * z + mean`` into ``post_quant_conv``
-        (``P' = P diag(std)``, ``b' = P mean + b``, composed in fp32, rounded once). After
-        this call ``decode`` takes the model's raw latents; ``clear_latent_affine`` undoes it.
-        The module's own weights are untouched."""
+        """Fold the latent de-normalization into ``decode``: ``latents_mean`` and
+        ``latents_std`` are per-channel (``z_dim`` elements each); afterwards ``decode(z)``
+        behaves as ``decode(std * z + mean)`` until ``clear_latent_affine``. The registered
+        weights are unchanged (the folded tensors are plain attributes, not buffers), so call
+        this after loading, moving or casting the weights, and again after any such change."""
+        # P' = P diag(std), b' = P mean + b, composed in fp32 and rounded once to the weight dtype.
         conv = self.post_quant_conv
         with torch.inference_mode(False), torch.no_grad():
             w = conv.weight.detach().float()  # [z, z, 1, 1, 1]

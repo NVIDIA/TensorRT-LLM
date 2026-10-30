@@ -213,11 +213,12 @@ def _cache_dir() -> pathlib.Path:
 
 
 def row_layout(channels: int, fold_single: bool = True) -> tuple[int, int]:
-    """(lanes per row, 16-byte vectors per lane) for a channel row. ``fold_single`` turns a
-    one-vector-per-lane layout into two vectors on half the lanes: the per-row overhead
-    amortizes over too few elements at one vector, and the two-slice pipeline with the
-    cross-frame prefetch keeps four rows per warp in flight (measured on the image shapes:
-    one vector per lane with whole-row prefetch ran 1.7x slower than the standalone norm)."""
+    """The lane layout of one channel row: ``(lanes, k)`` with ``lanes`` a power of two in
+    1..32 and ``k`` 16-byte vectors per lane, ``lanes * k * 8 == channels``. ``channels`` must
+    be a multiple of 8. With ``fold_single`` a one-vector-per-lane result becomes two vectors
+    on half the lanes (``k == 1`` only occurs for ``lanes == 1``)."""
+    # Two vectors per lane give the two-slice pipeline with cross-frame prefetch four rows per
+    # warp in flight; at one vector the per-row overhead amortizes over too few elements.
     nvec = channels // _VEC
     lanes = 32
     while nvec % lanes:
@@ -245,7 +246,7 @@ def blocks_per_sm(k: int, in_wino: bool, order: int, out: int) -> int:
     return 4 if (not in_wino and k <= 2) else 3
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Variant:
     slab_half: bool
     order: int
@@ -588,6 +589,16 @@ def wino_norm_silu(
         x, residual, in_bias = upsample.temp, upsample.shortcut, upsample.bias
     elif (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
+    for name, t in (
+        ("x", x),
+        ("residual", residual),
+        ("cache", cache),
+        ("gamma", gamma),
+        ("bias", bias),
+        ("in_bias", in_bias),
+    ):
+        if t is not None and t.dtype is not torch.bfloat16:
+            raise TypeError(f"{name} must be bf16 (the kernel reads bf16 rows), got {t.dtype}")
     if order not in (2, 4) or (order == 4 and not half_slabs):
         raise ValueError("order must be 2 or 4; order 4 needs fp16 slabs")
     if frames < order or frames % order:
@@ -641,23 +652,25 @@ def wino_norm_silu(
             raise ValueError("m must hold order + 2 tensors")
         m_ptr, m_stride = _stacked_products(m, slab_dtype)
     lanes, k = row_layout(channels, fold_single=True)
+    up_ft, up_ratio = _up_variant(upsample)
     variant = Variant(
-        half_slabs,
-        order,
-        lanes,
-        k,
-        reference_rounding,
-        bias is not None,
-        in_bias is not None,
-        residual is not None,
-        x is None,
-        MID_NORM_SILU,
-        OUT_SLABS,
-        False,
-        products_geometry is not None,
-        slab_geometry is not None,
-        *_up_variant(upsample),
-        slab_geometry is not None and slab_geometry.push is not None,
+        slab_half=half_slabs,
+        order=order,
+        lanes=lanes,
+        k=k,
+        reference=reference_rounding,
+        has_bias=bias is not None,
+        has_in_bias=in_bias is not None,
+        has_residual=residual is not None,
+        in_wino=x is None,
+        mid=MID_NORM_SILU,
+        out=OUT_SLABS,
+        padded=False,
+        in_map=products_geometry is not None,
+        out_map=slab_geometry is not None,
+        up_ft=up_ft,
+        up_ratio=up_ratio,
+        halo=slab_geometry is not None and slab_geometry.push is not None,
     )
     _launch(
         variant,
@@ -726,6 +739,16 @@ def rms_norm_silu_rows(
         rows = frames * upsample.positions
     else:
         rows, channels = x.shape
+    for name, t in (
+        ("x", x),
+        ("residual", residual),
+        ("gamma", gamma),
+        ("bias", bias),
+        ("in_bias", in_bias),
+        ("out", out),
+    ):
+        if t is not None and t.dtype is not torch.bfloat16:
+            raise TypeError(f"{name} must be bf16 (the kernel reads bf16 rows), got {t.dtype}")
     if channels % _VEC:
         raise ValueError("channels must be a multiple of 8")
     if out_geometry is not None and out_geometry.identity:
@@ -748,23 +771,25 @@ def rms_norm_silu_rows(
         else None
     )
     lanes, k = row_layout(channels, fold_single=True)
+    up_ft, up_ratio = _up_variant(upsample)
     variant = Variant(
-        False,
-        1,
-        lanes,
-        k,
-        reference_rounding,
-        bias is not None,
-        in_bias is not None,
-        residual is not None,
-        False,
-        MID_NORM_SILU if silu else MID_NORM,
-        OUT_ROWS,
-        False,
-        False,
-        out_geometry is not None,
-        *_up_variant(upsample),
-        out_geometry is not None and out_geometry.push is not None,
+        slab_half=False,
+        order=1,
+        lanes=lanes,
+        k=k,
+        reference=reference_rounding,
+        has_bias=bias is not None,
+        has_in_bias=in_bias is not None,
+        has_residual=residual is not None,
+        in_wino=False,
+        mid=MID_NORM_SILU if silu else MID_NORM,
+        out=OUT_ROWS,
+        padded=False,
+        in_map=False,
+        out_map=out_geometry is not None,
+        up_ft=up_ft,
+        up_ratio=up_ratio,
+        halo=out_geometry is not None and out_geometry.push is not None,
     )
     _launch(
         variant,
@@ -847,19 +872,19 @@ def combine(
     )
     lanes, k = row_layout(channels, fold_single=True)
     variant = Variant(
-        slab_half,
-        order,
-        lanes,
-        k,
-        True,
-        False,
-        bias is not None,
-        residual is not None,
-        m is not None,
-        MID_NONE,
-        OUT_ROWS,
-        padded,
-        products_geometry is not None,
+        slab_half=slab_half,
+        order=order,
+        lanes=lanes,
+        k=k,
+        reference=True,
+        has_bias=False,
+        has_in_bias=bias is not None,
+        has_residual=residual is not None,
+        in_wino=m is not None,
+        mid=MID_NONE,
+        out=OUT_ROWS,
+        padded=padded,
+        in_map=products_geometry is not None,
     )
     _launch(
         variant,

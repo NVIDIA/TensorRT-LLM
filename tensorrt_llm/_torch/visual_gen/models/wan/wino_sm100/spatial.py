@@ -3,8 +3,9 @@
 """Spatial Winograd F(4x4, 3x3) for the frame-pair convs on Blackwell (sm100), on the CuTe DSL
 kernels of this package: input transform, one batched tcgen05 GEMM over the 36 coordinates of
 every component (fp16 in, fp32 accumulate, fp16 out) on the static persistent schedule, output
-transform. Interpolation points (0, +-3/2, +-5/8, inf). The filters are transformed once at load
-time by :func:`spatial_filters`.
+transform. Interpolation points (0, +-3/2, +-5/8, inf). :func:`spatial_filters` transforms a
+conv's filters; the conv caches the result on first use and recomputes it when its weight
+tensor changes identity or version.
 
 The fused F(2,3)-horizontal / direct-vertical conv for the 256-output-channel level lives in
 :mod:`.fused_conv`; :func:`wino_spatial_conv_fused` is its per-component entry point.
@@ -130,9 +131,9 @@ def _run(x: torch.Tensor, u: torch.Tensor, y: torch.Tensor, comps: int, pairs: i
 
 
 def fused_eligible(cin: int, cout: int, height: int, width: int) -> bool:
-    """Shapes the fused conv covers: 256 output channels, input channels in multiples of 32,
-    8-row and 32-pixel tiles."""
-    return cout == 256 and cin % 32 == 0 and height % 8 == 0 and width % 32 == 0
+    """Shapes the fused conv covers: 256 output channels, at least two 32-channel input
+    chunks (the MMA schedule peels a first and a last chunk), 8-row and 32-pixel tiles."""
+    return cout == 256 and cin >= 64 and cin % 32 == 0 and height % 8 == 0 and width % 32 == 0
 
 
 def fused_filters(g: list[torch.Tensor]) -> list[torch.Tensor]:
