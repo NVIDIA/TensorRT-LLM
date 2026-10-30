@@ -1209,6 +1209,15 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     def language_model(self) -> torch.nn.Module:
         return self.llm
 
+    def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        prepared_inputs = super().prepare_breakable_cuda_graph_inputs(inputs)
+        if (
+            self.llm.model.hidden_size_per_layer_input
+            and prepared_inputs.get("ple_input_ids") is None
+        ):
+            prepared_inputs["ple_input_ids"] = inputs.get("input_ids")
+        return prepared_inputs
+
     def get_language_model_extra_forward_kwargs(
         self,
         *,

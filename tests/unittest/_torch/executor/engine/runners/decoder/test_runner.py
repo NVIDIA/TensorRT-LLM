@@ -39,6 +39,7 @@ from tensorrt_llm._torch.utils import (
     set_per_request_prefill_cuda_graph_flag,
     torch_compiling,
 )
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
@@ -382,6 +383,7 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                 breakable_runner.is_warming_up = False
                 breakable_runner.has_graph.return_value = True
                 breakable_runner.execute.return_value = outputs
+                breakable_runner.run_eager.side_effect = lambda fn: fn()
                 engine._graphs.breakable_cuda_graph_runner = breakable_runner
                 prepared = engine._inputs.prepare_inputs.return_value
 
@@ -410,9 +412,11 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                 self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})
                 self.assertIsNot(actual_outputs, outputs)
                 if return_context_logits:
+                    breakable_runner.run_eager.assert_called_once()
                     breakable_runner.execute.assert_not_called()
                     engine._forward_step.assert_called_once()
                 else:
+                    breakable_runner.run_eager.assert_not_called()
                     breakable_runner.execute.assert_called_once()
                     engine._forward_step.assert_not_called()
 
@@ -823,6 +827,7 @@ def test_prefill_compile_scopes_whole_model_forward(
     prefill_compiled_model = PrefillCompiledModel(eager_model, compiled_model)
     model = prefill_compiled_model if prefill_only else eager_model
     engine = SimpleNamespace(
+        _config=SimpleNamespace(prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED),
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
         _moe_workspace_reclaimer=None,

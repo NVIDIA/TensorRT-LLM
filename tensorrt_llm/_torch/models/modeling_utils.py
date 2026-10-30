@@ -540,6 +540,13 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    supports_multimodal_breakable_cuda_graph: ClassVar[bool] = False
+    """Whether prepared multimodal inputs can safely replay this decoder body.
+
+    Host-dependent scheduling and model-specific replay preparation must run
+    outside capture; refreshing the staged tensor inputs must be sufficient.
+    """
+
     # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
     use_fx_for_pcg_fallback: ClassVar[bool] = True
 

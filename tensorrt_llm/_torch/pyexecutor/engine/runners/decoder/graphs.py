@@ -558,7 +558,11 @@ class DecoderCudaGraphs:
                 outputs = breakable_runner.execute(num_tokens, lambda: run_model(inputs))
             else:
                 # real eager or BCG warmup or PCG
-                outputs = run_model(inputs)
+                outputs = (
+                    breakable_runner.run_eager(lambda: run_model(inputs))
+                    if breakable_runner is not None
+                    else run_model(inputs)
+                )
         else:
             needs_capture = self.cuda_graph_runner.needs_capture(key)
             if needs_capture:

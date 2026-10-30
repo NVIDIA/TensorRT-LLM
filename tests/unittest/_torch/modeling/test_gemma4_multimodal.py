@@ -143,6 +143,38 @@ SMALL_TEXT_CONFIG = {
 }
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("use_multimodal_embeds", [False, True])
+def test_gemma4_breakable_inputs_preserve_per_layer_token_ids(use_multimodal_embeds):
+    model = Gemma4MultimodalModelBase.__new__(Gemma4MultimodalModelBase)
+    torch.nn.Module.__init__(model)
+    embedding = torch.nn.Embedding(16, 4)
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=embedding, hidden_size_per_layer_input=4)
+    )
+    input_ids = torch.tensor([1, 7, 2])
+    safe_input_ids = torch.tensor([1, 0, 2]) if use_multimodal_embeds else None
+    inputs_embeds = torch.randn(3, 4) if use_multimodal_embeds else None
+    inputs = {
+        "input_ids": None if use_multimodal_embeds else input_ids,
+        "inputs_embeds": inputs_embeds,
+        "ple_input_ids": safe_input_ids,
+    }
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert prepared is not inputs
+    assert prepared["input_ids"] is None
+    expected_ids = safe_input_ids if use_multimodal_embeds else input_ids
+    assert prepared["ple_input_ids"] is expected_ids
+    if use_multimodal_embeds:
+        assert prepared["inputs_embeds"] is inputs_embeds
+    else:
+        assert inputs["input_ids"] is input_ids
+        assert inputs["ple_input_ids"] is None
+        torch.testing.assert_close(prepared["inputs_embeds"], embedding(input_ids), atol=0, rtol=0)
+
+
 class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
     """Lightweight Gemma4 encoder-cache harness without model weights."""
 

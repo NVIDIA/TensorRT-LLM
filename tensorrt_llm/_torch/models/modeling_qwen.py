@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Optional, Tuple
 
 import torch
@@ -247,6 +250,8 @@ class QwenModel(DecoderModel):
 
 @register_auto_model("Qwen2ForCausalLM")
 class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
+
+    supports_multimodal_breakable_cuda_graph = True
 
     def __init__(
         self,

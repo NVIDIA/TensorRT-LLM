@@ -631,6 +631,21 @@ class MultimodalModelMixin:
         """Return the token embedding layer used by `fuse_input_embeds`."""
         raise NotImplementedError
 
+    def prepare_breakable_cuda_graph_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Normalize decoder body inputs before breakable graph capture or replay.
+
+        The returned inputs always use prepared `[num_tokens, hidden_size]`
+        embeddings, keeping text and multimodal calls on the same body path.
+        """
+        prepared_inputs = dict(inputs)
+        if prepared_inputs.get("inputs_embeds") is None:
+            input_ids = prepared_inputs.get("input_ids")
+            if input_ids is None:
+                raise ValueError("Breakable multimodal prefill requires token IDs or embeddings")
+            prepared_inputs["inputs_embeds"] = self.language_model.model.embed_tokens(input_ids)
+        prepared_inputs["input_ids"] = None
+        return prepared_inputs
+
     @property
     def embedding_dim(self) -> int:
         """Return the width of each cached multimodal embedding row."""
@@ -686,7 +701,7 @@ class MultimodalModelMixin:
     @property
     def language_model(self) -> torch.nn.Module:
         """Return the inner language model that receives prepared inputs."""
-        raise NotImplementedError
+        return self.llm
 
     @property
     def vocab_size_padded(self) -> int:
