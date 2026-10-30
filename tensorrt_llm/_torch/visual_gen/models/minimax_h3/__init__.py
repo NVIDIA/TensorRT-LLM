@@ -18,5 +18,6 @@
 """MiniMax-H3 VisualGen pipeline."""
 
 from .pipeline_minimax_h3 import MiniMaxH3Pipeline
+from .pipeline_vdn_h3 import VDNMiniMaxH3Pipeline
 
-__all__ = ["MiniMaxH3Pipeline"]
+__all__ = ["MiniMaxH3Pipeline", "VDNMiniMaxH3Pipeline"]

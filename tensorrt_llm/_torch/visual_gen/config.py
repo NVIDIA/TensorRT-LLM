@@ -654,6 +654,18 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 raise ValueError("MiniMax-H3 workflow must be 'fl2va' or 'ref2va'.")
             extra_attrs["workflow"] = h3_workflow
 
+        # VDN stores the H3 backbone separately from its attention/LoRA overlay.
+        from .models.minimax_h3.vdn_checkpoint import is_vdn_checkpoint, read_vdn_config
+
+        vdn_spec = None
+        if is_vdn_checkpoint(checkpoint_path):
+            vdn_spec = read_vdn_config(
+                checkpoint_path, extra_attrs.get("stage", "stage-dmd-step-250")
+            )
+            base_checkpoint = extra_attrs.get("base_checkpoint") or str(checkpoint_path / "h3-base")
+            extra_attrs["vdn_base_checkpoint"] = base_checkpoint
+            checkpoint_path = Path(base_checkpoint)
+
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
         if h3_workflow == "ref2va":
@@ -677,6 +689,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                     component_config_dicts[component_name] = json.load(f)
 
             config_dict = component_config_dicts[component]
+            if vdn_spec is not None:
+                config_dict["vdn_transform"] = vdn_spec["transform"]
             pretrained_config = SimpleNamespace(**config_dict)
 
             # Ensure _name_or_path is set so TeaCache coefficient matching works.
