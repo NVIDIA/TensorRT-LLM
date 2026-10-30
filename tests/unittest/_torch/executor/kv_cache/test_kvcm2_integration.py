@@ -4082,7 +4082,7 @@ def _offload_setup_manager(
     manager.num_extra_kv_tokens = 0
     manager.max_total_draft_tokens = max_total_draft_tokens
     manager.tokens_per_block = 128
-    manager.kv_cache_map = {kv_cache_v2_module._GUARD_PAGE_REQUEST_ID: Mock()} if guard_page else {}
+    manager._guard_page_value = 0.0 if guard_page else None
     manager.get_host_backed_pool_groups = lambda: [
         SimpleNamespace(num_slots=n) for n in local_slots
     ]
@@ -4501,6 +4501,42 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
     assert config.host_sparse_pool_quota == (200 << 20) - 4096
     # The automatic host tier still takes half of what the 200 MiB leaves of the 250 MiB.
     assert host_tier.quota == (50 << 20) // 2
+
+
+@pytest.mark.cpu_only
+def test_automatic_host_budget_holds_the_batch_beside_the_dummies(monkeypatch) -> None:
+    manager = _offload_manager()
+    manager.mapping = SimpleNamespace(enable_attention_dp=True)
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    manager.max_total_draft_tokens = 0
+    manager.num_extra_kv_tokens = 0
+    manager.low_precision_dtype = None
+    manager._guard_page_value = None
+    manager._sparse_batch_staging_bytes = 4096
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=_offload_layers(),
+        max_util_for_resume=0.95,
+    )
+    monkeypatch.setattr(
+        kv_cache_v2_module,
+        "get_host_memory_limits",
+        lambda mapping: HostMemoryLimits(1, float("inf"), float("inf")),
+    )
+
+    with patch.object(KVCacheManagerV2, "_get_offload_sizing_config", return_value=config):
+        manager._plan_host_history_budget(
+            KvCacheConfig(enable_block_reuse=False),
+            tokens_per_block=TOKENS_PER_BLOCK,
+            num_reserved_index_slots=1,
+        )
+
+    # max_batch_size=2 requests of max_seq_len=16 tokens take four pages each, and the
+    # CUDA-graph padding dummy and the attention-DP dummy a page each. Resume keeps those
+    # 10 pages in at most 95% of the slots, 11 of the 1 KiB sparse page, and the pool
+    # rounds up to a 2 MiB grain.
+    assert manager._host_history_budget == 11 * 1024 + (2 << 20)
 
 
 @pytest.mark.parametrize(

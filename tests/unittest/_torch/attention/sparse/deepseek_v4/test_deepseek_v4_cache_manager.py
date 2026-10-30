@@ -4149,9 +4149,9 @@ def test_offload_capacity_report_names_the_binding_limit() -> None:
     # Half of a 100 GiB share of host memory, the automatic budget on a node of
     # four ranks with 400 GiB available.
     manager._host_history_budget = 50 << 30
-    # The native group holds 4,096 slots: four requests of 128K tokens. Its pool of
-    # sparse pages holds 217,728 host bytes per slot; its indexer pool is on the GPU,
-    # and the device quota counts only device-backed pools.
+    # The native group holds 4,096 slots. Its pools of sparse pages hold 217,728 host
+    # bytes per slot; its indexer pool is on the GPU, and the device quota counts only
+    # device-backed pools.
     manager.impl = SimpleNamespace(
         get_quota=lambda level: 100 << 30,
         sparse_backing_medium=lambda: CacheTier.HOST_MEM,
@@ -4162,18 +4162,24 @@ def test_offload_capacity_report_names_the_binding_limit() -> None:
         patch.object(kv_cache_v2_module.logger, "info") as info,
         patch.object(kv_cache_v2_module.logger, "warning") as warning,
     ):
-        manager._log_sparse_kv_offload_capacity(KvCacheConfig())
+        manager._log_sparse_kv_offload_capacity(
+            KvCacheConfig(), host_pool_slots=4096, dummy_blocks=1
+        )
 
     report = info.call_args.args[0]
     # The DeepSeek-V4 estimator sizes each 128K-token request at 128.8 MiB of GPU pools.
     assert "128.8MiB per request" in report
-    assert "4 by host" in report
+    # And its host history at 1,024 pages of 217,728 bytes.
+    assert "212.6MiB per request" in report
+    # Four requests of 128K tokens would fill the 4,096 slots, but resume keeps them
+    # at most 97% full (the config's max_util_for_resume) beside a dummy's page.
+    assert "3 by host" in report
     assert "limited by host" in report
     # One lease per Batch row, not per constrained request: max_batch_size, not 513.
     assert "256 leases" in report
-    # The 50 GiB host budget holds 240 requests of 128K tokens.
-    assert "A max_batch_size of 240 fits" in report
-    assert "Only 4 of max_batch_size=256" in warning.call_args.args[0]
+    # The 50 GiB host budget holds 233 requests of 128K tokens by the same count.
+    assert "A max_batch_size of 233 fits" in report
+    assert "Only 3 of max_batch_size=256" in warning.call_args.args[0]
 
 
 if __name__ == "__main__":

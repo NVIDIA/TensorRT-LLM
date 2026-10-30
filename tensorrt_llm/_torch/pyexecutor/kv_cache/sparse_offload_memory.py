@@ -588,6 +588,93 @@ def sparse_cache_config(
     )
 
 
+@dataclass(frozen=True)
+class HostHistoryShape:
+    """The host-backed pools that keep offloaded history, and what pages in them cost.
+
+    ``KvCache::resume`` refuses a request while any pool group is more than
+    ``max_util_for_resume`` full, so pages fit in a group at
+    ``1 / max_util_for_resume`` slots per page, which is how the manager counts its
+    own floors (``computePoolGroupMinSlotsFromConstraints``). Every pool rounds its
+    bytes up to the host grain, and the manager spends its host budget in whole
+    grains (``ratioToSlotCountList``), so a budget buys those slots only with a
+    grain per pool beside them.
+
+    Attributes:
+        num_pools: Host-backed pools.
+        bytes_per_block: Host bytes one slot takes across the pools.
+        max_util_for_resume: The utilization above which resume refuses a request.
+    """
+
+    num_pools: int
+    bytes_per_block: int
+    max_util_for_resume: float
+
+    def slots(self, num_pages: int) -> int:
+        """Return the slots that hold ``num_pages`` pages."""
+        return math.ceil(num_pages / self.max_util_for_resume)
+
+    def history_bytes(self, num_pages: int) -> int:
+        """Return the host budget that holds ``num_pages`` pages; 0 without host-backed pools."""
+        if not self.num_pools:
+            return 0
+        return (
+            self.slots(num_pages) * self.bytes_per_block + self.num_pools * _HOST_POOL_GRANULARITY
+        )
+
+    def slots_in(self, num_bytes: int) -> int:
+        """Return the slots a host budget of ``num_bytes`` buys."""
+        return max(0, num_bytes - self.num_pools * _HOST_POOL_GRANULARITY) // max(
+            1, self.bytes_per_block
+        )
+
+    def requests_in(self, num_slots: int, *, pages_per_request: int, dummy_pages: int) -> int:
+        """Return how many requests of ``pages_per_request`` pages ``num_slots`` slots hold.
+
+        Dummy requests hold ``dummy_pages`` pages beside them. The count inverts
+        :meth:`slots`, so slots sized for a batch hold all of it.
+        """
+
+        def fits(num_requests: int) -> bool:
+            return self.slots(num_requests * pages_per_request + dummy_pages) <= num_slots
+
+        if not fits(0):
+            return 0
+        # A page takes at least a slot, so no more than this many requests fit.
+        low, high = 0, num_slots // max(1, pages_per_request)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(middle):
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+
+def host_history_shape(
+    layers: Sequence[LayerConfig], *, tokens_per_block: int, max_util_for_resume: float
+) -> HostHistoryShape:
+    """Return the host-backed pools the native manager gives the sparse buffers of ``layers``.
+
+    Args:
+        layers: Every layer config the manager allocates.
+        tokens_per_block: Tokens per page.
+        max_util_for_resume: The utilization the manager keeps every pool group under.
+    """
+    # The native manager gives each size of sparse buffer in a life cycle a pool.
+    pools = {
+        (layer.sliding_window_size, ceil_div(layer.num_sink_tokens or 0, tokens_per_block), size)
+        for layer in layers
+        if isinstance(layer, AttentionLayerConfig)
+        for size in (buffer.size for buffer in layer.buffers if buffer.is_sparse)
+    }
+    return HostHistoryShape(
+        num_pools=len(pools),
+        bytes_per_block=sparse_history_bytes_per_block(layers),
+        max_util_for_resume=max_util_for_resume,
+    )
+
+
 def sparse_history_floor_bytes(
     layers: Sequence[LayerConfig],
     constraints: Sequence[BatchDesc],
@@ -601,9 +688,8 @@ def sparse_history_floor_bytes(
     divides the host budget, and refuses a budget below them
     (``computePoolGroupMinSlotsFromConstraints``, ``ratioToSlotCountList``). A batch
     needs a slot per page its requests' capacities cover in a life cycle that keeps
-    all of its history, every beam counted, and no more in a windowed one; the
-    manager scales that by ``1 / max_util_for_resume``. Every host-backed pool then
-    rounds its bytes up to the host grain, which this counts in full.
+    all of its history, every beam counted, and no more in a windowed one, at the
+    cost :class:`HostHistoryShape` counts.
 
     Args:
         layers: Every layer config the manager allocates.
@@ -611,14 +697,7 @@ def sparse_history_floor_bytes(
         tokens_per_block: Tokens per page.
         max_util_for_resume: The utilization the manager keeps every pool group under.
     """
-    # The native manager gives each size of sparse buffer in a life cycle a pool.
-    host_pools = {
-        (layer.sliding_window_size, ceil_div(layer.num_sink_tokens or 0, tokens_per_block), size)
-        for layer in layers
-        if isinstance(layer, AttentionLayerConfig)
-        for size in (buffer.size for buffer in layer.buffers if buffer.is_sparse)
-    }
-    if not host_pools or not constraints:
+    if not constraints:
         return 0
     pages = max(
         sum(
@@ -627,15 +706,16 @@ def sparse_history_floor_bytes(
         )
         for batch in constraints
     )
-    slots = math.ceil(pages / max_util_for_resume)
-    return slots * sparse_history_bytes_per_block(layers) + len(host_pools) * _HOST_POOL_GRANULARITY
+    history = host_history_shape(
+        layers, tokens_per_block=tokens_per_block, max_util_for_resume=max_util_for_resume
+    )
+    return history.history_bytes(pages)
 
 
 def plan_host_history_bytes(
     *,
     host_history_size: int | None,
-    max_batch_size: int,
-    host_bytes_per_request: int,
+    batch_bytes: int,
     pinnable_host_bytes: float,
     staging_bytes: int,
     floor_bytes: int = 0,
@@ -644,14 +724,15 @@ def plan_host_history_bytes(
 
     Offload also pins the sparse Batch's staging buffers, so they come out of
     the same host memory. An explicit ``host_history_size`` covers both.
-    Otherwise the pools hold ``max_batch_size`` requests, capped so that pools
-    and staging fit in the host memory the rank may pin. Either way they must
-    reach ``floor_bytes``: the native manager refuses a smaller budget.
+    Otherwise the pools take ``batch_bytes``, capped so that pools and staging
+    fit in the host memory the rank may pin. Either way they must reach
+    ``floor_bytes``: the native manager refuses a smaller budget.
 
     Args:
         host_history_size: The configured size, or None to size automatically.
-        max_batch_size: Requests the automatic budget holds.
-        host_bytes_per_request: Host history bytes one request holds.
+        batch_bytes: Host bytes that hold ``max_batch_size`` requests beside the
+            dummy requests (:meth:`HostHistoryShape.history_bytes`); 0 when this
+            rank's layers offload no history.
         pinnable_host_bytes: Host bytes automatic sizing may pin for offload;
             ``inf`` when unknown.
         staging_bytes: Pinned host bytes of the sparse Batch's staging buffers.
@@ -683,7 +764,7 @@ def plan_host_history_bytes(
                 "host_history_size, or lower max_seq_len."
             )
         return budget
-    if not host_bytes_per_request:
+    if not batch_bytes:
         # This rank's layers offload no history.
         return 0
     available = pinnable_host_bytes - staging_bytes
@@ -706,7 +787,7 @@ def plan_host_history_bytes(
             "sparse_attention_config.kv_cache_offload_config.host_history_size, lower "
             "max_seq_len, or lower kv_cache_config.host_cache_size."
         )
-    return int(max(min(max_batch_size * host_bytes_per_request, available), floor_bytes))
+    return int(max(min(batch_bytes, available), floor_bytes))
 
 
 # ---------------------------------------------------------------------------
@@ -793,7 +874,10 @@ def solve_sparse_offload_capacity(
     host_budget_bytes: int,
     gpu_bytes_per_request: int,
     fixed_gpu_bytes_per_request: int,
-    host_bytes_per_request: int,
+    host_history: HostHistoryShape,
+    host_pool_slots: int,
+    host_pages_per_request: int,
+    host_dummy_pages: int,
     arenas: Sequence[SparseArenaShape],
     num_leases: int,
     batch_buffer_bytes: int,
@@ -809,7 +893,10 @@ def solve_sparse_offload_capacity(
         gpu_bytes_per_request: Device pool bytes one request holds.
         fixed_gpu_bytes_per_request: The part of ``gpu_bytes_per_request`` that
             does not grow with length.
-        host_bytes_per_request: Host history bytes one request holds.
+        host_history: The host-backed pools.
+        host_pool_slots: Slots of the smallest pool group with a host-backed pool.
+        host_pages_per_request: Host history pages one request holds.
+        host_dummy_pages: Host history pages dummy requests hold beside the requests.
         arenas: The arena of each sparse life cycle.
         num_leases: Leases each arena holds. A cache holds a lease only while it
             is seated in the Batch, so this is ``max_batch_size``; any beyond it
@@ -818,12 +905,17 @@ def solve_sparse_offload_capacity(
             ``max_batch_size`` rows, reserved apart from ``gpu_pool_bytes``.
     """
     gpu_bytes_per_request = max(1, gpu_bytes_per_request)
-    host_bytes_per_request = max(1, host_bytes_per_request)
+
+    def host_requests(num_slots: int) -> int:
+        return host_history.requests_in(
+            num_slots, pages_per_request=host_pages_per_request, dummy_pages=host_dummy_pages
+        )
+
     arena_bytes = sum(arena.arena_bytes(num_leases) for arena in arenas)
     lease_bytes = sum(arena.lease_bytes for arena in arenas)
     by_limit = {
         "max_batch_size": max_batch_size,
-        "host": host_pool_bytes // host_bytes_per_request,
+        "host": host_requests(host_pool_slots),
         "gpu": gpu_pool_bytes // gpu_bytes_per_request,
     }
     # The device budget pays for the pools, the arena and the buffers sized for
@@ -836,7 +928,7 @@ def solve_sparse_offload_capacity(
     recommended = min(
         max(0, gpu_pool_bytes + arena_bytes + batch_buffer_bytes - fixed_arena_bytes)
         // (gpu_bytes_per_request + lease_bytes + batch_bytes_per_slot),
-        host_budget_bytes // host_bytes_per_request,
+        host_requests(host_history.slots_in(host_budget_bytes)),
     )
     return SparseOffloadCapacity(
         num_tokens=num_tokens,
@@ -846,7 +938,7 @@ def solve_sparse_offload_capacity(
         host_budget_bytes=host_budget_bytes,
         gpu_bytes_per_request=gpu_bytes_per_request,
         fixed_gpu_bytes_per_request=fixed_gpu_bytes_per_request,
-        host_bytes_per_request=host_bytes_per_request,
+        host_bytes_per_request=host_history.bytes_per_block * host_pages_per_request,
         arena_bytes=arena_bytes,
         num_leases=num_leases,
         lease_bytes=lease_bytes,

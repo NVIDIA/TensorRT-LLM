@@ -17,9 +17,11 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     HostHistoryReservations,
+    HostHistoryShape,
     LifeCyclePage,
     SparseArenaShape,
     SparseBatchShape,
+    host_history_shape,
     life_cycle_pages,
     plan_host_history_bytes,
     solve_sparse_offload_capacity,
@@ -50,6 +52,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 TOKENS_PER_BLOCK = 128
 # A V4-Flash NVFP4 compressed row covers four tokens: 288 data bytes and 36 scale bytes.
 V4_FLASH_HOST_BYTES_PER_BLOCK = 21 * 32 * (288 + 36)
+# The data and the scales of its 21 CSA layers each take a host-backed pool.
+V4_FLASH_HOST_HISTORY = HostHistoryShape(
+    num_pools=2, bytes_per_block=V4_FLASH_HOST_BYTES_PER_BLOCK, max_util_for_resume=0.95
+)
 V4_FLASH_ARENA = SparseArenaShape(
     num_layers=21,
     num_selections=21,
@@ -502,8 +508,8 @@ def test_sparse_cache_config_rejects_a_unit_that_does_not_divide_a_page() -> Non
         # An explicit size covers the staging buffers too, whatever automatic
         # sizing may pin.
         (1 << 30, 0.0, (1 << 30) - 4096),
-        # Otherwise the pools hold max_batch_size requests...
-        (None, float("inf"), 256 * 1000),
+        # Otherwise the pools take what holds the batch...
+        (None, float("inf"), 256_000),
         # ...unless they and the staging buffers outgrow what automatic sizing
         # may pin.
         (None, 50_000.0, 50_000 - 4096),
@@ -515,8 +521,7 @@ def test_host_budget(
     assert (
         plan_host_history_bytes(
             host_history_size=host_history_size,
-            max_batch_size=256,
-            host_bytes_per_request=1000,
+            batch_bytes=256_000,
             pinnable_host_bytes=pinnable_host_bytes,
             staging_bytes=4096,
         )
@@ -526,13 +531,12 @@ def test_host_budget(
 
 @pytest.mark.cpu_only
 def test_automatic_host_budget_grows_to_the_floor() -> None:
-    # 256 requests of 1,000 bytes would take 256,000 bytes, short of the 300,000 the
-    # manager's constraint batches need.
+    # The batch would take 256,000 bytes, short of the 300,000 the manager's
+    # constraint batches need.
     assert (
         plan_host_history_bytes(
             host_history_size=None,
-            max_batch_size=256,
-            host_bytes_per_request=1000,
+            batch_bytes=256_000,
             pinnable_host_bytes=float("inf"),
             staging_bytes=4096,
             floor_bytes=300_000,
@@ -558,8 +562,7 @@ def test_host_budget_below_the_floor_is_refused(
     with pytest.raises(ValueError, match=match):
         plan_host_history_bytes(
             host_history_size=host_history_size,
-            max_batch_size=256,
-            host_bytes_per_request=1000,
+            batch_bytes=256_000,
             pinnable_host_bytes=pinnable_host_bytes,
             staging_bytes=4096,
             floor_bytes=300_000,
@@ -580,11 +583,78 @@ def test_host_budget_must_leave_the_pools_room(
     with pytest.raises(ValueError, match=match):
         plan_host_history_bytes(
             host_history_size=host_history_size,
-            max_batch_size=256,
-            host_bytes_per_request=1000,
+            batch_bytes=256_000,
             pinnable_host_bytes=pinnable_host_bytes,
             staging_bytes=4096,
         )
+
+
+@pytest.mark.cpu_only
+def test_host_history_holds_pages_under_the_resume_limit() -> None:
+    history = host_history_shape(
+        _v4_flash_like_layers(), tokens_per_block=TOKENS_PER_BLOCK, max_util_for_resume=0.95
+    )
+
+    # The two sparse layers share a pool of data pages and a pool of scale pages.
+    assert history == HostHistoryShape(
+        num_pools=2, bytes_per_block=20_736, max_util_for_resume=0.95
+    )
+    # 256 requests of 32 pages beside two dummy pages: 8,194 pages, which resume keeps
+    # in at most 95% of the slots.
+    assert history.slots(256 * 32 + 2) == 8626
+    # Each pool rounds up to a 2 MiB grain, so a budget holds a grain per pool beside them.
+    assert history.history_bytes(256 * 32 + 2) == 8626 * 20_736 + 2 * (2 << 20)
+    assert history.slots_in(history.history_bytes(256 * 32 + 2)) == 8626
+    # The count inverts the cost: the slots sized for a batch hold all of it, and one
+    # slot fewer holds a request less.
+    assert history.requests_in(8626, pages_per_request=32, dummy_pages=2) == 256
+    assert history.requests_in(8625, pages_per_request=32, dummy_pages=2) == 255
+    # Dummies that fill the pools leave no room for a request.
+    assert history.requests_in(2, pages_per_request=32, dummy_pages=2) == 0
+    # A manager without host-backed pools needs no host budget.
+    dense = host_history_shape(
+        [_layer(0, ("key", 4096, False))],
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_util_for_resume=0.95,
+    )
+    assert dense.history_bytes(256 * 32 + 2) == 0
+
+
+@pytest.mark.cpu_only
+def test_host_budget_buys_the_slots_the_batch_needs_in_the_native_pools() -> None:
+    """The budget is sized by the rule the native allocator divides it by.
+
+    V4-Flash on a decode worker with max_batch_size 128 and requests of 4,096 tokens:
+    the data and the scales of 21 CSA layers take two host-backed pools beside the
+    GPU-resident indexer keys, and two dummy requests hold a page each.
+    """
+    device_quota = 100 << 30
+    batch_pages = 128 * 32 + 2
+
+    def host_slots(host_budget: int) -> int:
+        (slots,) = _introspection.ratio_to_slot_count_list(
+            device_quota,
+            [[21 * 32 * 288, 21 * 32 * 36, 21 * 32 * 68]],
+            [1.0],
+            _introspection.tier_allocation_granularity(CacheTier.GPU_MEM, device_quota),
+            [1],
+            second_quota=host_budget,
+            second_granularity=2 << 20,
+            second_pools=[[0, 1]],
+        )
+        return slots
+
+    def requests(slots: int) -> int:
+        return V4_FLASH_HOST_HISTORY.requests_in(slots, pages_per_request=32, dummy_pages=2)
+
+    # The bytes of 128 requests alone leave no room for each pool's grain, the dummies'
+    # pages or the slots resume keeps free: they buy 4,085 slots, which hold 121.
+    old_slots = host_slots(128 * 32 * V4_FLASH_HOST_BYTES_PER_BLOCK)
+    assert old_slots == 4085
+    assert requests(old_slots) == 121
+    budget = V4_FLASH_HOST_HISTORY.history_bytes(batch_pages)
+    assert host_slots(budget) >= V4_FLASH_HOST_HISTORY.slots(batch_pages)
+    assert requests(host_slots(budget)) == 128
 
 
 @pytest.mark.cpu_only
@@ -630,8 +700,7 @@ def test_host_budget_is_empty_on_a_rank_without_offloaded_history() -> None:
     assert (
         plan_host_history_bytes(
             host_history_size=None,
-            max_batch_size=256,
-            host_bytes_per_request=0,
+            batch_bytes=0,
             pinnable_host_bytes=0.0,
             staging_bytes=0,
         )
@@ -648,13 +717,17 @@ def _v4_flash_capacity(**overrides):
         num_tokens=1 << 17,
         max_batch_size=256,
         gpu_pool_bytes=100 << 30,
-        # The host pool holds 4,096 blocks: four requests of 128K tokens.
-        host_pool_bytes=4096 * V4_FLASH_HOST_BYTES_PER_BLOCK,
+        # The host pools hold four requests of 128K tokens beside a dummy's page:
+        # 4,313 slots, kept at most 95% full.
+        host_pool_bytes=4313 * V4_FLASH_HOST_BYTES_PER_BLOCK,
         host_budget_bytes=50 << 30,
         # Every window spans two pages, plus 52,176 GPU bytes per 128 tokens.
         gpu_bytes_per_request=81_657_856 + 1024 * 52_176,
         fixed_gpu_bytes_per_request=81_657_856,
-        host_bytes_per_request=1024 * V4_FLASH_HOST_BYTES_PER_BLOCK,
+        host_history=V4_FLASH_HOST_HISTORY,
+        host_pool_slots=4313,
+        host_pages_per_request=1024,
+        host_dummy_pages=1,
         arenas=[V4_FLASH_ARENA],
         # One lease per Batch row.
         num_leases=256,
@@ -673,15 +746,16 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert capacity.fits == 4
     assert capacity.lease_bytes == 7_362_688
     assert capacity.arena_bytes == V4_FLASH_ARENA.arena_bytes(256)
-    # The 50 GiB host budget holds 240 requests of 128K tokens; the GPU budget
-    # would hold more.
-    assert capacity.recommended_max_batch_size == 240
+    assert capacity.host_bytes_per_request == 1024 * V4_FLASH_HOST_BYTES_PER_BLOCK
+    # The 50 GiB host budget holds 228 requests of 128K tokens beside a dummy's page,
+    # kept at most 95% full; the GPU budget would hold more.
+    assert capacity.recommended_max_batch_size == 228
     report = capacity.describe()
     assert "4 by host" in report
     assert "limited by host" in report
     assert "256 leases" in report
     assert "offload buffers 173.0MiB for 256 rows" in report
-    assert "A max_batch_size of 240 fits" in report
+    assert "A max_batch_size of 228 fits" in report
 
 
 @pytest.mark.cpu_only

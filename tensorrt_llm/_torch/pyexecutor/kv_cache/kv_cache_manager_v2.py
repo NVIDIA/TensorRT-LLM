@@ -140,12 +140,12 @@ from ..resource_manager import (
 from ..scheduler import ScheduledRequests
 from .sparse_offload_memory import (
     HostHistoryReservations,
+    host_history_shape,
     plan_host_history_bytes,
     solve_sparse_offload_capacity,
     sparse_arena_bytes,
     sparse_arena_shapes,
     sparse_batch_shape,
-    sparse_history_bytes_per_block,
     sparse_history_floor_bytes,
 )
 
@@ -2441,7 +2441,9 @@ class KVCacheManagerV2(BaseResourceManager):
             if offload_error is None:
                 try:
                     self._plan_host_history_budget(
-                        kv_cache_config, tokens_per_block=tokens_per_block
+                        kv_cache_config,
+                        tokens_per_block=tokens_per_block,
+                        num_reserved_index_slots=num_reserved_index_slots,
                     )
                 except ValueError as error:
                     offload_error = error
@@ -4209,25 +4211,44 @@ class KVCacheManagerV2(BaseResourceManager):
         return typical_seq_len if typical_seq_len is not None else self.max_seq_len
 
     def _plan_host_history_budget(
-        self, kv_cache_config: KvCacheConfig, *, tokens_per_block: int
+        self,
+        kv_cache_config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        num_reserved_index_slots: int,
     ) -> None:
         """Settle the host memory the offloaded history may pin.
 
         The manager is given this budget and holds its host-backed pools inside it while
         dividing the device quota, so nothing is lowered here: a bound applied before the
-        manager and again inside it would size the level twice. The manager also keeps
-        the host-backed slots its constraint batches need, such as one ``max_seq_len``
-        request, and refuses a budget below them, so the budget never plans less.
+        manager and again inside it would size the level twice. Sized automatically, the
+        budget holds ``max_batch_size`` requests beside the dummy requests' pages, at the
+        cost the manager counts. The manager also keeps the host-backed slots its
+        constraint batches need, such as one ``max_seq_len`` request, and refuses a budget
+        below them, so the budget never plans less.
+
+        Args:
+            kv_cache_config: The KV cache configuration.
+            tokens_per_block: Tokens per block.
+            num_reserved_index_slots: Index slots reserved for persistent dummy
+                requests, such as CUDA-graph padding.
         """
         config = self._get_offload_sizing_config(kv_cache_config, tokens_per_block=tokens_per_block)
         num_tokens = self._get_sparse_offload_seq_len(kv_cache_config)
+        history = host_history_shape(
+            config.layers,
+            tokens_per_block=config.tokens_per_block,
+            max_util_for_resume=config.max_util_for_resume,
+        )
+        pages_per_request = ceil_div(num_tokens, tokens_per_block)
+        dummy_pages = self._get_dummy_history_blocks(num_reserved_index_slots)
         # An explicit host cache tier is pinned too, beside the offloaded history.
         host_tier_bytes = max(0, kv_cache_config.host_cache_size or 0)
         self._host_history_budget = plan_host_history_bytes(
             host_history_size=self._sparse_kv_offload.host_history_size,
-            max_batch_size=self.max_batch_size,
-            host_bytes_per_request=sparse_history_bytes_per_block(config.layers)
-            * ceil_div(num_tokens, tokens_per_block),
+            batch_bytes=history.history_bytes(
+                self.max_batch_size * pages_per_request + dummy_pages
+            ),
             pinnable_host_bytes=get_host_memory_limits(self.mapping).auto_pinnable_bytes
             - host_tier_bytes,
             staging_bytes=self._sparse_batch_staging_bytes,
@@ -7096,15 +7117,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 requests, such as CUDA-graph padding.
         """
         host_pool_groups = self.get_host_backed_pool_groups()
-        local_capacity_blocks = sys.maxsize
-        if host_pool_groups:
-            # Dummy requests hold history pages without a reservation, so
-            # admission keeps their pages out of what it can promise.
-            local_capacity_blocks = max(
-                0,
-                min(int(pool_group.num_slots) for pool_group in host_pool_groups)
-                - self._get_dummy_history_blocks(num_reserved_index_slots),
-            )
+        host_pool_slots = min(
+            (int(pool_group.num_slots) for pool_group in host_pool_groups), default=0
+        )
+        # Dummy requests hold history pages without a reservation, so admission
+        # keeps their pages out of what it can promise.
+        dummy_blocks = self._get_dummy_history_blocks(num_reserved_index_slots)
+        local_capacity_blocks = (
+            max(0, host_pool_slots - dummy_blocks) if host_pool_groups else sys.maxsize
+        )
         # The executor rejects a request on arrival when its history can never
         # fit (get_request_kv_block_budget), and admission reserves its history
         # pages. Each rank sizes its pools from its own host memory, but every
@@ -7124,22 +7145,25 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         self._host_history_reservations = HostHistoryReservations(capacity_blocks)
         if not self.is_estimating_kv_cache:
-            self._log_sparse_kv_offload_capacity(kv_cache_config)
+            self._log_sparse_kv_offload_capacity(
+                kv_cache_config, host_pool_slots=host_pool_slots, dummy_blocks=dummy_blocks
+            )
 
     def _get_dummy_history_blocks(self, num_reserved_index_slots: int) -> int:
         """Return the history pages dummy requests may hold at once, outside admission.
 
         These are the CUDA-graph padding dummies, one per reserved index slot,
         an attention-DP dummy when attention DP is on, and the guard page when
-        it is held. Each holds one token plus its draft and extra tokens.
-        Offload rejects speculative decoding (``_check_sparse_kv_offload_config``),
-        so padding uses one draft length and needs one dummy; the count relies
-        on that.
+        ``TRTLLM_KV_GUARD_PAGE`` asks for one. Each holds one token plus its draft
+        and extra tokens. Offload rejects speculative decoding
+        (``_check_sparse_kv_offload_config``), so padding uses one draft length
+        and needs one dummy; the count relies on that. The host budget is sized
+        before the dummies exist, so the count depends only on the config.
         """
         num_dummies = (
             num_reserved_index_slots
             + int(self.mapping.enable_attention_dp)
-            + int(_GUARD_PAGE_REQUEST_ID in self.kv_cache_map)
+            + int(self._guard_page_value is not None)
         )
         tokens_per_dummy = 1 + 2 * self.max_total_draft_tokens + self.num_extra_kv_tokens
         return num_dummies * ceil_div(tokens_per_dummy, self.tokens_per_block)
@@ -7165,13 +7189,18 @@ class KVCacheManagerV2(BaseResourceManager):
             "cache budget, or lower max_seq_len."
         )
 
-    def _log_sparse_kv_offload_capacity(self, kv_cache_config: KvCacheConfig) -> None:
-        """Log how many requests fit, which limit binds, and the batch size that fits."""
+    def _log_sparse_kv_offload_capacity(
+        self, kv_cache_config: KvCacheConfig, *, host_pool_slots: int, dummy_blocks: int
+    ) -> None:
+        """Log how many requests fit, which limit binds, and the batch size that fits.
+
+        Args:
+            kv_cache_config: The KV cache configuration.
+            host_pool_slots: Slots of this rank's smallest host-backed pool group.
+            dummy_blocks: History pages dummy requests hold outside admission.
+        """
         config = self.kv_cache_manager_py_config
         num_tokens = self._get_sparse_offload_seq_len(kv_cache_config)
-        host_bytes_per_request = sparse_history_bytes_per_block(config.layers) * ceil_div(
-            num_tokens, self.tokens_per_block
-        )
         capacity = solve_sparse_offload_capacity(
             num_tokens=num_tokens,
             max_batch_size=self.max_batch_size,
@@ -7181,7 +7210,14 @@ class KVCacheManagerV2(BaseResourceManager):
             host_budget_bytes=self._host_history_budget,
             gpu_bytes_per_request=self.get_request_device_bytes(num_tokens),
             fixed_gpu_bytes_per_request=self.get_request_device_bytes(0),
-            host_bytes_per_request=host_bytes_per_request,
+            host_history=host_history_shape(
+                config.layers,
+                tokens_per_block=config.tokens_per_block,
+                max_util_for_resume=config.max_util_for_resume,
+            ),
+            host_pool_slots=host_pool_slots,
+            host_pages_per_request=ceil_div(num_tokens, self.tokens_per_block),
+            host_dummy_pages=dummy_blocks,
             arenas=sparse_arena_shapes(config.layers, tokens_per_block=config.tokens_per_block),
             num_leases=self.max_batch_size,
             batch_buffer_bytes=self._sparse_batch_buffer_bytes,
