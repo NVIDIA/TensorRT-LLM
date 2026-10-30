@@ -388,3 +388,36 @@ def test_minicpmv46_multimodal_forward():
         torch.testing.assert_close(logits, attached_logits, rtol=0.02, atol=0.02)
         assert not torch.allclose(logits[-1:], changed_logits[-1:], rtol=1e-3, atol=1e-3)
         assert not torch.allclose(logits[-1:], bypassed_logits, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TRTLLM attention metadata requires CUDA")
+def test_minicpmv46_vision_attn_capacity_is_stable_across_grids():
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6VisionModel
+
+    raw = _minicpmv4_6_config_dict()
+    raw.update(torch_dtype="bfloat16", image_size=8, insert_layer_id=0)
+    raw["vision_config"].update(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        image_size=8,
+        patch_size=2,
+    )
+    vision = MiniCPMV4_6VisionModel(
+        ModelConfig(
+            pretrained_config=_build_minicpmv4_6_config(raw),
+            attn_backend="TRTLLM",
+            max_num_tokens=64,
+        )
+    )
+
+    # Grids of different resolutions share the configured capacity, not their own lengths.
+    small = vision._make_attn_metadata([16, 4])
+    large = vision._make_attn_metadata([64])
+    assert small.max_seq_len == large.max_seq_len == 64
+    assert small.seq_lens.tolist() == [16, 4]
+    assert large.seq_lens.tolist() == [64]
+    with pytest.raises(ValueError, match="exceeds the configured maximum"):
+        vision._make_attn_metadata([65])

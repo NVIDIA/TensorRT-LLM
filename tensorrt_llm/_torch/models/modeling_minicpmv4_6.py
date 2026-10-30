@@ -541,9 +541,9 @@ class MiniCPMV4_6VisionModel(nn.Module):
         self.merger = MiniCPMV4_6Merger(vision_model_config)
 
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-        # Stable per-segment capacity for the encoder attention metadata. A
-        # fixed value keeps the native attention-op cache key unchanged across
-        # image resolutions, as for the Qwen-VL and Cosmos3 vision towers.
+        # Per-segment capacity required by the shared encoder metadata helper.
+        # Like the Qwen-VL and Cosmos3 vision towers, default to the model's
+        # token budget rather than the live grid length.
         self._attn_max_seq_len = model_config.max_num_tokens
 
     def _make_attn_metadata(self, seq_lens: List[int]) -> AttentionMetadata:
