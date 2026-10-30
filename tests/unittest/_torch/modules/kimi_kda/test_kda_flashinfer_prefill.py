@@ -99,6 +99,74 @@ def test_indexed_prefill_matches_reference(
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@torch.inference_mode()
+def test_auto_prefill_stays_finite_on_repeated_token_with_mixed_decay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto routing with BF16 state matches the reference on a long repeated token.
+
+    One head repeats a single token for 2048 steps while its channels decay
+    from near-unit to strong (log-uniform -0.002 to -2 per step). Small-BH with
+    BF16 state diverges on this input (its error reaches about 3e11 and later
+    overflows to NaN; a K3 context worker hit the NaN during warmup and on
+    long prompts), so auto must not select it.
+    """
+    import math
+
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda import (
+        kda_chunked_bt16_small_bh,
+    )
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_chunked_bt16 import (
+        kda_chunked_mma_reference,
+    )
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_custom_ops import kda_prefill
+
+    def small_bh_must_not_run(*args, **kwargs):
+        raise AssertionError("auto KDA prefill routed to Small-BH")
+
+    monkeypatch.setattr(kda_chunked_bt16_small_bh, "chunk_kda_fwd", small_bh_must_not_run)
+
+    total, heads, lower_bound = 2048, 1, -5.0
+    generator = torch.Generator().manual_seed(1)
+    token_q, token_k, token_v = (torch.randn(heads, 128, generator=generator) for _ in range(3))
+    q, k, v = (
+        token.view(1, 1, heads, 128)
+        .expand(1, total, heads, 128)
+        .to("cuda", torch.bfloat16)
+        .contiguous()
+        for token in (token_q, token_k, token_v)
+    )
+    # With zero A_log and dt_bias the safe gate is lower_bound * sigmoid(g).
+    decay = torch.logspace(math.log10(0.002), math.log10(2.0), 128)
+    decay = decay[torch.randperm(128, generator=generator)]
+    ratio = decay / -lower_bound
+    raw_gate = torch.log(ratio / (1 - ratio))
+    g = raw_gate.view(1, 1, 1, 128).expand(1, total, heads, 128).to("cuda", torch.bfloat16)
+    g = g.contiguous()
+    beta = torch.full((1, total, heads), 4.8, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.zeros(heads, device="cuda")
+    bias = torch.zeros(heads, 128, device="cuda")
+    offsets = torch.tensor([0, total], device="cuda", dtype=torch.int64)
+    slots = torch.zeros(1, device="cuda", dtype=torch.int32)
+    state = torch.zeros(1, heads, 128, 128, device="cuda", dtype=torch.bfloat16)
+
+    output = kda_prefill(
+        q, k, v, g, beta, state, slots, offsets, a_log, bias, 128**-0.5, lower_bound, "auto", total
+    )
+    expected_out, expected_state = kda_chunked_mma_reference(
+        *(x.transpose(1, 2) for x in (q, k, v, g, beta)),
+        a_log=a_log,
+        dt_bias=bias,
+        gate_lower_bound=lower_bound,
+        cu_seqlens=offsets,
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, expected_out.transpose(1, 2), rtol=0.02, atol=0.02)
+    torch.testing.assert_close(
+        state[0], expected_state[0].transpose(-1, -2).to(torch.bfloat16), rtol=0.02, atol=0.02
+    )
+
+
 @pytest.mark.parametrize(
     "mode,state_dtype",
     [(mode, torch.bfloat16) for mode in ("engine", "decomp", "auto", "bt16", "small-bh")]
