@@ -315,6 +315,14 @@ class BaseWorker(GenerationExecutor):
         if self.engine.can_enqueue_requests():
             request_id = self._client_id_to_request_id.get(client_id, None)
             if request_id is None:
+                cancel_transfer = getattr(self.engine,
+                                          "_cancel_context_transfer", None)
+                if callable(cancel_transfer):
+                    # The terminal result can precede KV retirement. Resolve
+                    # this identity on the executor thread, without retaining
+                    # every completed result's routing entry indefinitely.
+                    cancel_transfer(client_id)
+                    return
                 logger.warning(
                     f"Request of client_id {client_id} is finished, cannot abort it."
                 )

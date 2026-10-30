@@ -27,6 +27,7 @@ CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheT
 BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
 _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL"
+_KV_LIFECYCLE_ENFORCEMENT_ENV = "TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT"
 _NIXL_KVCACHE_BACKEND_ENV = "TRTLLM_NIXL_KVCACHE_BACKEND"
 _DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"
 _DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
@@ -121,6 +122,19 @@ def create_kv_cache_transceiver(
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None
 ) -> Optional["KvCacheTransceiver"]:
     resolve_cache_transceiver_config(cache_transceiver_config)
+    lifecycle_policy = getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
+    bypasses_python = (cache_transceiver_config is None
+                       or cache_transceiver_config.backend is None or
+                       cache_transceiver_config.transceiver_runtime != "PYTHON")
+    # Python ranks report policy errors through their startup collective.
+    if bypasses_python:
+        if lifecycle_policy not in (None, "0", "1"):
+            raise ValueError(f"{_KV_LIFECYCLE_ENFORCEMENT_ENV} must be 0 or 1")
+        if lifecycle_policy == "1":
+            raise ValueError(
+                f"{_KV_LIFECYCLE_ENFORCEMENT_ENV}=1 requires an enabled Python/NIXL "
+                "transceiver; disabled and C++ transceivers do not support this policy"
+            )
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
