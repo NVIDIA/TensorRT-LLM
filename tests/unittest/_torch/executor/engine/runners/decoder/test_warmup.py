@@ -732,6 +732,56 @@ def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
     owner.dist.tp_allgather.assert_called_once_with(1)
 
 
+@pytest.mark.cpu_only
+def test_general_warmup_appends_moe_jit_shapes() -> None:
+    """Every per-rank token count a MoE backend reports becomes a context-only shape."""
+    engine = SimpleNamespace(
+        _config=SimpleNamespace(max_num_tokens=4096),
+        model=SimpleNamespace(
+            modules=lambda: [
+                object(),
+                SimpleNamespace(jit_warmup_num_tokens=lambda: [193, 1, 81, 5000]),
+                SimpleNamespace(jit_warmup_num_tokens=lambda: [81]),
+            ]
+        ),
+        _get_max_shape_warmup_requests=lambda resource_manager: [(4096, 0), (128, 128)],
+    )
+    engine._get_moe_jit_warmup_requests = lambda: DecoderWarmup._get_moe_jit_warmup_requests(engine)
+
+    configs = DecoderWarmup._get_full_general_warmup_requests(engine, Mock())
+
+    # The existing shapes keep their order; counts above max_num_tokens are dropped.
+    assert configs == [(1, 0), (1, 1), (4096, 0), (128, 128), (2, 0), (81, 0), (193, 0)]
+
+
+@pytest.mark.cpu_only
+def test_mega_moe_jit_warmup_num_tokens_reaches_every_tile() -> None:
+    """One token count per DeepGEMM token tile, the smallest that selects it."""
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm import MegaMoEDeepGemm
+
+    def get_block_m(num_ranks, num_experts, max_num_tokens, num_tokens, num_topk, mma_type):
+        assert (num_ranks, num_experts, max_num_tokens, num_topk, mma_type) == (
+            8,
+            384,
+            7,
+            6,
+            "fp8xfp4",
+        )
+        return 16 if num_tokens <= 2 else 32 if num_tokens <= 5 else 64
+
+    backend = SimpleNamespace(
+        _dg=SimpleNamespace(get_block_m_for_mega_moe=get_block_m),
+        ep_size=8,
+        num_slots=384,
+        max_num_tokens=7,
+        routing_method=SimpleNamespace(experts_per_token=6),
+    )
+    assert MegaMoEDeepGemm.jit_warmup_num_tokens(backend) == [1, 3, 6]
+
+    backend._dg = SimpleNamespace()
+    assert MegaMoEDeepGemm.jit_warmup_num_tokens(backend) == []
+
+
 class TestWarmupCleanup(unittest.TestCase):
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
