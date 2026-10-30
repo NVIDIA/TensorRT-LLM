@@ -37,9 +37,22 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.modules.embedding import LMHead
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm._torch.speculative.vocab_parallel import (
+    VocabParallelHead,
+    VocabShardedLogits,
+    _PairExchange,
+    _select_tokens,
+    markov_chain_logits,
+    tp_pair_exchange,
+)
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -93,10 +106,6 @@ def _run(fn, *args):
 def _make_head(rank, tp, mnnvl):
     # Selects MNNVL for the pair all-reduce on a single node.
     os.environ["TLLM_TEST_MNNVL"] = "1" if mnnvl else "0"
-    from tensorrt_llm._torch.modules.embedding import LMHead
-    from tensorrt_llm._torch.modules.linear import TensorParallelMode
-    from tensorrt_llm._torch.speculative.vocab_parallel import VocabParallelHead
-
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
     vocab = SHARD * tp
     lm_head = LMHead(
@@ -178,12 +187,8 @@ def _argmax_check(rank, tp, mnnvl):
 
 @torch.inference_mode()
 def _sample_check(rank, tp, mnnvl):
-    from tensorrt_llm._torch.speculative.vocab_parallel import (
-        VocabShardedLogits,
-        _local_sample_kernel,
-        _PairExchange,
-        _select_tokens,
-    )
+    # A Triton kernel holds a lock, so cloudpickle cannot ship it as a global of this check.
+    from tensorrt_llm._torch.speculative.vocab_parallel import _local_sample_kernel
 
     head, vocab = _make_head(rank, tp, mnnvl)
     for rows in (1, 64, 257):
@@ -238,10 +243,8 @@ def _markov_check(rank, tp, mnnvl):
             anchors[0] = -1  # out-of-vocab anchor: zero bias
         expected = _markov_reference(full, anchors, w1, w2)
         assert torch.equal(head.markov_tokens(_shard(full, rank), anchors, w1, w2), expected)
-    # The biased shard logits of a vocab-sharded draft head.
-    from tensorrt_llm._torch.distributed import AllReduceStrategy
-    from tensorrt_llm._torch.speculative.vocab_parallel import markov_chain_logits, tp_pair_exchange
 
+    # The biased shard logits of a vocab-sharded draft head.
     def global_argmax(step_logits):
         gathered = MPI.COMM_WORLD.allgather(step_logits.cpu())
         return torch.cat(gathered, dim=-1).argmax(dim=-1).cuda()
@@ -279,8 +282,6 @@ def _markov_check(rank, tp, mnnvl):
 @torch.inference_mode()
 def _worker_accept_check(rank, tp, mnnvl):
     """Strict acceptance on shard logits equals acceptance on gathered logits."""
-    from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
-    from tensorrt_llm._torch.speculative.vocab_parallel import VocabShardedLogits
 
     class _Worker(SpecWorkerBase):
         @property
@@ -359,10 +360,6 @@ def _after_large_allreduce_check(rank: int, tp: int, order: str) -> None:
     round starts each call late, so the other rank reads its part of the
     buffer before it arrives and takes any stale value.
     """
-    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
-    from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
-    from tensorrt_llm._torch.speculative.vocab_parallel import tp_pair_exchange
-
     head, vocab = _make_head(rank, tp, mnnvl=False)
     mapping = head.lm_head.mapping
     # Untuned AUTO runs the exchange on NCCL; the autotuner profiles it on the
