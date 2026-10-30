@@ -4,7 +4,12 @@
 the tp1 target's: against the reference of `qsa_paged_sparse_gqa_nvfp4` (this target's `__r38`)
 and QSA's bf16 kernel over the dequantized pool, inside the NVFP4 op's band (4 ulp of each
 (row, head)'s max, 2 ulp relative RMS), over its cells with and without the output gate; plus
-determinism and graph replay against eager."""
+determinism and graph replay against eager.
+
+The dep4 cells run at one rank's pool as the engine allocates it under `kv_nvfp4`: the
+requests' pages scattered over all 213295 pages, both planes' byte offsets on both sides of
+2^31 and 2^32 (asserted), every scale outside the mapped pages NaN, and each captured and
+replayed at its own compile variant. The bf16 twin dequantizes only the mapped pages."""
 
 import math
 import zlib
@@ -19,6 +24,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditio
     qsa_paged_sparse_gqa_nvfp4_decode as op,
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import triton_qsa_paged_sparse_gqa
+
+__extra_import_path__ = ["../../../.."]
+from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qsa_paged_sparse_gqa_nvfp4_decode requires a CUDA device"
 
@@ -71,6 +79,7 @@ def build(
     global_v=1.0,
     request_dtype=torch.int32,
     pool_pages=None,
+    spread=False,
 ):
     gen = torch.Generator(device=DEV).manual_seed(seed)
     tpb, kv, d, q_heads = 32, 2, 256, 24
@@ -80,19 +89,31 @@ def build(
     slots = max(slots, len(segments))
     slot_of = torch.randperm(slots, generator=torch.Generator().manual_seed(seed))[: len(segments)]
     mapped = [math.ceil((s + n) / tpb) for s, n in segments]
+    assert max(mapped) <= pages, (mapped, pages)
     needed = sum(mapped) + 7
     planes = slice(2 * layer, 2 * layer + 2)
     pool_pages = pool_pages or needed
-    first = pool_pages - needed
-    page_ids = first + torch.randperm(needed, generator=gen, device=DEV).to(torch.int32)
     data = torch.zeros(pool_pages, slot_pages, kv, tpb, d // 2, dtype=torch.uint8, device=DEV)
+    # Every scale outside the requests' pages is NaN, so a page address that strayed could
+    # not come back finite.
     scales = torch.full(
         (pool_pages, slot_pages, kv, tpb, d // 16), E4M3_NAN, dtype=torch.uint8, device=DEV
     )
-    data[first:, planes] = torch.randint(
+    if spread:
+        # The requests' pages scattered over the whole pool; the pool's last page is the first
+        # request's first page, so it is always mapped.
+        picked = torch.randperm(pool_pages - 1, generator=gen, device=DEV)[: needed - 1]
+        last = torch.full((1,), pool_pages - 1, device=DEV)
+        page_ids = torch.cat([last, picked]).to(torch.int32)
+        resident = page_ids.long()
+    else:
+        first = pool_pages - needed
+        page_ids = first + torch.randperm(needed, generator=gen, device=DEV).to(torch.int32)
+        resident = slice(first, None)
+    data[resident, planes] = torch.randint(
         0, 256, (needed, 2, kv, tpb, d // 2), generator=gen, device=DEV
     ).to(torch.uint8)
-    scales[first:, planes] = torch.randint(
+    scales[resident, planes] = torch.randint(
         0x08, 0x31, (needed, 2, kv, tpb, d // 16), generator=gen, device=DEV
     ).to(torch.uint8)
     block_table = torch.full((slots, pages), -1, dtype=torch.int32, device=DEV)
@@ -120,28 +141,58 @@ def build(
 
 
 def bf16_twin(args):
-    pages = args["k_cache"].shape[0]
-    all_pages = torch.arange(pages, device=DEV)[:, None].expand(-1, args["tokens_per_block"])
-    slots = torch.arange(args["tokens_per_block"], device=DEV)[None, :].expand(pages, -1)
+    """QSA's bf16 sparse GQA over a bf16 pool holding the dequantized values of the pages the
+    table maps, renumbered in order, so a cell's pool can reach past 2^32 bytes without the
+    twin dequantizing all of it."""
+    table = args["block_table"]
+    mapped = torch.unique(table[table >= 0]).long()
+    renumber = torch.full((args["k_cache"].shape[0],), -1, dtype=torch.int32, device=DEV)
+    renumber[mapped] = torch.arange(mapped.numel(), dtype=torch.int32, device=DEV)
+    twin_table = torch.where(table >= 0, renumber[table.clamp_min(0).long()], table)
+    tpb = args["tokens_per_block"]
+    pages = mapped[:, None].expand(-1, tpb)
+    slots = torch.arange(tpb, device=DEV)[None, :].expand(mapped.numel(), -1)
     planes = []
     for data, scales, index, grouped in (
         (args["k_cache"], args["k_scale_cache"], 1, False),
         (args["v_cache"], args["v_scale_cache"], 2, True),
     ):
         values = _nvfp4_module._dequantize_tokens(
-            data, scales, all_pages, slots, args["kv_scale_quant_orig"][index], grouped
+            data, scales, pages, slots, args["kv_scale_quant_orig"][index], grouped
         )
         planes.append(values.to(args["q"].dtype).transpose(1, 2).contiguous())
-    twin = {
-        n: args[n]
-        for n in ("q", "block_table", "selected_tokens", "request_indices", "tokens_per_block")
-    }
-    twin.update(softmax_scale=args["softmax_scale"], k_cache=planes[0], v_cache=planes[1])
+    twin = {n: args[n] for n in ("q", "selected_tokens", "request_indices", "tokens_per_block")}
+    twin.update(
+        softmax_scale=args["softmax_scale"],
+        block_table=twin_table,
+        k_cache=planes[0],
+        v_cache=planes[1],
+    )
     return triton_qsa_paged_sparse_gqa(**twin)
 
 
+def _assert_straddles(args, edges) -> None:
+    """The pages the cell's rows read put both planes' byte offsets on both sides of every
+    edge: what the cell claims about its pool."""
+    table = args["block_table"]
+    pages = table[table >= 0].long()
+    for name in ("k_cache", "v_cache", "k_scale_cache", "v_scale_cache"):
+        plane = args[name]
+        base = plane.data_ptr() - plane.untyped_storage().data_ptr()
+        ends = base + pages * plane.stride(0) + plane[0].numel() - 1
+        for edge in edges:
+            assert bool((ends >= edge).any()), f"{name}: no page the rows read lies past {edge}"
+            assert bool((ends < edge).any()), f"{name}: every page the rows read lies past {edge}"
+    last = args["k_cache"].shape[0] - 1
+    assert bool((pages == last).any()), "the pool's last page is not among the rows' pages"
+
+
+#: Spec keys that describe the cell rather than the state `build` makes.
+_CELL_ONLY = ("segments", "gated", "capture", "large", "offset_edges")
+
+
 def _args(spec, seed):
-    kw = {k: v for k, v in spec.items() if k not in ("segments", "gated")}
+    kw = {k: v for k, v in spec.items() if k not in _CELL_ONLY}
     args = build(spec["segments"], seed=seed, **kw)
     if spec.get("gated"):
         rows = args["q"].shape[0]
@@ -152,16 +203,72 @@ def _args(spec, seed):
     return args
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell) -> None:
-    args = _args(cell.spec, zlib.crc32(cell.why.encode()) % (2**31))
+def _replay_in_place(args, seed) -> None:
+    """The call captured at the cell's own compile variant, fresh q (and gate) written into
+    the captured buffers, replayed: bitwise the eager call on the fresh values."""
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = op(**args)
+        g = torch.Generator(device=DEV).manual_seed(seed)
+        for name in ("q", "output_gate"):
+            if name in args:
+                args[name].copy_(torch.randn(args[name].shape, generator=g, device=DEV))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, op(**args)), "replay differs from eager"
+    finally:
+        del graph
+        torch.cuda.synchronize()
+
+
+def _marks(cell):
+    return (pytest.mark.large, pytest.mark.high_cuda_memory) if cell.spec.get("large") else ()
+
+
+@pytest.mark.parametrize(
+    "cell", [pytest.param(c, marks=_marks(c), id=c.why[:44]) for c in op.CELLS]
+)
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture
+    certifying(op)
+    seed = zlib.crc32(cell.why.encode()) % (2**31)
+    args = _args(cell.spec, seed)
+    if "offset_edges" in cell.spec:
+        _assert_straddles(args, cell.spec["offset_edges"])
     out = op(**args)
     assert out.dtype == torch.bfloat16 and not out.isnan().any()
     el, rms, ok = within_ulp(out, op.reference(**args))
     assert ok, f"vs reference: {el:.2f} ulp element, {rms:.2f} ulp RMS"
-    if "output_gate" not in args:
-        el, rms, ok = within_ulp(out, bf16_twin(args))
-        assert ok, f"vs QSA bf16 kernel: {el:.2f} ulp element, {rms:.2f} ulp RMS"
+    # QSA's bf16 kernel has no output gate, so a gated cell checks its ungated call over the
+    # same state against it.
+    gate = args.pop("output_gate", None)
+    plain = out if gate is None else op(**args)
+    el, rms, ok = within_ulp(plain, bf16_twin(args))
+    assert ok, f"vs QSA bf16 kernel: {el:.2f} ulp element, {rms:.2f} ulp RMS"
+    if gate is not None:
+        args["output_gate"] = gate
+    if cell.spec.get("capture"):
+        _replay_in_place(args, seed + 7)
+
+
+def test_band_refuses_a_wrong_answer() -> None:
+    """The band's negative controls, at the dep4 32-request step over a pool of the pages it
+    maps: the reference read through a table one page off, and with one selected token
+    dropped a row, both lie outside the band the cells pass."""
+    dep4 = next(c.spec for c in op.CELLS if c.spec.get("large") and len(c.spec["segments"]) == 32)
+    args = _args({**dep4, "pool_pages": None, "spread": False}, seed=9900)
+    out = op(**args)
+    assert within_ulp(out, op.reference(**args))[2], "the unaltered reference is refused"
+    table = args["block_table"]
+    shifted = dict(args, block_table=torch.where(table >= 0, table + 1, table))
+    selection = args["selected_tokens"].clone()
+    last = (selection >= 0).sum(1) - 1
+    selection[torch.arange(selection.shape[0], device=DEV), last] = -1
+    dropped = dict(args, selected_tokens=selection)
+    for name, wrong in (("a table one page off", shifted), ("one token dropped a row", dropped)):
+        el, rms, ok = within_ulp(out, op.reference(**wrong))
+        assert not ok, f"the band accepts {name}: {el:.2f} ulp element, {rms:.2f} ulp RMS"
 
 
 def test_unaligned_row_slice_of_the_selection() -> None:

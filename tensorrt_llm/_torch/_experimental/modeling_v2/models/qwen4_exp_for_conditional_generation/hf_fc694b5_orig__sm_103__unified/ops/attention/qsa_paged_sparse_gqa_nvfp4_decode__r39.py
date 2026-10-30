@@ -1394,6 +1394,43 @@ def _decode(segments, **overrides) -> dict:
     return dict(segments=segments, **overrides)
 
 
+#: One dep4 rank's pool under `kv_nvfp4` (attention DP, so tp1's 24/2 x 256 geometry), as the
+#: stock engine allocates it at the gate's settings (`max_batch_size` 128, `max_seq_len` 9216,
+#: `free_gpu_memory_fraction` 0.6, chunked prefill): 213295 pages of 32 tokens a rank, the
+#: engine's `qsa_block_table` of `max_num_sequences` 128 rows by 292 columns
+#: (`ceil((9216 + 1) / 32)` rounded up to a multiple of 4), the trunk layout's 24 role pages a
+#: slot with layer 11's planes the last of them. The requests' pages are scattered over the
+#: whole pool, its last page among them.
+_DEP4_NVFP4 = dict(slots=128, pages=292, slot_pages=24, layer=11, pool_pages=213295, spread=True)
+
+#: The byte offsets the dep4 cells' pages must straddle in both planes: one page of layer 11's
+#: scale plane advances 24 x 2 x 32 x 16 bytes and of its data plane 8x that, so a 213295-page
+#: pool addresses the scale plane to 5.2 GB and the data plane to 41.9 GB.
+_OFFSET_EDGES = (2**31, 2**32)
+
+
+def _dep4_decode(positions) -> dict:
+    """A dep4 decode step: one row a request at each position, with the output gate, over
+    the pool above; captured, as the engine runs it. About 44 GiB of pool (`large`)."""
+    return _decode(
+        tuple((p, 1) for p in positions),
+        gated=True,
+        capture=True,
+        large=True,
+        offset_edges=_OFFSET_EDGES,
+        **_DEP4_NVFP4,
+    )
+
+
+#: Decode positions of a dep4 step's requests: the last token `max_seq_len` 9216 allows (table
+#: column 287), a first token, the last position whose history fits inside the 2048-token
+#: budget, then a spread across the rest.
+def _dep4_positions(requests: int) -> tuple[int, ...]:
+    edge = (9215, 0, 2047)
+    spread = tuple((100 + 499 * r) % 9216 for r in range(requests - len(edge)))
+    return (edge + spread)[:requests]
+
+
 class QsaPagedSparseGqaNvfp4Decode(OpWrapper):
     """`qsa_paged_sparse_gqa_nvfp4` for decode rows (no prefill pair): sparse GQA over the
     explicitly selected tokens of an NVFP4 paged pool, `[rows, Hq, D]` bf16. With
@@ -1424,6 +1461,21 @@ class QsaPagedSparseGqaNvfp4Decode(OpWrapper):
                 pool_pages=2048,
             ),
         ),
+        Cell(
+            why="dep4 kv_nvfp4 decode: 1 row at position 9215, 33-way split, gate fused into "
+            "the merge, [128, 292] table, 213295-page pool, captured",
+            spec=_dep4_decode(_dep4_positions(1)),
+        ),
+        Cell(
+            why="dep4 kv_nvfp4 decode: 32 requests (a fourth of the slots), 4-way split + "
+            "gated merge, 213295-page pool, captured",
+            spec=_dep4_decode(_dep4_positions(32)),
+        ),
+        Cell(
+            why="dep4 kv_nvfp4 decode: 128 requests (max_batch_size, every slot), one split "
+            "with the gate fused, 213295-page pool, captured",
+            spec=_dep4_decode(_dep4_positions(128)),
+        ),
     )
 
     note = """
@@ -1444,8 +1496,42 @@ class QsaPagedSparseGqaNvfp4Decode(OpWrapper):
     Numerics: dequantized K/V values are exact in f16; scores on f16 MMAs with fp32
     accumulation; P rounded to f16 (as the Triton op); the second-level scales act on the
     scores and the normalized output. Within the Triton op's band (4 ulp element, 2 ulp RMS)
-    of the float64 reference; not bitwise the Triton op. Deterministic; graph-capturable
+    of the fp32 reference; not bitwise the Triton op. Deterministic; graph-capturable
     (row count is a runtime value; one compile per split variant).
+
+    In the unified target only dep4's `kv_nvfp4` engine binds an NVFP4 pool, with tp1's
+    24/2 x 256 geometry (attention DP): its decode steps, one row a request with the output
+    gate, up to `max_batch_size` 128 rows a rank (the captured batches 1..128), over the
+    engine's `qsa_block_table` ([128, 292] at `max_seq_len` 9216) and one rank's pool as the
+    stock engine allocates it at the gate's settings: 213295 pages of 32 tokens, the trunk
+    layout's 24 role pages a slot. The dep4 cells drive 1, 32 and 128 rows there (33 splits,
+    4 splits, one split with the gate fused into the split kernel), each also captured and
+    replayed at its own compile variant. Measured on GB300 against `reference`, in bf16 ulp
+    (2^-7) of a (row, head)'s magnitude, max / 99.9th percentile / relative RMS: 1 row
+    0.54 / 0.45 / 0.12, cosine 0.9999995; 32 rows 1.10 / 0.48 / 0.03; 128 rows 1.38 / 0.50 /
+    0.05. Read through a table one page off the reference measures 398 / 165 (element / RMS)
+    and with one selected token dropped a row 2.6e11 / 548, against the band of 4 / 2.
+
+    Compiled variants: CuTe DSL, JIT-compiled on the first call of each key for the device
+    that runs it; every cell ran that path on sm_103 (GB300). The key holds the pool's page
+    count, the table's shape, the planes' strides, the split plan and whether the gate is
+    fused, so the dep4 cells compile the variants a dep4 engine at those settings runs; any
+    other page count or table shape compiles a variant of its own.
+
+    Large pools: a page index is widened to 64 bits before its product with a plane's page
+    stride. A 213295-page pool addresses layer 11's scale planes to 5.2 GB and its data
+    planes to 41.9 GB; the dep4 cells scatter their requests' pages over the whole pool, its
+    last page among them, so both planes are read on both sides of 2^31 and 2^32 bytes (the
+    test asserts it), with every scale outside them NaN. Hard limit, read from the source and
+    not probed: the token table's entry `page * tokens_per_block + slot` is 32-bit, so a pool
+    of 2^26 pages or more at 32 tokens a page wraps it (1.6 TB of scale planes at this
+    geometry, beyond any device).
+
+    Not certified: the target engine's own dep4 pool (the cells take the stock engine's page
+    count; the cache task records shapes only); dep4 with MTP (the draft layer's two more role
+    pages a slot, and the verify entry); positions past `max_seq_len` 9216 (the tune's 262144
+    widens the table to about 8196 columns, another variant); second-level scales other than
+    1.0 (the target binds ones); int64 request indices.
 
     Preconditions: bf16 q with head_dim 256; K and V planes (and their scale planes) share
     strides; power-of-two tokens per block; int32 row-contiguous block table; contiguous
@@ -1497,7 +1583,7 @@ class QsaPagedSparseGqaNvfp4Decode(OpWrapper):
         softmax_scale: float,
         output_gate=None,
     ) -> torch.Tensor:
-        """`qsa_paged_sparse_gqa_nvfp4`'s float64 reference, then the gate in fp32 over its
+        """`qsa_paged_sparse_gqa_nvfp4`'s fp32 reference, then the gate in fp32 over its
         bf16 rounding, rounded once."""
         out = _composition.reference(
             q,
