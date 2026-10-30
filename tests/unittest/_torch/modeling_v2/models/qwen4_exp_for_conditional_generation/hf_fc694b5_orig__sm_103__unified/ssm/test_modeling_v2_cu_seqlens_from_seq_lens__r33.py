@@ -72,28 +72,43 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         assert torch.equal(packed[bounds[s] : bounds[s + 1]], piece), f"sequence {s} mis-sliced"
 
 
-def test_cuda_graph_capture_and_replay() -> None:
+#: Graph-captured batches: the MTP-7 verify of 32 requests, and the largest captured
+#: batch (128 requests) at the call site's int64 output.
+_GRAPH_BATCHES = ((32, torch.int32), (128, torch.int64))
+
+
+@pytest.mark.parametrize(
+    "batch, dtype", _GRAPH_BATCHES, ids=[f"{b}req-{str(d)[6:]}" for b, d in _GRAPH_BATCHES]
+)
+def test_cuda_graph_capture_and_replay(batch, dtype) -> None:
     """A captured graph follows lengths rewritten in place: only the shape
     reaches Python, the values are read on device and never synchronized on.
-    32 requests of 8 rows (the MTP-7 verify's 256 rows)."""
-    batch, p = 32, 8
+    Replayed at one row a request, at MTP-7's 8, at one longer row, and at a
+    mixed step whose rows fill `max_num_tokens` (8192)."""
+    p, max_num_tokens = 8, 8192
     static_lens = _seq_lens([p] * batch)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         for _ in range(3):
-            op(static_lens, torch.int32)
+            op(static_lens, dtype)
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        static_out = op(static_lens, torch.int32)
-    for lengths in ([1] * batch, [p] * batch, [p + 1] + [1] * (batch - 1)):
+        static_out = op(static_lens, dtype)
+    for lengths in (
+        [1] * batch,
+        [p] * batch,
+        [p + 1] + [1] * (batch - 1),
+        [max_num_tokens - p * (batch - 1)] + [p] * (batch - 1),
+    ):
         static_lens.copy_(_seq_lens(lengths))
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(static_out, op.reference(static_lens, torch.int32))
+        assert static_out.dtype == dtype
+        assert torch.equal(static_out, op.reference(static_lens, dtype))
 
 
 def test_guard_refuses_non_integer_seq_lens() -> None:

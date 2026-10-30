@@ -3,11 +3,13 @@
 """Prepend-zero cumulative sum of a per-request query-row count: the
 ``cu_seqlens`` segmentation vector every varlen recurrent op takes.
 
-Tier-3 composed from native torch (``torch.zeros`` + ``torch.cumsum``, three
-launches). No registered op or ``modules/`` callable produces this vector: the
-recurrent metadata's ``query_start_loc*`` is built inline by
+A macro entry composed from native torch (``torch.zeros`` + ``torch.cumsum``).
+No registered op or ``modules/`` callable produces this vector in one launch:
+the recurrent metadata's ``query_start_loc*`` is built inline by
 ``Mamba2Metadata.prepare`` and segments the generation tail one row per
-sequence, which is short under speculative decoding.
+sequence, which is short under speculative decoding; the tree's other builders
+of the same vector (``speculative/ragged_helpers.build_qo_indptr``, and
+FlashInfer's private ``utils.get_indptr``) are this same composition.
 """
 
 from __future__ import annotations
@@ -22,11 +24,20 @@ _INTEGER_DTYPES = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int6
 
 #: Batch shapes this checkpoint's serving path produces where it calls this entry.
 #: ``p`` is the trunk's query rows per generation request, ``1 + runtime_draft_len``
-#: under MTP (2..8: `max_draft_len` 1..7); at ``p = 1`` the target reuses the
-#: recurrent metadata's vector instead.
+#: under MTP (2..8: `max_draft_len` 1..7); at ``p = 1`` the tp1 target reuses the
+#: recurrent metadata's vector instead, and ``decode_p1_128`` certifies the call
+#: there all the same.
+#: The ``_128`` batches are the serving envelope's widest step at every member of
+#: the unified target (``max_batch_size`` 128 requests per rank, ``max_num_tokens``
+#: 8192 rows): ``mixed_p8_128`` is one context chunk beside 127 MTP-7 verifies,
+#: 7176 + 127 * 8 = 8192 rows.
 BATCHES = {
     "mixed_p2": (1024, 37, 2, 2, 2, 2),
     "padded_decode_p2": (2, 2, 2, 0, 0, 0),
+    "decode_p1_128": (1,) * 128,
+    "verify_p8_128": (8,) * 128,
+    "chunk_8192": (8192,),
+    "mixed_p8_128": (7176,) + (8,) * 127,
 }
 
 
@@ -67,6 +78,42 @@ class CuSeqlensFromSeqLens(OpWrapper):
                 lengths=BATCHES["padded_decode_p2"], in_dtype=torch.int32, out_dtype=torch.int64
             ),
         ),
+        Cell(
+            why="decode at con 128: 128 one-row requests, prefix int32->int64",
+            spec=dict(
+                lengths=BATCHES["decode_p1_128"],
+                in_dtype=torch.int32,
+                out_dtype=torch.int64,
+                layout="prefix",
+            ),
+        ),
+        Cell(
+            why="MTP-7 verify at con 128: 128 x 8 rows, prefix int32->int64",
+            spec=dict(
+                lengths=BATCHES["verify_p8_128"],
+                in_dtype=torch.int32,
+                out_dtype=torch.int64,
+                layout="prefix",
+            ),
+        ),
+        Cell(
+            why="one 8192-row prefill chunk (max_num_tokens), prefix int32->int64",
+            spec=dict(
+                lengths=BATCHES["chunk_8192"],
+                in_dtype=torch.int32,
+                out_dtype=torch.int64,
+                layout="prefix",
+            ),
+        ),
+        Cell(
+            why="widest step: 7176-row chunk + 127 MTP-7 verifies = 8192 rows, 128 requests",
+            spec=dict(
+                lengths=BATCHES["mixed_p8_128"],
+                in_dtype=torch.int32,
+                out_dtype=torch.int64,
+                layout="prefix",
+            ),
+        ),
     )
 
     note = """
@@ -87,13 +134,30 @@ class CuSeqlensFromSeqLens(OpWrapper):
 
     Certified bitwise at the call site's prefix view of `seq_lens_cuda` (a
     mixed step at p 2, and the p 8 verify of 32 requests) and at a decode
-    batch padded with zero-length rows, int32 in and int64 out. CUDA-graph
-    capture is certified (only `seq_lens.shape[0]` reaches Python; a captured
-    graph follows lengths rewritten in place). Three launches, about 0.03 ms
-    at batch 8..256 -- launch bound.
+    batch padded with zero-length rows, int32 in and int64 out. Also at the
+    serving envelope of every unified member (a rank's batch is at most
+    `max_batch_size` 128 requests and `max_num_tokens` 8192 rows at tp4, tep4
+    and dep4 alike; the vector does not depend on the parallel layout): 128
+    one-row requests, 128 MTP-7 verifies of 8 rows, one 8192-row chunk, and a
+    7176-row chunk beside 127 verifies (128 requests, 8192 rows). CUDA-graph
+    capture is certified at 32 requests (int32 out) and 128 requests (int64
+    out): only `seq_lens.shape[0]` reaches Python, and a captured graph follows
+    lengths rewritten in place, up to a mixed step of 8192 rows.
+
+    Composition, measured on GB300 at the 128-request and 8192-row cells
+    (int32 in, int64 out): four kernels -- a fill, the int32 -> int64 cast copy,
+    and cub's scan-init and scan, all compiled into torch (no JIT path). Eager
+    35-41 us a call (host launch bound); 8-10 us a CUDA-graph replay.
+    Searched for one kernel that builds this vector: `torch.ops.trtllm` (no
+    scan / cu_seqlens op), the catalog and the in-tree targets' ops, the
+    engine's modules (`speculative/ragged_helpers.build_qo_indptr` is this same
+    composition at int32) and FlashInfer (`utils.get_indptr`, private, the same
+    composition). None exists.
 
     Not certified: a `seq_lens` dtype other than int32 (the guard admits any
-    integer dtype), a non-contiguous `seq_lens` view.
+    integer dtype), a non-contiguous `seq_lens` view, more than 128 requests,
+    and a step over 8192 rows (a larger `max_num_tokens`, as the tune may set;
+    an int64 `out` holds any reachable total).
 
     Hard limits
       out[-1]  accumulated in `dtype`  boundary 2^31 - 1 for int32
