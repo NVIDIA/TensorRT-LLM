@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 # Set up error handling
 set -xEeuo pipefail
@@ -45,6 +47,7 @@ slurm_install_setup() {
         fi
 
         echo "(Installing TensorRT-LLM and requirements) Install mode: ${INSTALL_MODE:-source}"
+        python3 "$llmSrcNode/scripts/install_benchmark_tools.py" --check-runtime
 
         # Support two installation modes: source (default) and wheel
         if [ "${INSTALL_MODE:-source}" = "wheel" ]; then

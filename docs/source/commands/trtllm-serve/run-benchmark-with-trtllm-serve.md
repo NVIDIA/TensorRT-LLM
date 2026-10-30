@@ -449,6 +449,41 @@ AIPerf integrates directly with the OpenAI-compatible endpoints exposed by
 
 ### Installation
 
+#### Migrating an existing runtime
+
+Benchmark clients must live in separate environments. Before upgrading TensorRT-LLM
+or installing `requirements-dev.txt`, run this read-only check with the Python
+interpreter used by the inference runtime:
+
+```bash
+python3 scripts/install_benchmark_tools.py --check-runtime
+```
+
+Older development installs may contain AIPerf 0.8.0, whose aiohttp requirement
+conflicts with the runtime's new minimum. Removing AIPerf from the requirements
+file does not uninstall an existing copy. The preflight rejects any ambient
+AIPerf installation and leaves all packages unchanged. CI benchmark setup runs
+this check before installing runtime dependencies.
+
+Use a clean runtime environment when upgrading. To reuse an existing environment,
+explicitly remove its AIPerf installation, then upgrade the runtime dependencies
+and check consistency with that same interpreter:
+
+```bash
+python3 -m pip uninstall aiperf
+python3 scripts/install_benchmark_tools.py --check-runtime
+python3 -m pip install --upgrade -r requirements-dev.txt
+python3 -m pip check
+```
+
+The benchmark installer never removes runtime packages. Uninstalling AIPerf does
+not remove its old dependencies; a clean runtime avoids retaining unused legacy
+packages. The preflight only checks the benchmark/runtime separation, not the
+security status of every installed package. Metadata export remains available
+independently of this check.
+
+#### Installing the client
+
 Install the benchmark client separately with Python 3.11, 3.12, or 3.13:
 
 ```bash

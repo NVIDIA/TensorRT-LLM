@@ -6,6 +6,7 @@ import functools
 import http.server
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -145,6 +146,130 @@ def write_wheel(
         for path, contents in files.items():
             archive.writestr(path, contents)
     return wheel
+
+
+@pytest.mark.parametrize("variable", ["PIP_PYTHON", "PIP_ROOT", "PIP_TARGET", "PIP_PREFIX"])
+def test_pip_destination_overrides_cannot_change_runtime(
+    installer: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supported_python: str,
+    variable: str,
+) -> None:
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    write_wheel(wheels, "aiperf", "0.8.0", marker="unchanged runtime client")
+    write_wheel(wheels, "aiperf", "0.13.0", marker="isolated client")
+    runtime = tmp_path / "inference"
+    venv.EnvBuilder(with_pip=True).create(runtime)
+    runtime_python = str(runtime / "bin/python")
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("PIP_FIND_LINKS", str(wheels))
+    monkeypatch.setenv("PIP_CACHE_DIR", str(tmp_path / "cache"))
+    env = installer.clean_environment()
+    subprocess.check_call([runtime_python, "-I", "-m", "pip", "install", "aiperf==0.8.0"], env=env)
+    before = {path.relative_to(runtime) for path in runtime.rglob("*")}
+    monkeypatch.setenv(variable, runtime_python if variable == "PIP_PYTHON" else str(runtime))
+    monkeypatch.setitem(installer.REQUIREMENTS, "stock", ["aiperf==0.13.0"])
+    root = tmp_path / "clients"
+    installer.install("stock", root, supported_python, root / "bin")
+    assert {path.relative_to(runtime) for path in runtime.rglob("*")} == before
+    assert (
+        subprocess.check_output(
+            [
+                runtime_python,
+                "-I",
+                "-c",
+                "import importlib.metadata as m;print(m.version('aiperf'))",
+            ],
+            text=True,
+        ).strip()
+        == "0.8.0"
+    )
+    assert (
+        subprocess.check_output([str(root / "bin/aiperf")], text=True).strip() == "isolated client"
+    )
+
+
+def test_clean_environment_keeps_package_transport_settings(
+    installer: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = {
+        "PIP_INDEX_URL": "https://packages.example.invalid/simple",
+        "PIP_EXTRA_INDEX_URL": "https://extra.example.invalid/simple",
+        "PIP_CACHE_DIR": "/test/cache",
+        "PIP_CERT": "/test/ca.pem",
+        "PIP_CLIENT_CERT": "/test/client.pem",
+        "PIP_KEYRING_PROVIDER": "subprocess",
+    }
+    for key, value in settings.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("PIP_USER", "1")
+    env = installer.clean_environment()
+    assert {key: env[key] for key in settings} == settings
+    assert "PIP_USER" not in env
+
+
+def test_runtime_preflight_is_read_only_and_explicit(tmp_path: Path, installer: ModuleType) -> None:
+    runtime = tmp_path / "inference"
+    package = make_environment(runtime)
+    metadata = package.parent / "aiperf-0.13.0.dist-info/METADATA"
+    metadata.write_text("Metadata-Version: 2.1\nName: aiperf\nVersion: 0.8.0\n")
+    before = metadata.read_bytes()
+    root = tmp_path / "unused-clients"
+    command = [
+        str(runtime / "bin/python"),
+        str(REPO_ROOT / "scripts/install_benchmark_tools.py"),
+        "--root",
+        str(root),
+        "--check-runtime",
+    ]
+    result = subprocess.run(
+        command, env=installer.clean_environment(), capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "AIPerf 0.8.0 is installed in the runtime environment" in result.stderr
+    assert "explicitly remove AIPerf" in result.stderr
+    assert metadata.read_bytes() == before
+    assert not root.exists()
+    clean = tmp_path / "clean-runtime"
+    venv.EnvBuilder(with_pip=False).create(clean)
+    command[0] = str(clean / "bin/python")
+    subprocess.check_call(command, env=installer.clean_environment())
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("mode", ["wheel", "source"])
+def test_local_setup_rejects_ambient_client_before_runtime_install(
+    installer: ModuleType, tmp_path: Path, mode: str
+) -> None:
+    runtime = tmp_path / "inference"
+    make_environment(runtime)
+    marker = tmp_path / "runtime-mutated"
+    env = installer.clean_environment()
+    env.update(
+        PATH=f"{runtime / 'bin'}:{os.environ['PATH']}",
+        llmSrcNode=str(REPO_ROOT),
+        INSTALL_MODE=mode,
+        SLURM_LOCALID="0",
+        SLURM_JOB_ID=f"benchmark-preflight-{os.getpid()}",
+        MUTATION_MARKER=str(marker),
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; retry_command() { touch "$MUTATION_MARKER"; }; slurm_install_setup',
+            "test",
+            str(REPO_ROOT / "jenkins/scripts/perf/local/slurm_install.sh"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "AIPerf 0.13.0 is installed in the runtime environment" in result.stderr
+    assert not marker.exists()
 
 
 def test_reused_environment_upgrades_transitive_dependencies(
@@ -289,6 +414,7 @@ def test_environment_export_uses_selected_client_without_installing(
         raise AssertionError("Export must not install packages or create a client environment")
 
     monkeypatch.setattr(installer, "install", no_install)
+    monkeypatch.setattr(installer, "check_runtime", no_install)
     monkeypatch.setattr(installer.subprocess, "check_call", no_install)
     installer.main()
     result = json.loads(output.read_text())

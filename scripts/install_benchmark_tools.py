@@ -3,6 +3,7 @@
 """Install benchmark clients without changing the inference environment."""
 
 import argparse
+import importlib.metadata
 import json
 import os
 import shlex
@@ -36,6 +37,8 @@ def clean_environment() -> dict[str, str]:
         "CONDA_PREFIX",
         "PIP_TARGET",
         "PIP_PREFIX",
+        "PIP_PYTHON",
+        "PIP_ROOT",
         "PIP_USER",
         "PIP_CONSTRAINT",
     ):
@@ -43,6 +46,20 @@ def clean_environment() -> dict[str, str]:
     # Tool requirements must not inherit the inference image's pip configuration.
     env["PIP_CONFIG_FILE"] = os.devnull
     return env
+
+
+def check_runtime() -> None:
+    """Reject ambient benchmark packages before changing runtime dependencies."""
+    try:
+        version = importlib.metadata.version("aiperf")
+    except importlib.metadata.PackageNotFoundError:
+        return
+    raise RuntimeError(
+        f"AIPerf {version} is installed in the runtime environment. "
+        "Use a clean runtime environment, or explicitly remove AIPerf with this "
+        "runtime's Python before upgrading TensorRT-LLM. Install benchmark clients "
+        "in their separate environments. See the benchmark setup guide's migration instructions."
+    )
 
 
 def _environment_metadata(executable: Path, env: dict[str, str]) -> dict[str, object]:
@@ -188,11 +205,23 @@ def main() -> None:
     )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--bin-dir", type=Path, help="Directory for client launchers only")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--export-environment", type=Path, help="Record an existing client; do not install"
+    )
+    mode.add_argument(
+        "--check-runtime",
+        action="store_true",
+        help="Check this interpreter for ambient AIPerf before upgrading runtime dependencies",
     )
     parser.add_argument("--client-python", help="Interpreter to inspect in export mode")
     args = parser.parse_args()
+    if args.check_runtime:
+        if args.client_python is not None:
+            parser.error("--client-python is only used with --export-environment")
+        check_runtime()
+        print("Runtime preflight passed: no ambient AIPerf installed.")
+        return
     root = args.root.resolve()
     if args.export_environment is not None:
         if args.profile == "all":

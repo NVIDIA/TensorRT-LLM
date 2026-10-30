@@ -70,6 +70,7 @@ slurm_install_setup() {
 
         which python3
         python3 --version
+        python3 "$llmSrcNode/scripts/install_benchmark_tools.py" --check-runtime
         retry_command apt-get install -y libffi-dev
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
         if [[ $pytestCommand == *--run-ray* ]]; then

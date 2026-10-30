@@ -5211,6 +5211,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (env.alternativeTRT) {
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
+            sh "python3 ${llmSrc}/scripts/install_benchmark_tools.py --check-runtime"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "python3 ${llmSrc}/scripts/install_benchmark_tools.py --profile all --bin-dir /usr/local/bin")
             // SMG's generated package remains an opt-in dependency. OpenEngine's
