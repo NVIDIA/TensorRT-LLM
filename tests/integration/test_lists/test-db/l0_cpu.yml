@@ -321,4 +321,5 @@ l0_cpu:
   - unittest/utils/test_logger.py
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
+  - unittest/utils/test_mpi_utils.py
   - unittest/visual_gen/test_output.py
