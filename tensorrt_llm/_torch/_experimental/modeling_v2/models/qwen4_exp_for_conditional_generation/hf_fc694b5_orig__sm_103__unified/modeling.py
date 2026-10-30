@@ -137,6 +137,7 @@ from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import pool as _pool
+from . import vision as _vision
 from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
     fused_sigmoid_mul_inplace as mtp_fused_sigmoid_mul_inplace,
@@ -3743,9 +3744,6 @@ class SpeculativeRollback:
 
 # -------------------------------------------------------------------- shell ---
 
-# The media keys a request's multimodal payload carries.
-_MEDIA_KEYS = ("image", "video")
-
 
 class ModelingV2HfFc694b5OrigSm103Unified(
     DecoderModelForCausalLM[Qwen4ExpUnifiedModelingV2, PretrainedConfig]
@@ -3816,6 +3814,8 @@ class ModelingV2HfFc694b5OrigSm103Unified(
         # init).
         self._mm_token_ids_value = (self.model.image_token_id, self.model.video_token_id)
         self._mm_token_ids_cache: torch.Tensor | None = None
+        # Replicated on every rank; built once the weights are real (`post_load_weights`).
+        self.vision_tower: _vision.VisionTower | None = None
 
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
@@ -3826,19 +3826,17 @@ class ModelingV2HfFc694b5OrigSm103Unified(
             self._mm_token_ids_cache = torch.tensor(self._mm_token_ids_value, dtype=torch.int32)
         return self._mm_token_ids_cache
 
+    @property
+    def multimodal_data_device_paths(self) -> list[str]:
+        """Tensors under `multimodal_data` the executor moves to the device. Absent, it moves
+        everything, putting the `(t, h, w)` grids the tower reads on the host there too."""
+        return list(_vision.DEVICE_PATHS)
+
     def validate_request(self, request) -> None:
-        """Admission check, run by the executor on every new request: a request carrying
-        media fails here as its own error, because this target does not run the vision
-        tower yet; a text request returns at once."""
-        data = request.py_multimodal_data
-        if not data:
-            return
-        carried = [key for key in _MEDIA_KEYS if data.get(key) is not None]
-        if carried:
-            raise ValueError(
-                f"the request carries {', '.join(carried)}; the vision tower is not "
-                "assembled in this target yet"
-            )
+        """Admission check, run by the executor on every new request: a media request the
+        vision tower would assert on fails here as its own error (`vision.validate_request`);
+        a text request returns at once."""
+        _vision.validate_request(self.vision_tower, request)
 
     def forward(
         self,
@@ -3865,7 +3863,7 @@ class ModelingV2HfFc694b5OrigSm103Unified(
             inputs_embeds=inputs_embeds,
             lora_params=lora_params,
             spec_metadata=spec_metadata,
-            vision=None,
+            vision=_vision.multimodal_embeds(self.vision_tower, kwargs),
         )
         if self.spec_worker is None:
             assert spec_metadata is None, (
@@ -3923,3 +3921,4 @@ class ModelingV2HfFc694b5OrigSm103Unified(
     def post_load_weights(self):
         super().post_load_weights()
         self.model.post_load_weights()
+        self.vision_tower = _vision.VisionTower(self.model.w, self.model.vision_config)
