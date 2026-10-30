@@ -624,6 +624,8 @@ class OpenAIHttpClient(OpenAIClient):
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"
         )
+        done_event = b"data: [DONE]\n\n"
+        pending = b""
         try:
             last_token_time = start_time
             chunk_count = 0
@@ -632,7 +634,6 @@ class OpenAIHttpClient(OpenAIClient):
             awaiting_output = isinstance(request, ResponsesRequest)
             marker = f"event: {SSE_METRICS_EVENT}\n".encode()
             event_delimiter = b"\n\n"
-            pending = b""
             metrics_event = b""
             async for chunk in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
@@ -662,20 +663,17 @@ class OpenAIHttpClient(OpenAIClient):
                 pending += chunk
                 marker_index = pending.find(marker)
                 if marker_index >= 0:
-                    if marker_index:
-                        yield pending[:marker_index]
                     metrics_event = pending[marker_index:]
-                    pending = b""
-                    continue
+                    pending = pending[:marker_index]
                 event_end = pending.rfind(event_delimiter)
                 if event_end >= 0:
                     emit_size = event_end + len(event_delimiter)
-                    yield pending[:emit_size]
-                    pending = pending[emit_size:]
+                    ready = pending[:emit_size].removesuffix(done_event)
+                    if ready:
+                        yield ready
+                        pending = pending[len(ready) :]
                 await asyncio.sleep(0)
 
-            if pending:
-                yield pending
             if hooks and metrics_event:
                 data_prefix = b"data: "
                 data_index = metrics_event.find(data_prefix)
@@ -688,7 +686,7 @@ class OpenAIHttpClient(OpenAIClient):
                             _metrics_phase(self._role),
                             adjusted_clock=response_clock,
                         )
-                    except (TypeError, ValueError) as error:
+                    except (AttributeError, TypeError, ValueError) as error:
                         logger.warning("Ignoring malformed perf metrics event: %s", error)
                         metrics = None
                     if metrics:
@@ -696,10 +694,19 @@ class OpenAIHttpClient(OpenAIClient):
 
             if hooks:
                 hooks.on_resp_done(server, request, None)
+            # pending still holds [DONE]. Forward it only after on_resp_done recorded
+            # the request: clients disconnect at [DONE], which cancels this generator.
+            if pending:
+                yield pending
             self._metrics_collector.complete_latency_seconds.observe(
                 get_steady_clock_now_in_seconds() - start_time
             )
         except aiohttp.ClientError as e:
+            if pending.endswith(done_event):
+                # The request finished; only its trailing metrics event was cut off.
+                logger.warning(f"{self._role} client {server} error after [DONE]: {e}")
+                yield pending
+                return
             # a client error is expected when the response stream is done if the connector has close=True
             logger.error(f"{self._role} client {server} error: {e}")
             raise

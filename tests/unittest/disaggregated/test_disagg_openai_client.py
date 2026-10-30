@@ -556,13 +556,17 @@ class TestOpenAIHttpClient:
         mock_http_response.__aexit__ = AsyncMock()
         mock_session.post.return_value = mock_http_response
         hooks = MagicMock(spec=ResponseHooks)
+        events = []
+        hooks.on_resp_done.side_effect = lambda *args: events.append("on_resp_done")
 
         response_generator = await openai_client.send_request(
             streaming_completion_request, hooks=hooks
         )
-        chunks = [chunk async for chunk in response_generator]
+        async for chunk in response_generator:
+            events.append(chunk)
 
-        assert chunks == [response_data, done_data]
+        # on_resp_done records the request, so it must run before [DONE] is forwarded.
+        assert events == [response_data, "on_resp_done", done_data]
         hooks.on_first_token.assert_called_once_with("localhost:8000", streaming_completion_request)
         hooks.on_perf_metrics.assert_called_once()
         hooks.on_resp_done.assert_called_once_with(
