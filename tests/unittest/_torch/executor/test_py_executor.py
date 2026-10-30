@@ -3280,13 +3280,32 @@ def test_pad_dummy_allocation_failure_skips_padding():
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 
 
-def test_adp_pad_dummy_uses_engine_beam_width() -> None:
-    stub = _StubADPExecutor(max_beam_width=4)
+@pytest.mark.parametrize("enable_adp_dummy_fixes", [True, False], ids=["fixed", "legacy"])
+@pytest.mark.parametrize(
+    ("peer_forward_intent", "is_gen", "beam_width"),
+    [
+        pytest.param(_ADPForwardIntent.GENERATION, True, 4, id="generation"),
+        pytest.param(_ADPForwardIntent.CONTEXT, False, 1, id="context"),
+    ],
+)
+def test_adp_pad_dummy_beam_width_follows_role(
+    enable_adp_dummy_fixes: bool,
+    peer_forward_intent: _ADPForwardIntent,
+    is_gen: bool,
+    beam_width: int,
+) -> None:
+    stub = _StubADPExecutor(
+        max_beam_width=4,
+        enable_adp_dummy_fixes=enable_adp_dummy_fixes,
+        peer_forward_intent=peer_forward_intent,
+    )
+    stub._adp_dummy_is_gen = is_gen
 
     _run_pad(stub)
 
     assert len(stub.add_dummy_calls) == 1
-    assert stub.add_dummy_calls[0]["max_beam_width"] == 4
+    assert stub.add_dummy_calls[0]["is_gen"] is is_gen
+    assert stub.add_dummy_calls[0].get("max_beam_width", 1) == beam_width
 
 
 @pytest.mark.parametrize(
@@ -3705,13 +3724,20 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
 
-def test_pad_empty_batch_dummy_uses_engine_beam_width() -> None:
+@pytest.mark.parametrize(
+    ("context_dummy", "beam_width"), [(False, 4), (True, 1)], ids=["generation", "context"]
+)
+def test_pad_empty_batch_dummy_beam_width_follows_role(
+    context_dummy: bool, beam_width: int
+) -> None:
     stub, scheduled_batch = _unfittable_rank(max_beam_width=4)
+    stub.kv_cache_manager.kda_context_only = context_dummy
 
     _run_pad_empty(stub, scheduled_batch)
 
     assert len(stub.add_dummy_calls) == 1
-    assert stub.add_dummy_calls[0]["max_beam_width"] == 4
+    assert stub.add_dummy_calls[0]["is_gen"] is not context_dummy
+    assert stub.add_dummy_calls[0].get("max_beam_width", 1) == beam_width
 
 
 def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
