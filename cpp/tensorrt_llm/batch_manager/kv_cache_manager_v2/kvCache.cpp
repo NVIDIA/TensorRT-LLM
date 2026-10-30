@@ -3190,7 +3190,9 @@ bool KvCache::_checkSanity() const
                 }
                 else
                 {
-                    TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
+                    // Working state is locked while active and held while suspended.
+                    TLLM_CHECK_DEBUG((mStatus == Status::ACTIVE && std::holds_alternative<SharedPageLock>(bp))
+                        || (mStatus == Status::SUSPENDED && std::holds_alternative<SharedPtr<PageHolder>>(bp)));
                     auto page = blockPageGetPage(bp);
                     TLLM_CHECK_DEBUG(dynamicPointerCast<UncommittedPage>(page) != nullptr);
                 }

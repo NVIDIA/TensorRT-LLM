@@ -328,6 +328,7 @@ TEST_F(ReplayCacheTest, MixedSsmPoliciesRestoreStateAndCopyEveryBeam)
         reader->setBeamWidth(BeamIndex{1});
         reader->commitPendingStats();
         EXPECT_TRUE(manager->getAndResetSsmSnapshotIterationStats().empty());
+        reader->suspend();
         reader->close();
         source->close();
         manager->shutdown();
@@ -370,6 +371,7 @@ TEST_F(ReplayCacheTest, OptionalSsmRequiresExactEndpointAndDoesNotLimitAttention
             ASSERT_TRUE(reader->resume(mStream));
             reader->commitPendingStats();
             EXPECT_TRUE(manager->getAndResetSsmSnapshotIterationStats().empty());
+            reader->suspend();
             reader->close();
         }
         manager->shutdown();
