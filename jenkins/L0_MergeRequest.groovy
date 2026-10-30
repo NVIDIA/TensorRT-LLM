@@ -181,7 +181,7 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
+// Kill switch for CBTS per-test coverage; stage eligibility is decided in L0_Test.groovy.
 @Field
 def ENABLE_CBTS_COVERAGE = true
 // Version-controlled Tier 2 application policy. Coverage decisions are evaluated
@@ -539,8 +539,8 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
         testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
-        // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
-        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+        // Propagate the coverage kill switch; L0_Test decides stage eligibility.
+        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE
     }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
@@ -1985,9 +1985,9 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
-// Upload sqlite-only early coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
+// Upload sqlite-only post-merge coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
 def uploadArchCoverage(String arch, pipeline, testFilter) {
-    if (!testFilter[(CBTS_COVERAGE)]) {
+    if (!testFilter[(CBTS_COVERAGE)] || !testFilter[(IS_POST_MERGE)]) {
         return
     }
     def sbsaPrefixPattern = "^results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-"

@@ -30,6 +30,7 @@ import com.nvidia.bloom.ContainerRuntime
 import com.nvidia.bloom.FailureEvidenceCollector
 import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
@@ -261,7 +262,7 @@ def getShortenedJenkinsInstanceName() {
 }
 
 def isCbtsStage(String stageName) {
-    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    // The pipeline-level kill switch is propagated by L0_MergeRequest.groovy.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
@@ -273,8 +274,16 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
-    // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.
-    if (stageName.contains("_GPUs") || stageName.contains("_Nodes")) {
+    // Collect single-GPU post-merge coverage and trial multi-GPU pre-merge coverage.
+    // Multi-node stages remain excluded from this experiment.
+    if (stageName.contains("_Nodes")) {
+        return false
+    }
+    if (testFilter[(IS_POST_MERGE)]) {
+        if (stageName.contains("_GPUs")) {
+            return false
+        }
+    } else if (!stageName.contains("_GPUs") || stageName.contains("Post-Merge")) {
         return false
     }
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
@@ -393,6 +402,60 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             """
         }
 
+        // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
+        if (isCbtsStage(stageName)) {
+            try {
+                timeout(time: 5, unit: 'MINUTES') {
+                    CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+                        def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                        def cbtsLocalDir = "${stageName}/cbts"
+                        def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
+                        sh "mkdir -p ${cbtsLocalDir}"
+                        // Pack the per-process databases on the login node.
+                        def archiveStatus = Utils.exec(
+                            pipeline,
+                            script: Utils.sshUserCmd(
+                                remote,
+                                "\"cd '${remoteWs}' && { sleep 2; " +
+                                "echo CBTS remote coverage files: && " +
+                                "find . -maxdepth 1 -type f -name '.cbtscov.${stageName}*.sqlite' | wc -l; " +
+                                "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
+                                "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }\""
+                            ),
+                            returnStatus: true,
+                            numRetries: 3,
+                        )
+                        if (archiveStatus != 0) {
+                            echo "CBTS: no coverage archive created for ${stageName} (remote status ${archiveStatus})."
+                        } else {
+                            def gotArchive = Utils.exec(
+                                pipeline,
+                                script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
+                                returnStatus: true,
+                                numRetries: 3,
+                            ) == 0
+                            if (gotArchive) {
+                                sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                                sh "echo CBTS local coverage files: && find ${cbtsLocalDir} -type f -name '.cbtscov.*.sqlite' | wc -l"
+                            } else {
+                                echo "CBTS: coverage archive transfer failed for ${stageName}."
+                            }
+                        }
+                    }
+                }
+            } catch (FlowInterruptedException e) {
+                if (e.causes.any { it.class.simpleName == 'ExceededTimeout' }) {
+                    echo "CBTS: coverage pull for ${stageName} timed out; continuing."
+                } else {
+                    throw e
+                }
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
+            }
+        }
+
         // Always re-tar the local stage directory and upload it directly, rather
         // than trusting the last progress snapshot uploaded by
         // progress_upload_snapshot.sh to still match it (the superseded-file
@@ -407,45 +470,6 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             "${UPLOAD_PATH}/test-results/"
         )
         deleteProgressArtifact(stageName, postTag)
-
-        // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
-        if (isCbtsStage(stageName)) {
-            CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
-                def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-                def cbtsLocalDir = "${stageName}/cbts"
-                def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
-                sh "mkdir -p ${cbtsLocalDir}"
-                try {
-                    timeout(time: 5, unit: 'MINUTES') {
-                        // Freeze writers, then pack on the login node; an archive with no member is dropped.
-                        Utils.exec(
-                            pipeline,
-                            script: Utils.sshUserCmd(
-                                remote,
-                                "\"cd '${remoteWs}' && sleep 2 && " +
-                                "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
-                                "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
-                            ),
-                            returnStatus: true,
-                            numRetries: 3,
-                        )
-                        def gotArchive = Utils.exec(
-                            pipeline,
-                            script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
-                            returnStatus: true,
-                            numRetries: 3,
-                        ) == 0
-                        if (gotArchive) {
-                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
-                        } else {
-                            echo "CBTS: no coverage archive retrieved for ${stageName} (no coverage data or transfer skipped)."
-                        }
-                    }
-                } catch (Exception e) {
-                    echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
-                }
-            }
-        }
     }
 
     // For a reportable attempt, rename local results*.xml with postTag so
@@ -1689,7 +1713,7 @@ def getPytestBaseCommandLine(
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
         "-o junit_logging=${jUnitLogging}",
-        // Coverage capture: only CBTS (post-merge) stages instrument, via cbts_plugin / sitecustomize.
+        // Coverage capture: eligible CBTS stages instrument via cbts_plugin / sitecustomize.
         cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
         "--periodic-junit-xmlpath ${outputPath}/results.xml",
