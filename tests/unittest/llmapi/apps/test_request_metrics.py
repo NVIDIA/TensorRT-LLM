@@ -568,13 +568,16 @@ class TestJsonlWriterSurvival:
         writer = PerfMetricsJsonlWriter(None, "test")
         logged_at = []
         for count in range(1, 2001):
-            num_logged = len(logged_errors)
-            writer._drop_after_unexpected_error(1, "write", RuntimeError("disk gone"))
-            if len(logged_errors) > num_logged:
-                logged_at.append(count)
+            for stage in ("serialize", "write"):
+                num_logged = len(logged_errors)
+                writer._drop_after_unexpected_error(1, stage, RuntimeError("failed"))
+                if len(logged_errors) > num_logged:
+                    logged_at.append((stage, count))
 
-        assert logged_at == [1, 1000, 2000]
-        assert writer.dropped_records == 2000
+        assert logged_at == [
+            (stage, count) for count in (1, 1000, 2000) for stage in ("serialize", "write")
+        ]
+        assert writer.dropped_records == 4000
 
     @pytest.mark.asyncio
     async def test_close_still_cancels_a_stuck_write(self, tmp_path, monkeypatch):

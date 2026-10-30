@@ -659,7 +659,7 @@ class PerfMetricsJsonlWriter:
         self._path: Optional[Path] = None
         self.dropped_records = 0
         self._write_error_count = 0
-        self._unexpected_error_count = 0
+        self._unexpected_error_counts: dict[str, int] = {}
 
     async def start(self) -> None:
         if self._output_dir is None or self._task is not None:
@@ -758,11 +758,13 @@ class PerfMetricsJsonlWriter:
     def _drop_after_unexpected_error(self, num_records: int, stage: str, error: Exception) -> None:
         """Count records lost to an unexpected exception and log it, rate-limited.
 
+        Each stage has its own rate limit so its first failure is always logged.
         The message carries the traceback, which shows where serializing or writing failed.
         """
         self.dropped_records += num_records
-        self._unexpected_error_count += 1
-        if self._unexpected_error_count == 1 or self._unexpected_error_count % 1000 == 0:
+        count = self._unexpected_error_counts.get(stage, 0) + 1
+        self._unexpected_error_counts[stage] = count
+        if count == 1 or count % 1000 == 0:
             logger.error(
                 "Dropped %d performance metrics record(s) that failed to %s (%s: %s)\n%s",
                 num_records,
