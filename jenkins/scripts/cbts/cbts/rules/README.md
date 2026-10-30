@@ -11,16 +11,30 @@ for the overall CBTS architecture.
 
 | File | Class | Scope | Triggers on |
 |---|---|---|---|
+| `python_formatting.py` | `PythonFormattingRule` | `noop` | Python files with verified equivalent complete ASTs and unchanged comments |
 | `waives.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs) |
+| `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
 | `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
 | `out_of_scope.py` | `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
+
+## PythonFormattingRule
+
+Claims Python files only after the raw patch matches the checked-out source
+and both complete source images have identical ASTs, including docstrings and
+type comments. Comment text must also match, preserving encoding and lint
+directives. Missing or mismatched patches, syntax errors, empty pre-images,
+and explicit rename/mode changes retain their normal impact. Repeated patches
+for old/new rename paths are not classified as formatting.
+
+Verified files are excluded from source rules and contribute `scope=noop`;
+the entry point still retains the always-run CPU stages. A mixed PR continues
+through the normal rules for every remaining changed file.
 
 ## DocsRule
 
@@ -203,8 +217,10 @@ Outcomes:
 
 Path-only rule. Claims source files under `examples/visual_gen/`,
 `scripts/visualgen_eval/`, `tensorrt_llm/_torch/visual_gen/`,
-`tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding `.md`,
-which `OutOfScopeRule` claims as noop). fused-DiT paths stay unclaimed:
+`tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding documentation,
+which `DocsRule` handles). It also claims the exact generated schema
+`tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.json`.
+fused-DiT paths stay unclaimed:
 those diffs also touch `inplace_info()` in
 `tensorrt_llm/_torch/compilation/utils.py`, which no VG rule claims.
 Image suffixes are intentionally NOT excluded: VG ships reference images
@@ -222,16 +238,25 @@ live in `backend: pytorch` and `backend: tensorrt` blocks. A block
 
 For each matched block, `block_filters` keeps only the VG entries.
 Non-VG siblings in the same block stay governed by other rules.
+Schema changes additionally keep the complete
+`unittest/llmapi/test_trtllm_serve_config_schemas.py` validation entry (or
+its enclosing test-directory entry). Missing validation stages force fallback.
+Other generated schemas remain unclaimed.
 
-Outward-facing fallback: VisualGen public symbols and
-`tensorrt_llm.media.*` are imported eagerly by non-VG startup paths such
-as `commands/serve.py`, `commands/utils.py`, and
-`serve/openai_server.py`. Both package prefixes
-(`tensorrt_llm/visual_gen/`, `tensorrt_llm/media/`) are listed in
-`_VG_OUTWARD_PREFIXES`; touching any non-doc file under them claims the
-changed files but emits `scope=None` so Selector falls back to baseline.
-This protects trtllm-serve / trtllm-bench startup paths from VG
-signature drift slipping through pre-merge.
+Shared serving validation: changes under `tensorrt_llm/visual_gen/` or
+`tensorrt_llm/media/` also keep every entry in `l0_cpu`, plus shared test
+families under `test_e2e.py`, `examples/serve`, `disaggregated`, `llmapi`,
+`unittest/llmapi`, and `unittest/disaggregated`. These cover public config,
+protocol/media imports, normal and disaggregated serving, multimodal requests,
+and online benchmarks. PackageSanityCheck and PerfSanity remain enabled.
+
+The CPU suite must contain runnable API stability, serve-schema, lazy-server
+import, and lazy-model-zoo validation. The serving chat/completions examples and
+config-override precedence test must also resolve to stages scheduled in the trigger mode;
+OnDemand stages and optional
+pre-merge multi-GPU stages cannot satisfy this requirement. Missing or filtered
+required validation keeps `scope=None`. Public changes therefore get a wider
+test set than internal VG changes without requiring all unrelated GPU tests.
 
 Outcomes:
 
@@ -242,8 +267,9 @@ Outcomes:
   sanity off (VG changes don't affect wheel sanity); perfsanity on iff
   a matched block lives in `l0_perf` or `*perf_sanity*`.
 - VG source touched, any outward-facing path under
-  `tensorrt_llm/visual_gen/` or `tensorrt_llm/media/` → `scope=None`
-  (fallback).
+  `tensorrt_llm/visual_gen/` or `tensorrt_llm/media/` → `scope=visualgenonly`
+  with shared serving, full CPU, package sanity, and performance sanity.
+  Missing required shared validation → `scope=None` (fallback).
 - VG source touched but no VG block found anywhere (defensive) →
   `scope=None` (fallback).
 
