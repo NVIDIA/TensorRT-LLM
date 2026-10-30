@@ -314,7 +314,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Shortest-uncached-first: context requests with the fewest uncached prompt
         # tokens go first. With a starvation limit, a request pending for more
         # scheduler iterations than that first takes up to a quarter of
-        # max_num_tokens, oldest first (see _split_starved_ctx).
+        # max_num_tokens in whole chunks, oldest first (see _starved_ctx_shares).
         self._ctx_shortest_first = (
             context_scheduling_policy == ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST
         )
@@ -1038,11 +1038,23 @@ class KVCacheV2Scheduler(RequestScheduler):
         return [req for req in pending_ctx if id(req) not in starved_ids], starved
 
     def _starved_ctx_shares(self, starved_ctx: RequestList, budget: BudgetTracker) -> list[int]:
-        """First share of each starved request: up to a quarter of max_num_tokens, oldest first, within the budget."""
+        """First share of each starved request, oldest first, within the budget.
+
+        A share is up to a quarter of max_num_tokens but at least one chunk unit, in whole chunk
+        units unless it ends the prompt, so an older request is never left a share too small to
+        run a chunk while a younger one runs.
+        """
+        if not starved_ctx:
+            return []
+        unit = self.chunk_unit_size
+        cap = max(self._starved_ctx_tokens // unit * unit, unit)
         shares = []
         left = budget.remaining_tokens
         for req in starved_ctx:
-            share = max(0, min(self._uncached_tokens(req), self._starved_ctx_tokens, left))
+            uncached = self._uncached_tokens(req)
+            share = max(0, min(uncached, cap, left))
+            if share < uncached:
+                share = share // unit * unit
             shares.append(share)
             left -= share
         return shares

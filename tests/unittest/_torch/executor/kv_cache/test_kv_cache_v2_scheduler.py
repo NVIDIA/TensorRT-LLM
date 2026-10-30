@@ -5558,6 +5558,17 @@ class TestShortestFirstStarvation:
         assert 0 in ids(out.context_requests)
         assert long.context_chunk_size == 2048
 
+    def test_small_budget_funds_whole_chunks_oldest_first(self):
+        """128-token budget: a quarter (32) is below a 64-token unit, so the two oldest get a unit
+        each instead of 32-token shares that only the younger ones could turn into chunks."""
+        sched = _make_srpt_scheduler(budget=128, starvation_iterations=8)
+        starved = _ctx_batch(0, [50000] * 4)
+        for req, seen_at in zip(starved, [40, 30, 20, 10]):
+            req.py_ctx_sched_since_iter = seen_at
+        out = sched.schedule_request(starved, set())
+        assert sorted(ids(out.context_requests)) == [2, 3]
+        assert [r.context_chunk_size for r in starved[2:]] == [64, 64]
+
     def test_starved_request_keeps_a_request_slot(self):
         sched = _make_srpt_scheduler(max_batch_size=2, starvation_iterations=8)
         (long,) = _ctx_batch(0, [50000], seen_at=0)
